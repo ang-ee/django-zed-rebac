@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import pytest
+from django.db import connection
+from django.test.utils import CaptureQueriesContext
 
 from rebac import (
     LocalBackend,
@@ -10,6 +12,7 @@ from rebac import (
     RelationshipTuple,
     SubjectRef,
 )
+from rebac.models import SchemaDefinition, SchemaPermission, SchemaRelation
 from rebac.schema import parse_zed
 
 SCHEMA_TEXT = """
@@ -157,6 +160,79 @@ def test_schema_level_builtin_actor_grants(db):
         action="signed_in",
         resource_type="auth_oidc/provider",
     )
+
+
+@pytest.mark.django_db
+def test_db_loaded_schema_refreshes_when_schema_rows_change() -> None:
+    sd = SchemaDefinition.objects.create(resource_type="blog/post")
+    SchemaRelation.objects.create(
+        definition=sd,
+        name="owner",
+        allowed_subjects=[{"type": "auth/user"}],
+    )
+    SchemaRelation.objects.create(
+        definition=sd,
+        name="viewer",
+        allowed_subjects=[{"type": "auth/user"}],
+    )
+    permission = SchemaPermission.objects.create(
+        definition=sd,
+        name="read",
+        expression="owner",
+    )
+    SchemaDefinition.objects.create(resource_type="auth/user")
+
+    backend = LocalBackend()
+    post = _post("p-db-refresh")
+    alice = _user("alice")
+    bob = _user("bob")
+    backend.write_relationships(
+        [
+            RelationshipTuple(resource=post, relation="owner", subject=alice),
+            RelationshipTuple(resource=post, relation="viewer", subject=bob),
+        ]
+    )
+
+    assert backend.has_access(subject=alice, action="read", resource=post)
+    assert not backend.has_access(subject=bob, action="read", resource=post)
+
+    permission.expression = "owner + viewer"
+    permission.save(update_fields=["expression"])
+
+    assert backend.has_access(subject=bob, action="read", resource=post)
+
+
+@pytest.mark.django_db
+def test_cached_db_schema_does_not_query_schema_tables_on_hot_path() -> None:
+    sd = SchemaDefinition.objects.create(resource_type="blog/post")
+    SchemaRelation.objects.create(
+        definition=sd,
+        name="owner",
+        allowed_subjects=[{"type": "auth/user"}],
+    )
+    SchemaPermission.objects.create(
+        definition=sd,
+        name="read",
+        expression="owner",
+    )
+    SchemaDefinition.objects.create(resource_type="auth/user")
+
+    backend = LocalBackend()
+    post = _post("p-db-hot-path")
+    alice = _user("alice")
+    backend.write_relationships(
+        [RelationshipTuple(resource=post, relation="owner", subject=alice)]
+    )
+
+    assert backend.has_access(subject=alice, action="read", resource=post)
+
+    with CaptureQueriesContext(connection) as queries:
+        assert backend.has_access(subject=alice, action="read", resource=post)
+
+    schema_queries = [
+        query["sql"] for query in queries if '"rebac_schema' in query["sql"].lower()
+    ]
+    assert schema_queries == []
 
 
 def test_arrow_propagates_via_folder(backend):

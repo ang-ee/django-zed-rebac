@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import pytest
+from django.test import override_settings
 
 from rebac import (
     NoActorResolvedError,
@@ -11,10 +12,11 @@ from rebac import (
     current_actor,
     rebac_subject,
     sudo,
+    system_context,
     to_subject_ref,
 )
 from rebac.actors import current_sudo_reason, is_sudo
-from rebac.errors import SudoReasonRequiredError
+from rebac.errors import SudoNotAllowedError, SudoReasonRequiredError
 
 
 def test_subject_ref_passes_through():
@@ -82,3 +84,20 @@ def test_sudo_with_reason_flips_flag():
         assert is_sudo()
         assert current_sudo_reason() == "cron.test"
     assert not is_sudo()
+
+
+def test_sudo_denied_when_disabled():
+    with override_settings(REBAC_ALLOW_SUDO=False):
+        with pytest.raises(SudoNotAllowedError):
+            with sudo(reason="request.path"):
+                pass
+
+
+@pytest.mark.django_db
+def test_system_context_allowed_when_sudo_disabled():
+    with override_settings(REBAC_ALLOW_SUDO=False):
+        assert not is_sudo()
+        with system_context(reason="asset.load"):
+            assert is_sudo()
+            assert current_sudo_reason() == "asset.load"
+        assert not is_sudo()

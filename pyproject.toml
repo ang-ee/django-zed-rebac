@@ -1,13 +1,14 @@
 [build-system]
-requires = ["setuptools>=68", "wheel"]
+requires = ["setuptools>=77", "wheel"]
 build-backend = "setuptools.build_meta"
 
 [project]
 name = "django-zed-rebac"
-version = "0.1.5"
+version = "0.2.0"
 description = "Drop-in REBAC engine for Django, SpiceDB-compatible, with a pure-Django LocalBackend."
 readme = "README.md"
-license = { text = "Apache-2.0" }
+license = "Apache-2.0"
+license-files = ["LICENSE"]
 requires-python = ">=3.14"
 authors = [{ name = "Apexive", email = "hi@apexive.com" }]
 keywords = ["django", "rebac", "spicedb", "zanzibar", "authorization", "permissions"]
@@ -18,7 +19,6 @@ classifiers = [
     "Framework :: Django :: 5.2",
     "Framework :: Django :: 6.0",
     "Intended Audience :: Developers",
-    "License :: OSI Approved :: Apache Software License",
     "Programming Language :: Python :: 3",
     "Programming Language :: Python :: 3.14",
     "Topic :: Security",

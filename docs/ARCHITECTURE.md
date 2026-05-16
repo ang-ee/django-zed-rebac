@@ -252,7 +252,8 @@ from rebac import (
     ActorLike,                          # SubjectRef | User | Group | <@rebac_subject-registered>
     current_actor, set_current_actor,
     actor_context,                      # context-manager form, mirrors sudo()
-    sudo, system_context,
+    sudo,                               # request-path bypass; gated by REBAC_ALLOW_SUDO
+    system_context,                     # framework-job bypass; NOT gated by REBAC_ALLOW_SUDO
 
     # Convenience helpers
     write_relationships, delete_relationships, backend,
@@ -471,7 +472,7 @@ All settings prefixed `REBAC_`. No nested dict. Read via the public `app_setting
 | `REBAC_PK_IN_THRESHOLD` | `10000` | `int` | Above this size, `accessible()` returns a JOIN instead of materialising `pk__in`. |
 | `REBAC_STRICT_MODE` | `True` | `bool` | If `True`, queryset construction without an actor (and not in `sudo()`) raises `MissingActorError`. **Production default.** |
 | `REBAC_REQUIRE_SUDO_REASON` | `True` | `bool` | If `True`, `sudo()` calls without a `reason=...` raise. |
-| `REBAC_ALLOW_SUDO` | `True` | `bool` | Globally disable `sudo()`. Strict tenants set `False`. |
+| `REBAC_ALLOW_SUDO` | `True` | `bool` | Globally disable the request-path `sudo()` bypass. Strict tenants set `False`. **Does NOT gate `system_context()`** — framework-owned jobs (migrations, fixture seeders, asset loaders) must still be able to bypass even on strict tenants; the two surfaces are deliberately split. Every block-scoped `system_context()` entry still emits a `KIND_SUDO_BYPASS` audit row, same as block-scoped `sudo()`. |
 | `REBAC_GC_INTERVAL_SECONDS` | `300` | `int` | How often the expiration GC task runs. |
 | `REBAC_ACTOR_RESOLVER` | `"rebac.actors.default_resolver"` | `str` | Dotted-path callable that resolves `request → SubjectRef`. Override for custom identity layers (e.g., agent grants). |
 | `REBAC_TYPE_PREFIX` | `""` | `str` | Optional prefix for all generated resource types (multi-tenant SaaS). |
@@ -659,17 +660,19 @@ class RebacManager:
     # Typed shorthands — all eventually call with_actor() internally.
     def as_user(self, user) -> RebacQuerySet: ...
     def as_agent(self, agent, *, on_behalf_of=None) -> RebacQuerySet: ...
+    def with_action(self, action: str) -> RebacQuerySet: ...           # override read-scope action
 
-    def sudo(self, *, reason: str) -> RebacQuerySet: ...
-    def system_context(self, *, reason: str) -> RebacQuerySet: ...   # alias
+    def sudo(self, *, reason: str) -> RebacQuerySet: ...                # gated by REBAC_ALLOW_SUDO
+    def system_context(self, *, reason: str) -> RebacQuerySet: ...      # framework-job bypass, NOT gated
     def actor(self) -> SubjectRef | None: ...                           # introspection
 
 class RebacQuerySet:
     def with_actor(self, actor: ActorLike) -> Self: ...
     def as_user(self, user) -> Self: ...
     def as_agent(self, agent, *, on_behalf_of=None) -> Self: ...
-    def sudo(self, *, reason: str) -> Self: ...
-    def system_context(self, *, reason: str) -> Self: ...
+    def with_action(self, action: str) -> Self: ...                    # override read-scope action
+    def sudo(self, *, reason: str) -> Self: ...                         # gated by REBAC_ALLOW_SUDO
+    def system_context(self, *, reason: str) -> Self: ...               # framework-job bypass, NOT gated
 
     # Standard queryset ops with REBAC-aware overrides:
     def update(self, **kwargs) -> int: ...
@@ -686,6 +689,7 @@ The three actor verbs are sugar over the same primitive:
 | `with_actor(actor)` | Resolves `actor` to a `SubjectRef` and pins it on the queryset clone. | The default. Works for any subject type. |
 | `as_user(user)` | Equivalent to `with_actor(to_subject_ref(user))` for a Django `User`. | The HTTP request path: `Post.objects.as_user(request.user)`. |
 | `as_agent(agent, on_behalf_of=u)` | Equivalent to `with_actor(grant_subject_ref(agent, u))` — resolves to an `agents/grant:<id>#valid` subject. | MCP servers and agent runtimes where a Grant is the canonical actor. |
+| `with_action(action)` | Pins the permission used for read-side queryset scoping instead of `read` / `Meta.rebac_default_action`. | Alternate read views such as `credential_lookup`, `list_admin`, or capability-specific resolver scopes. |
 
 `as_agent(agent)` without `on_behalf_of` resolves to a bare `agents/agent:<id>` subject (the agent acting standalone, with only its declared capabilities — no user grants). Use this only for system-initiated agent runs; for end-user-driven agent runs always pass `on_behalf_of=user`. The `agents/agent` and `agents/grant` definitions are NOT auto-emitted — they live in the consumer's own `agents` app, which references this plugin's `auth/user`.
 
@@ -694,7 +698,8 @@ The three actor verbs are sugar over the same primitive:
 [Borrowed from Odoo's `with_user` / `sudo` distinction. Adapted with mandatory `reason` and a generic actor type.]
 
 - `with_actor(actor)` — re-evaluate all checks **as** `actor`. The originating actor (`current_actor()`) is unchanged — `with_actor()` does NOT mutate the ContextVar; the new scope lives on the queryset clone. Audit events record both the originating actor and the queryset's pinned actor. Mirrors Odoo's `with_user(u)`, generalised to any subject type.
-- `sudo(reason=...)` — bypass all REBAC checks. `current_actor()` still returns the originating subject; only `is_sudo()` flips. Mirrors Odoo's `env.su` / `env.user` independence. Mandatory `reason`. Bypass writes a `PermissionAuditEvent` with kind `sudo.bypass`.
+- `sudo(reason=...)` — request-path bypass of all REBAC checks. `current_actor()` still returns the originating subject; only `is_sudo()` flips. Mirrors Odoo's `env.su` / `env.user` independence. Mandatory `reason`. The block-scoped context manager writes a `PermissionAuditEvent` with kind `sudo.bypass`. **Gated by `REBAC_ALLOW_SUDO`** — strict tenants disable it.
+- `system_context(reason=...)` — same bypass semantics as `sudo()` (same block-scoped audit kind, same reason requirement, same non-propagation through traversal), but intended for framework-owned jobs running outside a request: migrations, fixture seeders, asset loaders, scheduled maintenance. **Not gated by `REBAC_ALLOW_SUDO`** — a tenant who has disabled request-path sudo still needs to run migrations. Choose `sudo()` for request-path elevation (admin views, override layer); choose `system_context()` for framework jobs.
 
 What `sudo()` does NOT bypass:
 - App-layer `clean()` validators.
@@ -721,7 +726,7 @@ A per-queryset actor (path 1) **always wins** over `current_actor()` (path 3) �
 
 | Operation | Permission checked | Where |
 |---|---|---|
-| `Model.objects.all()` / `.filter(...)` / `.get()` / `.count()` / `.exists()` | `read` (or `Meta.rebac_default_action`) | `RebacQuerySet.get_queryset()` injects a `pk__in=<accessible(actor, action, type)>` clause (or a JOIN above the threshold). |
+| `Model.objects.all()` / `.filter(...)` / `.get()` / `.count()` / `.exists()` | `read` (or `Meta.rebac_default_action`; override per chain with `.with_action(action)`) | `RebacQuerySet.get_queryset()` injects a `pk__in=<accessible(actor, action, type)>` clause (or a JOIN above the threshold). |
 | `Model.objects.create(**fields)` | `create` on the model class | `RebacManager.create()` calls `check_access(actor, "create", ObjectRef(type, ""))` first. |
 | `Model.objects.bulk_create(rows)` | `create` once per page | Single class-level check. |
 | `instance.save()` (PK present) | `write` on the row | Pre-save signal handler. |
@@ -851,8 +856,8 @@ The `@rebac_resource` decorator registers the type with the schema validator (th
 | `@require_permission` decorator | `from rebac import require_permission` | Gate methods on plain Python classes (not just models). |
 | `current_actor()` ContextVar | `from rebac import current_actor` | Read the active actor inside any code path. |
 | `with actor_context(actor):` | `from rebac import actor_context` | Block-scoped actor for non-queryset code (manual `check_access` calls inside the block). |
-| `with sudo(reason=...)` | `from rebac import sudo` | Block-scoped bypass; logged. |
-| `with system_context(reason=...)` | `from rebac import system_context` | Like `sudo()`, idiomatic for cron. |
+| `with sudo(reason=...)` | `from rebac import sudo` | Block-scoped bypass for request-path elevation; logged. Gated by `REBAC_ALLOW_SUDO`. |
+| `with system_context(reason=...)` | `from rebac import system_context` | Block-scoped bypass for framework-owned jobs (migrations, fixture seeders, cron, asset loaders). Logged. **Not** gated by `REBAC_ALLOW_SUDO` — strict tenants that have turned `sudo()` off still need this path. |
 | `parse_zed(text)` | `from rebac.schema import parse_zed` | Tooling: round-trip `permissions.zed` to AST. |
 | `BackendPermission` checker | `from rebac.backends import to_subject_ref` | Identity-to-subject conversion (extension point). |
 
@@ -975,13 +980,14 @@ These four are highest-impact. The full Odoo 19 research note (with file/line ci
 
 ## Testing
 
-Three layers of tests ship in CI:
+Three layers of tests define the project target:
 
 1. **Unit tests** (`pytest`): pure-Python, no database. Schema parsing, expression compilation, codename mapping, build determinism.
 2. **Integration tests** (`pytest-django`, `@pytest.mark.django_db`): in-memory SQLite + real Postgres. `RebacMixin` end-to-end, manager scoping, signal handlers.
 3. **Cross-backend contract tests**: same suite parameterised over `LocalBackend` and `SpiceDBBackend` (the latter via [`testcontainers-spicedb`](https://pypi.org/project/testcontainers-spicedb/)). Run on CI when Docker is available; opt-in via `pytest -m spicedb`.
 
-CI matrix:
+Current GitHub CI gates `ruff` and `pytest` on Python 3.14 + Django 6.0. The
+target compatibility matrix is:
 
 ```
 Python:  3.11 · 3.12 · 3.13 · 3.14
@@ -990,21 +996,22 @@ DB:      sqlite (unit) · postgres-15 (integration) · postgres-16 (integration)
 Backend: local · spicedb (when Docker available)
 ```
 
-Type-checked end-to-end: `mypy --strict src/rebac/` and `pyright --pythonversion 3.13`. Both run on CI; both must pass. The plugin ships `py.typed` (PEP 561) and `RebacManager[M]` is `Generic[M]` over the model class so query return types are inferred.
+The package ships `py.typed` (PEP 561) and keeps the public API annotated. Full
+strict type-checking remains a release-hardening target; the current CI gate is
+lint + runtime tests.
 
 ---
 
 ## Versioning
 
-`django-zed-rebac` follows [DjangoVer](https://www.b-list.org/weblog/2024/nov/18/djangover/): `<DJANGO_MAJOR>.<DJANGO_FEATURE>.<PACKAGE_VERSION>`. Examples:
-
-- `6.0.1` — works with Django 6.0, package iteration 1.
-- `5.2.4` — works with Django 5.2 LTS, fourth iteration.
-- `5.2.4 → 6.0.1` is the supported upgrade path; we ship it the day Django 6.0 lands.
+`django-zed-rebac` follows SemVer while the project is below 1.0. Minor releases
+may add public API and tighten alpha contracts; patch releases are reserved for
+compatible fixes.
 
 LTS support: Django 4.2 LTS through April 2026, Django 5.2 LTS through April 2028. We track Django's own deprecation policy and never force users off LTS prematurely.
 
-Public API (`rebac.*` direct imports + the schema language) is semver-stable across same-Django versions. `rebac._internal.*` is private. Breaking changes are confined to Django-major bumps.
+Public API (`rebac.*` direct imports + the schema language) is intended to be
+stable across patch releases. `rebac._internal.*` is private.
 
 ---
 
@@ -1013,7 +1020,7 @@ Public API (`rebac.*` direct imports + the schema language) is semver-stable acr
 | Phase | Deliverable |
 |---|---|
 | **0.1.0 — MVP** | `LocalBackend` (Postgres CTE, MySQL CTE, SQLite test-mode); schema parser + sync command; `RebacMixin` + manager + signals; `RebacPermission` + `RebacFilterBackend`; system checks; sync/check/doctor commands; full test matrix. |
-| **0.2.0 — Caveats + expiration** | `cel-python` integration; `use expiration` schema directive; expiration GC task. |
+| **0.2.0 — Alpha hardening** | Schema-level built-in actor grants; action-scoped read querysets; split request-path `sudo()` from framework-job `system_context()`; hot-path schema cache invalidation. |
 | **0.3.0 — Celery + middleware** | `ActorMiddleware`; Celery signal handlers; ContextVar stack pattern. |
 | **0.4.0 — Override layer** | `SchemaOverride` model + admin; `effective_expr` composition; admin audit. |
 | **0.5.0 — `SpiceDBBackend`** | `authzed-py` adapter; `WriteSchema` auto-push; cross-backend contract tests. |

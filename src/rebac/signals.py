@@ -271,14 +271,35 @@ def _dirty_field_names(
 
 
 # ---------------------------------------------------------------------------
-# SchemaOverride invalidation + audit
+# Schema cache invalidation + SchemaOverride audit
 # ---------------------------------------------------------------------------
 #
-# Tier-2 override CRUD must reset the cached backend so the next permission
-# check rebuilds the in-memory schema with composition applied. Each create
-# or delete emits a PermissionAuditEvent via the single audit-emission
-# helper. Single-process only — multi-process LISTEN/NOTIFY is a v1.x
-# roadmap item.
+# Schema* CRUD must invalidate DB-loaded LocalBackend schemas so the next
+# permission check rebuilds the in-memory schema without paying schema-table
+# fingerprint queries on the hot path. Tier-2 override CRUD also resets the
+# cached global backend and emits a PermissionAuditEvent via the single
+# audit-emission helper. Single-process only — multi-process LISTEN/NOTIFY is
+# a v1.x roadmap item.
+
+
+def _mark_schema_caches_stale() -> None:
+    from .backends.local import mark_db_loaded_schemas_stale
+
+    mark_db_loaded_schemas_stale()
+
+
+@receiver(post_save, sender="rebac.SchemaDefinition")
+@receiver(post_delete, sender="rebac.SchemaDefinition")
+@receiver(post_save, sender="rebac.SchemaRelation")
+@receiver(post_delete, sender="rebac.SchemaRelation")
+@receiver(post_save, sender="rebac.SchemaPermission")
+@receiver(post_delete, sender="rebac.SchemaPermission")
+@receiver(post_save, sender="rebac.SchemaCaveat")
+@receiver(post_delete, sender="rebac.SchemaCaveat")
+def _rebac_schema_rows_changed(sender: type, raw: bool = False, **_: Any) -> None:
+    if raw:
+        return
+    _mark_schema_caches_stale()
 
 
 def _override_target_repr(instance: Any) -> str:
@@ -328,6 +349,7 @@ def _rebac_override_post_save(
     from .backends import reset_backend
     from .models import PermissionAuditEvent
 
+    _mark_schema_caches_stale()
     reset_backend()
     if created:
         _emit_override_audit(
@@ -345,6 +367,7 @@ def _rebac_override_post_delete(sender: type, instance: Any, **_: Any) -> None:
     from .backends import reset_backend
     from .models import PermissionAuditEvent
 
+    _mark_schema_caches_stale()
     reset_backend()
     _emit_override_audit(
         kind=PermissionAuditEvent.KIND_OVERRIDE_DELETE,

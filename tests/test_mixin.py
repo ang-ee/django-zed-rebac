@@ -33,6 +33,7 @@ definition blog/post {
     relation viewer: auth/user | auth/group#member | auth/user:*
     relation folder: blog/folder
     permission read = owner + viewer + folder->read
+    permission credential_lookup = owner
     permission write = owner
     permission delete = owner
     permission create = owner
@@ -151,6 +152,32 @@ def test_sudo_queryset_returns_all(alice, bob, post):
 
     qs = Post.objects.sudo(reason="test.sudo")
     assert qs.count() == 1
+
+
+def test_with_action_changes_queryset_read_scope(alice, bob, post):
+    _grant_owner(alice, post)
+    write_relationships(
+        [
+            RelationshipTuple(
+                resource=ObjectRef("blog/post", str(post.pk)),
+                relation="viewer",
+                subject=SubjectRef.of("auth/user", str(bob.pk)),
+            ),
+        ]
+    )
+    from tests.testapp.models import Post
+
+    assert list(Post.objects.as_user(bob).values_list("pk", flat=True)) == [post.pk]
+    assert list(
+        Post.objects.with_action("credential_lookup")
+        .as_user(bob)
+        .values_list("pk", flat=True)
+    ) == []
+    assert list(
+        Post.objects.with_action("credential_lookup")
+        .as_user(alice)
+        .values_list("pk", flat=True)
+    ) == [post.pk]
 
 
 # ---------------------------------------------------------------------------

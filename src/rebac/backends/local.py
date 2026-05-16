@@ -33,6 +33,7 @@ from __future__ import annotations
 import time
 from collections.abc import Iterable
 from threading import Lock
+from weakref import WeakSet
 
 from ..conf import app_settings
 from ..errors import PermissionDepthExceeded
@@ -59,6 +60,9 @@ from ..types import (
 )
 from .base import Backend
 
+_backend_registry_lock = Lock()
+_db_loaded_backends: WeakSet[LocalBackend] = WeakSet()
+
 
 class LocalBackend(Backend):
     """Recursive-CTE-style evaluator implemented as a bounded graph walk."""
@@ -68,9 +72,12 @@ class LocalBackend(Backend):
     def __init__(self) -> None:
         self._schema_lock = Lock()
         self._schema: Schema | None = None
+        self._schema_is_manual = False
         # Counter used as a stable monotonic xid on backends (e.g. SQLite test
         # mode) without `txid_current()`.
         self._xid_counter = 0
+        with _backend_registry_lock:
+            _db_loaded_backends.add(self)
 
     # ---------- Schema management ----------
 
@@ -78,12 +85,23 @@ class LocalBackend(Backend):
         """Install the in-memory schema. Called by the sync command."""
         with self._schema_lock:
             self._schema = schema
+            self._schema_is_manual = True
 
     def schema(self) -> Schema:
-        if self._schema is None:
-            # Lazy load from DB-stored Schema* rows.
-            self._schema = self._load_schema_from_db()
-        return self._schema
+        with self._schema_lock:
+            if self._schema is None:
+                # Lazy load from DB-stored Schema* rows. Schema model signals
+                # mark DB-loaded backends stale when those rows change in this
+                # process, avoiding schema-table reads on every permission check.
+                self._schema = self._load_schema_from_db()
+                self._schema_is_manual = False
+            return self._schema
+
+    def mark_schema_stale(self) -> None:
+        """Drop a DB-loaded schema cache after Schema* row changes."""
+        with self._schema_lock:
+            if not self._schema_is_manual:
+                self._schema = None
 
     def _load_schema_from_db(self) -> Schema:
         from django.db.models import Prefetch
@@ -878,6 +896,14 @@ class LocalBackend(Backend):
 
 
 # ---------- Module-level helpers ----------
+
+
+def mark_db_loaded_schemas_stale() -> None:
+    """Invalidate all live LocalBackend instances backed by Schema* DB rows."""
+    with _backend_registry_lock:
+        backends = list(_db_loaded_backends)
+    for backend in backends:
+        backend.mark_schema_stale()
 
 
 def _find_relation(definition: Definition, name: str) -> Relation | None:

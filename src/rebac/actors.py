@@ -277,13 +277,8 @@ def actor_context(actor: ActorLike) -> Iterator[None]:
 
 
 @contextmanager
-def sudo(*, reason: str | None = None) -> Iterator[None]:
-    """Bypass REBAC checks for the duration of the block.
-
-    `reason` is mandatory unless `REBAC_REQUIRE_SUDO_REASON = False`.
-    """
-    if not app_settings.REBAC_ALLOW_SUDO:
-        raise SudoNotAllowedError("sudo() denied: REBAC_ALLOW_SUDO is False")
+def _sudo_state_context(*, reason: str | None = None) -> Iterator[None]:
+    """Install the ambient bypass state and emit the mandatory audit row."""
     if app_settings.REBAC_REQUIRE_SUDO_REASON and not reason:
         raise SudoReasonRequiredError(
             "sudo() requires a `reason=...` argument when REBAC_REQUIRE_SUDO_REASON is True"
@@ -313,7 +308,28 @@ def sudo(*, reason: str | None = None) -> Iterator[None]:
         _sudo_state.reset(token)
 
 
-system_context = sudo  # alias, idiomatic for cron / migrations
+@contextmanager
+def sudo(*, reason: str | None = None) -> Iterator[None]:
+    """Bypass REBAC checks for an explicitly enabled elevated request path.
+
+    `reason` is mandatory unless `REBAC_REQUIRE_SUDO_REASON = False`.
+    """
+    if not app_settings.REBAC_ALLOW_SUDO:
+        raise SudoNotAllowedError("sudo() denied: REBAC_ALLOW_SUDO is False")
+    with _sudo_state_context(reason=reason):
+        yield
+
+
+@contextmanager
+def system_context(*, reason: str | None = None) -> Iterator[None]:
+    """Bypass REBAC checks for framework-owned jobs outside a request.
+
+    System tasks such as migrations, asset loaders, and fixture seeders
+    still need a fully audited bypass even when deployments disable raw
+    request-path `sudo()`.
+    """
+    with _sudo_state_context(reason=reason):
+        yield
 
 
 # ---------- Default resolver ----------

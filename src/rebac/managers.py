@@ -1,8 +1,8 @@
 """RebacManager + RebacQuerySet.
 
 Per ARCHITECTURE.md § Three actor-resolution paths:
-  1. Per-queryset actor (.with_actor) — strictly highest priority
-  2. Per-queryset sudo (.sudo) — bypass; logs an audit event
+  1. Per-queryset actor/action (.with_actor / .with_action)
+  2. Per-queryset sudo (.sudo) — bypass with a mandatory reason
   3. current_actor() ContextVar — populated by middleware / Celery hooks
   4. Fallback — STRICT_MODE=True raises; else system_context()
 
@@ -35,11 +35,13 @@ class RebacQuerySet(models.QuerySet):
 
     # Per-queryset state. Carried through `_clone()`.
     _rebac_actor: SubjectRef | None
+    _rebac_action: str | None
     _rebac_sudo_reason: str | None
 
     def __init__(self, *args: Any, **kwargs: Any) -> None:
         super().__init__(*args, **kwargs)
         self._rebac_actor = None
+        self._rebac_action = None
         self._rebac_sudo_reason = None
 
     # Note: a second `_clone` override below combines the actor + scope-flag
@@ -63,15 +65,26 @@ class RebacQuerySet(models.QuerySet):
         """Typed shorthand: scope to an agent acting via a Grant."""
         return self.with_actor(grant_subject_ref(agent, on_behalf_of))
 
+    def with_action(self, action: str) -> RebacQuerySet:
+        """Pin the REBAC permission used for queryset read scoping."""
+        if not action:
+            raise ValueError("with_action() requires a non-empty action")
+        clone = self._clone()
+        clone._rebac_action = action
+        clone._rebac_scope_applied = False
+        return clone
+
     def sudo(self, *, reason: str) -> RebacQuerySet:
         """Bypass REBAC for this queryset. Mandatory `reason`."""
-        from .actors import _sudo_state  # noqa: F401  — sanity import
-        from .errors import (
-            SudoNotAllowedError,
-            SudoReasonRequiredError,
-        )
+        return self._bypass(reason=reason, allow_when_sudo_disabled=False)
 
-        if not app_settings.REBAC_ALLOW_SUDO:
+    def system_context(self, *, reason: str) -> RebacQuerySet:
+        return self._bypass(reason=reason, allow_when_sudo_disabled=True)
+
+    def _bypass(self, *, reason: str, allow_when_sudo_disabled: bool) -> RebacQuerySet:
+        from .errors import SudoNotAllowedError, SudoReasonRequiredError
+
+        if not allow_when_sudo_disabled and not app_settings.REBAC_ALLOW_SUDO:
             raise SudoNotAllowedError("sudo() denied: REBAC_ALLOW_SUDO is False")
         if app_settings.REBAC_REQUIRE_SUDO_REASON and not reason:
             raise SudoReasonRequiredError(
@@ -81,9 +94,6 @@ class RebacQuerySet(models.QuerySet):
         clone._rebac_actor = None
         clone._rebac_sudo_reason = reason
         return clone
-
-    def system_context(self, *, reason: str) -> RebacQuerySet:
-        return self.sudo(reason=reason)
 
     def actor(self) -> SubjectRef | None:
         return self._rebac_actor
@@ -151,7 +161,11 @@ class RebacQuerySet(models.QuerySet):
         from .actors import accessible_cached
         from .backends import backend
 
-        action = getattr(self.model._meta, "rebac_default_action", "read")
+        action = self._rebac_action or getattr(
+            self.model._meta,
+            "rebac_default_action",
+            "read",
+        )
         active_backend = backend()
         grants_all = getattr(active_backend, "grants_all", None)
         if callable(grants_all) and grants_all(
@@ -195,6 +209,7 @@ class RebacQuerySet(models.QuerySet):
     def _clone(self, **kwargs: Any) -> RebacQuerySet:  # type: ignore[override]
         clone = super()._clone(**kwargs)
         clone._rebac_actor = self._rebac_actor
+        clone._rebac_action = self._rebac_action
         clone._rebac_sudo_reason = self._rebac_sudo_reason
         # Important: each clone re-applies scope when needed.
         clone._rebac_scope_applied = False
@@ -350,8 +365,11 @@ class RebacManager(models.Manager.from_queryset(RebacQuerySet)):  # type: ignore
     def as_agent(self, agent: Any, *, on_behalf_of: Any | None = None) -> RebacQuerySet:
         return self.get_queryset().as_agent(agent, on_behalf_of=on_behalf_of)
 
+    def with_action(self, action: str) -> RebacQuerySet:
+        return self.get_queryset().with_action(action)
+
     def sudo(self, *, reason: str) -> RebacQuerySet:
         return self.get_queryset().sudo(reason=reason)
 
     def system_context(self, *, reason: str) -> RebacQuerySet:
-        return self.sudo(reason=reason)
+        return self.get_queryset().system_context(reason=reason)

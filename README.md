@@ -4,7 +4,7 @@
 
 ---
 
-> **Status: pre-alpha.** The architecture is settled and reviewed; Tier-1 source has landed (`LocalBackend`, `RebacMixin`/manager, schema parser, `rebac sync` command, system checks). Caveat evaluation, `SpiceDBBackend`, and adapter modules are in flight. Nothing on PyPI yet. Track the milestones at [docs/ARCHITECTURE.md § Roadmap](./docs/ARCHITECTURE.md#roadmap).
+> **Status: alpha.** The package is published on PyPI and the core local REBAC path is usable: `LocalBackend`, `RebacMixin`/manager, schema parser, `rebac sync`, caveats, expirations, schema overrides, audit events, middleware, and system checks. `SpiceDBBackend` and adapter modules continue to evolve. Track the milestones at [docs/ARCHITECTURE.md § Roadmap](./docs/ARCHITECTURE.md#roadmap).
 
 ---
 
@@ -103,7 +103,7 @@ That's the end-to-end flow. The same `Post.objects.with_actor(...)` pattern work
 | Run SpiceDB-style permissions locally without infrastructure | None — SpiceDB itself is a Go binary that needs Postgres + a sidecar | `LocalBackend`: recursive CTE on a single Django table. Same API surface as `SpiceDBBackend`. |
 | AI-agent authorization | Cedar (no graph traversal); Casbin (in-memory post-filter); Polar/Oso (deprecated 2023) | Native Authzed Grant pattern: an agent acting on behalf of a user receives the *structural intersection* of the user's grants and the agent's declared capabilities — enforced by the schema graph, not by app-layer ANDs. |
 | Permission scoping outside HTTP | Manual `if user.has_perm(...)` everywhere | `Model.objects.with_actor(actor)` works in MCP servers, Celery tasks, cron, management commands, plain Python — anywhere. The actor is generic: Django `User`, `Agent`, `agents/grant`, `auth/apikey`, or any registered subject. |
-| Strict-by-default (no silent leaks) | `django-guardian` returns all rows when nothing scopes; easy to forget | Querysets without an actor raise `MissingActorError` rather than returning everything. Bypass requires explicit `.sudo(reason=...)` and is logged. |
+| Strict-by-default (no silent leaks) | `django-guardian` returns all rows when nothing scopes; easy to forget | Querysets without an actor raise `MissingActorError` rather than returning everything. Bypass requires an explicit `reason`; block-scoped `sudo()` is logged. |
 | Admin-editable policy with safe upgrades | `django-guardian` per-object ACL only; no rule overrides | Tier-2 `SchemaOverride` model: tighten / loosen / disable / extend a package-shipped baseline at runtime. `noupdate=True` semantics preserve admin edits across upgrades, mirroring Odoo's `ir.model.data`. |
 
 ## Highlights
@@ -112,12 +112,12 @@ That's the end-to-end flow. The same `Post.objects.with_actor(...)` pattern work
 - **Unified check API.** `check_access(op)` / `has_access(op)` / `accessible(op)` — one entrypoint family, borrowed from [Odoo 18's PR #179148](https://github.com/odoo/odoo/pull/179148) unification. No model-level vs record-level split at the call site.
 - **One mixin gates everything.** Add `RebacMixin` to a model, declare `Meta.rebac_resource_type`, and queries / writes / method calls / FK reverse accessors are all permission-aware. No per-viewset wiring.
 - **`with_actor(actor)` ≠ `sudo(reason=...)`.** Distinct verbs for distinct intents. `with_actor` re-evaluates checks as that subject (user, agent, grant, apikey, …); `sudo` bypasses them with mandatory `reason` and audit-log entry. Originating uid preserved through bypass for audit. Sudo does NOT propagate through relationship traversal — every related read re-resolves against the carrying scope.
-- **Strict by default.** A queryset without an actor scope raises rather than leaking. Bypass requires explicit `.sudo(reason="cron.expire_drafts")` and writes a structured audit event.
+- **Strict by default.** A queryset without an actor scope raises rather than leaking. Bypass requires an explicit reason; block-scoped `sudo()` writes a structured audit event.
 - **Drop-in DRF integration.** `permission_classes = [RebacPermission]` + `filter_backends = [RebacFilterBackend]`. Per-action permission map; customisable.
 - **Celery actor propagation built in.** `before_task_publish` injects the actor into task headers; `task_prerun` restores it on the worker. Inside `@shared_task`, scoping happens transparently.
 - **MCP-aware.** `@rebac_mcp_tool` decorator wraps FastMCP / official-SDK tool functions; resolves the actor from `ctx.request_context.meta`; checks before the tool body runs.
 - **Three-state checks.** Like SpiceDB, `check_access()` returns `HAS_PERMISSION`, `NO_PERMISSION`, or `CONDITIONAL_PERMISSION(missing=[...])` — the latter lists which caveat fields the caller must supply for a definitive answer.
-- **Type-checked.** Ships `py.typed`. `RebacManager[M]` is `Generic[M]` — your IDE infers the right model class through the manager. `mypy --strict` and `pyright` both run on CI.
+- **Typed package.** Ships `py.typed` and keeps the public API annotated so downstream projects and IDEs can reason about the manager/queryset surface.
 - **`noupdate=True` upgrade safety.** Admin schema edits are preserved across package upgrades. Destructive overwrite is an explicit `--force-overwrite` flag, never an implicit side effect of install vs upgrade. Engineers Odoo's `-i` footgun out.
 - **Deterministic build.** `python manage.py rebac sync --check` is a CI gate that returns non-zero on schema drift, mirroring `migrate --check`.
 
@@ -127,9 +127,9 @@ That's the end-to-end flow. The same `Post.objects.with_actor(...)` pattern work
 |---|---|---|
 | 3.11 / 3.12 / 3.13 / 3.14 | 4.2 LTS | ✅ planned |
 | 3.11 / 3.12 / 3.13 / 3.14 | 5.2 LTS | ✅ planned |
-| 3.13 / 3.14 | 6.0 | ✅ planned |
+| 3.13 / 3.14 | 6.0 | ✅ Python 3.14 + Django 6.0 covered by CI |
 
-Versioning follows [DjangoVer](https://www.b-list.org/weblog/2024/nov/18/djangover/): `<DJANGO_MAJOR>.<DJANGO_FEATURE>.<PACKAGE_VERSION>`. Example: `6.0.1` means "works with Django 6.0, package iteration 1".
+Versioning follows SemVer while the project is below 1.0: minor releases may add public API and tighten alpha contracts; patch releases are reserved for compatible fixes.
 
 Database support: PostgreSQL 13+ (production target), MySQL 8+ (supported), SQLite (test/dev only — recursive CTE performance is not production-grade). The `Relationship` table ships with all required indexes in `0001_initial.py`.
 
@@ -182,21 +182,18 @@ Both backends are line-for-line API-compatible. The migration path is well-defin
 
 ## Status & roadmap
 
-This is a **pre-alpha** package. The architecture is settled (see [docs/ARCHITECTURE.md](./docs/ARCHITECTURE.md)) but no PyPI release exists yet. Milestones:
+This is an **alpha** package. The architecture is settled (see [docs/ARCHITECTURE.md](./docs/ARCHITECTURE.md)) and releases are published to PyPI. Milestones:
 
 - **0.1** — `LocalBackend` MVP, schema parser + sync command, `RebacMixin`, system checks, sync/check commands.
-- **0.2** — Caveats + expiration support.
-- **0.3** — Celery propagation + `ActorMiddleware`.
-- **0.4** — Override layer (`SchemaOverride` + admin + `effective_expr` composition).
-- **0.5** — `SpiceDBBackend` via `authzed-py`.
-- **0.6** — MCP / GraphQL adapters.
+- **0.2** — Alpha hardening: schema-level built-in actors, action-scoped queryset reads, split `sudo()` / `system_context()`, and efficient schema cache invalidation.
+- **0.3+** — `SpiceDBBackend` hardening, broader CI matrix, and MCP / GraphQL adapters.
 - **1.0** — Stable release with full docs and CI matrix green.
 
 Track the full plan in [docs/ARCHITECTURE.md § Roadmap](./docs/ARCHITECTURE.md#roadmap).
 
 ## Contributing
 
-Once the package lands on PyPI, contribution guidelines will live at `CONTRIBUTING.md`. For now, design feedback is welcome via GitHub issues — schema-language proposals, missing scenarios, integration-surface concerns, anything in [ARCHITECTURE.md § Open questions](./docs/ARCHITECTURE.md#open-questions) you'd push back on.
+See `CONTRIBUTING.md` for local setup and checks. Design feedback is welcome via GitHub issues — schema-language proposals, missing scenarios, integration-surface concerns, anything in [ARCHITECTURE.md § Open questions](./docs/ARCHITECTURE.md#open-questions) you'd push back on.
 
 ## License
 
