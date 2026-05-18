@@ -134,7 +134,10 @@ def test_schema_level_builtin_actor_grants(db):
         )
     )
     provider = ObjectRef("auth_oidc/provider", "google")
-    anonymous = SubjectRef.of("anonymous", "*")
+    # ``anonymous`` schema keyword matches the canonical anonymous
+    # SubjectRef (``REBAC_ANONYMOUS_TYPE:*``, default ``auth/anonymous:*``).
+    # Default resolver returns this for unauthenticated requests.
+    anonymous = SubjectRef.of("auth/anonymous", "*")
     alice = SubjectRef.of("auth/user", "alice")
     service = SubjectRef.of("auth/service", "worker")
 

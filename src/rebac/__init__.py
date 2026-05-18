@@ -20,10 +20,13 @@ __version__ = "0.2.0"
 default_app_config = "rebac.apps.RebacConfig"
 
 from .actors import (
+    ANONYMOUS_ACTOR,
     ActorLike,
     actor_context,
+    anonymous_actor,
     current_actor,
     grant_subject_ref,
+    is_anonymous_actor,
     rebac_subject,
     set_current_actor,
     sudo,
@@ -123,6 +126,10 @@ __all__ = [
     "to_subject_ref",
     "grant_subject_ref",
     "to_object_ref",
+    # anonymous
+    "ANONYMOUS_ACTOR",
+    "anonymous_actor",
+    "is_anonymous_actor",
     # errors
     "PermissionDenied",
     "MissingActorError",

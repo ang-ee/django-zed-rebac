@@ -249,11 +249,16 @@ from rebac import (
     PermissionDepthExceeded, NoActorResolvedError,
 
     # Actor types & resolution
-    ActorLike,                          # SubjectRef | User | Group | <@rebac_subject-registered>
+    ActorLike,                          # SubjectRef | User | Group | AnonymousUser | <@rebac_subject-registered>
     current_actor, set_current_actor,
     actor_context,                      # context-manager form, mirrors sudo()
     sudo,                               # request-path bypass; gated by REBAC_ALLOW_SUDO
     system_context,                     # framework-job bypass; NOT gated by REBAC_ALLOW_SUDO
+
+    # Anonymous subject
+    ANONYMOUS_ACTOR,                    # SubjectRef.of("auth/anonymous", "*") — default
+    anonymous_actor,                    # callable form, reads REBAC_ANONYMOUS_TYPE at call time
+    is_anonymous_actor,                 # predicate
 
     # Convenience helpers
     write_relationships, delete_relationships, backend,
@@ -266,9 +271,145 @@ from rebac.drf    import RebacPermission, RebacFilterBackend
 from rebac.celery import propagate_actor
 from rebac.mcp    import rebac_mcp_tool
 from rebac.schema import parse_zed, validate_schema   # for tooling
+from rebac.roles  import grant, revoke, roles_of, members_of   # role-as-namespace helpers
 ```
 
 Everything else (`rebac._internal.*`) is private and may change in any minor release.
+
+### Anonymous subject — built-in
+
+The plugin ships **three** built-in subject types alongside what consumer
+apps register via `@rebac_subject`:
+
+| Subject type | Source | Constructed by |
+|---|---|---|
+| `auth/user` | maps onto `django.contrib.auth.User` | `to_subject_ref(user)` |
+| `auth/group` | maps onto `django.contrib.auth.Group` | `to_subject_ref(group)` → `auth/group:<pk>#member` |
+| `auth/anonymous` | the unauthenticated request | `anonymous_actor()` / `ANONYMOUS_ACTOR` |
+
+The subject type for anonymous is configurable via
+`REBAC_ANONYMOUS_TYPE` (default `"auth/anonymous"`). The canonical
+anonymous SubjectRef is `(REBAC_ANONYMOUS_TYPE, "*")`.
+
+Schemas reference it two ways — both match the same subject at check time:
+
+```zed
+// Wildcard subject on a relation type union
+definition knowledge/note {
+    relation public: auth/anonymous:*
+    permission read = public + viewer
+}
+
+// Bare schema keyword in a permission expression
+definition knowledge/page {
+    permission read = anonymous + authenticated
+}
+```
+
+The bare keyword `anonymous` matches the canonical anonymous SubjectRef;
+the bare keyword `authenticated` matches anything else with a real id.
+
+The default resolver (`rebac.actors.default_resolver`) returns
+`anonymous_actor()` for any request whose `user.is_authenticated` is
+False, so callers don't have to construct the anonymous subject by
+hand. Django's `AnonymousUser` also resolves to it via
+`to_subject_ref()`.
+
+### `rebac.roles` — predefined-role helpers
+
+A convention layer on top of `Relationship` for the GCP-style
+"role-as-resource" pattern. Roles live as objects in `<namespace>/role`
+resource types; grants are `Relationship` rows on those objects with
+relation `member`. No new storage type, no schema syntax addition —
+this module packages the recipe into four helpers so every consumer
+doesn't reinvent it.
+
+```python
+from rebac.roles import grant, revoke, roles_of, members_of
+
+grant(actor=alice,      role="storage/role:object_viewer")
+grant(actor=eng_group,  role="storage/role:object_admin")
+
+revoke(actor=alice,     role="storage/role:object_viewer")
+
+list(roles_of(alice))                          # [ObjectRef("storage/role", "object_viewer"), ...]
+list(members_of("storage/role:object_admin"))  # [SubjectRef(auth/group:eng#member), ...]
+```
+
+Each consumer addon ships one `definition <addon>/role { relation
+member: ... }` block per addon, plus references to specific role objects
+from its resource definitions:
+
+```zed
+definition storage/role {
+    relation member: auth/user | auth/group#member
+}
+
+definition storage/file {
+    relation viewer: auth/user
+                   | auth/group#member
+                   | storage/role:object_viewer#member
+                   | storage/role:object_admin#member   // admin includes viewer
+
+    permission read = viewer
+}
+```
+
+Granting Alice the `storage/role:object_viewer` role then lights up
+`read` on every `storage/file`, no per-file Relationship rows needed.
+
+**Role hierarchy** is stock SpiceDB — three recipes, none of which require
+engine changes:
+
+| Recipe | When to use |
+|---|---|
+| **Type-union inclusion** | Fixed compile-time hierarchy. Add the narrower role's `:<id>#member` to the wider role's type union: `relation member: auth/user \| storage/role:object_admin#member`. The narrower-role members flow through to every role declaring this union entry. Best for universal-admin (`angee/role:admin#member`). |
+| **Per-resource permission composition** | Per-resource viewer/editor/admin tiers. Each resource declares `permission read = viewer + editor + admin` so granting `object_admin` lights up read/write/delete automatically. Most explicit; grep-able. Default choice for CRUD-shape roles. |
+| **Runtime-editable `includes` + `effective_member`** | Hierarchy editable at runtime without a schema PR. Roles declare `relation includes` + `permission effective_member = member + includes`; resources reference `#effective_member`. `rebac.roles.imply(parent=..., child=...)` writes the tuple. Adds one engine hop per check. |
+
+**System / framework roles** (migrations, asset loaders) use
+`rebac.actors.sudo` / `system_context` — they are not modelled as
+roles. `rebac.roles` is exclusively for actor-grantable roles.
+
+### Universal-admin convention
+
+The "I'm in every role" tier is expressed as **a single role object plus
+a type-union entry in every other `<namespace>/role` definition**:
+
+```zed
+// Ship once in your framework's meta-addon
+definition angee/role {
+    relation member: auth/user | auth/group#member
+}
+
+// Every other addon's role:
+definition storage/role {
+    relation member: auth/user
+                   | auth/group#member
+                   | angee/role:admin#member   // the universal-admin entry
+}
+
+definition knowledge/role {
+    relation member: auth/user
+                   | auth/group#member
+                   | angee/role:admin#member
+}
+```
+
+Granting `rebac.roles.grant(actor=alice, role="angee/role:admin")` then
+makes alice a member of every opted-in role — `storage/role:object_viewer`,
+`knowledge/role:vault_editor`, etc. — automatically, without per-role
+plumbing. The `:admin#member` subject reference in the type union uses
+the canonical SpiceDB `<type>:<id>#<relation>` syntax (supported by the
+parser since v0.3.x).
+
+The convention's name and role identity are configurable via
+``REBAC_UNIVERSAL_ADMIN_ROLE`` (default ``"angee/role:admin"``). The
+``rebac.W004`` system check warns when a ``<namespace>/role`` definition
+is missing this entry from its ``member`` type union. Set
+``REBAC_UNIVERSAL_ADMIN_ROLE = None`` to disable the check in
+security-locked environments where the universal-admin tier is
+unacceptable.
 
 ---
 

@@ -6,16 +6,19 @@ import pytest
 from django.test import override_settings
 
 from rebac import (
+    ANONYMOUS_ACTOR,
     NoActorResolvedError,
     SubjectRef,
     actor_context,
+    anonymous_actor,
     current_actor,
+    is_anonymous_actor,
     rebac_subject,
     sudo,
     system_context,
     to_subject_ref,
 )
-from rebac.actors import current_sudo_reason, is_sudo
+from rebac.actors import current_sudo_reason, default_resolver, is_sudo
 from rebac.errors import SudoNotAllowedError, SudoReasonRequiredError
 
 
@@ -45,9 +48,86 @@ def test_django_group_to_subject_ref():
     assert ref.optional_relation == "member"
 
 
-def test_anonymous_or_unknown_raises():
+def test_unknown_actor_raises():
     with pytest.raises(NoActorResolvedError):
         to_subject_ref(object())
+
+
+def test_none_actor_raises():
+    with pytest.raises(NoActorResolvedError):
+        to_subject_ref(None)
+
+
+# ---------- Anonymous actor ----------
+
+
+def test_anonymous_actor_constant_uses_default_type():
+    assert ANONYMOUS_ACTOR.subject_type == "auth/anonymous"
+    assert ANONYMOUS_ACTOR.subject_id == "*"
+    assert ANONYMOUS_ACTOR.optional_relation == ""
+
+
+def test_anonymous_actor_function_reads_setting():
+    assert anonymous_actor() == ANONYMOUS_ACTOR
+    with override_settings(REBAC_ANONYMOUS_TYPE="anon/principal"):
+        ref = anonymous_actor()
+        assert ref.subject_type == "anon/principal"
+        assert ref.subject_id == "*"
+
+
+def test_is_anonymous_actor_recognises_canonical():
+    assert is_anonymous_actor(ANONYMOUS_ACTOR)
+    assert is_anonymous_actor(SubjectRef.of("auth/anonymous", "*"))
+
+
+def test_is_anonymous_actor_rejects_users_and_none():
+    assert not is_anonymous_actor(None)
+    assert not is_anonymous_actor(SubjectRef.of("auth/user", "42"))
+    assert not is_anonymous_actor(SubjectRef.of("auth/anonymous", "specific"))
+    assert not is_anonymous_actor(SubjectRef.of("auth/anonymous", "*", "member"))
+
+
+def test_is_anonymous_actor_honours_setting_override():
+    custom = SubjectRef.of("anon/principal", "*")
+    with override_settings(REBAC_ANONYMOUS_TYPE="anon/principal"):
+        assert is_anonymous_actor(custom)
+        # The default-typed singleton no longer matches when the
+        # setting was changed.
+        assert not is_anonymous_actor(ANONYMOUS_ACTOR)
+
+
+def test_django_anonymous_user_resolves_to_anonymous_actor():
+    from django.contrib.auth.models import AnonymousUser
+
+    ref = to_subject_ref(AnonymousUser())
+    assert is_anonymous_actor(ref)
+
+
+class _FakeRequest:
+    def __init__(self, user):
+        self.user = user
+
+
+def test_default_resolver_returns_anonymous_for_missing_user():
+    assert default_resolver(_FakeRequest(user=None)) == ANONYMOUS_ACTOR
+
+
+def test_default_resolver_returns_anonymous_for_unauth_user():
+    from django.contrib.auth.models import AnonymousUser
+
+    assert default_resolver(_FakeRequest(user=AnonymousUser())) == ANONYMOUS_ACTOR
+
+
+@pytest.mark.django_db
+def test_default_resolver_returns_user_ref_for_authenticated():
+    from django.contrib.auth import get_user_model
+
+    User = get_user_model()
+    alice = User.objects.create(username="alice", is_active=True)
+    ref = default_resolver(_FakeRequest(user=alice))
+    assert ref is not None
+    assert ref.subject_type == "auth/user"
+    assert ref.subject_id == str(alice.pk)
 
 
 def test_rebac_subject_decorator_registers():

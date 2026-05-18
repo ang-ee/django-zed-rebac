@@ -115,6 +115,100 @@ def _is_rebac_bound(model: Any) -> bool:
 
 
 @checks.register("rebac")
+def check_universal_admin_in_roles(
+    app_configs: Any = None, **kwargs: Any
+) -> list[checks.CheckMessage]:
+    """Warn when a ``<namespace>/role`` definition is missing the universal-admin
+    role's ``#member`` subject in its ``member`` relation type union.
+
+    The expected pattern (per the ``rebac.roles`` convention) is::
+
+        definition storage/role {
+            relation member: auth/user
+                           | auth/group#member
+                           | angee/role:admin#member       // universal admin
+        }
+
+    Granting an actor membership in ``angee/role:admin`` then makes them
+    a member of *every* role object in every opted-in addon, automatically.
+
+    The role checked is configurable via ``REBAC_UNIVERSAL_ADMIN_ROLE``
+    (default ``"angee/role:admin"``). Set to ``None`` to disable the
+    check entirely.
+
+    Only fires when the schema has been loaded from the DB (post-``rebac
+    sync``); a fresh install with no rows produces no warnings.
+    """
+    universal = app_settings.REBAC_UNIVERSAL_ADMIN_ROLE
+    if not universal:
+        return []
+    if ":" not in universal:
+        return [
+            checks.Error(
+                f"REBAC_UNIVERSAL_ADMIN_ROLE={universal!r} is not a valid "
+                f"<namespace>/role:<name> spec",
+                id="rebac.E005",
+            )
+        ]
+    expected_type, expected_id = universal.split(":", 1)
+
+    # Pull the schema via the singleton backend so tests / manual
+    # ``set_schema`` calls land in the same instance the check inspects.
+    # If the loader fails (fresh install, no tables yet) the check is a
+    # no-op — system checks must not blow up.
+    try:
+        from .backends import backend as _backend
+        from .backends.base import Backend
+
+        b: Backend = _backend()
+        if not hasattr(b, "schema"):
+            return []
+        schema = b.schema()  # type: ignore[attr-defined]
+    except Exception:  # pragma: no cover — defensive; see docstring
+        return []
+
+    issues: list[checks.CheckMessage] = []
+    for definition in schema.definitions:
+        # Only role definitions — by convention these live under
+        # ``<namespace>/role`` resource types.
+        if not definition.resource_type.endswith("/role"):
+            continue
+        # The universal-admin role itself is exempt (it would otherwise
+        # reference itself, creating a self-loop with no semantic).
+        if definition.resource_type == expected_type:
+            continue
+        member_relation = next(
+            (r for r in definition.relations if r.name == "member"),
+            None,
+        )
+        if member_relation is None:
+            continue  # role definition without a member relation — handled by other lint
+        has_universal = any(
+            sub.type == expected_type
+            and sub.id == expected_id
+            and sub.relation == "member"
+            for sub in member_relation.allowed_subjects
+        )
+        if not has_universal:
+            issues.append(
+                checks.Warning(
+                    f"Role definition {definition.resource_type!r} is missing "
+                    f"the universal-admin entry ({universal}#member) from its "
+                    f"member relation type union. Grants of {universal} will not "
+                    f"flow through to this role.",
+                    hint=(
+                        f"Add `| {universal}#member` to the `member` relation's "
+                        f"type union in {definition.resource_type}'s rebac.zed "
+                        f"definition. Or set REBAC_UNIVERSAL_ADMIN_ROLE = None "
+                        f"to disable this check globally."
+                    ),
+                    id="rebac.W004",
+                )
+            )
+    return issues
+
+
+@checks.register("rebac")
 def check_cross_rbac_relations(app_configs: Any = None, **kwargs: Any) -> list[checks.CheckMessage]:
     """Warn when an RBAC-bound model declares a forward FK / O2O / M2M whose
     target is also RBAC-bound.

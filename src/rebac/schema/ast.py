@@ -20,12 +20,23 @@ BUILTIN_ACTOR_TYPES = frozenset({"anonymous", "authenticated"})
 
 @dataclass(frozen=True, slots=True)
 class AllowedSubject:
-    """One subject type in a relation's type union."""
+    """One subject term in a relation's type union.
+
+    Four shapes are representable, in order of specificity:
+
+    - ``auth/user`` → ``type="auth/user"`` (any user)
+    - ``auth/user:*`` → ``type="auth/user", wildcard=True`` (the wildcard subject)
+    - ``auth/group#member`` → ``type="auth/group", relation="member"`` (any group's member)
+    - ``angee/role:admin#member`` → ``type="angee/role", id="admin", relation="member"``
+      (members of one specific resource id — the canonical pattern for
+      universal admin roles)
+    """
 
     type: str
     relation: str = ""  # subject set, e.g. group#member
     wildcard: bool = False  # `auth/user:*`
     with_caveat: str = ""  # caveat the subject is bound by
+    id: str = ""  # specific resource id, e.g. `angee/role:admin#member`
 
 
 @dataclass(frozen=True, slots=True)

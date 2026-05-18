@@ -34,6 +34,25 @@ _DEFAULTS: dict[str, Any] = {
     "REBAC_SYNC_DJANGO_GROUPS": False,
     "REBAC_USER_TYPE": "auth/user",
     "REBAC_GROUP_TYPE": "auth/group",
+    # Subject type representing an unauthenticated request. The default
+    # resolver returns ``SubjectRef.of(REBAC_ANONYMOUS_TYPE, "*")`` when
+    # ``request.user.is_authenticated`` is False, and ``to_subject_ref``
+    # returns the same when handed Django's ``AnonymousUser``. Schemas
+    # reference it as the type wildcard (``auth/anonymous:*``) on a
+    # relation, or via the bare ``anonymous`` schema keyword in a
+    # permission expression. Both forms match the same subject.
+    "REBAC_ANONYMOUS_TYPE": "auth/anonymous",
+    # Universal-admin role checked by the ``rebac.W004`` system check.
+    # Every ``<namespace>/role`` definition is expected to include this
+    # role's ``#member`` subject-set in its ``member`` relation's type
+    # union so the role acts as an "all roles" override.
+    #
+    # Set to ``None`` to disable the W004 check entirely (security-locked
+    # environments where the universal-admin tier is unacceptable).
+    #
+    # Default ``"angee/role:admin"`` matches the role shipped by
+    # ``angee.auth`` in the angee-django framework.
+    "REBAC_UNIVERSAL_ADMIN_ROLE": "angee/role:admin",
     # Where the engine sources resource ids when a model doesn't set
     # ``Meta.rebac_id_attr``. ``"pk"`` is the historical default;
     # consumers shipping public-id fields (sqid, public_id, slug) flip

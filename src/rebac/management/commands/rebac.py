@@ -136,6 +136,7 @@ class Command(BaseCommand):
                                 "relation": s.relation,
                                 "wildcard": s.wildcard,
                                 "with_caveat": s.with_caveat,
+                                "id": s.id,
                             }
                             for s in r.allowed_subjects
                         ]

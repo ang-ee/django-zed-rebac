@@ -141,6 +141,7 @@ class LocalBackend(Backend):
                         relation=item.get("relation", ""),
                         wildcard=item.get("wildcard", False),
                         with_caveat=item.get("with_caveat", ""),
+                        id=item.get("id", ""),
                     )
                     for item in (r.allowed_subjects or [])
                 )
@@ -914,17 +915,27 @@ def _find_relation(definition: Definition, name: str) -> Relation | None:
 
 
 def _builtin_actor_matches(name: str, subject: SubjectRef) -> bool:
+    """Match the bare schema keywords ``anonymous`` / ``authenticated``.
+
+    ``anonymous`` matches exactly the canonical anonymous SubjectRef
+    (``REBAC_ANONYMOUS_TYPE:*``, default ``auth/anonymous:*``).
+    ``authenticated`` matches any other subject with a real id — every
+    subject that isn't the anonymous singleton.
+    """
+    anon_type = app_settings.REBAC_ANONYMOUS_TYPE
+    is_anonymous = (
+        subject.subject_type == anon_type
+        and subject.subject_id == "*"
+        and not subject.optional_relation
+    )
     if name == "anonymous":
-        return (
-            subject.subject_type == "anonymous"
-            and subject.subject_id == "*"
-            and not subject.optional_relation
-        )
+        return is_anonymous
     if name == "authenticated":
-        return subject.subject_type != "anonymous" and subject.subject_id not in {
-            "",
-            "anonymous",
-        }
+        # Anything that isn't the anonymous singleton — including
+        # subject-set rows (``auth/group:eng#member``) and other wildcard
+        # subjects — counts as authenticated. The id check guards against
+        # degenerate empty-string ids.
+        return not is_anonymous and subject.subject_id != ""
     return False
 
 

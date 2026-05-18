@@ -8,7 +8,7 @@ from unittest.mock import patch
 from django.core import checks
 from django.test import override_settings
 
-from rebac.checks import check_cross_rbac_relations
+from rebac.checks import check_cross_rbac_relations, check_universal_admin_in_roles
 from rebac.conf import app_settings
 
 
@@ -124,3 +124,116 @@ def test_w003_does_not_fire_for_non_rbac_model_pointing_at_rbac():
     w003 = [i for i in issues if i.id == "rebac.W003"]
     # Nothing should be emitted from the non-RBAC source.
     assert not any("stats.PageView" in i.msg for i in w003), [i.msg for i in w003]
+
+
+# ---------------------------------------------------------------------------
+# rebac.W004 — universal-admin entry in <namespace>/role definitions
+# ---------------------------------------------------------------------------
+
+
+def _set_schema_via_localbackend(schema_text):
+    """Install a schema directly onto the singleton backend's in-memory cache.
+
+    Bypasses DB sync — sufficient for testing the W004 walk over
+    `backend().schema()`. The check itself is agnostic to where
+    the schema came from.
+    """
+    from rebac.backends import backend, reset_backend
+    from rebac.schema import parse_zed
+
+    reset_backend()
+    backend().set_schema(parse_zed(schema_text))
+
+
+def test_w004_warns_when_role_definition_missing_universal_admin():
+    _set_schema_via_localbackend(
+        """
+        definition auth/user {}
+        definition angee/role {
+            relation member: auth/user
+        }
+        definition storage/role {
+            relation member: auth/user | auth/group#member
+        }
+        """
+    )
+    issues = check_universal_admin_in_roles()
+    ids = {i.id for i in issues}
+    assert "rebac.W004" in ids
+    w004 = [i for i in issues if i.id == "rebac.W004"]
+    assert any("storage/role" in i.msg for i in w004)
+
+
+def test_w004_silent_when_universal_admin_present():
+    _set_schema_via_localbackend(
+        """
+        definition auth/user {}
+        definition angee/role {
+            relation member: auth/user
+        }
+        definition storage/role {
+            relation member: auth/user | auth/group#member | angee/role:admin#member
+        }
+        """
+    )
+    issues = check_universal_admin_in_roles()
+    w004 = [i for i in issues if i.id == "rebac.W004"]
+    assert w004 == []
+
+
+def test_w004_skips_the_universal_admin_role_itself():
+    # The universal-admin role doesn't reference itself; no self-loop
+    # warning.
+    _set_schema_via_localbackend(
+        """
+        definition auth/user {}
+        definition angee/role {
+            relation member: auth/user
+        }
+        """
+    )
+    issues = check_universal_admin_in_roles()
+    w004 = [i for i in issues if i.id == "rebac.W004"]
+    assert not any("angee/role" in i.msg for i in w004), [i.msg for i in w004]
+
+
+def test_w004_disabled_when_setting_is_none():
+    _set_schema_via_localbackend(
+        """
+        definition auth/user {}
+        definition storage/role {
+            relation member: auth/user | auth/group#member
+        }
+        """
+    )
+    with override_settings(REBAC_UNIVERSAL_ADMIN_ROLE=None):
+        issues = check_universal_admin_in_roles()
+    w004 = [i for i in issues if i.id == "rebac.W004"]
+    assert w004 == []
+
+
+def test_w004_skips_non_role_definitions():
+    # storage/file isn't a role — should be ignored by the check.
+    _set_schema_via_localbackend(
+        """
+        definition auth/user {}
+        definition angee/role {
+            relation member: auth/user
+        }
+        definition storage/file {
+            relation owner: auth/user
+            permission read = owner
+        }
+        """
+    )
+    issues = check_universal_admin_in_roles()
+    w004 = [i for i in issues if i.id == "rebac.W004"]
+    assert not any("storage/file" in i.msg for i in w004)
+
+
+def test_w004_errors_on_malformed_setting():
+    _set_schema_via_localbackend("definition auth/user {}")
+    with override_settings(REBAC_UNIVERSAL_ADMIN_ROLE="missing-colon"):
+        issues = check_universal_admin_in_roles()
+    e005 = [i for i in issues if i.id == "rebac.E005"]
+    assert e005, [i.id for i in issues]

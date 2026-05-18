@@ -259,15 +259,26 @@ class _Parser:
         relation = ""
         wildcard = False
         with_caveat = ""
+        specific_id = ""
         if self.at("punct", ":"):
-            # `auth/user:*` — wildcard
+            # Three shapes after `:`
+            #   `auth/user:*`                  → wildcard
+            #   `angee/role:admin`             → specific id, no subject-set
+            #   `angee/role:admin#member`      → specific id + subject-set
             self.consume()
-            star = self.consume()
-            if not (star.kind == "punct" and star.value == "*"):
+            next_tok = self.consume()
+            if next_tok.kind == "punct" and next_tok.value == "*":
+                wildcard = True
+            elif next_tok.kind in ("ident", "type"):
+                specific_id = next_tok.value
+                if self.at("punct", "#"):
+                    self.consume()
+                    relation = self.expect("ident").value
+            else:
                 raise ParseError(
-                    f"Expected '*' after ':' in subject term at line {star.line}; got {star.value!r}"
+                    f"Expected '*' or resource id after ':' in subject term "
+                    f"at line {next_tok.line}; got {next_tok.value!r}"
                 )
-            wildcard = True
         elif self.at("punct", "#"):
             self.consume()
             relation = self.expect("ident").value
@@ -275,7 +286,7 @@ class _Parser:
             # `... with caveat_name`
             self.consume()
             with_caveat = self.expect("ident").value
-        return AllowedSubject(type_name, relation, wildcard, with_caveat)
+        return AllowedSubject(type_name, relation, wildcard, with_caveat, specific_id)
 
     def _parse_permission(self) -> Permission:
         self.expect("keyword", "permission")

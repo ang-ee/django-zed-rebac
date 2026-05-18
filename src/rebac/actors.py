@@ -128,7 +128,15 @@ def disable_accessible_cache(token: Any) -> None:
 
 
 def current_actor() -> SubjectRef | None:
-    """The ambient actor. None when no middleware / task hook has populated it."""
+    """The ambient actor. None when no middleware / task hook has populated it.
+
+    Note: ``None`` means "the resolver chain has not run for this scope" — a
+    framework error, distinct from "the request is unauthenticated." An
+    unauthenticated request is represented by the anonymous SubjectRef
+    (:data:`ANONYMOUS_ACTOR`); the default resolver returns it for any
+    request whose ``user.is_authenticated`` is False. See
+    :func:`is_anonymous_actor`.
+    """
     return _current_actor.get()
 
 
@@ -139,6 +147,52 @@ def set_current_actor(actor: SubjectRef | None) -> None:
     Application code should pass the actor through the queryset, not via this.
     """
     _current_actor.set(actor)
+
+
+# ---------- Anonymous subject ----------
+#
+# The "anonymous actor" is a real SubjectRef with a stable, settings-driven
+# subject_type (``REBAC_ANONYMOUS_TYPE``, default ``"auth/anonymous"``) and
+# subject_id ``"*"``. Schemas reference it two ways:
+#
+#   relation public: auth/anonymous:*        // wildcard subject in a relation type union
+#   permission read = viewer + anonymous     // bare schema keyword in a permission expression
+#
+# Both match the same subject at check time. The default resolver returns
+# this SubjectRef for unauthenticated requests so anonymous-readable
+# permissions evaluate correctly without callers having to construct it.
+
+
+def anonymous_actor() -> SubjectRef:
+    """The canonical anonymous SubjectRef built from ``REBAC_ANONYMOUS_TYPE``.
+
+    Prefer this over :data:`ANONYMOUS_ACTOR` in code that may run after the
+    consumer overrides ``REBAC_ANONYMOUS_TYPE`` — this function reads the
+    current setting each call.
+    """
+    return SubjectRef.of(app_settings.REBAC_ANONYMOUS_TYPE, "*")
+
+
+# Module-level convenience constant. Uses the default ``REBAC_ANONYMOUS_TYPE``
+# at import time; consumers that override the setting should call
+# :func:`anonymous_actor` instead.
+ANONYMOUS_ACTOR: SubjectRef = SubjectRef.of("auth/anonymous", "*")
+
+
+def is_anonymous_actor(subject: SubjectRef | None) -> bool:
+    """Return True if ``subject`` is the anonymous SubjectRef.
+
+    Reads ``REBAC_ANONYMOUS_TYPE`` so consumer-overridden subject types are
+    honoured. Returns False for ``None`` — that's "resolver did not run",
+    not "anonymous" (see :func:`current_actor`).
+    """
+    if subject is None:
+        return False
+    return (
+        subject.subject_type == app_settings.REBAC_ANONYMOUS_TYPE
+        and subject.subject_id == "*"
+        and not subject.optional_relation
+    )
 
 
 def is_sudo() -> bool:
@@ -193,20 +247,38 @@ def rebac_subject(*, type: str, id_attr: str = "pk") -> Callable[[type], type]:
 
 
 def to_subject_ref(actor: ActorLike) -> SubjectRef:
-    """Resolve `actor` to a `SubjectRef`. Raises `NoActorResolvedError`."""
+    """Resolve `actor` to a `SubjectRef`. Raises `NoActorResolvedError`.
+
+    Django's ``AnonymousUser`` resolves to the anonymous SubjectRef
+    (``REBAC_ANONYMOUS_TYPE:*``) — see :func:`is_anonymous_actor`. Passing
+    raw ``None`` is a framework error (the resolver chain failed) and still
+    raises.
+    """
     if actor is None:
         raise NoActorResolvedError("Cannot resolve None to a SubjectRef")
     if isinstance(actor, SubjectRef):
         return actor
 
+    # AnonymousUser inherits from ``object``, not the swappable user model,
+    # so it bypasses the isinstance(user_model) check below. Handle it
+    # explicitly first — anonymous reads are a first-class authorization
+    # path, not an error.
+    try:
+        from django.contrib.auth.models import AnonymousUser
+    except ImportError:  # pragma: no cover
+        AnonymousUser = None  # type: ignore[assignment]
+    if AnonymousUser is not None and isinstance(actor, AnonymousUser):
+        return anonymous_actor()
+
     from ._id import subject_id_attr
 
     user_model = get_user_model()
     if isinstance(actor, user_model):
-        # AnonymousUser hits a different branch below since AbstractBaseUser
-        # is the parent class.
+        # Defensive: a custom AUTH_USER_MODEL may produce an instance with
+        # ``is_authenticated == False`` for a yet-to-be-saved row. Route
+        # those to anonymous rather than emitting a bogus SubjectRef.
         if not getattr(actor, "is_authenticated", False):
-            raise NoActorResolvedError("AnonymousUser cannot be a SubjectRef")
+            return anonymous_actor()
         attr = subject_id_attr(user_model)
         return SubjectRef.of(app_settings.REBAC_USER_TYPE, str(getattr(actor, attr)))
 
@@ -339,14 +411,30 @@ def default_resolver(request: Any) -> SubjectRef | None:
     """Default `request → SubjectRef` resolver. Used by `ActorMiddleware`.
 
     Override via `REBAC_ACTOR_RESOLVER = "myapp.path.to.resolver"`.
+
+    Resolution outcomes:
+
+    - Authenticated user → ``SubjectRef`` for that user
+      (``to_subject_ref(request.user)``).
+    - Unauthenticated or missing ``request.user`` → the anonymous SubjectRef
+      (``REBAC_ANONYMOUS_TYPE:*``). Schemas with ``permission read = ... +
+      anonymous`` (or wildcard relations like ``viewer: auth/anonymous:*``)
+      match this subject.
+    - Authenticated user that fails ``to_subject_ref`` (e.g. an unregistered
+      subject class) → the anonymous SubjectRef, as a fail-safe.
+
+    The return type stays ``SubjectRef | None`` for backwards compatibility
+    with custom resolvers that explicitly return ``None`` to signal
+    "no resolution attempted"; the default resolver itself never returns
+    ``None`` in v0.3+.
     """
     user = getattr(request, "user", None)
     if user is None or not getattr(user, "is_authenticated", False):
-        return None
+        return anonymous_actor()
     try:
         return to_subject_ref(user)
     except NoActorResolvedError:
-        return None
+        return anonymous_actor()
 
 
 def get_actor_resolver() -> Callable[[Any], SubjectRef | None]:
