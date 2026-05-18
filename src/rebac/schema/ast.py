@@ -36,7 +36,15 @@ class AllowedSubject:
     relation: str = ""  # subject set, e.g. group#member
     wildcard: bool = False  # `auth/user:*`
     with_caveat: str = ""  # caveat the subject is bound by
-    id: str = ""  # specific resource id, e.g. `angee/role:admin#member`
+    # Specific resource id, e.g. `angee/role:admin#member`. Constrained at
+    # parse time to identifier shape — `[A-Za-z_][A-Za-z0-9_]*` — even though
+    # the runtime `Relationship.resource_id` column accepts the broader
+    # SpiceDB object-id grammar. The schema-side restriction matches the
+    # universal-admin pattern's actual usage (`role:admin`,
+    # `role:object_viewer`) and keeps the tokenizer simple. Relationship rows
+    # may still carry numeric or hyphenated ids — the schema just can't
+    # name-check them.
+    id: str = ""
 
 
 @dataclass(frozen=True, slots=True)

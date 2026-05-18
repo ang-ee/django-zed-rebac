@@ -199,3 +199,133 @@ def test_validate_schema_detects_undefined_reference():
 def test_unterminated_block_raises():
     with pytest.raises(ParseError):
         parse_zed("definition x/y { relation a: auth/user")
+
+
+# ---------- Specific-id subject terms (universal-admin pattern) ----------
+
+
+def test_specific_id_subject_without_relation():
+    """`type:id` in a type union — specific resource id, no subject-set."""
+    schema = parse_zed(
+        """
+        definition angee/role {}
+        definition storage/file {
+            relation viewer: angee/role:admin
+        }
+        """
+    )
+    viewer = next(r for r in schema.get_definition("storage/file").relations if r.name == "viewer")
+    assert AllowedSubject(type="angee/role", id="admin") in viewer.allowed_subjects
+
+
+def test_specific_id_subject_with_relation():
+    """`type:id#relation` — the canonical universal-admin pattern."""
+    schema = parse_zed(
+        """
+        definition angee/role {
+            relation member: auth/user
+        }
+        definition storage/file {
+            relation viewer: angee/role:admin#member
+        }
+        """
+    )
+    viewer = next(r for r in schema.get_definition("storage/file").relations if r.name == "viewer")
+    assert (
+        AllowedSubject(type="angee/role", id="admin", relation="member") in viewer.allowed_subjects
+    )
+
+
+def test_specific_id_in_union_with_other_shapes():
+    """Specific-id mixed with wildcard, type-only, and subject-set shapes."""
+    schema = parse_zed(
+        """
+        definition auth/user {}
+        definition auth/group { relation member: auth/user }
+        definition angee/role { relation member: auth/user }
+        definition storage/file {
+            relation viewer:
+                auth/user
+                | auth/user:*
+                | auth/group#member
+                | angee/role:admin#member
+        }
+        """
+    )
+    viewer = next(r for r in schema.get_definition("storage/file").relations if r.name == "viewer")
+    assert AllowedSubject(type="auth/user") in viewer.allowed_subjects
+    assert AllowedSubject(type="auth/user", wildcard=True) in viewer.allowed_subjects
+    assert AllowedSubject(type="auth/group", relation="member") in viewer.allowed_subjects
+    assert (
+        AllowedSubject(type="angee/role", id="admin", relation="member") in viewer.allowed_subjects
+    )
+
+
+def test_specific_id_rejects_digit_start():
+    """Numeric ids (e.g. `role:42`) are not legal at schema-parse time."""
+    with pytest.raises(ParseError):
+        parse_zed(
+            """
+            definition angee/role {}
+            definition storage/file {
+                relation viewer: angee/role:42
+            }
+            """
+        )
+
+
+def test_specific_id_rejects_hyphen():
+    """Hyphenated ids (e.g. `role:obj-admin`) are not legal at schema-parse time."""
+    with pytest.raises(ParseError):
+        parse_zed(
+            """
+            definition angee/role {}
+            definition storage/file {
+                relation viewer: angee/role:obj-admin
+            }
+            """
+        )
+
+
+def test_specific_id_rejects_empty_after_colon():
+    """`role:` with no id (next token is `}` or `|`) must fail-fast."""
+    with pytest.raises(ParseError):
+        parse_zed(
+            """
+            definition angee/role {}
+            definition storage/file {
+                relation viewer: angee/role:
+            }
+            """
+        )
+
+
+def test_specific_id_with_hash_requires_relation_name():
+    """`type:id#` must be followed by an identifier."""
+    with pytest.raises(ParseError):
+        parse_zed(
+            """
+            definition angee/role {}
+            definition storage/file {
+                relation viewer: angee/role:admin#
+            }
+            """
+        )
+
+
+def test_specific_id_rejects_namespace_separator():
+    """`role:a/b` — namespace separators are forbidden inside specific ids.
+
+    The post-colon token tokenizes as kind="type" (contains `/`); the parser
+    must reject it rather than silently splicing a sub-namespace into the
+    role id.
+    """
+    with pytest.raises(ParseError):
+        parse_zed(
+            """
+            definition angee/role {}
+            definition storage/file {
+                relation viewer: angee/role:sub/admin
+            }
+            """
+        )

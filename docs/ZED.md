@@ -145,13 +145,17 @@ definition auth/user {
 }
 ```
 
-`anonymous` matches the global unauthenticated actor
-(`anonymous:*`). `authenticated` matches any resolved non-anonymous
-subject (`auth/user:<id>`, `auth/service:<id>`, `auth/apikey:<id>`,
-and similar). They are schema-level grants: do not declare
+`anonymous` matches the canonical anonymous SubjectRef typed by
+`REBAC_ANONYMOUS_TYPE` (default `auth/anonymous:*`).
+`authenticated` matches any resolved non-anonymous subject
+(`auth/user:<id>`, `auth/service:<id>`, `auth/apikey:<id>`, and
+similar). They are schema-level grants: do not declare
 `definition anonymous`, `definition authenticated`, `relation
 anonymous: ...`, `relation authenticated: ...`, or relationship rows
-whose subject type is either built-in actor.
+whose subject type is either built-in actor. To write
+relationship-shaped grants for unauthenticated readers, type the
+subject as the configured anonymous type (e.g. `viewer: auth/anonymous:*`)
+— see `REBAC_ANONYMOUS_TYPE` in the settings catalog.
 
 **Operators**:
 

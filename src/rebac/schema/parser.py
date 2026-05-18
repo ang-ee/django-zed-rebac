@@ -269,15 +269,27 @@ class _Parser:
             next_tok = self.consume()
             if next_tok.kind == "punct" and next_tok.value == "*":
                 wildcard = True
-            elif next_tok.kind in ("ident", "type"):
+            elif next_tok.kind == "ident":
+                # Schema-side specific-ids are constrained to identifier shape
+                # — `[A-Za-z_][A-Za-z0-9_]*`. See `AllowedSubject.id`. The
+                # tokenizer never emits an `ident` that violates this, so the
+                # parser side has nothing extra to check; bare-`type` tokens
+                # (containing `/`) are rejected below because a specific id
+                # cannot contain a namespace separator.
                 specific_id = next_tok.value
                 if self.at("punct", "#"):
                     self.consume()
                     relation = self.expect("ident").value
             else:
+                # Common authoring mistakes: `role:42` (digit-start, fails at
+                # tokenizer level — caller never reaches here); `role:obj-admin`
+                # (hyphen splits at tokenizer); `auth/sub/type:something`
+                # (namespace separator in id, lands here as kind="type").
                 raise ParseError(
-                    f"Expected '*' or resource id after ':' in subject term "
-                    f"at line {next_tok.line}; got {next_tok.value!r}"
+                    f"Expected '*' or identifier-shaped resource id after ':' in "
+                    f"subject term at line {next_tok.line}; got "
+                    f"{next_tok.kind}={next_tok.value!r}. Specific ids in type "
+                    f"unions must match [A-Za-z_][A-Za-z0-9_]*."
                 )
         elif self.at("punct", "#"):
             self.consume()

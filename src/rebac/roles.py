@@ -159,7 +159,7 @@ def _parse_role(role: str | ObjectRef) -> ObjectRef:
     return ObjectRef(rtype, rid)
 
 
-def grant(*, actor: ActorLike, role: str | ObjectRef) -> "Relationship":
+def grant(*, actor: ActorLike, role: str | ObjectRef) -> Relationship:
     """Grant ``actor`` membership in ``role``.
 
     ``role`` is either an :class:`ObjectRef` or a
@@ -260,7 +260,7 @@ def members_of(role: str | ObjectRef) -> Iterator[SubjectRef]:
         yield SubjectRef.of(st, sid, sr)
 
 
-def imply(*, parent: str | ObjectRef, child: str | ObjectRef) -> "Relationship":
+def imply(*, parent: str | ObjectRef, child: str | ObjectRef) -> Relationship:
     """Make ``child`` role's effective members also count as ``parent`` role's members.
 
     Requires both role definitions to use the ``includes`` /
@@ -370,15 +370,15 @@ def implied_by_of(role: str | ObjectRef) -> Iterator[ObjectRef]:
 
 
 __all__ = [
-    "ROLE_RELATION",
-    "ROLE_INCLUDES_RELATION",
     "ROLE_EFFECTIVE_MEMBER",
+    "ROLE_INCLUDES_RELATION",
+    "ROLE_RELATION",
     "grant",
+    "implied_by_of",
+    "implies_of",
+    "imply",
+    "members_of",
     "revoke",
     "roles_of",
-    "members_of",
-    "imply",
     "unimply",
-    "implies_of",
-    "implied_by_of",
 ]

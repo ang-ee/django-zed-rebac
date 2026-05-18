@@ -2,9 +2,11 @@
 
 from __future__ import annotations
 
+import logging
 from typing import Any
 
 from django.core import checks
+from django.db.utils import DatabaseError
 
 from .conf import app_settings
 
@@ -154,9 +156,19 @@ def check_universal_admin_in_roles(
 
     # Pull the schema via the singleton backend so tests / manual
     # ``set_schema`` calls land in the same instance the check inspects.
-    # If the loader fails (fresh install, no tables yet) the check is a
-    # no-op — system checks must not blow up.
+    # System checks run in three states where the schema is unloadable
+    # and the check must be a no-op rather than aborting startup:
+    #   - fresh install before migrations (``DatabaseError``)
+    #   - pytest without the ``django_db`` mark (``RuntimeError`` from
+    #     the pytest-django access guard)
+    #   - any unanticipated env where the singleton backend isn't ready.
+    # The broad catch is deliberate, but we log the exception at DEBUG
+    # so a real parser bug or backend misconfiguration is still
+    # diagnosable rather than fully silenced.
     try:
+        # Lazy import — `rebac.backends` triggers schema loading on first
+        # touch and module-level import would break app-registry boot
+        # order during `python manage.py migrate`.
         from .backends import backend as _backend
         from .backends.base import Backend
 
@@ -164,7 +176,10 @@ def check_universal_admin_in_roles(
         if not hasattr(b, "schema"):
             return []
         schema = b.schema()  # type: ignore[attr-defined]
-    except Exception:  # pragma: no cover — defensive; see docstring
+    except (DatabaseError, RuntimeError) as exc:  # pragma: no cover — install/test paths
+        logging.getLogger("rebac.checks").debug(
+            "Universal-admin check skipped: schema unavailable (%s)", exc
+        )
         return []
 
     issues: list[checks.CheckMessage] = []
@@ -184,9 +199,7 @@ def check_universal_admin_in_roles(
         if member_relation is None:
             continue  # role definition without a member relation — handled by other lint
         has_universal = any(
-            sub.type == expected_type
-            and sub.id == expected_id
-            and sub.relation == "member"
+            sub.type == expected_type and sub.id == expected_id and sub.relation == "member"
             for sub in member_relation.allowed_subjects
         )
         if not has_universal:

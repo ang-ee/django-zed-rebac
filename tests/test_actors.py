@@ -58,6 +58,36 @@ def test_none_actor_raises():
         to_subject_ref(None)
 
 
+def test_unauthenticated_user_instance_raises():
+    """A user-model instance with ``is_authenticated == False`` must raise.
+
+    Strict-by-default (CLAUDE.md § 3). The previous "defensive" downgrade to
+    the anonymous actor masked the most common cause of this state — a
+    programming bug like passing an unsaved User or a leftover fixture
+    instance. ``AnonymousUser`` remains the explicit anonymous path
+    (covered by ``test_anonymous_user_resolves_to_anonymous_subject``);
+    arbitrary user instances with ``is_authenticated=False`` must fail loudly.
+    """
+    from django.contrib.auth import get_user_model
+
+    User = get_user_model()
+
+    # Build a minimally-faked user with is_authenticated=False; the field is
+    # property-derived on the default User model so constructing an unsaved
+    # instance with no pk gives is_authenticated=True. Subclass + override.
+    class _UnauthUser(User):  # type: ignore[misc, valid-type]
+        class Meta:
+            proxy = True
+            app_label = "auth"
+
+        @property
+        def is_authenticated(self) -> bool:  # type: ignore[override]
+            return False
+
+    with pytest.raises(NoActorResolvedError, match="is_authenticated=False"):
+        to_subject_ref(_UnauthUser(username="ghost"))
+
+
 # ---------- Anonymous actor ----------
 
 

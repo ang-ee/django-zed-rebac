@@ -274,11 +274,19 @@ def to_subject_ref(actor: ActorLike) -> SubjectRef:
 
     user_model = get_user_model()
     if isinstance(actor, user_model):
-        # Defensive: a custom AUTH_USER_MODEL may produce an instance with
-        # ``is_authenticated == False`` for a yet-to-be-saved row. Route
-        # those to anonymous rather than emitting a bogus SubjectRef.
+        # Strict-by-default (CLAUDE.md § 3): a user-model instance with
+        # ``is_authenticated == False`` is almost always a programming bug
+        # (forgot to save, deleted user re-used, mid-test fixture). Anonymous
+        # has a dedicated singleton (``AnonymousUser``) — silently downgrading
+        # to it would mask the bug class the strict posture is meant to
+        # surface. The request-path resolver (:func:`default_resolver`)
+        # remains the fail-safe via its ``except NoActorResolvedError`` path.
         if not getattr(actor, "is_authenticated", False):
-            return anonymous_actor()
+            raise NoActorResolvedError(
+                f"{type(actor).__name__} instance has is_authenticated=False. "
+                "Pass AnonymousUser explicitly for the anonymous actor, or "
+                "save/load a real user row."
+            )
         attr = subject_id_attr(user_model)
         return SubjectRef.of(app_settings.REBAC_USER_TYPE, str(getattr(actor, attr)))
 

@@ -5,8 +5,6 @@ from __future__ import annotations
 from collections.abc import Callable
 from typing import Any
 
-from django.test.signals import setting_changed
-
 from .actors import (
     _current_actor,
     disable_accessible_cache,
@@ -36,9 +34,12 @@ class ActorMiddleware:
     against ``permission read = ... + anonymous`` evaluate correctly
     without callers having to construct the subject.
 
-    The resolver callable is cached on the middleware instance after
-    first lookup and invalidated on Django's ``setting_changed`` signal
-    (test ergonomics + runtime override safety).
+    The resolver is looked up per request via ``get_actor_resolver()``.
+    The cost is one ``sys.modules`` lookup + ``getattr`` per request —
+    cheap enough that adding signal-based cache invalidation is more
+    complexity than the saving justifies. ``app_settings`` already
+    invalidates its own cache on ``setting_changed``, so ``override_settings``
+    in tests works without any extra plumbing here.
 
     Per-request ``accessible()`` cache
     ----------------------------------
@@ -74,24 +75,9 @@ class ActorMiddleware:
 
     def __init__(self, get_response: Callable[[Any], Any]) -> None:
         self.get_response = get_response
-        self._resolver: Callable[[Any], Any] | None = None
-        # Drop the cached resolver when settings change so test
-        # ``override_settings`` (and any runtime reconfiguration)
-        # picks up the new ``REBAC_ACTOR_RESOLVER`` path on the next
-        # request.
-        setting_changed.connect(self._on_setting_changed)
-
-    def _on_setting_changed(self, sender: Any, setting: str, **kwargs: Any) -> None:
-        if setting == "REBAC_ACTOR_RESOLVER":
-            self._resolver = None
-
-    def _get_resolver(self) -> Callable[[Any], Any]:
-        if self._resolver is None:
-            self._resolver = get_actor_resolver()
-        return self._resolver
 
     def __call__(self, request: Any) -> Any:
-        resolver = self._get_resolver()
+        resolver = get_actor_resolver()
         actor_ref = resolver(request)
         actor_token = _current_actor.set(actor_ref)
         cache_token = enable_accessible_cache()

@@ -147,8 +147,10 @@ The same flow works in DRF, Celery tasks, MCP tools, and management commands. Se
 Two built-in actor terms, `anonymous` and `authenticated`, may appear
 directly in permission expressions. They are schema-level grants, not
 relationship rows and not user-declared definitions. `anonymous`
-matches `anonymous:*`; `authenticated` matches any non-anonymous
-resolved subject.
+matches the canonical anonymous SubjectRef typed by `REBAC_ANONYMOUS_TYPE`
+(default `auth/anonymous:*`); `authenticated` matches any non-anonymous
+resolved subject. See "Anonymous subject — built-in" below for the
+typing rationale.
 
 The fundamental check operation: `check_access(subject, action, resource, context)` returns one of:
 

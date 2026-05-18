@@ -27,7 +27,6 @@ from rebac.roles import (
 )
 from rebac.types import ObjectRef
 
-
 # ---------- _parse_role ----------
 
 
@@ -72,11 +71,14 @@ def test_grant_creates_relationship_row():
     assert row.subject_id == "42"
     assert row.optional_subject_relation == ""
 
-    assert Relationship.objects.filter(
-        resource_type="storage/role",
-        resource_id="object_viewer",
-        subject_id="42",
-    ).count() == 1
+    assert (
+        Relationship.objects.filter(
+            resource_type="storage/role",
+            resource_id="object_viewer",
+            subject_id="42",
+        ).count()
+        == 1
+    )
 
 
 @pytest.mark.django_db
@@ -85,11 +87,14 @@ def test_grant_is_idempotent():
     grant(actor=actor, role="storage/role:object_viewer")
     grant(actor=actor, role="storage/role:object_viewer")
 
-    assert Relationship.objects.filter(
-        resource_type="storage/role",
-        resource_id="object_viewer",
-        subject_id="42",
-    ).count() == 1
+    assert (
+        Relationship.objects.filter(
+            resource_type="storage/role",
+            resource_id="object_viewer",
+            subject_id="42",
+        ).count()
+        == 1
+    )
 
 
 @pytest.mark.django_db
@@ -231,11 +236,14 @@ def test_imply_writes_includes_tuple():
     assert row.subject_id == "object_admin"
     assert row.optional_subject_relation == ROLE_EFFECTIVE_MEMBER
 
-    assert Relationship.objects.filter(
-        resource_type="storage/role",
-        resource_id="object_editor",
-        relation="includes",
-    ).count() == 1
+    assert (
+        Relationship.objects.filter(
+            resource_type="storage/role",
+            resource_id="object_editor",
+            relation="includes",
+        ).count()
+        == 1
+    )
 
 
 @pytest.mark.django_db
@@ -243,11 +251,14 @@ def test_imply_is_idempotent():
     imply(parent="storage/role:object_editor", child="storage/role:object_admin")
     imply(parent="storage/role:object_editor", child="storage/role:object_admin")
 
-    assert Relationship.objects.filter(
-        resource_type="storage/role",
-        resource_id="object_editor",
-        relation="includes",
-    ).count() == 1
+    assert (
+        Relationship.objects.filter(
+            resource_type="storage/role",
+            resource_id="object_editor",
+            relation="includes",
+        ).count()
+        == 1
+    )
 
 
 @pytest.mark.django_db
@@ -319,3 +330,41 @@ def test_imply_accepts_objectref():
         relation="includes",
         subject_id="object_admin",
     ).exists()
+
+
+# ---------- Strict-by-default contract ----------
+
+
+@pytest.mark.django_db
+def test_roles_helpers_work_without_an_ambient_actor():
+    """``rebac.roles`` operates on the raw ``Relationship`` store.
+
+    ``Relationship`` is intentionally NOT a ``RebacMixin``-bearing model —
+    if a future refactor put it under the strict-mode manager, every
+    ``grant`` / ``revoke`` / ``roles_of`` call would suddenly require an
+    actor scope and start raising :class:`MissingActorError`. This test
+    pins the current contract so that regression surfaces loudly.
+
+    See CLAUDE.md § 3 — strict-by-default applies to consumer models,
+    not to the internal relationship store.
+    """
+    from rebac.actors import current_actor
+
+    assert current_actor() is None  # no ambient actor
+
+    actor = SubjectRef.of("auth/user", "1")
+    grant(actor=actor, role="storage/role:object_viewer")
+    grant(actor=actor, role="storage/role:object_editor")
+
+    # No MissingActorError on read.
+    direct = list(roles_of(actor))
+    assert {(r.resource_type, r.resource_id) for r in direct} == {
+        ("storage/role", "object_viewer"),
+        ("storage/role", "object_editor"),
+    }
+
+    # No MissingActorError on write or delete.
+    revoke(actor=actor, role="storage/role:object_viewer")
+    assert {(r.resource_type, r.resource_id) for r in roles_of(actor)} == {
+        ("storage/role", "object_editor"),
+    }

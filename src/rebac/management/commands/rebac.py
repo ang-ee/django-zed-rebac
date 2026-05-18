@@ -396,18 +396,30 @@ class Command(BaseCommand):
     def _render_relation(self, r: Any) -> str:
         # Sort the type-union deterministically. Keys cover every distinguishing
         # field of `AllowedSubject` so equal-by-type subjects with different
-        # subject-relations / wildcard / caveat slots stay distinguishable.
+        # subject-relations / wildcard / caveat / specific-id slots stay
+        # distinguishable. `id` MUST appear in the key or two subjects that
+        # differ only in id collapse to the same sort bucket — that breaks
+        # CLAUDE.md § 6 byte-for-byte determinism on the universal-admin
+        # pattern (`angee/role:admin#member` vs `angee/role:editor#member`).
         subjects = sorted(
             r.allowed_subjects,
-            key=lambda s: (s.type, s.relation, s.wildcard, s.with_caveat),
+            key=lambda s: (s.type, s.id, s.relation, s.wildcard, s.with_caveat),
         )
         rendered = " | ".join(self._render_subject(s) for s in subjects)
         suffix = " with expiration" if r.with_expiration else ""
         return f"relation {r.name}: {rendered}{suffix}"
 
     def _render_subject(self, s: Any) -> str:
+        # Five shapes; specific-id forms (`type:id` / `type:id#relation`) are
+        # the universal-admin pattern and were absent from earlier emitter
+        # versions — dropping `id` here widened a single-role type union to
+        # "members of any role of this type" and broke SpiceDB round-trip.
         if s.wildcard:
             base = f"{s.type}:*"
+        elif s.id and s.relation:
+            base = f"{s.type}:{s.id}#{s.relation}"
+        elif s.id:
+            base = f"{s.type}:{s.id}"
         elif s.relation:
             base = f"{s.type}#{s.relation}"
         else:

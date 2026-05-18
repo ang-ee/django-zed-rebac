@@ -35,6 +35,7 @@ from collections.abc import Iterable
 from threading import Lock
 from weakref import WeakSet
 
+from ..actors import is_anonymous_actor
 from ..conf import app_settings
 from ..errors import PermissionDepthExceeded
 from ..schema.ast import (
@@ -921,21 +922,20 @@ def _builtin_actor_matches(name: str, subject: SubjectRef) -> bool:
     (``REBAC_ANONYMOUS_TYPE:*``, default ``auth/anonymous:*``).
     ``authenticated`` matches any other subject with a real id — every
     subject that isn't the anonymous singleton.
+
+    Delegates the anonymous shape to :func:`actors.is_anonymous_actor` so the
+    two surfaces (actor layer and engine) cannot desynchronize if a future
+    change tightens what "anonymous" means.
     """
-    anon_type = app_settings.REBAC_ANONYMOUS_TYPE
-    is_anonymous = (
-        subject.subject_type == anon_type
-        and subject.subject_id == "*"
-        and not subject.optional_relation
-    )
+    anonymous = is_anonymous_actor(subject)
     if name == "anonymous":
-        return is_anonymous
+        return anonymous
     if name == "authenticated":
         # Anything that isn't the anonymous singleton — including
         # subject-set rows (``auth/group:eng#member``) and other wildcard
         # subjects — counts as authenticated. The id check guards against
         # degenerate empty-string ids.
-        return not is_anonymous and subject.subject_id != ""
+        return not anonymous and subject.subject_id != ""
     return False
 
 

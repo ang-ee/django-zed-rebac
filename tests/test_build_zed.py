@@ -198,3 +198,89 @@ def test_build_zed_sort_independent(
     assert "(owner + parent->read)" in text_natural
     # `owner - parent->banned` preserves LHS / RHS for the non-commutative `-`.
     assert "(owner - parent->banned)" in text_natural
+
+
+# Universal-admin (`type:id#relation`) — the emitter regression pinned by
+# this test was dropping `AllowedSubject.id` from both the sort key and the
+# rendered output, widening `angee/role:admin#member` to `angee/role#member`
+# (members of *any* role) and silently breaking SpiceDB round-trip.
+
+SCHEMA_UNIVERSAL_ADMIN = """\
+// @rebac_package: universal_test
+definition angee/role {
+    relation member: auth/user
+}
+definition storage/file {
+    relation viewer:
+        auth/user
+        | angee/role:admin#member
+        | angee/role:editor#member
+}
+"""
+
+SCHEMA_UNIVERSAL_ADMIN_REORDERED = """\
+// @rebac_package: universal_test
+definition storage/file {
+    relation viewer:
+        angee/role:editor#member
+        | auth/user
+        | angee/role:admin#member
+}
+definition angee/role {
+    relation member: auth/user
+}
+"""
+
+
+def test_build_zed_preserves_specific_id_in_subject_terms(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, stub_app: Any
+) -> None:
+    """`type:id#relation` shape must round-trip through the emitter intact."""
+    out = tmp_path / "effective.zed"
+    text = _run_build(
+        monkeypatch,
+        [stub_app(name="acme.uni", schema_text=SCHEMA_UNIVERSAL_ADMIN, label="uni")],
+        out,
+    )
+    # Both specific-id forms must appear with their ids intact.
+    assert "angee/role:admin#member" in text
+    # The id-less subject-set form (`angee/role#member`) must NOT appear —
+    # that would mean the emitter dropped the id and widened the union.
+    assert "angee/role#member" not in text
+    assert "angee/role:editor#member" in text
+
+
+def test_build_zed_specific_id_determinism(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, stub_app: Any
+) -> None:
+    """Two subjects differing only in ``id`` must sort deterministically.
+
+    Pinning regression: the sort key in ``_render_relation`` previously
+    omitted ``s.id``, so the order of two ``angee/role:*#member`` subjects
+    in the type union depended on input iteration order.
+    """
+    out_a = tmp_path / "a" / "effective.zed"
+    out_a.parent.mkdir()
+    out_b = tmp_path / "b" / "effective.zed"
+    out_b.parent.mkdir()
+
+    text_a = _run_build(
+        monkeypatch,
+        [stub_app(name="acme.uni", schema_text=SCHEMA_UNIVERSAL_ADMIN, label="uni_a")],
+        out_a,
+    )
+    text_b = _run_build(
+        monkeypatch,
+        [
+            stub_app(
+                name="acme.uni",
+                schema_text=SCHEMA_UNIVERSAL_ADMIN_REORDERED,
+                label="uni_b",
+            )
+        ],
+        out_b,
+    )
+    assert text_a == text_b
+    # `admin` sorts before `editor` lexicographically — verify both forms
+    # appear in that order in the output.
+    assert text_a.index("angee/role:admin#member") < text_a.index("angee/role:editor#member")
