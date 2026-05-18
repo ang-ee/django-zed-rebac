@@ -38,6 +38,35 @@ def test_actor_middleware_requires_authentication_middleware_present():
     assert "rebac.E003" in ids
 
 
+def test_actor_middleware_order_uses_configured_authentication_middleware():
+    auth_path = "example.auth.AuthenticationMiddleware"
+    with override_settings(
+        REBAC_AUTHENTICATION_MIDDLEWARE=auth_path,
+        MIDDLEWARE=[
+            auth_path,
+            "rebac.middleware.ActorMiddleware",
+        ],
+    ):
+        errors = checks.run_checks(tags=["rebac"])
+    ids = {issue.id for issue in errors}
+    assert "rebac.E003" not in ids
+    assert "rebac.E004" not in ids
+
+
+def test_actor_middleware_order_errors_against_configured_authentication_middleware():
+    auth_path = "example.auth.AuthenticationMiddleware"
+    with override_settings(
+        REBAC_AUTHENTICATION_MIDDLEWARE=auth_path,
+        MIDDLEWARE=[
+            "rebac.middleware.ActorMiddleware",
+            auth_path,
+        ],
+    ):
+        errors = checks.run_checks(tags=["rebac"])
+    ids = {issue.id for issue in errors}
+    assert "rebac.E004" in ids
+
+
 # ---------------------------------------------------------------------------
 # rebac.W003 — cross-RBAC FK/M2M warning
 # ---------------------------------------------------------------------------

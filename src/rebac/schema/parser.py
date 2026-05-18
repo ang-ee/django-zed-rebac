@@ -161,6 +161,14 @@ class _Parser:
             )
         return t
 
+    def expect_name(self) -> Token:
+        t = self.consume()
+        if t.kind not in ("ident", "keyword"):
+            raise ParseError(
+                f"Expected identifier at line {t.line}, col {t.col}; got {t.kind}={t.value!r}"
+            )
+        return t
+
     def at(self, kind: str, value: str | None = None) -> bool:
         t = self.peek()
         return t.kind == kind and (value is None or t.value == value)
@@ -230,7 +238,7 @@ class _Parser:
 
     def _parse_relation(self) -> Relation:
         self.expect("keyword", "relation")
-        name = self.expect("ident").value
+        name = self.expect_name().value
         self.expect("punct", ":")
         subjects = self._parse_subject_union()
         with_expiration = False
@@ -269,7 +277,7 @@ class _Parser:
             next_tok = self.consume()
             if next_tok.kind == "punct" and next_tok.value == "*":
                 wildcard = True
-            elif next_tok.kind == "ident":
+            elif next_tok.kind in ("ident", "keyword"):
                 # Schema-side specific-ids are constrained to identifier shape
                 # — `[A-Za-z_][A-Za-z0-9_]*`. See `AllowedSubject.id`. The
                 # tokenizer never emits an `ident` that violates this, so the
@@ -279,7 +287,7 @@ class _Parser:
                 specific_id = next_tok.value
                 if self.at("punct", "#"):
                     self.consume()
-                    relation = self.expect("ident").value
+                    relation = self.expect_name().value
             else:
                 # Common authoring mistakes: `role:42` (digit-start, fails at
                 # tokenizer level — caller never reaches here); `role:obj-admin`
@@ -293,7 +301,7 @@ class _Parser:
                 )
         elif self.at("punct", "#"):
             self.consume()
-            relation = self.expect("ident").value
+            relation = self.expect_name().value
         if self.at("keyword", "with"):
             # `... with caveat_name`
             self.consume()
@@ -302,7 +310,7 @@ class _Parser:
 
     def _parse_permission(self) -> Permission:
         self.expect("keyword", "permission")
-        name = self.expect("ident").value
+        name = self.expect_name().value
         self.expect("punct", "=")
         # Capture raw text: re-stitch tokens until end of expression
         start = self.pos
@@ -350,14 +358,14 @@ class _Parser:
             return PermNil()
         # ident or type — first token of arrow / ref
         t = self.consume()
-        if t.kind not in ("ident", "type"):
+        if t.kind not in ("ident", "type", "keyword"):
             raise ParseError(
                 f"Expected identifier or '(' in expression at line {t.line}; got {t.value!r}"
             )
         # arrow?
         if self.at("punct", "->"):
             self.consume()
-            target = self.expect("ident").value
+            target = self.expect_name().value
             return PermArrow(t.value, target)
         return PermRef(t.value)
 

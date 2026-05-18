@@ -28,6 +28,7 @@ _DEFAULTS: dict[str, Any] = {
     "REBAC_REQUIRE_SUDO_REASON": True,
     "REBAC_ALLOW_SUDO": True,
     "REBAC_GC_INTERVAL_SECONDS": 300,
+    "REBAC_AUTHENTICATION_MIDDLEWARE": "django.contrib.auth.middleware.AuthenticationMiddleware",
     "REBAC_ACTOR_RESOLVER": "rebac.actors.default_resolver",
     "REBAC_TYPE_PREFIX": "",
     "REBAC_SUPERUSER_BYPASS": True,

@@ -25,7 +25,8 @@ class ActorMiddleware:
     bypass, and (opt-in) rehydrates / persists a Zookie via header or
     session transport.
 
-    Add to MIDDLEWARE *after* `AuthenticationMiddleware`.
+    Add to MIDDLEWARE *after* the middleware named by
+    ``REBAC_AUTHENTICATION_MIDDLEWARE``.
 
     Resolver
     --------

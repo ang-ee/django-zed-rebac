@@ -151,12 +151,12 @@ def check_zookie_transport_setting(
 def check_actor_middleware_order(
     app_configs: Any = None, **kwargs: Any
 ) -> list[checks.CheckMessage]:
-    """Ensure ActorMiddleware appears after AuthenticationMiddleware."""
+    """Ensure ActorMiddleware appears after the configured auth middleware."""
     from django.conf import settings
 
     middleware = list(getattr(settings, "MIDDLEWARE", []))
     actor_path = "rebac.middleware.ActorMiddleware"
-    auth_path = "django.contrib.auth.middleware.AuthenticationMiddleware"
+    auth_path = app_settings.REBAC_AUTHENTICATION_MIDDLEWARE
     if actor_path not in middleware:
         return []
     if auth_path not in middleware:

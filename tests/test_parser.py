@@ -119,6 +119,26 @@ def test_permission_with_arrow():
     assert perm.expression.target == "read"
 
 
+def test_permission_names_may_match_top_level_keywords():
+    schema = parse_zed(
+        """
+        definition auth/service {
+            relation owner: auth/user
+            permission use = owner
+        }
+        definition auth/apikey {
+            relation service: auth/service
+            permission authenticate = service->use
+        }
+        """
+    )
+
+    assert schema.get_permission("auth/service", "use") is not None
+    perm = schema.get_permission("auth/apikey", "authenticate")
+    assert isinstance(perm.expression, PermArrow)
+    assert perm.expression.target == "use"
+
+
 def test_permission_with_parentheses_overrides_precedence():
     schema = parse_zed(
         """
