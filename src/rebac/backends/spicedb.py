@@ -89,3 +89,6 @@ class SpiceDBBackend(Backend):
 
     def delete_relationships(self, filter_: RelationshipFilter) -> Zookie:
         raise NotImplementedError
+
+    def delete_relationship(self, tuple_: RelationshipTuple) -> Zookie:
+        raise NotImplementedError

@@ -87,7 +87,7 @@ from collections.abc import Iterator
 from typing import TYPE_CHECKING
 
 from .actors import ActorLike, to_subject_ref
-from .types import ObjectRef, SubjectRef
+from .types import ObjectRef, RelationshipTuple, SubjectRef
 
 if TYPE_CHECKING:  # pragma: no cover
     from .models import Relationship
@@ -180,12 +180,22 @@ def grant(*, actor: ActorLike, role: str | ObjectRef) -> Relationship:
     Returns the :class:`Relationship` row (newly created or pre-existing).
     """
     from .models import active_relationship_model
+    from .relationships import write_relationships
 
     Relationship = active_relationship_model()
 
     actor_ref = to_subject_ref(actor)
     role_ref = _parse_role(role)
-    row, _ = Relationship.objects.get_or_create(
+    write_relationships(
+        [
+            RelationshipTuple(
+                resource=role_ref,
+                relation=ROLE_RELATION,
+                subject=actor_ref,
+            )
+        ]
+    )
+    return Relationship.objects.get(
         resource_type=role_ref.resource_type,
         resource_id=role_ref.resource_id,
         relation=ROLE_RELATION,
@@ -194,7 +204,6 @@ def grant(*, actor: ActorLike, role: str | ObjectRef) -> Relationship:
         optional_subject_relation=actor_ref.optional_relation,
         caveat_name="",
     )
-    return row
 
 
 def revoke(*, actor: ActorLike, role: str | ObjectRef) -> int:
@@ -205,20 +214,29 @@ def revoke(*, actor: ActorLike, role: str | ObjectRef) -> int:
     at most one matching row).
     """
     from .models import active_relationship_model
+    from .relationships import delete_relationship
 
     Relationship = active_relationship_model()
 
     actor_ref = to_subject_ref(actor)
     role_ref = _parse_role(role)
-    deleted, _ = Relationship.objects.filter(
+    exists = Relationship.objects.filter(
         resource_type=role_ref.resource_type,
         resource_id=role_ref.resource_id,
         relation=ROLE_RELATION,
         subject_type=actor_ref.subject_type,
         subject_id=actor_ref.subject_id,
         optional_subject_relation=actor_ref.optional_relation,
-    ).delete()
-    return deleted
+        caveat_name="",
+    ).exists()
+    delete_relationship(
+        RelationshipTuple(
+            resource=role_ref,
+            relation=ROLE_RELATION,
+            subject=actor_ref,
+        )
+    )
+    return 1 if exists else 0
 
 
 def roles_of(actor: ActorLike) -> Iterator[ObjectRef]:
@@ -307,12 +325,23 @@ def imply(*, parent: str | ObjectRef, child: str | ObjectRef) -> Relationship:
         # effective member of storage/role:object_editor.
     """
     from .models import active_relationship_model
+    from .relationships import write_relationships
 
     Relationship = active_relationship_model()
 
     parent_ref = _parse_role(parent)
     child_ref = _parse_role(child)
-    row, _ = Relationship.objects.get_or_create(
+    tuple_ = RelationshipTuple(
+        resource=parent_ref,
+        relation=ROLE_INCLUDES_RELATION,
+        subject=SubjectRef.of(
+            child_ref.resource_type,
+            child_ref.resource_id,
+            ROLE_EFFECTIVE_MEMBER,
+        ),
+    )
+    write_relationships([tuple_])
+    return Relationship.objects.get(
         resource_type=parent_ref.resource_type,
         resource_id=parent_ref.resource_id,
         relation=ROLE_INCLUDES_RELATION,
@@ -321,7 +350,6 @@ def imply(*, parent: str | ObjectRef, child: str | ObjectRef) -> Relationship:
         optional_subject_relation=ROLE_EFFECTIVE_MEMBER,
         caveat_name="",
     )
-    return row
 
 
 def unimply(*, parent: str | ObjectRef, child: str | ObjectRef) -> int:
@@ -330,20 +358,32 @@ def unimply(*, parent: str | ObjectRef, child: str | ObjectRef) -> int:
     Returns the number of rows deleted (0 or 1).
     """
     from .models import active_relationship_model
+    from .relationships import delete_relationship
 
     Relationship = active_relationship_model()
 
     parent_ref = _parse_role(parent)
     child_ref = _parse_role(child)
-    deleted, _ = Relationship.objects.filter(
+    tuple_ = RelationshipTuple(
+        resource=parent_ref,
+        relation=ROLE_INCLUDES_RELATION,
+        subject=SubjectRef.of(
+            child_ref.resource_type,
+            child_ref.resource_id,
+            ROLE_EFFECTIVE_MEMBER,
+        ),
+    )
+    exists = Relationship.objects.filter(
         resource_type=parent_ref.resource_type,
         resource_id=parent_ref.resource_id,
         relation=ROLE_INCLUDES_RELATION,
         subject_type=child_ref.resource_type,
         subject_id=child_ref.resource_id,
         optional_subject_relation=ROLE_EFFECTIVE_MEMBER,
-    ).delete()
-    return deleted
+        caveat_name="",
+    ).exists()
+    delete_relationship(tuple_)
+    return 1 if exists else 0
 
 
 def implies_of(role: str | ObjectRef) -> Iterator[ObjectRef]:

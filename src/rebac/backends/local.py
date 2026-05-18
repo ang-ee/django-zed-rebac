@@ -490,6 +490,21 @@ class LocalBackend(Backend):
         qs.delete()
         return self._zookie()
 
+    def delete_relationship(self, tuple_: RelationshipTuple) -> Zookie:
+        from ..models import active_relationship_model
+
+        RelationshipModel = active_relationship_model()
+        RelationshipModel.objects.filter(
+            resource_type=tuple_.resource.resource_type,
+            resource_id=tuple_.resource.resource_id,
+            relation=tuple_.relation,
+            subject_type=tuple_.subject.subject_type,
+            subject_id=tuple_.subject.subject_id,
+            optional_subject_relation=tuple_.subject.optional_relation,
+            caveat_name=tuple_.caveat_name,
+        ).delete()
+        return self._zookie()
+
     # ---------- Internal evaluation ----------
 
     def _eval_permission(
