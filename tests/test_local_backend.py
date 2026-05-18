@@ -12,7 +12,12 @@ from rebac import (
     RelationshipTuple,
     SubjectRef,
 )
-from rebac.models import SchemaDefinition, SchemaPermission, SchemaRelation
+from rebac.models import (
+    Relationship,
+    SchemaDefinition,
+    SchemaPermission,
+    SchemaRelation,
+)
 from rebac.schema import parse_zed
 
 SCHEMA_TEXT = """
@@ -103,6 +108,54 @@ def test_group_membership_inherits_read(backend):
     )
     assert backend.has_access(subject=_user("u4"), action="read", resource=_post("p3"))
     assert not backend.has_access(subject=_user("u5"), action="read", resource=_post("p3"))
+
+
+def test_delete_relationship_matches_empty_optional_relation_exactly(backend):
+    direct = RelationshipTuple(
+        resource=_post("p-delete"),
+        relation="viewer",
+        subject=_user("u-delete"),
+    )
+    subject_set = RelationshipTuple(
+        resource=_post("p-delete"),
+        relation="viewer",
+        subject=SubjectRef.of("auth/user", "u-delete", "member"),
+    )
+    caveated = RelationshipTuple(
+        resource=_post("p-delete"),
+        relation="viewer",
+        subject=_user("u-delete"),
+        caveat_name="during_business_hours",
+    )
+
+    backend.write_relationships([direct, subject_set, caveated])
+    backend.delete_relationship(direct)
+
+    assert not Relationship.objects.filter(
+        resource_type="blog/post",
+        resource_id="p-delete",
+        relation="viewer",
+        subject_type="auth/user",
+        subject_id="u-delete",
+        optional_subject_relation="",
+        caveat_name="",
+    ).exists()
+    assert Relationship.objects.filter(
+        resource_type="blog/post",
+        resource_id="p-delete",
+        relation="viewer",
+        subject_type="auth/user",
+        subject_id="u-delete",
+        optional_subject_relation="member",
+    ).exists()
+    assert Relationship.objects.filter(
+        resource_type="blog/post",
+        resource_id="p-delete",
+        relation="viewer",
+        subject_type="auth/user",
+        subject_id="u-delete",
+        caveat_name="during_business_hours",
+    ).exists()
 
 
 def test_wildcard_grants_read_to_anyone(backend):

@@ -132,3 +132,51 @@ def delete_relationships(filter_: RelationshipFilter) -> Zookie:
             defer_to_commit=True,
         )
     return zookie
+
+
+def delete_relationship(tuple_: RelationshipTuple) -> Zookie:
+    """Atomically delete exactly one relationship tuple shape.
+
+    Unlike ``delete_relationships(RelationshipFilter(...))``, empty optional
+    subject relations and caveat names are exact values here, not wildcards.
+    """
+    from . import backend
+    from .actors import current_actor
+    from .audit import emit as emit_audit
+    from .models import PermissionAuditEvent, active_relationship_model
+
+    RelationshipModel = active_relationship_model()
+    snapshot = list(
+        RelationshipModel.objects.filter(
+            resource_type=tuple_.resource.resource_type,
+            resource_id=tuple_.resource.resource_id,
+            relation=tuple_.relation,
+            subject_type=tuple_.subject.subject_type,
+            subject_id=tuple_.subject.subject_id,
+            optional_subject_relation=tuple_.subject.optional_relation,
+            caveat_name=tuple_.caveat_name,
+        )
+    )
+    zookie = backend().delete_relationship(tuple_)
+
+    from .consistency import record_zookie
+
+    record_zookie(zookie)
+
+    actor = current_actor()
+    for row in snapshot:
+        emit_audit(
+            PermissionAuditEvent.KIND_RELATIONSHIP_REVOKE,
+            actor=actor,
+            origin=actor,
+            target_repr=_format_target(
+                RelationshipTuple(
+                    resource=tuple_.resource,
+                    relation=tuple_.relation,
+                    subject=tuple_.subject,
+                    caveat_name=getattr(row, "caveat_name", ""),
+                )
+            ),
+            defer_to_commit=True,
+        )
+    return zookie

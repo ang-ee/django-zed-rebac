@@ -68,7 +68,7 @@ if TYPE_CHECKING:
     from .decorators import rebac_resource, require_permission
     from .mixins import RebacMixin, RebacObjectMeta
     from .permissions_mixin import RebacPermissionsMixin
-    from .relationships import delete_relationships, write_relationships
+    from .relationships import delete_relationship, delete_relationships, write_relationships
     from .resources import to_object_ref
 
 
@@ -86,6 +86,7 @@ _LAZY = {
     "require_permission": ("rebac.decorators", "require_permission"),
     "rebac_resource": ("rebac.decorators", "rebac_resource"),
     "write_relationships": ("rebac.relationships", "write_relationships"),
+    "delete_relationship": ("rebac.relationships", "delete_relationship"),
     "delete_relationships": ("rebac.relationships", "delete_relationships"),
     "to_object_ref": ("rebac.resources", "to_object_ref"),
     "emit_audit_event": ("rebac.audit", "emit"),
@@ -152,6 +153,7 @@ __all__ = [
     "RebacError",
     # helpers
     "write_relationships",
+    "delete_relationship",
     "delete_relationships",
     "emit_audit_event",
     # evaluator (proposal 0002)

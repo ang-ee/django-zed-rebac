@@ -93,3 +93,6 @@ class Backend(ABC):
 
     @abstractmethod
     def delete_relationships(self, filter_: RelationshipFilter) -> Zookie: ...
+
+    @abstractmethod
+    def delete_relationship(self, tuple_: RelationshipTuple) -> Zookie: ...
