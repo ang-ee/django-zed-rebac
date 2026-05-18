@@ -3,7 +3,7 @@
 All notable changes to `django-zed-rebac` are tracked here. The project is in
 pre-1.0; breaking changes within a minor version are explicitly called out.
 
-## [Unreleased]
+## [0.3.1] — 2026-05-18
 
 ### Added — composable actor resolvers
 
@@ -26,6 +26,30 @@ pre-1.0; breaking changes within a minor version are explicitly called out.
 Both helpers are exported at the top level (`from rebac import
 chain_resolvers, bearer_token`) and also available on
 `rebac.actors`.
+
+### Added — `Backend.delete_relationship` (singular)
+
+- **`Backend.delete_relationship(tuple_: RelationshipTuple) -> Zookie`**
+  — a singular companion to the filter-shaped
+  `delete_relationships(filter_)`. Where the filter form treats empty
+  `optional_subject_relation` / `caveat_name` as wildcards ("don't
+  filter on this field"), the singular form treats them as **exact
+  values**, so callers can delete one specific shape without
+  collaterally removing subject-set or caveated rows that share the
+  rest of the key. Exposed at the top level as
+  `rebac.delete_relationship`. `LocalBackend` implements;
+  `SpiceDBBackend` stubs to match the existing
+  `delete_relationships` stub.
+
+### Changed — `rebac.roles` mutations route through public helpers
+
+- `grant` / `revoke` / `imply` / `unimply` now call
+  `write_relationships` and `delete_relationship` instead of bare ORM
+  `get_or_create` / `filter().delete()`. Side-effect: every role
+  mutation now emits the standard `KIND_RELATIONSHIP_GRANT` /
+  `KIND_RELATIONSHIP_REVOKE` audit row and stamps a zookie into the
+  ambient freshness ContextVar — the role layer was previously the
+  only mutating surface that bypassed those.
 
 ## [0.3.0] — 2026-05-17
 

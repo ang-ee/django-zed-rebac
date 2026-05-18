@@ -15,7 +15,7 @@ from __future__ import annotations
 
 from typing import TYPE_CHECKING, Any
 
-__version__ = "0.3.0"
+__version__ = "0.3.1"
 
 default_app_config = "rebac.apps.RebacConfig"
 
