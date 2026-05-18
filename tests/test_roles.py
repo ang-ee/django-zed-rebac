@@ -335,6 +335,65 @@ def test_imply_accepts_objectref():
 # ---------- Strict-by-default contract ----------
 
 
+# ---------- Registry-mode parity (proposal 0001) ----------
+
+
+@pytest.mark.django_db
+def test_grant_and_roles_of_route_through_active_model_in_registry_mode():
+    """``rebac.roles`` must read/write the active relationship table.
+
+    Pinning regression for proposal 0001: ``grant`` / ``revoke`` /
+    ``roles_of`` originally imported ``Relationship`` directly, so in
+    registry mode they wrote to the wrong table and grants were
+    invisible to the engine.
+    """
+    from django.test import override_settings
+
+    from rebac.models import RebacResource, Relationship, RelationshipRegistry
+
+    actor = SubjectRef.of("auth/user", "42")
+    with override_settings(REBAC_LOCAL_BACKEND_STORAGE="registry"):
+        grant(actor=actor, role="storage/role:object_viewer")
+        # Registry table holds the grant; denormalized does NOT.
+        assert RelationshipRegistry.objects.filter(
+            resource_type="storage/role",
+            resource_id="object_viewer",
+        ).exists()
+        assert not Relationship.objects.filter(
+            resource_type="storage/role",
+            resource_id="object_viewer",
+        ).exists()
+        # RebacResource rows were upserted (storage/role:object_viewer + auth/user:42).
+        assert RebacResource.objects.count() >= 2
+        # roles_of() reads back through the same active model.
+        roles = [(r.resource_type, r.resource_id) for r in roles_of(actor)]
+        assert ("storage/role", "object_viewer") in roles
+        # revoke() removes the row from the registry.
+        revoke(actor=actor, role="storage/role:object_viewer")
+        assert not list(roles_of(actor))
+
+
+@pytest.mark.django_db
+def test_imply_routes_through_active_model_in_registry_mode():
+    """``imply`` writes the includes/effective_member edge into the active table."""
+    from django.test import override_settings
+
+    from rebac.models import Relationship, RelationshipRegistry
+
+    with override_settings(REBAC_LOCAL_BACKEND_STORAGE="registry"):
+        imply(parent="storage/role:editor", child="storage/role:viewer")
+        assert RelationshipRegistry.objects.filter(
+            resource_type="storage/role",
+            resource_id="editor",
+            relation=ROLE_INCLUDES_RELATION,
+            optional_subject_relation=ROLE_EFFECTIVE_MEMBER,
+        ).exists()
+        assert not Relationship.objects.filter(
+            resource_type="storage/role",
+            resource_id="editor",
+        ).exists()
+
+
 @pytest.mark.django_db
 def test_roles_helpers_work_without_an_ambient_actor():
     """``rebac.roles`` operates on the raw ``Relationship`` store.

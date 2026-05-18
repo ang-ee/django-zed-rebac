@@ -314,7 +314,9 @@ class LocalBackend(Backend):
     ) -> Iterable[SubjectRef]:
         # Minimal forward lookup — direct relation rows only. Walking through
         # subject sets / arrows for reverse lookup is deferred to v0.2.
-        from ..models import Relationship as RelationshipModel
+        from ..models import active_relationship_model
+
+        RelationshipModel = active_relationship_model()
 
         permission = self.schema().get_permission(resource.resource_type, action)
         relation_names = []
@@ -339,7 +341,9 @@ class LocalBackend(Backend):
     def write_relationships(self, writes: Iterable[RelationshipTuple]) -> Zookie:
         from django.db import transaction
 
-        from ..models import Relationship as RelationshipModel
+        from ..models import active_relationship_model
+
+        RelationshipModel = active_relationship_model()
 
         rows = list(writes)
         with transaction.atomic():
@@ -361,7 +365,9 @@ class LocalBackend(Backend):
         return self._zookie()
 
     def delete_relationships(self, filter_: RelationshipFilter) -> Zookie:
-        from ..models import Relationship as RelationshipModel
+        from ..models import active_relationship_model
+
+        RelationshipModel = active_relationship_model()
 
         qs = RelationshipModel.objects.all()
         if filter_.resource_type:
@@ -435,7 +441,9 @@ class LocalBackend(Backend):
                 )
             return False
         if isinstance(expr, PermArrow):
-            from ..models import Relationship as RelationshipModel
+            from ..models import active_relationship_model
+
+            RelationshipModel = active_relationship_model()
 
             via = _find_relation(definition, expr.via)
             if via is None:
@@ -600,7 +608,9 @@ class LocalBackend(Backend):
             raise PermissionDepthExceeded(f"Depth limit {app_settings.REBAC_DEPTH_LIMIT} exceeded")
         if missing is None:
             missing = set()
-        from ..models import Relationship as RelationshipModel
+        from ..models import active_relationship_model
+
+        RelationshipModel = active_relationship_model()
 
         rows = RelationshipModel.objects.filter(
             resource_type=resource_type,
@@ -731,7 +741,9 @@ class LocalBackend(Backend):
                 )
             return set()
         if isinstance(expr, PermArrow):
-            from ..models import Relationship as RelationshipModel
+            from ..models import active_relationship_model
+
+            RelationshipModel = active_relationship_model()
 
             via_rel = _find_relation(definition, expr.via)
             if via_rel is None:
@@ -832,7 +844,9 @@ class LocalBackend(Backend):
     ) -> set[str]:
         if depth > app_settings.REBAC_DEPTH_LIMIT:
             raise PermissionDepthExceeded(f"Depth limit {app_settings.REBAC_DEPTH_LIMIT} exceeded")
-        from ..models import Relationship as RelationshipModel
+        from ..models import active_relationship_model
+
+        RelationshipModel = active_relationship_model()
 
         result: set[str] = set()
         # Local sink: caveat-conditional rows feeding accessible() are

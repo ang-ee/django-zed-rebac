@@ -179,7 +179,9 @@ def grant(*, actor: ActorLike, role: str | ObjectRef) -> Relationship:
 
     Returns the :class:`Relationship` row (newly created or pre-existing).
     """
-    from .models import Relationship
+    from .models import active_relationship_model
+
+    Relationship = active_relationship_model()
 
     actor_ref = to_subject_ref(actor)
     role_ref = _parse_role(role)
@@ -202,7 +204,9 @@ def revoke(*, actor: ActorLike, role: str | ObjectRef) -> int:
     otherwise — the unique constraint on :class:`Relationship` guarantees
     at most one matching row).
     """
-    from .models import Relationship
+    from .models import active_relationship_model
+
+    Relationship = active_relationship_model()
 
     actor_ref = to_subject_ref(actor)
     role_ref = _parse_role(role)
@@ -225,18 +229,26 @@ def roles_of(actor: ActorLike) -> Iterator[ObjectRef]:
     use the engine (``has_access`` / ``accessible``), which traverses
     ``role:editor#member`` subject-sets at check time.
     """
-    from .models import Relationship
+    from .models import active_relationship_model
+
+    Relationship = active_relationship_model()
 
     actor_ref = to_subject_ref(actor)
+    # Iterate via property accessors rather than values_list — the registry
+    # manager's translator rewrites lookup *filter* kwargs, but
+    # values_list("resource_type", ...) asks for raw field names that don't
+    # exist on RelationshipRegistry. The manager's default
+    # select_related("resource_fk", "subject_fk") makes the property
+    # access free.
     rows = Relationship.objects.filter(
         relation=ROLE_RELATION,
         subject_type=actor_ref.subject_type,
         subject_id=actor_ref.subject_id,
         optional_subject_relation=actor_ref.optional_relation,
         resource_type__endswith="/role",
-    ).values_list("resource_type", "resource_id")
-    for rt, rid in rows:
-        yield ObjectRef(rt, rid)
+    )
+    for row in rows:
+        yield ObjectRef(row.resource_type, row.resource_id)
 
 
 def members_of(role: str | ObjectRef) -> Iterator[SubjectRef]:
@@ -248,16 +260,18 @@ def members_of(role: str | ObjectRef) -> Iterator[SubjectRef]:
     enumerate ``accessible()`` on a resource that references the role
     in its permission expression.
     """
-    from .models import Relationship
+    from .models import active_relationship_model
+
+    Relationship = active_relationship_model()
 
     role_ref = _parse_role(role)
     rows = Relationship.objects.filter(
         resource_type=role_ref.resource_type,
         resource_id=role_ref.resource_id,
         relation=ROLE_RELATION,
-    ).values_list("subject_type", "subject_id", "optional_subject_relation")
-    for st, sid, sr in rows:
-        yield SubjectRef.of(st, sid, sr)
+    )
+    for row in rows:
+        yield SubjectRef.of(row.subject_type, row.subject_id, row.optional_subject_relation)
 
 
 def imply(*, parent: str | ObjectRef, child: str | ObjectRef) -> Relationship:
@@ -292,7 +306,9 @@ def imply(*, parent: str | ObjectRef, child: str | ObjectRef) -> Relationship:
         # Now any member of storage/role:object_admin is also an
         # effective member of storage/role:object_editor.
     """
-    from .models import Relationship
+    from .models import active_relationship_model
+
+    Relationship = active_relationship_model()
 
     parent_ref = _parse_role(parent)
     child_ref = _parse_role(child)
@@ -313,7 +329,9 @@ def unimply(*, parent: str | ObjectRef, child: str | ObjectRef) -> int:
 
     Returns the number of rows deleted (0 or 1).
     """
-    from .models import Relationship
+    from .models import active_relationship_model
+
+    Relationship = active_relationship_model()
 
     parent_ref = _parse_role(parent)
     child_ref = _parse_role(child)
@@ -337,7 +355,9 @@ def implies_of(role: str | ObjectRef) -> Iterator[ObjectRef]:
     Direct edges only; the engine handles transitive closure at check
     time via the ``effective_member`` permission expression.
     """
-    from .models import Relationship
+    from .models import active_relationship_model
+
+    Relationship = active_relationship_model()
 
     role_ref = _parse_role(role)
     rows = Relationship.objects.filter(
@@ -345,9 +365,9 @@ def implies_of(role: str | ObjectRef) -> Iterator[ObjectRef]:
         subject_type=role_ref.resource_type,
         subject_id=role_ref.resource_id,
         optional_subject_relation=ROLE_EFFECTIVE_MEMBER,
-    ).values_list("resource_type", "resource_id")
-    for rt, rid in rows:
-        yield ObjectRef(rt, rid)
+    )
+    for row in rows:
+        yield ObjectRef(row.resource_type, row.resource_id)
 
 
 def implied_by_of(role: str | ObjectRef) -> Iterator[ObjectRef]:
@@ -356,7 +376,9 @@ def implied_by_of(role: str | ObjectRef) -> Iterator[ObjectRef]:
     Inverse of :func:`implies_of`. Looks up rows where ``role`` is the
     *parent* and yields the *children*.
     """
-    from .models import Relationship
+    from .models import active_relationship_model
+
+    Relationship = active_relationship_model()
 
     role_ref = _parse_role(role)
     rows = Relationship.objects.filter(
@@ -364,9 +386,9 @@ def implied_by_of(role: str | ObjectRef) -> Iterator[ObjectRef]:
         resource_id=role_ref.resource_id,
         relation=ROLE_INCLUDES_RELATION,
         optional_subject_relation=ROLE_EFFECTIVE_MEMBER,
-    ).values_list("subject_type", "subject_id")
-    for st, sid in rows:
-        yield ObjectRef(st, sid)
+    )
+    for row in rows:
+        yield ObjectRef(row.subject_type, row.subject_id)
 
 
 __all__ = [

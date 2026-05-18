@@ -469,6 +469,68 @@ class Relationship(models.Model):
 
 **`expires_at`.** Mirrors SpiceDB's [`use expiration`](https://authzed.com/docs/spicedb/concepts/schema#use-expiration) feature (GA in v1.40+). Expired rows are evaluated as absent at check time; a periodic GC task (`rebac.gc.expire_relationships`) deletes them every 5 minutes by default.
 
+### Storage modes (proposal 0001)
+
+`LocalBackend` ships two storage shapes for the relationship table; the
+active one is selected by `REBAC_LOCAL_BACKEND_STORAGE`:
+
+| Mode | Backing model | Hot index width per entry | When to use |
+|---|---|---|---|
+| `"denormalized"` *(0.4 default)* | `Relationship` (the table above) | ~192 bytes (4 × CharField + relation) | Existing deployments; smallest change footprint. |
+| `"registry"` *(0.5 default)* | `RelationshipRegistry` + `RebacResource` | ~16 bytes (two integer FKs + relation) | New deployments; large relationship tables (>100k rows); any deployment that wants FK-CASCADE cleanup. |
+
+Both tables ship in migration `0002_rebac_resource.py` so an operator can
+flip the setting without further schema changes. `rebac.models.active_relationship_model()`
+returns whichever is active; engine code (`LocalBackend`, `rebac.relationships`,
+`rebac.roles`) routes every read/write through that helper.
+
+The wire shape — `RelationshipTuple` and the string kwargs to the active
+manager — is invariant across modes. `RelationshipRegistry.objects.create(
+resource_type="…", resource_id="…", relation="…", subject_type="…",
+subject_id="…")` upserts the two `RebacResource` rows transparently. Reads
+translate string kwargs into FK-side lookups (`resource_fk__resource_type`,
+etc.) at the QuerySet layer, so chained filters work without consumer code
+changes.
+
+**Why registry shape exists.**
+
+- Index density: with integer FKs the hot `(resource_fk, relation)` index
+  fits ~500+ entries per Postgres leaf page vs ~40 in denormalized form.
+  The recursive CTE re-walks this index multiple times per check, so the
+  gain compounds in `accessible()` evaluation.
+- FK cascade: when a Django row backed by `RebacMixin` is deleted, the
+  `post_delete` signal handler drops the matching `RebacResource` row,
+  and the FK CASCADE on `RelationshipRegistry` sweeps every tuple that
+  referenced it. Denormalized mode requires the caller to issue a
+  follow-up `Relationship.objects.filter(...).delete()`.
+- Referential integrity: writes to `RelationshipRegistry` reference
+  registered `(type, id)` pairs only — typos surface as constraint
+  violations instead of orphan tuples that never match a check.
+
+**Migration command.**
+
+```bash
+python manage.py rebac migrate-storage --to registry [--from denormalized] \
+    [--batch 5000] [--dry-run]
+```
+
+Both directions supported; `--dry-run` reports row counts without writes;
+re-runs are idempotent (the destination's unique constraint absorbs
+duplicates). Row-count parity is checked at the end. The source table is
+not dropped — flip `REBAC_LOCAL_BACKEND_STORAGE` once the copy completes,
+then drop manually. `rebac.W005` surfaces the recommendation at startup
+when the setting is `"denormalized"`.
+
+**SpiceDB unaffected.** This is purely a `LocalBackend` optimisation. The
+`SpiceDBBackend` writes go through gRPC and never touch the local table.
+
+**Roadmap.**
+- **0.4** ships both tables; default `"denormalized"`; `rebac.W005` warns.
+- **0.5** flips default to `"registry"`; operators on the old shape get
+  `rebac.E007` at startup pointing at the migration command.
+- **0.6** drops the denormalized code path entirely; `Relationship` is
+  removed and `RelationshipRegistry` is renamed back to `Relationship`.
+
 ### `SchemaDefinition` / `SchemaRelation` / `SchemaPermission` / `SchemaCaveat` — Tier 1 baseline
 
 Loaded from each app's `permissions.zed` at sync time. Read by `LocalBackend` at app-ready into an in-memory expression tree.

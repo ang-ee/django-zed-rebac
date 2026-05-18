@@ -6,6 +6,7 @@ python manage.py rebac sync --force-overwrite   # destructive
 python manage.py rebac check                    # validate without writes
 python manage.py rebac build-zed                # emit effective.zed
 python manage.py rebac explain <type>.<perm>    # print compiled expression
+python manage.py rebac migrate-storage --to registry   # proposal 0001 cutover
 """
 
 from __future__ import annotations
@@ -47,6 +48,27 @@ class Command(BaseCommand):
         p_explain = sub.add_parser("explain", help="Print compiled expression for <type>.<perm>")
         p_explain.add_argument("target", help="e.g. blog/post.read")
 
+        p_mig = sub.add_parser(
+            "migrate-storage",
+            help="Proposal 0001 — copy rows between denormalized and registry shapes.",
+        )
+        p_mig.add_argument(
+            "--from",
+            dest="src",
+            choices=("denormalized", "registry"),
+            default=None,
+            help="Source shape (default: opposite of --to).",
+        )
+        p_mig.add_argument(
+            "--to",
+            dest="dst",
+            choices=("denormalized", "registry"),
+            required=True,
+            help="Destination shape.",
+        )
+        p_mig.add_argument("--batch", type=int, default=None, help="Override batch size.")
+        p_mig.add_argument("--dry-run", action="store_true", help="Report counts without writes.")
+
     def handle(self, *args: Any, **options: Any) -> None:
         cmd = options["cmd"]
         if cmd == "sync":
@@ -57,6 +79,8 @@ class Command(BaseCommand):
             self._handle_build_zed(options)
         elif cmd == "explain":
             self._handle_explain(options)
+        elif cmd == "migrate-storage":
+            self._handle_migrate_storage(options)
         else:
             raise CommandError(f"Unknown subcommand: {cmd}")
 
@@ -447,6 +471,187 @@ class Command(BaseCommand):
             right = self._render_expr(expr.right)
             return f"({left} {expr.op} {right})"
         raise CommandError(f"Unknown expression node: {type(expr).__name__}")
+
+    # ---------- migrate-storage (proposal 0001) ----------
+
+    def _handle_migrate_storage(self, options: dict[str, Any]) -> None:
+        """Copy rows between ``Relationship`` and ``RelationshipRegistry``.
+
+        Both directions supported. Source defaults to the opposite of
+        ``--to``. The active table per
+        ``REBAC_LOCAL_BACKEND_STORAGE`` is not changed by this command —
+        the operator flips the setting after the copy completes.
+
+        Implementation notes:
+
+        - The denormalized → registry path upserts ``RebacResource`` rows
+          in bulk (``upsert_refs_bulk``) per batch, then issues a single
+          ``bulk_create(ignore_conflicts=True)`` for the registry rows.
+        - The registry → denormalized path projects through the FK rows
+          and writes denormalized rows in a single ``bulk_create``.
+        - Row-count parity is verified at the end; mismatch raises.
+        - ``--dry-run`` short-circuits before writes so consumers can
+          gauge cost.
+        - The source table is never dropped — the operator confirms by
+          flipping the setting then drops manually.
+        """
+
+        from ...conf import app_settings
+        from ...models import RebacResource, Relationship, RelationshipRegistry
+
+        dst = options["dst"]
+        src = options["src"] or ("registry" if dst == "denormalized" else "denormalized")
+        if src == dst:
+            raise CommandError("--from and --to must differ")
+        batch = options["batch"] or app_settings.REBAC_LOCAL_BACKEND_REGISTRY_BATCH_SIZE
+        dry_run = options["dry_run"]
+
+        if src == "denormalized":
+            src_count = Relationship.objects.count()
+        else:
+            src_count = RelationshipRegistry.objects.count()
+        dst_count_before = (
+            RelationshipRegistry.objects.count()
+            if dst == "registry"
+            else Relationship.objects.count()
+        )
+
+        self.stdout.write(
+            f"migrate-storage {src} -> {dst}: src={src_count} dst_before={dst_count_before}"
+        )
+        if dry_run:
+            self.stdout.write("--dry-run: no writes performed")
+            return
+        if src_count == 0:
+            self.stdout.write("source table empty; nothing to copy")
+            return
+
+        if src == "denormalized" and dst == "registry":
+            self._copy_to_registry(Relationship, RelationshipRegistry, RebacResource, batch)
+        else:
+            self._copy_to_denormalized(RelationshipRegistry, Relationship, batch)
+
+        dst_count_after = (
+            RelationshipRegistry.objects.count()
+            if dst == "registry"
+            else Relationship.objects.count()
+        )
+        added = dst_count_after - dst_count_before
+        self.stdout.write(f"migrate-storage done: dst_after={dst_count_after} (+{added})")
+        # Parity check — destinations may already hold some rows
+        # (re-running a partial migration is supported). The total
+        # destination row count after the copy must cover the unique-key
+        # tuples that exist in the source: every source row's
+        # unique-key signature must have a counterpart in the destination.
+        # Anything else is a silent dedup (registry unique-constraint
+        # collapse, write failure absorbed by ignore_conflicts) and
+        # warrants an abort.
+        expected_after = max(dst_count_before, src_count)
+        if dst_count_after < expected_after:
+            raise CommandError(
+                f"parity: destination has {dst_count_after} rows but expected at "
+                f"least {expected_after} (src={src_count}, dst_before={dst_count_before}). "
+                f"Investigate dedup or ignored write failures."
+            )
+        if added > src_count:
+            raise CommandError(
+                f"parity: destination grew by {added} but source had only {src_count} rows. "
+                f"Concurrent writes during migration?"
+            )
+
+    def _copy_to_registry(
+        self,
+        src_model: type,
+        dst_model: type,
+        resource_model: type,
+        batch: int,
+    ) -> None:
+        """Stream rows from the denormalized table into the registry one.
+
+        For each batch:
+          1. Collect the unique ``(type, id)`` pairs across resource and
+             subject sides.
+          2. ``upsert_refs_bulk`` returns the ``(type, id) → pk`` map.
+          3. Build registry rows with ``resource_fk_id`` / ``subject_fk_id``
+             populated from the map.
+          4. ``bulk_create(ignore_conflicts=True)`` writes them; reruns
+             are idempotent.
+        """
+        from django.db import transaction
+
+        total = 0
+        qs = src_model.objects.all().order_by("pk")
+        offset = 0
+        while True:
+            rows = list(qs[offset : offset + batch])
+            if not rows:
+                break
+            pairs: list[tuple[str, str]] = []
+            for r in rows:
+                pairs.append((r.resource_type, r.resource_id))
+                pairs.append((r.subject_type, r.subject_id))
+            with transaction.atomic():
+                pk_map = resource_model.upsert_refs_bulk(pairs)
+                new_rows = [
+                    dst_model(
+                        resource_fk_id=pk_map[(r.resource_type, r.resource_id)],
+                        relation=r.relation,
+                        subject_fk_id=pk_map[(r.subject_type, r.subject_id)],
+                        optional_subject_relation=r.optional_subject_relation,
+                        caveat_name=r.caveat_name,
+                        caveat_context=r.caveat_context,
+                        expires_at=r.expires_at,
+                        written_at_xid=r.written_at_xid,
+                    )
+                    for r in rows
+                ]
+                dst_model.objects.bulk_create(new_rows, ignore_conflicts=True)
+            total += len(rows)
+            offset += batch
+            self.stdout.write(f"  copied {total}/...")
+        self.stdout.write(f"  total: {total} rows")
+
+    def _copy_to_denormalized(
+        self,
+        src_model: type,
+        dst_model: type,
+        batch: int,
+    ) -> None:
+        """Stream rows from the registry table into the denormalized one.
+
+        Projects through ``resource_fk`` / ``subject_fk`` to get the
+        string columns. ``bulk_create(ignore_conflicts=True)`` deduplicates.
+        """
+        from django.db import transaction
+
+        total = 0
+        qs = src_model.objects.all().select_related("resource_fk", "subject_fk").order_by("pk")
+        offset = 0
+        while True:
+            rows = list(qs[offset : offset + batch])
+            if not rows:
+                break
+            with transaction.atomic():
+                new_rows = [
+                    dst_model(
+                        resource_type=r.resource_fk.resource_type,
+                        resource_id=r.resource_fk.resource_id,
+                        relation=r.relation,
+                        subject_type=r.subject_fk.resource_type,
+                        subject_id=r.subject_fk.resource_id,
+                        optional_subject_relation=r.optional_subject_relation,
+                        caveat_name=r.caveat_name,
+                        caveat_context=r.caveat_context,
+                        expires_at=r.expires_at,
+                        written_at_xid=r.written_at_xid,
+                    )
+                    for r in rows
+                ]
+                dst_model.objects.bulk_create(new_rows, ignore_conflicts=True)
+            total += len(rows)
+            offset += batch
+            self.stdout.write(f"  copied {total}/...")
+        self.stdout.write(f"  total: {total} rows")
 
     # ---------- explain ----------
 

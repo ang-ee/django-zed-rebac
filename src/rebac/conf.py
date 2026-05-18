@@ -81,6 +81,25 @@ _DEFAULTS: dict[str, Any] = {
     # When the engine grows true auto-scoping for bare-string
     # prefetch (planned), this check goes away entirely.
     "REBAC_LINT_BARE_PREFETCH": False,
+    # LocalBackend storage shape. ``"denormalized"`` (the current and default
+    # 0.4 shape) stores ``resource_type / resource_id / subject_type /
+    # subject_id`` as wide ``CharField`` columns on every ``Relationship``
+    # row — the wire shape that mirrors ``authzed.api.v1.Relationship``.
+    # ``"registry"`` (proposal 0001, opt-in in 0.4, default in 0.5) stores
+    # those four columns as integer FKs into a shared ``RebacResource``
+    # table, yielding a 5-10x index-density gain on the hot path and
+    # FK-CASCADE cleanup when the underlying Django row is deleted.
+    #
+    # Migration between the two is one-shot via
+    # ``python manage.py rebac migrate-storage --to registry``. The wire
+    # shape (``RelationshipTuple`` + string kwargs to the public manager)
+    # is unchanged in either mode. Setting affects ``LocalBackend`` only;
+    # ``SpiceDBBackend`` is unaffected.
+    "REBAC_LOCAL_BACKEND_STORAGE": "denormalized",
+    # Batch size for ``rebac migrate-storage`` when streaming rows between
+    # the two shapes. Lower this on tight-memory hosts; raise it on big
+    # transactional DBs where round-trip cost dominates per-row work.
+    "REBAC_LOCAL_BACKEND_REGISTRY_BATCH_SIZE": 5000,
 }
 
 

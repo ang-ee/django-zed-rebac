@@ -375,3 +375,47 @@ def _rebac_override_post_delete(sender: type, instance: Any, **_: Any) -> None:
         before=_override_payload(instance),
         after=None,
     )
+
+
+# ---------- Proposal 0001: RebacResource cascade ----------
+#
+# When a Django row backed by ``RebacMixin`` is deleted in registry mode,
+# its corresponding ``RebacResource`` row must die with it so the
+# ``RelationshipRegistry.resource_fk`` / ``subject_fk`` CASCADE constraint
+# can sweep every tuple it appeared in. Without this handler the registry
+# row would be orphaned and tuples would persist past the underlying
+# resource's lifetime — exactly the leak the registry shape was meant to
+# fix.
+#
+# In denormalized mode the handler is a no-op (there are no FKs to
+# cascade through); callers do their own ``Relationship.objects.filter(
+# resource_type=..., resource_id=...).delete()`` post_delete sweep when
+# they need it.
+
+
+@receiver(post_delete)
+def _rebac_cascade_resource(sender: type, instance: Any, **_: Any) -> None:
+    """Drop the ``RebacResource`` registry row for a deleted ``RebacMixin`` row.
+
+    Listens on every model's ``post_delete``; short-circuits in O(1) when
+    the sender is not REBAC-bound (the ``getattr(meta,
+    rebac_resource_type, None)`` lookup is the only work done in the
+    common-case false branch).
+    """
+    if app_settings.REBAC_LOCAL_BACKEND_STORAGE != "registry":
+        return
+    if not isinstance(instance, RebacMixin):
+        return
+    rebac_type = getattr(sender._meta, "rebac_resource_type", None)
+    if not rebac_type:
+        return
+    # Lazy import — ``RebacResource`` lives in ``rebac.models`` which is
+    # available by signal-fire time but importing eagerly would be a
+    # heavy top-level dependency for a no-op in denormalized mode.
+    from .models import RebacResource
+
+    resource_id = str(getattr(instance, resource_id_attr(sender)))
+    RebacResource.objects.filter(
+        resource_type=rebac_type,
+        resource_id=resource_id,
+    ).delete()

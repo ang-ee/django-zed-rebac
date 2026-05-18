@@ -22,6 +22,34 @@ def check_backend_setting(app_configs: Any = None, **kwargs: Any) -> list[checks
                 id="rebac.E001",
             )
         )
+    storage = app_settings.REBAC_LOCAL_BACKEND_STORAGE
+    if storage not in ("denormalized", "registry"):
+        issues.append(
+            checks.Error(
+                f"REBAC_LOCAL_BACKEND_STORAGE={storage!r} (expected 'denormalized' or 'registry')",
+                id="rebac.E006",
+            )
+        )
+    elif backend == "local" and storage == "denormalized":
+        issues.append(
+            checks.Warning(
+                "REBAC_LOCAL_BACKEND_STORAGE='denormalized' — the registry "
+                "shape (proposal 0001) ships a 5-10x index density gain and "
+                "FK-CASCADE cleanup for deleted Django rows. The default "
+                "flips to 'registry' in v0.5; consider migrating early via "
+                "`python manage.py rebac migrate-storage --to registry`.",
+                id="rebac.W005",
+                hint=(
+                    "Run `python manage.py rebac migrate-storage --to "
+                    "registry --dry-run` first to see the row count, then "
+                    "without --dry-run to perform the copy. Flip "
+                    "REBAC_LOCAL_BACKEND_STORAGE='registry' once the copy "
+                    "completes. Set REBAC_LOCAL_BACKEND_STORAGE='registry' "
+                    "in this settings file (or silence this warning with "
+                    "SILENCED_SYSTEM_CHECKS = ['rebac.W005'])."
+                ),
+            )
+        )
     if backend == "spicedb":
         if not app_settings.REBAC_SPICEDB_ENDPOINT:
             issues.append(

@@ -65,9 +65,7 @@ class RebacBackend:
     def has_perm(self, user_obj: Any, perm: str, obj: Any = None) -> bool:
         if not getattr(user_obj, "is_active", False):
             return False
-        if app_settings.REBAC_SUPERUSER_BYPASS and getattr(
-            user_obj, "is_superuser", False
-        ):
+        if app_settings.REBAC_SUPERUSER_BYPASS and getattr(user_obj, "is_superuser", False):
             return True
 
         action = codename_to_action(perm)
@@ -99,18 +97,14 @@ class RebacBackend:
         # to a deny — the engine couldn't answer the question, treat
         # that as "no access" rather than 500.
         try:
-            return backend().has_access(
-                subject=subject, action=action, resource=resource
-            )
+            return backend().has_access(subject=subject, action=action, resource=resource)
         except PermissionDepthExceeded:
             return False
 
     def has_module_perms(self, user_obj: Any, app_label: str) -> bool:
         if not getattr(user_obj, "is_active", False):
             return False
-        if app_settings.REBAC_SUPERUSER_BYPASS and getattr(
-            user_obj, "is_superuser", False
-        ):
+        if app_settings.REBAC_SUPERUSER_BYPASS and getattr(user_obj, "is_superuser", False):
             return True
 
         from ..actors import to_subject_ref
@@ -141,13 +135,17 @@ class RebacBackend:
         # whose schema no longer authorises ``read`` — for the
         # admin-sidebar use case overshoot is fine (the per-row
         # ``has_perm`` still gates the actual page render).
-        from ..models import Relationship
+        from ..models import active_relationship_model
 
-        return Relationship.objects.filter(
-            subject_type=subject.subject_type,
-            subject_id=subject.subject_id,
-            resource_type__in=rebac_types,
-        ).exists()
+        return (
+            active_relationship_model()
+            .objects.filter(
+                subject_type=subject.subject_type,
+                subject_id=subject.subject_id,
+                resource_type__in=rebac_types,
+            )
+            .exists()
+        )
 
 
 def _model_level_resource_for_perm(perm: str) -> ObjectRef | None:
@@ -170,7 +168,9 @@ def _model_level_resource_for_perm(perm: str) -> ObjectRef | None:
     _, model_name = codename.split("_", 1)
     try:
         model = django_apps.get_model(app_label, model_name)
-    except (LookupError, ValueError):
+    except LookupError:
+        return None
+    except ValueError:
         return None
     rebac_type = _resource_type_for_model(model)
     if rebac_type is None:

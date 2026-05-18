@@ -47,13 +47,17 @@ def delete_relationships(filter_: RelationshipFilter) -> Zookie:
     from . import backend
     from .actors import current_actor
     from .audit import emit as emit_audit
-    from .models import PermissionAuditEvent
-    from .models import Relationship as RelationshipModel
+    from .models import PermissionAuditEvent, active_relationship_model
 
     # Snapshot the matched rows BEFORE the delete so we can audit each row's
     # canonical wire string. Keep the matcher in lockstep with
     # LocalBackend.delete_relationships — if a future filter field is added
-    # there, mirror it here.
+    # there, mirror it here. The audit projection always uses the
+    # denormalized field names (``resource_type``, ``subject_id``, etc.) —
+    # the registry manager translates filters internally and the property
+    # accessors expose the same names on instances, but for ``.values()``
+    # in registry mode we have to project through the FK rows explicitly.
+    RelationshipModel = active_relationship_model()
     qs = RelationshipModel.objects.all()
     if filter_.resource_type:
         qs = qs.filter(resource_type=filter_.resource_type)
@@ -67,16 +71,37 @@ def delete_relationships(filter_: RelationshipFilter) -> Zookie:
         qs = qs.filter(subject_id=filter_.subject_id)
     if filter_.optional_subject_relation:
         qs = qs.filter(optional_subject_relation=filter_.optional_subject_relation)
-    snapshot = list(
-        qs.values(
-            "resource_type",
-            "resource_id",
-            "relation",
-            "subject_type",
-            "subject_id",
-            "optional_subject_relation",
+    is_registry = RelationshipModel.__name__ == "RelationshipRegistry"
+    if is_registry:
+        snapshot = [
+            {
+                "resource_type": row["resource_fk__resource_type"],
+                "resource_id": row["resource_fk__resource_id"],
+                "relation": row["relation"],
+                "subject_type": row["subject_fk__resource_type"],
+                "subject_id": row["subject_fk__resource_id"],
+                "optional_subject_relation": row["optional_subject_relation"],
+            }
+            for row in qs.values(
+                "resource_fk__resource_type",
+                "resource_fk__resource_id",
+                "relation",
+                "subject_fk__resource_type",
+                "subject_fk__resource_id",
+                "optional_subject_relation",
+            )
+        ]
+    else:
+        snapshot = list(
+            qs.values(
+                "resource_type",
+                "resource_id",
+                "relation",
+                "subject_type",
+                "subject_id",
+                "optional_subject_relation",
+            )
         )
-    )
 
     zookie = backend().delete_relationships(filter_)
 
