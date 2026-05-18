@@ -211,3 +211,172 @@ def test_system_context_allowed_when_sudo_disabled():
             assert is_sudo()
             assert current_sudo_reason() == "asset.load"
         assert not is_sudo()
+
+
+# ---------- bearer_token ----------
+
+
+class _MetaRequest:
+    """Tiny request double that just carries a META dict."""
+
+    def __init__(self, meta: dict | None) -> None:
+        if meta is not None:
+            self.META = meta
+
+
+def test_bearer_token_returns_value_for_bearer_scheme():
+    from rebac.actors import bearer_token
+
+    request = _MetaRequest({"HTTP_AUTHORIZATION": "Bearer sk_test_123"})
+    assert bearer_token(request) == "sk_test_123"
+
+
+def test_bearer_token_scheme_match_is_case_insensitive():
+    from rebac.actors import bearer_token
+
+    for scheme in ("Bearer", "bearer", "BEARER", "BeArEr"):
+        request = _MetaRequest({"HTTP_AUTHORIZATION": f"{scheme} tok"})
+        assert bearer_token(request) == "tok"
+
+
+def test_bearer_token_strips_surrounding_whitespace():
+    from rebac.actors import bearer_token
+
+    request = _MetaRequest({"HTTP_AUTHORIZATION": "Bearer    padded   "})
+    assert bearer_token(request) == "padded"
+
+
+def test_bearer_token_returns_empty_for_non_bearer_scheme():
+    from rebac.actors import bearer_token
+
+    request = _MetaRequest({"HTTP_AUTHORIZATION": "Basic dXNlcjpwYXNz"})
+    assert bearer_token(request) == ""
+
+
+def test_bearer_token_returns_empty_when_header_missing():
+    from rebac.actors import bearer_token
+
+    assert bearer_token(_MetaRequest({})) == ""
+
+
+def test_bearer_token_returns_empty_when_meta_missing():
+    from rebac.actors import bearer_token
+
+    assert bearer_token(_MetaRequest(None)) == ""
+
+
+def test_bearer_token_returns_empty_when_meta_is_not_dict():
+    from rebac.actors import bearer_token
+
+    class _Bad:
+        META = "not a dict"
+
+    assert bearer_token(_Bad()) == ""
+
+
+def test_bearer_token_returns_empty_when_header_value_not_a_string():
+    from rebac.actors import bearer_token
+
+    request = _MetaRequest({"HTTP_AUTHORIZATION": b"Bearer raw_bytes"})
+    assert bearer_token(request) == ""
+
+
+def test_bearer_token_returns_empty_for_bearer_with_no_value():
+    from rebac.actors import bearer_token
+
+    request = _MetaRequest({"HTTP_AUTHORIZATION": "Bearer"})
+    assert bearer_token(request) == ""
+
+
+# ---------- chain_resolvers ----------
+
+
+def test_chain_resolvers_returns_first_non_none_result():
+    from rebac.actors import chain_resolvers
+
+    sentinel = SubjectRef.of("auth/apikey", "key_1")
+
+    def resolver_yes(_request):
+        return sentinel
+
+    def resolver_no(_request):
+        raise AssertionError("should not be called after a hit")
+
+    composed = chain_resolvers(resolver_yes, resolver_no)
+    assert composed(_FakeRequest(user=None)) is sentinel
+
+
+def test_chain_resolvers_skips_resolvers_that_return_none():
+    from rebac.actors import chain_resolvers
+
+    calls: list[str] = []
+
+    def first(_request):
+        calls.append("first")
+        return None
+
+    def second(_request):
+        calls.append("second")
+        return SubjectRef.of("auth/service", "svc_1")
+
+    composed = chain_resolvers(first, second)
+    assert composed(_FakeRequest(user=None)).subject_id == "svc_1"
+    assert calls == ["first", "second"]
+
+
+def test_chain_resolvers_falls_through_to_default_resolver():
+    from rebac.actors import chain_resolvers
+
+    def declines(_request):
+        return None
+
+    composed = chain_resolvers(declines)
+    # Missing user → default_resolver returns ANONYMOUS_ACTOR.
+    assert composed(_FakeRequest(user=None)) == ANONYMOUS_ACTOR
+
+
+def test_chain_resolvers_with_no_resolvers_calls_terminal():
+    from rebac.actors import chain_resolvers
+
+    composed = chain_resolvers()
+    assert composed(_FakeRequest(user=None)) == ANONYMOUS_ACTOR
+
+
+def test_chain_resolvers_accepts_custom_terminal():
+    from rebac.actors import chain_resolvers
+
+    final = SubjectRef.of("auth/user", "fallback")
+
+    def terminal(_request):
+        return final
+
+    composed = chain_resolvers(terminal=terminal)
+    assert composed(_FakeRequest(user=None)) is final
+
+
+def test_chain_resolvers_terminal_none_disables_fallback():
+    from rebac.actors import chain_resolvers
+
+    def declines(_request):
+        return None
+
+    composed = chain_resolvers(declines, terminal=None)
+    assert composed(_FakeRequest(user=None)) is None
+
+
+def test_chain_resolvers_terminal_none_with_empty_chain():
+    from rebac.actors import chain_resolvers
+
+    composed = chain_resolvers(terminal=None)
+    assert composed(_FakeRequest(user=None)) is None
+
+
+def test_chain_resolvers_top_level_export():
+    """The helpers must be importable directly from ``rebac``."""
+
+    from rebac import bearer_token as bearer_token_top
+    from rebac import chain_resolvers as chain_resolvers_top
+    from rebac.actors import bearer_token, chain_resolvers
+
+    assert bearer_token_top is bearer_token
+    assert chain_resolvers_top is chain_resolvers

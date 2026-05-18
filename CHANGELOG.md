@@ -3,6 +3,30 @@
 All notable changes to `django-zed-rebac` are tracked here. The project is in
 pre-1.0; breaking changes within a minor version are explicitly called out.
 
+## [Unreleased]
+
+### Added — composable actor resolvers
+
+- **`rebac.chain_resolvers(*resolvers, terminal=default_resolver)`** —
+  compose multiple actor resolvers into a single callable. Tries each
+  resolver in order; the first non-`None` `SubjectRef` wins. Falls
+  through to `terminal` (default: `default_resolver`) when every
+  supplied resolver declines. Pass `terminal=None` to disable the
+  fallback. Lets downstream addons stack alternative credential paths
+  (bearer-token → API key, service header → service account, …)
+  without re-deriving the user/anonymous resolution that the library
+  already ships.
+- **`rebac.bearer_token(request)`** — parse a `Bearer <token>` value
+  out of `request.META["HTTP_AUTHORIZATION"]`. Case-insensitive scheme
+  match per RFC 7235; returns an empty string when no Bearer
+  credential is present so callers can short-circuit on falsiness.
+  Pairs with `chain_resolvers` so downstream resolvers don't
+  re-implement header parsing.
+
+Both helpers are exported at the top level (`from rebac import
+chain_resolvers, bearer_token`) and also available on
+`rebac.actors`.
+
 ## [0.3.0] — 2026-05-17
 
 Three substantial feature drops since 0.2.0: built-in anonymous subject + role

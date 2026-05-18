@@ -453,3 +453,93 @@ def get_actor_resolver() -> Callable[[Any], SubjectRef | None]:
     module_path, _, attr = path.rpartition(".")
     module = import_module(module_path)
     return getattr(module, attr)
+
+
+# ---------- Composing custom resolvers ----------
+
+
+def chain_resolvers(
+    *resolvers: Callable[[Any], SubjectRef | None],
+    terminal: Callable[[Any], SubjectRef | None] | None = default_resolver,
+) -> Callable[[Any], SubjectRef | None]:
+    """Compose actor resolvers; first non-``None`` result wins.
+
+    Tries each `resolver` in order and returns the first non-``None``
+    :class:`SubjectRef`. If every supplied resolver declines, falls
+    through to `terminal` (default: :func:`default_resolver`). Pass
+    ``terminal=None`` to disable the fallback — the composed resolver
+    then returns ``None`` when every supplied resolver declines, which
+    :class:`~rebac.middleware.ActorMiddleware` surfaces as
+    :class:`~rebac.errors.NoActorResolvedError`.
+
+    Typical use: a downstream addon stacks alternative credential paths
+    (bearer-token → API key, service-token header → service account,
+    …) in front of the default user/anonymous resolution::
+
+        from rebac.actors import bearer_token, chain_resolvers
+
+
+        def _api_key_resolver(request):
+            token = bearer_token(request)
+            if not token:
+                return None
+            key = ApiKey.objects.filter(token_hash=hash(token)).first()
+            return key.as_subject_ref() if key else None
+
+
+        resolve = chain_resolvers(_api_key_resolver)
+
+        # In settings.py:
+        REBAC_ACTOR_RESOLVER = "myapp.actors.resolve"
+
+    The composed callable is plain and pickle-safe (no closure captures
+    beyond the resolver tuple and the terminal), so it can be assigned
+    to a module-level name and referenced from settings directly.
+    """
+
+    chain = tuple(resolvers)
+
+    def chained(request: Any) -> SubjectRef | None:
+        for resolver in chain:
+            ref = resolver(request)
+            if ref is not None:
+                return ref
+        if terminal is None:
+            return None
+        return terminal(request)
+
+    return chained
+
+
+def bearer_token(request: Any) -> str:
+    """Extract ``Bearer <token>`` value from an HTTP Authorization header.
+
+    Reads ``request.META["HTTP_AUTHORIZATION"]`` — the standard Django
+    :class:`~django.http.HttpRequest` shape, also produced by DRF and
+    Strawberry's Django integration. The scheme match is
+    case-insensitive per RFC 7235; the returned token is stripped of
+    surrounding whitespace.
+
+    Returns an empty string when no Bearer credential is present, so
+    callers can short-circuit on falsiness without distinguishing
+    "no header" from "wrong scheme" from "empty value"::
+
+        token = bearer_token(request)
+        if not token:
+            return None
+        ...
+
+    Pair with :func:`chain_resolvers` to build credential-aware actor
+    resolvers without re-deriving the header parse at every call site.
+    """
+
+    meta = getattr(request, "META", None)
+    if not isinstance(meta, dict):
+        return ""
+    header = meta.get("HTTP_AUTHORIZATION", "")
+    if not isinstance(header, str):
+        return ""
+    scheme, _, value = header.partition(" ")
+    if scheme.lower() != "bearer":
+        return ""
+    return value.strip()

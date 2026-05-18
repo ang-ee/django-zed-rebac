@@ -24,6 +24,8 @@ from .actors import (
     ActorLike,
     actor_context,
     anonymous_actor,
+    bearer_token,
+    chain_resolvers,
     current_actor,
     grant_subject_ref,
     is_anonymous_actor,
@@ -133,6 +135,9 @@ __all__ = [
     "to_subject_ref",
     "grant_subject_ref",
     "to_object_ref",
+    # composable resolvers
+    "bearer_token",
+    "chain_resolvers",
     # anonymous
     "ANONYMOUS_ACTOR",
     "anonymous_actor",
