@@ -38,7 +38,6 @@ from threading import Lock
 from typing import Any
 from weakref import WeakSet
 
-from ..actors import is_anonymous_actor
 from ..conf import app_settings
 from ..errors import PermissionDepthExceeded
 from ..schema.ast import (
@@ -50,8 +49,22 @@ from ..schema.ast import (
     PermExpr,
     PermNil,
     PermRef,
-    Relation,
     Schema,
+)
+from ..schema.walker import (
+    WalkContext,
+)
+from ..schema.walker import (
+    builtin_actor_matches as _builtin_actor_matches,
+)
+from ..schema.walker import (
+    eval_expr as _walk_eval_expr,
+)
+from ..schema.walker import (
+    find_relation as _find_relation,
+)
+from ..schema.walker import (
+    tri_and as _and,
 )
 from ..types import (
     CheckResult,
@@ -540,111 +553,94 @@ class LocalBackend(Backend):
             None  — at least one path is conditional on caveat params not yet
                     supplied; the union of missing names is added to
                     `missing` (caller-owned set).
+
+        Implementation delegates the AST walk to :func:`rebac.schema.walker.eval_expr`;
+        :meth:`_walk_resolve_relation` and :meth:`_walk_resolve_arrow` supply
+        the DB-backed direct-relation and arrow-hop resolution.
         """
-        # Depth counts dispatch hops (arrow walks + subject-set traversals),
-        # not expression-tree shape. Binary operators don't increment depth.
-        if depth > app_settings.REBAC_DEPTH_LIMIT:
-            raise PermissionDepthExceeded(f"Depth limit {app_settings.REBAC_DEPTH_LIMIT} exceeded")
         if missing is None:
             missing = set()
-        if isinstance(expr, PermNil):
-            return False
-        if isinstance(expr, PermRef):
-            if expr.name in BUILTIN_ACTOR_TYPES:
-                return _builtin_actor_matches(expr.name, subject)
-            relation = _find_relation(definition, expr.name)
-            if relation is not None:
-                return self._has_direct_relation(
-                    resource_type=definition.resource_type,
-                    resource_id=resource_id,
-                    relation=expr.name,
-                    subject=subject,
-                    depth=depth,
-                    context=context,
-                    missing=missing,
-                )
-            sub_perm = next((p for p in definition.permissions if p.name == expr.name), None)
-            if sub_perm is not None:
-                return self._eval_permission(
-                    sub_perm.expression,
-                    definition,
-                    resource_id,
-                    subject,
-                    depth,
-                    context,
-                    missing,
-                )
-            return False
-        if isinstance(expr, PermArrow):
-            from ..models import active_relationship_model
+        ctx = WalkContext(
+            schema=self.schema(),
+            subject=subject,
+            context=context,
+            missing=missing,
+            depth_limit=app_settings.REBAC_DEPTH_LIMIT,
+            resolve_relation=self._walk_resolve_relation,
+            resolve_arrow=self._walk_resolve_arrow,
+        )
+        return _walk_eval_expr(
+            expr,
+            definition=definition,
+            resource_id=resource_id,
+            depth=depth,
+            ctx=ctx,
+        )
 
-            RelationshipModel = active_relationship_model()
+    def _walk_resolve_relation(
+        self,
+        ctx: WalkContext,
+        definition: Definition,
+        resource_id: str,
+        relation: str,
+        depth: int,
+    ) -> bool | None:
+        return self._has_direct_relation(
+            resource_type=definition.resource_type,
+            resource_id=resource_id,
+            relation=relation,
+            subject=ctx.subject,
+            depth=depth,
+            context=ctx.context,
+            missing=ctx.missing,
+        )
 
-            via = _find_relation(definition, expr.via)
-            if via is None:
-                return False
-            targets = self._apply_freshness(
-                RelationshipModel.objects.filter(
-                    resource_type=definition.resource_type,
-                    resource_id=resource_id,
-                    relation=expr.via,
-                )
+    def _walk_resolve_arrow(
+        self,
+        ctx: WalkContext,
+        definition: Definition,
+        resource_id: str,
+        via: str,
+        target: str,
+        depth: int,
+    ) -> bool | None:
+        from ..models import active_relationship_model
+
+        RelationshipModel = active_relationship_model()
+        targets = self._apply_freshness(
+            RelationshipModel.objects.filter(
+                resource_type=definition.resource_type,
+                resource_id=resource_id,
+                relation=via,
             )
-            saw_conditional = False
-            for row in targets:
-                # The hop row itself may carry a caveat — evaluate it before
-                # walking through to the target type.
-                hop = self._evaluate_row_caveat(row, context, missing)
-                if hop is False:
-                    continue
-                target_def = self.schema().get_definition(row.subject_type)
-                if target_def is None:
-                    continue
-                inner = self._eval_permission_on(
-                    permission_name=expr.target,
-                    definition=target_def,
-                    resource_id=row.subject_id,
-                    subject=subject,
-                    depth=depth + 1,
-                    context=context,
-                    missing=missing,
-                )
-                # Combine hop AND inner.
-                combined = _and(hop, inner)
-                if combined is True:
-                    return True
-                if combined is None:
-                    saw_conditional = True
-            if saw_conditional:
-                return None
-            return False
-        if isinstance(expr, PermBinOp):
-            left = self._eval_permission(
-                expr.left, definition, resource_id, subject, depth, context, missing
+        )
+        saw_conditional = False
+        for row in targets:
+            # The hop row itself may carry a caveat — evaluate it before
+            # walking through to the target type.
+            hop = self._evaluate_row_caveat(row, ctx.context, ctx.missing)
+            if hop is False:
+                continue
+            target_def = ctx.schema.get_definition(row.subject_type)
+            if target_def is None:
+                continue
+            inner = self._eval_permission_on(
+                permission_name=target,
+                definition=target_def,
+                resource_id=row.subject_id,
+                subject=ctx.subject,
+                depth=depth + 1,
+                context=ctx.context,
+                missing=ctx.missing,
             )
-            if expr.op == "+":
-                if left is True:
-                    return True
-                right = self._eval_permission(
-                    expr.right, definition, resource_id, subject, depth, context, missing
-                )
-                return _or(left, right)
-            if expr.op == "&":
-                if left is False:
-                    return False
-                right = self._eval_permission(
-                    expr.right, definition, resource_id, subject, depth, context, missing
-                )
-                return _and(left, right)
-            if expr.op == "-":
-                if left is False:
-                    return False
-                right = self._eval_permission(
-                    expr.right, definition, resource_id, subject, depth, context, missing
-                )
-                return _minus(left, right)
-            raise ValueError(f"unknown operator: {expr.op}")
-        raise TypeError(f"unknown PermExpr: {expr!r}")
+            combined = _and(hop, inner)
+            if combined is True:
+                return True
+            if combined is None:
+                saw_conditional = True
+        if saw_conditional:
+            return None
+        return False
 
     def _expr_grants_all(
         self,
@@ -1069,37 +1065,6 @@ def mark_db_loaded_schemas_stale() -> None:
         backend.mark_schema_stale()
 
 
-def _find_relation(definition: Definition, name: str) -> Relation | None:
-    for r in definition.relations:
-        if r.name == name:
-            return r
-    return None
-
-
-def _builtin_actor_matches(name: str, subject: SubjectRef) -> bool:
-    """Match the bare schema keywords ``anonymous`` / ``authenticated``.
-
-    ``anonymous`` matches exactly the canonical anonymous SubjectRef
-    (``REBAC_ANONYMOUS_TYPE:*``, default ``auth/anonymous:*``).
-    ``authenticated`` matches any other subject with a real id — every
-    subject that isn't the anonymous singleton.
-
-    Delegates the anonymous shape to :func:`actors.is_anonymous_actor` so the
-    two surfaces (actor layer and engine) cannot desynchronize if a future
-    change tightens what "anonymous" means.
-    """
-    anonymous = is_anonymous_actor(subject)
-    if name == "anonymous":
-        return anonymous
-    if name == "authenticated":
-        # Anything that isn't the anonymous singleton — including
-        # subject-set rows (``auth/group:eng#member``) and other wildcard
-        # subjects — counts as authenticated. The id check guards against
-        # degenerate empty-string ids.
-        return not anonymous and subject.subject_id != ""
-    return False
-
-
 def _collect_direct_relations(expr: PermExpr) -> set[str]:
     """Walk a permission expression and collect bottom-most relation names.
 
@@ -1114,46 +1079,6 @@ def _collect_direct_relations(expr: PermExpr) -> set[str]:
     if isinstance(expr, PermBinOp):
         return _collect_direct_relations(expr.left) | _collect_direct_relations(expr.right)
     return set()
-
-
-# ---------- Tri-state operators ----------
-#
-# `None` means "conditional on caveat params not yet supplied" — short-circuit
-# where possible (True absorbs OR; False absorbs AND), otherwise propagate
-# CONDITIONAL up to the caller. Mirrors SpiceDB's caveat semantics.
-
-
-def _or(left: bool | None, right: bool | None) -> bool | None:
-    if left is True or right is True:
-        return True
-    if left is None or right is None:
-        return None
-    return False
-
-
-def _and(left: bool | None, right: bool | None) -> bool | None:
-    if left is False or right is False:
-        return False
-    if left is None or right is None:
-        return None
-    return True
-
-
-def _minus(left: bool | None, right: bool | None) -> bool | None:
-    # `a - b` ≡ `a AND NOT b`. None on the left absorbs through AND when the
-    # right side denies; otherwise we don't know the answer.
-    if left is False:
-        return False
-    if left is None and right is True:
-        return False  # whatever 'left' resolves to, '- True' kills it.
-    if left is None:
-        return None
-    # left is True
-    if right is True:
-        return False
-    if right is False:
-        return True
-    return None
 
 
 def _filter_active(qs: object) -> object:

@@ -24,9 +24,7 @@ from rebac import RebacPermissionsMixin
 class _FakeUser:
     """Plain Python user — exercises the methods without a Django row."""
 
-    def __init__(
-        self, *, is_active: bool = True, is_superuser: bool = False
-    ) -> None:
+    def __init__(self, *, is_active: bool = True, is_superuser: bool = False) -> None:
         self.is_active = is_active
         self.is_superuser = is_superuser
 
@@ -73,27 +71,29 @@ class _NoMethodsBackend:
 # ---------- has_perm ----------
 
 
-@override_settings(AUTHENTICATION_BACKENDS=[
-    "tests.test_permissions_mixin._AlwaysFalseBackend"
-])
+@override_settings(AUTHENTICATION_BACKENDS=["tests.test_permissions_mixin._AlwaysFalseBackend"])
 def test_has_perm_returns_false_when_no_backend_grants():
     user = _FakeUser()
     assert user.has_perm("any.perm") is False
 
 
-@override_settings(AUTHENTICATION_BACKENDS=[
-    "tests.test_permissions_mixin._AlwaysFalseBackend",
-    "tests.test_permissions_mixin._GrantBackend",
-])
+@override_settings(
+    AUTHENTICATION_BACKENDS=[
+        "tests.test_permissions_mixin._AlwaysFalseBackend",
+        "tests.test_permissions_mixin._GrantBackend",
+    ]
+)
 def test_has_perm_returns_true_when_any_backend_grants():
     user = _FakeUser()
     assert user.has_perm("any.perm") is True
 
 
-@override_settings(AUTHENTICATION_BACKENDS=[
-    "tests.test_permissions_mixin._RaisingBackend",
-    "tests.test_permissions_mixin._GrantBackend",
-])
+@override_settings(
+    AUTHENTICATION_BACKENDS=[
+        "tests.test_permissions_mixin._RaisingBackend",
+        "tests.test_permissions_mixin._GrantBackend",
+    ]
+)
 def test_has_perm_short_circuits_on_permission_denied():
     """A backend raising PermissionDenied wins — the chain stops there
     even if a later backend would grant. Matches contrib.auth's
@@ -116,19 +116,23 @@ class _RebacDenyingBackend:
         raise RebacPermissionDenied("rebac says no")
 
 
-@override_settings(AUTHENTICATION_BACKENDS=[
-    "tests.test_permissions_mixin._RebacDenyingBackend",
-    "tests.test_permissions_mixin._GrantBackend",
-])
+@override_settings(
+    AUTHENTICATION_BACKENDS=[
+        "tests.test_permissions_mixin._RebacDenyingBackend",
+        "tests.test_permissions_mixin._GrantBackend",
+    ]
+)
 def test_has_perm_short_circuits_on_rebac_permission_denied():
     user = _FakeUser()
     assert user.has_perm("any.perm") is False
 
 
-@override_settings(AUTHENTICATION_BACKENDS=[
-    "tests.test_permissions_mixin._NoMethodsBackend",
-    "tests.test_permissions_mixin._GrantBackend",
-])
+@override_settings(
+    AUTHENTICATION_BACKENDS=[
+        "tests.test_permissions_mixin._NoMethodsBackend",
+        "tests.test_permissions_mixin._GrantBackend",
+    ]
+)
 def test_has_perm_skips_backends_without_method():
     user = _FakeUser()
     assert user.has_perm("any.perm") is True
@@ -143,9 +147,7 @@ def test_has_perm_active_superuser_bypasses():
         assert user.has_perm("any.perm") is True
 
 
-@override_settings(AUTHENTICATION_BACKENDS=[
-    "tests.test_permissions_mixin._GrantBackend"
-])
+@override_settings(AUTHENTICATION_BACKENDS=["tests.test_permissions_mixin._GrantBackend"])
 def test_has_perm_inactive_superuser_still_walks_backends():
     """Inactive users skip the superuser fast-path and let the backend
     chain answer — the backend is responsible for re-checking
@@ -160,17 +162,13 @@ def test_has_perm_inactive_superuser_still_walks_backends():
 # ---------- has_perms ----------
 
 
-@override_settings(AUTHENTICATION_BACKENDS=[
-    "tests.test_permissions_mixin._GrantBackend"
-])
+@override_settings(AUTHENTICATION_BACKENDS=["tests.test_permissions_mixin._GrantBackend"])
 def test_has_perms_true_when_all_granted():
     user = _FakeUser()
     assert user.has_perms(["a", "b", "c"]) is True
 
 
-@override_settings(AUTHENTICATION_BACKENDS=[
-    "tests.test_permissions_mixin._AlwaysFalseBackend"
-])
+@override_settings(AUTHENTICATION_BACKENDS=["tests.test_permissions_mixin._AlwaysFalseBackend"])
 def test_has_perms_false_when_any_denied():
     user = _FakeUser()
     assert user.has_perms(["a", "b"]) is False
@@ -187,26 +185,24 @@ def test_has_perms_rejects_string_argument():
 # ---------- has_module_perms ----------
 
 
-@override_settings(AUTHENTICATION_BACKENDS=[
-    "tests.test_permissions_mixin._GrantBackend"
-])
+@override_settings(AUTHENTICATION_BACKENDS=["tests.test_permissions_mixin._GrantBackend"])
 def test_has_module_perms_true_when_backend_grants():
     user = _FakeUser()
     assert user.has_module_perms("any_app") is True
 
 
-@override_settings(AUTHENTICATION_BACKENDS=[
-    "tests.test_permissions_mixin._AlwaysFalseBackend"
-])
+@override_settings(AUTHENTICATION_BACKENDS=["tests.test_permissions_mixin._AlwaysFalseBackend"])
 def test_has_module_perms_false_when_no_backend_grants():
     user = _FakeUser()
     assert user.has_module_perms("any_app") is False
 
 
-@override_settings(AUTHENTICATION_BACKENDS=[
-    "tests.test_permissions_mixin._RaisingBackend",
-    "tests.test_permissions_mixin._GrantBackend",
-])
+@override_settings(
+    AUTHENTICATION_BACKENDS=[
+        "tests.test_permissions_mixin._RaisingBackend",
+        "tests.test_permissions_mixin._GrantBackend",
+    ]
+)
 def test_has_module_perms_short_circuits_on_permission_denied():
     user = _FakeUser()
     assert user.has_module_perms("any_app") is False

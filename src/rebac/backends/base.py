@@ -5,6 +5,7 @@ from __future__ import annotations
 from abc import ABC, abstractmethod
 from collections.abc import Iterable
 
+from ..schema.ast import Schema
 from ..types import (
     CheckResult,
     Consistency,
@@ -96,3 +97,16 @@ class Backend(ABC):
 
     @abstractmethod
     def delete_relationship(self, tuple_: RelationshipTuple) -> Zookie: ...
+
+    @abstractmethod
+    def schema(self) -> Schema:
+        """Return the installed schema AST.
+
+        Mirrors SpiceDB's ``ReadSchema`` — the parsed AST is the canonical
+        in-process representation. Engine-side semantic checks (notably
+        :func:`rebac.preflight.check_new`) require this to walk permission
+        expressions before any row exists; ``lookup_subjects`` reverse
+        walks will also lean on it once they grow past direct-relation
+        rows. SpiceDBBackend will implement by caching the result of
+        ``Client.ReadSchema()`` parsed through :func:`rebac.schema.parse_zed`.
+        """

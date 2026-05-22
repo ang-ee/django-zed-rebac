@@ -36,11 +36,7 @@ def test_with_action_survives_queryset_cloning() -> None:
     manager = RebacManager()
     manager.model = Post
 
-    queryset = (
-        manager.with_action("credential_lookup")
-        .filter(title="Notes")
-        .order_by("id")
-    )
+    queryset = manager.with_action("credential_lookup").filter(title="Notes").order_by("id")
 
     assert queryset._rebac_action == "credential_lookup"
 

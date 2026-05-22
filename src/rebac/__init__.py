@@ -15,7 +15,7 @@ from __future__ import annotations
 
 from typing import TYPE_CHECKING, Any
 
-__version__ = "0.3.2"
+__version__ = "0.4.0"
 
 default_app_config = "rebac.apps.RebacConfig"
 
@@ -52,6 +52,7 @@ from .errors import (
     SchemaError,
 )
 from .evaluator import PermissionEvaluator, current_evaluator, evaluator_scope
+from .preflight import check_new
 from .types import (
     CheckResult,
     Consistency,
@@ -160,6 +161,8 @@ __all__ = [
     "PermissionEvaluator",
     "current_evaluator",
     "evaluator_scope",
+    # preflight — create-time check against not-yet-persisted resources
+    "check_new",
     # consistency (proposal 0002)
     "current_zookie",
     "record_zookie",

@@ -3,6 +3,53 @@
 All notable changes to `django-zed-rebac` are tracked here. The project is in
 pre-1.0; breaking changes within a minor version are explicitly called out.
 
+## [0.4.0] — 2026-05-22
+
+### Added — preflight against not-yet-persisted resources
+
+- **`rebac.check_new(*, subject, action, resource_type, relationships=None,
+  backend=None, context=None) -> CheckResult`** — three-state preflight
+  for create-style permissions. Authorises a row *before* it exists by
+  evaluating the schema's permission expression against a caller-supplied
+  virtual `relation → subjects` overlay. Arrow hops walk into the real
+  target via `backend.check_access`, so caveat-conditional outcomes on
+  the target propagate as `CONDITIONAL_PERMISSION` with the union of
+  missing parameter names. Built-in actor terms (`anonymous` /
+  `authenticated`), subject-set candidates (`auth/group:eng#member`
+  inside a virtual relation), `<type>:*` wildcards, the `+ & -`
+  operators, sub-permission references, and `REBAC_DEPTH_LIMIT` are all
+  honoured via the shared walker.
+
+  Documented in `docs/ARCHITECTURE.md § check_new`. Free function by
+  intent — SpiceDB ships no "check with proposed tuples" RPC, so this
+  deliberately lives outside the `Backend` ABC. A SpiceDB-mode
+  implementation in 0.5+ will likely use a write-then-rollback
+  sub-transaction strategy.
+
+### Added — `Backend.schema()` abstract method (BREAKING for external subclasses)
+
+- **`Backend.schema() -> Schema`** — promoted from a `LocalBackend`
+  private to an ABC method. Mirrors SpiceDB's `ReadSchema`; required by
+  engine-side semantic checks (notably `check_new`) that walk
+  permission expressions before any row exists. `SpiceDBBackend`
+  carries a `raise NotImplementedError` stub until 0.5 wires
+  `Client.ReadSchema()`. **External `Backend` subclasses must
+  implement `schema()`** — adding the abstract method without a
+  fallback is intentional, per CLAUDE.md's "no backwards-compat shims
+  during 0.x" rule.
+
+### Changed — shared AST walker (`rebac.schema.walker`)
+
+- Refactored `LocalBackend._eval_permission`'s permission-expression
+  dispatcher into a reusable, injection-shaped tri-state walker at
+  `rebac.schema.walker`. Operator precedence, sub-permission cycle
+  detection, depth bookkeeping, `OR/AND/MINUS` tri-state combinators,
+  and the `anonymous` / `authenticated` built-in actor matching now
+  live in one place. `LocalBackend` and `check_new` both go through it
+  via caller-supplied `resolve_relation` / `resolve_arrow` callbacks.
+  Pure internal restructure — no behaviour change for existing
+  `check_access` / `accessible` callers.
+
 ## [0.3.2] — 2026-05-18
 
 Follow-up patch addressing review findings against 0.3.1.

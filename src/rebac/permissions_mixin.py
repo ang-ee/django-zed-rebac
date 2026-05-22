@@ -49,9 +49,7 @@ from django.core.exceptions import PermissionDenied
 from django.db import models
 
 
-def _walk_backends(
-    method_name: str, *args: Any, **kwargs: Any
-) -> bool:
+def _walk_backends(method_name: str, *args: Any, **kwargs: Any) -> bool:
     """Iterate ``AUTHENTICATION_BACKENDS`` and stop on first ``True``.
 
     A backend may raise :class:`PermissionDenied` to short-circuit the
@@ -78,9 +76,7 @@ def _walk_backends(
     return False
 
 
-async def _awalk_backends(
-    method_name: str, *args: Any, **kwargs: Any
-) -> bool:
+async def _awalk_backends(method_name: str, *args: Any, **kwargs: Any) -> bool:
     """Async sibling of :func:`_walk_backends`.
 
     Backends that ship the ``a``-prefixed sibling get awaited; ones
@@ -98,9 +94,7 @@ async def _awalk_backends(
     return False
 
 
-def _walk_get_permissions(
-    user: Any, obj: Any, scope: str
-) -> set[str]:
+def _walk_get_permissions(user: Any, obj: Any, scope: str) -> set[str]:
     """Aggregate permission codenames from every backend.
 
     Mirrors ``django.contrib.auth.models._user_get_permissions``: do
@@ -120,9 +114,7 @@ def _walk_get_permissions(
     return seen
 
 
-async def _awalk_get_permissions(
-    user: Any, obj: Any, scope: str
-) -> set[str]:
+async def _awalk_get_permissions(user: Any, obj: Any, scope: str) -> set[str]:
     """Async sibling of :func:`_walk_get_permissions`."""
     seen: set[str] = set()
     method_name = f"aget_{scope}_permissions"
@@ -153,8 +145,7 @@ class RebacPermissionsMixin(models.Model):
         "superuser status",
         default=False,
         help_text=(
-            "Designates that this user has all permissions without "
-            "explicitly assigning them."
+            "Designates that this user has all permissions without explicitly assigning them."
         ),
     )
 
@@ -195,9 +186,7 @@ class RebacPermissionsMixin(models.Model):
         contrib.auth's guard rail — a stringly-typed argument here is
         almost always a typo for ``has_perm``).
         """
-        if not isinstance(perm_list, Iterable) or isinstance(
-            perm_list, str
-        ):
+        if not isinstance(perm_list, Iterable) or isinstance(perm_list, str):
             raise ValueError("perm_list must be an iterable of permissions.")
         return all(self.has_perm(perm, obj) for perm in perm_list)
 
@@ -215,19 +204,13 @@ class RebacPermissionsMixin(models.Model):
 
     # ---------- Async siblings (Django 4.1+) ----------
 
-    async def aget_user_permissions(
-        self, obj: Any = None
-    ) -> set[str]:
+    async def aget_user_permissions(self, obj: Any = None) -> set[str]:
         return await _awalk_get_permissions(self, obj, "user")
 
-    async def aget_group_permissions(
-        self, obj: Any = None
-    ) -> set[str]:
+    async def aget_group_permissions(self, obj: Any = None) -> set[str]:
         return await _awalk_get_permissions(self, obj, "group")
 
-    async def aget_all_permissions(
-        self, obj: Any = None
-    ) -> set[str]:
+    async def aget_all_permissions(self, obj: Any = None) -> set[str]:
         return await _awalk_get_permissions(self, obj, "all")
 
     async def ahas_perm(self, perm: str, obj: Any = None) -> bool:
@@ -235,15 +218,9 @@ class RebacPermissionsMixin(models.Model):
             return True
         return await _awalk_backends("ahas_perm", self, perm, obj)
 
-    async def ahas_perms(
-        self, perm_list: Iterable[str], obj: Any = None
-    ) -> bool:
-        if not isinstance(perm_list, Iterable) or isinstance(
-            perm_list, str
-        ):
-            raise ValueError(
-                "perm_list must be an iterable of permissions."
-            )
+    async def ahas_perms(self, perm_list: Iterable[str], obj: Any = None) -> bool:
+        if not isinstance(perm_list, Iterable) or isinstance(perm_list, str):
+            raise ValueError("perm_list must be an iterable of permissions.")
         for perm in perm_list:
             if not await self.ahas_perm(perm, obj):
                 return False
@@ -252,9 +229,7 @@ class RebacPermissionsMixin(models.Model):
     async def ahas_module_perms(self, app_label: str) -> bool:
         if self.is_active and self.is_superuser:
             return True
-        return await _awalk_backends(
-            "ahas_module_perms", self, app_label
-        )
+        return await _awalk_backends("ahas_module_perms", self, app_label)
 
 
 __all__ = ["RebacPermissionsMixin"]

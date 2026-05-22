@@ -168,15 +168,14 @@ def test_with_action_changes_queryset_read_scope(alice, bob, post):
     from tests.testapp.models import Post
 
     assert list(Post.objects.as_user(bob).values_list("pk", flat=True)) == [post.pk]
+    assert (
+        list(
+            Post.objects.with_action("credential_lookup").as_user(bob).values_list("pk", flat=True)
+        )
+        == []
+    )
     assert list(
-        Post.objects.with_action("credential_lookup")
-        .as_user(bob)
-        .values_list("pk", flat=True)
-    ) == []
-    assert list(
-        Post.objects.with_action("credential_lookup")
-        .as_user(alice)
-        .values_list("pk", flat=True)
+        Post.objects.with_action("credential_lookup").as_user(alice).values_list("pk", flat=True)
     ) == [post.pk]
 
 

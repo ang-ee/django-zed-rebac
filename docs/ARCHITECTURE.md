@@ -265,6 +265,9 @@ from rebac import (
     # Convenience helpers
     write_relationships, delete_relationships, delete_relationship, backend,
 
+    # Preflight against not-yet-persisted resources (0.4+)
+    check_new,
+
     # Composable resolvers (0.3.1+)
     chain_resolvers, bearer_token,
 
@@ -845,9 +848,76 @@ class Backend(ABC):
         caller to construct an updates-with-operation list. Planned to be
         lowered through ``WriteRelationships`` in 0.4 once the ABC
         accepts operation-shaped updates."""
+
+    def schema(self) -> Schema:
+        """Return the installed schema AST.
+
+        Mirrors SpiceDB's ``ReadSchema``. Required by engine-side
+        semantic checks (notably ``rebac.check_new``) that walk
+        permission expressions before any row exists; ``lookup_subjects``
+        reverse walks will also lean on it once they grow past direct-
+        relation rows. LocalBackend serves the in-memory composed schema;
+        SpiceDBBackend will implement by caching the parsed result of
+        ``Client.ReadSchema()`` (0.5+)."""
 ```
 
 `CheckResult` is `(allowed: bool, conditional_on: list[str], reason: str | None)`. The `conditional_on` field lists caveat parameter names whose context wasn't supplied — the caller may retry.
+
+### `check_new` — preflight against not-yet-persisted resources
+
+Auto-CRUD create paths need to authorise a row *before* it exists. The
+permission expression on the resource type may reference relations that
+the new row would carry once written — e.g.::
+
+    definition blog/post {
+        relation vault: blog/vault
+        permission create = vault->write
+    }
+
+There are no ``Relationship`` rows on ``blog/post:<id>`` yet, so
+``Backend.check_access`` short-circuits to deny. Instead the caller
+supplies the relations the new row *would* point at, and
+:func:`rebac.check_new` evaluates the expression against that virtual
+overlay::
+
+    from rebac import check_new, SubjectRef
+
+    result = check_new(
+        subject=SubjectRef.of("auth/user", "alice"),
+        action="create",
+        resource_type="blog/post",
+        relationships={"vault": [SubjectRef.of("blog/vault", "v1")]},
+    )
+    if not result.allowed:
+        raise PermissionDenied(result.reason)
+
+Arrow hops walk into the (real) target via the active backend's
+``check_access``, so all post-hop evaluation reuses the canonical
+semantics — caveat-conditional outcomes propagate as
+``CONDITIONAL_PERMISSION`` with the union of missing caveat
+parameters. The dispatch (operator precedence, sub-permission cycle
+detection, ``anonymous`` / ``authenticated`` built-ins, tri-state
+combinators, ``REBAC_DEPTH_LIMIT``) reuses the shared walker that
+backs ``LocalBackend._eval_permission``.
+
+**Deliberately outside the ``Backend`` ABC.** ``check_new`` is a free
+function, not a backend RPC, because SpiceDB ships no "check with
+proposed tuples" call. A SpiceDB-mode strategy when 0.5 lands is to
+``WriteRelationships`` the proposed tuples in a sub-transaction,
+``CheckPermission`` against the (now-real) row, then roll back. Until
+then, ``check_new`` raises a clear ``RuntimeError`` if the active
+backend's ``schema()`` is not implemented.
+
+Limitations (0.4):
+
+* Caveats on the **top-level virtual tuples** are not supported — the
+  ``relationships`` overlay is a bare ``SubjectRef`` sequence with no
+  caveat context. Caveat-conditional ``create`` permissions still
+  resolve correctly for the *post-hop* targets (the real rows
+  ``check_access`` walks into).
+* Subject-set candidates (``auth/group:eng#member``) inside a virtual
+  relation list are resolved through the backend on the real group row
+  — that subject-set walk costs one dispatch level.
 
 ---
 

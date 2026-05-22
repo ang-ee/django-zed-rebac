@@ -191,8 +191,6 @@ def test_write_zookie_is_batch_high_watermark(backend, django_assert_num_queries
         ]
     )
     Rel = active_relationship_model()
-    max_row_xid = max(
-        r.written_at_xid for r in Rel.objects.filter(resource_type="blog/post")
-    )
+    max_row_xid = max(r.written_at_xid for r in Rel.objects.filter(resource_type="blog/post"))
     # Token equals the batch's max xid — not strictly greater.
     assert int(z.token) == max_row_xid

@@ -62,17 +62,13 @@ def _setup_schema(db):
 @pytest.fixture
 def user(db):
     User = get_user_model()
-    return User.objects.create_user(
-        username="alice", email="alice@example.com", password="x"
-    )
+    return User.objects.create_user(username="alice", email="alice@example.com", password="x")
 
 
 @pytest.fixture
 def other_user(db):
     User = get_user_model()
-    return User.objects.create_user(
-        username="bob", email="bob@example.com", password="x"
-    )
+    return User.objects.create_user(username="bob", email="bob@example.com", password="x")
 
 
 @pytest.fixture
@@ -103,10 +99,7 @@ def test_has_perm_object_level_owner_can_change(user, post):
 
 def test_has_perm_object_level_non_owner_denied(other_user, post):
     backend_ = RebacBackend()
-    assert (
-        backend_.has_perm(other_user, "testapp.change_post", obj=post)
-        is False
-    )
+    assert backend_.has_perm(other_user, "testapp.change_post", obj=post) is False
 
 
 def test_has_perm_inactive_user_always_denied(user, post):
@@ -119,9 +112,7 @@ def test_has_perm_inactive_user_always_denied(user, post):
 # ---------- Model-level (admin changelist / "Add") ----------
 
 
-def test_has_perm_model_level_returns_true_when_user_has_any_access(
-    user, post
-):
+def test_has_perm_model_level_returns_true_when_user_has_any_access(user, post):
     backend_ = RebacBackend()
     # User owns post, so they have read on at least one blog/post row.
     assert backend_.has_perm(user, "testapp.view_post") is True
@@ -233,10 +224,7 @@ def test_has_perm_object_level_unresolvable_obj_defers(user):
     """An object that can't resolve to an ObjectRef returns False
     rather than crashing the auth chain."""
     backend_ = RebacBackend()
-    assert (
-        backend_.has_perm(user, "testapp.change_post", obj=object())
-        is False
-    )
+    assert backend_.has_perm(user, "testapp.change_post", obj=object()) is False
 
 
 def test_has_perm_add_verb_routes_to_create_action(user, post):

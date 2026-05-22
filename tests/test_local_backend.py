@@ -320,18 +320,14 @@ def test_cached_db_schema_does_not_query_schema_tables_on_hot_path() -> None:
     backend = LocalBackend()
     post = _post("p-db-hot-path")
     alice = _user("alice")
-    backend.write_relationships(
-        [RelationshipTuple(resource=post, relation="owner", subject=alice)]
-    )
+    backend.write_relationships([RelationshipTuple(resource=post, relation="owner", subject=alice)])
 
     assert backend.has_access(subject=alice, action="read", resource=post)
 
     with CaptureQueriesContext(connection) as queries:
         assert backend.has_access(subject=alice, action="read", resource=post)
 
-    schema_queries = [
-        query["sql"] for query in queries if '"rebac_schema' in query["sql"].lower()
-    ]
+    schema_queries = [query["sql"] for query in queries if '"rebac_schema' in query["sql"].lower()]
     assert schema_queries == []
 
 

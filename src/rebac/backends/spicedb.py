@@ -10,6 +10,7 @@ from __future__ import annotations
 from collections.abc import Iterable
 
 from ..conf import app_settings
+from ..schema.ast import Schema
 from ..types import (
     CheckResult,
     Consistency,
@@ -91,4 +92,7 @@ class SpiceDBBackend(Backend):
         raise NotImplementedError
 
     def delete_relationship(self, tuple_: RelationshipTuple) -> Zookie:
+        raise NotImplementedError
+
+    def schema(self) -> Schema:
         raise NotImplementedError
