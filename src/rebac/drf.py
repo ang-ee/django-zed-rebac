@@ -18,8 +18,8 @@ from rest_framework.permissions import BasePermission
 from .actors import current_actor, to_subject_ref
 from .backends import backend
 from .errors import NoActorResolvedError
-from .resources import to_object_ref
-from .types import ObjectRef
+from .resources import model_resource_type, to_object_ref
+from .types import ObjectRef, SubjectRef
 
 _DEFAULT_ACTION_MAP = {
     "list": "read",
@@ -47,18 +47,12 @@ class RebacPermission(BasePermission):  # type: ignore[misc]  # untyped third-pa
         if rebac_action is None:
             return True
 
-        user = getattr(request, "user", None)
-        try:
-            subject = to_subject_ref(user) if user else None
-        except NoActorResolvedError:
-            subject = None
-        if subject is None:
-            subject = current_actor()
+        subject = _subject_from_request(request)
         if subject is None:
             return False
 
         model_cls = getattr(getattr(view, "queryset", None), "model", None)
-        rebac_type = getattr(getattr(model_cls, "_meta", None), "rebac_resource_type", None)
+        rebac_type = model_resource_type(model_cls) if model_cls is not None else None
         if not rebac_type:
             return True
 
@@ -75,13 +69,7 @@ class RebacPermission(BasePermission):  # type: ignore[misc]  # untyped third-pa
         if rebac_action is None:
             return True
 
-        user = getattr(request, "user", None)
-        try:
-            subject = to_subject_ref(user) if user else None
-        except NoActorResolvedError:
-            subject = None
-        if subject is None:
-            subject = current_actor()
+        subject = _subject_from_request(request)
         if subject is None:
             return False
 
@@ -96,9 +84,20 @@ class RebacFilterBackend(BaseFilterBackend):  # type: ignore[misc]  # untyped th
     """Scopes a viewset's queryset to the actor."""
 
     def filter_queryset(self, request: Any, queryset: Any, view: Any) -> Any:
-        user = getattr(request, "user", None)
-        if not user or not getattr(user, "is_authenticated", False):
-            return queryset.none()
         if not hasattr(queryset, "as_user"):
             return queryset
-        return queryset.as_user(user)
+        subject = _subject_from_request(request)
+        if subject is None:
+            return queryset.none()
+        return queryset.with_actor(subject)
+
+
+def _subject_from_request(request: Any) -> SubjectRef | None:
+    subject = current_actor()
+    if subject is not None:
+        return subject
+    user = getattr(request, "user", None)
+    try:
+        return to_subject_ref(user) if user is not None else None
+    except NoActorResolvedError:
+        return None

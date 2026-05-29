@@ -23,6 +23,17 @@ from ...models.resource import RebacResource
 from ...schema.parser import parse_zed, validate_schema
 
 
+def _stale_record_prune_order(external_id: str) -> tuple[int, str]:
+    kind, _, _name = external_id.partition(":")
+    order = {
+        "relation": 0,
+        "permission": 0,
+        "definition": 1,
+        "caveat": 1,
+    }
+    return (order.get(kind, 2), external_id)
+
+
 class Command(BaseCommand):
     help = "Manage rebac schema (sync / check / build-zed / explain)."
 
@@ -101,14 +112,15 @@ class Command(BaseCommand):
         force = options["force_overwrite"]
         only_package = options.get("package")
 
-        any_drift = False
+        sources: list[tuple[Any, Path, Any]] = []
+        seen_definitions: dict[str, str] = {}
+        seen_caveats: dict[str, str] = {}
         for app_config in apps.get_app_configs():
             schema_path = self._resolve_schema_path(app_config)
             if schema_path is None:
                 continue
             package_name = app_config.name
-            if only_package and only_package != package_name:
-                continue
+            selected = not only_package or only_package == package_name
 
             text = schema_path.read_text(encoding="utf-8")
             schema = parse_zed(text)
@@ -117,12 +129,37 @@ class Command(BaseCommand):
                 for e in errors:
                     self.stderr.write(self.style.ERROR(f"  {package_name}: {e}"))
                 raise CommandError(f"Schema validation failed for {package_name}")
+            for definition in schema.definitions:
+                previous = seen_definitions.get(definition.resource_type)
+                if previous is not None:
+                    raise CommandError(
+                        f"Duplicate definition {definition.resource_type!r} found in "
+                        f"{previous} and {package_name}"
+                    )
+                seen_definitions[definition.resource_type] = package_name
+            for caveat in schema.caveats:
+                previous = seen_caveats.get(caveat.name)
+                if previous is not None:
+                    raise CommandError(
+                        f"Duplicate caveat {caveat.name!r} found in "
+                        f"{previous} and {package_name}"
+                    )
+                seen_caveats[caveat.name] = package_name
+            if selected:
+                sources.append((app_config, schema_path, schema))
+
+        any_drift = False
+        for app_config, schema_path, schema in sources:
+            package_name = app_config.name
 
             self.stdout.write(f"-> {package_name} ({schema_path})")
 
             with transaction.atomic():
+                expected_external_ids: set[str] = set()
                 # Caveats first (definitions reference them).
                 for caveat in schema.caveats:
+                    external_id = f"caveat:{caveat.name}"
+                    expected_external_ids.add(external_id)
                     payload = {
                         "params": [{"name": p.name, "type": p.type} for p in caveat.params],
                         "expression": caveat.expression,
@@ -132,7 +169,7 @@ class Command(BaseCommand):
                         natural_key={"name": caveat.name},
                         payload=payload,
                         package=package_name,
-                        external_id=f"caveat:{caveat.name}",
+                        external_id=external_id,
                         check_only=check_only,
                         force=force,
                     )
@@ -140,21 +177,27 @@ class Command(BaseCommand):
 
                 # Definitions
                 for d in schema.definitions:
+                    external_id = f"definition:{d.resource_type}"
+                    expected_external_ids.add(external_id)
                     drift = self._sync_row(
                         SchemaDefinition,
                         natural_key={"resource_type": d.resource_type},
                         payload={},
                         package=package_name,
-                        external_id=f"definition:{d.resource_type}",
+                        external_id=external_id,
                         check_only=check_only,
                         force=force,
                     )
                     any_drift = any_drift or drift
-                    if check_only:
+                    schema_def = SchemaDefinition.objects.filter(resource_type=d.resource_type).first()
+                    if schema_def is None:
                         continue
-                    schema_def = SchemaDefinition.objects.get(resource_type=d.resource_type)
 
+                    relation_names: set[str] = set()
                     for r in d.relations:
+                        relation_names.add(r.name)
+                        external_id = f"relation:{d.resource_type}#{r.name}"
+                        expected_external_ids.add(external_id)
                         allowed = [
                             {
                                 "type": s.type,
@@ -165,22 +208,58 @@ class Command(BaseCommand):
                             }
                             for s in r.allowed_subjects
                         ]
-                        SchemaRelation.objects.update_or_create(
-                            definition=schema_def,
-                            name=r.name,
-                            defaults={
+                        drift = self._sync_row(
+                            SchemaRelation,
+                            natural_key={"definition": schema_def, "name": r.name},
+                            payload={
                                 "allowed_subjects": allowed,
                                 "caveat": "",
                                 "with_expiration": r.with_expiration,
                             },
+                            package=package_name,
+                            external_id=external_id,
+                            check_only=check_only,
+                            force=force,
                         )
+                        any_drift = any_drift or drift
 
+                    permission_names: set[str] = set()
                     for p in d.permissions:
-                        SchemaPermission.objects.update_or_create(
-                            definition=schema_def,
-                            name=p.name,
-                            defaults={"expression": p.raw_text or "<expr>"},
+                        permission_names.add(p.name)
+                        external_id = f"permission:{d.resource_type}#{p.name}"
+                        expected_external_ids.add(external_id)
+                        drift = self._sync_row(
+                            SchemaPermission,
+                            natural_key={"definition": schema_def, "name": p.name},
+                            payload={"expression": p.raw_text or "<expr>"},
+                            package=package_name,
+                            external_id=external_id,
+                            check_only=check_only,
+                            force=force,
                         )
+                        any_drift = any_drift or drift
+
+                    drift = self._prune_schema_children(
+                        SchemaRelation,
+                        definition=schema_def,
+                        keep_names=relation_names,
+                        check_only=check_only,
+                    )
+                    any_drift = any_drift or drift
+                    drift = self._prune_schema_children(
+                        SchemaPermission,
+                        definition=schema_def,
+                        keep_names=permission_names,
+                        check_only=check_only,
+                    )
+                    any_drift = any_drift or drift
+
+                drift = self._prune_package_records(
+                    package=package_name,
+                    keep_external_ids=expected_external_ids,
+                    check_only=check_only,
+                )
+                any_drift = any_drift or drift
 
         if check_only:
             if any_drift:
@@ -246,7 +325,9 @@ class Command(BaseCommand):
             )
             return False
 
-        # Already present. Decide based on hash + no_update.
+        # Already present. Decide based on the actual row payload, not just
+        # the provenance hash: an out-of-band edit can leave the
+        # PackageManagedRecord untouched while the live schema row drifts.
         if record is None:
             # Orphan adoption — claim ownership.
             if check_only:
@@ -266,7 +347,13 @@ class Command(BaseCommand):
             )
             return False
 
-        if record.content_hash == content_hash:
+        actual_payload = {key: getattr(existing, key) for key in payload}
+        actual_hash = self._hash_payload({**natural_key, **actual_payload})
+        if actual_hash == content_hash:
+            if record.content_hash != content_hash and not check_only:
+                record.content_hash = content_hash
+                record.last_synced_at = timezone.now()
+                record.save(update_fields=["content_hash", "last_synced_at"])
             return False  # no-op
 
         if record.no_update and not force:
@@ -286,6 +373,70 @@ class Command(BaseCommand):
         record.last_synced_at = timezone.now()
         record.save(update_fields=["content_hash", "last_synced_at"])
         return False
+
+    def _prune_schema_children(
+        self,
+        model_cls: Any,
+        *,
+        definition: Any,
+        keep_names: set[str],
+        check_only: bool,
+    ) -> bool:
+        """Remove relation/permission rows no longer declared by the package schema."""
+        stale = list(model_cls.objects.filter(definition=definition).exclude(name__in=keep_names))
+        if not stale:
+            return False
+        if check_only:
+            for obj in stale:
+                self.stdout.write(
+                    self.style.WARNING(
+                        f"  ! drift: stale {model_cls.__name__} "
+                        f"{definition.resource_type}#{obj.name}"
+                    )
+                )
+            return True
+
+        from django.contrib.contenttypes.models import ContentType
+
+        from ...models import PackageManagedRecord
+
+        ct = ContentType.objects.get_for_model(model_cls)
+        target_pks = [obj.pk for obj in stale]
+        PackageManagedRecord.objects.filter(target_ct=ct, target_pk__in=target_pks).delete()
+        model_cls.objects.filter(pk__in=target_pks).delete()
+        return True
+
+    def _prune_package_records(
+        self,
+        *,
+        package: str,
+        keep_external_ids: set[str],
+        check_only: bool,
+    ) -> bool:
+        from ...models import PackageManagedRecord
+
+        schema_prefixes = ("caveat:", "definition:", "relation:", "permission:")
+        stale = [
+            record
+            for record in PackageManagedRecord.objects.filter(package=package)
+            if record.external_id.startswith(schema_prefixes)
+            and record.external_id not in keep_external_ids
+        ]
+        if not stale:
+            return False
+        if check_only:
+            for record in stale:
+                self.stdout.write(
+                    self.style.WARNING(f"  ! drift: stale managed row {record.external_id}")
+                )
+            return True
+
+        for record in sorted(stale, key=lambda record: _stale_record_prune_order(record.external_id)):
+            target = record.target
+            if target is not None:
+                target.delete()
+            record.delete()
+        return True
 
     @staticmethod
     def _hash_payload(payload: dict[str, Any]) -> str:

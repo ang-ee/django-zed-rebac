@@ -6,6 +6,7 @@ import builtins
 from collections.abc import Callable
 from typing import Any
 
+from ._id import resource_id_attr
 from .conf import app_settings
 from .types import ObjectRef
 
@@ -32,6 +33,30 @@ def _apply_prefix(rebac_type: str) -> str:
     """
     prefix = app_settings.REBAC_TYPE_PREFIX or ""
     return f"{prefix}{rebac_type}" if prefix else rebac_type
+
+
+def model_resource_type(model_cls: Any) -> str | None:
+    """Return the generated wire resource type for a REBAC-bound model class."""
+    meta = getattr(model_cls, "_meta", None)
+    if meta is None:
+        return None
+    rebac_type = getattr(meta, "rebac_resource_type", None)
+    if not rebac_type:
+        return None
+    return _apply_prefix(str(rebac_type))
+
+
+def model_resource_id(obj: Any) -> str:
+    """Resolve a model instance's configured REBAC id attribute."""
+    attr = resource_id_attr(type(obj))
+    try:
+        value = _resolve_dotted(obj, attr)
+    except AttributeError as exc:
+        raise TypeError(
+            f"Cannot resolve {type(obj).__name__} to ObjectRef: "
+            f"rebac_id_attr={attr!r} not found on instance ({exc})."
+        ) from exc
+    return str(value)
 
 
 _resource_registry: dict[type, tuple[str, str]] = {}
@@ -73,11 +98,9 @@ def to_object_ref(obj: Any) -> ObjectRef:
     Raises :class:`TypeError` if no path resolves ``obj``.
     """
     # 1. Django model with RebacMixin
-    meta = getattr(obj, "_meta", None)
-    if meta is not None:
-        rebac_type = getattr(meta, "rebac_resource_type", None)
-        if rebac_type:
-            return ObjectRef(_apply_prefix(rebac_type), str(obj.pk))
+    rebac_type = model_resource_type(type(obj))
+    if rebac_type:
+        return ObjectRef(rebac_type, model_resource_id(obj))
 
     # 2. @rebac_resource registry
     for cls, (type_, id_attr) in _resource_registry.items():

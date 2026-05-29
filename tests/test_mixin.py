@@ -146,6 +146,27 @@ def test_count_respects_scope(alice, bob, post):
     assert Post.objects.as_user(bob).count() == 0
 
 
+def test_bulk_update_denies_rows_actor_cannot_read(alice, bob, post):
+    _grant_owner(alice, post)
+    from tests.testapp.models import Post
+
+    with pytest.raises(PermissionDenied):
+        Post.objects.as_user(bob).filter(pk=post.pk).update(title="hijacked")
+
+    post.refresh_from_db()
+    assert post.title == "hello"
+
+
+def test_bulk_delete_denies_rows_actor_cannot_read(alice, bob, post):
+    _grant_owner(alice, post)
+    from tests.testapp.models import Post
+
+    with pytest.raises(PermissionDenied):
+        Post.objects.as_user(bob).filter(pk=post.pk).delete()
+
+    assert Post.objects.sudo(reason="test.check").filter(pk=post.pk).exists()
+
+
 def test_sudo_queryset_returns_all(alice, bob, post):
     _grant_owner(alice, post)
     from tests.testapp.models import Post

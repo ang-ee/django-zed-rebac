@@ -21,6 +21,7 @@ from django.db.models.base import ModelBase
 
 from ._id import resource_id_attr
 from .managers import RebacManager
+from .resources import model_resource_type
 from .types import CheckResult, Consistency, FieldDenyMode, ObjectRef, SubjectRef
 
 _RECOGNISED_META = (
@@ -332,7 +333,7 @@ class RebacMixin(models.Model, metaclass=RebacModelBase):
         from .conf import app_settings
         from .errors import MissingActorError
 
-        rebac_type = getattr(type(self)._meta, "rebac_resource_type", None)
+        rebac_type = model_resource_type(type(self))
         if not rebac_type:
             # Model isn't wired into REBAC — answer permissively to mirror
             # the manager's no-op behaviour.

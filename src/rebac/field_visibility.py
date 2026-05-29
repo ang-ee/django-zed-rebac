@@ -10,6 +10,7 @@ from django.db import models
 
 from ._id import resource_id_attr
 from .conf import app_settings
+from .resources import model_resource_type
 from .schema.ast import Schema
 from .schema.walker import field_gated_actions
 from .types import CheckResult, FieldDenyMode, ObjectRef, PermissionResult, SubjectRef
@@ -137,7 +138,7 @@ def check_field_access(
 
 def gated_read_fields(model: type[models.Model]) -> frozenset[str]:
     """Field names on ``model`` protected by declared ``read__<field>`` permissions."""
-    rebac_type = getattr(model._meta, "rebac_resource_type", None)
+    rebac_type = model_resource_type(model)
     if not rebac_type:
         return frozenset()
     schema = backend_schema()
@@ -167,7 +168,7 @@ def visible_id_sets(
     ``None`` means the field action grants every row of this resource type, so
     callers should skip per-row redaction for that field.
     """
-    rebac_type = getattr(model._meta, "rebac_resource_type", None)
+    rebac_type = model_resource_type(model)
     if not rebac_type or not fields:
         return {}
     if active_backend is None:
@@ -223,7 +224,7 @@ def apply_field_visibility(
         fields=fields,
         active_backend=active_backend,
     )
-    rebac_type = getattr(model._meta, "rebac_resource_type", None)
+    rebac_type = model_resource_type(model)
     if not rebac_type:
         return
 

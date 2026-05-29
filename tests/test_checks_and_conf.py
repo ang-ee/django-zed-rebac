@@ -109,9 +109,14 @@ def test_w003_fires_for_rbac_to_rbac_fk_in_testapp():
         assert ".with_actor(actor)" in issue.hint
 
 
-def test_w003_off_by_default():
-    """``REBAC_LINT_BARE_PREFETCH`` defaults to False — the check must
-    early-return [] without walking the model graph."""
+def test_w003_on_by_default_for_rbac_related_fields():
+    """The structural RBAC-to-RBAC relation warning is enabled by default."""
+    issues = check_cross_rbac_relations()
+    assert any(i.id == "rebac.W003" for i in issues)
+
+
+@override_settings(REBAC_LINT_BARE_PREFETCH=False)
+def test_w003_can_be_disabled_explicitly():
     assert check_cross_rbac_relations() == []
 
 

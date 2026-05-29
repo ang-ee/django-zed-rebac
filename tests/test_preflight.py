@@ -29,6 +29,7 @@ definition auth/group {
 definition blog/vault {
     relation owner:  auth/user
     relation writer: auth/user | auth/group#member with link_not_expired
+    relation public: auth/user:*
     permission write = owner + writer
     permission read  = owner + writer
 }
@@ -288,12 +289,24 @@ def test_wildcard_subject_matches_in_virtual_relation(backend):
     wildcard = SubjectRef.of("auth/user", "*")
     result = check_new(
         subject=_user("alice"),
+        action="public",
+        resource_type="blog/vault",
+        relationships={"public": [wildcard]},
+        backend=backend,
+    )
+    assert result.allowed
+
+
+def test_wildcard_subject_must_be_allowed_by_virtual_relation_type_union(backend):
+    wildcard = SubjectRef.of("auth/user", "*")
+    result = check_new(
+        subject=_user("alice"),
         action="owner",
         resource_type="blog/vault",
         relationships={"owner": [wildcard]},
         backend=backend,
     )
-    assert result.allowed
+    assert not result.allowed
 
 
 def test_unknown_action_returns_diagnostic(backend):
@@ -349,6 +362,47 @@ def test_virtual_relation_with_subject_set_candidate_denies_non_member(backend):
         action="writer",
         resource_type="blog/vault",
         relationships={"writer": [_group("g1")]},
+        backend=backend,
+    )
+    assert not result.allowed
+
+
+def test_subject_set_candidate_must_be_allowed_by_virtual_relation_type_union(backend):
+    backend.write_relationships(
+        [
+            RelationshipTuple(
+                resource=ObjectRef("auth/group", "g1"),
+                relation="member",
+                subject=_user("alice"),
+            ),
+        ]
+    )
+    result = check_new(
+        subject=_user("alice"),
+        action="owner",
+        resource_type="blog/vault",
+        relationships={"owner": [_group("g1")]},
+        backend=backend,
+    )
+    assert not result.allowed
+
+
+def test_arrow_candidate_must_match_virtual_relation_type_union(backend):
+    backend.write_relationships(
+        [
+            RelationshipTuple(
+                resource=ObjectRef("blog/vault", "v1"),
+                relation="owner",
+                subject=_user("alice"),
+            ),
+        ]
+    )
+    invalid_subject_set = SubjectRef.of("blog/vault", "v1", "owner")
+    result = check_new(
+        subject=_user("alice"),
+        action="create",
+        resource_type="blog/post",
+        relationships={"vault": [invalid_subject_set]},
         backend=backend,
     )
     assert not result.allowed

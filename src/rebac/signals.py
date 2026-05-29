@@ -16,6 +16,7 @@ from .conf import app_settings
 from .errors import MissingActorError, PermissionDenied
 from .field_visibility import backend_schema
 from .mixins import RebacMixin
+from .resources import model_resource_type
 from .schema.walker import field_gated_actions
 from .types import ObjectRef, SubjectRef
 
@@ -63,7 +64,7 @@ def _rebac_pre_save(
         return
     if not isinstance(instance, RebacMixin):
         return
-    rebac_type = getattr(sender._meta, "rebac_resource_type", None)
+    rebac_type = model_resource_type(sender)
     if not rebac_type:
         return
     # Per-instance sudo (set by `instance.sudo(reason=...)`) bypasses the
@@ -127,7 +128,7 @@ def _rebac_pre_save(
 def _rebac_pre_delete(sender: type[Model], instance: Any, using: Any = None, **_: Any) -> None:
     if not isinstance(instance, RebacMixin):
         return
-    rebac_type = getattr(sender._meta, "rebac_resource_type", None)
+    rebac_type = model_resource_type(sender)
     if not rebac_type:
         return
     if _is_sudo() or getattr(instance, "_rebac_sudo_reason", None) is not None:
@@ -443,7 +444,7 @@ def _rebac_cascade_resource(sender: type[Model], instance: Any, **_: Any) -> Non
         return
     if not isinstance(instance, RebacMixin):
         return
-    rebac_type = getattr(sender._meta, "rebac_resource_type", None)
+    rebac_type = model_resource_type(sender)
     if not rebac_type:
         return
     # Lazy import — ``RebacResource`` lives in ``rebac.models`` which is

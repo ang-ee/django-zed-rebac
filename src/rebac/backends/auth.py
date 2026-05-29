@@ -37,11 +37,11 @@ from typing import Any
 
 from django.apps import apps as django_apps
 from django.contrib.auth.base_user import AbstractBaseUser
-from django.db.models import Model
 
 from ..codenames import codename_to_action
 from ..conf import app_settings
 from ..errors import PermissionDepthExceeded
+from ..resources import model_resource_type
 from ..types import ObjectRef
 
 
@@ -128,10 +128,7 @@ class RebacBackend:
         except LookupError:
             return False
 
-        rebac_types = [
-            getattr(model._meta, "rebac_resource_type", None)
-            for model in cfg.get_models(include_auto_created=False)
-        ]
+        rebac_types = [model_resource_type(model) for model in cfg.get_models(include_auto_created=False)]
         rebac_types = [t for t in rebac_types if t]
         if not rebac_types:
             return False
@@ -180,17 +177,7 @@ def _model_level_resource_for_perm(perm: str) -> ObjectRef | None:
         return None
     except ValueError:
         return None
-    rebac_type = _resource_type_for_model(model)
+    rebac_type = model_resource_type(model)
     if rebac_type is None:
         return None
     return ObjectRef(rebac_type, "")
-
-
-def _resource_type_for_model(model: type[Model]) -> str | None:
-    """Return the model's ``Meta.rebac_resource_type`` if declared.
-
-    Falls back to ``None`` (caller defers to other backends) rather
-    than synthesising a default — convention-driven defaults would
-    break silently against a schema that uses different names.
-    """
-    return getattr(model._meta, "rebac_resource_type", None) or None

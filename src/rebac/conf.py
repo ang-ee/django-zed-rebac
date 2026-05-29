@@ -77,11 +77,11 @@ _DEFAULTS: dict[str, Any] = {
     # ``prefetch_related`` usage — so it surfaces the JOIN-leak
     # surface but cannot tell whether callers are already wrapping
     # those JOINs in ``Prefetch(queryset=Related.objects.with_actor)``.
-    # That makes it noise on a healthy codebase and useful only as a
-    # one-off audit. Opt in with ``REBAC_LINT_BARE_PREFETCH = True``.
+    # Enabled by default because the unsafe shape should be visible unless
+    # a project has audited and accepted every occurrence.
     # When the engine grows true auto-scoping for bare-string
     # prefetch (planned), this check goes away entirely.
-    "REBAC_LINT_BARE_PREFETCH": False,
+    "REBAC_LINT_BARE_PREFETCH": True,
     # LocalBackend storage shape. ``"denormalized"`` (the current and default
     # 0.4 shape) stores ``resource_type / resource_id / subject_type /
     # subject_id`` as wide ``CharField`` columns on every ``Relationship``

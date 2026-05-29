@@ -34,6 +34,7 @@ from ..errors import PermissionDepthExceeded
 from ..types import SubjectRef
 from .ast import (
     BUILTIN_ACTOR_TYPES,
+    AllowedSubject,
     Definition,
     PermArrow,
     PermBinOp,
@@ -219,6 +220,34 @@ def field_gated_actions(definition: Definition, verb: str) -> frozenset[str]:
     return frozenset(p.name for p in definition.permissions if p.name.startswith(prefix))
 
 
+def subject_allowed_by_relation(relation: Relation, subject: SubjectRef) -> bool:
+    """Return whether ``subject`` matches a relation's declared type union."""
+    return any(_subject_matches_allowed(allowed, subject) for allowed in relation.allowed_subjects)
+
+
+def relationship_row_allowed_by_relation(relation: Relation, row: object) -> bool:
+    subject = SubjectRef.of(
+        getattr(row, "subject_type", ""),
+        getattr(row, "subject_id", ""),
+        getattr(row, "optional_subject_relation", ""),
+    )
+    return subject_allowed_by_relation(relation, subject)
+
+
+def _subject_matches_allowed(allowed: AllowedSubject, subject: SubjectRef) -> bool:
+    if subject.subject_type != allowed.type:
+        return False
+    if allowed.wildcard:
+        return subject.subject_id == "*" and subject.optional_relation == ""
+    if subject.subject_id == "*":
+        return False
+    if allowed.id and subject.subject_id != allowed.id:
+        return False
+    if allowed.relation:
+        return subject.optional_relation == allowed.relation
+    return subject.optional_relation == ""
+
+
 def builtin_actor_matches(name: str, subject: SubjectRef) -> bool:
     """Match the bare schema keywords ``anonymous`` / ``authenticated``.
 
@@ -289,6 +318,8 @@ __all__ = [
     "eval_expr",
     "find_permission",
     "find_relation",
+    "relationship_row_allowed_by_relation",
+    "subject_allowed_by_relation",
     "tri_and",
     "tri_minus",
     "tri_or",

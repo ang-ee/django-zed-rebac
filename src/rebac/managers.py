@@ -33,6 +33,7 @@ from .field_visibility import (
     validate_field_deny_mode,
     warn_raise_mode_degrades,
 )
+from .resources import model_resource_type
 from .types import FieldDenyMode, SubjectRef
 
 _M = TypeVar("_M", bound=models.Model)
@@ -182,7 +183,7 @@ class RebacQuerySet(models.QuerySet[_M]):
         # ``_resolve_effective_actor`` only returns ``sudo=False`` paired
         # with a non-None actor (the None cases all carry ``sudo=True``).
         assert actor is not None
-        rebac_type = getattr(self.model._meta, "rebac_resource_type", None)
+        rebac_type = model_resource_type(self.model)
         if not rebac_type:
             return
         from django.db.models import Q
@@ -326,7 +327,7 @@ class RebacQuerySet(models.QuerySet[_M]):
         actor, sudo = self._resolve_effective_actor()
         if sudo:
             return super().update(**kwargs)
-        rebac_type = getattr(self.model._meta, "rebac_resource_type", None)
+        rebac_type = model_resource_type(self.model)
         if rebac_type:
             self._guard_bulk_action(actor, "write")  # type: ignore[arg-type]
             # Per-field write gates — same all-or-nothing semantics as the
@@ -340,7 +341,7 @@ class RebacQuerySet(models.QuerySet[_M]):
         actor, sudo = self._resolve_effective_actor()
         if sudo:
             return super().delete()
-        rebac_type = getattr(self.model._meta, "rebac_resource_type", None)
+        rebac_type = model_resource_type(self.model)
         if rebac_type:
             self._guard_bulk_action(actor, "delete")  # type: ignore[arg-type]
         return super().delete()
@@ -348,12 +349,11 @@ class RebacQuerySet(models.QuerySet[_M]):
     def _guard_bulk_action(self, actor: SubjectRef, action: str) -> None:
         from .backends import backend
 
-        rebac_type = getattr(self.model._meta, "rebac_resource_type", None)
+        rebac_type = model_resource_type(self.model)
         if not rebac_type:
             return
-        attr = resource_id_attr(self.model)
         # Pre-fetch ids in scope, intersect with allowed.
-        affected = {str(v) for v in self.values_list(attr, flat=True)}
+        affected = self._affected_resource_ids_for_guard()
         if not affected:
             return
         allowed = set(backend().accessible(subject=actor, action=action, resource_type=rebac_type))
@@ -383,7 +383,7 @@ class RebacQuerySet(models.QuerySet[_M]):
         from .schema.ast import Schema
         from .schema.walker import field_gated_actions
 
-        rebac_type = getattr(self.model._meta, "rebac_resource_type", None)
+        rebac_type = model_resource_type(self.model)
         if not rebac_type:
             return
         accessor = getattr(backend(), "schema", None)
@@ -402,8 +402,7 @@ class RebacQuerySet(models.QuerySet[_M]):
         if not declared:
             return
 
-        attr = resource_id_attr(self.model)
-        affected = {str(v) for v in self.values_list(attr, flat=True)}
+        affected = self._affected_resource_ids_for_guard()
         if not affected:
             return
 
@@ -434,6 +433,12 @@ class RebacQuerySet(models.QuerySet[_M]):
                     f"Bulk {action}: {len(denied)} row(s) outside actor scope "
                     f"(e.g. {sample}). Bulk operations are all-or-nothing."
                 )
+
+    def _affected_resource_ids_for_guard(self) -> set[str]:
+        """Scan the queryset's target rows without read-scoping the guard itself."""
+        attr = resource_id_attr(self.model)
+        scan = self.system_context(reason="rebac.bulk-guard")
+        return {str(v) for v in scan.values_list(attr, flat=True)}
 
 
 class RebacManager(models.Manager.from_queryset(RebacQuerySet)):  # type: ignore[misc]

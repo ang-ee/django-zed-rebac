@@ -39,7 +39,7 @@ definition auth/group {
 }
 definition blog/post {
     relation owner: auth/user
-    relation viewer: auth/user
+    relation viewer: auth/user | auth/group#member
     permission read = owner + viewer
     permission write = owner
     permission delete = owner

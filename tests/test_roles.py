@@ -10,7 +10,8 @@ from __future__ import annotations
 
 import pytest
 
-from rebac import SubjectRef
+from rebac import SubjectRef, backend
+from rebac.backends import reset_backend
 from rebac.models import Relationship
 from rebac.roles import (
     ROLE_EFFECTIVE_MEMBER,
@@ -25,7 +26,43 @@ from rebac.roles import (
     roles_of,
     unimply,
 )
+from rebac.schema import parse_zed
 from rebac.types import ObjectRef
+
+ROLE_SCHEMA_TEXT = """
+definition auth/user {}
+
+definition auth/group {
+    relation member: auth/user
+}
+
+definition angee/role {
+    relation member: auth/user | auth/group#member
+    relation includes: angee/role#effective_member
+    permission effective_member = member + includes
+}
+
+definition knowledge/role {
+    relation member: auth/user | auth/group#member
+}
+
+definition storage/role {
+    relation member: auth/user | auth/group#member | angee/role:admin#member
+    relation includes: storage/role#effective_member | angee/role#effective_member
+    permission effective_member = member + includes
+}
+"""
+
+
+@pytest.fixture(autouse=True)
+def _role_schema(request):
+    if request.node.get_closest_marker("django_db") is None:
+        yield
+        return
+    reset_backend()
+    backend().set_schema(parse_zed(ROLE_SCHEMA_TEXT))
+    yield
+    reset_backend()
 
 # ---------- _parse_role ----------
 

@@ -66,6 +66,12 @@ from ..schema.walker import (
     find_relation as _find_relation,
 )
 from ..schema.walker import (
+    relationship_row_allowed_by_relation as _row_allowed_by_relation,
+)
+from ..schema.walker import (
+    subject_allowed_by_relation as _subject_allowed_by_relation,
+)
+from ..schema.walker import (
     tri_and as _and,
 )
 from ..types import (
@@ -291,6 +297,8 @@ class LocalBackend(Backend):
         missing: set[str] = set()
         if permission is None:
             # No permission expression — fall back to checking the relation directly.
+            if _find_relation(definition, action) is None:
+                return CheckResult.no(reason=f"unknown action: {resource.resource_type}#{action}")
             allowed = self._has_direct_relation(
                 resource_type=resource.resource_type,
                 resource_id=resource.resource_id,
@@ -355,6 +363,8 @@ class LocalBackend(Backend):
         # Mapping `(resource_type, action)` -> currently-resolving sentinel or set.
         cache: dict[tuple[str, str], set[str] | None] = {}
         if permission is None:
+            if _find_relation(definition, action) is None:
+                return []
             return list(
                 self._resources_via_relation(
                     resource_type=resource_type,
@@ -424,11 +434,16 @@ class LocalBackend(Backend):
         RelationshipModel = active_relationship_model()
 
         permission = self.schema().get_permission(resource.resource_type, action)
+        definition = self.schema().get_definition(resource.resource_type)
+        if definition is None:
+            return []
+        relation_by_name = {r.name: r for r in definition.relations}
         relation_names = []
         if permission is None:
-            relation_names = [action]
+            if action in relation_by_name:
+                relation_names = [action]
         else:
-            relation_names = sorted(_collect_direct_relations(permission.expression))
+            relation_names = sorted(_collect_direct_relations(permission.expression) & relation_by_name.keys())
 
         if not relation_names:
             return []
@@ -445,6 +460,7 @@ class LocalBackend(Backend):
             return [
                 SubjectRef.of(r.subject_type, r.subject_id, r.optional_subject_relation)
                 for r in rows
+                if _row_allowed_by_relation(relation_by_name[r.relation], r)
             ]
 
     def write_relationships(self, writes: Iterable[RelationshipTuple]) -> Zookie:
@@ -455,6 +471,8 @@ class LocalBackend(Backend):
         RelationshipModel = active_relationship_model()
 
         rows = list(writes)
+        for tup in rows:
+            self._validate_relationship_tuple(tup)
         max_xid = 0
         with transaction.atomic():
             for tup in rows:
@@ -608,6 +626,10 @@ class LocalBackend(Backend):
     ) -> bool | None:
         from ..models import active_relationship_model
 
+        via_relation = _find_relation(definition, via)
+        if via_relation is None:
+            return False
+
         RelationshipModel = active_relationship_model()
         targets = self._apply_freshness(
             RelationshipModel.objects.filter(
@@ -618,6 +640,8 @@ class LocalBackend(Backend):
         )
         saw_conditional = False
         for row in targets:
+            if not _row_allowed_by_relation(via_relation, row):
+                continue
             # The hop row itself may carry a caveat — evaluate it before
             # walking through to the target type.
             hop = self._evaluate_row_caveat(row, ctx.context, ctx.missing)
@@ -708,6 +732,8 @@ class LocalBackend(Backend):
         permission = next((p for p in definition.permissions if p.name == permission_name), None)
         if permission is None:
             # Treat as direct relation lookup.
+            if _find_relation(definition, permission_name) is None:
+                return False
             return self._has_direct_relation(
                 resource_type=definition.resource_type,
                 resource_id=resource_id,
@@ -745,6 +771,13 @@ class LocalBackend(Backend):
             missing = set()
         from ..models import active_relationship_model
 
+        definition = self.schema().get_definition(resource_type)
+        if definition is None:
+            return False
+        relation_def = _find_relation(definition, relation)
+        if relation_def is None:
+            return False
+
         RelationshipModel = active_relationship_model()
 
         rows = self._apply_freshness(
@@ -764,6 +797,8 @@ class LocalBackend(Backend):
             )
         )
         for row in direct:
+            if not _row_allowed_by_relation(relation_def, row):
+                continue
             verdict = self._evaluate_row_caveat(row, context, missing)
             if verdict is True:
                 return True
@@ -780,6 +815,8 @@ class LocalBackend(Backend):
                 )
             )
             for row in wildcard:
+                if not _row_allowed_by_relation(relation_def, row):
+                    continue
                 verdict = self._evaluate_row_caveat(row, context, missing)
                 if verdict is True:
                     return True
@@ -789,6 +826,8 @@ class LocalBackend(Backend):
         # Subject-set rows: e.g. `viewer @ auth/group:eng#member`. Walk the
         # group's `member` relation and see if subject is a member.
         for row in rows.exclude(optional_subject_relation=""):
+            if not _row_allowed_by_relation(relation_def, row):
+                continue
             if not _is_active(row):
                 continue
             hop = self._evaluate_row_caveat(row, context, missing)
@@ -905,6 +944,8 @@ class LocalBackend(Backend):
                     )
                 )
                 for r in _filter_active(rows):
+                    if not _row_allowed_by_relation(via_rel, r):
+                        continue
                     # Hop-row caveat must evaluate True (silent on conditional).
                     sink: set[str] = set()
                     if self._evaluate_row_caveat(r, context, sink) is True:
@@ -985,6 +1026,13 @@ class LocalBackend(Backend):
             raise PermissionDepthExceeded(f"Depth limit {app_settings.REBAC_DEPTH_LIMIT} exceeded")
         from ..models import active_relationship_model
 
+        definition = self.schema().get_definition(resource_type)
+        if definition is None:
+            return set()
+        relation_def = _find_relation(definition, relation)
+        if relation_def is None:
+            return set()
+
         RelationshipModel = active_relationship_model()
 
         result: set[str] = set()
@@ -1003,6 +1051,8 @@ class LocalBackend(Backend):
             )
         )
         for r in _filter_active(direct):
+            if not _row_allowed_by_relation(relation_def, r):
+                continue
             if self._evaluate_row_caveat(r, context, sink) is True:
                 result.add(r.resource_id)
 
@@ -1017,6 +1067,8 @@ class LocalBackend(Backend):
                 )
             )
             for r in _filter_active(wildcard):
+                if not _row_allowed_by_relation(relation_def, r):
+                    continue
                 if self._evaluate_row_caveat(r, context, sink) is True:
                     result.add(r.resource_id)
 
@@ -1028,6 +1080,8 @@ class LocalBackend(Backend):
             ).exclude(optional_subject_relation="")
         )
         for row in subject_set_rows:
+            if not _row_allowed_by_relation(relation_def, row):
+                continue
             if not _is_active(row):
                 continue
             hop = self._evaluate_row_caveat(row, context, sink)
@@ -1054,6 +1108,21 @@ class LocalBackend(Backend):
 
     def _zookie(self) -> Zookie:
         return Zookie(self.kind, str(self._next_xid()))
+
+    def _validate_relationship_tuple(self, tup: RelationshipTuple) -> None:
+        definition = self.schema().get_definition(tup.resource.resource_type)
+        if definition is None:
+            raise ValueError(f"unknown resource type: {tup.resource.resource_type}")
+        relation = _find_relation(definition, tup.relation)
+        if relation is None:
+            raise ValueError(
+                f"unknown relation: {tup.resource.resource_type}#{tup.relation}"
+            )
+        if not _subject_allowed_by_relation(relation, tup.subject):
+            raise ValueError(
+                f"subject {tup.subject} is not allowed for "
+                f"{tup.resource.resource_type}#{tup.relation}"
+            )
 
 
 # ---------- Module-level helpers ----------

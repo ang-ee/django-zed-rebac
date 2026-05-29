@@ -128,7 +128,16 @@ def test_delete_relationship_matches_empty_optional_relation_exactly(backend):
         caveat_name="during_business_hours",
     )
 
-    backend.write_relationships([direct, subject_set, caveated])
+    backend.write_relationships([direct, caveated])
+    Relationship.objects.create(
+        resource_type=subject_set.resource.resource_type,
+        resource_id=subject_set.resource.resource_id,
+        relation=subject_set.relation,
+        subject_type=subject_set.subject.subject_type,
+        subject_id=subject_set.subject.subject_id,
+        optional_subject_relation=subject_set.subject.optional_relation,
+        caveat_name=subject_set.caveat_name,
+    )
     backend.delete_relationship(direct)
 
     assert not Relationship.objects.filter(

@@ -54,6 +54,7 @@ from .schema.walker import (
     eval_expr,
     find_permission,
     find_relation,
+    subject_allowed_by_relation,
 )
 from .types import CheckResult, ObjectRef, PermissionResult, SubjectRef
 
@@ -176,11 +177,19 @@ def _build_ctx(
         relation: str,
         depth: int,
     ) -> bool | None:
-        del resource_id, definition  # virtual — relation lookup is dict-only
+        del resource_id  # virtual — relation lookup is dict-only
+        relation_def = find_relation(definition, relation)
+        if relation_def is None:
+            return False
+        candidates = [
+            candidate
+            for candidate in relationships.get(relation, ())
+            if subject_allowed_by_relation(relation_def, candidate)
+        ]
         return _virtual_membership(
             ctx=ctx,
             backend=backend,
-            candidates=relationships.get(relation, ()),
+            candidates=candidates,
             depth=depth,
         )
 
@@ -192,8 +201,15 @@ def _build_ctx(
         target: str,
         depth: int,
     ) -> bool | None:
-        del resource_id, definition  # virtual — arrow walks the dict, not rows
-        candidates = relationships.get(via, ())
+        del resource_id  # virtual — arrow walks the dict, not rows
+        via_relation = find_relation(definition, via)
+        if via_relation is None:
+            return False
+        candidates = [
+            candidate
+            for candidate in relationships.get(via, ())
+            if subject_allowed_by_relation(via_relation, candidate)
+        ]
         if not candidates:
             return False
         # Each arrow hop is a dispatch into another (real) resource, so
