@@ -12,6 +12,7 @@ chaining via `_clone()` and propagates into instances via `from_db()`.
 
 from __future__ import annotations
 
+from collections.abc import Iterable
 from typing import Any, TypeVar
 
 from django.db import models
@@ -55,6 +56,7 @@ class RebacQuerySet(models.QuerySet[_M]):
     _rebac_action: str | None
     _rebac_sudo_reason: str | None
     _rebac_field_deny: FieldDenyMode | None
+    _rebac_select_related_guards: tuple[str, ...]
 
     def __init__(self, *args: Any, **kwargs: Any) -> None:
         super().__init__(*args, **kwargs)
@@ -62,6 +64,7 @@ class RebacQuerySet(models.QuerySet[_M]):
         self._rebac_action = None
         self._rebac_sudo_reason = None
         self._rebac_field_deny = None
+        self._rebac_select_related_guards = ()
 
     # Note: a second `_clone` override below combines the actor + scope-flag
     # propagation; this stub kept for readability.
@@ -127,6 +130,39 @@ class RebacQuerySet(models.QuerySet[_M]):
 
     def is_sudo(self) -> bool:
         return self._rebac_sudo_reason is not None
+
+    # ----- Relation loading -----
+
+    def rebac_select_related(self, *fields: Any) -> RebacQuerySet[_M]:
+        """``select_related`` plus a post-fetch guard for REBAC-bound targets."""
+        clone: RebacQuerySet[_M] = self.select_related(*fields)
+        if fields == (None,):
+            clone._rebac_select_related_guards = ()
+            return clone
+        from .relation_loading import selected_related_paths
+
+        paths = tuple(str(field) for field in fields) if fields else selected_related_paths(
+            self.model,
+            clone.query.select_related,
+        )
+        clone._rebac_select_related_guards = tuple(
+            dict.fromkeys((*self._rebac_select_related_guards, *paths))
+        )
+        return clone
+
+    def rebac_prefetch_related(self, *lookups: Any) -> RebacQuerySet[_M]:
+        """``prefetch_related`` with actor-scoped querysets for protected targets."""
+        if lookups == (None,):
+            return self.prefetch_related(None)
+        from .relation_loading import relation_actor, scope_prefetch_lookups
+
+        scoped = scope_prefetch_lookups(
+            self.model,
+            lookups,
+            actor=relation_actor(self),
+            mode=self._rebac_field_deny,
+        )
+        return self.prefetch_related(*scoped)
 
     # ----- Materialisation -----
 
@@ -242,6 +278,7 @@ class RebacQuerySet(models.QuerySet[_M]):
         clone._rebac_action = self._rebac_action
         clone._rebac_sudo_reason = self._rebac_sudo_reason
         clone._rebac_field_deny = self._rebac_field_deny
+        clone._rebac_select_related_guards = self._rebac_select_related_guards
         # Important: each clone re-applies scope when needed.
         clone._rebac_scope_applied = False
         return clone
@@ -252,6 +289,7 @@ class RebacQuerySet(models.QuerySet[_M]):
     def _guard_projected_field_reads(self, actor: SubjectRef | None, sudo: bool) -> None:
         if actor is None or sudo:
             return
+        self._guard_projected_related_reads()
         if runtime_field_deny_mode(self._effective_field_mode()) == "allow":
             return
         projected = projection_field_names(self.model, getattr(self, "_fields", None))
@@ -268,6 +306,26 @@ class RebacQuerySet(models.QuerySet[_M]):
                 "field read enforcement requires model-instance materialisation "
                 "or a projection that omits gated fields."
             )
+
+    def _guard_projected_related_reads(self) -> None:
+        if not self._rebac_select_related_guards:
+            return
+        raw_fields = getattr(self, "_fields", None)
+        if raw_fields is None:
+            return
+        guarded = tuple(f"{path}__" for path in self._rebac_select_related_guards)
+        related = sorted(
+            field
+            for field in raw_fields
+            if isinstance(field, str) and any(field.startswith(prefix) for prefix in guarded)
+        )
+        if not related:
+            return
+        names = ", ".join(related[:5])
+        raise PermissionDenied(
+            f"Cannot project related field(s) {names}: rebac_select_related() "
+            "enforcement requires model-instance materialisation."
+        )
 
     def _fetch_all(self) -> None:
         if self._result_cache is None:
@@ -287,6 +345,7 @@ class RebacQuerySet(models.QuerySet[_M]):
                     actor=actor,
                     mode=self._effective_field_mode(),
                 )
+            self._guard_selected_related_reads()
 
     def iterator(self, *args: Any, **kwargs: Any) -> Any:
         if self._result_cache is None:
@@ -305,7 +364,23 @@ class RebacQuerySet(models.QuerySet[_M]):
                 actor=actor,
                 mode=self._effective_field_mode(),
             )
+        self._guard_selected_related_reads(rows)
         return iter(rows)
+
+    def _guard_selected_related_reads(self, rows: Iterable[Any] | None = None) -> None:
+        if not self._rebac_select_related_guards:
+            return
+        from .relation_loading import guard_selected_related_instances, relation_actor
+
+        if rows is None:
+            rows = self._result_cache or ()
+        guard_selected_related_instances(
+            rows,
+            root_model=self.model,
+            paths=self._rebac_select_related_guards,
+            actor=relation_actor(self),
+            mode=self._effective_field_mode(),
+        )
 
     # ----- Counts / existence respect scope too -----
 
@@ -476,6 +551,12 @@ class RebacManager(models.Manager.from_queryset(RebacQuerySet)):  # type: ignore
 
     def on_field_deny(self, mode: FieldDenyMode) -> RebacQuerySet[Any]:
         return self.get_queryset().on_field_deny(mode)
+
+    def rebac_select_related(self, *fields: Any) -> RebacQuerySet[Any]:
+        return self.get_queryset().rebac_select_related(*fields)
+
+    def rebac_prefetch_related(self, *lookups: Any) -> RebacQuerySet[Any]:
+        return self.get_queryset().rebac_prefetch_related(*lookups)
 
     def sudo(self, *, reason: str) -> RebacQuerySet[Any]:
         return self.get_queryset().sudo(reason=reason)

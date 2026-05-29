@@ -102,11 +102,11 @@ def test_w003_fires_for_rbac_to_rbac_fk_in_testapp():
     assert any("testapp.Post.folder" in m and "testapp.Folder" in m for m in messages), messages
     # Folder.parent → Folder (self-FK, both RBAC-bound).
     assert any("testapp.Folder.parent" in m and "testapp.Folder" in m for m in messages), messages
-    # Hint references the explicit Prefetch form.
+    # Hint references the permission-aware relation-loading helpers.
     for issue in w003:
         assert issue.hint is not None
-        assert "Prefetch(" in issue.hint
-        assert ".with_actor(actor)" in issue.hint
+        assert "rebac_select_related" in issue.hint
+        assert "rebac_prefetch_related" in issue.hint
 
 
 def test_w003_on_by_default_for_rbac_related_fields():

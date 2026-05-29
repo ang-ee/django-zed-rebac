@@ -129,7 +129,7 @@ wheels = [
 
 [[package]]
 name = "django-zed-rebac"
-version = "0.7.0"
+version = "0.8.0"
 source = { editable = "." }
 dependencies = [
     { name = "django" },
@@ -146,6 +146,7 @@ dev = [
     { name = "pytest" },
     { name = "pytest-django" },
     { name = "ruff" },
+    { name = "strawberry-graphql-django" },
 ]
 drf = [
     { name = "djangorestframework" },
@@ -156,6 +157,9 @@ spicedb = [
 strawberry = [
     { name = "channels" },
     { name = "strawberry-graphql" },
+]
+strawberry-django = [
+    { name = "strawberry-graphql-django" },
 ]
 
 [package.metadata]
@@ -172,8 +176,10 @@ requires-dist = [
     { name = "pytest-django", marker = "extra == 'dev'", specifier = ">=4.8" },
     { name = "ruff", marker = "extra == 'dev'", specifier = ">=0.5" },
     { name = "strawberry-graphql", marker = "extra == 'strawberry'", specifier = ">=0.220" },
+    { name = "strawberry-graphql-django", marker = "extra == 'dev'", specifier = ">=0.86.0" },
+    { name = "strawberry-graphql-django", marker = "extra == 'strawberry-django'", specifier = ">=0.86.0" },
 ]
-provides-extras = ["spicedb", "caveats", "drf", "strawberry", "dev"]
+provides-extras = ["spicedb", "caveats", "drf", "strawberry", "strawberry-django", "dev"]
 
 [[package]]
 name = "djangorestframework"
@@ -556,6 +562,20 @@ dependencies = [
 sdist = { url = "https://files.pythonhosted.org/packages/18/9b/101940ee899959d4d220cc8beb4f41bce9c58830d1872df06f35cf92c457/strawberry_graphql-0.315.5.tar.gz", hash = "sha256:29a2f04479aba29f9f30ecdfce1ef9ee04acee3c434a4f6019249474cd649492", size = 222724, upload-time = "2026-05-14T10:46:16.222Z" }
 wheels = [
     { url = "https://files.pythonhosted.org/packages/7e/19/e389140b3b50faf803b4817ae5a8c3c2d6737f062f4a0fe6778e929a405d/strawberry_graphql-0.315.5-py3-none-any.whl", hash = "sha256:073bc818a5f55951a9a6fbab40bbfa07c418d2c4151cc2aab24399bd14d9a51a", size = 325062, upload-time = "2026-05-14T10:46:18.672Z" },
+]
+
+[[package]]
+name = "strawberry-graphql-django"
+version = "0.86.0"
+source = { registry = "https://pypi.org/simple" }
+dependencies = [
+    { name = "asgiref" },
+    { name = "django" },
+    { name = "strawberry-graphql" },
+]
+sdist = { url = "https://files.pythonhosted.org/packages/97/7b/d69f31702e8b33f4af0da95aa9d27b070711f40e5f49584b0ef643aa8be5/strawberry_graphql_django-0.86.0.tar.gz", hash = "sha256:380326ab2f9a9bf79a66ca7fad8a1c2fe72760f3608d3b39b617213c8b3f3329", size = 92535, upload-time = "2026-05-23T10:56:44.458Z" }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/17/d6/a5d530989e79bd45606305b58004cb523622f8172e24e9466f93f0523b75/strawberry_graphql_django-0.86.0-py3-none-any.whl", hash = "sha256:5d5771fd6227d48aa9d94e72e9d7ab5a995e64bd970f2d17123563869b4b02cc", size = 116481, upload-time = "2026-05-23T10:56:43.314Z" },
 ]
 
 [[package]]

@@ -365,8 +365,10 @@ def check_cross_rbac_relations(app_configs: Any = None, **kwargs: Any) -> list[c
                     "select_related/prefetch_related against RBAC-bound "
                     f"related model {related_label} won't auto-scope.",
                     hint=(
-                        f'Use Prefetch("{field.name}", queryset='
-                        f"{related.__name__}.objects.with_actor(actor))."
+                        f'Use queryset.rebac_select_related("{field.name}") for '
+                        "to-one joins or "
+                        f'queryset.rebac_prefetch_related("{field.name}") for '
+                        "prefetches."
                     ),
                     obj=model,
                     id="rebac.W003",

@@ -1,6 +1,6 @@
 # `django-zed-rebac` — Architecture
 
-> Status: **alpha implementation guide** — reflects the 0.7.0 codebase.
+> Status: **alpha implementation guide** — reflects the 0.8.0 codebase.
 > Last updated: 2026-05-29
 > Audience: Django integrators evaluating fit, contributors, framework authors building on top.
 >
@@ -227,6 +227,7 @@ This three-state result mirrors SpiceDB exactly and is critical for layered chec
 | Celery | `before_task_publish` + `task_prerun` signals | Injects `actor_id` into task headers on enqueue; restores into ContextVar on worker. |
 | MCP (FastMCP / official SDK) | Planned `@rebac_mcp_tool` decorator | Tracked in [proposal 0004](./proposals/0004-mcp-tool-integration.md). For now, model MCP tools as resources and call `check_access` / `with_actor` explicitly in your server. |
 | GraphQL (strawberry) | `rebac.graphql.strawberry.RebacExtension` + `RebacChannelsConsumerMixin` | Opens evaluator/Zookie scopes per operation and per subscription emission. Use `require_permission` or actor-scoped querysets inside resolvers. |
+| GraphQL (Strawberry-Django) | `rebac.graphql.strawberry_django.RebacDjangoOptimizerExtension` | Wraps Strawberry-Django's optimizer with REBAC-safe relation loading: guarded `select_related` for to-one paths and actor-scoped protected prefetches. |
 | Plain Python | `@rebac_resource(type=..., id_attr=...)` | Registers the class as a known resource type for explicit `check_access()` calls. |
 
 ---
@@ -530,7 +531,7 @@ when the setting is `"denormalized"`.
 future `SpiceDBBackend` will write through gRPC and will not touch the local
 relationship table.
 
-**Current status.** Both tables ship in 0.7.0. The default remains
+**Current status.** Both tables have shipped since 0.7.0. The default remains
 `"denormalized"` and registry mode is opt-in. A future minor release may flip
 the default or remove the denormalized path after migration experience is
 boring enough to justify the churn.
@@ -689,7 +690,7 @@ All settings prefixed `REBAC_`. No nested dict. Read via the public `app_setting
 | `REBAC_ACTOR_RESOLVER` | `"rebac.actors.default_resolver"` | `str` | Dotted-path callable that resolves `request → SubjectRef`. Override for custom identity layers (e.g., agent grants). |
 | `REBAC_TYPE_PREFIX` | `""` | `str` | Optional prefix for all generated resource types (multi-tenant SaaS). |
 | `REBAC_SUPERUSER_BYPASS` | `True` | `bool` | If `True`, active superusers short-circuit `has_perm` AND run inside an `ActorMiddleware`-opened `sudo("superuser-bypass")` bracket so QuerySet scoping lifts too. Each elevated request emits a `KIND_SUDO_BYPASS` audit row. Suppressed when `REBAC_ALLOW_SUDO = False`. Strict tenants set this to `False`. |
-| `REBAC_LINT_BARE_PREFETCH` | `True` | `bool` | Toggle for `rebac.W003` — the structural warning that an RBAC-bound model has an FK / O2O / M2M to another RBAC-bound model (a bare-string `select_related` / `prefetch_related` would JOIN unscoped). Enabled by default so the risky shape is visible; set `False` only after auditing the relation paths or wrapping them in actor-scoped querysets. Goes away once true bare-string prefetch auto-scoping ships. |
+| `REBAC_LINT_BARE_PREFETCH` | `True` | `bool` | Toggle for `rebac.W003` — the structural warning that an RBAC-bound model has an FK / O2O / M2M to another RBAC-bound model (a bare-string `select_related` / `prefetch_related` can load unguarded related rows). Enabled by default so the risky shape is visible; use `rebac_select_related()` / `rebac_prefetch_related()` or the Strawberry-Django optimizer for protected paths. |
 | `REBAC_EVALUATOR_CACHE_SIZE` | `10000` | `int` | Max entries across the per-scope evaluator's `check_access` and `accessible` LRU caches. |
 | `REBAC_ZOOKIE_TRANSPORT` | `"none"` | `"none"` \| `"header"` \| `"session"` | Optional cross-request transport for the current Zookie. |
 | `REBAC_ZOOKIE_HEADER_NAME` | `"X-Rebac-Zookie"` | `str` | Header name used when `REBAC_ZOOKIE_TRANSPORT = "header"`. |
@@ -733,7 +734,7 @@ System checks (in `rebac/checks.py`):
 | `rebac.E008` | Error | `REBAC_FIELD_READ_MODE` is not one of `"allow"`, `"redact"`, `"omit"`, or `"raise"`. |
 | `rebac.W001` | Warning | `rebac.backends.RebacBackend` not in `AUTHENTICATION_BACKENDS`. |
 | `rebac.W002` | Warning | A model with `Meta.rebac_resource_type` is missing `RebacMixin`. |
-| `rebac.W003` | Warning | A `prefetch_related("rel")` string-form for an RBAC-flagged related model — should use explicit `Prefetch(...)`. |
+| `rebac.W003` | Warning | An RBAC-bound relation exists where bare `select_related("rel")` / `prefetch_related("rel")` can be unsafe outside the REBAC helpers or Strawberry-Django optimizer. |
 | `rebac.W004` | Warning | Universal-admin role convention lint for role definitions. |
 | `rebac.W005` | Warning | LocalBackend is still on denormalized storage and registry migration is recommended for large tables. |
 | `rebac.W006` | Warning | `REBAC_ZOOKIE_TRANSPORT = "session"` without `django.contrib.sessions`. |
@@ -972,6 +973,8 @@ class RebacManager:
     def as_agent(self, agent, *, on_behalf_of=None) -> RebacQuerySet: ...
     def with_action(self, action: str) -> RebacQuerySet: ...           # override read-scope action
     def on_field_deny(self, mode: FieldDenyMode) -> RebacQuerySet: ... # allow/redact/omit/raise
+    def rebac_select_related(self, *fields) -> RebacQuerySet: ...      # guarded to-one joins
+    def rebac_prefetch_related(self, *lookups) -> RebacQuerySet: ...   # scoped protected prefetches
 
     def sudo(self, *, reason: str) -> RebacQuerySet: ...                # gated by REBAC_ALLOW_SUDO
     def system_context(self, *, reason: str) -> RebacQuerySet: ...      # framework-job bypass, NOT gated
@@ -983,6 +986,8 @@ class RebacQuerySet:
     def as_agent(self, agent, *, on_behalf_of=None) -> Self: ...
     def with_action(self, action: str) -> Self: ...                    # override read-scope action
     def on_field_deny(self, mode: FieldDenyMode) -> Self: ...          # override field-read deny mode
+    def rebac_select_related(self, *fields) -> Self: ...               # select_related + related read guard
+    def rebac_prefetch_related(self, *lookups) -> Self: ...            # prefetch_related + scoped targets
     def sudo(self, *, reason: str) -> Self: ...                         # gated by REBAC_ALLOW_SUDO
     def system_context(self, *, reason: str) -> Self: ...               # framework-job bypass, NOT gated
 
@@ -1003,8 +1008,20 @@ The three actor verbs are sugar over the same primitive:
 | `as_agent(agent, on_behalf_of=u)` | Equivalent to `with_actor(grant_subject_ref(agent, u))` — resolves to an `agents/grant:<id>#valid` subject. | Agent runtimes and future MCP servers where a Grant is the canonical actor. |
 | `with_action(action)` | Pins the permission used for read-side queryset scoping instead of `read` / `Meta.rebac_default_action`. | Alternate read views such as `credential_lookup`, `list_admin`, or capability-specific resolver scopes. |
 | `on_field_deny(mode)` | Pins the field-read deny mode for `read__<field>` gates instead of the global setting. | Projection-sensitive paths that want `"omit"` while the global default stays `"allow"` or `"redact"`. |
+| `rebac_select_related(*fields)` | Applies Django `select_related` and batch-checks selected REBAC-bound related rows before serialization. | To-one relation optimization when an unreadable related object should fail the field/query instead of leaking. |
+| `rebac_prefetch_related(*lookups)` | Applies Django `prefetch_related`, rewriting bare protected lookups to `Prefetch(queryset=Related.objects.with_actor(actor))`. | Reverse, M2M, and to-many loading where protected children should be scoped rather than loaded via `_base_manager`. |
 
 `as_agent(agent)` without `on_behalf_of` resolves to a bare `agents/agent:<id>` subject (the agent acting standalone, with only its declared capabilities — no user grants). Use this only for system-initiated agent runs; for end-user-driven agent runs always pass `on_behalf_of=user`. The `agents/agent` and `agents/grant` definitions are NOT auto-emitted — they live in the consumer's own `agents` app, which references this plugin's `auth/user`.
+
+`rebac_select_related()` preserves Django's to-one join optimization, then
+checks every selected REBAC-bound related object in batches. If the actor cannot
+read one of those joined rows, the queryset raises `PermissionDenied` before the
+object can serialize. Related-field projections such as
+`.values("folder__name")` fail closed because they bypass model-instance
+materialisation and cannot carry the related-object guard. `rebac_prefetch_related()`
+is the to-many counterpart: it keeps Django prefetching, but protected bare
+lookups are rewritten to actor-scoped `Prefetch` querysets using the related
+model's default manager, never `_base_manager`.
 
 ### `with_actor` vs `sudo` — distinct verbs
 
@@ -1232,6 +1249,39 @@ Subscription invariants:
   Zookie within the emission's scope.
 
 For non-request contexts (Celery, cron, management commands), use `with sudo(reason=...)` or set the actor explicitly via `.with_actor(actor)` / `.as_user(user)` / `.as_agent(agent, on_behalf_of=user)`.
+
+### Strawberry-Django optimizer (`rebac.graphql.strawberry_django`)
+
+Behind the `[strawberry-django]` extra:
+`pip install django-zed-rebac[strawberry-django]`.
+
+```python
+import strawberry
+from rebac.graphql.strawberry import RebacExtension
+from rebac.graphql.strawberry_django import RebacDjangoOptimizerExtension
+
+schema = strawberry.Schema(
+    query=Query,
+    extensions=[RebacExtension, RebacDjangoOptimizerExtension],
+)
+```
+
+`RebacDjangoOptimizerExtension` targets `strawberry-graphql-django`'s
+`DjangoOptimizerExtension` surface while preserving REBAC invariants:
+
+- Root querysets inherit `current_actor()` when a resolver did not already call
+  `.with_actor(...)`, `.as_user(...)`, `.as_agent(...)`, or `.sudo(...)`.
+- To-one relation paths keep `select_related`; selected REBAC-bound related rows
+  are batch-checked before serialization. A denied joined row raises
+  `PermissionDenied`.
+- To-many / reverse relation paths use actor-scoped `Prefetch` querysets for
+  protected targets, using `_default_manager` and never `_base_manager`.
+- Optimized `.only(...)` selections keep each REBAC-bound model's configured
+  `Meta.rebac_id_attr`, so row and field gates can resolve resource ids without
+  lazy-loading them later.
+
+Outside Strawberry-Django, use `rebac_select_related()` and
+`rebac_prefetch_related()` directly on `RebacQuerySet`.
 
 ---
 
@@ -1487,7 +1537,7 @@ stable across patch releases. `rebac._internal.*` is private.
 |---|---|
 | **0.1.0 — MVP** | `LocalBackend`; schema parser + sync command; `RebacMixin` + manager + signals; `RebacPermission` + `RebacFilterBackend`; system checks; sync/check commands; first test matrix. |
 | **0.2.0 — Alpha hardening** | Schema-level built-in actor grants; action-scoped read querysets; split request-path `sudo()` from framework-job `system_context()`; hot-path schema cache invalidation. |
-| **0.3.0-0.7.0 — shipped alpha core** | `ActorMiddleware`; Celery signal handlers; registry storage mode; evaluator/Zookie scopes; Strawberry adapter; field-level read gates; LocalBackend hardening. |
+| **0.3.0-0.8.0 — shipped alpha core** | `ActorMiddleware`; Celery signal handlers; registry storage mode; evaluator/Zookie scopes; Strawberry adapter; field-level read gates; REBAC-safe relation loading; Strawberry-Django optimizer; LocalBackend hardening. |
 | **Next — `SpiceDBBackend`** | `authzed-py` adapter; `WriteSchema` auto-push; cross-backend contract tests; SpiceDB Zookie translation. |
 | **Next — MCP adapter** | `rebac_mcp_tool` decorator for FastMCP / official SDK shapes; actor resolution from request metadata; capability/resource gating. See [proposal 0004](./proposals/0004-mcp-tool-integration.md). |
 | **1.0.0 — Stable release** | Full docs, CI matrix green, stable audit/logging contracts, `select_related` compiler hook (or carved to 1.1). |

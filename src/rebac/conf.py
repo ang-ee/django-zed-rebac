@@ -74,13 +74,11 @@ _DEFAULTS: dict[str, Any] = {
     # ``rebac.W003`` ``checks.Warning`` for every FK / O2O / M2M
     # whose target is also RBAC-bound. The check fires for the
     # *existence* of the relation, not for any actual bare-string
-    # ``prefetch_related`` usage — so it surfaces the JOIN-leak
+    # ``select_related`` / ``prefetch_related`` usage — so it surfaces the JOIN-leak
     # surface but cannot tell whether callers are already wrapping
-    # those JOINs in ``Prefetch(queryset=Related.objects.with_actor)``.
+    # those joins in ``rebac_select_related`` / ``rebac_prefetch_related``.
     # Enabled by default because the unsafe shape should be visible unless
     # a project has audited and accepted every occurrence.
-    # When the engine grows true auto-scoping for bare-string
-    # prefetch (planned), this check goes away entirely.
     "REBAC_LINT_BARE_PREFETCH": True,
     # LocalBackend storage shape. ``"denormalized"`` (the current and default
     # 0.4 shape) stores ``resource_type / resource_id / subject_type /

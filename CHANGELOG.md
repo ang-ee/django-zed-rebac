@@ -5,6 +5,21 @@ pre-1.0; breaking changes within a minor version are explicitly called out.
 
 ## [Unreleased]
 
+## [0.8.0] — 2026-05-29
+
+### Added
+
+- Added `rebac_select_related()` and `rebac_prefetch_related()` queryset /
+  manager helpers for permission-aware relation loading. Guarded
+  `select_related` keeps to-one JOIN performance while raising before an
+  unreadable related row can serialize; protected prefetches are rewritten to
+  actor-scoped `Prefetch` querysets.
+- Added the `strawberry-django` extra and
+  `rebac.graphql.strawberry_django.RebacDjangoOptimizerExtension`, a
+  Strawberry-Django optimizer wrapper that preserves upstream `only`,
+  `annotate`, `select_related`, and `prefetch_related` optimizations while
+  routing protected relations through the REBAC helper surface.
+
 ### Documentation
 
 - Removed proposal docs for work already shipped in code and recorded in this
@@ -12,7 +27,7 @@ pre-1.0; breaking changes within a minor version are explicitly called out.
   read gates.
 - Added proposal 0004 for the not-yet-implemented MCP tool adapter.
 - Clarified that `SpiceDBBackend` remains roadmap work and that registry
-  storage is still opt-in in 0.7.0.
+  storage is still opt-in in 0.8.0.
 
 ## [0.7.0] — 2026-05-29
 
