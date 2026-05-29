@@ -21,7 +21,7 @@ jobs:
         uses: astral-sh/setup-uv@v7
       - name: Install dependencies
         run: |
-          uv pip install --system -e .[dev,caveats]
+          uv pip install --system -e .[dev,caveats,drf]
           uv pip install --system "django==${{ matrix.django-version }}.*"
       - name: Lint
         run: uv run ruff check .
