@@ -2,13 +2,13 @@
 
 Wire-shape mirrors `authzed.api.v1.Relationship` exactly. Renames are breaking.
 
-Two storage shapes coexist starting in v0.4 (proposal 0001):
+Two LocalBackend storage shapes coexist:
 
   - ``Relationship`` (denormalized) — the historical shape with four wide
     CharField columns. Default in 0.4.
   - ``RelationshipRegistry`` (registry) — same wire-shape, but the four
     string columns become two integer FKs into ``RebacResource``. Opt-in
-    via ``REBAC_LOCAL_BACKEND_STORAGE='registry'`` in 0.4; default in 0.5.
+    via ``REBAC_LOCAL_BACKEND_STORAGE='registry'``.
 
 Both tables ship on disk; ``rebac.models.active_relationship_model()``
 returns the one selected by the setting. The wire shape (``RelationshipTuple``

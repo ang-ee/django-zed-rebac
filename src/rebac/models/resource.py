@@ -1,7 +1,7 @@
 """RebacResource — registry-mode resource table.
 
-Proposal 0001. A row per ``(resource_type, resource_id)`` pair seen by the
-engine; ``Relationship``-shape integer FKs point at it. The two correctness
+A row per ``(resource_type, resource_id)`` pair seen by the engine;
+``RelationshipRegistry`` integer FKs point at it. The two correctness
 wins are:
 
   - **Cascade delete**: ``post_delete`` on a ``RebacMixin``-bearing Django

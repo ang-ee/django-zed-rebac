@@ -1,6 +1,6 @@
 """PermissionEvaluator — per-scope cache for ``check_access`` and ``accessible``.
 
-Proposal 0002. Solves N+1 permission checks in GraphQL / DRF render paths
+Solves N+1 permission checks in GraphQL / DRF render paths
 by deduping ``(subject, action, resource_or_type, context)`` keys across
 a single scope (HTTP request, subscription tick, Celery task).
 

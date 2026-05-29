@@ -1,6 +1,4 @@
-"""Tests for ``rebac.consistency`` Zookie ContextVar + freshness resolution
-(proposal 0002).
-"""
+"""Tests for ``rebac.consistency`` Zookie ContextVar + freshness resolution."""
 
 from __future__ import annotations
 
@@ -82,7 +80,7 @@ def test_explicit_zookie_wins():
 
 
 def test_auto_upgrades_to_at_least_as_fresh_with_in_scope_zookie():
-    """The proposal 0002 happy-path: post-write read auto-upgrades."""
+    """The happy path: post-write read auto-upgrades."""
     with zookie_scope():
         record_zookie(Zookie("local", "500"))
         consistency, zookie = effective_consistency()

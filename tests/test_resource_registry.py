@@ -1,4 +1,4 @@
-"""Tests for ``RebacResource`` + ``RelationshipRegistry`` (proposal 0001).
+"""Tests for ``RebacResource`` + ``RelationshipRegistry``.
 
 Covers:
   - ``RebacResource.upsert_ref`` idempotency + lazy backing pointer fill.

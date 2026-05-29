@@ -1,4 +1,4 @@
-"""Strawberry / Channels adapter tests (proposal 0002 § locked decision #5).
+"""Strawberry / Channels adapter tests.
 
 Unit-mocks the Schema execution context — full Strawberry integration
 lives behind a separate ``-m strawberry_integration`` marker so the

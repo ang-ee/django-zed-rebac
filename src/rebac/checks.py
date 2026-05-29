@@ -35,9 +35,8 @@ def check_backend_setting(app_configs: Any = None, **kwargs: Any) -> list[checks
         issues.append(
             checks.Warning(
                 "REBAC_LOCAL_BACKEND_STORAGE='denormalized' — the registry "
-                "shape (proposal 0001) ships a 5-10x index density gain and "
-                "FK-CASCADE cleanup for deleted Django rows. The default "
-                "flips to 'registry' in v0.5; consider migrating early via "
+                "shape ships a 5-10x index density gain and "
+                "FK-CASCADE cleanup for deleted Django rows. Consider migrating via "
                 "`python manage.py rebac migrate-storage --to registry`.",
                 id="rebac.W005",
                 hint=(

@@ -6,7 +6,7 @@ python manage.py rebac sync --force-overwrite   # destructive
 python manage.py rebac check                    # validate without writes
 python manage.py rebac build-zed                # emit effective.zed
 python manage.py rebac explain <type>.<perm>    # print compiled expression
-python manage.py rebac migrate-storage --to registry   # proposal 0001 cutover
+python manage.py rebac migrate-storage --to registry   # registry-storage cutover
 """
 
 from __future__ import annotations
@@ -62,7 +62,7 @@ class Command(BaseCommand):
 
         p_mig = sub.add_parser(
             "migrate-storage",
-            help="Proposal 0001 — copy rows between denormalized and registry shapes.",
+            help="Copy rows between denormalized and registry storage shapes.",
         )
         p_mig.add_argument(
             "--from",
@@ -624,7 +624,7 @@ class Command(BaseCommand):
             return f"({left} {expr.op} {right})"
         raise CommandError(f"Unknown expression node: {type(expr).__name__}")
 
-    # ---------- migrate-storage (proposal 0001) ----------
+    # ---------- migrate-storage ----------
 
     def _handle_migrate_storage(self, options: dict[str, Any]) -> None:
         """Copy rows between ``Relationship`` and ``RelationshipRegistry``.

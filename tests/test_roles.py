@@ -372,14 +372,14 @@ def test_imply_accepts_objectref():
 # ---------- Strict-by-default contract ----------
 
 
-# ---------- Registry-mode parity (proposal 0001) ----------
+# ---------- Registry-mode parity ----------
 
 
 @pytest.mark.django_db
 def test_grant_and_roles_of_route_through_active_model_in_registry_mode():
     """``rebac.roles`` must read/write the active relationship table.
 
-    Pinning regression for proposal 0001: ``grant`` / ``revoke`` /
+    Pinning regression for registry storage: ``grant`` / ``revoke`` /
     ``roles_of`` originally imported ``Relationship`` directly, so in
     registry mode they wrote to the wrong table and grants were
     invisible to the engine.

@@ -1,4 +1,4 @@
-"""Proposal 0001 — registry storage shape.
+"""Registry storage shape.
 
 Adds ``RebacResource`` (one row per ``(resource_type, resource_id)`` pair)
 and ``RelationshipRegistry`` (FK-shaped relationship table). Both tables
@@ -7,8 +7,8 @@ ship on disk; the active one is selected by ``REBAC_LOCAL_BACKEND_STORAGE``.
 This migration is additive — the existing ``Relationship`` table is
 unchanged. Operators flip ``REBAC_LOCAL_BACKEND_STORAGE = 'registry'``
 after running ``python manage.py rebac migrate-storage --to registry`` to
-copy existing rows. In v0.5 the default flips; in v0.6 the denormalized
-table is dropped.
+copy existing rows. The default remains denormalized in 0.7.0; any default
+flip or denormalized-table removal is deferred to a future release.
 """
 
 from __future__ import annotations

@@ -29,7 +29,7 @@ dependencies = [
 spicedb = ["authzed>=0.13"]
 caveats = ["cel-python>=0.1.5"]
 drf = ["djangorestframework>=3.14"]
-# Strawberry + Channels integration (proposal 0002). Channels is a
+# Strawberry + Channels integration. Channels is a
 # subscription-transport prerequisite — Strawberry alone covers HTTP
 # GraphQL but WS subscriptions need Channels' ASGI scope handling.
 strawberry = [

@@ -1,14 +1,14 @@
 # Defining Permissions in `django-zed-rebac`
 
-> Last updated: 2026-05-01
-> Status: **draft for review**.
+> Last updated: 2026-05-29
+> Status: **alpha implementation guide**.
 > Audience: Django developers writing permission schemas. Read [ARCHITECTURE.md](./ARCHITECTURE.md) first for the system design.
 
 ---
 
 ## What you author
 
-A **schema** is a `.zed` file shipped alongside your Django app. It declares the resource types, relations, permissions, and caveats your app uses. The plugin parses every app's `.zed` file at sync time and stores the result in `Schema*` tables; both backends (`LocalBackend`, `SpiceDBBackend`) consume the same parsed output.
+A **schema** is a `.zed` file shipped alongside your Django app. It declares the resource types, relations, permissions, and caveats your app uses. The plugin parses every app's `.zed` file at sync time and stores the result in `Schema*` tables. `LocalBackend` consumes that parsed output today; the planned `SpiceDBBackend` will consume the same schema contract.
 
 You write three things and only three things:
 
@@ -65,14 +65,14 @@ python manage.py rebac sync       # parses permissions.zed → Schema* tables
 `Post.objects.with_actor(request.user).all()` now returns only posts the user is `owner` of. Granting access:
 
 ```python
-from rebac import backend, ObjectRef, SubjectRef, RelationshipTuple
+from rebac import ObjectRef, RelationshipTuple, SubjectRef, write_relationships
 
-backend().write_relationships([
-    ("create", RelationshipTuple(
+write_relationships([
+    RelationshipTuple(
         resource=ObjectRef("blog/post", str(post.pk)),
         relation="owner",
         subject=SubjectRef.of("auth/user", str(user.pk)),
-    )),
+    ),
 ])
 ```
 
@@ -242,15 +242,15 @@ definition blog/post {
 To grant `viewer` to every member of group `editors`:
 
 ```python
-backend().write_relationships([
-    ("create", RelationshipTuple(
+write_relationships([
+    RelationshipTuple(
         resource=ObjectRef("blog/post", str(post.pk)),
         relation="viewer",
         subject=SubjectRef(
             object=ObjectRef("auth/group", str(editors.pk)),
             optional_relation="member",
         ),
-    )),
+    ),
 ])
 ```
 
@@ -272,12 +272,12 @@ definition blog/page {
 
 ```python
 # Make a page world-readable
-backend().write_relationships([
-    ("create", RelationshipTuple(
+write_relationships([
+    RelationshipTuple(
         resource=ObjectRef("blog/page", str(page.pk)),
         relation="public_viewer",
         subject=SubjectRef.of("auth/user", "*"),
-    )),
+    ),
 ])
 ```
 
@@ -316,7 +316,7 @@ definition storage/file {
 }
 ```
 
-The arrow `parent->read` reads as "walk to the parent, then evaluate `read` over there". Recursion is bounded by `REBAC_DEPTH_LIMIT` (default 8). Deeper trees raise `PermissionDepthExceeded`; switch to `SpiceDBBackend` (default depth 50) when you need deep walks.
+The arrow `parent->read` reads as "walk to the parent, then evaluate `read` over there". Recursion is bounded by `REBAC_DEPTH_LIMIT` (default 8). Deeper trees raise `PermissionDepthExceeded`; raise the limit carefully or move to the future `SpiceDBBackend` once it lands when you need deeper walks.
 
 **Multi-hop arrows are not supported.** You cannot write `parent->parent->read`. The pattern above works because `read` itself recurses through `parent->read` — that's how multi-hop traversal is expressed in SpiceDB.
 
@@ -348,13 +348,13 @@ definition blog/post {
 ```python
 from datetime import datetime, timedelta, timezone
 
-backend().write_relationships([
-    ("create", RelationshipTuple(
+write_relationships([
+    RelationshipTuple(
         resource=ObjectRef("blog/post", str(post.pk)),
         relation="temporary_viewer",
         subject=SubjectRef.of("auth/user", str(user.pk)),
         expires_at=datetime.now(timezone.utc) + timedelta(hours=24),
-    )),
+    ),
 ])
 ```
 
@@ -385,14 +385,14 @@ definition docs/sensitive {
 When writing the relationship, supply the static parameters (caveat *context*):
 
 ```python
-backend().write_relationships([
-    ("create", RelationshipTuple(
+write_relationships([
+    RelationshipTuple(
         resource=ObjectRef("docs/sensitive", str(doc.pk)),
         relation="ip_restricted_viewer",
         subject=SubjectRef.of("auth/user", str(user.pk)),
         caveat_name="ip_in_cidr",
         caveat_context={"cidr": "10.0.0.0/8"},
-    )),
+    ),
 ])
 ```
 
@@ -410,11 +410,14 @@ result = backend().check_access(
 
 If you check WITHOUT supplying `ip`, the result is `CONDITIONAL_PERMISSION(missing=["ip"])`. The application can re-check with the missing field — useful for two-pass evaluation (cheap relationship check + expensive context resolution).
 
-**`LocalBackend` caveat support.** Backed by [`cel-python`](https://pypi.org/project/cel-python/). Most CEL types work out of the box (`int`, `string`, `bool`, `list`, `map`, `timestamp`, `duration`). The `ipaddress` type is **not** in `cel-python`'s built-ins — `LocalBackend` raises `CaveatUnsupportedError`. Either migrate to `SpiceDBBackend`, or rewrite the caveat to take strings and do CIDR matching server-side.
+**`LocalBackend` caveat support.** Backed by [`cel-python`](https://pypi.org/project/cel-python/). Most CEL types work out of the box (`int`, `string`, `bool`, `list`, `map`, `timestamp`, `duration`). The `ipaddress` type is **not** in `cel-python`'s built-ins — `LocalBackend` raises `CaveatUnsupportedError`. Rewrite the caveat to take strings and do CIDR matching server-side, or move to the future `SpiceDBBackend` once it lands.
 
-### MCP tools as resources
+### MCP tools as resources (schema pattern; adapter planned)
 
-MCP (Model Context Protocol) tools are first-class resources. Permissions on them gate which tools an actor can invoke.
+MCP (Model Context Protocol) tools can be modeled as first-class resources.
+Permissions on them gate which tools an actor can invoke. The schema pattern is
+usable today, but the convenience `rebac_mcp_tool` decorator is planned work
+tracked in [proposal 0004](./proposals/0004-mcp-tool-integration.md).
 
 #### Pattern 1 — one resource type per tool
 
@@ -431,26 +434,30 @@ definition mcp/tool/edit_post {
 }
 ```
 
-Wire the tool with the plugin's MCP decorator:
+Until the adapter lands, wire the tool by resolving the actor in your MCP
+server and checking the permission explicitly:
 
 ```python
-from rebac.mcp import rebac_mcp_tool
+from rebac import ObjectRef, PermissionDenied, SubjectRef, backend
 
 @mcp.tool
-@rebac_mcp_tool(resource_type="mcp/tool/query_posts", action="invoke")
 async def query_posts(query: str, ctx: Context = CurrentContext()) -> list[dict]:
+    actor = SubjectRef.parse(ctx.request_context.meta["actor_subject"])
+    resource = ObjectRef("mcp/tool/query_posts", "*")
+    if not backend().check_access(subject=actor, action="invoke", resource=resource).allowed:
+        raise PermissionDenied(f"Denied: {actor} cannot invoke {resource}")
     ...
 ```
 
 Granting the right to invoke:
 
 ```python
-backend().write_relationships([
-    ("create", RelationshipTuple(
+write_relationships([
+    RelationshipTuple(
         resource=ObjectRef("mcp/tool/query_posts", "*"),  # "*" = the tool itself
         relation="invoker",
         subject=SubjectRef.of("auth/user", str(user.pk)),
-    )),
+    ),
 ])
 ```
 
@@ -465,21 +472,27 @@ definition mcp/capability {
 }
 ```
 
-Tag each tool with the capability it requires:
+Tag each tool with the capability it requires. The future MCP adapter should
+hide the internal capability argument from the published tool schema; until
+then, keep that plumbing in your server layer:
 
 ```python
 @mcp.tool
-@rebac_mcp_tool(resource_type="mcp/capability", action="use", id_arg="_capability")
 async def query_posts(
     query: str,
     ctx: Context = CurrentContext(),
     *,
     _capability: str = "blog.read",
 ) -> list[dict]:
+    actor = SubjectRef.parse(ctx.request_context.meta["actor_subject"])
+    resource = ObjectRef("mcp/capability", _capability)
+    if not backend().check_access(subject=actor, action="use", resource=resource).allowed:
+        raise PermissionDenied(f"Denied: {actor} cannot use {resource}")
     ...
 ```
 
-The `_capability="blog.read"` argument is filtered out of the published MCP schema (clients don't see it) but tells the decorator which capability to check. Capabilities form a flat namespace (`blog.read`, `blog.write`, `admin.users`) — easy for admins to grant in bulk.
+Capabilities form a flat namespace (`blog.read`, `blog.write`, `admin.users`)
+so admins can grant them in bulk.
 
 ### Agents acting on behalf of users (the Grant pattern)
 
@@ -563,8 +576,8 @@ caveat grant_constraints(now timestamp, expires_at timestamp, model_kind string,
 ```
 
 ```python
-backend().write_relationships([
-    ("create", RelationshipTuple(
+write_relationships([
+    RelationshipTuple(
         resource=ObjectRef("agents/grant", str(grant.pk)),
         relation="user",
         subject=SubjectRef.of("auth/user", str(user.pk)),
@@ -573,7 +586,7 @@ backend().write_relationships([
             "expires_at": "2026-12-31T23:59:59Z",
             "allowed_kinds": ["claude_internal", "claude_external"],
         },
-    )),
+    ),
 ])
 ```
 
@@ -602,11 +615,11 @@ Post.objects.with_actor(SubjectRef.of("auth/apikey", apikey.public_id))
 Post.objects.with_actor(my_apikey_instance)
 ```
 
-Inside an MCP tool, where the canonical actor is an `agents/grant`:
+Inside a future MCP tool adapter, where the canonical actor is an `agents/grant`,
+the server should scope ORM work through the grant actor:
 
 ```python
 @mcp.tool
-@rebac_mcp_tool(resource_type="blog/post", action="write", id_arg="post_id")
 async def edit_post(post_id: str, body: str, ctx: Context = CurrentContext()) -> dict:
     user, agent = ctx.rebac.user, ctx.rebac.agent
     post = await Post.objects.as_agent(agent, on_behalf_of=user).aget(pk=post_id)
@@ -909,7 +922,7 @@ definition docs/document {
 }
 ```
 
-### Pattern H — MCP tool gated by capability
+### Pattern H — Future MCP tool gated by capability
 
 ```zed
 definition mcp/capability {
@@ -920,7 +933,6 @@ definition mcp/capability {
 
 ```python
 @mcp.tool
-@rebac_mcp_tool(resource_type="mcp/capability", action="use", id_arg="_capability")
 async def search_documents(
     q: str,
     ctx: Context = CurrentContext(),

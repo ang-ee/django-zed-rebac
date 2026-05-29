@@ -1,6 +1,6 @@
 """Zookie freshness ContextVar + per-call consistency resolution.
 
-Proposal 0002. The mechanism that closes SpiceDB's write-then-read
+The mechanism that closes write-then-read
 staleness window: every write returns a ``Zookie``; subsequent reads
 within the same scope auto-upgrade to ``at_least_as_fresh(<zookie>)``
 under default consistency.

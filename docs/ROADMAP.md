@@ -1,4 +1,28 @@
-# ROADMAP (Code Review Follow-ups)
+# ROADMAP
+
+## Product roadmap
+
+- [ ] Implement `SpiceDBBackend`.
+  - Why: the public backend boundary is in place, but
+    `src/rebac/backends/spicedb.py` is still an explicit stub.
+  - Outcome: `REBAC_BACKEND = "spicedb"` becomes a supported runtime path,
+    with `authzed-py` wiring, schema push, Zookie translation, and
+    cross-backend contract tests.
+
+- [ ] Implement MCP tool integration.
+  - Why: schema authors can already model MCP tools as resources, but the
+    advertised `rebac_mcp_tool` decorator does not exist yet.
+  - Outcome: proposal 0004 lands as `rebac.mcp.rebac_mcp_tool` with
+    fail-closed actor resolution and sync/async tool support.
+
+- [ ] Decide the LocalBackend registry-storage default.
+  - Why: registry mode exists and is tested, but the package still defaults to
+    the historical denormalized table.
+  - Outcome: either flip the default in a future minor release after migration
+    confidence, or document denormalized as the long-lived compatibility
+    default and keep registry opt-in.
+
+## Code review follow-ups
 
 This document captures **technical-debt and best-practice follow-ups** identified during a repository review.
 

@@ -1,4 +1,4 @@
-"""Tests for ``manage.py rebac migrate-storage`` (proposal 0001)."""
+"""Tests for ``manage.py rebac migrate-storage``."""
 
 from __future__ import annotations
 

@@ -1,4 +1,4 @@
-"""Tests for ``rebac.evaluator.PermissionEvaluator`` (proposal 0002).
+"""Tests for ``rebac.evaluator.PermissionEvaluator``.
 
 Covers cache hit/miss, conditional bypass, LRU eviction, scope nesting,
 async-task isolation, and stats reporting.

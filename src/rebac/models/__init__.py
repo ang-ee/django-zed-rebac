@@ -1,7 +1,7 @@
 """Django models.
 
-Tables: ``Relationship`` + ``RelationshipRegistry`` (proposal 0001) + ``RebacResource``
-(proposal 0001) + ``Schema*`` (4) + ``PackageManagedRecord`` + ``SchemaOverride``
+Tables: ``Relationship`` + ``RelationshipRegistry`` + ``RebacResource`` +
+``Schema*`` (4) + ``PackageManagedRecord`` + ``SchemaOverride``
 + ``PermissionAuditEvent``. Per ARCHITECTURE.md § Models.
 
 Both ``Relationship`` and ``RelationshipRegistry`` ship in the migration; only

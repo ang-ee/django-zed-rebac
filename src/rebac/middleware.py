@@ -1,6 +1,6 @@
 """ActorMiddleware — populates `current_actor()` from `request.user`.
 
-Per proposal 0002 also brackets each request with an evaluator scope
+Also brackets each request with an evaluator scope
 (per-request permission check cache) and a Zookie scope (write-then-read
 freshness propagation, with optional cross-request transport via header
 or session).

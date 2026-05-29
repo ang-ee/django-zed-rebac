@@ -22,7 +22,7 @@ class Backend(ABC):
     """Mirror of `authzed.api.v1` surface, snake_cased.
 
     The ``at_zookie`` parameter on read methods (added in 0.4 per
-    proposal 0002) carries the freshness floor for
+    evaluator/Zookie freshness layer carries the freshness floor for
     ``Consistency.AT_LEAST_AS_FRESH`` / ``AT_EXACT_SNAPSHOT`` reads.
     Backends MUST validate ``at_zookie.backend == self.kind`` and raise
     a clear error on mismatch — a SpiceDB zookie handed to LocalBackend
@@ -108,6 +108,6 @@ class Backend(ABC):
         :func:`rebac.preflight.check_new`) require this to walk permission
         expressions before any row exists; ``lookup_subjects`` reverse
         walks will also lean on it once they grow past direct-relation
-        rows. SpiceDBBackend will implement by caching the result of
+        rows. The future SpiceDB adapter should cache the result of
         ``Client.ReadSchema()`` parsed through :func:`rebac.schema.parse_zed`.
         """

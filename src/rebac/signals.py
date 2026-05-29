@@ -415,7 +415,7 @@ def _rebac_override_post_delete(sender: type[Model], instance: Any, **_: Any) ->
     )
 
 
-# ---------- Proposal 0001: RebacResource cascade ----------
+# ---------- RebacResource cascade ----------
 #
 # When a Django row backed by ``RebacMixin`` is deleted in registry mode,
 # its corresponding ``RebacResource`` row must die with it so the

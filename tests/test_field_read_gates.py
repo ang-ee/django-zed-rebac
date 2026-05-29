@@ -1,4 +1,4 @@
-"""Field-level read enforcement (proposal 0003).
+"""Field-level read enforcement.
 
 ``read__<field>`` is a normal permission name in the schema. These tests pin
 the model-layer redaction behavior that consumes those permissions for every

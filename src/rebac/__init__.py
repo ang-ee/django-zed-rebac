@@ -166,13 +166,13 @@ __all__ = [
     "delete_relationships",
     "emit_audit_event",
     "aemit_audit_event",
-    # evaluator (proposal 0002)
+    # evaluator
     "PermissionEvaluator",
     "current_evaluator",
     "evaluator_scope",
     # preflight — create-time check against not-yet-persisted resources
     "check_new",
-    # consistency (proposal 0002)
+    # consistency
     "current_zookie",
     "record_zookie",
     "zookie_scope",

@@ -86,7 +86,7 @@ _DEFAULTS: dict[str, Any] = {
     # 0.4 shape) stores ``resource_type / resource_id / subject_type /
     # subject_id`` as wide ``CharField`` columns on every ``Relationship``
     # row — the wire shape that mirrors ``authzed.api.v1.Relationship``.
-    # ``"registry"`` (proposal 0001, opt-in in 0.4, default in 0.5) stores
+    # ``"registry"`` stores
     # those four columns as integer FKs into a shared ``RebacResource``
     # table, yielding a 5-10x index-density gain on the hot path and
     # FK-CASCADE cleanup when the underlying Django row is deleted.

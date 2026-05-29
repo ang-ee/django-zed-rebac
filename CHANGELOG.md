@@ -5,6 +5,15 @@ pre-1.0; breaking changes within a minor version are explicitly called out.
 
 ## [Unreleased]
 
+### Documentation
+
+- Removed proposal docs for work already shipped in code and recorded in this
+  changelog: registry storage, evaluator/Zookie/Strawberry, and field-level
+  read gates.
+- Added proposal 0004 for the not-yet-implemented MCP tool adapter.
+- Clarified that `SpiceDBBackend` remains roadmap work and that registry
+  storage is still opt-in in 0.7.0.
+
 ## [0.7.0] — 2026-05-29
 
 ### Added — field-level read gates (proposal 0003)
@@ -340,8 +349,8 @@ adapter for GraphQL-over-WebSocket subscriptions (proposal 0002).
   `denormalized`).
 - Cascade signal handler `_rebac_cascade_resource` (registry mode
   only).
-- **Default flips to `"registry"` in v0.4**; `"denormalized"` removed
-  in v0.5.
+- Registry storage remains opt-in in 0.7.0; any default flip or
+  denormalized-path removal is deferred to a future minor release.
 
 ### Added — proposal 0002 (evaluator + Zookie freshness + Strawberry/Channels)
 

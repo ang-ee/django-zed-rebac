@@ -1,4 +1,4 @@
-"""ActorMiddleware integration with evaluator + Zookie transport (proposal 0002).
+"""ActorMiddleware integration with evaluator + Zookie transport.
 
 Covers:
   - HTTP request opens evaluator_scope + zookie_scope.

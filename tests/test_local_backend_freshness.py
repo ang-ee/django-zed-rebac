@@ -1,4 +1,4 @@
-"""LocalBackend's ``at_least_as_fresh`` filter (proposal 0002 § LocalBackend).
+"""LocalBackend's ``at_least_as_fresh`` filter.
 
 The LocalBackend uses ``Relationship.written_at_xid`` as its freshness
 witness — ``Zookie.token`` carries the xid; reads with
@@ -172,7 +172,7 @@ def test_write_zookie_is_batch_high_watermark(backend, django_assert_num_queries
     see every row produced by the write and exclude any strictly-later
     rows.
 
-    Regression for the proposal-0002 contract: an earlier implementation
+    Regression for the freshness contract: an earlier implementation
     consumed an extra xid in ``_zookie()`` after the loop, making the
     returned token strictly greater than every row. Tests happened to
     pass because the next batch's xids were also strictly greater, but

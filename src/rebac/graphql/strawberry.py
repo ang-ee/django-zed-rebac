@@ -1,6 +1,6 @@
 """Strawberry + Channels integration for ``django-zed-rebac``.
 
-Proposal 0002. Two pieces:
+Two pieces:
 
   - :class:`RebacExtension` — Strawberry Schema Extension that brackets
     every GraphQL operation (query, mutation, AND each subscription
@@ -17,7 +17,7 @@ Proposal 0002. Two pieces:
     scopes inside :class:`RebacExtension` reset per emission so a
     revoked grant takes effect on the next yield.
 
-Subscription invariants (per proposal 0002 § "Subscription lifecycle"):
+Subscription invariants:
 
   - **Actor**: connection-scoped. A long-lived WS started 2h ago
     keeps the actor identity it had at handshake. (Auth re-validation

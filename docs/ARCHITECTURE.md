@@ -1,24 +1,24 @@
 # `django-zed-rebac` — Architecture
 
-> Status: **draft for review** — first public spec; no code merged yet.
-> Last updated: 2026-05-01
+> Status: **alpha implementation guide** — reflects the 0.7.0 codebase.
+> Last updated: 2026-05-29
 > Audience: Django integrators evaluating fit, contributors, framework authors building on top.
 >
 > Companion docs:
-> - [ZED.md](./ZED.md) — schema authoring guide. How to write `permissions.zed` for users, groups, MCP tools, agents, Celery tasks, and arbitrary entities.
+> - [ZED.md](./ZED.md) — schema authoring guide. How to write `permissions.zed` for users, groups, agents, Celery tasks, future MCP tools, and arbitrary entities.
 
 ---
 
 ## TL;DR
 
-`django-zed-rebac` is a **drop-in REBAC engine** for any Django 4.2 / 5.2 / 6.0 project. Add it to `INSTALLED_APPS`, declare your authorisation schema in a per-package `permissions.zed` file, and every queryset, save, and method call is gated against the effective user — without rewriting your viewsets.
+`django-zed-rebac` is a **drop-in REBAC engine** for Django 6.0 projects. Add it to `INSTALLED_APPS`, declare your authorisation schema in a per-package `permissions.zed` file, and every queryset, save, and method call is gated against the effective user — without rewriting your viewsets.
 
 Core capabilities:
 
 - **The SpiceDB schema language**, hand-authored as `.zed` files shipped per package. Loaded into DB tables on install/upgrade with `noupdate=True` semantics that preserve admin edits.
-- **Two pluggable backends:**
-  - `LocalBackend` — pure-Django evaluation via PostgreSQL/MySQL/SQLite recursive CTEs over a single `Relationship` table. Zero infrastructure.
-  - `SpiceDBBackend` — wraps the official [`authzed`](https://pypi.org/project/authzed/) Python client. Production drop-in; same Python API.
+- **A pluggable backend boundary:**
+  - `LocalBackend` — pure-Django evaluation over relationship rows. Zero infrastructure.
+  - `SpiceDBBackend` — roadmap adapter for the official [`authzed`](https://pypi.org/project/authzed/) Python client. The class is present as a clear stub, not a supported runtime backend yet.
 - **A `RebacMixin` model mixin** that, by inclusion, replaces `Manager.objects` with a permission-aware variant. Every read scopes to the effective user; every write checks before SQL is issued.
 - **Three storage tiers, three editors:**
   - **Tier 1 — Structural.** Per-package `permissions.zed`, code-shipped, DB-loaded.
@@ -61,7 +61,7 @@ AUTHENTICATION_BACKENDS = [
     "django.contrib.auth.backends.ModelBackend",
 ]
 
-REBAC_BACKEND = "local"   # or "spicedb"
+REBAC_BACKEND = "local"   # "spicedb" is roadmap/stubbed today
 ```
 
 ### 2. Ship a `permissions.zed` next to your app
@@ -128,7 +128,7 @@ def post_detail(request, pk):
 # Post.objects.as_agent(agent, on_behalf_of=request.user)
 ```
 
-The same flow works in DRF, Celery tasks, MCP tools, and management commands. See [§ Surface integrations](#surface-integrations).
+The same flow works in DRF, Celery tasks, GraphQL resolvers, management commands, and future MCP tools. See [§ Surface integrations](#surface-integrations).
 
 ---
 
@@ -192,7 +192,7 @@ This three-state result mirrors SpiceDB exactly and is critical for layered chec
 ┌─────────────────────────────────────────────────────────────────┐
 │                         your Django project                      │
 │                                                                   │
-│  views/    drf/    celery/    mcp/    graphql/    plain Python   │
+│  views/    drf/    celery/    graphql/    plain Python           │
 │    │         │        │         │         │            │          │
 │    └─────────┴────────┴─────────┴─────────┴────────────┘          │
 │                          │                                        │
@@ -208,8 +208,8 @@ This three-state result mirrors SpiceDB exactly and is critical for layered chec
 │  ┌─────────▼──────────┐    ┌──────────▼──────────────┐          │
 │  │  LocalBackend      │    │  SpiceDBBackend          │          │
 │  │  ─────────────     │    │  ──────────────          │          │
-│  │  recursive CTE     │    │  authzed.api.v1.Client   │          │
-│  │  on Relationship   │    │  → gRPC to spicedb       │          │
+│  │  local graph walk  │    │  planned authzed adapter │          │
+│  │  on Relationship   │    │  roadmap implementation  │          │
 │  │  + cel-python      │    │                          │          │
 │  └────────────────────┘    └──────────────────────────┘          │
 │                                                                   │
@@ -225,8 +225,8 @@ This three-state result mirrors SpiceDB exactly and is critical for layered chec
 | Django ORM | `RebacMixin` metaclass | Replaces `objects` with `RebacManager`; wires pre-save / pre-delete signals; installs `from_db` actor propagation. |
 | DRF | `RebacPermission` (BasePermission) + `RebacFilterBackend` (BaseFilterBackend) | Per-action permission check on viewsets; queryset filter on list endpoints. |
 | Celery | `before_task_publish` + `task_prerun` signals | Injects `actor_id` into task headers on enqueue; restores into ContextVar on worker. |
-| MCP (FastMCP / official SDK) | `@rebac_mcp_tool` decorator | Wraps the tool function; resolves actor from `ctx.request_context.meta`; checks before body runs. |
-| GraphQL (graphene / strawberry) | `@rebac_resource` resolver decorator | Same pattern as MCP, applied at field resolution. |
+| MCP (FastMCP / official SDK) | Planned `@rebac_mcp_tool` decorator | Tracked in [proposal 0004](./proposals/0004-mcp-tool-integration.md). For now, model MCP tools as resources and call `check_access` / `with_actor` explicitly in your server. |
+| GraphQL (strawberry) | `rebac.graphql.strawberry.RebacExtension` + `RebacChannelsConsumerMixin` | Opens evaluator/Zookie scopes per operation and per subscription emission. Use `require_permission` or actor-scoped querysets inside resolvers. |
 | Plain Python | `@rebac_resource(type=..., id_attr=...)` | Registers the class as a known resource type for explicit `check_access()` calls. |
 
 ---
@@ -244,7 +244,7 @@ from rebac import (
     # Backend interface
     Backend, LocalBackend, SpiceDBBackend,
     CheckResult, Consistency, Zookie,
-    ObjectRef, SubjectRef, Relationship as RelationshipTuple,
+    ObjectRef, SubjectRef, RelationshipTuple,
 
     # Errors
     PermissionDenied, MissingActorError, CaveatUnsupportedError,
@@ -277,7 +277,6 @@ from rebac import (
 
 from rebac.drf    import RebacPermission, RebacFilterBackend
 from rebac.celery import propagate_actor
-from rebac.mcp    import rebac_mcp_tool
 from rebac.schema import parse_zed, validate_schema   # for tooling
 from rebac.roles  import grant, revoke, roles_of, members_of   # role-as-namespace helpers
 ```
@@ -462,7 +461,7 @@ class Relationship(models.Model):
         ]
 ```
 
-**Frozen contract.** The shape mirrors `authzed.api.v1.Relationship` exactly. Renames are breaking. Indexes are critical (the recursive CTE walks them on every check) and ship in the initial migration — never as a documentation step.
+**Frozen contract.** The shape mirrors `authzed.api.v1.Relationship` exactly. Renames are breaking. Indexes are critical (the local graph walk reads them on every check) and ship in the initial migration — never as a documentation step.
 
 **Swappability.** Projects that need to extend the model (audit FKs, multi-tenant prefix, etc.) declare a custom subclass and point `REBAC_RELATIONSHIP_MODEL = "myapp.MyRelationship"`. The plugin uses [`swapper`](https://pypi.org/project/swapper/) to keep migrations correct across this swap. Default behaviour: `swapper` returns the built-in `rebac.Relationship`.
 
@@ -475,15 +474,15 @@ class Relationship(models.Model):
 
 **`expires_at`.** Mirrors SpiceDB's [`use expiration`](https://authzed.com/docs/spicedb/concepts/schema#use-expiration) feature (GA in v1.40+). Expired rows are evaluated as absent at check time; a periodic GC task (`rebac.gc.expire_relationships`) deletes them every 5 minutes by default.
 
-### Storage modes (proposal 0001)
+### Storage modes
 
 `LocalBackend` ships two storage shapes for the relationship table; the
 active one is selected by `REBAC_LOCAL_BACKEND_STORAGE`:
 
 | Mode | Backing model | Hot index width per entry | When to use |
 |---|---|---|---|
-| `"denormalized"` *(0.4 default)* | `Relationship` (the table above) | ~192 bytes (4 × CharField + relation) | Existing deployments; smallest change footprint. |
-| `"registry"` *(0.5 default)* | `RelationshipRegistry` + `RebacResource` | ~16 bytes (two integer FKs + relation) | New deployments; large relationship tables (>100k rows); any deployment that wants FK-CASCADE cleanup. |
+| `"denormalized"` *(current default)* | `Relationship` (the table above) | ~192 bytes (4 x CharField + relation) | Existing deployments; smallest change footprint. |
+| `"registry"` *(opt-in)* | `RelationshipRegistry` + `RebacResource` | ~16 bytes (two integer FKs + relation) | Large relationship tables (>100k rows); deployments that want FK-CASCADE cleanup. |
 
 Both tables ship in migration `0002_rebac_resource.py` so an operator can
 flip the setting without further schema changes. `rebac.models.active_relationship_model()`
@@ -502,8 +501,8 @@ changes.
 
 - Index density: with integer FKs the hot `(resource_fk, relation)` index
   fits ~500+ entries per Postgres leaf page vs ~40 in denormalized form.
-  The recursive CTE re-walks this index multiple times per check, so the
-  gain compounds in `accessible()` evaluation.
+  The local graph walk reuses these indexes heavily, so the gain compounds in
+  `accessible()` evaluation.
 - FK cascade: when a Django row backed by `RebacMixin` is deleted, the
   `post_delete` signal handler drops the matching `RebacResource` row,
   and the FK CASCADE on `RelationshipRegistry` sweeps every tuple that
@@ -528,14 +527,13 @@ then drop manually. `rebac.W005` surfaces the recommendation at startup
 when the setting is `"denormalized"`.
 
 **SpiceDB unaffected.** This is purely a `LocalBackend` optimisation. The
-`SpiceDBBackend` writes go through gRPC and never touch the local table.
+future `SpiceDBBackend` will write through gRPC and will not touch the local
+relationship table.
 
-**Roadmap.**
-- **0.4** ships both tables; default `"denormalized"`; `rebac.W005` warns.
-- **0.5** flips default to `"registry"`; operators on the old shape get
-  `rebac.E007` at startup pointing at the migration command.
-- **0.6** drops the denormalized code path entirely; `Relationship` is
-  removed and `RelationshipRegistry` is renamed back to `Relationship`.
+**Current status.** Both tables ship in 0.7.0. The default remains
+`"denormalized"` and registry mode is opt-in. A future minor release may flip
+the default or remove the denormalized path after migration experience is
+boring enough to justify the churn.
 
 ### `SchemaDefinition` / `SchemaRelation` / `SchemaPermission` / `SchemaCaveat` — Tier 1 baseline
 
@@ -669,12 +667,14 @@ All settings prefixed `REBAC_`. No nested dict. Read via the public `app_setting
 
 | Setting | Default | Type | Purpose |
 |---|---|---|---|
-| `REBAC_BACKEND` | `"local"` | `"local"` \| `"spicedb"` | Which backend to instantiate at app-ready. |
+| `REBAC_BACKEND` | `"local"` | `"local"` \| `"spicedb"` | Which backend to instantiate at app-ready. `"spicedb"` is reserved for the roadmap adapter and raises today. |
 | `REBAC_RELATIONSHIP_MODEL` | `"rebac.Relationship"` | `str` | Swappable relationship model (Django convention). |
-| `REBAC_SPICEDB_ENDPOINT` | `None` | `str` \| `None` | `host:port` for `authzed.api.v1.Client`. Required when backend is `spicedb`. |
-| `REBAC_SPICEDB_TOKEN` | `None` | `str` \| `None` | Preshared key. Required when backend is `spicedb`. |
-| `REBAC_SPICEDB_TLS` | `True` | `bool` | If `False`, uses `InsecureClient` (dev only). |
-| `REBAC_SPICEDB_AUTO_WRITE_SCHEMA` | `True` | `bool` | On app-ready (when backend is `spicedb`), push the compiled schema via `WriteSchema`. |
+| `REBAC_LOCAL_BACKEND_STORAGE` | `"denormalized"` | `"denormalized"` \| `"registry"` | LocalBackend relationship storage shape. Registry mode is opt-in and uses `RelationshipRegistry` + `RebacResource`. |
+| `REBAC_LOCAL_BACKEND_REGISTRY_BATCH_SIZE` | `5000` | `int` | Batch size for `python manage.py rebac migrate-storage`. |
+| `REBAC_SPICEDB_ENDPOINT` | `None` | `str` \| `None` | Roadmap setting for the future `authzed.api.v1.Client`. Required once backend `spicedb` is implemented. |
+| `REBAC_SPICEDB_TOKEN` | `None` | `str` \| `None` | Roadmap setting for the future SpiceDB preshared key. |
+| `REBAC_SPICEDB_TLS` | `True` | `bool` | Roadmap setting for TLS behavior in the future SpiceDB adapter. |
+| `REBAC_SPICEDB_AUTO_WRITE_SCHEMA` | `True` | `bool` | Roadmap setting for future schema auto-push. |
 | `REBAC_SCHEMA_DIR` | `BASE_DIR / "rebac"` | `Path` \| `str` | Where `build-zed` writes `effective.zed`. |
 | `REBAC_DEPTH_LIMIT` | `8` | `int` | Hard cap on recursive permission walks. Matches SpiceDB default. |
 | `REBAC_DEFAULT_CONSISTENCY` | `"minimize_latency"` | `str` | Default `Consistency` for checks. |
@@ -690,6 +690,10 @@ All settings prefixed `REBAC_`. No nested dict. Read via the public `app_setting
 | `REBAC_TYPE_PREFIX` | `""` | `str` | Optional prefix for all generated resource types (multi-tenant SaaS). |
 | `REBAC_SUPERUSER_BYPASS` | `True` | `bool` | If `True`, active superusers short-circuit `has_perm` AND run inside an `ActorMiddleware`-opened `sudo("superuser-bypass")` bracket so QuerySet scoping lifts too. Each elevated request emits a `KIND_SUDO_BYPASS` audit row. Suppressed when `REBAC_ALLOW_SUDO = False`. Strict tenants set this to `False`. |
 | `REBAC_LINT_BARE_PREFETCH` | `True` | `bool` | Toggle for `rebac.W003` — the structural warning that an RBAC-bound model has an FK / O2O / M2M to another RBAC-bound model (a bare-string `select_related` / `prefetch_related` would JOIN unscoped). Enabled by default so the risky shape is visible; set `False` only after auditing the relation paths or wrapping them in actor-scoped querysets. Goes away once true bare-string prefetch auto-scoping ships. |
+| `REBAC_EVALUATOR_CACHE_SIZE` | `10000` | `int` | Max entries across the per-scope evaluator's `check_access` and `accessible` LRU caches. |
+| `REBAC_ZOOKIE_TRANSPORT` | `"none"` | `"none"` \| `"header"` \| `"session"` | Optional cross-request transport for the current Zookie. |
+| `REBAC_ZOOKIE_HEADER_NAME` | `"X-Rebac-Zookie"` | `str` | Header name used when `REBAC_ZOOKIE_TRANSPORT = "header"`. |
+| `REBAC_ZOOKIE_SESSION_KEY` | `"_rebac_zookie"` | `str` | Session key used when `REBAC_ZOOKIE_TRANSPORT = "session"`. |
 | `REBAC_FIELD_READ_MODE` | `"allow"` | `"allow"` \| `"redact"` \| `"omit"` \| `"raise"` | Deny behavior for schema permissions named `read__<field>`. `"raise"` currently degrades to `"redact"` and emits `rebac.W008` until descriptor-level protected fields land. |
 | `REBAC_FIELD_READ_FAIL_CLOSED_ON_CONDITIONAL` | `True` | `bool` | Bulk field redaction has no per-row caveat context; `True` treats conditional `read__<field>` results as denied. Set `False` only when conditional visibility is acceptable without context. |
 
@@ -724,11 +728,15 @@ System checks (in `rebac/checks.py`):
 | `rebac.E003` | Error | A model with `Meta.rebac_resource_type` references a type not declared in any loaded `permissions.zed`. |
 | `rebac.E004` | Error | Permission expressions parse against operator grammar. |
 | `rebac.E005` | Error | `permissions.zed` declared in an `AppConfig` cannot be located on disk. |
+| `rebac.E006` | Error | `REBAC_LOCAL_BACKEND_STORAGE` is `"denormalized"` or `"registry"`. |
+| `rebac.E007` | Error | `REBAC_ZOOKIE_TRANSPORT` is `"none"`, `"header"`, or `"session"`. |
 | `rebac.E008` | Error | `REBAC_FIELD_READ_MODE` is not one of `"allow"`, `"redact"`, `"omit"`, or `"raise"`. |
 | `rebac.W001` | Warning | `rebac.backends.RebacBackend` not in `AUTHENTICATION_BACKENDS`. |
 | `rebac.W002` | Warning | A model with `Meta.rebac_resource_type` is missing `RebacMixin`. |
 | `rebac.W003` | Warning | A `prefetch_related("rel")` string-form for an RBAC-flagged related model — should use explicit `Prefetch(...)`. |
-| `rebac.W004` | Warning | A relation has zero `Relationship` rows after 30 days (potential dead schema). |
+| `rebac.W004` | Warning | Universal-admin role convention lint for role definitions. |
+| `rebac.W005` | Warning | LocalBackend is still on denormalized storage and registry migration is recommended for large tables. |
+| `rebac.W006` | Warning | `REBAC_ZOOKIE_TRANSPORT = "session"` without `django.contrib.sessions`. |
 | `rebac.W008` | Warning | `REBAC_FIELD_READ_MODE = "raise"` currently degrades to `"redact"` until descriptor-based protected fields land. |
 | `rebac.W101` | Warning (`--deploy`) | `REBAC_SPICEDB_TLS = False` in production. |
 
@@ -804,6 +812,8 @@ class Backend(ABC):
         action:  str,
         resource: ObjectRef,
         context: dict | None = None,
+        consistency: Consistency | None = None,
+        at_zookie: Zookie | None = None,
     ) -> CheckResult:
         """Three-state: HAS / NO / CONDITIONAL.
            Combines model-level and record-level checks.
@@ -818,6 +828,8 @@ class Backend(ABC):
         action:         str,
         resource_type:  str,
         context:        dict | None = None,
+        consistency:    Consistency | None = None,
+        at_zookie:      Zookie | None = None,
     ) -> Iterable[str]:
         """Set of resource_ids the subject has `action` on. Basis of
            `Model.objects.with_actor(actor)` queryset scoping."""
@@ -828,6 +840,8 @@ class Backend(ABC):
         action:       str,
         subject_type: str,
         context:      dict | None = None,
+        consistency:  Consistency | None = None,
+        at_zookie:    Zookie | None = None,
     ) -> Iterable[SubjectRef]:
         """Reverse: who has `action` on this resource?
            Powers share-with-user search and audit views."""
@@ -849,9 +863,7 @@ class Backend(ABC):
         ``OPERATION_DELETE``. Adding a dedicated verb keeps the local
         ergonomics — empty ``optional_subject_relation`` / ``caveat_name``
         as exact values rather than wildcards — without forcing every
-        caller to construct an updates-with-operation list. Planned to be
-        lowered through ``WriteRelationships`` in 0.4 once the ABC
-        accepts operation-shaped updates."""
+        caller to construct an updates-with-operation list."""
 
     def schema(self) -> Schema:
         """Return the installed schema AST.
@@ -861,8 +873,8 @@ class Backend(ABC):
         permission expressions before any row exists; ``lookup_subjects``
         reverse walks will also lean on it once they grow past direct-
         relation rows. LocalBackend serves the in-memory composed schema;
-        SpiceDBBackend will implement by caching the parsed result of
-        ``Client.ReadSchema()`` (0.5+)."""
+        the future SpiceDB adapter should cache the parsed result of
+        ``Client.ReadSchema()``."""
 ```
 
 `CheckResult` is `(allowed: bool, conditional_on: list[str], reason: str | None)`. The `conditional_on` field lists caveat parameter names whose context wasn't supplied — the caller may retry.
@@ -988,7 +1000,7 @@ The three actor verbs are sugar over the same primitive:
 |---|---|---|
 | `with_actor(actor)` | Resolves `actor` to a `SubjectRef` and pins it on the queryset clone. | The default. Works for any subject type. |
 | `as_user(user)` | Equivalent to `with_actor(to_subject_ref(user))` for a Django `User`. | The HTTP request path: `Post.objects.as_user(request.user)`. |
-| `as_agent(agent, on_behalf_of=u)` | Equivalent to `with_actor(grant_subject_ref(agent, u))` — resolves to an `agents/grant:<id>#valid` subject. | MCP servers and agent runtimes where a Grant is the canonical actor. |
+| `as_agent(agent, on_behalf_of=u)` | Equivalent to `with_actor(grant_subject_ref(agent, u))` — resolves to an `agents/grant:<id>#valid` subject. | Agent runtimes and future MCP servers where a Grant is the canonical actor. |
 | `with_action(action)` | Pins the permission used for read-side queryset scoping instead of `read` / `Meta.rebac_default_action`. | Alternate read views such as `credential_lookup`, `list_admin`, or capability-specific resolver scopes. |
 | `on_field_deny(mode)` | Pins the field-read deny mode for `read__<field>` gates instead of the global setting. | Projection-sensitive paths that want `"omit"` while the global default stays `"allow"` or `"redact"`. |
 
@@ -1110,7 +1122,7 @@ MIDDLEWARE = [
 
 The contextvar is exposed as `current_actor()` — works in async views, sync views, ASGI consumers, and DRF viewsets identically.
 
-## Per-request evaluator + Zookie freshness (proposal 0002)
+## Per-request evaluator + Zookie freshness
 
 `ActorMiddleware` brackets each request with TWO additional scopes alongside
 the actor ContextVar: an evaluator scope (per-request permission check cache)
@@ -1137,9 +1149,9 @@ LRU eviction across BOTH check and accessible caches. Conditional results
 params are part of the answer and the next call may supply them. Per-call
 explicit `consistency` / `at_zookie` also bypass the cache.
 
-`accessible_cached`, `enable_accessible_cache`, `disable_accessible_cache`
-(the v0.3 helpers) are kept as `DeprecationWarning`-emitting aliases through
-0.5 and removed in 0.6 alongside the denormalized storage path.
+The old `accessible_cached`, `enable_accessible_cache`, and
+`disable_accessible_cache` helpers were removed in 0.5. Use
+`current_evaluator()` / `evaluator_scope()` directly.
 
 ### Zookie freshness — closes the write-then-read window
 
@@ -1153,11 +1165,10 @@ from rebac import write_relationships, current_zookie, zookie_scope
 
 with zookie_scope():
     write_relationships([...])     # → records Zookie
-    # Subsequent read in scope sees post-write state across both backends:
-    # - SpiceDBBackend: ConsistencyRequirement.at_least_as_fresh translates
-    #   to the protobuf union, closing the dispatcher-cache window.
-    # - LocalBackend: `written_at_xid <= cutoff` filter on every Relationship
-    #   read in the evaluation walk.
+    # Subsequent LocalBackend reads in scope see post-write state:
+    # `written_at_xid <= cutoff` filters every Relationship read in
+    # the evaluation walk. The same public API is reserved for the
+    # planned SpiceDB adapter.
     accessible(subject=u, action="read", resource_type="blog/post")
 ```
 
@@ -1254,19 +1265,16 @@ def email_user_their_drafts(user_id: int):
 
 **Eager-mode caveat.** `before_task_publish` does NOT fire when `CELERY_TASK_ALWAYS_EAGER = True`. The plugin handles this by falling back to `task_prerun` — which DOES fire in eager mode — reading `current_actor()` directly.
 
-### MCP (FastMCP / official Python SDK)
+### MCP (planned)
 
-```python
-@mcp.tool
-@rebac_mcp_tool(resource_type="blog/post", action="write", id_arg="post_id")
-async def edit_post(post_id: str, body: str, ctx: Context = CurrentContext()) -> dict:
-    post = await Post.objects.aget(public_id=post_id)
-    post.body = body
-    await post.asave()
-    return {"ok": True}
-```
+MCP tools can be modeled as resources today, but the convenience decorator is
+not shipped yet. The implementation is tracked in
+[proposal 0004](./proposals/0004-mcp-tool-integration.md).
 
-The MCP client must place the actor's subject into the request envelope's `meta` dict (`{"actor_subject": "auth/user:42"}`). The plugin does NOT mint or validate identity — that's the MCP server's transport-layer job (typically OAuth 2.1, per the MCP spec).
+Until that lands, MCP servers should resolve the actor at their transport
+boundary, pass it through `.with_actor(...)` / `.as_agent(...)`, and call
+`backend().check_access(...)` or `@require_permission(...)` explicitly. The MCP
+server remains responsible for minting and validating identity.
 
 ### GraphQL (graphene / strawberry)
 
@@ -1441,16 +1449,16 @@ Three layers of tests define the project target:
 
 1. **Unit tests** (`pytest`): pure-Python, no database. Schema parsing, expression compilation, codename mapping, build determinism.
 2. **Integration tests** (`pytest-django`, `@pytest.mark.django_db`): in-memory SQLite + real Postgres. `RebacMixin` end-to-end, manager scoping, signal handlers.
-3. **Cross-backend contract tests**: same suite parameterised over `LocalBackend` and `SpiceDBBackend` (the latter via [`testcontainers-spicedb`](https://pypi.org/project/testcontainers-spicedb/)). Run on CI when Docker is available; opt-in via `pytest -m spicedb`.
+3. **Future cross-backend contract tests**: once `SpiceDBBackend` lands, run the same suite against `LocalBackend` and SpiceDB (for example via [`testcontainers-spicedb`](https://pypi.org/project/testcontainers-spicedb/)).
 
 Current GitHub CI gates `ruff` and `pytest` on Python 3.14 + Django 6.0. The
 target compatibility matrix is:
 
 ```
-Python:  3.11 · 3.12 · 3.13 · 3.14
-Django:  4.2 · 5.2 · 6.0
+Python:  3.14
+Django:  6.0
 DB:      sqlite (unit) · postgres-15 (integration) · postgres-16 (integration)
-Backend: local · spicedb (when Docker available)
+Backend: local
 ```
 
 The package ships `py.typed` (PEP 561) and keeps the public API annotated. Full
@@ -1465,7 +1473,8 @@ lint + runtime tests.
 may add public API and tighten alpha contracts; patch releases are reserved for
 compatible fixes.
 
-LTS support: Django 4.2 LTS through April 2026, Django 5.2 LTS through April 2028. We track Django's own deprecation policy and never force users off LTS prematurely.
+LTS support for older Django lines was dropped before 0.7.0. The package
+currently targets Django 6.0+ and Python 3.14+.
 
 Public API (`rebac.*` direct imports + the schema language) is intended to be
 stable across patch releases. `rebac._internal.*` is private.
@@ -1476,20 +1485,19 @@ stable across patch releases. `rebac._internal.*` is private.
 
 | Phase | Deliverable |
 |---|---|
-| **0.1.0 — MVP** | `LocalBackend` (Postgres CTE, MySQL CTE, SQLite test-mode); schema parser + sync command; `RebacMixin` + manager + signals; `RebacPermission` + `RebacFilterBackend`; system checks; sync/check/doctor commands; full test matrix. |
+| **0.1.0 — MVP** | `LocalBackend`; schema parser + sync command; `RebacMixin` + manager + signals; `RebacPermission` + `RebacFilterBackend`; system checks; sync/check commands; first test matrix. |
 | **0.2.0 — Alpha hardening** | Schema-level built-in actor grants; action-scoped read querysets; split request-path `sudo()` from framework-job `system_context()`; hot-path schema cache invalidation. |
-| **0.3.0 — Celery + middleware** | `ActorMiddleware`; Celery signal handlers; ContextVar stack pattern. |
-| **0.4.0 — Override layer** | `SchemaOverride` model + admin; `effective_expr` composition; admin audit. |
-| **0.5.0 — `SpiceDBBackend`** | `authzed-py` adapter; `WriteSchema` auto-push; cross-backend contract tests. |
-| **0.6.0 — MCP / GraphQL adapters** | `rebac_mcp_tool` decorator; resolver decorator; FastMCP & strawberry support. |
-| **1.0.0 — Stable release** | Full docs, CI matrix green, audit-log model, `select_related` compiler hook (or carved to 1.1). |
+| **0.3.0-0.7.0 — shipped alpha core** | `ActorMiddleware`; Celery signal handlers; registry storage mode; evaluator/Zookie scopes; Strawberry adapter; field-level read gates; LocalBackend hardening. |
+| **Next — `SpiceDBBackend`** | `authzed-py` adapter; `WriteSchema` auto-push; cross-backend contract tests; SpiceDB Zookie translation. |
+| **Next — MCP adapter** | `rebac_mcp_tool` decorator for FastMCP / official SDK shapes; actor resolution from request metadata; capability/resource gating. See [proposal 0004](./proposals/0004-mcp-tool-integration.md). |
+| **1.0.0 — Stable release** | Full docs, CI matrix green, stable audit/logging contracts, `select_related` compiler hook (or carved to 1.1). |
 | **1.x** | `select_related` SQL compiler; bulk operations; `Meta.protected_fields` (descriptor-based field gating / true `"raise"` mode complementing [`read__<field>`](#field-level-read-gates-readfield)); PostgreSQL RLS defense-in-depth track. |
 
 ---
 
 ## Open questions
 
-1. **Relationship table partitioning at scale.** Above ~100M rows, PostgreSQL recursive CTEs slow even with the indexes shipped. Worth designing a `(resource_type)` LIST partition scheme? **Lean: yes, post-1.0**, document the threshold and shipped migration helper.
+1. **Relationship table partitioning at scale.** Above ~100M rows, the local graph walk can slow even with the indexes shipped. Worth designing a `(resource_type)` LIST partition scheme? **Lean: yes, post-1.0**, document the threshold and shipped migration helper.
 
 2. **Swappable User dependency.** `auth/user` is hardcoded as a subject type label. Projects with `AUTH_USER_MODEL` aliases (`accounts.User`) need... what? Lean: a `REBAC_USER_TYPE` setting (default `"auth/user"`), plus `to_subject_ref()` consults `settings.AUTH_USER_MODEL` to decide. Settle in 0.1.
 
@@ -1497,7 +1505,7 @@ stable across patch releases. `rebac._internal.*` is private.
 
 4. **Override layer precedence vs caveats.** When a `SchemaOverride` tightens a permission AND a caveat returns `CONDITIONAL`, what wins? Lean: tightening wins (security-fail-closed). Documented as a doctor warning.
 
-5. **MCP authentication standardisation.** As of May 2026, `ctx.request_context.meta` is the de facto channel for actor identity. If MCP adds a typed identity field in 2026/2027, the plugin should adopt it without a major bump.
+5. **MCP authentication standardisation.** Tracked in [proposal 0004](./proposals/0004-mcp-tool-integration.md). As of May 2026, `ctx.request_context.meta` is the de facto channel for actor identity. If MCP adds a typed identity field in 2026/2027, the plugin should adopt it without a major bump.
 
 6. **Per-tenant override scope.** Today `SchemaOverride` is global (one row applies to all tenants). For SaaS, we'll need a `tenant_id` column. Lean: ship 1.0 without it (single-tenant), add `REBAC_TENANT_RESOLVER` callable in 1.x driven by real demand.
 
