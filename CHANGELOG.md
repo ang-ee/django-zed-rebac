@@ -5,6 +5,8 @@ pre-1.0; breaking changes within a minor version are explicitly called out.
 
 ## [Unreleased]
 
+## [0.7.0] — 2026-05-29
+
 ### Added — field-level read gates (proposal 0003)
 
 - Added `REBAC_FIELD_READ_MODE = "allow" | "redact" | "omit" | "raise"` and
@@ -29,6 +31,38 @@ pre-1.0; breaking changes within a minor version are explicitly called out.
   `rebac.schema.walker.field_gated_actions(definition, verb)` and reused the
   evaluator-aware `accessible()` routing for both row scoping and field
   visibility.
+- `REBAC_LINT_BARE_PREFETCH` now defaults to `True`, so bare relation
+  prefetch checks run by default unless explicitly opted out.
+
+### Fixed — authorization hardening
+
+- Public LocalBackend relationship writes now validate the relation and
+  subject shape against the installed schema before persisting rows. Stale
+  invalid relationship rows are ignored by checks and accessible-resource
+  enumeration.
+- Create preflight now validates virtual relation candidates against relation
+  type unions before evaluating permissions.
+- Bulk queryset update/delete guards now scan the affected rows through a
+  system context, preventing unreadable rows from disappearing from the guard
+  while still being mutated.
+- Schema sync now routes relation and permission rows through the shared row
+  sync path, recomputes row hashes from actual payloads, prunes stale
+  package-managed definitions/caveats and child rows, and rejects duplicate
+  definitions/caveats across installed app schemas even during targeted
+  package syncs.
+- Model resource identity resolution now consistently honours
+  `Meta.rebac_id_attr` across object refs, managers, signals, mixins, auth,
+  DRF filtering, and field visibility.
+- DRF permission and filter helpers now prefer the ambient current actor over
+  `request.user`, keeping grant-backed agent flows scoped to the resolved
+  actor.
+
+### Internal — test coverage
+
+- Added a dedicated LocalBackend end-to-end suite with fake users/resources
+  covering public backend methods, caveated checks, grant/revoke lifecycle,
+  queryset read scoping, protected field reads/writes, and agent grant
+  shorthands.
 
 ## [0.5.0] — 2026-05-23
 
