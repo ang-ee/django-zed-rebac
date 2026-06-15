@@ -30,6 +30,14 @@ _DEFAULTS: dict[str, Any] = {
     "REBAC_GC_INTERVAL_SECONDS": 300,
     "REBAC_AUTHENTICATION_MIDDLEWARE": "django.contrib.auth.middleware.AuthenticationMiddleware",
     "REBAC_ACTOR_RESOLVER": "rebac.actors.default_resolver",
+    # Dotted-path callable resolving an MCP request Context → SubjectRef, used
+    # by the ``rebac.mcp.rebac_mcp_tool`` decorator. Its result is the per-call
+    # actor and takes priority over the ambient ``current_actor()`` (explicit
+    # per-request identity wins; ambient is the fallback). The default reads the
+    # canonical SubjectRef string at ``ctx.request_context.meta["actor_subject"]``.
+    # Override for transports that carry the actor elsewhere (a signed header, a
+    # session).
+    "REBAC_MCP_ACTOR_RESOLVER": "rebac.mcp.default_actor_resolver",
     "REBAC_TYPE_PREFIX": "",
     "REBAC_SUPERUSER_BYPASS": True,
     "REBAC_SYNC_DJANGO_GROUPS": False,

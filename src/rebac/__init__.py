@@ -15,7 +15,7 @@ from __future__ import annotations
 
 from typing import TYPE_CHECKING, Any
 
-__version__ = "0.10.0"
+__version__ = "0.11.0"
 
 default_app_config = "rebac.apps.RebacConfig"
 
@@ -71,6 +71,7 @@ if TYPE_CHECKING:
     from .audit import emit as emit_audit_event
     from .backends import Backend, LocalBackend, SpiceDBBackend
     from .decorators import rebac_resource, require_permission
+    from .mcp import default_actor_resolver, get_mcp_actor_resolver, rebac_mcp_tool
     from .mixins import RebacMixin, RebacObjectMeta
     from .permissions_mixin import RebacPermissionsMixin
     from .relationships import delete_relationship, delete_relationships, write_relationships
@@ -94,6 +95,9 @@ _LAZY = {
     "delete_relationship": ("rebac.relationships", "delete_relationship"),
     "delete_relationships": ("rebac.relationships", "delete_relationships"),
     "to_object_ref": ("rebac.resources", "to_object_ref"),
+    "rebac_mcp_tool": ("rebac.mcp", "rebac_mcp_tool"),
+    "default_actor_resolver": ("rebac.mcp", "default_actor_resolver"),
+    "get_mcp_actor_resolver": ("rebac.mcp", "get_mcp_actor_resolver"),
     "emit_audit_event": ("rebac.audit", "emit"),
     "aemit_audit_event": ("rebac.audit", "aemit"),
 }
@@ -128,6 +132,10 @@ __all__ = [
     "require_permission",
     "rebac_resource",
     "rebac_subject",
+    # mcp adapter
+    "rebac_mcp_tool",
+    "default_actor_resolver",
+    "get_mcp_actor_resolver",
     # backends
     "Backend",
     "LocalBackend",

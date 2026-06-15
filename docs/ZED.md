@@ -459,12 +459,12 @@ If you check WITHOUT supplying `ip`, the result is `CONDITIONAL_PERMISSION(missi
 
 **`LocalBackend` caveat support.** Backed by [`cel-python`](https://pypi.org/project/cel-python/). Most CEL types work out of the box (`int`, `string`, `bool`, `list`, `map`, `timestamp`, `duration`). The `ipaddress` type is **not** in `cel-python`'s built-ins — `LocalBackend` raises `CaveatUnsupportedError`. Rewrite the caveat to take strings and do CIDR matching server-side, or move to the future `SpiceDBBackend` once it lands.
 
-### MCP tools as resources (schema pattern; adapter planned)
+### MCP tools as resources
 
 MCP (Model Context Protocol) tools can be modeled as first-class resources.
-Permissions on them gate which tools an actor can invoke. The schema pattern is
-usable today, but the convenience `rebac_mcp_tool` decorator is planned work
-tracked in [proposal 0004](./proposals/0004-mcp-tool-integration.md).
+Permissions on them gate which tools an actor can invoke. Gate a tool with the
+shipped `rebac.mcp.rebac_mcp_tool` decorator (see
+[proposal 0004](./proposals/0004-mcp-tool-integration.md)).
 
 #### Pattern 1 — one resource type per tool
 
@@ -481,19 +481,17 @@ definition mcp/tool/edit_post {
 }
 ```
 
-Until the adapter lands, wire the tool by resolving the actor in your MCP
-server and checking the permission explicitly:
+Wire the tool with `rebac_mcp_tool` — it resolves the actor from the request
+context, checks `invoke` on the singleton `mcp/tool/query_posts:*`, and runs the
+body only on allow:
 
 ```python
-from rebac import ObjectRef, PermissionDenied, SubjectRef, backend
+from rebac.mcp import rebac_mcp_tool
 
 @mcp.tool
+@rebac_mcp_tool(resource_type="mcp/tool/query_posts", action="invoke")
 async def query_posts(query: str, ctx: Context = CurrentContext()) -> list[dict]:
-    actor = SubjectRef.parse(ctx.request_context.meta["actor_subject"])
-    resource = ObjectRef("mcp/tool/query_posts", "*")
-    if not backend().check_access(subject=actor, action="invoke", resource=resource).allowed:
-        raise PermissionDenied(f"Denied: {actor} cannot invoke {resource}")
-    ...
+    ...   # runs only if the resolved actor may invoke the tool
 ```
 
 Granting the right to invoke:
@@ -519,23 +517,29 @@ definition mcp/capability {
 }
 ```
 
-Tag each tool with the capability it requires. The future MCP adapter should
-hide the internal capability argument from the published tool schema; until
-then, keep that plumbing in your server layer:
+Tag each tool with the capability it requires via `id_arg`. The keyword-only
+`_capability` argument carries the id; `hide_id_arg=True` requests that the
+adapter drop it from the published tool schema (a documented no-op under
+FastMCP 1.27, which exposes no schema-filtering hook — keeping it keyword-only
+already keeps it off the model-facing surface):
 
 ```python
+from rebac.mcp import rebac_mcp_tool
+
 @mcp.tool
+@rebac_mcp_tool(
+    resource_type="mcp/capability",
+    action="use",
+    id_arg="_capability",
+    hide_id_arg=True,
+)
 async def query_posts(
     query: str,
     ctx: Context = CurrentContext(),
     *,
     _capability: str = "blog.read",
 ) -> list[dict]:
-    actor = SubjectRef.parse(ctx.request_context.meta["actor_subject"])
-    resource = ObjectRef("mcp/capability", _capability)
-    if not backend().check_access(subject=actor, action="use", resource=resource).allowed:
-        raise PermissionDenied(f"Denied: {actor} cannot use {resource}")
-    ...
+    ...   # checks `use` on mcp/capability:blog.read
 ```
 
 Capabilities form a flat namespace (`blog.read`, `blog.write`, `admin.users`)
@@ -662,16 +666,20 @@ Post.objects.with_actor(SubjectRef.of("auth/apikey", apikey.public_id))
 Post.objects.with_actor(my_apikey_instance)
 ```
 
-Inside a future MCP tool adapter, where the canonical actor is an `agents/grant`,
-the server should scope ORM work through the grant actor:
+Inside an MCP tool gated by `rebac_mcp_tool`, the canonical actor is an
+`agents/grant` resolved from the request context; the decorator opens
+`actor_context(actor)` around the body, so ORM work scopes to that grant
+automatically:
 
 ```python
+from rebac.mcp import rebac_mcp_tool
+
 @mcp.tool
+@rebac_mcp_tool(resource_type="blog/post", action="write", id_arg="post_id")
 async def edit_post(post_id: str, body: str, ctx: Context = CurrentContext()) -> dict:
-    user, agent = ctx.rebac.user, ctx.rebac.agent
-    post = await Post.objects.as_agent(agent, on_behalf_of=user).aget(pk=post_id)
+    post = await Post.objects.aget(pk=post_id)   # scoped to the resolved grant
     post.body = body
-    await post.asave()                  # re-checks `write` against the same grant
+    await post.asave()                           # re-checks `write` against the grant
     return {"ok": True}
 ```
 
@@ -969,7 +977,7 @@ definition docs/document {
 }
 ```
 
-### Pattern H — Future MCP tool gated by capability
+### Pattern H — MCP tool gated by capability
 
 ```zed
 definition mcp/capability {
@@ -979,7 +987,15 @@ definition mcp/capability {
 ```
 
 ```python
+from rebac.mcp import rebac_mcp_tool
+
 @mcp.tool
+@rebac_mcp_tool(
+    resource_type="mcp/capability",
+    action="use",
+    id_arg="_capability",
+    hide_id_arg=True,
+)
 async def search_documents(
     q: str,
     ctx: Context = CurrentContext(),

@@ -5,6 +5,51 @@ pre-1.0; breaking changes within a minor version are explicitly called out.
 
 ## [Unreleased]
 
+## [0.11.0] — 2026-06-15
+
+### Added
+
+- Added the FastMCP adapter `rebac.mcp.rebac_mcp_tool` (proposal 0004): a
+  decorator that resolves the already-authenticated actor from the MCP request
+  context, checks the target permission, and only then runs the tool body.
+  Authentication stays the transport's job; the decorator only authorises.
+  Exported `rebac_mcp_tool`, `default_actor_resolver`, and
+  `get_mcp_actor_resolver` (lazily from the top-level `rebac` package). Actor
+  resolution is pluggable via `REBAC_MCP_ACTOR_RESOLVER`.
+- Actor resolution is **ctx-first, ambient fallback**: the per-call request
+  context (`ctx.request_context.meta["actor_subject"]`) is the explicit
+  identity and outranks the ambient `current_actor()` ContextVar, so a leaked
+  ambient actor cannot override the authenticated caller.
+- Create-shaped actions (`action="create"`) route through `rebac.check_new`
+  and accept a `create_relations` mapping (relation name → the call argument
+  holding the subject the new row would point at, as a canonical ref string),
+  so a relation/arrow-based create permission (e.g. `create = parent->write`)
+  can authorise a not-yet-persisted row.
+- Sync functions, coroutine functions, and async generators (streaming tools)
+  are all supported; the body runs inside `actor_context(actor)` so any
+  queryset it builds scopes to the resolved actor without re-resolving it.
+- The adapter is SDK-neutral — it reads the FastMCP context shape by
+  duck-typing and never imports the `mcp` SDK. Added the optional `mcp` extra
+  (`pip install django-zed-rebac[mcp]`) for running an MCP server alongside it.
+
+### Fixed
+
+- `default_actor_resolver` returns `None` on a missing **or malformed**
+  `actor_subject`, so bad request metadata is a clean fail-closed deny rather
+  than an uncaught `ValueError` (500).
+- A `create`/`id_arg` parameter whose default the caller omits no longer
+  targets a bogus `<type>:None` row — it falls back to `resource_id` / the
+  singleton `"*"`.
+- A `CONDITIONAL_PERMISSION` result fail-closes but now names the missing
+  caveat parameters in the raised `PermissionDenied` so the caller can retry
+  with context.
+- The MCP `Context` is located by the conventional `ctx` / `context`
+  parameter name, then by an argument whose type name is `Context` **and**
+  that carries a `request_context` attribute, so an unrelated argument of some
+  other `Context`-named class is not mistaken for the context.
+- `hide_id_arg` emits a warning when set (documented no-op against FastMCP
+  1.27) instead of silently doing nothing.
+
 ## [0.10.0] — 2026-06-01
 
 ### Added

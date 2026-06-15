@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "django-zed-rebac"
-version = "0.10.0"
+version = "0.11.0"
 description = "Drop-in REBAC engine for Django, SpiceDB-compatible, with a pure-Django LocalBackend."
 readme = "README.md"
 license = "Apache-2.0"
@@ -29,6 +29,10 @@ dependencies = [
 spicedb = ["authzed>=0.13"]
 caveats = ["cel-python>=0.1.5"]
 drf = ["djangorestframework>=3.14"]
+# FastMCP adapter (``rebac.mcp.rebac_mcp_tool``). The adapter reads the
+# request context by duck-typing and never imports the SDK, so this extra is
+# only needed to *run* an MCP server alongside the decorator.
+mcp = ["mcp>=1.27"]
 # Strawberry + Channels integration. Channels is a
 # subscription-transport prerequisite — Strawberry alone covers HTTP
 # GraphQL but WS subscriptions need Channels' ASGI scope handling.

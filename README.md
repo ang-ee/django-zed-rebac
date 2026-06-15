@@ -4,7 +4,7 @@
 
 ---
 
-> **Status: alpha.** The package is published on PyPI and the core local REBAC path is usable: `LocalBackend`, `RebacMixin`/manager, schema parser, `rebac sync`, caveats, expirations, schema overrides, audit events, middleware, system checks, DRF helpers, Celery actor propagation, the Strawberry GraphQL adapter, a REBAC-safe Strawberry-Django optimizer, and field-backed structural relations. `SpiceDBBackend` and MCP integration are roadmap work. Track the milestones at [docs/ARCHITECTURE.md § Roadmap](./docs/ARCHITECTURE.md#roadmap).
+> **Status: alpha.** The package is published on PyPI and the core local REBAC path is usable: `LocalBackend`, `RebacMixin`/manager, schema parser, `rebac sync`, caveats, expirations, schema overrides, audit events, middleware, system checks, DRF helpers, Celery actor propagation, the Strawberry GraphQL adapter, a REBAC-safe Strawberry-Django optimizer, field-backed structural relations, and the FastMCP `rebac_mcp_tool` adapter. `SpiceDBBackend` is roadmap work. Track the milestones at [docs/ARCHITECTURE.md § Roadmap](./docs/ARCHITECTURE.md#roadmap).
 
 ---
 
@@ -86,14 +86,14 @@ def post_detail(request, pk):
     return render(request, "post.html", {"post": post})
 ```
 
-That's the end-to-end flow. The same `Post.objects.with_actor(...)` pattern works in DRF viewsets, Celery tasks, GraphQL resolvers, management commands, and future MCP tools — the actor can be a Django `User`, an `Agent`, an `agents/grant`, or any registered subject. Typed shorthands `as_user(request.user)` and `as_agent(agent, on_behalf_of=request.user)` cover the common cases.
+That's the end-to-end flow. The same `Post.objects.with_actor(...)` pattern works in DRF viewsets, Celery tasks, GraphQL resolvers, management commands, and MCP tools — the actor can be a Django `User`, an `Agent`, an `agents/grant`, or any registered subject. Typed shorthands `as_user(request.user)` and `as_agent(agent, on_behalf_of=request.user)` cover the common cases.
 
 ## Documentation
 
 | Doc | When to read it |
 |---|---|
 | **[docs/ARCHITECTURE.md](./docs/ARCHITECTURE.md)** | You're integrating, contributing, or evaluating fit. Architecture, public API, the three storage tiers, settings, surface integrations, determinism, testing, roadmap. |
-| **[docs/ZED.md](./docs/ZED.md)** | You're writing permission schemas. How to define permissions for users, groups, AI agents (Grant pattern), Celery tasks, future MCP tools, hierarchical resources, time-bound access, arbitrary Python entities. Patterns library and anti-patterns. |
+| **[docs/ZED.md](./docs/ZED.md)** | You're writing permission schemas. How to define permissions for users, groups, AI agents (Grant pattern), Celery tasks, MCP tools, hierarchical resources, time-bound access, arbitrary Python entities. Patterns library and anti-patterns. |
 
 ## Why use this
 
@@ -102,7 +102,7 @@ That's the end-to-end flow. The same `Post.objects.with_actor(...)` pattern work
 | Per-object permissions in Django | `django-guardian` (per-object ACL via GenericFK; no JOIN propagation; no graph traversal) | True REBAC graph; SpiceDB-compatible; manager-level queryset scoping; cross-relation propagation. |
 | Run SpiceDB-style permissions locally without infrastructure | None — SpiceDB itself is a Go binary that needs Postgres + a sidecar | `LocalBackend`: pure-Django graph evaluation over relationship rows. Same API surface the planned `SpiceDBBackend` will use. |
 | AI-agent authorization | Cedar (no graph traversal); Casbin (in-memory post-filter); Polar/Oso (deprecated 2023) | Native Authzed Grant pattern: an agent acting on behalf of a user receives the *structural intersection* of the user's grants and the agent's declared capabilities — enforced by the schema graph, not by app-layer ANDs. |
-| Permission scoping outside HTTP | Manual `if user.has_perm(...)` everywhere | `Model.objects.with_actor(actor)` works in Celery tasks, cron, management commands, plain Python, and future MCP servers. The actor is generic: Django `User`, `Agent`, `agents/grant`, `auth/apikey`, or any registered subject. |
+| Permission scoping outside HTTP | Manual `if user.has_perm(...)` everywhere | `Model.objects.with_actor(actor)` works in Celery tasks, cron, management commands, plain Python, and MCP servers. The actor is generic: Django `User`, `Agent`, `agents/grant`, `auth/apikey`, or any registered subject. |
 | Strict-by-default (no silent leaks) | `django-guardian` returns all rows when nothing scopes; easy to forget | Querysets without an actor raise `MissingActorError` rather than returning everything. Bypass requires an explicit `reason`; block-scoped `sudo()` is logged. |
 | Admin-editable policy with safe upgrades | `django-guardian` per-object ACL only; no rule overrides | Tier-2 `SchemaOverride` model: tighten / loosen / disable / extend a package-shipped baseline at runtime. `noupdate=True` semantics preserve admin edits across upgrades, mirroring Odoo's `ir.model.data`. |
 
@@ -122,7 +122,7 @@ That's the end-to-end flow. The same `Post.objects.with_actor(...)` pattern work
 - **GraphQL + WebSocket-aware.** Per-request `PermissionEvaluator` LRU-caches `check_access` / `accessible` calls — a single GraphQL query that fans out across 50 nested resolvers makes 1 backend call per `(actor, action, resource)`, not 50. The Strawberry adapter (`pip install django-zed-rebac[strawberry]`) ships `RebacExtension` (per-operation scope, per-emission for subscriptions) and `RebacChannelsConsumerMixin` (actor resolved at WS handshake; per-emission cache reset means revoked grants take effect on the next subscription tick). Strawberry-Django users can install `django-zed-rebac[strawberry-django]` and use `RebacDjangoOptimizerExtension` for permission-aware `select_related` / `prefetch_related` optimization. See [docs/ARCHITECTURE.md § Per-request evaluator + Zookie freshness](./docs/ARCHITECTURE.md#per-request-evaluator--zookie-freshness).
 - **Write-then-read freshness via Zookie ContextVar.** Every write returns a `Zookie`; subsequent LocalBackend reads in the same scope auto-upgrade to `Consistency.AT_LEAST_AS_FRESH(zookie)`. Cross-request transport (SPA / JWT) is opt-in via `REBAC_ZOOKIE_TRANSPORT = "header" | "session"`. LocalBackend uses `Relationship.written_at_xid` as the freshness witness; the same public API is reserved for the planned SpiceDB adapter.
 - **Celery actor propagation built in.** `before_task_publish` injects the actor into task headers; `task_prerun` restores it on the worker. Inside `@shared_task`, scoping happens transparently.
-- **MCP integration planned.** MCP tools can already be modeled as schema resources, but the `rebac_mcp_tool` decorator is future work tracked in [proposal 0004](./docs/proposals/0004-mcp-tool-integration.md).
+- **MCP integration shipped.** Model MCP tools as schema resources and gate them with `from rebac.mcp import rebac_mcp_tool` — it resolves the actor from the request context (`ctx.request_context.meta["actor_subject"]` by default), checks the permission, then runs the tool body. Sync and async tools both supported. See [proposal 0004](./docs/proposals/0004-mcp-tool-integration.md).
 - **Three-state checks.** Like SpiceDB, `check_access()` returns `HAS_PERMISSION`, `NO_PERMISSION`, or `CONDITIONAL_PERMISSION(missing=[...])` — the latter lists which caveat fields the caller must supply for a definitive answer.
 - **Typed package.** Ships `py.typed` and keeps the public API annotated so downstream projects and IDEs can reason about the manager/queryset surface.
 - **`noupdate=True` upgrade safety.** Admin schema edits are preserved across package upgrades. Destructive overwrite is an explicit `--force-overwrite` flag, never an implicit side effect of install vs upgrade. Engineers Odoo's `-i` footgun out.
@@ -192,7 +192,8 @@ This is an **alpha** package. The architecture is settled (see [docs/ARCHITECTUR
 - **0.1** — `LocalBackend` MVP, schema parser + sync command, `RebacMixin`, system checks, sync/check commands.
 - **0.2** — Alpha hardening: schema-level built-in actors, action-scoped queryset reads, split `sudo()` / `system_context()`, and efficient schema cache invalidation.
 - **0.3-0.9** — shipped middleware, Celery propagation, registry storage mode, evaluator/Zookie scopes, Strawberry adapter, field-level read gates, REBAC-safe relation loading, Strawberry-Django optimizer, field-backed structural relations, and LocalBackend hardening.
-- **Next** — `SpiceDBBackend` adapter and MCP tool integration ([proposal 0004](./docs/proposals/0004-mcp-tool-integration.md)).
+- **0.11** — FastMCP `rebac_mcp_tool` adapter ([proposal 0004](./docs/proposals/0004-mcp-tool-integration.md)).
+- **Next** — `SpiceDBBackend` adapter.
 - **1.0** — Stable release with full docs and CI matrix green.
 
 Track the full plan in [docs/ARCHITECTURE.md § Roadmap](./docs/ARCHITECTURE.md#roadmap).

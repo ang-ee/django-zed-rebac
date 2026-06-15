@@ -5,7 +5,7 @@
 > Audience: Django integrators evaluating fit, contributors, framework authors building on top.
 >
 > Companion docs:
-> - [ZED.md](./ZED.md) — schema authoring guide. How to write `permissions.zed` for users, groups, agents, Celery tasks, future MCP tools, and arbitrary entities.
+> - [ZED.md](./ZED.md) — schema authoring guide. How to write `permissions.zed` for users, groups, agents, Celery tasks, MCP tools, and arbitrary entities.
 
 ---
 
@@ -128,7 +128,7 @@ def post_detail(request, pk):
 # Post.objects.as_agent(agent, on_behalf_of=request.user)
 ```
 
-The same flow works in DRF, Celery tasks, GraphQL resolvers, management commands, and future MCP tools. See [§ Surface integrations](#surface-integrations).
+The same flow works in DRF, Celery tasks, GraphQL resolvers, management commands, and MCP tools. See [§ Surface integrations](#surface-integrations).
 
 ---
 
@@ -295,7 +295,7 @@ Resolution is fixed-target rather than per-row, which has two consequences in
 | Django ORM | `RebacMixin` metaclass | Replaces `objects` with `RebacManager`; wires pre-save / pre-delete signals; installs `from_db` actor propagation. |
 | DRF | `RebacPermission` (BasePermission) + `RebacFilterBackend` (BaseFilterBackend) | Per-action permission check on viewsets; queryset filter on list endpoints. |
 | Celery | `before_task_publish` + `task_prerun` signals | Injects `actor_id` into task headers on enqueue; restores into ContextVar on worker. |
-| MCP (FastMCP / official SDK) | Planned `@rebac_mcp_tool` decorator | Tracked in [proposal 0004](./proposals/0004-mcp-tool-integration.md). For now, model MCP tools as resources and call `check_access` / `with_actor` explicitly in your server. |
+| MCP (FastMCP) | `rebac.mcp.rebac_mcp_tool` decorator | Resolves the actor (ambient `current_actor()`, then `REBAC_MCP_ACTOR_RESOLVER` reading `ctx.request_context.meta["actor_subject"]`), checks the target permission, then runs the body inside `actor_context`. Reads the context by duck-typing — no SDK import. See [proposal 0004](./proposals/0004-mcp-tool-integration.md). |
 | GraphQL (strawberry) | `rebac.graphql.strawberry.RebacExtension` + `RebacChannelsConsumerMixin` | Opens evaluator/Zookie scopes per operation and per subscription emission. Use `require_permission` or actor-scoped querysets inside resolvers. |
 | GraphQL (Strawberry-Django) | `rebac.graphql.strawberry_django.RebacDjangoOptimizerExtension` | Wraps Strawberry-Django's optimizer with REBAC-safe relation loading: guarded `select_related` for to-one paths and actor-scoped protected prefetches. |
 | Plain Python | `@rebac_resource(type=..., id_attr=...)` | Registers the class as a known resource type for explicit `check_access()` calls. |
@@ -348,6 +348,7 @@ from rebac import (
 
 from rebac.drf    import RebacPermission, RebacFilterBackend
 from rebac.celery import propagate_actor
+from rebac.mcp    import rebac_mcp_tool, default_actor_resolver, get_mcp_actor_resolver
 from rebac.schema import parse_zed, validate_schema   # for tooling
 from rebac.roles  import grant, revoke, roles_of, members_of   # role-as-namespace helpers
 ```
@@ -758,6 +759,7 @@ All settings prefixed `REBAC_`. No nested dict. Read via the public `app_setting
 | `REBAC_GC_INTERVAL_SECONDS` | `300` | `int` | How often the expiration GC task runs. |
 | `REBAC_AUTHENTICATION_MIDDLEWARE` | `"django.contrib.auth.middleware.AuthenticationMiddleware"` | `str` | Middleware path that populates `request.user`. `rebac.middleware.ActorMiddleware` must appear after this path. Frameworks that replace Django's stock auth middleware set this to their canonical middleware. |
 | `REBAC_ACTOR_RESOLVER` | `"rebac.actors.default_resolver"` | `str` | Dotted-path callable that resolves `request → SubjectRef`. Override for custom identity layers (e.g., agent grants). |
+| `REBAC_MCP_ACTOR_RESOLVER` | `"rebac.mcp.default_actor_resolver"` | `str` | Dotted-path callable resolving an MCP request `Context → SubjectRef`, used by `rebac_mcp_tool` when no ambient `current_actor()` is set. The default reads the canonical `SubjectRef` string at `ctx.request_context.meta["actor_subject"]`. |
 | `REBAC_TYPE_PREFIX` | `""` | `str` | Optional prefix for all generated resource types (multi-tenant SaaS). |
 | `REBAC_SUPERUSER_BYPASS` | `True` | `bool` | If `True`, active superusers short-circuit `has_perm` AND run inside an `ActorMiddleware`-opened `sudo("superuser-bypass")` bracket so QuerySet scoping lifts too. Each elevated request emits a `KIND_SUDO_BYPASS` audit row. Suppressed when `REBAC_ALLOW_SUDO = False`. Strict tenants set this to `False`. |
 | `REBAC_LINT_BARE_PREFETCH` | `True` | `bool` | Toggle for `rebac.W003` — the structural warning that an RBAC-bound model has an FK / O2O / M2M to another RBAC-bound model (a bare-string `select_related` / `prefetch_related` can load unguarded related rows). Enabled by default so the risky shape is visible; use `rebac_select_related()` / `rebac_prefetch_related()` or the Strawberry-Django optimizer for protected paths. |
@@ -1075,7 +1077,7 @@ The three actor verbs are sugar over the same primitive:
 |---|---|---|
 | `with_actor(actor)` | Resolves `actor` to a `SubjectRef` and pins it on the queryset clone. | The default. Works for any subject type. |
 | `as_user(user)` | Equivalent to `with_actor(to_subject_ref(user))` for a Django `User`. | The HTTP request path: `Post.objects.as_user(request.user)`. |
-| `as_agent(agent, on_behalf_of=u)` | Equivalent to `with_actor(grant_subject_ref(agent, u))` — resolves to an `agents/grant:<id>#valid` subject. | Agent runtimes and future MCP servers where a Grant is the canonical actor. |
+| `as_agent(agent, on_behalf_of=u)` | Equivalent to `with_actor(grant_subject_ref(agent, u))` — resolves to an `agents/grant:<id>#valid` subject. | Agent runtimes and MCP servers where a Grant is the canonical actor. |
 | `with_action(action)` | Pins the permission used for read-side queryset scoping instead of `read` / `Meta.rebac_default_action`. | Alternate read views such as `credential_lookup`, `list_admin`, or capability-specific resolver scopes. |
 | `on_field_deny(mode)` | Pins the field-read deny mode for `read__<field>` gates instead of the global setting. | Projection-sensitive paths that want `"omit"` while the global default stays `"allow"` or `"redact"`. |
 | `rebac_select_related(*fields)` | Applies Django `select_related` and batch-checks selected REBAC-bound related rows before serialization. | To-one relation optimization when an unreadable related object should fail the field/query instead of leaking. |
@@ -1385,16 +1387,27 @@ def email_user_their_drafts(user_id: int):
 
 **Eager-mode caveat.** `before_task_publish` does NOT fire when `CELERY_TASK_ALWAYS_EAGER = True`. The plugin handles this by falling back to `task_prerun` — which DOES fire in eager mode — reading `current_actor()` directly.
 
-### MCP (planned)
+### MCP
 
-MCP tools can be modeled as resources today, but the convenience decorator is
-not shipped yet. The implementation is tracked in
-[proposal 0004](./proposals/0004-mcp-tool-integration.md).
+```python
+from mcp.server.fastmcp import Context, CurrentContext
+from rebac.mcp import rebac_mcp_tool
 
-Until that lands, MCP servers should resolve the actor at their transport
-boundary, pass it through `.with_actor(...)` / `.as_agent(...)`, and call
-`backend().check_access(...)` or `@require_permission(...)` explicitly. The MCP
-server remains responsible for minting and validating identity.
+@mcp.tool
+@rebac_mcp_tool(resource_type="blog/post", action="write", id_arg="post_id")
+async def edit_post(post_id: str, body: str, ctx: Context = CurrentContext()) -> dict:
+    ...
+```
+
+`rebac_mcp_tool` resolves the actor (ambient `current_actor()` first, then the
+`REBAC_MCP_ACTOR_RESOLVER` callable — by default
+`ctx.request_context.meta["actor_subject"]`, a canonical `SubjectRef` string),
+checks the permission, and only then runs the body inside `actor_context`. No
+actor resolved → `PermissionDenied` (fail closed). `action="create"` routes
+through `check_new` for not-yet-persisted resources. The MCP server remains
+responsible for minting and validating identity — the decorator only resolves
+and authorises an actor an upstream boundary already established. Implemented
+per [proposal 0004](./proposals/0004-mcp-tool-integration.md).
 
 ### GraphQL (graphene / strawberry)
 
@@ -1608,8 +1621,8 @@ stable across patch releases. `rebac._internal.*` is private.
 | **0.1.0 — MVP** | `LocalBackend`; schema parser + sync command; `RebacMixin` + manager + signals; `RebacPermission` + `RebacFilterBackend`; system checks; sync/check commands; first test matrix. |
 | **0.2.0 — Alpha hardening** | Schema-level built-in actor grants; action-scoped read querysets; split request-path `sudo()` from framework-job `system_context()`; hot-path schema cache invalidation. |
 | **0.3.0-0.9.0 — shipped alpha core** | `ActorMiddleware`; Celery signal handlers; registry storage mode; evaluator/Zookie scopes; Strawberry adapter; field-level read gates; REBAC-safe relation loading; Strawberry-Django optimizer; field-backed structural relations; LocalBackend hardening. |
+| **0.11.0 — MCP adapter** | `rebac.mcp.rebac_mcp_tool` decorator for FastMCP; actor resolution from request metadata (`REBAC_MCP_ACTOR_RESOLVER`); capability/resource gating; create-shaped actions via `create_relations`; sync, async, and streaming (async-generator) tool bodies. See [proposal 0004](./proposals/0004-mcp-tool-integration.md). |
 | **Next — `SpiceDBBackend`** | `authzed-py` adapter; `WriteSchema` auto-push; cross-backend contract tests; SpiceDB Zookie translation. |
-| **Next — MCP adapter** | `rebac_mcp_tool` decorator for FastMCP / official SDK shapes; actor resolution from request metadata; capability/resource gating. See [proposal 0004](./proposals/0004-mcp-tool-integration.md). |
 | **1.0.0 — Stable release** | Full docs, CI matrix green, stable audit/logging contracts, `select_related` compiler hook (or carved to 1.1). |
 | **1.x** | `select_related` SQL compiler; bulk operations; `Meta.protected_fields` (descriptor-based field gating / true `"raise"` mode complementing [`read__<field>`](#field-level-read-gates-readfield)); PostgreSQL RLS defense-in-depth track. |
 
