@@ -198,9 +198,7 @@ def test_public_backend_methods_cover_graph_checks_and_relationship_lifecycle(
     assert local_backend.has_access(
         subject=_user(fake_users.bob), action="read", resource=public_post
     )
-    assert local_backend.has_access(
-        subject=_agent("indexer"), action="write", resource=owned
-    )
+    assert local_backend.has_access(subject=_agent("indexer"), action="write", resource=owned)
     assert local_backend.grants_all(
         subject=_user(fake_users.alice),
         action="global_read",
@@ -226,9 +224,7 @@ def test_public_backend_methods_cover_graph_checks_and_relationship_lifecycle(
     assert not local_backend.has_access(
         subject=_user(fake_users.bob), action="write", resource=owned
     )
-    assert local_backend.has_access(
-        subject=_user(fake_users.alice), action="write", resource=owned
-    )
+    assert local_backend.has_access(subject=_user(fake_users.alice), action="write", resource=owned)
 
     delete_relationships(
         RelationshipFilter(
@@ -266,14 +262,17 @@ def test_local_backend_consistency_tokens_scope_direct_checks_and_accessible(
         resource=resource,
         at_zookie=after_bob,
     )
-    assert list(
-        local_backend.accessible(
-            subject=_user(fake_users.bob),
-            action="read",
-            resource_type="blog/post",
-            at_zookie=before_bob,
+    assert (
+        list(
+            local_backend.accessible(
+                subject=_user(fake_users.bob),
+                action="read",
+                resource_type="blog/post",
+                at_zookie=before_bob,
+            )
         )
-    ) == []
+        == []
+    )
     assert set(
         local_backend.accessible(
             subject=_user(fake_users.bob),
@@ -328,13 +327,16 @@ def test_local_backend_caveats_are_conditional_for_checks_and_conservative_for_r
         resource=expired,
         context={"now": FUTURE},
     ).allowed
-    assert list(
-        local_backend.accessible(
-            subject=_user(fake_users.alice),
-            action="read",
-            resource_type="blog/post",
+    assert (
+        list(
+            local_backend.accessible(
+                subject=_user(fake_users.alice),
+                action="read",
+                resource_type="blog/post",
+            )
         )
-    ) == []
+        == []
+    )
     assert set(
         local_backend.accessible(
             subject=_user(fake_users.alice),
@@ -377,7 +379,9 @@ def test_queryset_read_methods_and_field_read_gates_use_local_backend_end_to_end
     assert viewer_row.title is None
     assert viewer_row.body == "viewer can see body"
     assert viewer_row._rebac_redacted_fields == frozenset({"title"})
-    iterated = list(Post.objects.as_user(fake_users.alice).filter(pk=viewer_visible_row.pk).iterator())
+    iterated = list(
+        Post.objects.as_user(fake_users.alice).filter(pk=viewer_visible_row.pk).iterator()
+    )
     assert iterated[0].title is None
 
     with pytest.raises(PermissionDenied):
@@ -465,7 +469,9 @@ def test_model_write_delete_and_field_write_gates_use_local_backend_end_to_end(
     with sudo(reason="local-backend-e2e.verify"):
         assert Post.objects.get(pk=post.pk).title == "original title"
     assert Post.objects.as_user(fake_users.bob).filter(pk=post.pk).update(body="bulk body") == 1
-    assert Post.objects.as_user(fake_users.alice).filter(pk=post.pk).update(title="owner title") == 1
+    assert (
+        Post.objects.as_user(fake_users.alice).filter(pk=post.pk).update(title="owner title") == 1
+    )
 
     with pytest.raises(PermissionDenied):
         Post.objects.as_user(fake_users.bob).filter(pk=post.pk).delete()

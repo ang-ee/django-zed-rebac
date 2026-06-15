@@ -63,9 +63,7 @@ def test_model_refs_managers_and_signals_share_prefixed_type_policy() -> None:
     )
 
     assert to_object_ref(post) == ObjectRef("tenantA/blog/sluggedpost", "prefixed")
-    assert list(SluggedPost.objects.with_actor(user).values_list("slug", flat=True)) == [
-        "prefixed"
-    ]
+    assert list(SluggedPost.objects.with_actor(user).values_list("slug", flat=True)) == ["prefixed"]
 
     loaded = SluggedPost.objects.with_actor(user).get(slug="prefixed")
     loaded.title = "Updated"

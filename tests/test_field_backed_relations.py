@@ -89,9 +89,7 @@ def test_direct_field_backed_relation_reads_forward_fk_without_tuple(backend, ro
         resource_type="blog/post",
         relation="folder",
     ).exists()
-    relationship_queries = [
-        q["sql"] for q in queries if "rebac_relationship" in q["sql"].lower()
-    ]
+    relationship_queries = [q["sql"] for q in queries if "rebac_relationship" in q["sql"].lower()]
     assert relationship_queries == []
 
 
@@ -107,9 +105,15 @@ def test_arrow_walks_field_backed_relation_to_target_permission(backend, rows):
         ]
     )
 
-    assert backend.has_access(subject=_user("alice"), action="read", resource=_post_ref(visible_post))
-    assert not backend.has_access(subject=_user("alice"), action="read", resource=_post_ref(hidden_post))
-    assert not backend.has_access(subject=_user("alice"), action="read", resource=_post_ref(null_post))
+    assert backend.has_access(
+        subject=_user("alice"), action="read", resource=_post_ref(visible_post)
+    )
+    assert not backend.has_access(
+        subject=_user("alice"), action="read", resource=_post_ref(hidden_post)
+    )
+    assert not backend.has_access(
+        subject=_user("alice"), action="read", resource=_post_ref(null_post)
+    )
 
 
 def test_accessible_unions_field_backed_arrow_and_tuple_grants(backend, rows):
@@ -254,9 +258,9 @@ def test_field_backed_relation_to_auth_user_honors_subject_id_attr(db):
     post_ref = ObjectRef("blog/authoredpost", str(post.pk))
 
     assert backend.has_access(subject=alice, action="author", resource=post_ref)
-    assert set(backend.accessible(subject=alice, action="read", resource_type="blog/authoredpost")) == {
-        str(post.pk)
-    }
+    assert set(
+        backend.accessible(subject=alice, action="read", resource_type="blog/authoredpost")
+    ) == {str(post.pk)}
     assert list(
         backend.lookup_subjects(
             resource=post_ref,
@@ -332,4 +336,6 @@ def test_system_check_reports_missing_field_binding(db):
 
     issues = check_field_backed_relations()
 
-    assert any(issue.id == "rebac.E009" and "missing field 'missing'" in issue.msg for issue in issues)
+    assert any(
+        issue.id == "rebac.E009" and "missing field 'missing'" in issue.msg for issue in issues
+    )

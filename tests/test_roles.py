@@ -64,6 +64,7 @@ def _role_schema(request):
     yield
     reset_backend()
 
+
 # ---------- _parse_role ----------
 
 
