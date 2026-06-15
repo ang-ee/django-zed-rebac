@@ -77,7 +77,14 @@ def _shutdown_fallback_executor() -> None:
         # ``wait=True`` lets any in-flight INSERT finish; we then close
         # the worker's thread-local Django connection on the same
         # thread that opened it.
-        _FALLBACK_EXECUTOR.submit(_close_worker_connections).result(timeout=5)
+        try:
+            _FALLBACK_EXECUTOR.submit(_close_worker_connections).result(timeout=5)
+        except RuntimeError:
+            # The interpreter is already tearing down and the stdlib's own
+            # ``concurrent.futures`` atexit hook ran first, disabling new work
+            # ("cannot schedule new futures after shutdown"). Nothing to do —
+            # the process is exiting and the worker connection dies with it.
+            pass
         _FALLBACK_EXECUTOR.shutdown(wait=True)
         _FALLBACK_EXECUTOR = None
 

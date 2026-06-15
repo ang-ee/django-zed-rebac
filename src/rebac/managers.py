@@ -12,9 +12,10 @@ chaining via `_clone()` and propagates into instances via `from_db()`.
 
 from __future__ import annotations
 
-from collections.abc import Iterable
+from collections.abc import AsyncIterator, Iterable
 from typing import Any, TypeVar
 
+from asgiref.sync import sync_to_async
 from django.db import models
 
 from ._id import resource_id_attr
@@ -387,6 +388,48 @@ class RebacQuerySet(models.QuerySet[_M]):
             mode=self._effective_field_mode(),
         )
 
+    # ----- Async iteration: Django's aiterator bypasses the sync overrides -----
+
+    async def aiterator(self, *args: Any, **kwargs: Any) -> AsyncIterator[_M]:
+        """Async variant of :meth:`iterator` that preserves REBAC scoping.
+
+        Django's ``QuerySet.aiterator`` builds the row iterable directly rather
+        than routing through the (overridden) sync ``iterator`` / ``_fetch_all``
+        path, so without this override an ``async for`` over ``aiterator()``
+        would bypass actor scoping entirely — an unscoped read. We apply the
+        same scope filter, actor stamping, field-visibility redaction, and
+        ``rebac_select_related`` guards as the sync path, running the
+        DB-touching steps off the event loop via ``sync_to_async`` (same
+        posture as the rest of the async surface, which Django itself wraps in
+        ``sync_to_async`` around our sync overrides).
+
+        Every other async ORM method (``aget`` / ``acount`` / ``aexists`` /
+        ``afirst`` / ``aupdate`` / ``adelete`` / ``acreate`` / ``__aiter__`` /
+        ``ain_bulk`` / …) is a ``sync_to_async`` wrapper around the sync method
+        we already override, so it inherits scoping for free — only
+        ``aiterator`` and :meth:`aggregate` need explicit handling.
+        """
+        if self._result_cache is None:
+            await sync_to_async(self._apply_scope_in_place)()
+        actor, sudo = self._resolve_effective_actor()
+        self._guard_projected_field_reads(actor, sudo)
+        field_mode = self._effective_field_mode()
+        redact = runtime_field_deny_mode(field_mode) != "allow" and bool(
+            gated_read_fields(self.model)
+        )
+        guard_related = bool(self._rebac_select_related_guards)
+        async for inst in super().aiterator(*args, **kwargs):
+            if actor is not None and not sudo and isinstance(inst, models.Model):
+                inst._rebac_actor = actor  # type: ignore[attr-defined]
+                inst._rebac_field_deny = self._rebac_field_deny  # type: ignore[attr-defined]
+                if redact:
+                    await sync_to_async(apply_field_visibility)(
+                        [inst], model=self.model, actor=actor, mode=field_mode
+                    )
+                if guard_related:
+                    await sync_to_async(self._guard_selected_related_reads)([inst])
+            yield inst
+
     # ----- Counts / existence respect scope too -----
 
     def count(self) -> int:
@@ -400,6 +443,19 @@ class RebacQuerySet(models.QuerySet[_M]):
             return bool(self._result_cache)
         self._apply_scope_in_place()
         return super().exists()
+
+    def aggregate(self, *args: Any, **kwargs: Any) -> dict[str, Any]:
+        """Aggregate over the actor's scope, not the whole table.
+
+        Django computes ``aggregate`` against ``self.query`` directly, so it
+        never triggers ``_fetch_all`` / ``iterator``. Without scoping the WHERE
+        clause first, ``SomeModel.objects.as_user(u).aggregate(Count("pk"))``
+        would summarise rows ``u`` cannot read (and ``aaggregate`` — a
+        ``sync_to_async`` wrapper around this method — would leak the same way).
+        Applying scope here fixes both surfaces.
+        """
+        self._apply_scope_in_place()
+        return super().aggregate(*args, **kwargs)
 
     # ----- Write ops: enforce all-or-nothing -----
 
