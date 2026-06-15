@@ -301,8 +301,33 @@ class LocalBackend(Backend):
         context: dict[str, Any] | None,
     ) -> CheckResult:
         # Empty resource_id → model-level check (any row of this type the subject
-        # has the action on). Treat as "is the accessible() set non-empty?".
+        # has the action on). First honour resource-independent grants — built-in
+        # actor terms (``authenticated`` / ``anonymous``) and const arrows — by
+        # evaluating the permission against an empty row: a create/list permission
+        # like ``create = authenticated`` has no accessible row yet but still grants
+        # (this is the gate the pre_save create signal relies on). Otherwise fall
+        # back to "is the accessible() set non-empty?".
         if not resource.resource_id:
+            definition = self.schema().get_definition(resource.resource_type)
+            permission = (
+                self.schema().get_permission(resource.resource_type, action)
+                if definition is not None
+                else None
+            )
+            if (
+                definition is not None
+                and permission is not None
+                and self._eval_permission(
+                    expr=permission.expression,
+                    definition=definition,
+                    resource_id="",
+                    subject=subject,
+                    depth=0,
+                    context=context,
+                    missing=set(),
+                )
+            ):
+                return CheckResult.has()
             try:
                 next(
                     iter(
