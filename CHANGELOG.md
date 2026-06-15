@@ -5,6 +5,46 @@ pre-1.0; breaking changes within a minor version are explicitly called out.
 
 ## [Unreleased]
 
+## [0.11.1] — 2026-06-15
+
+### Fixed
+
+- **Async/aggregate scoping holes (unscoped reads).** Two `RebacQuerySet`
+  paths summarised or streamed rows outside the actor's scope:
+  - `aiterator()` — Django builds the async row iterable directly instead of
+    routing through the overridden sync `iterator()` / `_fetch_all`, so
+    `async for row in qs.as_user(u).aiterator()` returned rows `u` could not
+    read. Now overridden to apply the scope filter, actor stamping,
+    field-visibility redaction, and `rebac_select_related` guards (DB-touching
+    steps run off the event loop via `sync_to_async`).
+  - `aggregate()` / `aaggregate()` — computed against the query without
+    materialising rows, so `qs.as_user(u).aggregate(Count("pk"))` counted the
+    whole table. Now applies scope first; this closes the hole in **both** the
+    sync `aggregate()` and the async `aaggregate()` wrapper.
+- Hardened the audit fallback executor's `atexit` shutdown to tolerate
+  interpreter-teardown ordering — when the stdlib's own `concurrent.futures`
+  atexit hook runs first, `submit()` is skipped instead of raising "cannot
+  schedule new futures after shutdown".
+- `LocalBackend.check_access` on an empty `resource_id` (the model-level "may
+  this subject create a new row of this type?" gate the `pre_save` create
+  signal relies on) now honours resource-independent grants — the built-in
+  `authenticated` / `anonymous` actors and const-backed arrows — by evaluating
+  the permission against the not-yet-persisted row. Previously a permission
+  like `create = authenticated` denied every create because no accessible row
+  existed yet. Relation-based create permissions (`create = owner`) still
+  resolve through the `accessible()` fallback, and row-dependent terms evaluate
+  `False` against the empty id so nothing is spuriously granted.
+
+### Notes
+
+- No separate async manager API is needed: Django implements the rest of the
+  async ORM surface (`aget` / `acount` / `aexists` / `afirst` / `aupdate` /
+  `adelete` / `acreate` / `__aiter__` / `ain_bulk` / …) as `sync_to_async`
+  wrappers around the sync methods `RebacQuerySet` already overrides, so
+  scoping is inherited and the `current_actor()` ContextVar carries into the
+  worker thread. `await Post.objects.as_user(u).aget(...)` enforces directly.
+  See ARCHITECTURE.md § Open questions #3.
+
 ## [0.11.0] — 2026-06-15
 
 ### Added
