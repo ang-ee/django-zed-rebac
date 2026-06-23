@@ -5,6 +5,28 @@ pre-1.0; breaking changes within a minor version are explicitly called out.
 
 ## [Unreleased]
 
+## [0.12.0] — 2026-06-23
+
+### Added
+
+- **`.for_write()` queryset/manager verb.** A named shorthand for
+  `.on_field_deny("allow")` for the load-then-mutate case: resolving an
+  update/delete target must materialise every column of the row, so
+  `read__<field>` redaction must not hide columns from the loaded instance —
+  yet the row must still be one the actor may access. `for_write()` turns field
+  redaction off for that queryset while leaving actor **row** scope intact (the
+  scope filter is still applied on materialisation). It grants no write
+  permission of its own; the pre-save / pre-delete checks still run. Reach for
+  it when `REBAC_FIELD_READ_MODE` is `"redact"` / `"omit"` and a redacted column
+  must not be hidden from the row being written.
+
+### Changed
+
+- Project metadata: authorship transferred to Angee, Inc. (`hi@angee.ai`) and
+  the repository moved to `https://github.com/ang-ee/django-zed-rebac`.
+  Homepage, documentation, and issue-tracker URLs in the package metadata
+  updated accordingly. No code or API changes.
+
 ## [0.11.1] — 2026-06-15
 
 ### Fixed

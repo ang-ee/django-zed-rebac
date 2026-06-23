@@ -4,13 +4,13 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "django-zed-rebac"
-version = "0.11.1"
+version = "0.12.0"
 description = "Drop-in REBAC engine for Django, SpiceDB-compatible, with a pure-Django LocalBackend."
 readme = "README.md"
 license = "Apache-2.0"
 license-files = ["LICENSE"]
 requires-python = ">=3.14"
-authors = [{ name = "Apexive", email = "hi@apexive.com" }]
+authors = [{ name = "Angee, Inc.", email = "hi@angee.ai" }]
 keywords = ["django", "rebac", "spicedb", "zanzibar", "authorization", "permissions"]
 classifiers = [
     "Development Status :: 3 - Alpha",
@@ -55,9 +55,9 @@ dev = [
 ]
 
 [project.urls]
-Homepage = "https://github.com/fyltr/django-zed-rebac"
-Documentation = "https://github.com/fyltr/django-zed-rebac/tree/main/docs"
-Issues = "https://github.com/fyltr/django-zed-rebac/issues"
+Homepage = "https://github.com/ang-ee/django-zed-rebac"
+Documentation = "https://github.com/ang-ee/django-zed-rebac/tree/main/docs"
+Issues = "https://github.com/ang-ee/django-zed-rebac/issues"
 
 [tool.setuptools.packages.find]
 where = ["src"]
