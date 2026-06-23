@@ -1045,6 +1045,7 @@ class RebacManager:
     def as_agent(self, agent, *, on_behalf_of=None) -> RebacQuerySet: ...
     def with_action(self, action: str) -> RebacQuerySet: ...           # override read-scope action
     def on_field_deny(self, mode: FieldDenyMode) -> RebacQuerySet: ... # allow/redact/omit/raise
+    def for_write(self) -> RebacQuerySet: ...                          # write-target: row scope kept, field redaction off
     def rebac_select_related(self, *fields) -> RebacQuerySet: ...      # guarded to-one joins
     def rebac_prefetch_related(self, *lookups) -> RebacQuerySet: ...   # scoped protected prefetches
 
@@ -1058,6 +1059,7 @@ class RebacQuerySet:
     def as_agent(self, agent, *, on_behalf_of=None) -> Self: ...
     def with_action(self, action: str) -> Self: ...                    # override read-scope action
     def on_field_deny(self, mode: FieldDenyMode) -> Self: ...          # override field-read deny mode
+    def for_write(self) -> Self: ...                                   # write-target: row scope kept, field redaction off
     def rebac_select_related(self, *fields) -> Self: ...               # select_related + related read guard
     def rebac_prefetch_related(self, *lookups) -> Self: ...            # prefetch_related + scoped targets
     def sudo(self, *, reason: str) -> Self: ...                         # gated by REBAC_ALLOW_SUDO
@@ -1080,6 +1082,7 @@ The three actor verbs are sugar over the same primitive:
 | `as_agent(agent, on_behalf_of=u)` | Equivalent to `with_actor(grant_subject_ref(agent, u))` — resolves to an `agents/grant:<id>#valid` subject. | Agent runtimes and MCP servers where a Grant is the canonical actor. |
 | `with_action(action)` | Pins the permission used for read-side queryset scoping instead of `read` / `Meta.rebac_default_action`. | Alternate read views such as `credential_lookup`, `list_admin`, or capability-specific resolver scopes. |
 | `on_field_deny(mode)` | Pins the field-read deny mode for `read__<field>` gates instead of the global setting. | Projection-sensitive paths that want `"omit"` while the global default stays `"allow"` or `"redact"`. |
+| `for_write()` | `on_field_deny("allow")` named for intent: keeps actor row scope but turns off `read__<field>` redaction so a load-then-mutate target carries every column. | Resolving an update/delete target while `REBAC_FIELD_READ_MODE` is `"redact"`/`"omit"`, where a redacted column must not be hidden from the row being written. |
 | `rebac_select_related(*fields)` | Applies Django `select_related` and batch-checks selected REBAC-bound related rows before serialization. | To-one relation optimization when an unreadable related object should fail the field/query instead of leaking. |
 | `rebac_prefetch_related(*lookups)` | Applies Django `prefetch_related`, rewriting bare protected lookups to `Prefetch(queryset=Related.objects.with_actor(actor))`. | Reverse, M2M, and to-many loading where protected children should be scoped rather than loaded via `_base_manager`. |
 
@@ -1183,6 +1186,14 @@ redacted field via `save(update_fields=[...])`, the pre-save path raises
 `PermissionDenied`. A full `save()` on a redacted instance rewrites
 `update_fields` to exclude redacted fields, preventing a display-time `None`
 from overwriting the stored value.
+
+When the goal is to load a row *in order to mutate it* (resolve an
+update/delete target, then write a different column), redaction would hide
+columns the writer legitimately needs. `.for_write()` is the named shorthand
+for `.on_field_deny("allow")` that turns field-read redaction off for that
+queryset while leaving actor row scope intact — the row must still be one the
+actor may access, but every column is materialised. It does not grant any
+write permission; the pre-save / pre-delete checks still run.
 
 ---
 
@@ -1572,7 +1583,7 @@ Odoo 19's `ir.rule` / `ir.model.access` / `env.su` / `with_user` system covers m
 
 ### Cross-reference
 
-These four are highest-impact. The full Odoo 19 research note (with file/line citations into the upstream tree) lives at [`../odoo-research/notes/01-permissions-security.md`](https://github.com/apexive/odoo-research/blob/main/notes/01-permissions-security.md) for contributors auditing edge cases. If you're proposing a new feature that resembles `ir.rule.domain_force` (Python evaluated at runtime against ambient context), `_check_company` (cross-relation invariants enforced at write time), or a new ambient context key, read the research note first; chances are we've ruled it out by design.
+These four are highest-impact. The full Odoo 19 research note (with file/line citations into the upstream tree) lives at `../odoo-research/notes/01-permissions-security.md` for contributors auditing edge cases. If you're proposing a new feature that resembles `ir.rule.domain_force` (Python evaluated at runtime against ambient context), `_check_company` (cross-relation invariants enforced at write time), or a new ambient context key, read the research note first; chances are we've ruled it out by design.
 
 ---
 

@@ -105,6 +105,18 @@ class RebacQuerySet(models.QuerySet[_M]):
         clone._rebac_field_deny = validate_field_deny_mode(mode)
         return clone
 
+    def for_write(self) -> RebacQuerySet[_M]:
+        """Return a write-target queryset: REBAC row scope kept, field-read
+        redaction off.
+
+        Resolving an update/delete target must load every column of the row to
+        mutate it, so field-read redaction must not hide columns from the loaded
+        instance -- yet the row must still be one the actor may access (row scope
+        is applied on materialization as usual). ``for_write()`` is
+        ``on_field_deny("allow")`` named for that intent.
+        """
+        return self.on_field_deny("allow")
+
     def sudo(self, *, reason: str) -> RebacQuerySet[_M]:
         """Bypass REBAC for this queryset. Mandatory `reason`."""
         return self._bypass(reason=reason, allow_when_sudo_disabled=False)
@@ -615,6 +627,9 @@ class RebacManager(models.Manager.from_queryset(RebacQuerySet)):  # type: ignore
 
     def on_field_deny(self, mode: FieldDenyMode) -> RebacQuerySet[Any]:
         return self.get_queryset().on_field_deny(mode)
+
+    def for_write(self) -> RebacQuerySet[Any]:
+        return self.get_queryset().for_write()
 
     def rebac_select_related(self, *fields: Any) -> RebacQuerySet[Any]:
         return self.get_queryset().rebac_select_related(*fields)

@@ -224,6 +224,31 @@ def test_on_field_deny_omit_overrides_global_allow_and_survives_clones(alice, bo
 
 
 @override_settings(REBAC_FIELD_READ_MODE="redact")
+def test_for_write_keeps_row_scope_but_disables_field_redaction(alice, bob):
+    from tests.testapp.models import Post
+
+    post = _post(title="secret title")
+    _grant(post.pk, bob, "owner")
+    _grant(post.pk, alice, "editor")  # can write, but read__title=owner redacts on a normal read
+
+    # A normal read redacts the gated field for the non-owner editor.
+    redacted = Post.objects.as_user(alice).get(pk=post.pk)
+    assert redacted.title is None
+    assert redacted._rebac_redacted_fields == frozenset({"title"})
+
+    # for_write() = on_field_deny("allow"): redaction off so the write target carries
+    # every column, while row scope still applies.
+    writable = Post.objects.as_user(alice).for_write().get(pk=post.pk)
+    assert writable.title == "secret title"
+    assert getattr(writable, "_rebac_redacted_fields", frozenset()) == frozenset()
+
+    # Row scope is preserved: a row the actor cannot access is still not returned.
+    unrelated = _post(title="bob only")
+    _grant(unrelated.pk, bob, "owner")
+    assert Post.objects.as_user(alice).for_write().filter(pk=unrelated.pk).first() is None
+
+
+@override_settings(REBAC_FIELD_READ_MODE="redact")
 def test_values_projection_of_gated_field_fails_closed(alice, bob):
     from tests.testapp.models import Post
 
