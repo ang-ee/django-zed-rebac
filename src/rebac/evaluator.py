@@ -241,4 +241,14 @@ def evaluator_scope(
     try:
         yield evaluator
     finally:
-        _current_evaluator.reset(token)
+        try:
+            _current_evaluator.reset(token)
+        except ValueError:
+            # Enter and exit ran in different contexts — e.g. a Strawberry
+            # ``on_operation`` extension whose teardown is driven from an
+            # ``AsyncExitStack`` while an error unwinds, resuming this generator
+            # in a different context than the ``set``. A ContextVar token cannot
+            # be reset across contexts; swallow it so cleanup never masks the
+            # real error being unwound (the ContextVar is discarded with its
+            # context, so nothing leaks).
+            pass

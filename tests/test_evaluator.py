@@ -321,3 +321,20 @@ def test_evaluator_scopes_isolated_across_copied_contexts():
         assert collected[0] is not collected[1]
         # Parent's cache stays intact regardless of what the children did.
         assert parent.stats()["check_entries"] == 1
+
+
+def test_evaluator_scope_tolerates_cross_context_reset() -> None:
+    """Teardown must not raise when enter and exit run in different contexts.
+
+    Strawberry's ``on_operation`` extension enters the scope in one context, and
+    its ``AsyncExitStack`` drives teardown from another while an error unwinds. A
+    ContextVar token cannot be reset across contexts, so the cleanup swallows
+    that ``ValueError`` rather than masking the real error being unwound. Without
+    the guard, ``__exit__`` below raises ``ValueError`` and the user sees that
+    instead of the actual operation error.
+    """
+    scope = evaluator_scope()
+    # Enter (the ``set``) inside a copied context; the token is bound there.
+    copy_context().run(scope.__enter__)
+    # Exit from the outer context: the cross-context reset must be swallowed.
+    scope.__exit__(None, None, None)
