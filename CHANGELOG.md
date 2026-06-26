@@ -5,6 +5,19 @@ pre-1.0; breaking changes within a minor version are explicitly called out.
 
 ## [Unreleased]
 
+## [0.12.1] — 2026-06-26
+
+### Fixed
+
+- **`evaluator_scope` tolerates cross-context teardown.** The scope's
+  `ContextVar` reset raised `ValueError: Token was created in a different
+  Context` when the scope was entered in one context and torn down from
+  another — e.g. a Strawberry `on_operation` extension whose `AsyncExitStack`
+  drives teardown while an error unwinds. The reset failure then masked the
+  real operation error (such as an invalid GraphQL `where`), making it
+  undebuggable. Cleanup now swallows that cross-context `ValueError`; the
+  `ContextVar` is discarded with its context, so nothing leaks.
+
 ## [0.12.0] — 2026-06-23
 
 ### Added
