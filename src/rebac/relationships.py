@@ -5,9 +5,12 @@ from __future__ import annotations
 from collections.abc import Iterable
 from typing import Any
 
+from django.db import models
 from django.db.models import QuerySet
 
-from .types import RelationshipFilter, RelationshipTuple, Zookie
+from ._id import resource_id_attr
+from .resources import model_for_resource_type, model_resource_id
+from .types import RelationshipFilter, RelationshipTuple, SubjectRef, Zookie
 
 
 def _format_target(tup: RelationshipTuple) -> str:
@@ -196,3 +199,33 @@ def delete_relationship(tuple_: RelationshipTuple) -> Zookie:
             defer_to_commit=True,
         )
     return zookie
+
+
+def resolve_subjects(refs: Iterable[SubjectRef | str]) -> dict[SubjectRef, models.Model]:
+    """Resolve subject refs whose object type maps to a registered Django model.
+
+    This is the inverse of the public ``SubjectRef`` creation path for resource
+    types the library can map back to a model. Unknown resource types and
+    missing rows are omitted. ``optional_relation`` is ignored for lookup
+    purposes: ``auth/group:eng#member`` and ``auth/group:eng`` both point at
+    the same underlying object id.
+    """
+    refs_by_type: dict[str, list[SubjectRef]] = {}
+    for ref in refs:
+        if not isinstance(ref, SubjectRef):
+            ref = SubjectRef.parse(str(ref))
+        refs_by_type.setdefault(ref.subject_type, []).append(ref)
+
+    resolved: dict[SubjectRef, models.Model] = {}
+    for subject_type, refs_for_type in refs_by_type.items():
+        model = model_for_resource_type(subject_type)
+        if model is None:
+            continue
+        ids = {ref.subject_id for ref in refs_for_type}
+        rows = model._base_manager.filter(**{f"{resource_id_attr(model)}__in": list(ids)})
+        by_id = {model_resource_id(row): row for row in rows}
+        for ref in refs_for_type:
+            row = by_id.get(ref.subject_id)
+            if row is not None:
+                resolved[ref] = row
+    return resolved

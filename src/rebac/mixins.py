@@ -306,6 +306,38 @@ class RebacMixin(models.Model, metaclass=RebacModelBase):
         """Return the pinned actor on this instance, or ``None``."""
         return self._rebac_actor
 
+    def effective_actor(self, *, strict: bool = False) -> tuple[SubjectRef | None, bool]:
+        """Return ``(actor_ref, is_unscoped)`` for this instance.
+
+        Explicit instance scope wins over ambient scope: per-instance sudo
+        bypasses, a pinned actor scopes, ambient sudo only bypasses when no
+        actor is pinned, and ambient ``current_actor()`` is the final scoped
+        fallback. In observer mode (``strict=False``), a strict-mode no-actor
+        state returns ``(None, False)`` instead of raising.
+        """
+        from .actors import current_actor as _current_actor
+        from .actors import is_sudo as _is_sudo_ambient
+        from .conf import app_settings
+        from .errors import MissingActorError
+
+        if self._rebac_sudo_reason is not None:
+            return (None, True)
+        if self._rebac_actor is not None:
+            return (self._rebac_actor, False)
+        if _is_sudo_ambient():
+            return (None, True)
+        ambient = _current_actor()
+        if ambient is not None:
+            return (ambient, False)
+        if app_settings.REBAC_STRICT_MODE:
+            if strict:
+                raise MissingActorError(
+                    f"{type(self).__name__}.check_access() called with no actor. "
+                    f"Use instance.with_actor(actor) or wrap in `with sudo(reason='...'):`."
+                )
+            return (None, False)
+        return (None, True)
+
     # ----- Check API (Odoo PR #179148 triple) -----
 
     def check_access(
@@ -320,18 +352,13 @@ class RebacMixin(models.Model, metaclass=RebacModelBase):
         Resolution order:
           1. Model not wired (no ``rebac_resource_type``) → ``HAS_PERMISSION``
              (mirrors the queryset's no-op behaviour).
-          2. Per-instance sudo OR ambient ``is_sudo()`` → ``HAS_PERMISSION``.
-             Note: ambient sudo overrides a pinned actor at check time —
-             same precedence as ``RebacQuerySet._resolve_effective_actor``.
-          3. Resolve actor: ``_rebac_actor`` first, then ``current_actor()``.
-          4. No actor + strict mode → raise ``MissingActorError``.
+          2. Resolve via ``effective_actor(strict=True)``:
+             per-instance sudo → pinned actor → ambient sudo → ambient actor
+             → strict-mode fallback.
+          3. Unscoped/bypass resolution → ``HAS_PERMISSION``.
           5. Otherwise dispatch to the backend.
         """
-        from .actors import current_actor as _current_actor
-        from .actors import is_sudo as _is_sudo_ambient
         from .backends import backend
-        from .conf import app_settings
-        from .errors import MissingActorError
 
         rebac_type = model_resource_type(type(self))
         if not rebac_type:
@@ -339,17 +366,10 @@ class RebacMixin(models.Model, metaclass=RebacModelBase):
             # the manager's no-op behaviour.
             return CheckResult.has(reason="no resource type")
 
-        if self._rebac_sudo_reason is not None or _is_sudo_ambient():
-            return CheckResult.has(reason="sudo")
-
-        actor = self._rebac_actor or _current_actor()
-        if actor is None:
-            if app_settings.REBAC_STRICT_MODE:
-                raise MissingActorError(
-                    f"{type(self).__name__}.check_access({action!r}) called with no actor. "
-                    f"Use instance.with_actor(actor) or wrap in `with sudo(reason='...'):`."
-                )
-            return CheckResult.no(reason="no actor (strict mode off)")
+        actor, unscoped = self.effective_actor(strict=True)
+        if unscoped:
+            return CheckResult.has(reason="unscoped")
+        assert actor is not None
 
         # Empty resource_id on adding — same sentinel the pre-save signal
         # uses so the backend treats it as a model-level "any row?" check.

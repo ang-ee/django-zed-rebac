@@ -16,6 +16,7 @@ from .overrides import SchemaOverride
 from .provenance import PackageManagedRecord
 from .relationship import (
     Relationship,
+    RelationshipManager,
     RelationshipRegistry,
     RelationshipRegistryManager,
     active_relationship_model,
@@ -33,6 +34,7 @@ __all__ = [
     "PermissionAuditEvent",
     "RebacResource",
     "Relationship",
+    "RelationshipManager",
     "RelationshipRegistry",
     "RelationshipRegistryManager",
     "SchemaCaveat",

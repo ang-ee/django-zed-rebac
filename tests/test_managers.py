@@ -2,9 +2,11 @@ from __future__ import annotations
 
 from typing import Any
 
+import pytest
 from django.test import override_settings
 
-from rebac.errors import SudoNotAllowedError
+from rebac import SubjectRef, sudo
+from rebac.errors import MissingActorError, SudoNotAllowedError
 from rebac.managers import RebacManager, RebacQuerySet
 from tests.testapp.models import Post
 
@@ -76,3 +78,28 @@ def test_system_context_allowed_when_sudo_disabled() -> None:
         queryset = manager.system_context(reason="fixture.load")
 
     assert queryset.is_sudo()
+
+
+def test_queryset_effective_actor_observer_does_not_raise_without_actor() -> None:
+    manager = RebacManager()
+    manager.model = Post
+
+    assert manager.get_queryset().effective_actor() == (None, False)
+
+
+def test_queryset_effective_actor_strict_raises_without_actor() -> None:
+    manager = RebacManager()
+    manager.model = Post
+
+    with pytest.raises(MissingActorError):
+        manager.get_queryset().effective_actor(strict=True)
+
+
+@pytest.mark.django_db
+def test_queryset_pinned_actor_beats_ambient_sudo() -> None:
+    manager = RebacManager()
+    manager.model = Post
+    actor = SubjectRef.of("auth/user", "1")
+
+    with sudo(reason="test.ambient"):
+        assert manager.with_actor(actor).effective_actor() == (actor, False)

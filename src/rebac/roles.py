@@ -91,6 +91,7 @@ from .types import ObjectRef, RelationshipTuple, SubjectRef
 
 if TYPE_CHECKING:  # pragma: no cover
     from .models import Relationship
+    from .schema.ast import Schema
 
 
 ROLE_RELATION = "member"
@@ -452,6 +453,53 @@ def implied_by_of(role: str | ObjectRef) -> Iterator[ObjectRef]:
         yield ObjectRef(row.subject_type, row.subject_id)
 
 
+def roles_reaching(
+    resource_type: str,
+    permission: str,
+    *,
+    role_resource_type: str,
+    schema: Schema | None = None,
+) -> frozenset[ObjectRef]:
+    """Return statically named role objects that can reach a permission.
+
+    The helper reads the effective schema through ``backend().schema()`` when
+    ``schema`` is omitted. It only returns roles with a concrete object id from
+    the schema: specific-id allowed subjects like
+    ``storage/role:object_viewer#member`` and const-backed role relations like
+    ``relation admin: storage/role // rebac:const=admin``.
+    """
+    from .backends import backend
+    from .schema.ast import ConstBinding
+    from .schema.introspection import permission_sources
+    from .schema.walker import find_relation
+
+    active_schema = schema if schema is not None else backend().schema()
+    definition = active_schema.get_definition(resource_type)
+    if definition is None:
+        return frozenset()
+
+    sources = permission_sources(active_schema, resource_type, permission)
+    relation_names = set(sources.direct_relations)
+    relation_names.update(via for via, _target in sources.arrows)
+
+    roles: set[ObjectRef] = set()
+    for relation_name in relation_names:
+        relation = find_relation(definition, relation_name)
+        if relation is None:
+            continue
+        for allowed in relation.allowed_subjects:
+            if allowed.type == role_resource_type and allowed.id:
+                roles.add(ObjectRef(role_resource_type, allowed.id))
+        backing = relation.backing
+        if (
+            isinstance(backing, ConstBinding)
+            and len(relation.allowed_subjects) == 1
+            and relation.allowed_subjects[0].type == role_resource_type
+        ):
+            roles.add(ObjectRef(role_resource_type, backing.target_id))
+    return frozenset(roles)
+
+
 __all__ = [
     "ROLE_EFFECTIVE_MEMBER",
     "ROLE_INCLUDES_RELATION",
@@ -463,5 +511,6 @@ __all__ = [
     "members_of",
     "revoke",
     "roles_of",
+    "roles_reaching",
     "unimply",
 ]

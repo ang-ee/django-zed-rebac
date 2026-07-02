@@ -10,6 +10,7 @@ from rebac import (
     PermissionDepthExceeded,
     PermissionResult,
     RelationshipTuple,
+    SchemaError,
     SubjectRef,
     check_new,
 )
@@ -86,6 +87,35 @@ def _group(id_: str) -> SubjectRef:
 
 def _vault(id_: str) -> SubjectRef:
     return SubjectRef.of("blog/vault", id_)
+
+
+CONST_CREATE_SCHEMA_TEXT = """
+definition auth/user {}
+
+definition auth/role {
+    relation member: auth/user
+}
+
+definition blog/vault {
+    relation owner: auth/user
+    permission create = owner
+    permission write = owner
+}
+
+definition blog/post {
+    relation vault: blog/vault
+    relation admin: auth/role // rebac:const=superadmin
+
+    permission create_admin = admin->member
+    permission create = vault->create
+}
+"""
+
+
+def _const_backend() -> LocalBackend:
+    b = LocalBackend()
+    b.set_schema(parse_zed(CONST_CREATE_SCHEMA_TEXT))
+    return b
 
 
 def test_create_via_arrow_consults_real_target(backend):
@@ -539,3 +569,74 @@ def test_minus_with_conditional_right_propagates(backend):
         backend=backend,
     )
     assert not blocked.allowed
+
+
+def test_create_via_const_backed_relation_injects_virtual_tuple(db):
+    b = _const_backend()
+    b.write_relationships(
+        [
+            RelationshipTuple(
+                resource=ObjectRef("auth/role", "superadmin"),
+                relation="member",
+                subject=_user("alice"),
+            )
+        ]
+    )
+
+    result = check_new(
+        subject=_user("alice"),
+        action="create_admin",
+        resource_type="blog/post",
+        backend=b,
+    )
+
+    assert result.allowed
+
+
+def test_create_via_const_backed_relation_denies_non_member(db):
+    b = _const_backend()
+
+    result = check_new(
+        subject=_user("bob"),
+        action="create_admin",
+        resource_type="blog/post",
+        backend=b,
+    )
+
+    assert not result.allowed
+
+
+def test_create_rejects_caller_supplied_const_relation_overlay(db):
+    b = _const_backend()
+
+    with pytest.raises(SchemaError, match="const-backed"):
+        check_new(
+            subject=_user("alice"),
+            action="create_admin",
+            resource_type="blog/post",
+            relationships={"admin": [SubjectRef.of("auth/role", "editor")]},
+            backend=b,
+        )
+
+
+def test_create_via_parent_arrow_denies_when_actor_can_create_elsewhere(db):
+    b = _const_backend()
+    b.write_relationships(
+        [
+            RelationshipTuple(
+                resource=ObjectRef("blog/vault", "allowed"),
+                relation="owner",
+                subject=_user("alice"),
+            )
+        ]
+    )
+
+    result = check_new(
+        subject=_user("alice"),
+        action="create",
+        resource_type="blog/post",
+        relationships={"vault": [SubjectRef.of("blog/vault", "denied")]},
+        backend=b,
+    )
+
+    assert not result.allowed

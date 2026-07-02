@@ -18,6 +18,12 @@ from .ast import (
     Relation,
     Schema,
 )
+from .introspection import (
+    PermissionSources,
+    permission_sources,
+    permissions_reaching_relation,
+    relation_dependencies,
+)
 from .parser import ParseError, parse_permission_expression, parse_zed, validate_schema
 
 __all__ = [
@@ -34,10 +40,14 @@ __all__ = [
     "PermNil",
     "PermRef",
     "Permission",
+    "PermissionSources",
     "Relation",
     "Schema",
     "parse_permission_expression",
     "parse_permission_expression",
     "parse_zed",
+    "permission_sources",
+    "permissions_reaching_relation",
+    "relation_dependencies",
     "validate_schema",
 ]

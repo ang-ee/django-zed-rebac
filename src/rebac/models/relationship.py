@@ -24,6 +24,63 @@ from django.db import models
 
 from ..conf import app_settings
 
+WIRE_VALUE_FIELDS = (
+    "resource_type",
+    "resource_id",
+    "relation",
+    "subject_type",
+    "subject_id",
+    "optional_subject_relation",
+    "caveat_name",
+)
+
+
+class RelationshipQuerySet(models.QuerySet["Relationship"]):
+    """Mode-agnostic queryset helpers for denormalized relationship rows."""
+
+    def for_resource(self, resource_type: str, resource_id: str) -> RelationshipQuerySet:
+        return self.filter(resource_type=resource_type, resource_id=resource_id)
+
+    def for_subject(
+        self,
+        subject_type: str,
+        subject_id: str,
+        optional_relation: str | None = None,
+    ) -> RelationshipQuerySet:
+        qs = self.filter(subject_type=subject_type, subject_id=subject_id)
+        if optional_relation is not None:
+            qs = qs.filter(optional_subject_relation=optional_relation)
+        return qs
+
+    def order_by_resource(self) -> RelationshipQuerySet:
+        return self.order_by(
+            "resource_type",
+            "resource_id",
+            "relation",
+            "subject_type",
+            "subject_id",
+            "optional_subject_relation",
+            "caveat_name",
+        )
+
+    def order_by_subject(self) -> RelationshipQuerySet:
+        return self.order_by(
+            "subject_type",
+            "subject_id",
+            "optional_subject_relation",
+            "resource_type",
+            "resource_id",
+            "relation",
+            "caveat_name",
+        )
+
+    def wire_values(self) -> Any:
+        return self.values(*WIRE_VALUE_FIELDS)
+
+
+class RelationshipManager(models.Manager.from_queryset(RelationshipQuerySet)):  # type: ignore[misc]
+    """Manager exposing the public relationship-query helper surface."""
+
 
 class Relationship(models.Model):
     """Denormalized relationship row — historical default storage shape."""
@@ -38,6 +95,8 @@ class Relationship(models.Model):
     caveat_context = models.JSONField(null=True, blank=True)
     expires_at = models.DateTimeField(null=True, blank=True, db_index=True)
     written_at_xid = models.BigIntegerField(default=0, db_index=True)
+
+    objects = RelationshipManager()
 
     class Meta:
         app_label = "rebac"
@@ -134,6 +193,64 @@ class RelationshipRegistryQuerySet(models.QuerySet["RelationshipRegistry"]):
 
     def get(self, *args: Any, **kwargs: Any) -> Any:
         return super().get(*args, **_translate_read_kwargs(kwargs))
+
+    def for_resource(self, resource_type: str, resource_id: str) -> RelationshipRegistryQuerySet:
+        return self.filter(resource_type=resource_type, resource_id=resource_id)
+
+    def for_subject(
+        self,
+        subject_type: str,
+        subject_id: str,
+        optional_relation: str | None = None,
+    ) -> RelationshipRegistryQuerySet:
+        qs = self.filter(subject_type=subject_type, subject_id=subject_id)
+        if optional_relation is not None:
+            qs = qs.filter(optional_subject_relation=optional_relation)
+        return qs
+
+    def order_by_resource(self) -> RelationshipRegistryQuerySet:
+        return self.order_by(
+            "resource_fk__resource_type",
+            "resource_fk__resource_id",
+            "relation",
+            "subject_fk__resource_type",
+            "subject_fk__resource_id",
+            "optional_subject_relation",
+            "caveat_name",
+        )
+
+    def order_by_subject(self) -> RelationshipRegistryQuerySet:
+        return self.order_by(
+            "subject_fk__resource_type",
+            "subject_fk__resource_id",
+            "optional_subject_relation",
+            "resource_fk__resource_type",
+            "resource_fk__resource_id",
+            "relation",
+            "caveat_name",
+        )
+
+    def wire_values(self) -> list[dict[str, Any]]:
+        return [
+            {
+                "resource_type": row["resource_fk__resource_type"],
+                "resource_id": row["resource_fk__resource_id"],
+                "relation": row["relation"],
+                "subject_type": row["subject_fk__resource_type"],
+                "subject_id": row["subject_fk__resource_id"],
+                "optional_subject_relation": row["optional_subject_relation"],
+                "caveat_name": row["caveat_name"],
+            }
+            for row in self.values(
+                "resource_fk__resource_type",
+                "resource_fk__resource_id",
+                "relation",
+                "subject_fk__resource_type",
+                "subject_fk__resource_id",
+                "optional_subject_relation",
+                "caveat_name",
+            )
+        ]
 
 
 class RelationshipRegistryManager(models.Manager.from_queryset(RelationshipRegistryQuerySet)):  # type: ignore[misc]

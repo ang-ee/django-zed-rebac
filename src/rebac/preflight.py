@@ -48,7 +48,8 @@ from collections.abc import Mapping, Sequence
 from typing import TYPE_CHECKING
 
 from .conf import app_settings
-from .errors import PermissionDepthExceeded
+from .errors import PermissionDepthExceeded, SchemaError
+from .schema.ast import ConstBinding
 from .schema.walker import (
     WalkContext,
     eval_expr,
@@ -122,6 +123,8 @@ def check_new(
     if permission is None and relation is None:
         return CheckResult.no(reason=f"unknown action: {resource_type}#{action}")
 
+    rels = _merge_const_backed_relationships(definition, rels)
+
     missing: set[str] = set()
     ctx = _build_ctx(
         backend=active_backend,
@@ -152,6 +155,31 @@ def check_new(
     if verdict is None:
         return CheckResult.conditional(missing=tuple(sorted(missing)))
     return CheckResult.no()
+
+
+def _merge_const_backed_relationships(
+    definition: Definition,
+    relationships: Mapping[str, Sequence[SubjectRef]],
+) -> Mapping[str, Sequence[SubjectRef]]:
+    """Inject schema-owned const relation subjects into the virtual overlay."""
+    merged: dict[str, tuple[SubjectRef, ...]] = {
+        name: tuple(subjects) for name, subjects in relationships.items()
+    }
+    for relation in definition.relations:
+        backing = relation.backing
+        if not isinstance(backing, ConstBinding):
+            continue
+        supplied = merged.get(relation.name, ())
+        if supplied:
+            raise SchemaError(
+                f"{definition.resource_type}#{relation.name} is const-backed; "
+                "check_new callers must not supply virtual tuples for synthetic relations"
+            )
+        if len(relation.allowed_subjects) != 1:
+            continue
+        allowed = relation.allowed_subjects[0]
+        merged[relation.name] = (SubjectRef.of(allowed.type, backing.target_id),)
+    return merged
 
 
 def _build_ctx(

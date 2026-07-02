@@ -16,6 +16,7 @@ from __future__ import annotations
 import pytest
 from django.test import override_settings
 
+from rebac import SubjectRef, sudo
 from rebac.models import (
     RebacResource,
     Relationship,
@@ -318,3 +319,86 @@ def test_subject_delete_also_cascades():
     subject_pk = row.subject_fk_id
     RebacResource.objects.filter(pk=subject_pk).delete()
     assert not RelationshipRegistry.objects.filter(pk=row.pk).exists()
+
+
+# ---------- mode-agnostic relationship query helpers ----------
+
+
+@pytest.mark.django_db
+@pytest.mark.parametrize("model_cls", [Relationship, RelationshipRegistry])
+def test_relationship_helpers_filter_and_order_wire_rows(model_cls):
+    model_cls.objects.create(
+        resource_type="storage/file",
+        resource_id="b",
+        relation="viewer",
+        subject_type="auth/user",
+        subject_id="2",
+    )
+    model_cls.objects.create(
+        resource_type="storage/file",
+        resource_id="a",
+        relation="owner",
+        subject_type="auth/user",
+        subject_id="1",
+    )
+
+    rows = list(
+        model_cls.objects.for_resource("storage/file", "a").order_by_subject().wire_values()
+    )
+
+    assert rows == [
+        {
+            "resource_type": "storage/file",
+            "resource_id": "a",
+            "relation": "owner",
+            "subject_type": "auth/user",
+            "subject_id": "1",
+            "optional_subject_relation": "",
+            "caveat_name": "",
+        }
+    ]
+
+
+@pytest.mark.django_db
+@pytest.mark.parametrize("model_cls", [Relationship, RelationshipRegistry])
+def test_for_subject_optional_relation_none_means_any_relation(model_cls):
+    model_cls.objects.create(
+        resource_type="storage/file",
+        resource_id="a",
+        relation="viewer",
+        subject_type="auth/group",
+        subject_id="eng",
+        optional_subject_relation="member",
+    )
+    model_cls.objects.create(
+        resource_type="storage/file",
+        resource_id="b",
+        relation="viewer",
+        subject_type="auth/group",
+        subject_id="eng",
+    )
+
+    any_rows = list(
+        model_cls.objects.for_subject(
+            "auth/group", "eng", optional_relation=None
+        ).order_by_resource().wire_values()
+    )
+    direct_rows = list(
+        model_cls.objects.for_subject("auth/group", "eng", optional_relation="").wire_values()
+    )
+
+    assert [row["resource_id"] for row in any_rows] == ["a", "b"]
+    assert [row["resource_id"] for row in direct_rows] == ["b"]
+
+
+@pytest.mark.django_db
+def test_resolve_subjects_maps_registered_models_to_rows():
+    from rebac.relationships import resolve_subjects
+    from tests.testapp.models import Post
+
+    with sudo(reason="test.fixture"):
+        post = Post.objects.create(title="subject")
+    post_ref = SubjectRef.of("blog/post", str(post.pk))
+    refs = [post_ref, SubjectRef.of("missing/type", "1")]
+
+    assert resolve_subjects(refs) == {post_ref: post}

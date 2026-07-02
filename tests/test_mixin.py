@@ -331,21 +331,61 @@ def test_instance_with_actor_outranks_ambient_actor(alice, bob, post):
             instance.save()
 
 
-def test_instance_check_access_ambient_sudo_overrides_pinned_actor(bob, post):
-    """Ambient `with sudo():` overrides a pinned actor — same precedence as queryset.
+def test_instance_effective_actor_observer_does_not_raise_without_actor(post):
+    from tests.testapp.models import Post
 
-    Documents and locks the precedence rule on the new instance API:
-    ambient sudo wins. Bob has no grants; without sudo `check_access`
-    would deny. Inside `with sudo(...)` the same call returns HAS.
+    with sudo(reason="test.load"):
+        instance = Post.objects.get(pk=post.pk)
+    instance._rebac_actor = None
+
+    assert instance.effective_actor() == (None, False)
+
+
+def test_instance_effective_actor_strict_raises_without_actor(post):
+    from tests.testapp.models import Post
+
+    with sudo(reason="test.load"):
+        instance = Post.objects.get(pk=post.pk)
+    instance._rebac_actor = None
+
+    with pytest.raises(MissingActorError):
+        instance.effective_actor(strict=True)
+
+
+def test_instance_check_access_pinned_actor_beats_ambient_sudo(bob, post):
+    """Explicit instance actor beats ambient sudo, matching queryset behavior.
+
+    Bob has no grants; without sudo `check_access` denies. Ambient sudo should
+    not convert a deliberately pinned user view into an unscoped bypass.
     """
     from tests.testapp.models import Post
 
     with sudo(reason="test.load"):
         instance = Post.objects.get(pk=post.pk)
     instance.with_actor(bob)
+    bob_ref = SubjectRef.of("auth/user", str(bob.pk))
+
+    assert instance.effective_actor() == (bob_ref, False)
     assert instance.check_access("read").allowed is False
     with sudo(reason="test.ambient"):
-        assert instance.check_access("read").allowed is True
+        assert instance.effective_actor() == (bob_ref, False)
+        assert instance.check_access("read").allowed is False
+
+
+@pytest.mark.parametrize("ambient_sudo", [False, True])
+def test_instance_check_access_uses_effective_actor_rule(alice, bob, post, ambient_sudo):
+    _grant_owner(alice, post)
+    from tests.testapp.models import Post
+
+    with sudo(reason="test.load"):
+        instance = Post.objects.get(pk=post.pk)
+    instance.with_actor(bob)
+
+    if ambient_sudo:
+        with sudo(reason="ambient"):
+            assert not instance.has_access("read")
+    else:
+        assert not instance.has_access("read")
 
 
 def test_instance_sudo_bypasses_save(alice, post):

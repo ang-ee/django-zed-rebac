@@ -74,7 +74,12 @@ if TYPE_CHECKING:
     from .mcp import default_actor_resolver, get_mcp_actor_resolver, rebac_mcp_tool
     from .mixins import RebacMixin, RebacObjectMeta
     from .permissions_mixin import RebacPermissionsMixin
-    from .relationships import delete_relationship, delete_relationships, write_relationships
+    from .relationships import (
+        delete_relationship,
+        delete_relationships,
+        resolve_subjects,
+        write_relationships,
+    )
     from .resources import to_object_ref
 
 
@@ -94,6 +99,7 @@ _LAZY = {
     "write_relationships": ("rebac.relationships", "write_relationships"),
     "delete_relationship": ("rebac.relationships", "delete_relationship"),
     "delete_relationships": ("rebac.relationships", "delete_relationships"),
+    "resolve_subjects": ("rebac.relationships", "resolve_subjects"),
     "to_object_ref": ("rebac.resources", "to_object_ref"),
     "rebac_mcp_tool": ("rebac.mcp", "rebac_mcp_tool"),
     "default_actor_resolver": ("rebac.mcp", "default_actor_resolver"),
@@ -172,6 +178,7 @@ __all__ = [
     "write_relationships",
     "delete_relationship",
     "delete_relationships",
+    "resolve_subjects",
     "emit_audit_event",
     "aemit_audit_event",
     # evaluator

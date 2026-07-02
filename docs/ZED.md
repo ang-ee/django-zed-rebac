@@ -173,6 +173,14 @@ the intended "covers any `<type>`" semantics. Like field-backing, this is a
 `LocalBackend` synthesis with no SpiceDB equivalent; a SpiceDB backend would
 need the edge materialised as tuples.
 
+Create preflight (`rebac.check_new`) injects const-backed relations from the
+schema into its virtual tuple overlay. For the `admin` relation above, a create
+check behaves as if the not-yet-persisted post already carried
+`#admin @ angee/role:admin`, then evaluates `admin->member` through the real
+relationship store. Callers must not supply virtual tuples for const-backed
+relation names; those relations are synthetic schema facts, and
+`check_new()` raises `SchemaError` for non-empty caller entries on them.
+
 **Permissions** — computed expressions over relations:
 
 ```zed

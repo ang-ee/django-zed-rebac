@@ -183,10 +183,17 @@ class RebacQuerySet(models.QuerySet[_M]):
 
     # ----- Materialisation -----
 
-    def _resolve_effective_actor(self) -> tuple[SubjectRef | None, bool]:
-        """Returns (actor_ref, is_sudo).
+    def effective_actor(self, *, strict: bool = False) -> tuple[SubjectRef | None, bool]:
+        """Return ``(actor_ref, is_unscoped)`` for this queryset.
 
-        Resolution order: per-queryset → ambient ContextVar → strict-mode fallback.
+        ``is_unscoped`` is true when evaluation should bypass row scoping:
+        explicit queryset sudo, ambient sudo with no pinned actor, or
+        ``REBAC_STRICT_MODE=False`` with no actor. In observer mode
+        (``strict=False``), a strict-mode no-actor state returns
+        ``(None, False)`` instead of raising.
+
+        Resolution order: per-queryset sudo → per-queryset actor →
+        ambient sudo → ambient actor → strict-mode fallback.
         """
         if self._rebac_sudo_reason is not None:
             return (None, True)
@@ -198,13 +205,26 @@ class RebacQuerySet(models.QuerySet[_M]):
         if ambient is not None:
             return (ambient, False)
         if app_settings.REBAC_STRICT_MODE:
-            raise MissingActorError(
-                f"Queryset on {self.model.__name__} materialised without an actor. "
-                f"Use .with_actor(actor), .as_user(user), .as_agent(agent, on_behalf_of=user), "
-                f"or .sudo(reason='...'). Or set REBAC_STRICT_MODE=False (NOT recommended)."
-            )
+            if strict:
+                raise MissingActorError(
+                    f"Queryset on {self.model.__name__} materialised without an actor. "
+                    f"Use .with_actor(actor), .as_user(user), "
+                    f".as_agent(agent, on_behalf_of=user), "
+                    f"or .sudo(reason='...'). Or set REBAC_STRICT_MODE=False "
+                    f"(NOT recommended)."
+                )
+            return (None, False)
         # STRICT_MODE=False: fall through unscoped.
         return (None, True)
+
+    def _resolve_effective_actor(self) -> tuple[SubjectRef | None, bool]:
+        """Deprecated private wrapper for :meth:`effective_actor`.
+
+        Removal target: 0.14. Use ``effective_actor(strict=True)`` for
+        gate/materialisation paths or ``effective_actor()`` for observer
+        paths.
+        """
+        return self.effective_actor(strict=True)
 
     _rebac_scope_applied: bool = False
 

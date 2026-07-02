@@ -569,6 +569,17 @@ translate string kwargs into FK-side lookups (`resource_fk__resource_type`,
 etc.) at the QuerySet layer, so chained filters work without consumer code
 changes.
 
+Both concrete relationship models expose the same mode-agnostic query helper
+surface on their manager/queryset: `for_resource(type, id)`,
+`for_subject(type, id, optional_relation=None)`, `order_by_resource()`,
+`order_by_subject()`, and `wire_values()`. The `wire_values()` projection
+returns denormalized wire-shaped dicts (`resource_type`, `resource_id`,
+`relation`, `subject_type`, `subject_id`, `optional_subject_relation`,
+`caveat_name`) in both storage modes; registry mode projects through
+`resource_fk` / `subject_fk` internally. `rebac.relationships.resolve_subjects`
+is the inverse model lookup for `SubjectRef`s whose object type maps to a
+registered Django model; unknown types and missing rows are omitted.
+
 **Why registry shape exists.**
 
 - Index density: with integer FKs the hot `(resource_fk, relation)` index
@@ -989,6 +1000,14 @@ detection, ``anonymous`` / ``authenticated`` built-ins, tri-state
 combinators, ``REBAC_DEPTH_LIMIT``) reuses the shared walker that
 backs ``LocalBackend._eval_permission``.
 
+Const-backed relations are injected into the virtual overlay from the schema.
+If a new `blog/post` declares `relation admin: angee/role //
+rebac:const=admin`, `check_new()` behaves as if the proposed object carried
+`#admin @ angee/role:admin`, then evaluates `admin->member` through the real
+backend store. Callers must not supply virtual tuples for const-backed
+relations; those are synthetic schema facts, so `check_new()` raises
+`SchemaError` for non-empty caller entries on a const-backed relation name.
+
 **Deliberately outside the ``Backend`` ABC.** ``check_new`` is a free
 function, not a backend RPC, because SpiceDB ships no "check with
 proposed tuples" call. A SpiceDB-mode strategy when 0.5 lands is to
@@ -1007,6 +1026,25 @@ Limitations (0.4):
 * Subject-set candidates (``auth/group:eng#member``) inside a virtual
   relation list are resolved through the backend on the real group row
   — that subject-set walk costs one dispatch level.
+
+---
+
+### Schema introspection
+
+Tooling that needs to answer "which relation or role reaches this permission?"
+should read the effective schema through `backend().schema()` and use
+`rebac.schema.introspection`, not walk AST node classes directly. The stable
+helper surface is `permission_sources(schema, resource_type, permission)`,
+`relation_dependencies(...)`, and `permissions_reaching_relation(...)`.
+`PermissionSources` reports direct relations, arrows as `(via_relation,
+target_permission)` pairs, built-in actor terms, and traversed same-definition
+sub-permissions. The AST node types remain private implementation details so
+the schema language can grow without downstream walkers silently misreading new
+nodes.
+
+Role convention tooling should use `rebac.roles.roles_reaching(...)`, passing a
+`role_resource_type` such as `"storage/role"` or `"angee/role"` rather than
+assuming a single namespace.
 
 ---
 
@@ -1052,6 +1090,7 @@ class RebacManager:
     def sudo(self, *, reason: str) -> RebacQuerySet: ...                # gated by REBAC_ALLOW_SUDO
     def system_context(self, *, reason: str) -> RebacQuerySet: ...      # framework-job bypass, NOT gated
     def actor(self) -> SubjectRef | None: ...                           # introspection
+    def effective_actor(self, *, strict: bool = False) -> tuple[SubjectRef | None, bool]: ...
 
 class RebacQuerySet:
     def with_actor(self, actor: ActorLike) -> Self: ...
@@ -1064,6 +1103,7 @@ class RebacQuerySet:
     def rebac_prefetch_related(self, *lookups) -> Self: ...            # prefetch_related + scoped targets
     def sudo(self, *, reason: str) -> Self: ...                         # gated by REBAC_ALLOW_SUDO
     def system_context(self, *, reason: str) -> Self: ...               # framework-job bypass, NOT gated
+    def effective_actor(self, *, strict: bool = False) -> tuple[SubjectRef | None, bool]: ...
 
     # Standard queryset ops with REBAC-aware overrides:
     def update(self, **kwargs) -> int: ...
@@ -1116,14 +1156,23 @@ What `sudo()` does NOT bypass:
 
 ### Three actor-resolution paths
 
-The manager picks the effective actor in this priority order, every time it materialises a queryset:
+The queryset and instance APIs expose the same observer:
+`effective_actor(strict=False) -> (actor, is_unscoped)`. The second tuple
+member means "this resolves to unscoped/bypass evaluation", not specifically
+"sudo"; it is true for explicit sudo, ambient sudo when no actor is pinned, and
+non-strict no-actor fallthrough. In default observer mode a strict no-actor
+state returns `(None, False)` rather than raising; materialisation and write
+gates call the strict path and raise `MissingActorError`.
 
-1. **Per-queryset actor**, set via `.with_actor(actor)` / `.as_user(user)` / `.as_agent(agent, on_behalf_of=u)`. Stored on the queryset instance — not on a ContextVar — so it survives chaining and DOESN'T leak across queryset boundaries.
-2. **Per-queryset sudo**, set via `.sudo(reason=...)`. Bypasses scoping; logs a structured audit event.
-3. **Implicit from `current_actor()`**, the contextvar populated by middleware (see [§ Middleware](#middleware)) and by Celery prerun hooks.
-4. **Falls through to** `REBAC_STRICT_MODE` handling: `True` → raise `MissingActorError`; `False` → resolve to `system_context()` (full visibility).
+Resolution order:
 
-A per-queryset actor (path 1) **always wins** over `current_actor()` (path 3) — there is no path by which the ambient ContextVar can override an explicit `.with_actor(...)`. This is the inverse of Odoo's `allowed_company_ids` ambient-scope precedence; we want the explicit local scope to be the authoritative one.
+1. **Per-queryset or per-instance sudo**, set via `.sudo(reason=...)`. Bypasses scoping; logs a structured audit event.
+2. **Per-queryset or per-instance actor**, set via `.with_actor(actor)` / `.as_user(user)` / `.as_agent(agent, on_behalf_of=u)`. Stored on the queryset or instance — not on a ContextVar — so it survives chaining and DOESN'T leak across queryset boundaries.
+3. **Ambient sudo**, set by `with sudo(...)` / `with system_context(...)`, only when no explicit actor is pinned.
+4. **Implicit from `current_actor()`**, the contextvar populated by middleware (see [§ Middleware](#middleware)) and by Celery prerun hooks.
+5. **Falls through to** `REBAC_STRICT_MODE` handling: `True` → raise for gates/materialisation; `False` → full visibility.
+
+A pinned actor (path 2) **always wins** over ambient state (paths 3-4) — there is no path by which ambient sudo or the ambient actor ContextVar can override an explicit `.with_actor(...)`. This is the inverse of Odoo's `allowed_company_ids` ambient-scope precedence; we want the explicit local scope to be the authoritative one. If code truly wants bypass inside an elevated block, it must call `.sudo(reason=...)` on that queryset or instance.
 
 **Critical: scope sticks across writes.** A queryset created with `with_actor(actor)` produces instances tagged with that actor; `instance.save()` re-checks against the same actor, regardless of what `current_actor()` says now. This is the Odoo `with_user(...)` invariant translated into Django — the actor follows the recordset.
 
