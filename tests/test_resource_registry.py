@@ -14,9 +14,11 @@ Covers:
 from __future__ import annotations
 
 import pytest
+from django.db.models import F, Q
 from django.test import override_settings
 
 from rebac import SubjectRef, sudo
+from rebac.errors import RelationshipReadError
 from rebac.models import (
     RebacResource,
     Relationship,
@@ -282,6 +284,107 @@ def test_filter_for_missing_resource_returns_empty():
     )
     assert rows.count() == 0
     assert RebacResource.objects.count() == before
+
+
+@pytest.mark.django_db
+@pytest.mark.parametrize("storage_mode", ["denormalized", "registry"])
+def test_active_relationship_model_q_filters_use_wire_field_names(storage_mode):
+    with override_settings(REBAC_LOCAL_BACKEND_STORAGE=storage_mode):
+        model_cls = active_relationship_model()
+        model_cls.objects.create(
+            resource_type="storage/file",
+            resource_id="alpha",
+            relation="viewer",
+            subject_type="auth/user",
+            subject_id="1",
+        )
+        model_cls.objects.create(
+            resource_type="storage/file",
+            resource_id="beta",
+            relation="viewer",
+            subject_type="auth/user",
+            subject_id="2",
+        )
+        model_cls.objects.create(
+            resource_type="storage/folder",
+            resource_id="gamma",
+            relation="viewer",
+            subject_type="auth/user",
+            subject_id="3",
+        )
+
+        rows = list(
+            model_cls.objects.filter(
+                Q(resource_type="storage/file", resource_id="alpha")
+                | Q(subject_id="2")
+            )
+            .order_by("resource_id")
+            .values_list("resource_id", "subject_id")
+        )
+
+    assert rows == [("alpha", "1"), ("beta", "2")]
+
+
+@pytest.mark.django_db
+@pytest.mark.parametrize("storage_mode", ["denormalized", "registry"])
+def test_active_relationship_model_values_and_values_list_use_wire_field_names(storage_mode):
+    with override_settings(REBAC_LOCAL_BACKEND_STORAGE=storage_mode):
+        model_cls = active_relationship_model()
+        model_cls.objects.create(
+            resource_type="storage/file",
+            resource_id="alpha",
+            relation="viewer",
+            subject_type="auth/user",
+            subject_id="2",
+        )
+        model_cls.objects.create(
+            resource_type="storage/file",
+            resource_id="beta",
+            relation="owner",
+            subject_type="auth/user",
+            subject_id="1",
+        )
+
+        subject_ids = list(
+            model_cls.objects.filter(resource_type="storage/file")
+            .order_by("subject_id")
+            .values_list("subject_id", flat=True)
+        )
+        rows = list(
+            model_cls.objects.filter(resource_type="storage/file")
+            .order_by("-resource_id")
+            .values("resource_type", "resource_id", "relation", "subject_id")
+        )
+
+    assert subject_ids == ["1", "2"]
+    assert rows == [
+        {
+            "resource_type": "storage/file",
+            "resource_id": "beta",
+            "relation": "owner",
+            "subject_id": "1",
+        },
+        {
+            "resource_type": "storage/file",
+            "resource_id": "alpha",
+            "relation": "viewer",
+            "subject_id": "2",
+        },
+    ]
+
+
+@pytest.mark.django_db
+def test_registry_untranslatable_expression_raises_rebac_error():
+    RelationshipRegistry.objects.create(
+        resource_type="storage/file",
+        resource_id="alpha",
+        relation="viewer",
+        subject_type="auth/user",
+        subject_id="1",
+    )
+
+    with pytest.raises(RelationshipReadError, match="wire field subject_id"):
+        list(RelationshipRegistry.objects.annotate(subject_wire=F("subject_id")))
 
 
 # ---------- FK CASCADE ----------

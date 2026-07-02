@@ -319,7 +319,7 @@ from rebac import (
 
     # Errors
     PermissionDenied, MissingActorError, CaveatUnsupportedError,
-    PermissionDepthExceeded, NoActorResolvedError,
+    PermissionDepthExceeded, NoActorResolvedError, RelationshipReadError,
 
     # Actor types & resolution
     ActorLike,                          # SubjectRef | User | Group | AnonymousUser | <@rebac_subject-registered>
@@ -565,9 +565,20 @@ The wire shape — `RelationshipTuple` and the string kwargs to the active
 manager — is invariant across modes. `RelationshipRegistry.objects.create(
 resource_type="…", resource_id="…", relation="…", subject_type="…",
 subject_id="…")` upserts the two `RebacResource` rows transparently. Reads
-translate string kwargs into FK-side lookups (`resource_fk__resource_type`,
-etc.) at the QuerySet layer, so chained filters work without consumer code
-changes.
+translate the four denormalized wire field names (`resource_type`,
+`resource_id`, `subject_type`, `subject_id`) into FK-side lookups
+(`resource_fk__resource_type`, etc.) at the QuerySet layer. The read boundary
+covers filter/exclude/get kwargs, nested `Q(...)` objects, positional
+`values()` / `values_list()` projections, and `order_by()` (including `-`
+prefixes), so chained filters and natural Django projection code work without
+consumer storage-mode branches.
+
+Expression surfaces that cannot be translated without changing Django's query
+semantics, such as `annotate(subject=F("subject_id"))`, fail early with
+`RelationshipReadError` instead of leaking a raw `FieldError`. Use
+`for_resource()`, `for_subject()`, `wire_values()`, `order_by_resource()`,
+`order_by_subject()`, or the explicit registry FK path when writing
+storage-mode-specific expressions.
 
 Both concrete relationship models expose the same mode-agnostic query helper
 surface on their manager/queryset: `for_resource(type, id)`,
@@ -1144,6 +1155,7 @@ model's default manager, never `_base_manager`.
 
 - `with_actor(actor)` — re-evaluate all checks **as** `actor`. The originating actor (`current_actor()`) is unchanged — `with_actor()` does NOT mutate the ContextVar; the new scope lives on the queryset clone. Audit events record both the originating actor and the queryset's pinned actor. Mirrors Odoo's `with_user(u)`, generalised to any subject type.
 - `sudo(reason=...)` — request-path bypass of all REBAC checks. `current_actor()` still returns the originating subject; only `is_sudo()` flips. Mirrors Odoo's `env.su` / `env.user` independence. Mandatory `reason`. The block-scoped context manager writes a `PermissionAuditEvent` with kind `sudo.bypass`. **Gated by `REBAC_ALLOW_SUDO`** — strict tenants disable it.
+- `instance.unsudo()` — clears only a per-instance sudo pin and returns the instance. It does not bind an actor; use `with_actor(actor)` when the intent is to leave sudo under a concrete subject.
 - `system_context(reason=...)` — same bypass semantics as `sudo()` (same block-scoped audit kind, same reason requirement, same non-propagation through traversal), but intended for framework-owned jobs running outside a request: migrations, fixture seeders, asset loaders, scheduled maintenance. **Not gated by `REBAC_ALLOW_SUDO`** — a tenant who has disabled request-path sudo still needs to run migrations. Choose `sudo()` for request-path elevation (admin views, override layer); choose `system_context()` for framework jobs.
 
 What `sudo()` does NOT bypass:

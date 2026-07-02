@@ -144,7 +144,7 @@ class RebacBackend:
         # ``has_perm`` still gates the actual page render).
         from ..models import active_relationship_model
 
-        return (
+        return bool(
             active_relationship_model()
             .objects.filter(
                 subject_type=subject.subject_type,

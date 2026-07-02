@@ -104,11 +104,11 @@ class RebacObjectMeta(type):
         return new_cls
 
     @staticmethod
-    def _store_rebac_meta(cls: type, captured: dict[str, Any]) -> None:
+    def _store_rebac_meta(target_cls: type, captured: dict[str, Any]) -> None:
         # Keys are already named "rebac_*", so prefix with "_" only:
         # "rebac_resource_type" → "_rebac_resource_type"
         for key, value in captured.items():
-            setattr(cls, f"_{key}", value)
+            setattr(target_cls, f"_{key}", value)
 
 
 class RebacModelBase(RebacObjectMeta, ModelBase):
@@ -125,9 +125,9 @@ class RebacModelBase(RebacObjectMeta, ModelBase):
     """
 
     @staticmethod
-    def _store_rebac_meta(cls: type[models.Model], captured: dict[str, Any]) -> None:
+    def _store_rebac_meta(target_cls: type[models.Model], captured: dict[str, Any]) -> None:
         for key, value in captured.items():
-            setattr(cls._meta, key, value)
+            setattr(target_cls._meta, key, value)
 
 
 class RebacMixin(models.Model, metaclass=RebacModelBase):
@@ -156,6 +156,8 @@ class RebacMixin(models.Model, metaclass=RebacModelBase):
         accessors must not inherit it. (Today no accessor reads the flag, so
         the invariant holds vacuously; the v1.x FK-accessor scoping work
         will need to keep ignoring ``_rebac_sudo_reason`` on traversal.)
+      - ``instance.unsudo()`` — clear only the instance sudo pin, without
+        binding an actor.
       - ``instance.is_sudo()`` / ``instance.actor()`` — introspection.
       - ``instance.check_access(action)`` — three-state ``CheckResult``.
       - ``instance.has_access(action)`` — boolean shorthand.
@@ -297,6 +299,16 @@ class RebacMixin(models.Model, metaclass=RebacModelBase):
                 "sudo() requires reason= when REBAC_REQUIRE_SUDO_REASON=True"
             )
         self._rebac_sudo_reason = reason
+        return self
+
+    def unsudo(self) -> Self:
+        """Clear this instance's sudo pin without binding an actor.
+
+        Use ``with_actor(actor)`` when the intent is to bind a concrete actor
+        and clear sudo in one step; ``unsudo()`` is only the inverse of
+        ``sudo(reason=...)`` for actorless paths.
+        """
+        self._rebac_sudo_reason = None
         return self
 
     def is_sudo(self) -> bool:

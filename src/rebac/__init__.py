@@ -15,7 +15,7 @@ from __future__ import annotations
 
 from typing import TYPE_CHECKING, Any
 
-__version__ = "0.13.0"
+__version__ = "0.14.0"
 
 default_app_config = "rebac.apps.RebacConfig"
 
@@ -51,6 +51,7 @@ from .errors import (
     PermissionDenied,
     PermissionDepthExceeded,
     RebacError,
+    RelationshipReadError,
     SchemaError,
 )
 from .evaluator import PermissionEvaluator, current_evaluator, evaluator_scope
@@ -69,7 +70,7 @@ from .types import (
 if TYPE_CHECKING:
     from .audit import aemit as aemit_audit_event
     from .audit import emit as emit_audit_event
-    from .backends import Backend, LocalBackend, SpiceDBBackend
+    from .backends import Backend, LocalBackend, SpiceDBBackend, backend
     from .decorators import rebac_resource, require_permission
     from .mcp import default_actor_resolver, get_mcp_actor_resolver, rebac_mcp_tool
     from .mixins import RebacMixin, RebacObjectMeta
@@ -172,6 +173,7 @@ __all__ = [
     "CaveatUnsupportedError",
     "PermissionDepthExceeded",
     "NoActorResolvedError",
+    "RelationshipReadError",
     "SchemaError",
     "RebacError",
     # helpers

@@ -17,12 +17,14 @@ returns the one selected by the setting. The wire shape (``RelationshipTuple``
 
 from __future__ import annotations
 
-from collections.abc import Mapping
-from typing import Any
+from collections.abc import Iterable, Mapping
+from typing import Any, cast
 
 from django.db import models
+from django.db.models import F, Q
 
 from ..conf import app_settings
+from ..errors import RelationshipReadError
 
 WIRE_VALUE_FIELDS = (
     "resource_type",
@@ -33,6 +35,13 @@ WIRE_VALUE_FIELDS = (
     "optional_subject_relation",
     "caveat_name",
 )
+
+_REGISTRY_WIRE_FIELD_MAP = {
+    "resource_type": "resource_fk__resource_type",
+    "resource_id": "resource_fk__resource_id",
+    "subject_type": "subject_fk__resource_type",
+    "subject_id": "subject_fk__resource_id",
+}
 
 
 class RelationshipQuerySet(models.QuerySet["Relationship"]):
@@ -142,6 +151,66 @@ class Relationship(models.Model):
         )
 
 
+def _translate_read_lookup(key: str) -> str:
+    head, _, tail = key.partition("__")
+    suffix = ("__" + tail) if tail else ""
+    translated = _REGISTRY_WIRE_FIELD_MAP.get(head)
+    if translated is None:
+        return key
+    return f"{translated}{suffix}"
+
+
+def _wire_field_head(name: str) -> str | None:
+    head = name.removeprefix("-").partition("__")[0]
+    if head in _REGISTRY_WIRE_FIELD_MAP:
+        return head
+    return None
+
+
+def _raise_for_wire_field_expression(value: Any, *, surface: str) -> None:
+    if isinstance(value, F):
+        field = _wire_field_head(getattr(value, "name", ""))
+        if field is not None:
+            raise RelationshipReadError(
+                f"RelationshipRegistry cannot translate wire field {field} inside "
+                f"{surface} expressions. Use for_resource(), for_subject(), "
+                "wire_values(), order_by_resource(), order_by_subject(), or the "
+                f"registry field {_REGISTRY_WIRE_FIELD_MAP[field]!r} explicitly."
+            )
+        return
+    get_source_expressions = getattr(value, "get_source_expressions", None)
+    if callable(get_source_expressions):
+        for child in cast(Iterable[Any], get_source_expressions()):
+            _raise_for_wire_field_expression(child, surface=surface)
+
+
+def _translate_q_object(q_object: Q) -> Q:
+    translated = q_object.copy()
+    children: list[Any] = []
+    for child in q_object.children:
+        if isinstance(child, Q):
+            children.append(_translate_q_object(child))
+        elif isinstance(child, tuple) and len(child) == 2 and isinstance(child[0], str):
+            key, value = child
+            _raise_for_wire_field_expression(value, surface="filter()/exclude()")
+            children.append((_translate_read_lookup(key), value))
+        else:
+            children.append(child)
+    translated.children = children
+    return translated
+
+
+def _translate_read_args(args: tuple[Any, ...]) -> tuple[Any, ...]:
+    translated: list[Any] = []
+    for arg in args:
+        if isinstance(arg, Q):
+            translated.append(_translate_q_object(arg))
+        else:
+            _raise_for_wire_field_expression(arg, surface="filter()/exclude()")
+            translated.append(arg)
+    return tuple(translated)
+
+
 def _translate_read_kwargs(kwargs: dict[str, Any]) -> dict[str, Any]:
     """Rewrite denormalized-style string lookups into FK-side lookups.
 
@@ -160,19 +229,36 @@ def _translate_read_kwargs(kwargs: dict[str, Any]) -> dict[str, Any]:
     """
     out: dict[str, Any] = {}
     for key, value in kwargs.items():
-        head, _, tail = key.partition("__")
-        suffix = ("__" + tail) if tail else ""
-        if head == "resource_type":
-            out[f"resource_fk__resource_type{suffix}"] = value
-        elif head == "resource_id":
-            out[f"resource_fk__resource_id{suffix}"] = value
-        elif head == "subject_type":
-            out[f"subject_fk__resource_type{suffix}"] = value
-        elif head == "subject_id":
-            out[f"subject_fk__resource_id{suffix}"] = value
-        else:
-            out[key] = value
+        _raise_for_wire_field_expression(value, surface="filter()/exclude()/get()")
+        out[_translate_read_lookup(key)] = value
     return out
+
+
+def _translate_projection_fields(fields: tuple[Any, ...], *, surface: str) -> tuple[Any, ...]:
+    translated: list[Any] = []
+    for field in fields:
+        if isinstance(field, str):
+            translated.append(_translate_read_lookup(field))
+        else:
+            _raise_for_wire_field_expression(field, surface=surface)
+            translated.append(field)
+    return tuple(translated)
+
+
+def _translate_ordering_fields(fields: tuple[Any, ...]) -> tuple[Any, ...]:
+    translated: list[Any] = []
+    for field in fields:
+        if isinstance(field, str):
+            if field == "?":
+                translated.append(field)
+                continue
+            prefix = "-" if field.startswith("-") else ""
+            raw = field[1:] if prefix else field
+            translated.append(f"{prefix}{_translate_read_lookup(raw)}")
+        else:
+            _raise_for_wire_field_expression(field, surface="order_by()")
+            translated.append(field)
+    return tuple(translated)
 
 
 class RelationshipRegistryQuerySet(models.QuerySet["RelationshipRegistry"]):
@@ -186,16 +272,49 @@ class RelationshipRegistryQuerySet(models.QuerySet["RelationshipRegistry"]):
     """
 
     def filter(self, *args: Any, **kwargs: Any) -> RelationshipRegistryQuerySet:
-        return super().filter(*args, **_translate_read_kwargs(kwargs))
+        return super().filter(*_translate_read_args(args), **_translate_read_kwargs(kwargs))
 
     def exclude(self, *args: Any, **kwargs: Any) -> RelationshipRegistryQuerySet:
-        return super().exclude(*args, **_translate_read_kwargs(kwargs))
+        return super().exclude(*_translate_read_args(args), **_translate_read_kwargs(kwargs))
 
     def get(self, *args: Any, **kwargs: Any) -> Any:
-        return super().get(*args, **_translate_read_kwargs(kwargs))
+        return super().get(*_translate_read_args(args), **_translate_read_kwargs(kwargs))
+
+    def values(
+        self, *fields: Any, **expressions: Any
+    ) -> models.QuerySet[RelationshipRegistry, dict[str, Any]]:
+        aliases: dict[str, Any] = {}
+        translated_fields: list[Any] = []
+        for field in fields:
+            if isinstance(field, str) and field in _REGISTRY_WIRE_FIELD_MAP:
+                aliases[field] = F(_REGISTRY_WIRE_FIELD_MAP[field])
+            elif isinstance(field, str):
+                translated_fields.append(_translate_read_lookup(field))
+            else:
+                _raise_for_wire_field_expression(field, surface="values()")
+                translated_fields.append(field)
+        for value in expressions.values():
+            _raise_for_wire_field_expression(value, surface="values()")
+        return super().values(*translated_fields, **{**aliases, **expressions})
+
+    def values_list(
+        self, *fields: Any, **kwargs: Any
+    ) -> models.QuerySet[RelationshipRegistry, Any]:
+        return super().values_list(
+            *_translate_projection_fields(fields, surface="values_list()"),
+            **kwargs,
+        )
+
+    def order_by(self, *field_names: Any) -> RelationshipRegistryQuerySet:
+        return super().order_by(*_translate_ordering_fields(field_names))
+
+    def annotate(self, *args: Any, **kwargs: Any) -> RelationshipRegistryQuerySet:
+        for value in (*args, *kwargs.values()):
+            _raise_for_wire_field_expression(value, surface="annotate()")
+        return super().annotate(*args, **kwargs)
 
     def for_resource(self, resource_type: str, resource_id: str) -> RelationshipRegistryQuerySet:
-        return self.filter(resource_type=resource_type, resource_id=resource_id)
+        return self.filter(**{"resource_type": resource_type, "resource_id": resource_id})
 
     def for_subject(
         self,
@@ -203,7 +322,7 @@ class RelationshipRegistryQuerySet(models.QuerySet["RelationshipRegistry"]):
         subject_id: str,
         optional_relation: str | None = None,
     ) -> RelationshipRegistryQuerySet:
-        qs = self.filter(subject_type=subject_type, subject_id=subject_id)
+        qs = self.filter(**{"subject_type": subject_type, "subject_id": subject_id})
         if optional_relation is not None:
             qs = qs.filter(optional_subject_relation=optional_relation)
         return qs

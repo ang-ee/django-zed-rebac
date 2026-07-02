@@ -434,6 +434,35 @@ def test_instance_with_actor_clears_prior_sudo(alice, post):
     assert instance.is_sudo() is False
 
 
+def test_instance_unsudo_clears_sudo_without_binding_actor(post):
+    from tests.testapp.models import Post
+
+    with sudo(reason="test.load"):
+        instance = Post.objects.get(pk=post.pk)
+    instance.sudo(reason="test.instance_sudo")
+    assert instance.unsudo() is instance
+    assert instance.is_sudo() is False
+    assert instance.actor() is None
+    with pytest.raises(MissingActorError):
+        instance.check_access("read")
+
+
+def test_instance_unsudo_preserves_existing_actor(alice, post):
+    _grant_owner(alice, post)
+    from tests.testapp.models import Post
+
+    with sudo(reason="test.load"):
+        instance = Post.objects.get(pk=post.pk)
+    instance.with_actor(alice)
+    instance.sudo(reason="test.instance_sudo")
+
+    instance.unsudo()
+
+    assert instance.is_sudo() is False
+    assert instance.actor() == SubjectRef.of("auth/user", str(alice.pk))
+    assert instance.has_access("read") is True
+
+
 def test_instance_check_access_owner_has_read(alice, post):
     _grant_owner(alice, post)
     from tests.testapp.models import Post

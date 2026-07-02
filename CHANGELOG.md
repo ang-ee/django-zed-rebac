@@ -5,6 +5,24 @@ pre-1.0; breaking changes within a minor version are explicitly called out.
 
 ## [Unreleased]
 
+## [0.14.0] — 2026-07-02
+
+### Added
+
+- Added `RebacMixin.unsudo()`, which clears an instance-level sudo pin and
+  returns the instance without binding an actor. `with_actor(actor)` remains the
+  bind-and-clear path for code that wants to leave sudo under a concrete actor.
+- Added `RelationshipReadError` for registry-mode relationship reads that use a
+  denormalized wire field in an expression surface the library cannot translate
+  cleanly.
+
+### Fixed
+
+- Registry relationship storage now translates denormalized wire field names
+  through `Q(...)` filters, `values()`, `values_list()`, and `order_by()`.
+  Consumers can use the natural relationship read shape in both
+  `REBAC_LOCAL_BACKEND_STORAGE` modes instead of branching on field layout.
+
 ## [0.13.0] — 2026-07-02
 
 ### Added

@@ -84,14 +84,18 @@ helpers here are exclusively for **actor-grantable** roles (the GCP
 from __future__ import annotations
 
 from collections.abc import Iterator
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Any, cast
 
 from .actors import ActorLike, to_subject_ref
 from .types import ObjectRef, RelationshipTuple, SubjectRef
 
 if TYPE_CHECKING:  # pragma: no cover
-    from .models import Relationship
+    from .models import Relationship, RelationshipRegistry
     from .schema.ast import Schema
+
+    RelationshipRow = Relationship | RelationshipRegistry
+else:  # pragma: no cover
+    RelationshipRow = Any
 
 
 ROLE_RELATION = "member"
@@ -160,7 +164,7 @@ def _parse_role(role: str | ObjectRef) -> ObjectRef:
     return ObjectRef(rtype, rid)
 
 
-def grant(*, actor: ActorLike, role: str | ObjectRef) -> Relationship:
+def grant(*, actor: ActorLike, role: str | ObjectRef) -> RelationshipRow:
     """Grant ``actor`` membership in ``role``.
 
     ``role`` is either an :class:`ObjectRef` or a
@@ -203,7 +207,7 @@ def grant(*, actor: ActorLike, role: str | ObjectRef) -> Relationship:
         )
         # `Relationship` is the active model — a union of the two storage
         # shapes; mypy narrows it via django-stubs, pyright keeps the union.
-        return Relationship.objects.get(  # pyright: ignore[reportReturnType]
+        row = Relationship.objects.get(
             resource_type=role_ref.resource_type,
             resource_id=role_ref.resource_id,
             relation=ROLE_RELATION,
@@ -212,6 +216,7 @@ def grant(*, actor: ActorLike, role: str | ObjectRef) -> Relationship:
             optional_subject_relation=actor_ref.optional_relation,
             caveat_name="",
         )
+        return cast("RelationshipRow", row)
 
 
 def revoke(*, actor: ActorLike, role: str | ObjectRef) -> int:
@@ -306,7 +311,7 @@ def members_of(role: str | ObjectRef) -> Iterator[SubjectRef]:
         yield SubjectRef.of(row.subject_type, row.subject_id, row.optional_subject_relation)
 
 
-def imply(*, parent: str | ObjectRef, child: str | ObjectRef) -> Relationship:
+def imply(*, parent: str | ObjectRef, child: str | ObjectRef) -> RelationshipRow:
     """Make ``child`` role's effective members also count as ``parent`` role's members.
 
     Requires both role definitions to use the ``includes`` /
@@ -359,7 +364,7 @@ def imply(*, parent: str | ObjectRef, child: str | ObjectRef) -> Relationship:
     # Wrap write + read-back: same DoesNotExist race as ``grant``.
     with transaction.atomic():
         write_relationships([tuple_])
-        return Relationship.objects.get(  # pyright: ignore[reportReturnType]
+        row = Relationship.objects.get(
             resource_type=parent_ref.resource_type,
             resource_id=parent_ref.resource_id,
             relation=ROLE_INCLUDES_RELATION,
@@ -368,6 +373,7 @@ def imply(*, parent: str | ObjectRef, child: str | ObjectRef) -> Relationship:
             optional_subject_relation=ROLE_EFFECTIVE_MEMBER,
             caveat_name="",
         )
+        return cast("RelationshipRow", row)
 
 
 def unimply(*, parent: str | ObjectRef, child: str | ObjectRef) -> int:

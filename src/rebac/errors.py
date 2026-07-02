@@ -45,6 +45,10 @@ class SchemaError(RebacError):
     """Schema-level error (parse failure, undefined reference, etc.)."""
 
 
+class RelationshipReadError(RebacError):
+    """Raised for relationship-store reads that cannot be made storage-agnostic."""
+
+
 class SudoNotAllowedError(RebacError):
     """`sudo()` called when REBAC_ALLOW_SUDO is False."""
 
