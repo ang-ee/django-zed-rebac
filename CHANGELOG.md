@@ -5,6 +5,34 @@ pre-1.0; breaking changes within a minor version are explicitly called out.
 
 ## [Unreleased]
 
+## [0.13.0] — 2026-07-02
+
+### Added
+
+- Public effective-actor resolution for instances and querysets via
+  `effective_actor(strict=False)`, returning the resolved actor and whether
+  evaluation is unscoped. The private queryset resolver remains as a
+  compatibility wrapper for one minor release.
+- Mode-agnostic relationship query helpers for filtering, ordering, and
+  projecting relationship rows across denormalized and registry-backed storage.
+- Generic `resolve_subjects()` reverse lookup for `SubjectRef` values registered
+  with Django models.
+- Persisted-schema introspection helpers for permission dependencies and
+  role reachability.
+
+### Changed
+
+- Instance permission checks now route actor resolution through the same public
+  helper used for observation, with explicit pinned actors taking precedence
+  over ambient sudo while per-instance sudo remains a bypass.
+
+### Fixed
+
+- `check_new()` now injects schema-derived const-backed relationship tuples into
+  the virtual overlay used for create checks, and rejects caller-supplied tuples
+  for const-backed relations. This closes the parent-specific create over-grant
+  that could occur when callers fell back to type-level create checks.
+
 ## [0.12.1] — 2026-06-26
 
 ### Fixed
