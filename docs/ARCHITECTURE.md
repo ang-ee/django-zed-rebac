@@ -434,8 +434,16 @@ definition storage/file {
 }
 ```
 
-Granting Alice the `storage/role:object_viewer` role then lights up
-`read` on every `storage/file`, no per-file Relationship rows needed.
+A pinned-id `#member` allowed subject is a *grantable* subject, not an
+implicit grant. Granting Alice `storage/role:object_viewer` lights up `read`
+only on files carrying a per-file `viewer @ storage/role:object_viewer#member`
+tuple; once that linking tuple exists, role-membership changes reach every
+linked file with no further per-file rows, but the role grant alone opens
+nothing (the local backend never synthesises the linking tuple). For a role
+that must cover *every* row of a type with no per-resource tuple, use a
+const-backed relation (see [Const-backed (synthetic) relations](#const-backed-synthetic-relations)) —
+the one tuple-free canon for role reach. The recipes below describe where a
+*written* tuple takes effect; none makes an allowed subject reach implicitly.
 
 **Role hierarchy** is stock SpiceDB — three recipes, none of which require
 engine changes:

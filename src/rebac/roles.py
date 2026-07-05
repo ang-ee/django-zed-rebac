@@ -45,8 +45,16 @@ Granting Alice the ``object_viewer`` role is one row::
     >>> from rebac.roles import grant
     >>> grant(actor=alice, role="storage/role:object_viewer")
 
-…and every ``storage/file`` then evaluates ``read`` against the new
-grant. No per-file Relationship rows needed.
+A pinned-id ``#member`` allowed subject is a *grantable* subject, not an
+implicit grant: the role grant opens ``read`` only on files that carry a
+per-file ``viewer @ storage/role:object_viewer#member`` tuple linking them
+to the role. Once that linking tuple exists, membership changes reach every
+linked file with no further per-file rows — but the role grant alone opens
+nothing, and the local backend never synthesises the linking tuple. For a
+role that must cover **every** row of a type with no per-resource tuple,
+declare a const-backed relation
+(``relation admin: <ns>/role // rebac:const=<id>`` + ``admin->member``);
+that is the tuple-free canon for role reach.
 
 Role hierarchy
 ==============
@@ -470,9 +478,17 @@ def roles_reaching(
 
     The helper reads the effective schema through ``backend().schema()`` when
     ``schema`` is omitted. It only returns roles with a concrete object id from
-    the schema: specific-id allowed subjects like
-    ``storage/role:object_viewer#member`` and const-backed role relations like
-    ``relation admin: storage/role // rebac:const=admin``.
+    the schema, of two shapes:
+
+    - **const-backed role relations** — ``relation admin: storage/role //
+      rebac:const=admin`` reached through ``admin->member``: tuple-free role
+      reach, the canon; and
+    - **specific-id allowed subjects** — ``storage/role:object_viewer#member``:
+      *declared* reachers that resolve only once a per-resource linking tuple is
+      written (the local backend never synthesises one).
+
+    So the result names the roles a permission *can* be reached by, not the
+    roles that reach it tuple-free.
     """
     from .backends import backend
     from .schema.ast import ConstBinding
