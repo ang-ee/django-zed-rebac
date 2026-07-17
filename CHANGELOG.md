@@ -5,6 +5,18 @@ pre-1.0; breaking changes within a minor version are explicitly called out.
 
 ## [Unreleased]
 
+## [0.14.1] — 2026-07-17
+
+### Fixed
+
+- Corrected the role-reach documentation in `docs/ARCHITECTURE.md` and
+  `rebac.roles`, which claimed that granting a role lights up a permission on
+  every row of a type with no per-resource rows. A pinned-id `#member` allowed
+  subject is a *grantable* subject: the grant opens the permission only on
+  resources carrying a linking tuple, and the local backend never synthesises
+  one. Const-backed relations remain the tuple-free path for role reach.
+  Documentation only — no behaviour change.
+
 ## [0.14.0] — 2026-07-02
 
 ### Added
