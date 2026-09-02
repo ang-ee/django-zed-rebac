@@ -465,3 +465,40 @@ def test_roles_helpers_work_without_an_ambient_actor():
     assert {(r.resource_type, r.resource_id) for r in roles_of(actor)} == {
         ("storage/role", "object_editor"),
     }
+
+
+# ---------- imply is honoured by evaluation ----------
+
+@pytest.mark.django_db
+def test_imply_resolves_in_check_access():
+    alice = SubjectRef.of("auth/user", "alice")
+    grant(actor=alice, role="storage/role:object_admin")
+    imply(parent="storage/role:object_editor", child="storage/role:object_admin")
+    assert backend().has_access(subject=alice, action="effective_member", resource=ObjectRef("storage/role", "object_editor"))
+
+@pytest.mark.django_db
+def test_imply_resolves_in_accessible():
+    alice = SubjectRef.of("auth/user", "alice")
+    grant(actor=alice, role="storage/role:object_admin")
+    imply(parent="storage/role:object_editor", child="storage/role:object_admin")
+    ids = set(backend().accessible(subject=alice, action="effective_member", resource_type="storage/role"))
+    assert {"object_admin", "object_editor"} <= ids
+
+@pytest.mark.django_db
+def test_imply_chain_is_transitive():
+    bob = SubjectRef.of("auth/user", "bob")
+    grant(actor=bob, role="storage/role:object_admin")
+    imply(parent="storage/role:object_editor", child="storage/role:object_admin")
+    imply(parent="storage/role:object_viewer", child="storage/role:object_editor")
+    assert backend().has_access(subject=bob, action="effective_member", resource=ObjectRef("storage/role", "object_viewer"))
+
+@pytest.mark.django_db
+def test_relation_subject_set_still_expands():
+    # unchanged behaviour: auth/group#member (a RELATION subject-set) keeps working
+    from rebac import RelationshipTuple, write_relationships
+    cara = SubjectRef.of("auth/user", "cara")
+    write_relationships([
+        RelationshipTuple(resource=ObjectRef("auth/group", "eng"), relation="member", subject=cara),
+        RelationshipTuple(resource=ObjectRef("storage/role", "object_viewer"), relation="member", subject=SubjectRef.of("auth/group", "eng", "member")),
+    ])
+    assert backend().has_access(subject=cara, action="effective_member", resource=ObjectRef("storage/role", "object_viewer"))

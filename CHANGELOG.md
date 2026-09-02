@@ -5,6 +5,14 @@ pre-1.0; breaking changes within a minor version are explicitly called out.
 
 ## [Unreleased]
 
+### Fixed
+
+- `LocalBackend` now resolves subject-sets whose relation is a permission
+  (`storage/role:x#effective_member`). Previously the `includes` /
+  `effective_member` recipe — and therefore `rebac.roles.imply()` — wrote an
+  edge that neither `check_access` nor `accessible()` ever honoured; arrows were
+  unaffected. Relation subject-sets (`auth/group#member`) behave as before.
+
 ## [0.14.1] — 2026-07-17
 
 ### Fixed

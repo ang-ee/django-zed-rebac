@@ -950,6 +950,36 @@ class LocalBackend(Backend):
             permission.expression, definition, resource_id, subject, depth, context, missing
         )
 
+    def _eval_subject_set(
+        self,
+        resource_type: str,
+        resource_id: str,
+        relation_or_permission: str,
+        *,
+        subject: SubjectRef,
+        depth: int,
+        context: dict[str, Any] | None,
+        missing: set[str] | None,
+    ) -> bool | None:
+        """Expand one subject-set row (``type:id#name``) for ``subject``.
+
+        ``name`` may be a relation (``auth/group#member``) or a permission
+        (``storage/role#effective_member``, the ``includes`` recipe); dispatch
+        through :meth:`_eval_permission_on` so both resolve.
+        """
+        definition = self.schema().get_definition(resource_type)
+        if definition is None:
+            return False
+        return self._eval_permission_on(
+            relation_or_permission,
+            definition,
+            resource_id,
+            subject,
+            depth,
+            context,
+            missing,
+        )
+
     def _has_direct_relation(
         self,
         resource_type: str,
@@ -1055,10 +1085,10 @@ class LocalBackend(Backend):
             hop = self._evaluate_row_caveat(row, context, missing)
             if hop is False:
                 continue
-            inner = self._has_direct_relation(
-                resource_type=row.subject_type,
-                resource_id=row.subject_id,
-                relation=row.optional_subject_relation,
+            inner = self._eval_subject_set(
+                row.subject_type,
+                row.subject_id,
+                row.optional_subject_relation,
                 subject=subject,
                 depth=depth + 1,
                 context=context,
@@ -1423,10 +1453,10 @@ class LocalBackend(Backend):
             hop = self._evaluate_row_caveat(row, context, sink)
             if hop is not True:
                 continue
-            inner = self._has_direct_relation(
-                resource_type=row.subject_type,
-                resource_id=row.subject_id,
-                relation=row.optional_subject_relation,
+            inner = self._eval_subject_set(
+                row.subject_type,
+                row.subject_id,
+                row.optional_subject_relation,
                 subject=subject,
                 depth=depth + 1,
                 context=context,
