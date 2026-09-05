@@ -376,7 +376,7 @@ def test_rebac_prefetch_protected_terminal_keeps_scoped_custom_queryset(
         assert row.selected_posts[0].actor() == SubjectRef.of("auth/user", str(alice.pk))
 
 
-@pytest.mark.django_db
+@pytest.mark.django_db(transaction=True)
 def test_rebac_prefetch_tail_preserves_each_protected_prefix_and_field_gate(
     alice, authored_folder, django_assert_num_queries
 ):
@@ -396,6 +396,8 @@ def test_rebac_prefetch_tail_preserves_each_protected_prefix_and_field_gate(
     _grant("blog/folder", root.pk, "viewer", alice)
     _grant("blog/authoredpost", hidden_path_post.pk, "viewer", alice)
 
+    # Permission decisions deliberately bypass caches inside transactions. Use
+    # native autocommit to measure the prefetched graph within one request scope.
     with evaluator_scope():
         row = (
             Folder.objects.as_user(alice)
