@@ -9,14 +9,17 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 
+from ..types import ObjectRef
 from .ast import (
     BUILTIN_ACTOR_TYPES,
+    ConstBinding,
     Definition,
     PermArrow,
     PermBinOp,
     PermExpr,
     PermNil,
     PermRef,
+    Relation,
     Schema,
 )
 from .walker import find_permission, find_relation
@@ -101,6 +104,88 @@ def permissions_reaching_relation(
     )
 
 
+def permission_object_sources(
+    schema: Schema,
+    resource_type: str,
+    permission: str,
+    *,
+    object_type: str,
+) -> frozenset[ObjectRef]:
+    """Return statically named objects in positive permission source branches.
+
+    This is schema introspection, never authorization: tuples, caveats and
+    intersections can make a reported source ineffective. Union/intersection
+    visit both operands; exclusion omits its right subtree. Arrows follow the
+    target permission or relation, and direct subject sets follow their declared
+    relation. Generic/wildcard subjects contribute no invented object IDs.
+    """
+    refs: set[ObjectRef] = set()
+
+    def visit(name: str, term: str, seen: frozenset[tuple[str, str]]) -> None:
+        key = (name, term)
+        if key in seen:
+            return
+        definition = schema.get_definition(name)
+        if definition is None:
+            return
+        seen = seen | {key}
+        relation = find_relation(definition, term)
+        if relation is not None:
+            visit_relation(relation, seen)
+        else:
+            selected = find_permission(definition, term)
+            if selected is not None:
+                visit_expr(definition, selected.expression, seen)
+
+    def visit_relation(
+        relation: Relation,
+        seen: frozenset[tuple[str, str]],
+        *,
+        arrow_target: str | None = None,
+    ) -> None:
+        const_id = relation.backing.target_id if isinstance(relation.backing, ConstBinding) else ""
+        for allowed in relation.allowed_subjects:
+            target = arrow_target if arrow_target is not None else allowed.relation
+            if target:
+                definition = schema.get_definition(allowed.type)
+                if definition is None or (
+                    find_relation(definition, target) is None
+                    and find_permission(definition, target) is None
+                ):
+                    continue
+            object_id = const_id or allowed.id
+            if allowed.type == object_type and object_id and not allowed.wildcard:
+                refs.add(ObjectRef(object_type, object_id))
+            if target:
+                visit(allowed.type, target, seen)
+
+    def visit_expr(
+        definition: Definition,
+        expr: PermExpr,
+        seen: frozenset[tuple[str, str]],
+    ) -> None:
+        if isinstance(expr, PermNil):
+            return
+        if isinstance(expr, PermRef):
+            if expr.name not in BUILTIN_ACTOR_TYPES:
+                visit(definition.resource_type, expr.name, seen)
+            return
+        if isinstance(expr, PermArrow):
+            relation = find_relation(definition, expr.via)
+            if relation is not None:
+                visit_relation(relation, seen, arrow_target=expr.target)
+            return
+        if isinstance(expr, PermBinOp):
+            visit_expr(definition, expr.left, seen)
+            if expr.op != "-":
+                visit_expr(definition, expr.right, seen)
+            return
+        raise TypeError(f"unknown PermExpr: {expr!r}")
+
+    visit(resource_type, permission, frozenset())
+    return frozenset(refs)
+
+
 def _collect_sources(
     expr: PermExpr,
     *,
@@ -162,6 +247,7 @@ def _collect_sources(
 
 __all__ = [
     "PermissionSources",
+    "permission_object_sources",
     "permission_sources",
     "permissions_reaching_relation",
     "relation_dependencies",

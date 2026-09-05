@@ -3,7 +3,51 @@
 All notable changes to `django-zed-rebac` are tracked here. The project is in
 pre-1.0; breaking changes within a minor version are explicitly called out.
 
-## [Unreleased]
+## [Unreleased] — 0.15.0.dev0
+
+### Added
+
+- Public `rebac.schema` source resolution, canonical source-preserving rendering,
+  allowed-subject rendering and `Definition.extend()` editing. Source rendering
+  preserves headers/directives and local field/constant bindings; SpiceDB export
+  explicitly uses `include_backing=False`. The management command shares these
+  APIs instead of maintaining a second renderer/resolver.
+- `permission_object_sources()` reports statically named positive object sources,
+  including const bindings, arrows, subject sets and cycles. It is schema
+  introspection, never authorization.
+- Public `resource_id_attr()` and `subject_id_attr()` exports retain distinct
+  resource and actor setting fallbacks.
+- `QuerySet.scoped()` returns an eagerly scoped clone for SQL projections and
+  subqueries, pinning its resolved actor. `scoped_for_aggregate()` adds explicit
+  fail-closed behavior without an actor, independent of strict mode, and disables
+  instance field redaction. Callers still own projection-axis validation and
+  the cardinality of their own SQL joins.
+
+### Changed
+
+- `roles_reaching()` delegates to object-source introspection. It now follows
+  arrow-to-relation and subject-set targets and omits exclusion-right branches
+  from positive role classification. Named sources may still be ineffective due
+  to tuples, intersections or caveats; this helper must not authorize access.
+- Explicit actors override ambient sudo on both eager projection APIs, matching
+  normal queryset actor precedence. Explicit queryset sudo still bypasses scope.
+
+### Fixed
+
+- Changing actor/action or applying sudo to an eagerly scoped queryset replaces
+  its old authorization restriction while preserving caller-authored predicates.
+  Lazy queryset clones also remove stale scope predicates before re-evaluation.
+- Boolean and SQL set combinations apply the left queryset actor/action policy
+  to every operand, including for native SQL subquery compilation. A combined
+  unscoped branch can no longer bypass the eager scope; rebinding replaces each
+  operand restriction without mutating source querysets. Empty-query boolean
+  fast paths retain the left actor. Boolean combinations with plain unscoped
+  QuerySets now raise TypeError because Django can return the unscoped operand
+  itself; combine REBAC querysets instead. SQL set combinators support plain
+  operands by applying policy to each underlying model query.
+- Numeric CEL literals and source columns following string literals survive
+  schema parsing and rendering.
+
 
 ## [0.14.1] — 2026-07-17
 

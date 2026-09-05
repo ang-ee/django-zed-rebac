@@ -491,35 +491,14 @@ def roles_reaching(
     roles that reach it tuple-free.
     """
     from .backends import backend
-    from .schema.ast import ConstBinding
-    from .schema.introspection import permission_sources
-    from .schema.walker import find_relation
+    from .schema.introspection import permission_object_sources
 
-    active_schema = schema if schema is not None else backend().schema()
-    definition = active_schema.get_definition(resource_type)
-    if definition is None:
-        return frozenset()
-
-    sources = permission_sources(active_schema, resource_type, permission)
-    relation_names = set(sources.direct_relations)
-    relation_names.update(via for via, _target in sources.arrows)
-
-    roles: set[ObjectRef] = set()
-    for relation_name in relation_names:
-        relation = find_relation(definition, relation_name)
-        if relation is None:
-            continue
-        for allowed in relation.allowed_subjects:
-            if allowed.type == role_resource_type and allowed.id:
-                roles.add(ObjectRef(role_resource_type, allowed.id))
-        backing = relation.backing
-        if (
-            isinstance(backing, ConstBinding)
-            and len(relation.allowed_subjects) == 1
-            and relation.allowed_subjects[0].type == role_resource_type
-        ):
-            roles.add(ObjectRef(role_resource_type, backing.target_id))
-    return frozenset(roles)
+    return permission_object_sources(
+        schema if schema is not None else backend().schema(),
+        resource_type,
+        permission,
+        object_type=role_resource_type,
+    )
 
 
 __all__ = [

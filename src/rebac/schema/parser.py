@@ -110,6 +110,16 @@ def _tokenize(text: str) -> list[Token]:
             i += consumed
             col += consumed
             continue
+        # Numbers in opaque CEL bodies must survive the lexical sweep. They
+        # remain invalid as schema identifiers; the caveat parser reads raw CEL.
+        if c.isdigit():
+            j = i + 1
+            while j < n and text[j].isdigit():
+                j += 1
+            tokens.append(Token("number", text[i:j], line, col))
+            col += j - i
+            i = j
+            continue
         # Multi-char punct: "->"
         if c == "-" and i + 1 < n and text[i + 1] == ">":
             tokens.append(Token("punct", "->", line, col))
@@ -133,8 +143,8 @@ def _tokenize(text: str) -> list[Token]:
             if j >= n:
                 raise ParseError(f"Unterminated string at line {line}")
             tokens.append(Token("string", text[i + 1 : j], line, col))
+            col += j + 1 - i
             i = j + 1
-            col += j + 1 - i + len(text[i + 1 : j])
             continue
         raise ParseError(f"Unexpected character {c!r} at line {line}, col {col}")
     tokens.append(Token("eof", "", line, col))

@@ -20,11 +20,14 @@ from .ast import (
 )
 from .introspection import (
     PermissionSources,
+    permission_object_sources,
     permission_sources,
     permissions_reaching_relation,
     relation_dependencies,
 )
 from .parser import ParseError, parse_permission_expression, parse_zed, validate_schema
+from .rendering import render_allowed_subject, render_zed
+from .sources import resolve_schema_path
 
 __all__ = [
     "AllowedSubject",
@@ -44,10 +47,13 @@ __all__ = [
     "Relation",
     "Schema",
     "parse_permission_expression",
-    "parse_permission_expression",
     "parse_zed",
+    "permission_object_sources",
     "permission_sources",
     "permissions_reaching_relation",
     "relation_dependencies",
+    "render_allowed_subject",
+    "render_zed",
+    "resolve_schema_path",
     "validate_schema",
 ]

@@ -147,6 +147,38 @@ class Definition:
     relations: tuple[Relation, ...]
     permissions: tuple[Permission, ...]
 
+    def extend(
+        self,
+        *,
+        relations: Sequence[Relation] = (),
+        permission_arms: Sequence[Permission] = (),
+    ) -> Definition:
+        """Add relations and union permission arms without mutating this definition.
+
+        Existing declaration names cannot be reused; every permission arm must
+        target an existing permission. Operand order follows contribution order.
+        """
+        all_relations = {relation.name: relation for relation in self.relations}
+        permissions = {permission.name: permission for permission in self.permissions}
+        for relation in relations:
+            if relation.name in all_relations or relation.name in permissions:
+                raise ValueError(
+                    f"relation {self.resource_type}#{relation.name!r} already declared"
+                )
+            all_relations[relation.name] = relation
+        for arm in permission_arms:
+            current = permissions.get(arm.name)
+            if current is None:
+                raise ValueError(f"permission {self.resource_type}#{arm.name!r} is not declared")
+            permissions[arm.name] = Permission(
+                arm.name, PermBinOp("+", current.expression, arm.expression)
+            )
+        return Definition(
+            self.resource_type,
+            tuple(sorted(all_relations.values(), key=lambda relation: relation.name)),
+            tuple(sorted(permissions.values(), key=lambda permission: permission.name)),
+        )
+
 
 @dataclass
 class Schema:

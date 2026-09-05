@@ -1048,13 +1048,48 @@ Limitations (0.4):
 
 ---
 
+### Schema source and projection APIs
+
+The schema library owns source resolution, canonical rendering and additive AST
+editing. `rebac.schema.resolve_schema_path(app_config)` resolves a declared
+relative/absolute source (None means `permissions.zed`), returns None for absent
+files and raises for non-files. `render_zed(schema)` preserves semantic headers,
+directives, caveats, bindings and expressions; `include_backing=False` explicitly
+omits local relation backing for SpiceDB export. Ordinary comments and source
+whitespace are not AST data. `Definition.extend(...)` returns a new definition,
+rejecting name collisions and permission arms without an existing target.
+
+`permission_object_sources(schema, resource_type, permission, object_type=...)`
+reports statically named objects in positive expression branches, including
+constant bindings, arrows and subject sets. Union/intersection visit both sides;
+exclusion omits its right subtree. Cycles terminate; missing targets contribute
+nothing; unknown AST nodes fail loudly. Generic and wildcard subjects never
+invent IDs. This is syntactic over-approximation for introspection, not an access
+check. `roles_reaching` delegates to this same operation.
+
+`RebacQuerySet.scoped()` returns an eagerly scoped clone suitable for SQL
+subqueries, pinning the actor resolved at the call. `scoped_for_aggregate()` also
+disables instance field redaction and fails closed without an actor in both
+strict modes. It preserves caller-authored filters, annotations, database alias,
+ordering and SQL cardinality; it adds no joins. Callers must separately validate
+field-gated projection axes and the cardinality of their own joins. Explicit
+actors continue to override ambient sudo. Cloning or changing actor/action must
+never retain a stale scope predicate. Boolean and SQL set combinations retain
+the left queryset actor/action policy across all operands; rebinding replaces
+the restriction on each operand without mutating the original querysets.
+Boolean combinations require REBAC querysets so empty-query fast paths cannot
+return a plain unscoped manager. Native `resource_id_attr` and
+`subject_id_attr` are public top-level exports with distinct resource/user setting
+fallbacks.
+
 ### Schema introspection
 
 Tooling that needs to answer "which relation or role reaches this permission?"
 should read the effective schema through `backend().schema()` and use
 `rebac.schema.introspection`, not walk AST node classes directly. The stable
 helper surface is `permission_sources(schema, resource_type, permission)`,
-`relation_dependencies(...)`, and `permissions_reaching_relation(...)`.
+`relation_dependencies(...)`, `permissions_reaching_relation(...)`, and
+`permission_object_sources(...)`.
 `PermissionSources` reports direct relations, arrows as `(via_relation,
 target_permission)` pairs, built-in actor terms, and traversed same-definition
 sub-permissions. The AST node types remain private implementation details so

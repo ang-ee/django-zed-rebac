@@ -15,10 +15,11 @@ from __future__ import annotations
 
 from typing import TYPE_CHECKING, Any
 
-__version__ = "0.14.1"
+__version__ = "0.15.0.dev0"
 
 default_app_config = "rebac.apps.RebacConfig"
 
+from ._id import resource_id_attr, subject_id_attr
 from .actors import (
     ANONYMOUS_ACTOR,
     ActorLike,
@@ -122,6 +123,8 @@ def __getattr__(name: str) -> Any:
 
 __all__ = [
     "__version__",
+    "resource_id_attr",
+    "subject_id_attr",
     # types
     "ObjectRef",
     "SubjectRef",

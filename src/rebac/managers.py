@@ -17,10 +17,12 @@ from typing import Any, TypeVar
 
 from asgiref.sync import sync_to_async
 from django.db import models
+from django.db.models.sql import Query
+from django.db.models.sql.where import NothingNode, WhereNode
 
 from ._id import resource_id_attr
 from .actors import current_actor as _current_actor
-from .actors import grant_subject_ref, to_subject_ref
+from .actors import current_sudo_reason, grant_subject_ref, to_subject_ref
 from .actors import is_sudo as _is_sudo_ambient
 from .conf import app_settings
 from .errors import MissingActorError, PermissionDenied
@@ -39,6 +41,27 @@ from .resources import model_resource_type
 from .types import FieldDenyMode, SubjectRef
 
 _M = TypeVar("_M", bound=models.Model)
+
+
+class _ScopeWhere(WhereNode):
+    """A removable authorization restriction, separate from caller predicates."""
+
+
+def _without_scope(node: WhereNode) -> WhereNode:
+    clone = node.clone()
+    clone.children = [
+        _without_scope(child) if isinstance(child, WhereNode) else child
+        for child in node.children
+        if not isinstance(child, _ScopeWhere)
+    ]
+    return clone
+
+
+def _without_query_scope(query: Query) -> Query:
+    clone = query.clone()
+    clone.where = _without_scope(clone.where)
+    clone.combined_queries = tuple(_without_query_scope(part) for part in clone.combined_queries)
+    return clone
 
 
 class RebacQuerySet(models.QuerySet[_M]):
@@ -66,6 +89,8 @@ class RebacQuerySet(models.QuerySet[_M]):
         self._rebac_sudo_reason = None
         self._rebac_field_deny = None
         self._rebac_select_related_guards = ()
+        self._rebac_eager_scope = False
+        self._rebac_aggregate_scope = False
 
     # Note: a second `_clone` override below combines the actor + scope-flag
     # propagation; this stub kept for readability.
@@ -78,6 +103,7 @@ class RebacQuerySet(models.QuerySet[_M]):
         clone = self._clone()
         clone._rebac_actor = ref
         clone._rebac_sudo_reason = None
+        clone._refresh_scope()
         return clone
 
     def as_user(self, user: Any) -> RebacQuerySet[_M]:
@@ -94,7 +120,7 @@ class RebacQuerySet(models.QuerySet[_M]):
             raise ValueError("with_action() requires a non-empty action")
         clone = self._clone()
         clone._rebac_action = action
-        clone._rebac_scope_applied = False
+        clone._refresh_scope()
         return clone
 
     def on_field_deny(self, mode: FieldDenyMode) -> RebacQuerySet[_M]:
@@ -117,6 +143,46 @@ class RebacQuerySet(models.QuerySet[_M]):
         """
         return self.on_field_deny("allow")
 
+    def scoped(self) -> RebacQuerySet[_M]:
+        """Return an eagerly scoped clone, including for SQL subquery consumers.
+
+        The resolved actor is pinned to the clone. Caller predicates, database,
+        annotations and ordering remain intact; this adds no relationship joins.
+        """
+        clone = self._clone()
+        actor, bypass = clone.effective_actor(strict=True)
+        if actor is not None:
+            clone._rebac_actor = actor
+        elif bypass and _is_sudo_ambient() and not clone.is_sudo():
+            clone._rebac_sudo_reason = current_sudo_reason()
+        clone._rebac_eager_scope = True
+        clone._apply_scope_in_place()
+        return clone
+
+    def scoped_for_aggregate(self) -> RebacQuerySet[_M]:
+        """Eager row scope for projection, fail-closed without an actor.
+
+        Instance field redaction cannot operate on aggregate/dict rows. The
+        caller must validate allowed projection axes separately. SQL cardinality
+        of caller-authored joins is preserved; permission scoping adds no joins.
+        """
+        clone = self.on_field_deny("allow")
+        clone._rebac_aggregate_scope = True
+        clone._reset_scope()
+        return clone.scoped()
+
+    def _reset_scope(self) -> None:
+        # QuerySet.query's public setter switches values_list() to ValuesIterable
+        # when values_select is populated. This is an internal SQL replacement;
+        # preserve the caller's scalar/tuple/model iterable contract.
+        self._query = _without_query_scope(self.query)
+        self._rebac_scope_applied = False
+
+    def _refresh_scope(self) -> None:
+        self._reset_scope()
+        if self._rebac_eager_scope:
+            self._apply_scope_in_place()
+
     def sudo(self, *, reason: str) -> RebacQuerySet[_M]:
         """Bypass REBAC for this queryset. Mandatory `reason`."""
         return self._bypass(reason=reason, allow_when_sudo_disabled=False)
@@ -136,6 +202,7 @@ class RebacQuerySet(models.QuerySet[_M]):
         clone = self._clone()
         clone._rebac_actor = None
         clone._rebac_sudo_reason = reason
+        clone._refresh_scope()
         return clone
 
     def actor(self) -> SubjectRef | None:
@@ -204,6 +271,8 @@ class RebacQuerySet(models.QuerySet[_M]):
         ambient = _current_actor()
         if ambient is not None:
             return (ambient, False)
+        if self._rebac_aggregate_scope:
+            return (None, False)
         if app_settings.REBAC_STRICT_MODE:
             if strict:
                 raise MissingActorError(
@@ -253,19 +322,28 @@ class RebacQuerySet(models.QuerySet[_M]):
         self._rebac_scope_applied = True
         if sudo:
             return
-        # ``_resolve_effective_actor`` only returns ``sudo=False`` paired
-        # with a non-None actor (the None cases all carry ``sudo=True``).
-        assert actor is not None
-        rebac_type = model_resource_type(self.model)
+        self._scope_query(self.query, actor)
+
+    def _scope_query(self, query: Query, actor: SubjectRef | None) -> None:
+        if query.combined_queries:
+            for part in query.combined_queries:
+                self._scope_query(part, actor)
+            return
+        model = query.model
+        if model is None:
+            return
+        rebac_type = model_resource_type(model)
         if not rebac_type:
+            return
+        if actor is None:
+            # Aggregate projection is fail-closed regardless of strict mode.
+            query.where = WhereNode([query.where, _ScopeWhere(children=[NothingNode()])])
             return
         from django.db.models import Q
 
         from .backends import backend
 
-        action = str(
-            self._rebac_action or getattr(self.model._meta, "rebac_default_action", "read")
-        )
+        action = str(self._rebac_action or getattr(model._meta, "rebac_default_action", "read"))
         active_backend = backend()
         if backend_grants_all(
             active_backend,
@@ -282,14 +360,14 @@ class RebacQuerySet(models.QuerySet[_M]):
                 resource_type=rebac_type,
             )
         )
-        attr = resource_id_attr(self.model)
+        attr = resource_id_attr(model)
         if attr == "pk":
             # Coerce to ints when the PK is integer-typed; leave as
             # strings for UUID/Char PKs. Only relevant for the pk path
             # — non-pk attrs (sqid, public_id, slug) are always
             # string-valued and pass through unchanged.
             try:
-                pk_field = self.model._meta.pk
+                pk_field = model._meta.pk
                 if pk_field is not None and pk_field.get_internal_type() in (
                     "AutoField",
                     "BigAutoField",
@@ -306,7 +384,11 @@ class RebacQuerySet(models.QuerySet[_M]):
             except TypeError:
                 pass
         # ``Q.add_q`` works even on sliced queries.
-        self.query.add_q(Q(**{f"{attr}__in": ids}))
+        restriction = query.build_where(Q(**{f"{attr}__in": ids}))
+        # Keep the authorization clause identifiable, including in Django's
+        # cloned/combined WHERE trees, so changing actor cannot intersect stale
+        # permission IDs with the new actor's scope.
+        query.where = WhereNode([query.where, _ScopeWhere(children=[restriction])])
 
     def _clone(self, **kwargs: Any) -> RebacQuerySet[_M]:
         # ``QuerySet._clone`` is a real method django-stubs intentionally
@@ -317,9 +399,47 @@ class RebacQuerySet(models.QuerySet[_M]):
         clone._rebac_sudo_reason = self._rebac_sudo_reason
         clone._rebac_field_deny = self._rebac_field_deny
         clone._rebac_select_related_guards = self._rebac_select_related_guards
-        # Important: each clone re-applies scope when needed.
-        clone._rebac_scope_applied = False
+        clone._rebac_eager_scope = self._rebac_eager_scope
+        clone._rebac_aggregate_scope = self._rebac_aggregate_scope
+        clone._rebac_scope_applied = self._rebac_scope_applied
+        if not self._rebac_eager_scope:
+            clone._reset_scope()
         return clone
+
+    def _merge_sanity_check(self, other: models.QuerySet[_M]) -> None:
+        if not isinstance(other, RebacQuerySet):
+            raise TypeError("Boolean REBAC combinations require REBAC querysets")
+        super()._merge_sanity_check(other)  # type: ignore[misc]
+
+    def _combined_scope(self, combined: RebacQuerySet[_M]) -> RebacQuerySet[_M]:
+        # Django's empty-query fast paths may return the right operand itself.
+        # Preserve its result shape, but apply the left operand's actor policy
+        # without mutating either original queryset.
+        clone = combined._clone()
+        clone._rebac_actor = self._rebac_actor
+        clone._rebac_action = self._rebac_action
+        clone._rebac_sudo_reason = self._rebac_sudo_reason
+        clone._rebac_eager_scope = self._rebac_eager_scope
+        clone._rebac_aggregate_scope = self._rebac_aggregate_scope
+        clone._rebac_field_deny = self._rebac_field_deny
+        clone._refresh_scope()
+        return clone
+
+    def __and__(self, other: models.QuerySet[_M]) -> RebacQuerySet[_M]:
+        return self._combined_scope(super().__and__(other))
+
+    def __or__(self, other: models.QuerySet[_M]) -> RebacQuerySet[_M]:
+        return self._combined_scope(super().__or__(other))
+
+    def __xor__(self, other: models.QuerySet[_M]) -> RebacQuerySet[_M]:
+        return self._combined_scope(super().__xor__(other))
+
+    def _combinator_query(
+        self, combinator: str, *other_qs: Any, all: bool = False
+    ) -> RebacQuerySet[_M]:
+        combined: RebacQuerySet[_M] = super()._combinator_query(combinator, *other_qs, all=all)  # type: ignore[misc]
+        combined._refresh_scope()
+        return combined
 
     def _effective_field_mode(self) -> FieldDenyMode:
         return effective_field_deny_mode(self._rebac_field_deny)
