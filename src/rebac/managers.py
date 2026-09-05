@@ -12,11 +12,12 @@ chaining via `_clone()` and propagates into instances via `from_db()`.
 
 from __future__ import annotations
 
-from collections.abc import AsyncIterator, Iterable
-from typing import Any, TypeVar
+from collections.abc import AsyncIterator, Collection, Iterable
+from typing import Any, TypeVar, cast
 
 from asgiref.sync import sync_to_async
 from django.db import models
+from django.db.models.expressions import Col
 from django.db.models.sql import Query
 from django.db.models.sql.where import NothingNode, WhereNode
 
@@ -38,7 +39,7 @@ from .field_visibility import (
     warn_raise_mode_degrades,
 )
 from .resources import model_resource_type
-from .types import FieldDenyMode, SubjectRef
+from .types import FieldDenyMode, ObjectRef, SubjectRef
 
 _M = TypeVar("_M", bound=models.Model)
 
@@ -62,6 +63,31 @@ def _without_query_scope(query: Query) -> Query:
     clone.where = _without_scope(clone.where)
     clone.combined_queries = tuple(_without_query_scope(part) for part in clone.combined_queries)
     return clone
+
+
+def _expression_columns(expression: Any) -> Iterable[Col]:
+    """Inspect resolved ORM expressions, including aliases and SQL functions."""
+    if isinstance(expression, Col):
+        yield expression
+        return
+    sources = getattr(expression, "get_source_expressions", None)
+    if callable(sources):
+        for source in cast(Iterable[Any], sources()):
+            yield from _expression_columns(source)
+
+
+def _column_relation_path(query: Query, column: Col) -> str:
+    names: list[str] = []
+    alias = column.alias
+    while alias != query.base_table:
+        join = query.alias_map.get(alias)
+        field = getattr(join, "join_field", None)
+        parent = getattr(join, "parent_alias", None)
+        if field is None or parent is None:
+            return ""
+        names.append(field.name)
+        alias = parent
+    return "__".join(reversed(names))
 
 
 class RebacQuerySet(models.QuerySet[_M]):
@@ -444,19 +470,37 @@ class RebacQuerySet(models.QuerySet[_M]):
     def _effective_field_mode(self) -> FieldDenyMode:
         return effective_field_deny_mode(self._rebac_field_deny)
 
-    def _guard_projected_field_reads(self, actor: SubjectRef | None, sudo: bool) -> None:
+    def _guard_projected_field_reads(
+        self,
+        actor: SubjectRef | None,
+        sudo: bool,
+        *,
+        expressions: dict[str, Any] | None = None,
+        query: Query | None = None,
+    ) -> None:
+        query = self.query if query is None else query
+        selected = dict(query.annotation_select)
+        if expressions:
+            selected.update(expressions)
+        # Root bypass never carries across the protected relation boundary.
+        self._guard_projected_related_reads(selected, query=query)
         if actor is None or sudo:
             return
-        self._guard_projected_related_reads()
         if runtime_field_deny_mode(self._effective_field_mode()) == "allow":
             return
         projected = projection_field_names(self.model, getattr(self, "_fields", None))
-        if projected is None:
-            return
         gated = gated_read_fields(self.model)
         if not gated:
             return
-        requested = gated if not projected else gated & projected
+        requested: set[str] = set()
+        if projected is not None:
+            requested.update(gated if not projected else gated & projected)
+        for expression in selected.values():
+            requested.update(
+                column.target.name
+                for column in _expression_columns(expression)
+                if column.alias == query.base_table and column.target.name in gated
+            )
         if requested:
             names = ", ".join(f"read__{name}" for name in sorted(requested))
             raise PermissionDenied(
@@ -465,21 +509,31 @@ class RebacQuerySet(models.QuerySet[_M]):
                 "or a projection that omits gated fields."
             )
 
-    def _guard_projected_related_reads(self) -> None:
+    def _guard_projected_related_reads(self, expressions: dict[str, Any], *, query: Query) -> None:
         if not self._rebac_select_related_guards:
             return
+        from .relation_loading import protected_lookup_prefixes
+
+        paths = {
+            path
+            for guard in self._rebac_select_related_guards
+            for path, _ in protected_lookup_prefixes(self.model, guard)
+        }
+        guarded = tuple(f"{path}__" for path in sorted(paths))
         raw_fields = getattr(self, "_fields", None)
-        if raw_fields is None:
-            return
-        guarded = tuple(f"{path}__" for path in self._rebac_select_related_guards)
-        related = sorted(
+        related = {
             field
-            for field in raw_fields
+            for field in raw_fields or ()
             if isinstance(field, str) and any(field.startswith(prefix) for prefix in guarded)
-        )
+        }
+        for name, expression in expressions.items():
+            for column in _expression_columns(expression):
+                path = _column_relation_path(query, column)
+                if path in paths or any(path.startswith(prefix) for prefix in guarded):
+                    related.add(name)
         if not related:
             return
-        names = ", ".join(related[:5])
+        names = ", ".join(sorted(related)[:5])
         raise PermissionDenied(
             f"Cannot project related field(s) {names}: rebac_select_related() "
             "enforcement requires model-instance materialisation."
@@ -564,10 +618,13 @@ class RebacQuerySet(models.QuerySet[_M]):
         if self._result_cache is None:
             await sync_to_async(self._apply_scope_in_place)()
         actor, sudo = self._resolve_effective_actor()
-        self._guard_projected_field_reads(actor, sudo)
+        # DB-backed schemas refresh at operation boundaries. Field discovery
+        # and projection guards therefore need the same worker thread as the
+        # scope/visibility checks, even when the schema was loaded just above.
+        await sync_to_async(self._guard_projected_field_reads)(actor, sudo)
         field_mode = self._effective_field_mode()
         redact = runtime_field_deny_mode(field_mode) != "allow" and bool(
-            gated_read_fields(self.model)
+            await sync_to_async(gated_read_fields)(self.model)
         )
         guard_related = bool(self._rebac_select_related_guards)
         async for inst in super().aiterator(*args, **kwargs):
@@ -578,8 +635,8 @@ class RebacQuerySet(models.QuerySet[_M]):
                     await sync_to_async(apply_field_visibility)(
                         [inst], model=self.model, actor=actor, mode=field_mode
                     )
-                if guard_related:
-                    await sync_to_async(self._guard_selected_related_reads)([inst])
+            if guard_related:
+                await sync_to_async(self._guard_selected_related_reads)([inst])
             yield inst
 
     # ----- Counts / existence respect scope too -----
@@ -607,9 +664,91 @@ class RebacQuerySet(models.QuerySet[_M]):
         Applying scope here fixes both surfaces.
         """
         self._apply_scope_in_place()
+        actor, sudo = self._resolve_effective_actor()
+        if self._rebac_select_related_guards or (
+            actor is not None
+            and not sudo
+            and runtime_field_deny_mode(self._effective_field_mode()) != "allow"
+        ):
+            query = self.query.clone()
+            expressions = {
+                f"aggregate_{index}": expression.resolve_expression(query)
+                for index, expression in enumerate((*args, *kwargs.values()))
+                if callable(getattr(expression, "resolve_expression", None))
+            }
+            self._guard_projected_field_reads(actor, sudo, expressions=expressions, query=query)
         return super().aggregate(*args, **kwargs)
 
     # ----- Write ops: enforce all-or-nothing -----
+
+    def create(self, **kwargs: Any) -> _M:
+        """Carry queryset scope into the instance before its save signals run."""
+        actor, unscoped = self._resolve_effective_actor()
+        self._guard_create(actor, unscoped=unscoped)
+        reverse_one_to_one_fields = frozenset(kwargs).intersection(
+            self.model._meta._reverse_one_to_one_field_names  # type: ignore[attr-defined]
+        )
+        if reverse_one_to_one_fields:
+            raise ValueError(
+                "The following fields do not exist in this model: "
+                + ", ".join(sorted(reverse_one_to_one_fields))
+            )
+        obj = self.model(**kwargs)
+        obj._rebac_actor = actor  # type: ignore[attr-defined]
+        self._for_write = True
+        # The signal layer needs the explicit queryset bypass for this insert.
+        # Clear it afterwards, just as reading through a sudo queryset does not
+        # leave its returned instances permanently elevated.
+        if self._rebac_sudo_reason is not None:
+            obj._rebac_sudo_reason = self._rebac_sudo_reason  # type: ignore[attr-defined]
+        try:
+            obj.save(force_insert=True, using=self.db)
+        finally:
+            obj._rebac_sudo_reason = None  # type: ignore[attr-defined]
+        return obj
+
+    def _guard_create(self, actor: SubjectRef | None, *, unscoped: bool) -> None:
+        rebac_type = model_resource_type(self.model)
+        if unscoped or not rebac_type:
+            return
+        if actor is None:
+            raise MissingActorError(f"{self.model.__name__}.create() called with no actor.")
+        from .backends import backend
+
+        resource = ObjectRef(rebac_type, "")
+        if not backend().check_access(subject=actor, action="create", resource=resource).allowed:
+            raise PermissionDenied(f"Denied: {actor} cannot create {resource}")
+
+    def bulk_create(
+        self,
+        objs: Iterable[_M],
+        batch_size: int | None = None,
+        ignore_conflicts: bool = False,
+        update_conflicts: bool = False,
+        update_fields: Collection[str] | None = None,
+        unique_fields: Collection[str] | None = None,
+    ) -> list[_M]:
+        """Authorize inserts before Django's signal-free bulk path runs."""
+        actor, unscoped = self._resolve_effective_actor()
+        self._guard_create(actor, unscoped=unscoped)
+        if update_conflicts and not unscoped and model_resource_type(self.model):
+            raise PermissionDenied(
+                "Actor-scoped bulk_create(update_conflicts=True) cannot check write "
+                "permissions on conflicting rows. Use checked saves or explicit sudo."
+            )
+        rows = super().bulk_create(
+            objs,
+            batch_size=batch_size,
+            ignore_conflicts=ignore_conflicts,
+            update_conflicts=update_conflicts,
+            update_fields=update_fields,
+            unique_fields=unique_fields,
+        )
+        if actor is not None and not unscoped:
+            for row in rows:
+                row._rebac_actor = actor  # type: ignore[attr-defined]
+                row._rebac_sudo_reason = None  # type: ignore[attr-defined]
+        return rows
 
     def update(self, **kwargs: Any) -> int:
         actor, sudo = self._resolve_effective_actor()

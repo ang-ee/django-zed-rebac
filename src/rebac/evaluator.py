@@ -9,15 +9,13 @@ Lifecycle:
   - HTTP: opened by :class:`rebac.middleware.ActorMiddleware` for the
     request lifetime via :func:`evaluator_scope`.
   - GraphQL HTTP: opened per-operation by ``RebacExtension``.
-  - GraphQL WS subscription: opened per emission by ``RebacExtension``,
-    NOT per-connection — a long-lived WS that emits over hours must not
-    serve cached pre-revocation answers (CLAUDE.md § 3 strict-by-default
-    extends to freshness).
-  - Celery: opened per task by ``propagate_actor`` (0.3+ roadmap).
+  - GraphQL WS subscription: cleared per emission by ``RebacExtension`` —
+    a long-lived WS must not serve cached pre-revocation answers.
+  - Celery: explicitly opened by the application inside each task.
 
 Cache key:
-  - check:      ``(subject, action, resource, _ctx_key(context))``
-  - accessible: ``(subject, action, resource_type, _ctx_key(context))``
+  - check:      ``(backend_identity, schema_generation, subject, action, resource, context)``
+  - accessible: ``(backend_identity, schema_generation, subject, action, resource_type, context)``
 
 Both share a single LRU bounded by ``REBAC_EVALUATOR_CACHE_SIZE``
 (default 10_000). Conditional results are never cached — the missing
@@ -43,21 +41,50 @@ if TYPE_CHECKING:  # pragma: no cover
     from .backends.base import Backend
 
 
-def _ctx_key(context: dict[str, Any] | None) -> Hashable:
+def _ctx_key(context: dict[str, Any] | None) -> Hashable | None:
     """Hashable summary of a context dict for cache keying.
 
     ``None`` and empty dict collapse to the same key so the two common
-    no-context call shapes share a slot. Non-hashable values fall back
-    to a sentinel that bypasses cache (returns a unique object per call).
+    no-context call shapes share a slot. Scalar types remain distinct:
+    Python's ``True == 1 == 1.0`` does not imply equivalent caveat inputs.
+    Complex values bypass caching rather than relying on their equality
+    or mutable contents; ``None`` is the bypass sentinel.
     """
     if not context:
         return ()
-    try:
-        return tuple(sorted((str(k), v) for k, v in context.items()))
-    except TypeError:
-        # Non-hashable context value (e.g. dict-of-dict). Bypass cache —
-        # the unique sentinel ensures every call misses.
-        return object()
+    if any(
+        type(k) is not str or type(v) not in (str, bytes, bool, int, float, type(None))
+        for k, v in context.items()
+    ):
+        return None
+    return tuple(sorted((k, type(v), v) for k, v in context.items()))
+
+
+class _BackendKey:
+    """Strong identity key, even for unhashable or value-equal custom backends."""
+
+    __slots__ = ("backend",)
+
+    def __init__(self, backend: Backend) -> None:
+        self.backend = backend
+
+    def __hash__(self) -> int:
+        return id(self.backend)
+
+    def __eq__(self, other: object) -> bool:
+        return isinstance(other, _BackendKey) and self.backend is other.backend
+
+
+def _backend_cache_key(backend: Backend) -> tuple[_BackendKey, Hashable | None] | None:
+    # LocalBackend refreshes expired or invalidated schema snapshots before
+    # a cached permission answer can be reused. Other backends need no hook.
+    generation = getattr(backend, "_cache_generation", None)
+    if callable(generation):
+        value = generation()
+        if value is None:
+            return None
+        return _BackendKey(backend), value
+    return _BackendKey(backend), None
 
 
 class PermissionEvaluator:
@@ -68,12 +95,13 @@ class PermissionEvaluator:
     supported for tests.
     """
 
-    __slots__ = ("_accessible_cache", "_check_cache", "_max_size")
+    __slots__ = ("_accessible_cache", "_check_cache", "_max_size", "_schema_scope_token")
 
     def __init__(self, *, max_size: int = 10_000) -> None:
         self._check_cache: OrderedDict[tuple[Any, ...], CheckResult] = OrderedDict()
         self._accessible_cache: OrderedDict[tuple[Any, ...], tuple[str, ...]] = OrderedDict()
         self._max_size = max_size
+        self._schema_scope_token = object()
 
     # ----- public API -----
 
@@ -98,7 +126,8 @@ class PermissionEvaluator:
         a stale-tolerant read and a freshness-pinned read against the
         same key are different operations.
         """
-        if consistency is not None or at_zookie is not None:
+        context_key = _ctx_key(context)
+        if consistency is not None or at_zookie is not None or context_key is None:
             return backend.check_access(
                 subject=subject,
                 action=action,
@@ -107,7 +136,12 @@ class PermissionEvaluator:
                 consistency=consistency,
                 at_zookie=at_zookie,
             )
-        key = (str(subject), action, str(resource), _ctx_key(context))
+        backend_key = _backend_cache_key(backend)
+        if backend_key is None:
+            return backend.check_access(
+                subject=subject, action=action, resource=resource, context=context
+            )
+        key = (*backend_key, str(subject), action, str(resource), context_key)
         if key in self._check_cache:
             self._check_cache.move_to_end(key)
             return self._check_cache[key]
@@ -148,7 +182,12 @@ class PermissionEvaluator:
                     at_zookie=at_zookie,
                 )
             )
-        key = (str(subject), action, resource_type, _ctx_key(context))
+        backend_key = _backend_cache_key(backend)
+        if backend_key is None:
+            return tuple(
+                backend.accessible(subject=subject, action=action, resource_type=resource_type)
+            )
+        key = (*backend_key, str(subject), action, resource_type, _ctx_key(context))
         if key in self._accessible_cache:
             self._accessible_cache.move_to_end(key)
             return self._accessible_cache[key]
@@ -168,6 +207,7 @@ class PermissionEvaluator:
         """
         self._check_cache.clear()
         self._accessible_cache.clear()
+        self._schema_scope_token = object()
 
     # ----- introspection (for tests + debugging) -----
 

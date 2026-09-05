@@ -372,6 +372,15 @@ def test_instance_check_access_pinned_actor_beats_ambient_sudo(bob, post):
         assert instance.check_access("read").allowed is False
 
 
+@pytest.mark.parametrize("operation", ["save", "delete"])
+def test_instance_write_pinned_actor_beats_ambient_sudo(bob, post, operation):
+    post.with_actor(bob)
+
+    with sudo(reason="test.ambient"):
+        with pytest.raises(PermissionDenied):
+            getattr(post, operation)()
+
+
 @pytest.mark.parametrize("ambient_sudo", [False, True])
 def test_instance_check_access_uses_effective_actor_rule(alice, bob, post, ambient_sudo):
     _grant_owner(alice, post)

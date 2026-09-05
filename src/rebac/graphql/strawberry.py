@@ -3,9 +3,9 @@
 Two pieces:
 
   - :class:`RebacExtension` — Strawberry Schema Extension that brackets
-    every GraphQL operation (query, mutation, AND each subscription
-    emission) with a fresh :func:`rebac.evaluator.evaluator_scope` +
-    :func:`rebac.consistency.zookie_scope`. This is the GraphQL-side
+    every GraphQL operation with :func:`rebac.evaluator.evaluator_scope` +
+    :func:`rebac.consistency.zookie_scope`, clearing the permission cache
+    after each subscription emission. This is the GraphQL-side
     equivalent of what :class:`rebac.middleware.ActorMiddleware` does
     for plain HTTP.
 
@@ -44,9 +44,10 @@ from __future__ import annotations
 from typing import TYPE_CHECKING, Any
 
 from strawberry.extensions import SchemaExtension
+from strawberry.types.graphql import OperationType
 
 from ..actors import _current_actor
-from ..consistency import current_zookie, zookie_scope
+from ..consistency import _current_zookie, current_zookie, record_zookie, zookie_scope
 from ..errors import NoActorResolvedError
 from ..evaluator import current_evaluator, evaluator_scope
 
@@ -74,14 +75,15 @@ class RebacExtension(SchemaExtension):
 
     1. Opens a fresh evaluator scope (LRU cache per
        ``REBAC_EVALUATOR_CACHE_SIZE``).
-    2. Opens a fresh Zookie scope (no initial token — the SchemaExtension
-       runs inside whatever transport scope the surrounding
-       middleware/consumer already established).
+    2. Opens a Zookie scope inheriting the surrounding transport's token,
+       then propagates recorded writes back to that scope on exit.
     3. Mirrors ``current_evaluator()`` onto ``info.context.rebac_evaluator``
        and ``current_zookie()`` onto ``info.context.rebac_zookie`` for
        resolvers that prefer explicit DI over the ambient ContextVar.
        Best-effort — if ``info.context`` doesn't accept attribute
        assignment (e.g. a Mapping), the mirror is silently skipped.
+    4. For subscriptions, clears cached decisions in ``get_results`` after
+       each emission. Strawberry does not reopen ``on_operation`` per yield.
 
     Composition with :class:`rebac.middleware.ActorMiddleware`: for
     plain HTTP GraphQL the middleware already opens evaluator + zookie
@@ -98,10 +100,37 @@ class RebacExtension(SchemaExtension):
         teardown runs in the ``finally`` of the surrounding ``with``
         blocks when the schema's execution returns.
         """
-        with evaluator_scope():
-            with zookie_scope():
-                self._mirror_onto_context()
-                yield
+        latest_zookie = current_zookie()
+        try:
+            with evaluator_scope() as evaluator:
+                self._rebac_evaluator = evaluator
+                with zookie_scope(initial=latest_zookie):
+                    self._mirror_onto_context()
+                    try:
+                        yield
+                    finally:
+                        latest_zookie = current_zookie()
+        finally:
+            # Preserve write-then-read freshness in the surrounding middleware
+            # scope so its response header/session can carry GraphQL writes.
+            record_zookie(latest_zookie)
+
+    def get_results(self) -> dict[str, Any]:
+        """Discard permission decisions after every subscription emission.
+
+        Strawberry holds ``on_operation`` open for the entire subscription,
+        but calls this public hook before returning each result. Invalidate
+        the shared evaluator object so producer tasks inheriting it cannot
+        reuse the previous emission's grants after a revocation.
+        """
+        if (
+            self.execution_context.graphql_document is not None
+            and self.execution_context.operation_type is OperationType.SUBSCRIPTION
+        ):
+            self._rebac_evaluator.invalidate()
+            _current_zookie.set(None)
+            self._mirror_onto_context()
+        return {}
 
     def _mirror_onto_context(self) -> None:
         """Best-effort: copy ContextVar values onto ``info.context``.
@@ -136,31 +165,22 @@ class RebacChannelsConsumerMixin:
     pins it on the connection-level :func:`rebac.actors._current_actor`
     ContextVar so every subscription emission sees the same identity.
 
-    Compose with whichever consumer base your stack uses
-    (``JsonWebsocketConsumer``, ``AsyncJsonWebsocketConsumer``,
-    Strawberry's own ``GraphQLWSConsumer`` /
-    ``GraphQLTransportWSConsumer``)::
+    Compose with an async consumer base, such as
+    ``AsyncJsonWebsocketConsumer`` or Strawberry's ``GraphQLWSConsumer``::
 
-        from channels.generic.websocket import AsyncJsonWebsocketConsumer
         from strawberry.channels import GraphQLWSConsumer
         from rebac.graphql.strawberry import RebacChannelsConsumerMixin
 
         class MyGraphQLConsumer(RebacChannelsConsumerMixin, GraphQLWSConsumer):
             pass
 
-    The mixin overrides ``connect`` only; subscribe / send / disconnect
-    flow through the underlying consumer unchanged. ``super().connect()``
-    is called so other mixins / the base consumer still run.
+    The mixin brackets ``connect`` and ``disconnect`` while delegating
+    both hooks to the underlying consumer. Synchronous Channels consumers
+    are unsupported because they do not await these async hooks.
 
-    For sync consumers, the mixin's ``connect`` is async because
-    Channels' WS protocol is async-only — sync ``JsonWebsocketConsumer``
-    spawns a thread-local event loop internally and either ``connect``
-    shape works.
-
-    The actor is also re-resolved on each subscription emission by the
-    :class:`RebacExtension` schema extension; this mixin's contribution
-    is the connection-lifetime ``_current_actor`` so the evaluator and
-    Zookie scopes opened per emission have an actor to work with.
+    Actor identity stays connection-scoped. :class:`RebacExtension` clears
+    permission decisions between emissions so the next emission checks
+    that actor's current grants.
     """
 
     scope: dict[str, Any]

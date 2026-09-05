@@ -387,8 +387,9 @@ class _Parser:
         elif self.at("punct", "#"):
             self.consume()
             relation = self.expect_name().value
-        if self.at("keyword", "with"):
-            # `... with caveat_name`
+        if self.at("keyword", "with") and self.tokens[self.pos + 1].value != "expiration":
+            # `... with caveat_name`. Leave the expiration modifier for
+            # _parse_relation; it is not a caveat literally named expiration.
             self.consume()
             with_caveat = self.expect("ident").value
         return AllowedSubject(type_name, relation, wildcard, with_caveat, specific_id)

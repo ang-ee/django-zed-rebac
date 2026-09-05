@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "django-zed-rebac"
-version = "0.15.0.dev0"
+version = "0.15.0"
 description = "Drop-in REBAC engine for Django, SpiceDB-compatible, with a pure-Django LocalBackend."
 readme = "README.md"
 license = "Apache-2.0"
@@ -22,7 +22,7 @@ classifiers = [
     "Topic :: Security",
 ]
 dependencies = [
-    "django>=6.0",
+    "django>=6.0,<6.1",
 ]
 
 [project.optional-dependencies]
@@ -49,8 +49,8 @@ dev = [
     "ruff>=0.5",
     "mypy>=1.10",
     "pyright>=1.1.350",
-    "django-stubs[compatible-mypy]>=5.1",
-    "django-stubs-ext>=5.1",
+    "django-stubs[compatible-mypy]>=6.0,<6.1",
+    "django-stubs-ext>=6.0,<6.1",
     "strawberry-graphql-django>=0.86.0",
 ]
 
@@ -130,7 +130,7 @@ check_untyped_defs = true
 
 [tool.ruff.lint.per-file-ignores]
 # Lazy `__getattr__` shim plus grouped (not alphabetised) `__all__` is intentional;
-# see CLAUDE.md § "Don't import ZedRBACMixin from `__init__.py` eagerly".
+# see AGENTS.md § "Don't import RebacMixin from `rebac/__init__.py` eagerly".
 "src/rebac/__init__.py" = ["E402", "RUF022"]
 # Django Meta options (indexes, constraints, ordering, operations) MUST be class-level
 # lists/sets/tuples — that's the framework's convention.

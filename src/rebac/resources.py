@@ -15,7 +15,7 @@ def _resolve_dotted(obj: Any, attr_path: str) -> Any:
     """Resolve a dotted attribute path against ``obj``.
 
     ``"a.b.c"`` → ``obj.a.b.c``. Used by ``to_object_ref`` to support
-    ``rebac_id_attr = "_angee_view_meta.source.operation"`` on view classes
+    ``rebac_id_attr = "_view_meta.source.operation"`` on view classes
     registered via ``RebacObjectMeta``.
     """
     value = obj

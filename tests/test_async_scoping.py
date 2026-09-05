@@ -23,7 +23,7 @@ from __future__ import annotations
 import asyncio
 
 import pytest
-from django.db.models import Count
+from django.db.models import Count, F
 
 from rebac import (
     MissingActorError,
@@ -86,6 +86,39 @@ def _grant_owner(user, post) -> None:
 
 def _ref(user) -> SubjectRef:
     return SubjectRef.of("auth/user", str(user.pk))
+
+
+@pytest.mark.django_db(transaction=True)
+@pytest.mark.parametrize("shape", ["instances", "projection", "annotation"])
+def test_aiterator_enforces_field_gates_from_persisted_schema(shape) -> None:
+    from rebac.models import SchemaDefinition, SchemaPermission
+    from tests.testapp.models import Post
+
+    SchemaDefinition.objects.create(resource_type="auth/user")
+    definition = SchemaDefinition.objects.create(resource_type="blog/post")
+    SchemaPermission.objects.create(definition=definition, name="read", expression="authenticated")
+    SchemaPermission.objects.create(
+        definition=definition, name="read__title", expression="anonymous"
+    )
+    # The normal fixture uses set_schema(), which never needs a database read
+    # and would hide an unsafe schema refresh on the async event-loop thread.
+    reset_backend()
+    post = _post("private title")
+    qs = Post.objects.with_actor(SubjectRef.of("auth/user", "alice")).on_field_deny("redact")
+    assert qs.get(pk=post.pk).title is None
+    if shape == "projection":
+        qs = qs.values_list("title", flat=True)
+    elif shape == "annotation":
+        qs = qs.annotate(copied_title=F("title"))
+
+    async def collect():
+        return [row async for row in qs.aiterator()]
+
+    if shape == "instances":
+        assert asyncio.run(collect())[0].title is None
+    else:
+        with pytest.raises(PermissionDenied):
+            asyncio.run(collect())
 
 
 # ---------- methods that route through sync overrides (regression guards) ----------

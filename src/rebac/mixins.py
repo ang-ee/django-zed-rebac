@@ -74,11 +74,11 @@ class RebacObjectMeta(type):
 
         class FileListView(ListView):
             class Meta:
-                rebac_resource_type = "angee/view"
-                rebac_id_attr = "_angee_view_meta.source.operation"
+                rebac_resource_type = "app/view"
+                rebac_id_attr = "_view_meta.source.operation"
 
         # After class creation:
-        # FileListView._rebac_resource_type == "angee/view"
+        # FileListView._rebac_resource_type == "app/view"
     """
 
     # Declared so static analysis knows classes built with this metaclass

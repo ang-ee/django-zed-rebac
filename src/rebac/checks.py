@@ -268,15 +268,14 @@ def check_universal_admin_in_roles(
         definition storage/role {
             relation member: auth/user
                            | auth/group#member
-                           | angee/role:admin#member       // universal admin
+                           | platform/role:admin#member       // universal admin
         }
 
-    Granting an actor membership in ``angee/role:admin`` then makes them
-    a member of *every* role object in every opted-in addon, automatically.
+    Membership flows through explicit linking tuples from each role object
+    to ``platform/role:admin#member``; allowed-subject entries alone grant nothing.
 
     The role checked is configurable via ``REBAC_UNIVERSAL_ADMIN_ROLE``
-    (default ``"angee/role:admin"``). Set to ``None`` to disable the
-    check entirely.
+    (default ``None``). Set an application-owned role reference to enable it.
 
     Only fires when the schema has been loaded from the DB (post-``rebac
     sync``); a fresh install with no rows produces no warnings.

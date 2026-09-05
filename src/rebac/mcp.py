@@ -25,7 +25,10 @@ The per-call ctx actor is the explicit identity the transport established for
 rule that explicit local scope beats ambient context (CLAUDE.md § 5) and
 avoiding privilege confusion from a leaked ambient actor.
 
-No actor resolved → fail closed (:class:`rebac.PermissionDenied`).
+No actor resolved → fail closed (:class:`rebac.PermissionDenied`). An explicit
+but invalid ``actor_subject`` also denies instead of inheriting an ambient actor.
+The default metadata field must be written by trusted authentication code; a
+client-provided ``_meta.actor_subject`` is not proof of identity.
 
 SDK neutrality
 --------------
@@ -145,6 +148,10 @@ def _resolve_actor(ctx: Any) -> SubjectRef | None:
         actor = get_mcp_actor_resolver()(ctx)
         if actor is not None:
             return actor
+        if "actor_subject" in _context_meta(ctx):
+            # Explicit identity that failed resolution must not silently pick
+            # up a more privileged actor from the surrounding transport.
+            return None
     return current_actor()
 
 
@@ -392,13 +399,24 @@ def rebac_mcp_tool(
 
             @functools.wraps(func)
             async def asyncgen_wrapper(*args: Any, **kwargs: Any) -> Any:
-                # Authorize off the event loop (the check may touch the ORM), then
-                # iterate the streaming body inside the actor context so each
-                # yielded chunk is produced under the resolved actor.
+                # Scope each advancement, never the outer yield: the consumer
+                # must not inherit the tool actor while processing a chunk, and
+                # a later advancement may run in a different asyncio task.
                 actor = await sync_to_async(authorize, thread_sensitive=True)(args, kwargs)
-                with actor_context(actor):
-                    async for item in cast(Callable[..., Any], func)(*args, **kwargs):
+                iterator = cast(Callable[..., Any], func)(*args, **kwargs)
+                try:
+                    while True:
+                        with actor_context(actor):
+                            try:
+                                item = await anext(iterator)
+                            except StopAsyncIteration:
+                                return
                         yield item
+                finally:
+                    # Early close/cancellation must also run the tool's cleanup
+                    # under its actor and restore the closing task's context.
+                    with actor_context(actor):
+                        await iterator.aclose()
 
             return cast(_F, asyncgen_wrapper)
 

@@ -10,6 +10,8 @@ extra not yet wired into the dev install).
 
 from __future__ import annotations
 
+from collections.abc import AsyncGenerator
+
 import pytest
 
 pytest.importorskip(
@@ -18,10 +20,14 @@ pytest.importorskip(
 )
 
 from rebac import (
+    CheckResult,
+    ObjectRef,
+    SubjectRef,
     Zookie,
     current_evaluator,
     current_zookie,
     record_zookie,
+    zookie_scope,
 )
 from rebac.graphql.strawberry import (
     RebacChannelsConsumerMixin,
@@ -158,6 +164,77 @@ def test_extension_with_none_context_works():
         assert current_evaluator() is not None
     finally:
         _close(gen)
+
+
+def test_extension_preserves_transport_zookie_and_propagates_mutation_write():
+    initial = Zookie("local", "10")
+    written = Zookie("local", "11")
+    with zookie_scope(initial=initial):
+        extension = _make_extension()
+        gen = _run_on_operation(extension)
+        try:
+            assert current_zookie() == initial
+            record_zookie(written)
+        finally:
+            _close(gen)
+        assert current_zookie() == written
+    assert current_zookie() is None
+
+
+def test_real_subscription_does_not_reuse_permission_after_revocation():
+    import asyncio
+
+    import strawberry
+
+    allowed = True
+    calls = 0
+
+    class MutableBackend:
+        def check_access(self, **kwargs):
+            nonlocal calls
+            calls += 1
+            return CheckResult.has() if allowed else CheckResult.no()
+
+    permission_backend = MutableBackend()
+
+    @strawberry.type
+    class Query:
+        @strawberry.field
+        def alive(self) -> bool:
+            return True
+
+    @strawberry.type
+    class Subscription:
+        @strawberry.subscription
+        async def access(self) -> AsyncGenerator[bool]:
+            for _ in range(2):
+                evaluator = current_evaluator()
+                assert evaluator is not None
+                yield evaluator.check(
+                    permission_backend,
+                    subject=SubjectRef.of("auth/user", "1"),
+                    action="read",
+                    resource=ObjectRef("blog/post", "1"),
+                ).allowed
+
+    schema = strawberry.Schema(query=Query, subscription=Subscription, extensions=[RebacExtension])
+
+    async def consume() -> None:
+        nonlocal allowed
+        stream = await schema.subscribe("subscription { access }")
+        try:
+            first = await anext(stream)
+            assert first.errors is None
+            assert first.data == {"access": True}
+            allowed = False
+            second = await anext(stream)
+            assert second.errors is None
+            assert second.data == {"access": False}
+        finally:
+            await stream.aclose()
+
+    asyncio.run(consume())
+    assert calls == 2
 
 
 # ---------- RebacChannelsConsumerMixin ----------

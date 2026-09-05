@@ -27,7 +27,7 @@ class AllowedSubject:
     - ``auth/user`` → ``type="auth/user"`` (any user)
     - ``auth/user:*`` → ``type="auth/user", wildcard=True`` (the wildcard subject)
     - ``auth/group#member`` → ``type="auth/group", relation="member"`` (any group's member)
-    - ``angee/role:admin#member`` → ``type="angee/role", id="admin", relation="member"``
+    - ``platform/role:admin#member`` → ``type="platform/role", id="admin", relation="member"``
       (members of one specific resource id — the canonical pattern for
       universal admin roles)
     """
@@ -36,7 +36,7 @@ class AllowedSubject:
     relation: str = ""  # subject set, e.g. group#member
     wildcard: bool = False  # `auth/user:*`
     with_caveat: str = ""  # caveat the subject is bound by
-    # Specific resource id, e.g. `angee/role:admin#member`. Constrained at
+    # Specific resource id, e.g. `platform/role:admin#member`. Constrained at
     # parse time to identifier shape — `[A-Za-z_][A-Za-z0-9_]*` — even though
     # the runtime `Relationship.resource_id` column accepts the broader
     # SpiceDB object-id grammar. The schema-side restriction matches the

@@ -15,7 +15,7 @@ from __future__ import annotations
 
 from typing import TYPE_CHECKING, Any
 
-__version__ = "0.15.0.dev0"
+__version__ = "0.15.0"
 
 default_app_config = "rebac.apps.RebacConfig"
 
@@ -73,6 +73,7 @@ if TYPE_CHECKING:
     from .audit import emit as emit_audit_event
     from .backends import Backend, LocalBackend, SpiceDBBackend, backend
     from .decorators import rebac_resource, require_permission
+    from .managers import RebacManager, RebacQuerySet
     from .mcp import default_actor_resolver, get_mcp_actor_resolver, rebac_mcp_tool
     from .mixins import RebacMixin, RebacObjectMeta
     from .permissions_mixin import RebacPermissionsMixin
@@ -87,6 +88,8 @@ if TYPE_CHECKING:
 
 _LAZY = {
     "RebacMixin": ("rebac.mixins", "RebacMixin"),
+    "RebacManager": ("rebac.managers", "RebacManager"),
+    "RebacQuerySet": ("rebac.managers", "RebacQuerySet"),
     "RebacObjectMeta": ("rebac.mixins", "RebacObjectMeta"),
     "RebacPermissionsMixin": (
         "rebac.permissions_mixin",
@@ -136,6 +139,8 @@ __all__ = [
     "RelationshipTuple",
     # mixin / managers / metaclasses
     "RebacMixin",
+    "RebacManager",
+    "RebacQuerySet",
     "RebacObjectMeta",
     "RebacPermissionsMixin",
     # decorators

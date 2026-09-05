@@ -24,10 +24,18 @@ from .types import ObjectRef, SubjectRef
 _DEFAULT_ACTION_MAP = {
     "list": "read",
     "retrieve": "read",
+    "metadata": "read",
     "create": "create",
     "update": "write",
     "partial_update": "write",
     "destroy": "delete",
+    "get": "read",
+    "head": "read",
+    "options": "read",
+    "post": "create",
+    "put": "write",
+    "patch": "write",
+    "delete": "delete",
 }
 
 
@@ -41,24 +49,34 @@ class RebacPermission(BasePermission):  # type: ignore[misc]  # untyped third-pa
 
     action_map = _DEFAULT_ACTION_MAP
 
+    def _action_for_view(self, request: Any, view: Any) -> str | None:
+        action_name = getattr(view, "action", None) or request.method.lower()
+        action_map = {**self.action_map, **getattr(view, "rebac_action_map", {})}
+        action: str | None = action_map.get(action_name)
+        return action
+
     # pyright infers BasePermission's `return True` body as `Literal[True]`;
     # widening to `bool` is the correct override, not an incompatibility.
     def has_permission(self, request: Any, view: Any) -> bool:  # pyright: ignore[reportIncompatibleMethodOverride]
-        action_name = getattr(view, "action", None) or request.method.lower()
-        rebac_action = self.action_map.get(action_name)
+        rebac_action = self._action_for_view(request, view)
         if rebac_action is None:
-            return True
+            return False
 
         subject = _subject_from_request(request)
         if subject is None:
             return False
+
+        # Read admission is separate from row authorization: empty lists are
+        # valid, and DRF checks concrete detail objects after queryset scoping.
+        if rebac_action == "read":
+            return True
 
         model_cls = getattr(getattr(view, "queryset", None), "model", None)
         rebac_type = model_resource_type(model_cls) if model_cls is not None else None
         if not rebac_type:
             return True
 
-        # Model-level check (empty resource_id) for create/list.
+        # Non-read collection actions require the model-level permission.
         return backend().has_access(
             subject=subject,
             action=rebac_action,
@@ -66,10 +84,9 @@ class RebacPermission(BasePermission):  # type: ignore[misc]  # untyped third-pa
         )
 
     def has_object_permission(self, request: Any, view: Any, obj: Any) -> bool:  # pyright: ignore[reportIncompatibleMethodOverride]
-        action_name = getattr(view, "action", None) or request.method.lower()
-        rebac_action = self.action_map.get(action_name)
+        rebac_action = self._action_for_view(request, view)
         if rebac_action is None:
-            return True
+            return False
 
         subject = _subject_from_request(request)
         if subject is None:

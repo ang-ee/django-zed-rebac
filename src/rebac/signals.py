@@ -11,9 +11,8 @@ from django.dispatch import receiver
 
 from ._id import resource_id_attr
 from .actors import current_actor as _current_actor
-from .actors import is_sudo as _is_sudo
 from .conf import app_settings
-from .errors import MissingActorError, PermissionDenied
+from .errors import PermissionDenied
 from .field_visibility import backend_schema
 from .mixins import RebacMixin
 from .resources import model_resource_type
@@ -67,23 +66,12 @@ def _rebac_pre_save(
     rebac_type = model_resource_type(sender)
     if not rebac_type:
         return
-    # Per-instance sudo (set by `instance.sudo(reason=...)`) bypasses the
-    # check just like the ambient ContextVar. Per CLAUDE.md § 5a, the flag
-    # is non-transitive — it lives on this instance only and does not
-    # propagate to FK / M2M accessors.
-    if _is_sudo() or getattr(instance, "_rebac_sudo_reason", None) is not None:
+    # Share the observer/check API's precedence: a pinned actor outranks
+    # ambient sudo, while an explicit instance bypass still wins locally.
+    actor, unscoped = instance.effective_actor(strict=True)
+    if unscoped:
         return
-
-    # Resolve actor: per-instance (set by from_db / queryset / .with_actor) → ambient.
-    actor = getattr(instance, "_rebac_actor", None) or _current_actor()
-    if actor is None:
-        if app_settings.REBAC_STRICT_MODE:
-            raise MissingActorError(
-                f"{sender.__name__}.save() called with no actor. "
-                f"Use a queryset scoped via .with_actor()/.as_user()/.as_agent(), "
-                f"or wrap in `with sudo(reason='...'):`."
-            )
-        return
+    assert actor is not None
 
     is_create = instance._state.adding
     action = "create" if is_create else "write"
@@ -131,14 +119,10 @@ def _rebac_pre_delete(sender: type[Model], instance: Any, using: Any = None, **_
     rebac_type = model_resource_type(sender)
     if not rebac_type:
         return
-    if _is_sudo() or getattr(instance, "_rebac_sudo_reason", None) is not None:
+    actor, unscoped = instance.effective_actor(strict=True)
+    if unscoped:
         return
-
-    actor = getattr(instance, "_rebac_actor", None) or _current_actor()
-    if actor is None:
-        if app_settings.REBAC_STRICT_MODE:
-            raise MissingActorError(f"{sender.__name__}.delete() called with no actor.")
-        return
+    assert actor is not None
 
     from .backends import backend
 
@@ -312,12 +296,11 @@ def _normalise_update_field_names(
 # Schema cache invalidation + SchemaOverride audit
 # ---------------------------------------------------------------------------
 #
-# Schema* CRUD must invalidate DB-loaded LocalBackend schemas so the next
-# permission check rebuilds the in-memory schema without paying schema-table
-# fingerprint queries on the hot path. Tier-2 override CRUD also resets the
-# cached global backend and emits a PermissionAuditEvent via the single
-# audit-emission helper. Single-process only — multi-process LISTEN/NOTIFY is
-# a v1.x roadmap item.
+# Schema* CRUD invalidates DB-loaded LocalBackend schemas within the current
+# process and scope. New request/backend-operation scopes also reload schema
+# rows, so another worker's commits do not require a process-local signal.
+# Tier-2 override CRUD also resets the cached global backend and emits a
+# PermissionAuditEvent via the single audit-emission helper.
 
 
 def _mark_schema_caches_stale() -> None:

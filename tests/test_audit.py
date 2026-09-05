@@ -33,13 +33,14 @@ from rebac.schema import parse_zed
 from rebac.types import RelationshipFilter
 
 SCHEMA_TEXT = """
+caveat during_business_hours(hour int) { hour >= 0 }
 definition auth/user {}
 definition auth/group {
     relation member: auth/user
 }
 definition blog/post {
     relation owner: auth/user
-    relation viewer: auth/user | auth/group#member
+    relation viewer: auth/user | auth/user with during_business_hours | auth/group#member
     permission read = owner + viewer
     permission write = owner
     permission delete = owner

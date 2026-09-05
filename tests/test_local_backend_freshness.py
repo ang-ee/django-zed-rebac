@@ -1,9 +1,8 @@
-"""LocalBackend's ``at_least_as_fresh`` filter.
+"""LocalBackend's ``at_least_as_fresh`` read contract.
 
 The LocalBackend uses ``Relationship.written_at_xid`` as its freshness
 witness — ``Zookie.token`` carries the xid; reads with
-``Consistency.AT_LEAST_AS_FRESH(zookie)`` filter
-``written_at_xid <= cutoff``.
+``Consistency.AT_LEAST_AS_FRESH(zookie)`` retain newer writes.
 """
 
 from __future__ import annotations
@@ -66,8 +65,8 @@ def test_zookie_with_non_numeric_token_raises(backend):
         )
 
 
-def test_at_least_as_fresh_excludes_later_writes(backend):
-    """A read pinned to an early xid does not see writes that came after."""
+def test_at_least_as_fresh_includes_later_writes(backend):
+    """A token is a freshness floor, not a historical snapshot."""
     # First write — capture the resulting Zookie.
     z1 = backend.write_relationships(
         [
@@ -91,8 +90,7 @@ def test_at_least_as_fresh_excludes_later_writes(backend):
     # Read without Zookie sees both posts.
     all_ids = set(backend.accessible(subject=_user("u1"), action="read", resource_type="blog/post"))
     assert all_ids == {"p1", "p2"}
-    # Read pinned to z1 sees ONLY p1 — p2's xid is strictly greater
-    # than z1's xid and is excluded by ``written_at_xid <= cutoff``.
+    # A read carrying z1 sees newer writes as well.
     pinned = set(
         backend.accessible(
             subject=_user("u1"),
@@ -101,11 +99,11 @@ def test_at_least_as_fresh_excludes_later_writes(backend):
             at_zookie=z1,
         )
     )
-    assert pinned == {"p1"}
+    assert pinned == {"p1", "p2"}
 
 
 def test_at_least_as_fresh_applies_to_check_access(backend):
-    """``check_access`` honours the cutoff via the same internal walk."""
+    """``check_access`` retains newer writes through the same internal walk."""
     z1 = backend.write_relationships(
         [
             RelationshipTuple(
@@ -124,14 +122,14 @@ def test_at_least_as_fresh_applies_to_check_access(backend):
             ),
         ]
     )
-    # p2 created AFTER z1 — pinned read says NO.
+    # p2 was created after z1 and remains visible to a read carrying z1.
     assert backend.has_access(
         subject=_user("u1"), action="read", resource=_post("p1"), at_zookie=z1
     )
-    assert not backend.has_access(
+    assert backend.has_access(
         subject=_user("u1"), action="read", resource=_post("p2"), at_zookie=z1
     )
-    # Without the cutoff both pass.
+    # Without a token both pass too.
     assert backend.has_access(subject=_user("u1"), action="read", resource=_post("p2"))
 
 
@@ -169,8 +167,7 @@ def test_delete_returns_zookie(backend):
 def test_write_zookie_is_batch_high_watermark(backend, django_assert_num_queries=None):
     """The returned Zookie's token equals the max ``written_at_xid`` of the
     batch — NOT a phantom xid past it. Reads pinned to this Zookie must
-    see every row produced by the write and exclude any strictly-later
-    rows.
+    see every row produced by the write and retain newer rows.
 
     Regression for the freshness contract: an earlier implementation
     consumed an extra xid in ``_zookie()`` after the loop, making the

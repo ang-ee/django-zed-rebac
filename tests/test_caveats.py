@@ -46,7 +46,7 @@ caveat link_not_expired(expires_at timestamp, now timestamp) {
 definition auth/user {}
 
 definition blog/post {
-    relation viewer: auth/user with link_not_expired
+    relation viewer: auth/user | auth/user with link_not_expired
     permission read = viewer
 }
 """
@@ -195,8 +195,7 @@ def test_accessible_excludes_only_false_rows(backend):
 
 def test_uncaveated_row_unaffected(backend):
     """Rows without a caveat name continue to evaluate as before."""
-    # Schema permits viewer with caveat, but a row written without caveat
-    # name is unconditional — that's how the wire format works.
+    # The schema explicitly permits both plain and caveated viewer tuples.
     backend.write_relationships(
         [
             RelationshipTuple(
@@ -292,8 +291,8 @@ def test_evaluate_handles_datetime_objects():
     assert verdict is True
 
 
-def test_dynamic_overrides_static_in_evaluate():
-    """`evaluate(static, dynamic)` — dynamic wins on key conflict."""
+def test_static_overrides_dynamic_in_evaluate():
+    """Request context cannot replace stored policy constraints."""
     from rebac.caveats import evaluate, reset_cache
     from rebac.schema.ast import Caveat, CaveatParam
 
@@ -306,20 +305,20 @@ def test_dynamic_overrides_static_in_evaluate():
         ),
         expression="now < expires_at",
     )
-    # static says future, dynamic overrides with past.
+    # Static says future, and conflicting request values cannot replace it.
     verdict, _ = evaluate(
         caveat,
         {"expires_at": FUTURE, "now": PAST},
-        {"expires_at": EXPIRED, "now": PAST},  # PAST < EXPIRED -> True
+        {"expires_at": EXPIRED, "now": PAST},
     )
     assert verdict is True
 
     verdict, _ = evaluate(
         caveat,
         {"expires_at": FUTURE, "now": PAST},
-        {"expires_at": PAST},  # now stays PAST from static; but PAST < PAST is False.
+        {"expires_at": PAST},
     )
-    assert verdict is False
+    assert verdict is True
 
 
 def test_compile_cache_keyed_by_name_and_hash():
@@ -338,6 +337,25 @@ def test_compile_cache_keyed_by_name_and_hash():
     p2 = compile_caveat(c2)
     assert p2 is not p1a
     assert len(_compile_cache) == 2
+
+
+@pytest.mark.parametrize("value", ["false", "true", "0", 1, [False], {"enabled": False}])
+def test_boolean_caveat_rejects_truthy_non_boolean_values(value):
+    from rebac.caveats import evaluate
+    from rebac.schema.ast import Caveat, CaveatParam
+
+    caveat = Caveat("flag", (CaveatParam("enabled", "bool"),), "enabled")
+    with pytest.raises(CaveatUnsupportedError, match="boolean"):
+        evaluate(caveat, {}, {"enabled": value})
+
+
+def test_caveat_result_must_be_a_boolean():
+    from rebac.caveats import evaluate
+    from rebac.schema.ast import Caveat, CaveatParam
+
+    caveat = Caveat("value", (CaveatParam("count", "int"),), "count")
+    with pytest.raises(CaveatUnsupportedError, match="boolean"):
+        evaluate(caveat, {}, {"count": 1})
 
 
 def test_caveat_unsupported_when_celpy_missing(monkeypatch):
@@ -370,16 +388,16 @@ def test_caveat_unsupported_when_celpy_missing(monkeypatch):
 
 def test_unknown_caveat_in_row_is_treated_as_deny(backend):
     """Row references a caveat the schema doesn't know — fail closed."""
-    backend.write_relationships(
-        [
-            RelationshipTuple(
-                resource=_post("p_unknown"),
-                relation="viewer",
-                subject=_user("u_unknown"),
-                caveat_name="does_not_exist",
-                caveat_context={},
-            ),
-        ]
+    from rebac.models import Relationship
+
+    # Simulate a stale row after schema removal; public writes reject it.
+    Relationship.objects.create(
+        resource_type="blog/post",
+        resource_id="p_unknown",
+        relation="viewer",
+        subject_type="auth/user",
+        subject_id="u_unknown",
+        caveat_name="does_not_exist",
     )
     result = backend.check_access(
         subject=_user("u_unknown"),

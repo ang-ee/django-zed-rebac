@@ -2,11 +2,22 @@
 
 from __future__ import annotations
 
+import asyncio
 from typing import Any
 
 import pytest
+from django.db.models import F
 
-from rebac import ObjectRef, PermissionDenied, RelationshipTuple, SubjectRef, backend, sudo
+from rebac import (
+    MissingActorError,
+    ObjectRef,
+    PermissionDenied,
+    RelationshipTuple,
+    SubjectRef,
+    actor_context,
+    backend,
+    sudo,
+)
 from rebac.backends import reset_backend
 from rebac.schema import parse_zed
 
@@ -102,6 +113,73 @@ def test_rebac_select_related_tags_readable_related_without_extra_query(
 
 
 @pytest.mark.django_db
+def test_rebac_select_related_redacts_and_tags_every_copy_of_shared_related_row(alice):
+    from tests.testapp.models import Post
+
+    backend().set_schema(
+        parse_zed(
+            SCHEMA_TEXT.replace(
+                "permission read = owner + viewer",
+                """
+            permission read = owner + viewer
+            permission read__name = owner
+        """,
+                1,
+            )
+        )
+    )
+    folder = _folder("private name")
+    posts = [_post("first", folder=folder), _post("second", folder=folder)]
+    _grant("blog/folder", folder.pk, "viewer", alice)
+    for post in posts:
+        _grant("blog/post", post.pk, "viewer", alice)
+
+    rows = list(Post.objects.as_user(alice).on_field_deny("redact").rebac_select_related("folder"))
+
+    assert len(rows) == 2
+    assert rows[0].folder is not rows[1].folder
+    assert [row.folder.name for row in rows] == [None, None]
+    assert [row.folder.actor() for row in rows] == [SubjectRef.of("auth/user", str(alice.pk))] * 2
+
+
+@pytest.mark.django_db(transaction=True)
+@pytest.mark.parametrize("with_ambient_actor", [False, True])
+def test_aiterator_sudo_does_not_bypass_selected_related_guards(alice, with_ambient_actor):
+    from tests.testapp.models import Post
+
+    folder = _folder("private")
+    post = _post("visible", folder=folder)
+
+    async def collect():
+        qs = Post.objects.sudo(reason="test.root-only").rebac_select_related("folder")
+        return [row async for row in qs.filter(pk=post.pk).aiterator()]
+
+    if with_ambient_actor:
+        with actor_context(SubjectRef.of("auth/user", str(alice.pk))):
+            with pytest.raises(PermissionDenied):
+                asyncio.run(collect())
+    else:
+        with pytest.raises(MissingActorError):
+            asyncio.run(collect())
+
+
+@pytest.mark.django_db
+def test_sudo_does_not_bypass_selected_related_projection_guard(alice):
+    from tests.testapp.models import Post
+
+    folder = _folder("private")
+    _post("visible", folder=folder)
+
+    with actor_context(SubjectRef.of("auth/user", str(alice.pk))):
+        with pytest.raises(PermissionDenied):
+            list(
+                Post.objects.sudo(reason="test.root-only")
+                .rebac_select_related("folder")
+                .values("folder__name")
+            )
+
+
+@pytest.mark.django_db
 def test_rebac_select_related_skips_guard_when_target_grants_all(alice):
     from tests.testapp.models import Post
 
@@ -151,6 +229,29 @@ def test_rebac_select_related_rejects_related_field_projection(alice):
 
     with pytest.raises(PermissionDenied):
         list(Post.objects.as_user(alice).rebac_select_related("folder").values("folder__name"))
+
+
+@pytest.mark.django_db
+@pytest.mark.parametrize("project", [False, True])
+def test_rebac_select_related_rejects_related_field_annotation(alice, project):
+    from tests.testapp.models import Post
+
+    folder = _folder("private")
+    post = _post("visible", folder=folder)
+    _grant("blog/post", post.pk, "viewer", alice)
+    # Root-only sudo exercises the annotation guard independently from normal
+    # instance joins. The related projection cannot inherit that bypass.
+    qs = (
+        Post.objects.sudo(reason="test.root-only")
+        .rebac_select_related("folder")
+        .annotate(copied_name=F("folder__name"))
+    )
+    if project:
+        qs = qs.values("id", "copied_name")
+
+    with actor_context(SubjectRef.of("auth/user", str(alice.pk))):
+        with pytest.raises(PermissionDenied):
+            list(qs)
 
 
 @pytest.mark.django_db

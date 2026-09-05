@@ -153,21 +153,21 @@ model field:
 ```zed
 definition blog/post {
     relation owner: auth/user             // rebac:field=author
-    relation admin: angee/role            // rebac:const=admin
+    relation admin: platform/role            // rebac:const=admin
 
     permission read = owner + admin->member
 }
 ```
 
-Here `post#admin` resolves to `angee/role:admin` for every post, so
-`admin->member` is "is the actor a member of `angee/role:admin`?" — answered
+Here `post#admin` resolves to `platform/role:admin` for every post, so
+`admin->member` is "is the actor a member of `platform/role:admin`?" — answered
 from the single role-membership tuples, never a per-post grant. This is the
 schema-level "static relationship" SpiceDB never shipped (issues #346 / #1266);
 it is the idiomatic way to express GCP-IAM's "admin at a scope covers every
 resource under it" without a container model. The same single-concrete-type
 constraints as field-backing apply, and `rebac.E009` verifies the declaring
 type has a Django model (the target type need not — it is typically a virtual
-role namespace such as `angee/role`). In reverse (`accessible`), a const arrow
+role namespace such as `platform/role`). In reverse (`accessible`), a const arrow
 returns *every* row of the source type when the constant target grants access —
 the intended "covers any `<type>`" semantics. Like field-backing, this is a
 `LocalBackend` synthesis with no SpiceDB equivalent; a SpiceDB backend would
@@ -176,7 +176,7 @@ need the edge materialised as tuples.
 Create preflight (`rebac.check_new`) injects const-backed relations from the
 schema into its virtual tuple overlay. For the `admin` relation above, a create
 check behaves as if the not-yet-persisted post already carried
-`#admin @ angee/role:admin`, then evaluates `admin->member` through the real
+`#admin @ platform/role:admin`, then evaluates `admin->member` through the real
 relationship store. Callers must not supply virtual tuples for const-backed
 relation names; those relations are synthetic schema facts, and
 `check_new()` raises `SchemaError` for non-empty caller entries on them.
@@ -270,10 +270,12 @@ The build emits `use typechecking` automatically — that catches *type* errors 
 
 ### Users and groups
 
-`django-zed-rebac` auto-emits `auth/user` and `auth/group` so they map onto `django.contrib.auth.User` and `Group`. You don't write these yourself:
+`auth/user` and `auth/group` are the default actor type labels for Django users
+and groups. Automatic base-schema emission is planned but not implemented;
+include these definitions once in an application schema when using them:
 
 ```zed
-// emitted by rebac itself
+// Include once in your application schema
 definition auth/user {}
 
 definition auth/group {
@@ -311,7 +313,10 @@ write_relationships([
 
 #### Auto-syncing Django's `User.groups`
 
-Opt in with `REBAC_SYNC_DJANGO_GROUPS = True`. The plugin connects to the `User.groups` M2M change signal and writes `auth/group:<id>#member @ auth/user:<id>` rows. One-way (Django → REBAC); two-way is custom-territory.
+`REBAC_SYNC_DJANGO_GROUPS` is reserved for a planned adapter; no M2M signal
+handler is shipped. Applications must maintain
+`auth/group:<id>#member @ auth/user:<id>` relationships explicitly when Django
+group memberships change, including deleting the tuples on membership removal.
 
 #### Public read access
 
@@ -450,6 +455,12 @@ write_relationships([
     ),
 ])
 ```
+
+Stored caveat context takes precedence over request context. A caller can supply
+the missing `ip`, but cannot replace the pinned `cidr` during a permission check.
+The `with ip_in_cidr` declaration requires that caveat on every viewer tuple;
+allow both shapes explicitly with `auth/user | auth/user with ip_in_cidr` if
+uncaveated grants are also intended.
 
 When checking, supply the runtime parameter:
 
@@ -695,7 +706,7 @@ async def edit_post(post_id: str, body: str, ctx: Context = CurrentContext()) ->
 
 ### Celery tasks acting on behalf of users
 
-Tasks inherit the actor automatically when wired through the plugin's signals (see [ARCHITECTURE.md § Celery](./ARCHITECTURE.md#celery)). The schema authoring is the same as for HTTP — you don't declare separate "task" resource types unless tasks themselves are gated.
+Tasks must restore an actor explicitly with `actor_context()` or `.with_actor()`; automatic propagation is not shipped (see [ARCHITECTURE.md § Celery](./ARCHITECTURE.md#celery)). The schema authoring is the same as for HTTP — you don't declare separate "task" resource types unless tasks themselves are gated.
 
 If they are (e.g., "only ops users can run reindex"), declare them as resources:
 
@@ -719,6 +730,10 @@ from rebac import require_permission
 def reindex_posts():
     ...
 ```
+
+The example requires a task wrapper that opens `actor_context()` from a trusted
+producer-supplied actor before invoking the decorated function. Without that
+scope the permission decorator denies the call.
 
 ### DRF viewsets
 
@@ -1014,6 +1029,9 @@ async def search_documents(
 ```
 
 ### Pattern I — Celery task gated by role
+
+Restore the trusted producer-supplied actor in `actor_context()` before calling
+the decorated body; automatic task propagation is not shipped.
 
 ```zed
 definition celery/task/reindex {
