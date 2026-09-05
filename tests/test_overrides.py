@@ -159,9 +159,20 @@ def test_next_scope_observes_schema_edits_without_local_signals():
     local.write_relationships([RelationshipTuple(post, "viewer", viewer)])
     with evaluator_scope() as evaluator:
         assert evaluator.check(local, subject=viewer, action="read", resource=post).allowed
-        # Model QuerySet.update bypasses this process's signals, simulating a
-        # write committed by another worker. This scope retains its snapshot.
-        SchemaPermission.objects.filter(pk=sp.pk).update(expression="owner")
+        # A different connection has neither this evaluator's SQL observer nor
+        # local model signals, as with a write committed by another worker.
+        from django.db import connection
+        from django.db.backends.base.base import BaseDatabaseWrapper
+
+        other = connection.copy(alias="schema_writer")
+        try:
+            with other.cursor() as cursor:
+                cursor.execute(
+                    'UPDATE "rebac_schemapermission" SET "expression" = %s WHERE "id" = %s',
+                    ["owner", sp.pk],
+                )
+        finally:
+            BaseDatabaseWrapper.close(other)
         assert evaluator.check(local, subject=viewer, action="read", resource=post).allowed
     with evaluator_scope() as evaluator:
         assert not evaluator.check(local, subject=viewer, action="read", resource=post).allowed

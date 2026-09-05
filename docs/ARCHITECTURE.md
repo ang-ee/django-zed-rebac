@@ -743,20 +743,36 @@ effective_expr = (baseline_expr + extends) AND tightens
                                  with caveats merged from recaveats
 ```
 
-Compiled lazily into the in-memory expression tree. AST reuse is bounded to the
-current evaluator/request scope, or a temporary public backend-operation scope
-when there is no evaluator. Nested graph reads reuse that scope. A new scope
-reloads DB schema rows, so updates made by another worker are visible on the
-next request without relying on process-local signals. Standalone `schema()`
-calls reload DB state. Signals also invalidate same-process caches within a
-scope. In-flight request snapshots are intentional; transaction isolation and
-database routing determine which committed schema is visible. App startup
-performs no schema queries.
+Compiled lazily into the in-memory expression tree. Each evaluator/request owns
+its snapshots, separated by backend and actual Django database connection.
+Concurrent requests cannot replace each other's snapshots or decision generations.
+A temporary public backend-operation scope serves callers without an evaluator.
+Nested graph reads reuse that scope. A new scope reloads DB schema rows, so
+updates made by another worker are visible on the next request without relying
+on process-local signals. Standalone `schema()` calls reload DB state. Signals
+also invalidate same-process caches within a scope. In-flight request snapshots
+are intentional; transaction isolation and database routing determine which
+committed schema is visible. App startup performs no schema queries.
 
 Evaluator invalidation opens a new schema snapshot, including on subscription
-emissions. Inside a database transaction, only the temporary backend-operation
-scope may retain an AST; an uncommitted schema edit cannot survive rollback in
-a request's cache.
+emissions. Read-only work inside Django `atomic()` reuses the evaluator's AST.
+A connection-local observer on Django's SQL execution seam discards that AST
+before non-SELECT SQL in both autocommit and transactions, including bulk writes
+and manual savepoint rollback. A
+pending native `on_commit` marker identifies outer transaction completion,
+including rollback and repeated use of an Atomic object. These observers are
+removed when the evaluator scope exits, including exception exits. Manually
+managed transactions (autocommit disabled by the caller) retain only temporary
+backend-operation snapshots. Permission decisions remain uncached in transactions.
+
+The observer covers ordinary Django ORM writes and raw DML executed through
+Django cursors. SQL `SELECT` statements invoking application-defined mutating
+functions and direct DB-API driver writes are explicit escape hatches: callers
+must call `current_evaluator().invalidate()` after that work (including error or
+rollback paths) and before any further permission check, or perform it outside
+an evaluator scope. The SQL observer is not a SQL parser and does not claim that
+arbitrary SELECTs are free of side effects. Applications using those escape
+hatches must supply that invalidation boundary; ordinary ORM consumers need none.
 
 An override is active only while `expires_at` is null or strictly later than
 the evaluation time. The DB-loaded schema cache expires at the earliest active
