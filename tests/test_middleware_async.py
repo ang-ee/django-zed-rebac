@@ -126,6 +126,50 @@ def test_async_superuser_request_runs_inside_sudo_bracket(db):
 
 
 @pytest.mark.django_db(transaction=True)
+def test_async_middleware_resolves_django_lazy_user_off_event_loop():
+    from django.utils.functional import SimpleLazyObject
+
+    from rebac import SubjectRef
+
+    user = get_user_model().objects.create_user(username="lazy-async")
+    request = RequestFactory().get("/")
+    # AuthenticationMiddleware installs this same lazy shape. Resolving the
+    # user performs a database lookup on the first attribute access.
+    request.user = SimpleLazyObject(lambda: get_user_model().objects.get(pk=user.pk))
+    seen = []
+
+    async def get_response(request):
+        seen.append(current_actor())
+        return "ok"
+
+    assert asyncio.run(ActorMiddleware(get_response)(request)) == "ok"
+    assert seen == [SubjectRef.of("auth/user", str(user.pk))]
+
+
+@pytest.mark.django_db(transaction=True)
+def test_async_custom_resolver_leaves_lazy_user_safe_for_superuser_check(monkeypatch, settings):
+    from django.utils.functional import SimpleLazyObject
+
+    from rebac import SubjectRef
+
+    settings.REBAC_SUPERUSER_BYPASS = True
+    user = get_user_model().objects.create_user(username="lazy-custom-async")
+    request = RequestFactory().get("/")
+    request.user = SimpleLazyObject(lambda: get_user_model().objects.get(pk=user.pk))
+
+    async def resolver(request):
+        return SubjectRef.of("auth/user", str(user.pk))
+
+    monkeypatch.setattr("rebac.middleware.get_actor_resolver", lambda: resolver)
+
+    async def get_response(request):
+        assert not is_sudo()
+        return "ok"
+
+    assert asyncio.run(ActorMiddleware(get_response)(request)) == "ok"
+
+
+@pytest.mark.django_db(transaction=True)
 @override_settings(REBAC_SUPERUSER_BYPASS=True)
 def test_async_exception_in_view_still_tears_down(db):
     User = get_user_model()

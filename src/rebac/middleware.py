@@ -11,9 +11,10 @@ Dual-mode (sync + async)
 The middleware advertises both ``sync_capable`` and ``async_capable``
 to Django and dispatches on the type of ``get_response`` it receives.
 When mounted in a pure-async middleware stack (ASGI), Django passes a
-coroutine ``get_response`` and the middleware runs entirely on the
-event loop via :meth:`__acall__` — no ``async_to_sync`` bridge, no
-thread hop, and ``asyncio.CancelledError`` on client disconnect
+coroutine ``get_response`` and the middleware awaits it directly via
+:meth:`__acall__`. Synchronous actor resolution runs in a worker thread
+because Django's lazy ``request.user`` can perform database IO. No
+``async_to_sync`` bridge wraps the response, and ``asyncio.CancelledError`` on client disconnect
 propagates as a single frame instead of the chained traceback the
 sync-only path produces. When mounted in a sync (WSGI) stack the
 :meth:`__call__` path runs as before.
@@ -25,7 +26,7 @@ import inspect
 from collections.abc import Awaitable, Callable
 from typing import Any, cast
 
-from asgiref.sync import iscoroutinefunction, markcoroutinefunction
+from asgiref.sync import iscoroutinefunction, markcoroutinefunction, sync_to_async
 
 from .actors import _current_actor, asudo, get_actor_resolver, sudo
 from .conf import app_settings
@@ -166,7 +167,9 @@ class ActorMiddleware:
         """
         resolver = get_actor_resolver()
         actor_ref = await _aresolve_actor(resolver, request)
-        use_sudo = self._should_sudo(request)
+        # A custom resolver may leave Django's lazy session user unresolved.
+        # The superuser probe can therefore perform its own synchronous lookup.
+        use_sudo = await sync_to_async(self._should_sudo, thread_sensitive=True)(request)
         # Install the actor token *immediately* before ``try:`` so the
         # ``finally`` block always pairs with the ``set``. The earlier
         # ordering put ``await self._arehydrate_zookie(...)`` between
@@ -313,17 +316,14 @@ async def _aresolve_actor(
 ) -> Any:
     """Invoke the actor resolver, awaiting it if it's a coroutine fn.
 
-    The default :func:`rebac.actors.default_resolver` is sync and only
-    inspects ``request.user`` — no IO, fast under both modes. A
-    downstream resolver that needs to hit the DB (e.g. a bearer-token
-    chain that loads an API-key row) can declare itself ``async def``
-    and the async path will await it without forcing the rest of the
-    chain through a thread.
+    Synchronous resolvers run in a thread: even the default resolver's
+    ``request.user`` access may load a session and user from the database.
+    Async resolvers are awaited directly on the event loop.
     """
     if iscoroutinefunction(resolver):
         result = cast(Awaitable[Any], resolver(request))
         return await result
-    result_sync = resolver(request)
+    result_sync = await sync_to_async(resolver, thread_sensitive=True)(request)
     if inspect.isawaitable(result_sync):
         # Resolver returned a coroutine without being declared async
         # (e.g. wrapped via decorator). Await it.

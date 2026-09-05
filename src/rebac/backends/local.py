@@ -31,9 +31,10 @@ Caveats are tri-state:
 from __future__ import annotations
 
 import time
-from collections.abc import Iterable, Iterator
-from contextlib import contextmanager
+from collections.abc import Callable, Iterable
 from contextvars import ContextVar
+from datetime import datetime
+from functools import wraps
 from threading import Lock
 from typing import Any
 from weakref import WeakSet
@@ -96,25 +97,27 @@ from .base import Backend
 
 _backend_registry_lock = Lock()
 _db_loaded_backends: WeakSet[LocalBackend] = WeakSet()
-
-# Per-evaluation freshness cutoff. When non-None, every Relationship
-# queryset inside _has_direct_relation / _resources_via_relation /
-# _resources_for_expr is narrowed by ``written_at_xid__lte=cutoff`` so
-# `Consistency.AT_LEAST_AS_FRESH(zookie)` semantics hold across the
-# whole walk without threading the value through every internal call.
-# ContextVar (not instance state) because LocalBackend is a singleton
-# reused across requests / async tasks; each task gets its own slot.
-_freshness_xid: ContextVar[int | None] = ContextVar("rebac_local_freshness_xid", default=None)
+_relationship_generation = 0
+_schema_operation_scope: ContextVar[object | None] = ContextVar(
+    "rebac_schema_operation", default=None
+)
 
 
-@contextmanager
-def _freshness_scope(xid: int | None) -> Iterator[None]:
-    """Bracket every internal read with ``written_at_xid <= xid`` when set."""
-    token = _freshness_xid.set(xid)
-    try:
-        yield
-    finally:
-        _freshness_xid.reset(token)
+def _schema_operation[**P, R](method: Callable[P, R]) -> Callable[P, R]:
+    """Reuse one schema within a public backend operation and nested reads."""
+
+    @wraps(method)
+    def wrapped(*args: P.args, **kwargs: P.kwargs) -> R:
+        token = None
+        if _schema_operation_scope.get() is None:
+            token = _schema_operation_scope.set(object())
+        try:
+            return method(*args, **kwargs)
+        finally:
+            if token is not None:
+                _schema_operation_scope.reset(token)
+
+    return wrapped
 
 
 class LocalBackend(Backend):
@@ -123,16 +126,16 @@ class LocalBackend(Backend):
     kind = "local"
 
     @staticmethod
-    def _validate_zookie(at_zookie: Zookie | None) -> int | None:
-        """Validate the backend kind and return the freshness xid cutoff.
+    def _validate_consistency(consistency: Consistency | None, at_zookie: Zookie | None) -> None:
+        """Validate read options without filtering away newer relationship rows.
 
-        Returns ``None`` when no zookie was supplied. Raises ``ValueError``
-        when the zookie was emitted by a different backend (a SpiceDB
-        token handed here would be interpreted as a numeric xid with
-        garbage semantics; fail loudly).
+        Local reads use the current state visible to the Django connection.
+        Row write timestamps cannot reconstruct historical updates/deletes.
         """
+        if consistency is Consistency.AT_EXACT_SNAPSHOT:
+            raise ValueError("LocalBackend does not support exact historical snapshots")
         if at_zookie is None:
-            return None
+            return
         if at_zookie.backend != "local":
             raise ValueError(
                 f"LocalBackend cannot consume a Zookie from backend "
@@ -140,28 +143,19 @@ class LocalBackend(Backend):
                 f"the boundary where backends switched."
             )
         try:
-            return int(at_zookie.token)
+            int(at_zookie.token)
         except (TypeError, ValueError) as exc:
             raise ValueError(
                 f"LocalBackend Zookie token must be a numeric xid; got {at_zookie.token!r}"
             ) from exc
 
-    def _apply_freshness(self, qs: Any) -> Any:
-        """Narrow a Relationship queryset by the ambient freshness cutoff.
-
-        No-op when no scope is open. Applied at every relationship-table
-        read in the evaluation walk so any path through the engine
-        honours the floor uniformly.
-        """
-        cutoff = _freshness_xid.get()
-        if cutoff is None:
-            return qs
-        return qs.filter(written_at_xid__lte=cutoff)
-
     def __init__(self) -> None:
         self._schema_lock = Lock()
         self._schema: Schema | None = None
         self._schema_is_manual = False
+        self._schema_scope: object | None = None
+        self._schema_expires_at: datetime | None = None
+        self._schema_generation = 0
         # Counter used as a stable monotonic xid on backends (e.g. SQLite test
         # mode) without `txid_current()`.
         self._xid_counter = 0
@@ -184,16 +178,51 @@ class LocalBackend(Backend):
         with self._schema_lock:
             self._schema = schema
             self._schema_is_manual = True
+            self._schema_generation += 1
 
     def schema(self) -> Schema:
+        from django.db import connection
+        from django.utils import timezone
+
+        from ..evaluator import current_evaluator
+
+        evaluator = current_evaluator()
+        scope = (
+            evaluator._schema_scope_token
+            if evaluator is not None and not connection.in_atomic_block
+            else _schema_operation_scope.get() or object()
+        )
         with self._schema_lock:
-            if self._schema is None:
-                # Lazy load from DB-stored Schema* rows. Schema model signals
-                # mark DB-loaded backends stale when those rows change in this
-                # process, avoiding schema-table reads on every permission check.
+            if self._schema is None or (
+                not self._schema_is_manual
+                and (
+                    self._schema_scope is not scope
+                    or (
+                        self._schema_expires_at is not None
+                        and self._schema_expires_at <= timezone.now()
+                    )
+                )
+            ):
+                # Scope boundaries observe other workers' commits. Within a
+                # scope, signals and override deadlines invalidate the AST.
                 self._schema = self._load_schema_from_db()
                 self._schema_is_manual = False
+                self._schema_scope = scope
+                self._schema_generation += 1
             return self._schema
+
+    def _cache_generation(self) -> tuple[int, int] | None:
+        """Return a decision generation, or bypass time/transaction-sensitive caching."""
+        from django.db import connection
+
+        if connection.in_atomic_block:
+            return None
+        schema = self.schema()
+        if any(relation.with_expiration for d in schema.definitions for relation in d.relations):
+            # A relationship deadline can pass with no write or schema change.
+            # Dependency-specific expiry tracking is not implemented yet.
+            return None
+        return self._schema_generation, _relationship_generation
 
     def mark_schema_stale(self) -> None:
         """Drop a DB-loaded schema cache after Schema* row changes."""
@@ -202,7 +231,8 @@ class LocalBackend(Backend):
                 self._schema = None
 
     def _load_schema_from_db(self) -> Schema:
-        from django.db.models import Prefetch
+        from django.db.models import Prefetch, Q
+        from django.utils import timezone
 
         from ..composition import compose
         from ..models import (
@@ -274,11 +304,22 @@ class LocalBackend(Backend):
         # single source of determinism (it re-sorts disables by
         # (created_at, pk) per kind), so the loader-side order_by is just
         # cosmetic; we keep it for readable EXPLAIN plans.
-        overrides = list(SchemaOverride.objects.all().order_by("kind", "created_at", "pk"))
+        overrides = list(
+            SchemaOverride.objects.filter(
+                Q(expires_at__isnull=True) | Q(expires_at__gt=timezone.now())
+            )
+            .select_related("target_ct")
+            .order_by("kind", "created_at", "pk")
+        )
+        self._schema_expires_at = min(
+            (row.expires_at for row in overrides if row.expires_at is not None),
+            default=None,
+        )
         return compose(baseline, overrides)
 
     # ---------- Public API ----------
 
+    @_schema_operation
     def check_access(
         self,
         *,
@@ -289,9 +330,8 @@ class LocalBackend(Backend):
         consistency: Consistency | None = None,
         at_zookie: Zookie | None = None,
     ) -> CheckResult:
-        cutoff = self._validate_zookie(at_zookie)
-        with _freshness_scope(cutoff):
-            return self._check_access(subject, action, resource, context)
+        self._validate_consistency(consistency, at_zookie)
+        return self._check_access(subject, action, resource, context)
 
     def _check_access(
         self,
@@ -380,6 +420,7 @@ class LocalBackend(Backend):
             return CheckResult.conditional(missing=tuple(sorted(missing)))
         return CheckResult.no()
 
+    @_schema_operation
     def accessible(
         self,
         *,
@@ -390,14 +431,13 @@ class LocalBackend(Backend):
         consistency: Consistency | None = None,
         at_zookie: Zookie | None = None,
     ) -> Iterable[str]:
-        cutoff = self._validate_zookie(at_zookie)
-        with _freshness_scope(cutoff):
-            return self._accessible(
-                subject=subject,
-                action=action,
-                resource_type=resource_type,
-                context=context,
-            )
+        self._validate_consistency(consistency, at_zookie)
+        return self._accessible(
+            subject=subject,
+            action=action,
+            resource_type=resource_type,
+            context=context,
+        )
 
     def _accessible(
         self,
@@ -442,6 +482,7 @@ class LocalBackend(Backend):
             )
         )
 
+    @_schema_operation
     def grants_all(
         self,
         *,
@@ -472,6 +513,7 @@ class LocalBackend(Backend):
             seen=set(),
         )
 
+    @_schema_operation
     def lookup_subjects(
         self,
         *,
@@ -486,7 +528,7 @@ class LocalBackend(Backend):
         # subject sets / arrows for reverse lookup is deferred to v0.2.
         from ..models import active_relationship_model
 
-        cutoff = self._validate_zookie(at_zookie)
+        self._validate_consistency(consistency, at_zookie)
         RelationshipModel = active_relationship_model()
 
         permission = self.schema().get_permission(resource.resource_type, action)
@@ -534,11 +576,9 @@ class LocalBackend(Backend):
                 continue
             stored_relation_names.append(relation_name)
 
-        if not stored_relation_names:
-            return synthetic_subjects
-
-        with _freshness_scope(cutoff):
-            rows = self._apply_freshness(
+        candidates = set(synthetic_subjects)
+        if stored_relation_names:
+            rows = _filter_active(
                 RelationshipModel.objects.filter(
                     resource_type=resource.resource_type,
                     resource_id=resource.resource_id,
@@ -546,13 +586,21 @@ class LocalBackend(Backend):
                     subject_type=subject_type,
                 )
             )
-            stored_subjects = [
+            candidates.update(
                 SubjectRef.of(r.subject_type, r.subject_id, r.optional_subject_relation)
                 for r in rows
                 if _row_allowed_by_relation(relation_by_name[r.relation], r)
-            ]
-            return [*synthetic_subjects, *stored_subjects]
+            )
+        # Relation rows are candidate sources, never proof of the requested
+        # permission. Apply intersections, exclusions and caveats before
+        # returning the subjects, including candidates from synthetic backing.
+        return [
+            candidate
+            for candidate in sorted(candidates, key=str)
+            if self._check_access(candidate, action, resource, context).allowed
+        ]
 
+    @_schema_operation
     def write_relationships(self, writes: Iterable[RelationshipTuple]) -> Zookie:
         from django.db import transaction
 
@@ -584,14 +632,15 @@ class LocalBackend(Backend):
                     },
                 )
         # Zookie token == the maximum xid actually written in the batch,
-        # so ``at_least_as_fresh(zookie)`` reads include every row this
-        # call produced and exclude every row written strictly later.
-        # An empty batch returns the most-recent watermark (or 0 on a
-        # fresh backend) — never advances the clock.
+        # so the token witnesses every row written by this batch. Newer
+        # relationship rows remain visible to reads carrying this token.
+        # An empty batch returns a token for the current local clock.
         if max_xid == 0:
             return self._zookie()
+        _advance_relationship_generation()
         return Zookie(self.kind, str(max_xid))
 
+    @_schema_operation
     def delete_relationships(self, filter_: RelationshipFilter) -> Zookie:
         from django.db import transaction
 
@@ -620,8 +669,10 @@ class LocalBackend(Backend):
             if filter_.caveat_name:
                 qs = qs.filter(caveat_name=filter_.caveat_name)
             qs.delete()
+        _advance_relationship_generation()
         return self._zookie()
 
+    @_schema_operation
     def delete_relationship(self, tuple_: RelationshipTuple) -> Zookie:
         # Local-only convenience verb: exact-match delete for one tuple shape
         # (treats empty optional_subject_relation / caveat_name as exact
@@ -650,6 +701,7 @@ class LocalBackend(Backend):
                 optional_subject_relation=tuple_.subject.optional_relation,
                 caveat_name=tuple_.caveat_name,
             ).delete()
+        _advance_relationship_generation()
         return self._zookie()
 
     # ---------- Internal evaluation ----------
@@ -749,15 +801,13 @@ class LocalBackend(Backend):
             )
 
         RelationshipModel = active_relationship_model()
-        targets = self._apply_freshness(
-            RelationshipModel.objects.filter(
-                resource_type=definition.resource_type,
-                resource_id=resource_id,
-                relation=via,
-            )
+        targets = RelationshipModel.objects.filter(
+            resource_type=definition.resource_type,
+            resource_id=resource_id,
+            relation=via,
         )
         saw_conditional = False
-        for row in targets:
+        for row in _filter_active(targets):
             if not _row_allowed_by_relation(via_relation, row):
                 continue
             # The hop row itself may carry a caveat — evaluate it before
@@ -1002,12 +1052,10 @@ class LocalBackend(Backend):
 
         RelationshipModel = active_relationship_model()
 
-        rows = self._apply_freshness(
-            RelationshipModel.objects.filter(
-                resource_type=resource_type,
-                resource_id=resource_id,
-                relation=relation,
-            )
+        rows = RelationshipModel.objects.filter(
+            resource_type=resource_type,
+            resource_id=resource_id,
+            relation=relation,
         )
         saw_conditional = False
         # Direct subject match
@@ -1176,13 +1224,11 @@ class LocalBackend(Backend):
                 )
                 if not target_resource_ids:
                     continue
-                rows = self._apply_freshness(
-                    RelationshipModel.objects.filter(
-                        resource_type=definition.resource_type,
-                        relation=expr.via,
-                        subject_type=target_type,
-                        subject_id__in=list(target_resource_ids),
-                    )
+                rows = RelationshipModel.objects.filter(
+                    resource_type=definition.resource_type,
+                    relation=expr.via,
+                    subject_type=target_type,
+                    subject_id__in=list(target_resource_ids),
                 )
                 for r in _filter_active(rows):
                     if not _row_allowed_by_relation(via_rel, r):
@@ -1194,13 +1240,23 @@ class LocalBackend(Backend):
             return results
         if isinstance(expr, PermBinOp):
             left = self._resources_for_expr(expr.left, definition, subject, depth, cache, context)
+            if expr.op == "-":
+                # Enumerating the RHS drops conditional matches and cannot
+                # enumerate built-in actor grants. Subtracting that incomplete
+                # set would grant access. Recheck candidates with the shared
+                # tri-state walker so only an unconditional exclusion result
+                # survives, including exclusions nested under arrows/unions.
+                return {
+                    resource_id
+                    for resource_id in left
+                    if self._eval_permission(expr, definition, resource_id, subject, depth, context)
+                    is True
+                }
             right = self._resources_for_expr(expr.right, definition, subject, depth, cache, context)
             if expr.op == "+":
                 return left | right
             if expr.op == "&":
                 return left & right
-            if expr.op == "-":
-                return left - right
             raise ValueError(f"unknown operator: {expr.op}")
         raise TypeError(f"unknown PermExpr: {expr!r}")
 
@@ -1377,14 +1433,12 @@ class LocalBackend(Backend):
         sink: set[str] = set()
 
         # Direct rows
-        direct = self._apply_freshness(
-            RelationshipModel.objects.filter(
-                resource_type=resource_type,
-                relation=relation,
-                subject_type=subject.subject_type,
-                subject_id=subject.subject_id,
-                optional_subject_relation=subject.optional_relation,
-            )
+        direct = RelationshipModel.objects.filter(
+            resource_type=resource_type,
+            relation=relation,
+            subject_type=subject.subject_type,
+            subject_id=subject.subject_id,
+            optional_subject_relation=subject.optional_relation,
         )
         for r in _filter_active(direct):
             if not _row_allowed_by_relation(relation_def, r):
@@ -1394,13 +1448,11 @@ class LocalBackend(Backend):
 
         # Wildcard rows
         if not subject.optional_relation:
-            wildcard = self._apply_freshness(
-                RelationshipModel.objects.filter(
-                    resource_type=resource_type,
-                    relation=relation,
-                    subject_type=subject.subject_type,
-                    subject_id="*",
-                )
+            wildcard = RelationshipModel.objects.filter(
+                resource_type=resource_type,
+                relation=relation,
+                subject_type=subject.subject_type,
+                subject_id="*",
             )
             for r in _filter_active(wildcard):
                 if not _row_allowed_by_relation(relation_def, r):
@@ -1410,11 +1462,9 @@ class LocalBackend(Backend):
 
         # Subject-set rows: e.g. resources granted to `auth/group:X#member`
         # require the subject to actually be a member of group X.
-        subject_set_rows = self._apply_freshness(
-            RelationshipModel.objects.filter(
-                resource_type=resource_type, relation=relation
-            ).exclude(optional_subject_relation="")
-        )
+        subject_set_rows = RelationshipModel.objects.filter(
+            resource_type=resource_type, relation=relation
+        ).exclude(optional_subject_relation="")
         for row in subject_set_rows:
             if not _row_allowed_by_relation(relation_def, row):
                 continue
@@ -1458,6 +1508,17 @@ class LocalBackend(Backend):
             raise ValueError(
                 f"subject {tup.subject} is not allowed for "
                 f"{tup.resource.resource_type}#{tup.relation}"
+            )
+        if not _subject_allowed_by_relation(relation, tup.subject, caveat_name=tup.caveat_name):
+            raise ValueError(
+                f"caveat {tup.caveat_name!r} is not allowed for subject {tup.subject} on "
+                f"{tup.resource.resource_type}#{tup.relation}"
+            )
+        if tup.caveat_name and self.schema().get_caveat(tup.caveat_name) is None:
+            raise ValueError(f"unknown caveat: {tup.caveat_name}")
+        if tup.expires_at is not None and not relation.with_expiration:
+            raise ValueError(
+                f"expiration is not allowed for {tup.resource.resource_type}#{tup.relation}"
             )
 
     def _backed_write_error(self, resource_type: str, relation: Relation) -> SchemaError:
@@ -1535,6 +1596,13 @@ class LocalBackend(Backend):
 
 
 # ---------- Module-level helpers ----------
+
+
+def _advance_relationship_generation() -> None:
+    """Invalidate decisions across backend instances and nested evaluator scopes."""
+    global _relationship_generation
+    with _backend_registry_lock:
+        _relationship_generation += 1
 
 
 def mark_db_loaded_schemas_stale() -> None:

@@ -58,7 +58,7 @@ def guard_selected_related_instances(
     if not paths:
         return
 
-    batches: dict[type[models.Model], dict[str, models.Model]] = {}
+    batches: dict[type[models.Model], dict[str, dict[int, models.Model]]] = {}
     for instance in instances:
         if not isinstance(instance, models.Model):
             continue
@@ -87,7 +87,9 @@ def guard_selected_related_instances(
         if not rebac_type:
             continue
         action = str(getattr(model._meta, "rebac_default_action", "read"))
-        rows = list(rows_by_id.values())
+        # Django creates a separate related instance for each joined root row.
+        # Check IDs once, but stamp and redact every in-memory copy of that ID.
+        rows = [row for copies in rows_by_id.values() for row in copies.values()]
 
         if not backend_grants_all(
             active_backend,
@@ -365,7 +367,7 @@ def _collect_cached_related(
     *,
     root_model: type[models.Model],
     path: str,
-    batches: dict[type[models.Model], dict[str, models.Model]],
+    batches: dict[type[models.Model], dict[str, dict[int, models.Model]]],
 ) -> None:
     current: models.Model | None = instance
     current_model = root_model
@@ -384,7 +386,7 @@ def _collect_cached_related(
         rebac_type = model_resource_type(type(related))
         if rebac_type:
             resource_id = str(getattr(related, _resource_id_attr(type(related))))
-            batches.setdefault(type(related), {})[resource_id] = related
+            batches.setdefault(type(related), {}).setdefault(resource_id, {})[id(related)] = related
         current = related
         current_model = type(related)
 

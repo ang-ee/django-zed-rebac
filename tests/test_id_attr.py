@@ -20,11 +20,12 @@ from rebac import (
     RelationshipTuple,
     SubjectRef,
     backend,
+    resource_id_attr,
+    subject_id_attr,
     sudo,
     to_subject_ref,
     write_relationships,
 )
-from rebac._id import resource_id_attr, subject_id_attr
 from rebac.backends import reset_backend
 from rebac.schema import parse_zed
 

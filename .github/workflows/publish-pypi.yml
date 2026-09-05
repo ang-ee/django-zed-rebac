@@ -61,7 +61,22 @@ jobs:
           PY
 
       - name: Build distributions
-        run: uv build --out-dir dist
+        # Release artifacts are built only after the same checks as branch CI.
+        run: |
+          uv venv --python 3.14
+          make install-dev
+          make check
+          uv build --out-dir dist
+
+      - name: Validate distributions
+        run: uvx --from twine twine check --strict dist/*
+
+      - name: Store release distributions
+        uses: actions/upload-artifact@v4
+        with:
+          name: distributions
+          path: dist/*
+          if-no-files-found: error
 
       - name: Publish distributions
         uses: pypa/gh-action-pypi-publish@release/v1

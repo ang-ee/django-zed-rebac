@@ -11,6 +11,7 @@ import pickle
 from typing import Any, cast
 
 import pytest
+from django.db.models import Count, F, Min
 from django.test import override_settings
 
 from rebac import (
@@ -321,6 +322,35 @@ def test_pk_values_projection_remains_allowed_with_read_gates(alice, bob):
     _grant(post.pk, alice, "viewer")
 
     assert list(Post.objects.as_user(alice).values_list("pk", flat=True)) == [post.pk]
+
+
+@override_settings(REBAC_FIELD_READ_MODE="redact")
+@pytest.mark.parametrize("project", [False, True])
+def test_annotation_cannot_copy_a_gated_field(alice, project):
+    from tests.testapp.models import Post
+
+    post = _post(title="aliased secret")
+    _grant(post.pk, alice, "viewer")
+    qs = Post.objects.as_user(alice).annotate(copied_title=F("title"))
+    if project:
+        qs = qs.values("id", "copied_title")
+
+    with pytest.raises(PermissionDenied):
+        list(qs)
+
+
+@override_settings(REBAC_FIELD_READ_MODE="redact")
+def test_aggregate_cannot_return_a_gated_field(alice):
+    from tests.testapp.models import Post
+
+    post = _post(title="aggregate secret")
+    _grant(post.pk, alice, "viewer")
+    qs = Post.objects.as_user(alice)
+
+    with pytest.raises(PermissionDenied):
+        qs.aggregate(secret=Min("title"))
+    assert qs.aggregate(total=Count("pk")) == {"total": 1}
+    assert qs.for_write().aggregate(secret=Min("title")) == {"secret": "aggregate secret"}
 
 
 def test_no_read_gates_do_not_add_field_accessible_calls(alice, monkeypatch):

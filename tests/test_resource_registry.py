@@ -315,8 +315,7 @@ def test_active_relationship_model_q_filters_use_wire_field_names(storage_mode):
 
         rows = list(
             model_cls.objects.filter(
-                Q(resource_type="storage/file", resource_id="alpha")
-                | Q(subject_id="2")
+                Q(resource_type="storage/file", resource_id="alpha") | Q(subject_id="2")
             )
             .order_by("resource_id")
             .values_list("resource_id", "subject_id")
@@ -482,9 +481,9 @@ def test_for_subject_optional_relation_none_means_any_relation(model_cls):
     )
 
     any_rows = list(
-        model_cls.objects.for_subject(
-            "auth/group", "eng", optional_relation=None
-        ).order_by_resource().wire_values()
+        model_cls.objects.for_subject("auth/group", "eng", optional_relation=None)
+        .order_by_resource()
+        .wire_values()
     )
     direct_rows = list(
         model_cls.objects.for_subject("auth/group", "eng", optional_relation="").wire_values()

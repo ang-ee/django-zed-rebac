@@ -46,7 +46,8 @@ def test_sync_check_detects_stale_permission_rows() -> None:
 
 
 @pytest.mark.django_db
-def test_sync_prunes_stale_relation_and_permission_rows() -> None:
+@pytest.mark.parametrize("force", [False, True])
+def test_sync_only_prunes_stale_children_when_forced(force: bool) -> None:
     call_command("rebac", "sync", stdout=io.StringIO())
     post_def = SchemaDefinition.objects.get(resource_type="blog/post")
     SchemaRelation.objects.create(
@@ -60,20 +61,22 @@ def test_sync_prunes_stale_relation_and_permission_rows() -> None:
         expression="owner",
     )
 
-    call_command("rebac", "sync", stdout=io.StringIO())
+    flags = ["--force-overwrite", "--yes"] if force else []
+    call_command("rebac", "sync", *flags, stdout=io.StringIO())
 
-    assert not SchemaRelation.objects.filter(
+    assert SchemaRelation.objects.filter(
         definition=post_def,
         name="stale_relation",
-    ).exists()
-    assert not SchemaPermission.objects.filter(
+    ).exists() is (not force)
+    assert SchemaPermission.objects.filter(
         definition=post_def,
         name="stale_permission",
-    ).exists()
+    ).exists() is (not force)
 
 
 @pytest.mark.django_db
-def test_sync_prunes_stale_package_managed_definition_and_caveat_rows() -> None:
+@pytest.mark.parametrize("force", [False, True])
+def test_sync_only_prunes_stale_managed_rows_when_forced(force: bool) -> None:
     call_command("rebac", "sync", stdout=io.StringIO())
     stale_definition = SchemaDefinition.objects.create(resource_type="legacy/type")
     stale_relation = SchemaRelation.objects.create(
@@ -93,18 +96,33 @@ def test_sync_prunes_stale_package_managed_definition_and_caveat_rows() -> None:
     with pytest.raises(CommandError, match="Schema drift detected"):
         call_command("rebac", "sync", "--check", stdout=io.StringIO())
 
-    call_command("rebac", "sync", stdout=io.StringIO())
+    flags = ["--force-overwrite", "--yes"] if force else []
+    call_command("rebac", "sync", *flags, stdout=io.StringIO())
 
-    assert not SchemaDefinition.objects.filter(resource_type="legacy/type").exists()
-    assert not SchemaRelation.objects.filter(pk=stale_relation.pk).exists()
-    assert not SchemaCaveat.objects.filter(name="legacy_caveat").exists()
-    assert not PackageManagedRecord.objects.filter(
+    assert SchemaDefinition.objects.filter(resource_type="legacy/type").exists() is (not force)
+    assert SchemaRelation.objects.filter(pk=stale_relation.pk).exists() is (not force)
+    assert SchemaCaveat.objects.filter(name="legacy_caveat").exists() is (not force)
+    assert PackageManagedRecord.objects.filter(
         external_id__in=[
             "definition:legacy/type",
             "relation:legacy/type#owner",
             "caveat:legacy_caveat",
         ]
-    ).exists()
+    ).exists() is (not force)
+
+
+@pytest.mark.django_db
+def test_sync_force_requires_confirmation_before_writing(monkeypatch) -> None:
+    monkeypatch.setattr("sys.stdin", io.StringIO())
+    with pytest.raises(CommandError, match="--yes"):
+        call_command("rebac", "sync", "--force-overwrite", stdout=io.StringIO())
+    assert not SchemaDefinition.objects.exists()
+
+
+@pytest.mark.django_db
+def test_sync_force_check_does_not_require_confirmation() -> None:
+    call_command("rebac", "sync", stdout=io.StringIO())
+    call_command("rebac", "sync", "--force-overwrite", "--check", stdout=io.StringIO())
 
 
 @pytest.mark.django_db

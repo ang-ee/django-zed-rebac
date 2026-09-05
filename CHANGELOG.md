@@ -3,7 +3,113 @@
 All notable changes to `django-zed-rebac` are tracked here. The project is in
 pre-1.0; breaking changes within a minor version are explicitly called out.
 
-## [Unreleased]
+## [0.15.0] — 2026-09-05
+
+### Added
+
+- Public `rebac.schema` source resolution, canonical source-preserving rendering,
+  allowed-subject rendering and `Definition.extend()` editing. Source rendering
+  preserves headers/directives and local field/constant bindings; SpiceDB export
+  explicitly uses `include_backing=False`. The management command shares these
+  APIs instead of maintaining a second renderer/resolver.
+- `permission_object_sources()` reports statically named positive object sources,
+  including const bindings, arrows, subject sets and cycles. It is schema
+  introspection, never authorization.
+- Public `resource_id_attr()` and `subject_id_attr()` exports retain distinct
+  resource and actor setting fallbacks.
+- Documented top-level `RebacManager` and `RebacQuerySet` imports are exposed
+  lazily without loading Django model classes during app initialization.
+- `QuerySet.scoped()` returns an eagerly scoped clone for SQL projections and
+  subqueries, pinning its resolved actor. `scoped_for_aggregate()` adds explicit
+  fail-closed behavior without an actor, independent of strict mode, and disables
+  instance field redaction. Callers still own projection-axis validation and
+  the cardinality of their own SQL joins.
+
+### Changed
+
+- Django and its development stubs are constrained to the supported 6.0.x
+  line. Fresh installations cannot silently select an unverified Django
+  feature release with incompatible ORM and admin hooks.
+- **Security hardening (alpha contract changes):** actor-scoped bulk upserts
+  (`bulk_create(update_conflicts=True)`) and unmapped DRF actions now fail
+  closed. Configure custom DRF actions through `rebac_action_map`, and use
+  checked saves or explicit sudo for bulk conflict updates.
+- `REBAC_UNIVERSAL_ADMIN_ROLE` now defaults to `None`. Set an application-owned
+  role reference to enable the lint; the standalone engine no longer assumes
+  a particular consumer's admin namespace.
+- Normal schema sync preserves stale policy rows and reports drift. Deletion
+  requires `--force-overwrite`, with `--yes` in non-interactive runs as specified.
+- LocalBackend reads current database-visible state for freshness tokens and
+  rejects `AT_EXACT_SNAPSHOT`, which requires historical relationship storage.
+  Older tokens no longer hide newer deny relationships.
+- DB-backed schemas refresh per request/evaluator scope or unscoped public
+  backend operation, so policy edits in other workers take effect on the next
+  scope. This adds one schema load per scope; recursive reads reuse the AST.
+- LocalBackend bypasses decision caching inside database transactions and for
+  schemas declaring expiring relationships. This prevents grants surviving
+  rollback or tuple expiry; relationship mutations invalidate decisions across
+  backend instances and nested evaluator scopes.
+- CI and `make check` now gate formatting, strict mypy, and Pyright as well as
+  lint and tests. Contributor requirements match Python 3.14 / Django 6.0;
+  Celery docs now state that automatic propagation is not shipped.
+- Tag publication runs the full verification chain and strict distribution
+  metadata checks before uploading to PyPI, and retains the built artifacts.
+- `roles_reaching()` delegates to object-source introspection. It now follows
+  arrow-to-relation and subject-set targets and omits exclusion-right branches
+  from positive role classification. Named sources may still be ineffective due
+  to tuples, intersections or caveats; this helper must not authorize access.
+- Explicit actors override ambient sudo on both eager projection APIs, matching
+  normal queryset actor precedence. Explicit queryset sudo still bypasses scope.
+
+### Fixed
+
+- The documented top-level `RebacManager` and `RebacQuerySet` imports now
+  resolve lazily, preserving Django app-loading safety.
+- Channels adapter documentation now limits the mixin to async consumers;
+  synchronous Channels consumers do not await its connection hooks.
+- Stored caveat parameters take precedence over request context; invalid
+  boolean inputs and non-boolean caveat results cannot become truthy grants.
+  Relationship writes and reads enforce the declared caveat/expiration shape,
+  and `with expiration` parses as a relation modifier. Preflight virtual tuples
+  cannot bypass required caveats; their current shape supports only explicitly
+  uncaveated subject alternatives.
+- Conditional or built-in exclusion branches cannot over-grant resource
+  lookups; expired arrow edges are absent, and reverse subject lookups check
+  the complete permission rather than treating candidate tuples as grants.
+- Evaluator caches cannot reuse another backend's grants or conflate boolean
+  and numeric context values. Nested context values safely bypass caching.
+- Expired schema overrides stop granting through warm schema and evaluator
+  caches. Subscription invalidation refreshes schema snapshots too, and
+  transaction-local policy grants cannot remain cached after rollback.
+- Explicit queryset actors now carry through `create()` / `bulk_create()`;
+  bulk inserts enforce create permission. Save/delete signals share the same
+  actor resolver, so ambient sudo cannot override a pinned actor.
+- Every materialized copy of a joined related row receives actor stamping and
+  field redaction. Async iteration and projections no longer inherit root sudo
+  across protected relationships; expression aliases cannot hide guarded reads.
+- Async iterator field discovery and projection guards run in the worker thread,
+  preserving field redaction when schemas must be loaded from the database.
+- Strawberry subscription caches clear at each emission; GraphQL scopes retain
+  inherited freshness tokens and propagate writes back to HTTP middleware.
+- MCP streams restore the consumer's actor between chunks and during cross-task
+  cleanup; malformed explicit identity cannot fall back to an ambient actor.
+- ASGI middleware resolves Django's lazy session user and probes superuser
+  status through a worker thread, avoiding synchronous ORM access on the loop.
+- DRF honors per-view action mappings and keeps empty scoped lists valid.
+- Changing actor/action or applying sudo to an eagerly scoped queryset replaces
+  its old authorization restriction while preserving caller-authored predicates.
+  Lazy queryset clones also remove stale scope predicates before re-evaluation.
+- Boolean and SQL set combinations apply the left queryset actor/action policy
+  to every operand, including for native SQL subquery compilation. A combined
+  unscoped branch can no longer bypass the eager scope; rebinding replaces each
+  operand restriction without mutating source querysets. Empty-query boolean
+  fast paths retain the left actor. Boolean combinations with plain unscoped
+  QuerySets now raise TypeError because Django can return the unscoped operand
+  itself; combine REBAC querysets instead. SQL set combinators support plain
+  operands by applying policy to each underlying model query.
+- Numeric CEL literals and source columns following string literals survive
+  schema parsing and rendering.
+
 
 ## [0.14.1] — 2026-07-17
 

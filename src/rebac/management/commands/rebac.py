@@ -12,6 +12,7 @@ python manage.py rebac migrate-storage --to registry   # registry-storage cutove
 from __future__ import annotations
 
 import hashlib
+import sys
 from pathlib import Path
 from typing import Any
 
@@ -20,6 +21,7 @@ from django.core.management.base import BaseCommand, CommandError
 from django.utils import timezone
 
 from ...models.resource import RebacResource
+from ...schema import Schema, render_zed, resolve_schema_path
 from ...schema.parser import parse_zed, validate_schema
 
 
@@ -111,12 +113,20 @@ class Command(BaseCommand):
         check_only = options["check"]
         force = options["force_overwrite"]
         only_package = options.get("package")
+        if force and not check_only and not options["yes"]:
+            if not sys.stdin.isatty():
+                raise CommandError("Non-interactive --force-overwrite requires --yes.")
+            answer = input(
+                "Overwrite edited schema rows and delete stale policy rows? Type 'yes': "
+            )
+            if answer != "yes":
+                raise CommandError("Schema overwrite cancelled; no changes made.")
 
         sources: list[tuple[Any, Path, Any]] = []
         seen_definitions: dict[str, str] = {}
         seen_caveats: dict[str, str] = {}
         for app_config in apps.get_app_configs():
-            schema_path = self._resolve_schema_path(app_config)
+            schema_path = resolve_schema_path(app_config)
             if schema_path is None:
                 continue
             package_name = app_config.name
@@ -252,6 +262,7 @@ class Command(BaseCommand):
                         definition=schema_def,
                         keep_names=relation_names,
                         check_only=check_only,
+                        force=force,
                     )
                     any_drift = any_drift or drift
                     drift = self._prune_schema_children(
@@ -259,6 +270,7 @@ class Command(BaseCommand):
                         definition=schema_def,
                         keep_names=permission_names,
                         check_only=check_only,
+                        force=force,
                     )
                     any_drift = any_drift or drift
 
@@ -266,6 +278,7 @@ class Command(BaseCommand):
                     package=package_name,
                     keep_external_ids=expected_external_ids,
                     check_only=check_only,
+                    force=force,
                 )
                 any_drift = any_drift or drift
 
@@ -280,16 +293,6 @@ class Command(BaseCommand):
 
         reset_backend()
         self.stdout.write(self.style.SUCCESS("Sync complete."))
-
-    def _resolve_schema_path(self, app_config: Any) -> Path | None:
-        # Two ways to declare: `AppConfig.rebac_schema = "permissions.zed"` (rel
-        # path), or a `permissions.zed` adjacent to apps.py.
-        rel = getattr(app_config, "rebac_schema", None)
-        if rel is not None:
-            path = Path(app_config.path) / rel
-        else:
-            path = Path(app_config.path) / "permissions.zed"
-        return path if path.exists() else None
 
     def _sync_row(
         self,
@@ -389,17 +392,19 @@ class Command(BaseCommand):
         definition: Any,
         keep_names: set[str],
         check_only: bool,
+        force: bool,
     ) -> bool:
         """Remove relation/permission rows no longer declared by the package schema."""
         stale = list(model_cls.objects.filter(definition=definition).exclude(name__in=keep_names))
         if not stale:
             return False
-        if check_only:
+        if check_only or not force:
             for obj in stale:
                 self.stdout.write(
                     self.style.WARNING(
                         f"  ! drift: stale {model_cls.__name__} "
-                        f"{definition.resource_type}#{obj.name}"
+                        f"{definition.resource_type}#{obj.name} "
+                        "(--force-overwrite to delete)"
                     )
                 )
             return True
@@ -420,6 +425,7 @@ class Command(BaseCommand):
         package: str,
         keep_external_ids: set[str],
         check_only: bool,
+        force: bool,
     ) -> bool:
         from ...models import PackageManagedRecord
 
@@ -432,10 +438,13 @@ class Command(BaseCommand):
         ]
         if not stale:
             return False
-        if check_only:
+        if check_only or not force:
             for record in stale:
                 self.stdout.write(
-                    self.style.WARNING(f"  ! drift: stale managed row {record.external_id}")
+                    self.style.WARNING(
+                        f"  ! drift: stale managed row {record.external_id} "
+                        "(--force-overwrite to delete)"
+                    )
                 )
             return True
 
@@ -460,7 +469,7 @@ class Command(BaseCommand):
     def _handle_check(self) -> None:
         any_errors = False
         for app_config in apps.get_app_configs():
-            path = self._resolve_schema_path(app_config)
+            path = resolve_schema_path(app_config)
             if path is None:
                 continue
             text = path.read_text(encoding="utf-8")
@@ -513,7 +522,7 @@ class Command(BaseCommand):
         seen_definition_types: set[str] = set()
         seen_caveat_names: set[str] = set()
         for app_config in sorted(apps.get_app_configs(), key=lambda a: a.name):
-            path = self._resolve_schema_path(app_config)
+            path = resolve_schema_path(app_config)
             if path is None:
                 continue
             schema = parse_zed(path.read_text(encoding="utf-8"))
@@ -530,9 +539,9 @@ class Command(BaseCommand):
                 seen_caveat_names.add(c.name)
                 all_caveats.append(c)
 
-        body = self._render_zed_body(
-            sorted(all_definitions, key=lambda d: d.resource_type),
-            sorted(all_caveats, key=lambda c: c.name),
+        body = "\n" + render_zed(
+            Schema(definitions=all_definitions, caveats=all_caveats),
+            include_backing=False,
         )
         content_hash = hashlib.sha256(body.encode("utf-8")).hexdigest()
 
@@ -547,92 +556,6 @@ class Command(BaseCommand):
         # disables the platform-default translation.
         out_path.write_text(output, encoding="utf-8", newline="")
         self.stdout.write(self.style.SUCCESS(f"Wrote {out_path}"))
-
-    # ----- deterministic emitter helpers -----
-
-    def _render_zed_body(self, definitions: list[Any], caveats: list[Any]) -> str:
-        """Render the post-header body. Always ends in a trailing newline."""
-        parts: list[str] = []
-        # Caveats first — definitions may reference them, mirrors sync order
-        # and matches the SpiceDB convention.
-        for c in caveats:
-            parts.append(self._render_caveat(c))
-        for d in definitions:
-            parts.append(self._render_definition(d))
-        # `\n` separates each block; trailing `\n` ensures POSIX-clean file.
-        return ("\n" + "\n".join(parts)) if parts else "\n"
-
-    def _render_caveat(self, c: Any) -> str:
-        params = ", ".join(f"{p.name} {p.type}" for p in c.params)
-        return f"caveat {c.name}({params}) {{\n{c.expression}\n}}\n"
-
-    def _render_definition(self, d: Any) -> str:
-        lines: list[str] = [f"definition {d.resource_type} {{"]
-        relations = sorted(d.relations, key=lambda r: r.name)
-        permissions = sorted(d.permissions, key=lambda p: p.name)
-        for r in relations:
-            lines.append(f"    {self._render_relation(r)}")
-        if relations and permissions:
-            lines.append("")
-        for p in permissions:
-            lines.append(f"    permission {p.name} = {self._render_expr(p.expression)}")
-        lines.append("}")
-        return "\n".join(lines) + "\n"
-
-    def _render_relation(self, r: Any) -> str:
-        # Sort the type-union deterministically. Keys cover every distinguishing
-        # field of `AllowedSubject` so equal-by-type subjects with different
-        # subject-relations / wildcard / caveat / specific-id slots stay
-        # distinguishable. `id` MUST appear in the key or two subjects that
-        # differ only in id collapse to the same sort bucket — that breaks
-        # CLAUDE.md § 6 byte-for-byte determinism on the universal-admin
-        # pattern (`angee/role:admin#member` vs `angee/role:editor#member`).
-        subjects = sorted(
-            r.allowed_subjects,
-            key=lambda s: (s.type, s.id, s.relation, s.wildcard, s.with_caveat),
-        )
-        rendered = " | ".join(self._render_subject(s) for s in subjects)
-        suffix = " with expiration" if r.with_expiration else ""
-        return f"relation {r.name}: {rendered}{suffix}"
-
-    def _render_subject(self, s: Any) -> str:
-        # Five shapes; specific-id forms (`type:id` / `type:id#relation`) are
-        # the universal-admin pattern and were absent from earlier emitter
-        # versions — dropping `id` here widened a single-role type union to
-        # "members of any role of this type" and broke SpiceDB round-trip.
-        if s.wildcard:
-            base = f"{s.type}:*"
-        elif s.id and s.relation:
-            base = f"{s.type}:{s.id}#{s.relation}"
-        elif s.id:
-            base = f"{s.type}:{s.id}"
-        elif s.relation:
-            base = f"{s.type}#{s.relation}"
-        else:
-            base = s.type
-        if s.with_caveat:
-            base += f" with {s.with_caveat}"
-        return base
-
-    def _render_expr(self, expr: Any) -> str:
-        # Lazy import — keep AST coupling local to this method.
-        from ...schema.ast import PermArrow, PermBinOp, PermNil, PermRef
-
-        if isinstance(expr, PermNil):
-            return "nil"
-        if isinstance(expr, PermRef):
-            return expr.name
-        if isinstance(expr, PermArrow):
-            return f"{expr.via}->{expr.target}"
-        if isinstance(expr, PermBinOp):
-            # Per CLAUDE.md § 7: always parenthesise compound expressions.
-            # Operand order is preserved — `+` and `&` are commutative but
-            # reordering them changes meaning when arrows / caveats are in
-            # play (sorted definitions / relations is enough for determinism).
-            left = self._render_expr(expr.left)
-            right = self._render_expr(expr.right)
-            return f"({left} {expr.op} {right})"
-        raise CommandError(f"Unknown expression node: {type(expr).__name__}")
 
     # ---------- migrate-storage ----------
 

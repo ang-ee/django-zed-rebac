@@ -250,7 +250,7 @@ def test_local_backend_consistency_tokens_scope_direct_checks_and_accessible(
     after_bob = write_relationships([_grant(fake_users.bob, resource, "viewer")])
 
     assert local_backend.has_access(subject=_user(fake_users.bob), action="read", resource=resource)
-    assert not local_backend.has_access(
+    assert local_backend.has_access(
         subject=_user(fake_users.bob),
         action="read",
         resource=resource,
@@ -262,17 +262,14 @@ def test_local_backend_consistency_tokens_scope_direct_checks_and_accessible(
         resource=resource,
         at_zookie=after_bob,
     )
-    assert (
-        list(
-            local_backend.accessible(
-                subject=_user(fake_users.bob),
-                action="read",
-                resource_type="blog/post",
-                at_zookie=before_bob,
-            )
+    assert list(
+        local_backend.accessible(
+            subject=_user(fake_users.bob),
+            action="read",
+            resource_type="blog/post",
+            at_zookie=before_bob,
         )
-        == []
-    )
+    ) == ["freshness"]
     assert set(
         local_backend.accessible(
             subject=_user(fake_users.bob),

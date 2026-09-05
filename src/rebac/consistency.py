@@ -7,8 +7,9 @@ under default consistency.
 
 LocalBackend's freshness witness is the existing
 ``Relationship.written_at_xid`` column (already populated on every
-write); ``Zookie.token`` carries the xid and the backend translates
-``at_least_as_fresh`` to a ``written_at_xid <= cutoff`` filter.
+write); ``Zookie.token`` carries the xid. LocalBackend reads the current
+state visible to its Django connection, including rows newer than the
+token. A freshness floor must never filter out newer deny relationships.
 
 Transport between calls within a single request: the
 ``_current_zookie`` ContextVar, set automatically by
@@ -42,7 +43,7 @@ from .types import Consistency, Zookie
 # pytest reuses one thread per session, so the leak persists.
 _NO_SCOPE: Any = object()
 
-_current_zookie: ContextVar[Zookie | None | object] = ContextVar(
+_current_zookie: ContextVar[Zookie | object | None] = ContextVar(
     "rebac_current_zookie", default=_NO_SCOPE
 )
 

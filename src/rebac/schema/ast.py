@@ -27,7 +27,7 @@ class AllowedSubject:
     - ``auth/user`` → ``type="auth/user"`` (any user)
     - ``auth/user:*`` → ``type="auth/user", wildcard=True`` (the wildcard subject)
     - ``auth/group#member`` → ``type="auth/group", relation="member"`` (any group's member)
-    - ``angee/role:admin#member`` → ``type="angee/role", id="admin", relation="member"``
+    - ``platform/role:admin#member`` → ``type="platform/role", id="admin", relation="member"``
       (members of one specific resource id — the canonical pattern for
       universal admin roles)
     """
@@ -36,7 +36,7 @@ class AllowedSubject:
     relation: str = ""  # subject set, e.g. group#member
     wildcard: bool = False  # `auth/user:*`
     with_caveat: str = ""  # caveat the subject is bound by
-    # Specific resource id, e.g. `angee/role:admin#member`. Constrained at
+    # Specific resource id, e.g. `platform/role:admin#member`. Constrained at
     # parse time to identifier shape — `[A-Za-z_][A-Za-z0-9_]*` — even though
     # the runtime `Relationship.resource_id` column accepts the broader
     # SpiceDB object-id grammar. The schema-side restriction matches the
@@ -146,6 +146,38 @@ class Definition:
     resource_type: str
     relations: tuple[Relation, ...]
     permissions: tuple[Permission, ...]
+
+    def extend(
+        self,
+        *,
+        relations: Sequence[Relation] = (),
+        permission_arms: Sequence[Permission] = (),
+    ) -> Definition:
+        """Add relations and union permission arms without mutating this definition.
+
+        Existing declaration names cannot be reused; every permission arm must
+        target an existing permission. Operand order follows contribution order.
+        """
+        all_relations = {relation.name: relation for relation in self.relations}
+        permissions = {permission.name: permission for permission in self.permissions}
+        for relation in relations:
+            if relation.name in all_relations or relation.name in permissions:
+                raise ValueError(
+                    f"relation {self.resource_type}#{relation.name!r} already declared"
+                )
+            all_relations[relation.name] = relation
+        for arm in permission_arms:
+            current = permissions.get(arm.name)
+            if current is None:
+                raise ValueError(f"permission {self.resource_type}#{arm.name!r} is not declared")
+            permissions[arm.name] = Permission(
+                arm.name, PermBinOp("+", current.expression, arm.expression)
+            )
+        return Definition(
+            self.resource_type,
+            tuple(sorted(all_relations.values(), key=lambda relation: relation.name)),
+            tuple(sorted(permissions.values(), key=lambda permission: permission.name)),
+        )
 
 
 @dataclass

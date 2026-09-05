@@ -21,6 +21,8 @@ from rebac.models import (
 from rebac.schema import parse_zed
 
 SCHEMA_TEXT = """
+caveat during_business_hours(hour int) { hour >= 0 }
+caveat weekend_only(day int) { day >= 6 }
 definition auth/user {}
 
 definition auth/group {
@@ -29,7 +31,7 @@ definition auth/group {
 
 definition blog/post {
     relation owner:  auth/user
-    relation viewer: auth/user | auth/group#member | auth/user:*
+    relation viewer: auth/user | auth/group#member | auth/user:* | auth/user with during_business_hours | auth/user with weekend_only
     relation folder: blog/folder
 
     permission read   = owner + viewer + folder->read
@@ -311,8 +313,10 @@ def test_db_loaded_schema_refreshes_when_schema_rows_change() -> None:
     assert backend.has_access(subject=bob, action="read", resource=post)
 
 
-@pytest.mark.django_db
+@pytest.mark.django_db(transaction=True)
 def test_cached_db_schema_does_not_query_schema_tables_on_hot_path() -> None:
+    from rebac import evaluator_scope
+
     sd = SchemaDefinition.objects.create(resource_type="blog/post")
     SchemaRelation.objects.create(
         definition=sd,
@@ -331,10 +335,10 @@ def test_cached_db_schema_does_not_query_schema_tables_on_hot_path() -> None:
     alice = _user("alice")
     backend.write_relationships([RelationshipTuple(resource=post, relation="owner", subject=alice)])
 
-    assert backend.has_access(subject=alice, action="read", resource=post)
-
-    with CaptureQueriesContext(connection) as queries:
+    with evaluator_scope():
         assert backend.has_access(subject=alice, action="read", resource=post)
+        with CaptureQueriesContext(connection) as queries:
+            assert backend.has_access(subject=alice, action="read", resource=post)
 
     schema_queries = [query["sql"] for query in queries if '"rebac_schema' in query["sql"].lower()]
     assert schema_queries == []

@@ -202,11 +202,12 @@ def _set_schema_via_localbackend(schema_text):
     active.set_schema(parse_zed(schema_text))
 
 
+@override_settings(REBAC_UNIVERSAL_ADMIN_ROLE="platform/role:admin")
 def test_w004_warns_when_role_definition_missing_universal_admin():
     _set_schema_via_localbackend(
         """
         definition auth/user {}
-        definition angee/role {
+        definition platform/role {
             relation member: auth/user
         }
         definition storage/role {
@@ -221,15 +222,16 @@ def test_w004_warns_when_role_definition_missing_universal_admin():
     assert any("storage/role" in i.msg for i in w004)
 
 
+@override_settings(REBAC_UNIVERSAL_ADMIN_ROLE="platform/role:admin")
 def test_w004_silent_when_universal_admin_present():
     _set_schema_via_localbackend(
         """
         definition auth/user {}
-        definition angee/role {
+        definition platform/role {
             relation member: auth/user
         }
         definition storage/role {
-            relation member: auth/user | auth/group#member | angee/role:admin#member
+            relation member: auth/user | auth/group#member | platform/role:admin#member
         }
         """
     )
@@ -238,20 +240,21 @@ def test_w004_silent_when_universal_admin_present():
     assert w004 == []
 
 
+@override_settings(REBAC_UNIVERSAL_ADMIN_ROLE="platform/role:admin")
 def test_w004_skips_the_universal_admin_role_itself():
     # The universal-admin role doesn't reference itself; no self-loop
     # warning.
     _set_schema_via_localbackend(
         """
         definition auth/user {}
-        definition angee/role {
+        definition platform/role {
             relation member: auth/user
         }
         """
     )
     issues = check_universal_admin_in_roles()
     w004 = [i for i in issues if i.id == "rebac.W004"]
-    assert not any("angee/role" in i.msg for i in w004), [i.msg for i in w004]
+    assert not any("platform/role" in i.msg for i in w004), [i.msg for i in w004]
 
 
 def test_w004_disabled_when_setting_is_none():
@@ -269,12 +272,13 @@ def test_w004_disabled_when_setting_is_none():
     assert w004 == []
 
 
+@override_settings(REBAC_UNIVERSAL_ADMIN_ROLE="platform/role:admin")
 def test_w004_skips_non_role_definitions():
     # storage/file isn't a role — should be ignored by the check.
     _set_schema_via_localbackend(
         """
         definition auth/user {}
-        definition angee/role {
+        definition platform/role {
             relation member: auth/user
         }
         definition storage/file {
@@ -294,3 +298,8 @@ def test_w004_errors_on_malformed_setting():
         issues = check_universal_admin_in_roles()
     e005 = [i for i in issues if i.id == "rebac.E005"]
     assert e005, [i.id for i in issues]
+
+
+def test_universal_admin_is_opt_in():
+    assert app_settings.REBAC_UNIVERSAL_ADMIN_ROLE is None
+    assert check_universal_admin_in_roles() == []

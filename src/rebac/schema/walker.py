@@ -220,9 +220,15 @@ def field_gated_actions(definition: Definition, verb: str) -> frozenset[str]:
     return frozenset(p.name for p in definition.permissions if p.name.startswith(prefix))
 
 
-def subject_allowed_by_relation(relation: Relation, subject: SubjectRef) -> bool:
-    """Return whether ``subject`` matches a relation's declared type union."""
-    return any(_subject_matches_allowed(allowed, subject) for allowed in relation.allowed_subjects)
+def subject_allowed_by_relation(
+    relation: Relation, subject: SubjectRef, *, caveat_name: str | None = None
+) -> bool:
+    """Match a subject, and optionally its exact caveat, to one declared alternative."""
+    return any(
+        _subject_matches_allowed(allowed, subject)
+        and (caveat_name is None or allowed.with_caveat == caveat_name)
+        for allowed in relation.allowed_subjects
+    )
 
 
 def relationship_row_allowed_by_relation(relation: Relation, row: object) -> bool:
@@ -231,7 +237,11 @@ def relationship_row_allowed_by_relation(relation: Relation, row: object) -> boo
         getattr(row, "subject_id", ""),
         getattr(row, "optional_subject_relation", ""),
     )
-    return subject_allowed_by_relation(relation, subject)
+    if getattr(row, "expires_at", None) is not None and not relation.with_expiration:
+        return False
+    return subject_allowed_by_relation(
+        relation, subject, caveat_name=getattr(row, "caveat_name", "") or ""
+    )
 
 
 def _subject_matches_allowed(allowed: AllowedSubject, subject: SubjectRef) -> bool:
