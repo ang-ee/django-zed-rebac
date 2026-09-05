@@ -3,6 +3,29 @@
 All notable changes to `django-zed-rebac` are tracked here. The project is in
 pre-1.0; breaking changes within a minor version are explicitly called out.
 
+## [0.15.2] — 2026-09-05
+
+### Fixed
+
+- Persisted permission schemas belong to each evaluator and database connection.
+  Concurrent requests no longer replace each other's schema or decision cache.
+- Read-only work inside Django `atomic()` reuses its schema snapshot instead of
+  rebuilding the entire AST for every field or prefetched relation. Native SQL
+  writes, bulk updates and manual savepoint rollback invalidate retained schemas;
+  outer rollback and reused Atomic objects cannot retain temporary grants.
+  Permission decisions remain uncached inside transactions.
+- Same-connection bulk schema edits also invalidate autocommit snapshots. Changes
+  committed by another connection remain visible at the next evaluator boundary.
+- Manually managed transactions bypass decision caching as well, preventing a
+  rolled-back grant from surviving in an evaluator. Snapshot observers and their
+  no-op transaction markers are removed on scope exit without disturbing other
+  Django SQL wrappers or commit callbacks.
+
+### Clarified
+
+- Application-defined mutating SELECT functions and direct driver writes require
+  explicit evaluator invalidation; standard ORM and Django-cursor DML are observed.
+
 ## [0.15.1] — 2026-09-05
 
 ### Fixed

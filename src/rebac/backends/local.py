@@ -63,6 +63,7 @@ from ..schema.ast import (
     Relation,
     Schema,
 )
+from ..schema.cache import SchemaScope, SchemaSnapshot
 from ..schema.walker import (
     WalkContext,
 )
@@ -98,7 +99,7 @@ from .base import Backend
 _backend_registry_lock = Lock()
 _db_loaded_backends: WeakSet[LocalBackend] = WeakSet()
 _relationship_generation = 0
-_schema_operation_scope: ContextVar[object | None] = ContextVar(
+_schema_operation_scope: ContextVar[SchemaScope | None] = ContextVar(
     "rebac_schema_operation", default=None
 )
 
@@ -110,11 +111,14 @@ def _schema_operation[**P, R](method: Callable[P, R]) -> Callable[P, R]:
     def wrapped(*args: P.args, **kwargs: P.kwargs) -> R:
         token = None
         if _schema_operation_scope.get() is None:
-            token = _schema_operation_scope.set(object())
+            token = _schema_operation_scope.set(SchemaScope())
         try:
             return method(*args, **kwargs)
         finally:
             if token is not None:
+                scope = _schema_operation_scope.get()
+                if scope is not None:
+                    scope.clear()
                 _schema_operation_scope.reset(token)
 
     return wrapped
@@ -153,9 +157,8 @@ class LocalBackend(Backend):
         self._schema_lock = Lock()
         self._schema: Schema | None = None
         self._schema_is_manual = False
-        self._schema_scope: object | None = None
-        self._schema_expires_at: datetime | None = None
         self._schema_generation = 0
+        self._schema_invalidation_generation = 0
         # Counter used as a stable monotonic xid on backends (e.g. SQLite test
         # mode) without `txid_current()`.
         self._xid_counter = 0
@@ -181,56 +184,77 @@ class LocalBackend(Backend):
             self._schema_generation += 1
 
     def schema(self) -> Schema:
-        from django.db import connection
+        return self._schema_snapshot().schema
+
+    def _schema_snapshot(self) -> SchemaSnapshot:
+        from django.db import DEFAULT_DB_ALIAS, connections
         from django.utils import timezone
 
         from ..evaluator import current_evaluator
 
         evaluator = current_evaluator()
-        scope = (
-            evaluator._schema_scope_token
-            if evaluator is not None and not connection.in_atomic_block
-            else _schema_operation_scope.get() or object()
-        )
         with self._schema_lock:
-            if self._schema is None or (
-                not self._schema_is_manual
-                and (
-                    self._schema_scope is not scope
-                    or (
-                        self._schema_expires_at is not None
-                        and self._schema_expires_at <= timezone.now()
-                    )
+            if self._schema_is_manual and self._schema is not None:
+                return SchemaSnapshot(
+                    self._schema,
+                    None,
+                    self._schema_generation,
+                    self._schema_invalidation_generation,
                 )
+            connection = connections[DEFAULT_DB_ALIAS]
+            # Manual transaction management has no on_commit lifecycle to
+            # observe. Preserve operation-only snapshots in that mode.
+            scoped = connection.get_autocommit() or (
+                connection.in_atomic_block and connection.commit_on_exit
+            )
+            scope = (
+                evaluator._schema_scope
+                if evaluator is not None and scoped
+                else _schema_operation_scope.get()
+            )
+            snapshots = scope.snapshots(connection) if scope is not None else None
+            snapshot = snapshots.get(self) if snapshots is not None else None
+            if (
+                snapshot is not None
+                and snapshot.invalidation_generation == self._schema_invalidation_generation
+                and (snapshot.expires_at is None or snapshot.expires_at > timezone.now())
             ):
-                # Scope boundaries observe other workers' commits. Within a
-                # scope, signals and override deadlines invalidate the AST.
-                self._schema = self._load_schema_from_db()
-                self._schema_is_manual = False
-                self._schema_scope = scope
-                self._schema_generation += 1
-            return self._schema
+                return snapshot
+            schema, expires_at = self._load_schema_from_db()
+            self._schema = schema
+            self._schema_is_manual = False
+            self._schema_generation += 1
+            snapshot = SchemaSnapshot(
+                schema, expires_at, self._schema_generation, self._schema_invalidation_generation
+            )
+            if snapshots is not None:
+                snapshots[self] = snapshot
+            return snapshot
 
     def _cache_generation(self) -> tuple[int, int] | None:
         """Return a decision generation, or bypass time/transaction-sensitive caching."""
         from django.db import connection
 
-        if connection.in_atomic_block:
+        if connection.in_atomic_block or (
+            connection.connection is not None and not connection.get_autocommit()
+        ):
             return None
-        schema = self.schema()
+        snapshot = self._schema_snapshot()
+        schema = snapshot.schema
         if any(relation.with_expiration for d in schema.definitions for relation in d.relations):
             # A relationship deadline can pass with no write or schema change.
             # Dependency-specific expiry tracking is not implemented yet.
             return None
-        return self._schema_generation, _relationship_generation
+        return snapshot.generation, _relationship_generation
 
     def mark_schema_stale(self) -> None:
         """Drop a DB-loaded schema cache after Schema* row changes."""
         with self._schema_lock:
             if not self._schema_is_manual:
                 self._schema = None
+                self._schema_invalidation_generation += 1
 
-    def _load_schema_from_db(self) -> Schema:
+    def _load_schema_from_db(self) -> tuple[Schema, datetime | None]:
         from django.db.models import Prefetch, Q
         from django.utils import timezone
 
@@ -311,11 +335,11 @@ class LocalBackend(Backend):
             .select_related("target_ct")
             .order_by("kind", "created_at", "pk")
         )
-        self._schema_expires_at = min(
+        expires_at = min(
             (row.expires_at for row in overrides if row.expires_at is not None),
             default=None,
         )
-        return compose(baseline, overrides)
+        return compose(baseline, overrides), expires_at
 
     # ---------- Public API ----------
 

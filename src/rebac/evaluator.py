@@ -35,6 +35,7 @@ from contextlib import contextmanager
 from contextvars import ContextVar
 from typing import TYPE_CHECKING, Any
 
+from .schema.cache import SchemaScope
 from .types import CheckResult, Consistency, ObjectRef, PermissionResult, SubjectRef, Zookie
 
 if TYPE_CHECKING:  # pragma: no cover
@@ -95,13 +96,13 @@ class PermissionEvaluator:
     supported for tests.
     """
 
-    __slots__ = ("_accessible_cache", "_check_cache", "_max_size", "_schema_scope_token")
+    __slots__ = ("_accessible_cache", "_check_cache", "_max_size", "_schema_scope")
 
     def __init__(self, *, max_size: int = 10_000) -> None:
         self._check_cache: OrderedDict[tuple[Any, ...], CheckResult] = OrderedDict()
         self._accessible_cache: OrderedDict[tuple[Any, ...], tuple[str, ...]] = OrderedDict()
         self._max_size = max_size
-        self._schema_scope_token = object()
+        self._schema_scope = SchemaScope()
 
     # ----- public API -----
 
@@ -207,7 +208,7 @@ class PermissionEvaluator:
         """
         self._check_cache.clear()
         self._accessible_cache.clear()
-        self._schema_scope_token = object()
+        self._schema_scope.clear()
 
     # ----- introspection (for tests + debugging) -----
 
@@ -278,9 +279,13 @@ def evaluator_scope(
     if evaluator is None:
         evaluator = PermissionEvaluator(max_size=app_settings.REBAC_EVALUATOR_CACHE_SIZE)
     token = _current_evaluator.set(evaluator)
+    evaluator._schema_scope.users += 1
     try:
         yield evaluator
     finally:
+        evaluator._schema_scope.users -= 1
+        if evaluator._schema_scope.users == 0:
+            evaluator._schema_scope.clear()
         try:
             _current_evaluator.reset(token)
         except ValueError:
