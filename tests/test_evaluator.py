@@ -9,6 +9,8 @@ from __future__ import annotations
 from contextvars import copy_context
 from typing import Any
 
+import pytest
+
 from rebac import (
     Backend,
     CheckResult,
@@ -158,6 +160,86 @@ def test_check_with_different_context_misses():
     ev.check(backend, subject=subj, action="read", resource=res, context={"ip": "1.1.1.1"})
     ev.check(backend, subject=subj, action="read", resource=res, context={"ip": "2.2.2.2"})
     assert backend.check_calls == 2
+
+
+def test_evaluator_does_not_reuse_another_backends_grants():
+    allowed = _StubBackend(accessible_ids=("private",))
+    denied = _StubBackend(check_result=CheckResult.no(), accessible_ids=())
+    actor = SubjectRef.of("auth/user", "1")
+    resource = ObjectRef("blog/post", "private")
+    ev = PermissionEvaluator()
+    assert ev.check(allowed, subject=actor, action="read", resource=resource).allowed
+    assert ev.accessible(
+        allowed, subject=actor, action="read", resource_type=resource.resource_type
+    )
+    assert not ev.check(denied, subject=actor, action="read", resource=resource).allowed
+    assert (
+        ev.accessible(denied, subject=actor, action="read", resource_type=resource.resource_type)
+        == ()
+    )
+
+
+def test_evaluator_keeps_reentrant_backend_checks_separate():
+    ev = PermissionEvaluator()
+    denied = _StubBackend(check_result=CheckResult.no())
+    actor = SubjectRef.of("auth/user", "1")
+    resource = ObjectRef("blog/post", "private")
+
+    class DelegatingBackend(_StubBackend):
+        def check_access(self, **_: Any) -> CheckResult:
+            assert not ev.check(denied, subject=actor, action="read", resource=resource).allowed
+            return CheckResult.has()
+
+    assert ev.check(DelegatingBackend(), subject=actor, action="read", resource=resource).allowed
+    assert not ev.check(denied, subject=actor, action="read", resource=resource).allowed
+
+
+def test_evaluator_keeps_reentrant_backend_lookups_separate():
+    ev = PermissionEvaluator()
+    denied = _StubBackend(accessible_ids=())
+    actor = SubjectRef.of("auth/user", "1")
+
+    class DelegatingBackend(_StubBackend):
+        def accessible(self, **_: Any) -> tuple[str, ...]:
+            assert (
+                ev.accessible(denied, subject=actor, action="read", resource_type="blog/post") == ()
+            )
+            return ("private",)
+
+    assert ev.accessible(
+        DelegatingBackend(), subject=actor, action="read", resource_type="blog/post"
+    ) == ("private",)
+    assert ev.accessible(denied, subject=actor, action="read", resource_type="blog/post") == ()
+
+
+@pytest.mark.parametrize("second_value", [1, 1.0])
+def test_evaluator_context_preserves_scalar_types(second_value):
+    backend = _StubBackend()
+    ev = PermissionEvaluator()
+    args = {
+        "subject": SubjectRef.of("auth/user", "1"),
+        "action": "read",
+        "resource": ObjectRef("blog/post", "p1"),
+    }
+    assert ev.check(backend, **args, context={"flag": True}).allowed
+    backend._check_result = CheckResult.no()
+    assert not ev.check(backend, **args, context={"flag": second_value}).allowed
+    assert backend.check_calls == 2
+
+
+@pytest.mark.parametrize("value", [{"nested": "value"}, ["value"], (True,)])
+def test_evaluator_complex_context_bypasses_cache(value):
+    backend = _StubBackend()
+    ev = PermissionEvaluator()
+    args = {
+        "subject": SubjectRef.of("auth/user", "1"),
+        "action": "read",
+        "resource": ObjectRef("blog/post", "p1"),
+    }
+    assert ev.check(backend, **args, context={"data": value}).allowed
+    backend._check_result = CheckResult.no()
+    assert not ev.check(backend, **args, context={"data": value}).allowed
+    assert ev.stats()["check_entries"] == 0
 
 
 # ---------- Accessible cache hit/miss ----------

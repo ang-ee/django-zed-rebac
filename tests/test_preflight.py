@@ -29,7 +29,7 @@ definition auth/group {
 
 definition blog/vault {
     relation owner:  auth/user
-    relation writer: auth/user | auth/group#member with link_not_expired
+    relation writer: auth/user | auth/user with link_not_expired | auth/group#member
     relation public: auth/user:*
     permission write = owner + writer
     permission read  = owner + writer

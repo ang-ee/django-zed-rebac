@@ -452,6 +452,42 @@ def test_async_generator_tool_denied_does_not_run_body() -> None:
     assert produced == []
 
 
+@pytest.mark.django_db(transaction=True)
+def test_stream_actor_is_scoped_to_production_and_cleanup() -> None:
+    from rebac import current_actor
+
+    caller = SubjectRef.of("auth/user", "caller")
+    tool_actor = SubjectRef.of("auth/user", "1")
+    _grant_invoke(ObjectRef("mcp/tool/edit_post", "*"), tool_actor)
+    seen: list[SubjectRef | None] = []
+
+    @rebac_mcp_tool(resource_type="mcp/tool/edit_post", action="invoke")
+    async def stream(ctx: object = None):
+        try:
+            seen.append(current_actor())
+            yield "a"
+            seen.append(current_actor())
+            yield "b"
+        finally:
+            seen.append(current_actor())
+
+    async def consume() -> None:
+        with actor_context(caller):
+            chunks = stream(ctx=_ctx(str(tool_actor)))
+            assert await anext(chunks) == "a"
+            try:
+                assert current_actor() == caller
+                # Stream consumers may resume or close in a different task.
+                assert await asyncio.create_task(anext(chunks)) == "b"
+                assert current_actor() == caller
+            finally:
+                await asyncio.create_task(chunks.aclose())
+            assert current_actor() == caller
+
+    asyncio.run(consume())
+    assert seen == [tool_actor, tool_actor, tool_actor]
+
+
 # ---------- malformed actor_subject fails closed (no 500) ----------
 
 
@@ -471,6 +507,24 @@ def test_malformed_actor_subject_raises_permission_denied_not_value_error() -> N
 
     with pytest.raises(PermissionDenied):
         edit(ctx=_ctx("garbage-no-colon"))
+    assert calls == []
+
+
+@pytest.mark.django_db
+@pytest.mark.parametrize("raw", ["garbage-no-colon", "", None, 123, {"actor": "auth/user:1"}])
+def test_explicit_invalid_actor_cannot_fall_back_to_privileged_ambient(raw) -> None:
+    _grant_invoke(ObjectRef("mcp/tool/edit_post", "*"), SubjectRef.of("auth/user", "1"))
+    calls = []
+
+    @rebac_mcp_tool(resource_type="mcp/tool/edit_post", action="invoke")
+    def edit(ctx: object = None) -> str:
+        calls.append("ran")
+        return "ok"
+
+    ctx = SimpleNamespace(request_context=SimpleNamespace(meta={"actor_subject": raw}))
+    with actor_context(SubjectRef.of("auth/user", "1")):
+        with pytest.raises(PermissionDenied):
+            edit(ctx=ctx)
     assert calls == []
 
 

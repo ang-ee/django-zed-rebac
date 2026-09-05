@@ -123,7 +123,7 @@ Convention paired with this relation: addons that want runtime-editable role
 hierarchy declare their roles as::
 
     definition <namespace>/role {
-        relation member:   auth/user | auth/group#member | angee/role:admin#member
+        relation member:   auth/user | auth/group#member | platform/role:admin#member
         relation includes: <namespace>/role#effective_member
 
         permission effective_member = member + includes

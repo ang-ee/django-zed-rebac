@@ -17,12 +17,14 @@ import pytest
 
 from rebac import (
     LocalBackend,
+    MissingActorError,
     ObjectRef,
     PermissionDenied,
     RelationshipTuple,
     SubjectRef,
     actor_context,
     backend,
+    sudo,
 )
 from rebac.actors import anonymous_actor
 from rebac.backends import reset_backend
@@ -171,3 +173,86 @@ def test_anonymous_actor_cannot_create_when_create_is_authenticated(_global_back
     with actor_context(anonymous_actor()):
         with pytest.raises(PermissionDenied):
             Post.objects.create(title="nope")
+
+
+@pytest.mark.django_db
+def test_queryset_create_pins_actor_without_ambient_context(_global_backend) -> None:
+    from tests.testapp.models import Post
+
+    actor = SubjectRef.of("auth/user", "alice")
+    post = Post.objects.with_actor(actor).create(title="hello")
+
+    assert post.pk is not None
+    assert post.actor() == actor
+
+
+@pytest.mark.django_db
+@pytest.mark.parametrize("ambient_bypass", [False, True])
+def test_queryset_create_explicit_denied_actor_beats_ambient_scope(
+    _global_backend, ambient_bypass
+) -> None:
+    from tests.testapp.models import Post
+
+    context = (
+        sudo(reason="test.ambient")
+        if ambient_bypass
+        else actor_context(SubjectRef.of("auth/user", "alice"))
+    )
+    with context:
+        with pytest.raises(PermissionDenied):
+            Post.objects.with_actor(anonymous_actor()).create(title="forbidden")
+    assert not Post.objects.sudo(reason="test.verify").exists()
+
+
+@pytest.mark.django_db
+def test_explicit_queryset_sudo_allows_create_without_leaving_instance_elevated(
+    _global_backend,
+) -> None:
+    from tests.testapp.models import Post
+
+    post = Post.objects.sudo(reason="test.create").create(title="fixture")
+
+    assert post.pk is not None
+    assert not post.is_sudo()
+
+
+@pytest.mark.django_db
+def test_bulk_create_requires_actor(_global_backend) -> None:
+    from tests.testapp.models import Post
+
+    with pytest.raises(MissingActorError):
+        Post.objects.bulk_create([Post(title="forbidden")])
+    assert not Post.objects.sudo(reason="test.verify").exists()
+
+
+@pytest.mark.django_db
+def test_bulk_create_rejects_denied_actor_and_pins_authorized_actor(_global_backend) -> None:
+    from tests.testapp.models import Post
+
+    with sudo(reason="test.ambient"):
+        with pytest.raises(PermissionDenied):
+            Post.objects.with_actor(anonymous_actor()).bulk_create([Post(title="forbidden")])
+    actor = SubjectRef.of("auth/user", "alice")
+    rows = Post.objects.with_actor(actor).bulk_create([Post(title="allowed")])
+    assert rows[0].pk is not None
+    assert rows[0].actor() == actor
+    assert Post.objects.sudo(reason="test.verify").count() == 1
+
+
+@pytest.mark.django_db
+def test_bulk_create_cannot_update_conflicts_with_only_create_permission(_global_backend) -> None:
+    from tests.testapp.models import Post
+
+    with sudo(reason="test.fixture"):
+        post = Post.objects.create(title="private")
+    actor = SubjectRef.of("auth/user", "alice")
+
+    with pytest.raises(PermissionDenied):
+        Post.objects.with_actor(actor).bulk_create(
+            [Post(pk=post.pk, title="overwritten")],
+            update_conflicts=True,
+            update_fields=["title"],
+            unique_fields=["pk"],
+        )
+
+    assert Post.objects.sudo(reason="test.verify").get(pk=post.pk).title == "private"

@@ -16,6 +16,14 @@ class CustomPostQuerySet(RebacQuerySet[Any]):
         return self.filter(title=title)
 
 
+def test_documented_manager_imports_resolve_from_package() -> None:
+    import rebac
+
+    assert rebac.RebacManager is RebacManager
+    assert rebac.RebacQuerySet is RebacQuerySet
+    assert {"RebacManager", "RebacQuerySet"} <= set(rebac.__all__)
+
+
 def test_rebac_manager_from_queryset_preserves_queryset_class() -> None:
     manager = RebacManager.from_queryset(CustomPostQuerySet)()
     manager.model = Post

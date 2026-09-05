@@ -31,7 +31,9 @@ Limitations (v0.4):
 
 * Caveats on the **top-level virtual tuples** are not supported — the
   ``relationships`` overlay is a bare ``SubjectRef`` sequence with no
-  caveat context. Caveat-conditional ``create`` permissions remain
+  caveat name or pinned context. These tuples must match an explicitly
+  uncaveated schema alternative; required-caveat alternatives fail closed.
+  Caveat-conditional ``create`` permissions remain
   evaluated through :meth:`Backend.check_access` for the *post-hop*
   targets only.
 * SpiceDB-style backends don't ship a "check with proposed tuples"
@@ -212,7 +214,7 @@ def _build_ctx(
         candidates = [
             candidate
             for candidate in relationships.get(relation, ())
-            if subject_allowed_by_relation(relation_def, candidate)
+            if subject_allowed_by_relation(relation_def, candidate, caveat_name="")
         ]
         return _virtual_membership(
             ctx=ctx,
@@ -236,7 +238,7 @@ def _build_ctx(
         candidates = [
             candidate
             for candidate in relationships.get(via, ())
-            if subject_allowed_by_relation(via_relation, candidate)
+            if subject_allowed_by_relation(via_relation, candidate, caveat_name="")
         ]
         if not candidates:
             return False

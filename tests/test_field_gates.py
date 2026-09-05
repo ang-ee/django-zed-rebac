@@ -199,7 +199,7 @@ def test_editor_save_with_update_fields_includes_gated(alice, bob, post):
         instance.save(update_fields=["title"])
 
 
-def test_handbuilt_instance_with_pinned_actor(alice):
+def test_handbuilt_instance_with_pinned_actor(alice, post):
     """A hand-built instance with ``_rebac_actor`` pinned saves through
     the create path (no per-field gate fires on INSERT).
     """
@@ -207,12 +207,10 @@ def test_handbuilt_instance_with_pinned_actor(alice):
 
     instance = Post(title="from-thin-air", body="b")
     instance._rebac_actor = SubjectRef.of("auth/user", str(alice.pk))
-    # Owner is implied by the schema's ``create = owner`` test only when
-    # the relation row exists. Use sudo for the pure-create demonstration
-    # — what matters for Part C is that pinned-actor instances reach
-    # pre_save with the actor attached.
-    with sudo(reason="test.create"):
-        instance.save()
+    # This schema's create gate requires ownership of an existing resource.
+    # Grant it explicitly so the pinned actor can authorize the insert.
+    _grant(post.pk, alice, "owner")
+    instance.save()
     assert instance.pk is not None
 
 

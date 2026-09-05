@@ -12,6 +12,7 @@ python manage.py rebac migrate-storage --to registry   # registry-storage cutove
 from __future__ import annotations
 
 import hashlib
+import sys
 from pathlib import Path
 from typing import Any
 
@@ -112,6 +113,14 @@ class Command(BaseCommand):
         check_only = options["check"]
         force = options["force_overwrite"]
         only_package = options.get("package")
+        if force and not check_only and not options["yes"]:
+            if not sys.stdin.isatty():
+                raise CommandError("Non-interactive --force-overwrite requires --yes.")
+            answer = input(
+                "Overwrite edited schema rows and delete stale policy rows? Type 'yes': "
+            )
+            if answer != "yes":
+                raise CommandError("Schema overwrite cancelled; no changes made.")
 
         sources: list[tuple[Any, Path, Any]] = []
         seen_definitions: dict[str, str] = {}
@@ -253,6 +262,7 @@ class Command(BaseCommand):
                         definition=schema_def,
                         keep_names=relation_names,
                         check_only=check_only,
+                        force=force,
                     )
                     any_drift = any_drift or drift
                     drift = self._prune_schema_children(
@@ -260,6 +270,7 @@ class Command(BaseCommand):
                         definition=schema_def,
                         keep_names=permission_names,
                         check_only=check_only,
+                        force=force,
                     )
                     any_drift = any_drift or drift
 
@@ -267,6 +278,7 @@ class Command(BaseCommand):
                     package=package_name,
                     keep_external_ids=expected_external_ids,
                     check_only=check_only,
+                    force=force,
                 )
                 any_drift = any_drift or drift
 
@@ -380,17 +392,19 @@ class Command(BaseCommand):
         definition: Any,
         keep_names: set[str],
         check_only: bool,
+        force: bool,
     ) -> bool:
         """Remove relation/permission rows no longer declared by the package schema."""
         stale = list(model_cls.objects.filter(definition=definition).exclude(name__in=keep_names))
         if not stale:
             return False
-        if check_only:
+        if check_only or not force:
             for obj in stale:
                 self.stdout.write(
                     self.style.WARNING(
                         f"  ! drift: stale {model_cls.__name__} "
-                        f"{definition.resource_type}#{obj.name}"
+                        f"{definition.resource_type}#{obj.name} "
+                        "(--force-overwrite to delete)"
                     )
                 )
             return True
@@ -411,6 +425,7 @@ class Command(BaseCommand):
         package: str,
         keep_external_ids: set[str],
         check_only: bool,
+        force: bool,
     ) -> bool:
         from ...models import PackageManagedRecord
 
@@ -423,10 +438,13 @@ class Command(BaseCommand):
         ]
         if not stale:
             return False
-        if check_only:
+        if check_only or not force:
             for record in stale:
                 self.stdout.write(
-                    self.style.WARNING(f"  ! drift: stale managed row {record.external_id}")
+                    self.style.WARNING(
+                        f"  ! drift: stale managed row {record.external_id} "
+                        "(--force-overwrite to delete)"
+                    )
                 )
             return True
 

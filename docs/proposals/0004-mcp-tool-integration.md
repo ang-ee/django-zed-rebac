@@ -81,9 +81,11 @@ async def search_documents(
 callable (against the request context) first, then falls back to the ambient
 `current_actor()`; no actor resolved → fail closed. The explicit per-request
 ctx identity outranks the ambient ContextVar (CLAUDE.md § 5), so a leaked
-ambient actor cannot override the authenticated caller. A malformed
-`actor_subject` is a clean deny, not a 500 — `default_actor_resolver` returns
-`None` on an unparseable ref. The body runs inside `actor_context(actor)` so any
+ambient actor cannot override the authenticated caller. An explicitly supplied
+`actor_subject` that is malformed, empty, or not a string is a clean deny, even
+when an ambient actor exists. `default_actor_resolver` returns `None` on an
+unparseable ref; the wrapper permits ambient fallback only when the metadata
+contains no identity field. The body runs inside `actor_context(actor)` so any
 queryset it builds scopes to the same actor; sync functions, coroutine
 functions, and async generators (streaming tools) are all supported. The context
 is read through a single `_context_meta(ctx)` accessor by duck-typing
@@ -98,6 +100,18 @@ surfaces the missing caveat parameters in the `PermissionDenied` message.
 `hide_id_arg` is a documented no-op against FastMCP 1.27 (no public
 schema-filtering hook) and warns when set; keep the hidden id keyword-only so it
 stays off the model-facing surface.
+
+**Identity trust boundary.** The default resolver expects `actor_subject` to
+have been populated by trusted server authentication code. Never copy a
+client-provided `_meta.actor_subject` into this field unchanged: the transport
+must overwrite it with the verified caller identity, or configure
+`REBAC_MCP_ACTOR_RESOLVER` to read verified server-side authentication state.
+Parsing a canonical subject string establishes its shape, not its authenticity.
+
+Streaming tools enter the actor scope around each iterator advancement and
+cleanup, then restore the caller's scope before yielding a chunk. This keeps
+the tool actor out of the stream consumer and supports advancement/close in
+different asynchronous tasks.
 
 ## Tests
 

@@ -56,12 +56,9 @@ _DEFAULTS: dict[str, Any] = {
     # role's ``#member`` subject-set in its ``member`` relation's type
     # union so the role acts as an "all roles" override.
     #
-    # Set to ``None`` to disable the W004 check entirely (security-locked
-    # environments where the universal-admin tier is unacceptable).
-    #
-    # Default ``"angee/role:admin"`` matches the role shipped by
-    # ``angee.auth`` in the angee-django framework.
-    "REBAC_UNIVERSAL_ADMIN_ROLE": "angee/role:admin",
+    # Opt in with an application-owned role reference; the standalone engine
+    # must not assume a consumer's namespace or admin policy.
+    "REBAC_UNIVERSAL_ADMIN_ROLE": None,
     # Where the engine sources resource ids when a model doesn't set
     # ``Meta.rebac_id_attr``. ``"pk"`` is the historical default;
     # consumers shipping public-id fields (sqid, public_id, slug) flip

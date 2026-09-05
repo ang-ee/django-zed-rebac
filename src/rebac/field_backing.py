@@ -131,7 +131,7 @@ def resolve_const_backing(
 
     Returns ``None`` when the binding is not a const backing or the declaring
     type has no loaded Django model. The target type need not be a model (it is
-    commonly a virtual role namespace such as ``angee/role``); only the source
+    commonly a virtual role namespace such as ``platform/role``); only the source
     type must be one, because the reverse direction enumerates its rows.
     """
     backing = relation.backing

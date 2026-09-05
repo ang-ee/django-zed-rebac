@@ -9,10 +9,19 @@ audit emission, and cycle detection.
 
 from __future__ import annotations
 
+from datetime import timedelta
+
 import pytest
 from django.contrib.contenttypes.models import ContentType
 
-from rebac import LocalBackend, ObjectRef, RelationshipTuple, SubjectRef
+from rebac import (
+    LocalBackend,
+    ObjectRef,
+    PermissionEvaluator,
+    RelationshipTuple,
+    SubjectRef,
+    evaluator_scope,
+)
 from rebac.composition import compose
 from rebac.errors import SchemaError
 from rebac.models import (
@@ -82,6 +91,124 @@ def _seed_db_schema(resource_type: str, perm_name: str, expr_text: str) -> Schem
     )
     sp = SchemaPermission.objects.create(definition=sd, name=perm_name, expression=expr_text)
     return sp
+
+
+@pytest.mark.django_db(transaction=True)
+@pytest.mark.parametrize("warm_cache", [False, True])
+@pytest.mark.parametrize(
+    "surface", ["check", "accessible", "lookup", "grants_all", "evaluator", "evaluator_accessible"]
+)
+def test_expired_override_cannot_grant_access(monkeypatch, warm_cache, surface):
+    from django.utils import timezone
+
+    now = timezone.now()
+    deadline = now + timedelta(minutes=1)
+    clock = {"now": now}
+    monkeypatch.setattr(timezone, "now", lambda: clock["now"])
+    sp = _seed_db_schema("blog/post", "read", "owner")
+    SchemaDefinition.objects.create(resource_type="auth/user")
+    SchemaOverride.objects.create(
+        kind=SchemaOverride.KIND_LOOSEN,
+        target_ct=ContentType.objects.get_for_model(SchemaPermission),
+        target_pk=sp.pk,
+        expression="authenticated" if surface == "grants_all" else "viewer",
+        reason="temporary sharing",
+        expires_at=deadline,
+    )
+    local = LocalBackend()
+    viewer = SubjectRef.of("auth/user", "viewer")
+    post = ObjectRef("blog/post", "1")
+    local.write_relationships([RelationshipTuple(post, "viewer", viewer)])
+    local.mark_schema_stale()
+    evaluator = PermissionEvaluator()
+
+    def granted():
+        if surface == "accessible":
+            return bool(
+                list(local.accessible(subject=viewer, action="read", resource_type="blog/post"))
+            )
+        if surface == "lookup":
+            return bool(
+                list(local.lookup_subjects(resource=post, action="read", subject_type="auth/user"))
+            )
+        if surface == "evaluator":
+            return evaluator.check(local, subject=viewer, action="read", resource=post).allowed
+        if surface == "evaluator_accessible":
+            return bool(
+                evaluator.accessible(
+                    local, subject=viewer, action="read", resource_type="blog/post"
+                )
+            )
+        if surface == "grants_all":
+            return local.grants_all(subject=viewer, action="read", resource_type="blog/post")
+        return local.check_access(subject=viewer, action="read", resource=post).allowed
+
+    with evaluator_scope(evaluator):
+        if warm_cache:
+            assert granted()
+        clock["now"] = deadline
+        assert not granted()
+
+
+@pytest.mark.django_db(transaction=True)
+def test_next_scope_observes_schema_edits_without_local_signals():
+    sp = _seed_db_schema("blog/post", "read", "viewer")
+    local = LocalBackend()
+    viewer = SubjectRef.of("auth/user", "viewer")
+    post = ObjectRef("blog/post", "1")
+    local.write_relationships([RelationshipTuple(post, "viewer", viewer)])
+    with evaluator_scope() as evaluator:
+        assert evaluator.check(local, subject=viewer, action="read", resource=post).allowed
+        # Model QuerySet.update bypasses this process's signals, simulating a
+        # write committed by another worker. This scope retains its snapshot.
+        SchemaPermission.objects.filter(pk=sp.pk).update(expression="owner")
+        assert evaluator.check(local, subject=viewer, action="read", resource=post).allowed
+    with evaluator_scope() as evaluator:
+        assert not evaluator.check(local, subject=viewer, action="read", resource=post).allowed
+
+
+@pytest.mark.django_db(transaction=True)
+def test_evaluator_invalidation_refreshes_schema_after_external_edit():
+    sp = _seed_db_schema("blog/post", "read", "viewer")
+    local = LocalBackend()
+    viewer = SubjectRef.of("auth/user", "viewer")
+    post = ObjectRef("blog/post", "1")
+    local.write_relationships([RelationshipTuple(post, "viewer", viewer)])
+    with evaluator_scope() as evaluator:
+        assert evaluator.check(local, subject=viewer, action="read", resource=post).allowed
+        SchemaPermission.objects.filter(pk=sp.pk).update(expression="owner")
+        # Subscription emissions reuse this object and call invalidate().
+        evaluator.invalidate()
+        assert not evaluator.check(local, subject=viewer, action="read", resource=post).allowed
+
+
+@pytest.mark.django_db(transaction=True)
+def test_unscoped_backend_reads_observe_schema_edits_without_local_signals():
+    sp = _seed_db_schema("blog/post", "read", "viewer")
+    local = LocalBackend()
+    viewer = SubjectRef.of("auth/user", "viewer")
+    post = ObjectRef("blog/post", "1")
+    local.write_relationships([RelationshipTuple(post, "viewer", viewer)])
+    assert local.check_access(subject=viewer, action="read", resource=post).allowed
+    SchemaPermission.objects.filter(pk=sp.pk).update(expression="owner")
+    assert not local.check_access(subject=viewer, action="read", resource=post).allowed
+
+
+@pytest.mark.django_db(transaction=True)
+def test_schema_grant_cannot_survive_transaction_rollback_in_evaluator():
+    from django.db import transaction
+
+    sp = _seed_db_schema("blog/post", "read", "owner")
+    local = LocalBackend()
+    viewer = SubjectRef.of("auth/user", "viewer")
+    post = ObjectRef("blog/post", "1")
+    local.write_relationships([RelationshipTuple(post, "viewer", viewer)])
+    with evaluator_scope() as evaluator:
+        with transaction.atomic():
+            SchemaPermission.objects.filter(pk=sp.pk).update(expression="viewer")
+            assert evaluator.check(local, subject=viewer, action="read", resource=post).allowed
+            transaction.set_rollback(True)
+        assert not evaluator.check(local, subject=viewer, action="read", resource=post).allowed
 
 
 def _make_ovr(target: SchemaPermission, kind: str, expression: str) -> SchemaOverride:

@@ -9,8 +9,8 @@ sources:
     (`now`).
   - **dynamic context**: passed to `check_access(context=...)` at check time.
 
-The two are merged with **dynamic > static** precedence (the request can
-override what was pinned, mirroring SpiceDB).
+The two are merged with **static > dynamic** precedence, mirroring SpiceDB.
+Request context can supply missing inputs but cannot override pinned policy.
 
 Evaluation is tri-state:
 
@@ -141,7 +141,9 @@ def _coerce_param(value: Any, type_name: str, cel: Any) -> Any:
     if base in ("double", "float"):
         return ct.DoubleType(value)
     if base == "bool":
-        return ct.BoolType(bool(value))
+        if not isinstance(value, (bool, ct.BoolType)):
+            raise CaveatUnsupportedError("A bool caveat parameter requires a boolean value")
+        return ct.BoolType(value)
     if base == "string":
         return ct.StringType(value)
     if base == "bytes":
@@ -164,9 +166,8 @@ def evaluate(
         `(None, missing)` — required params missing in both contexts; tuple
         of names is sorted (deterministic).
 
-    `dynamic_context` (request-time) takes precedence over `static_context`
-    (write-time) when a key is present in both. This mirrors SpiceDB's
-    "context overrides relationship-pinned values" semantics.
+    `static_context` (write-time) takes precedence over `dynamic_context`
+    (request-time) when a key is present in both, as in SpiceDB.
     """
     static = static_context or {}
     dynamic = dynamic_context or {}
@@ -189,18 +190,18 @@ def evaluate(
     cel = _load_celpy()
     activation: dict[str, Any] = {}
     for name, type_name in declared.items():
-        # Dynamic wins when both supply.
-        raw = dynamic[name] if name in dynamic else static[name]
+        # Stored policy wins when both supply.
+        raw = static[name] if name in static else dynamic[name]
         activation[name] = _coerce_param(raw, type_name, cel)
 
     # Surface anything else the caller passed (caveats can reference globals
     # like `request.ip` if the schema declares them; we already handled
     # declared params above). Everything else is best-effort opaque.
-    for name, raw in static.items():
+    for name, raw in dynamic.items():
         if name in declared or name in activation:
             continue
         activation[name] = raw
-    for name, raw in dynamic.items():
+    for name, raw in static.items():
         if name in declared:
             continue
         activation[name] = raw
@@ -220,6 +221,8 @@ def evaluate(
             f"Caveat {caveat.name!r} failed to evaluate: {exc.args[0] if exc.args else exc}"
         ) from exc
 
+    if not isinstance(result, (bool, cel.celtypes.BoolType)):
+        raise CaveatUnsupportedError(f"Caveat {caveat.name!r} must evaluate to a boolean")
     return bool(result), ()
 
 
