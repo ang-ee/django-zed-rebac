@@ -263,7 +263,7 @@ wheels = [
 
 [[package]]
 name = "django-zed-rebac"
-version = "0.15.0.dev0"
+version = "0.15.1"
 source = { editable = "." }
 dependencies = [
     { name = "django" },
@@ -305,9 +305,9 @@ requires-dist = [
     { name = "authzed", marker = "extra == 'spicedb'", specifier = ">=0.13" },
     { name = "cel-python", marker = "extra == 'caveats'", specifier = ">=0.1.5" },
     { name = "channels", marker = "extra == 'strawberry'", specifier = ">=4.0" },
-    { name = "django", specifier = ">=6.0" },
-    { name = "django-stubs", extras = ["compatible-mypy"], marker = "extra == 'dev'", specifier = ">=5.1" },
-    { name = "django-stubs-ext", marker = "extra == 'dev'", specifier = ">=5.1" },
+    { name = "django", specifier = ">=6.0,<6.1" },
+    { name = "django-stubs", extras = ["compatible-mypy"], marker = "extra == 'dev'", specifier = ">=6.0,<6.1" },
+    { name = "django-stubs-ext", marker = "extra == 'dev'", specifier = ">=6.0,<6.1" },
     { name = "djangorestframework", marker = "extra == 'drf'", specifier = ">=3.14" },
     { name = "mcp", marker = "extra == 'mcp'", specifier = ">=1.27" },
     { name = "mypy", marker = "extra == 'dev'", specifier = ">=1.10" },

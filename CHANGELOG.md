@@ -3,6 +3,16 @@
 All notable changes to `django-zed-rebac` are tracked here. The project is in
 pre-1.0; breaking changes within a minor version are explicitly called out.
 
+## [0.15.1] — 2026-09-05
+
+### Fixed
+
+- Permission-aware prefetches preserve unprotected terminal relations after
+  protected prefixes. Both string paths and explicit `Prefetch` objects retain
+  their complete lookup, including custom querysets and `to_attr`, while each
+  protected prefix keeps its actor scope and field gates. This prevents dropped
+  prefetches and per-row lazy queries without propagating root sudo to related rows.
+
 ## [0.15.0] — 2026-09-05
 
 ### Added

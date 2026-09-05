@@ -149,8 +149,7 @@ def scope_prefetch_lookups(
                             ),
                         ),
                     )
-            else:
-                _remember_prefetch(scoped, lookup)
+            _remember_prefetch(scoped, lookup)
             continue
         if isinstance(lookup, Prefetch):
             prefixes = protected_lookup_prefixes(model, lookup.prefetch_through)
@@ -179,8 +178,7 @@ def scope_prefetch_lookups(
                                 ),
                             ),
                         )
-            else:
-                _remember_prefetch(scoped, lookup)
+            _remember_prefetch(scoped, lookup)
             continue
         _remember_prefetch(scoped, lookup)
     return tuple(scoped.values())
