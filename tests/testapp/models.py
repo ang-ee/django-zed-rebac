@@ -51,6 +51,9 @@ class SluggedPost(RebacMixin, models.Model):
 
 class AuthoredPost(RebacMixin, models.Model):
     title = models.CharField(max_length=200)
+    folder = models.ForeignKey(
+        Folder, null=True, blank=True, on_delete=models.SET_NULL, related_name="authored_posts"
+    )
     author = models.ForeignKey(
         settings.AUTH_USER_MODEL,
         on_delete=models.CASCADE,

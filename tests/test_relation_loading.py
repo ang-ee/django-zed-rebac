@@ -5,9 +5,21 @@ from __future__ import annotations
 from typing import Any
 
 import pytest
+from django.contrib.auth import get_user_model
+from django.contrib.auth.models import Group
+from django.db.models import Prefetch
 
-from rebac import ObjectRef, PermissionDenied, RelationshipTuple, SubjectRef, backend, sudo
+from rebac import (
+    MissingActorError,
+    ObjectRef,
+    PermissionDenied,
+    RelationshipTuple,
+    SubjectRef,
+    backend,
+    sudo,
+)
 from rebac.backends import reset_backend
+from rebac.evaluator import evaluator_scope
 from rebac.schema import parse_zed
 
 SCHEMA_TEXT = """
@@ -21,6 +33,12 @@ definition blog/post {
     relation owner: auth/user
     relation viewer: auth/user
     permission read = owner + viewer
+}
+definition blog/authoredpost {
+    relation owner: auth/user
+    relation viewer: auth/user
+    permission read = owner + viewer
+    permission read__title = owner
 }
 """
 
@@ -184,3 +202,138 @@ def test_rebac_prefetch_related_scopes_nested_protected_prefix(alice):
     row = Folder.objects.as_user(alice).rebac_prefetch_related("children__posts").get(pk=root.pk)
 
     assert list(row.children.all()) == []
+
+
+@pytest.fixture
+def authored_folder(alice):
+    from tests.testapp.models import AuthoredPost
+
+    folder = _folder("root")
+    _grant("blog/folder", folder.pk, "viewer", alice)
+    posts = []
+    for index in range(3):
+        author = get_user_model().objects.create(username=f"author-{index}")
+        author.groups.add(Group.objects.create(name=f"group-{index}"))
+        with sudo(reason="test.fixture"):
+            post = AuthoredPost.objects.create(title=f"post-{index}", folder=folder, author=author)
+        if index < 2:
+            _grant("blog/authoredpost", post.pk, "viewer", alice)
+            posts.append(post)
+    return folder, posts
+
+
+@pytest.mark.django_db
+@pytest.mark.parametrize("tail", ["author", "author__groups"])
+def test_rebac_prefetch_preserves_unprotected_tail(
+    alice, authored_folder, tail, django_assert_num_queries
+):
+    from tests.testapp.models import Folder
+
+    folder, visible = authored_folder
+    row = (
+        Folder.objects.as_user(alice)
+        .rebac_prefetch_related(f"authored_posts__{tail}")
+        .get(pk=folder.pk)
+    )
+
+    with django_assert_num_queries(0):
+        posts = sorted(row.authored_posts.all(), key=lambda post: post.pk)
+        assert [post.pk for post in posts] == [post.pk for post in visible]
+        assert [post.author.username for post in posts] == ["author-0", "author-1"]
+        if tail.endswith("groups"):
+            assert [[group.name for group in post.author.groups.all()] for post in posts] == [
+                ["group-0"],
+                ["group-1"],
+            ]
+
+
+@pytest.mark.django_db
+def test_rebac_prefetch_preserves_unprotected_custom_queryset_and_to_attr(
+    alice, authored_folder, django_assert_num_queries
+):
+    from tests.testapp.models import Folder
+
+    folder, _ = authored_folder
+    author_queryset = get_user_model().objects.filter(username="author-0")
+    lookup = Prefetch("authored_posts__author", queryset=author_queryset, to_attr="selected_author")
+    row = Folder.objects.as_user(alice).rebac_prefetch_related(lookup).get(pk=folder.pk)
+
+    assert lookup.queryset is author_queryset
+    assert lookup.prefetch_to == "authored_posts__selected_author"
+    with django_assert_num_queries(0):
+        posts = sorted(row.authored_posts.all(), key=lambda post: post.pk)
+        assert posts[0].selected_author.username == "author-0"
+        assert posts[1].selected_author is None
+
+
+@pytest.mark.django_db
+def test_rebac_prefetch_protected_terminal_keeps_scoped_custom_queryset(
+    alice, authored_folder, django_assert_num_queries
+):
+    from tests.testapp.models import AuthoredPost, Folder
+
+    folder, visible = authored_folder
+    queryset = AuthoredPost.objects.filter(title__in=["post-0", "post-2"])
+    lookup = Prefetch("authored_posts", queryset=queryset, to_attr="selected_posts")
+    row = Folder.objects.as_user(alice).rebac_prefetch_related(lookup).get(pk=folder.pk)
+
+    assert lookup.queryset is queryset
+    assert queryset.actor() is None
+    with django_assert_num_queries(0):
+        assert [post.pk for post in row.selected_posts] == [visible[0].pk]
+        assert row.selected_posts[0].actor() == SubjectRef.of("auth/user", str(alice.pk))
+
+
+@pytest.mark.django_db
+def test_rebac_prefetch_tail_preserves_each_protected_prefix_and_field_gate(
+    alice, authored_folder, django_assert_num_queries
+):
+    from tests.testapp.models import AuthoredPost, Folder
+
+    root = _folder("outer root")
+    child, visible = authored_folder
+    hidden_child = _folder("denied child")
+    with sudo(reason="test.fixture"):
+        child.parent = root
+        child.save()
+        hidden_child.parent = root
+        hidden_child.save()
+        hidden_path_post = AuthoredPost.objects.create(
+            title="readable behind denied folder", folder=hidden_child, author=alice
+        )
+    _grant("blog/folder", root.pk, "viewer", alice)
+    _grant("blog/authoredpost", hidden_path_post.pk, "viewer", alice)
+
+    with evaluator_scope():
+        row = (
+            Folder.objects.as_user(alice)
+            .on_field_deny("redact")
+            .rebac_prefetch_related("children__authored_posts__author__groups")
+            .get(pk=root.pk)
+        )
+        with django_assert_num_queries(0):
+            children = list(row.children.all())
+            assert [folder.pk for folder in children] == [child.pk]
+            posts = sorted(children[0].authored_posts.all(), key=lambda post: post.pk)
+            assert [post.pk for post in posts] == [post.pk for post in visible]
+            assert [post.title for post in posts] == [None, None]
+            assert [post.actor() for post in posts] == [
+                SubjectRef.of("auth/user", str(alice.pk))
+            ] * 2
+            assert [[group.name for group in post.author.groups.all()] for post in posts] == [
+                ["group-0"],
+                ["group-1"],
+            ]
+
+
+@pytest.mark.django_db
+def test_rebac_prefetch_unprotected_tail_does_not_inherit_root_sudo(authored_folder):
+    from tests.testapp.models import Folder
+
+    folder, _ = authored_folder
+    with pytest.raises(MissingActorError):
+        (
+            Folder.objects.sudo(reason="test.root-only")
+            .rebac_prefetch_related("authored_posts__author")
+            .get(pk=folder.pk)
+        )

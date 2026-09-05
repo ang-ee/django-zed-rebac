@@ -1191,6 +1191,9 @@ materialisation and cannot carry the related-object guard. `rebac_prefetch_relat
 is the to-many counterpart: it keeps Django prefetching, but protected bare
 lookups are rewritten to actor-scoped `Prefetch` querysets using the related
 model's default manager, never `_base_manager`.
+Every requested path is retained after its protected prefixes, including
+unprotected terminal relations and their explicit `Prefetch` queryset/`to_attr`.
+Loading an unprotected tail does not bypass any protected intermediate relation.
 
 ### `with_actor` vs `sudo` — distinct verbs
 
