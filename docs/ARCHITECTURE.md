@@ -1153,6 +1153,21 @@ permission expression to the existing conservative evaluator. In particular, an
 unsupported exclusion arm must never be treated as false. This optimization
 makes no claim to eliminate enumeration for recursive/caveated schemas, and does
 not change the explicit `accessible()` enumeration API or write authorization.
+Field-backed arrows compare native foreign-key target columns, independently of
+public resource-ID encoding. If a stored relation targets a resource field whose
+Python/wire value differs from SQL storage (custom converters, virtual fields or
+UUIDs), Django's field conversion remains authoritative: only that tuple-backed
+branch enumerates grants into a native subquery at SQL compilation time. Native
+field ownership stays in SQL even for a very large owned corpus. This fallback
+can still grow with the number of explicit shares; it never compares an encoded
+wire ID to a raw storage cast. A stored hop into a transformed field identity
+retains whole-expression evaluator fallback when SQL cannot represent the hop.
+
+Whole-type grants keep the existing `grants_all()` shortcut when scope is applied;
+like the previous implementation, an eagerly applied blanket grant is a scope
+snapshot. Tuple predicates and conversion fallbacks recheck their rows before SQL
+execution. Existing evaluated Django result caches are not refreshed implicitly.
+
 Same-definition permission-alias cycles deny the repeated branch in both
 queryset fallback and individual checks; they cannot cause Python recursion.
 

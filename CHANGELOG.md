@@ -3,6 +3,24 @@
 All notable changes to `django-zed-rebac` are tracked here. The project is in
 pre-1.0; breaking changes within a minor version are explicitly called out.
 
+## [0.16.1] — 2026-09-12
+
+### Fixed
+
+- Resource fields that encode their SQL values into different public IDs now use
+  Django's conversion for tuple-derived grants. Sharing and exclusions no longer
+  compare encoded wire IDs to raw database values. Use this release instead of
+  0.16.0 when a resource ID field has a custom converter or virtual storage.
+- Native FK columns own structural arrow membership, even when the target has
+  an encoded public ID or a non-PK resource identity. Large field-owned corpora
+  remain in SQL; only explicit tuple-grant branches needing conversion enumerate.
+- Converted tuple branches resolve at SQL compilation, preserving revocation in
+  pending scopes. Downstream caveats and recursion retain whole-expression
+  fallback, including the negative arm of exclusions.
+- Restore the established whole-type grant shortcut to avoid expensive redundant
+  predicates on broad role scopes. Skip impossible direct/wildcard/subject-set
+  reads according to the declared relation alternatives.
+
 ## [0.16.0] — 2026-09-12
 
 ### Added

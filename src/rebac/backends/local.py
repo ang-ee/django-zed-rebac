@@ -1493,6 +1493,8 @@ class LocalBackend(Backend):
             subject_id=subject.subject_id,
             optional_subject_relation=subject.optional_relation,
         )
+        if not _subject_allowed_by_relation(relation_def, subject):
+            direct = direct.none()
         for r in _filter_active(direct):
             if not _row_allowed_by_relation(relation_def, r):
                 continue
@@ -1500,7 +1502,9 @@ class LocalBackend(Backend):
                 result.add(r.resource_id)
 
         # Wildcard rows
-        if not subject.optional_relation:
+        if not subject.optional_relation and _subject_allowed_by_relation(
+            relation_def, SubjectRef.of(subject.subject_type, "*")
+        ):
             wildcard = RelationshipModel.objects.filter(
                 resource_type=resource_type,
                 relation=relation,
@@ -1515,6 +1519,8 @@ class LocalBackend(Backend):
 
         # Subject-set rows: e.g. resources granted to `auth/group:X#member`
         # require the subject to actually be a member of group X.
+        if not any(allowed.relation for allowed in relation_def.allowed_subjects):
+            return result
         subject_set_rows = RelationshipModel.objects.filter(
             resource_type=resource_type, relation=relation
         ).exclude(optional_subject_relation="")

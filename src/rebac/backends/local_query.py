@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from typing import TYPE_CHECKING, Any, cast
 
-from django.db import models
+from django.db import connections, models
 from django.db.models import Exists, F, OuterRef, Q, Subquery, Value
 from django.db.models.functions import Cast, Now
 
@@ -35,6 +35,58 @@ class UnsupportedScope(Exception):
 
 def _truth(value: bool) -> Q:
     return Q(Value(value, output_field=models.BooleanField()))
+
+
+class ConvertedRelationIds(models.Expression):
+    """Apply a resource field's Python conversion to tuple-derived grants only.
+
+    Deferring until SQL compilation preserves revocation for scoped subqueries.
+    The surrounding permission tree (including field ownership) stays in SQL.
+    Django builds the subquery and performs every ID conversion itself.
+    """
+
+    def __init__(
+        self,
+        scope: LocalQueryScope,
+        definition: Definition,
+        relation: Relation,
+        model: type[models.Model],
+        identity: str,
+        target: str | None,
+    ) -> None:
+        super().__init__()
+        self.scope = scope
+        self.definition = definition
+        self.relation = relation
+        self.model = model
+        self.id_attr = identity
+        self.target = target
+
+    def as_sql(self, compiler: Any, connection: Any) -> tuple[str, list[Any]]:
+        if self.target is None:
+            ids = self.scope.backend._resources_via_relation(
+                resource_type=self.definition.resource_type,
+                relation=self.relation.name,
+                subject=self.scope.subject,
+                depth=0,
+                cache={},
+            )
+        else:
+            ids = self.scope.backend._resources_for_expr(
+                PermArrow(self.relation.name, self.target),
+                self.definition,
+                self.scope.subject,
+                0,
+                {},
+            )
+        rows = (
+            self.model._base_manager.using(connection.alias)
+            .filter(**{f"{self.id_attr}__in": sorted(ids)})
+            .order_by()
+            .values(self.id_attr)
+        )
+        sql, params = compiler.compile(Subquery(rows))
+        return str(sql), list(params)
 
 
 class LocalQueryScope:
@@ -151,10 +203,23 @@ class LocalQueryScope:
         backing = self.backend._resolve_declared_field_backing(definition, relation)
         if backing is not None:
             source = backing.source_model._base_manager.using(self.using)
+            field = cast("models.ForeignKey[Any, Any]", backing.field)
             if target is None:
                 if not subject_allowed_by_relation(relation, self.subject):
                     return _truth(False)
-                condition = Q(**backing.target_filter(self.subject))
+                if backing.target_id_attr == "pk":
+                    condition = Q(**backing.target_filter(self.subject))
+                else:
+                    destination = backing.target_model._base_manager.using(self.using).filter(
+                        **{backing.target_id_attr: self.subject.subject_id}
+                    )
+                    condition = Q(
+                        **{
+                            f"{field.attname}__in": Subquery(
+                                destination.order_by().values(field.target_field.name)
+                            )
+                        }
+                    )
             else:
                 destination = backing.target_model._base_manager.using(self.using).filter(
                     self.permission(
@@ -167,16 +232,15 @@ class LocalQueryScope:
                 )
                 condition = Q(
                     **{
-                        f"{backing.target_values_path()}__in": Subquery(
-                            destination.order_by().values(backing.target_id_attr)
+                        f"{field.attname}__in": Subquery(
+                            destination.order_by().values(field.target_field.name)
                         )
                     }
                 )
-            # Direct local columns preserve their native indexes. Related-ID
-            # projections stay inside EXISTS, so authorization adds no joins
-            # to the caller's query and cannot multiply aggregate rows.
-            if model is backing.source_model and backing.target_id_attr == "pk":
+            if model is backing.source_model:
                 return condition
+            if not self.native_identity(backing.source_model, backing.source_id_attr):
+                raise UnsupportedScope
             return Q(
                 Exists(
                     source.alias(
@@ -198,6 +262,28 @@ class LocalQueryScope:
                 None,
                 Value(const.target_id),
                 seen,
+            )
+        if (
+            model is not None
+            and isinstance(identity, str)
+            and not self.native_identity(model, identity)
+        ):
+            # Validate every reachable branch before selecting the conversion
+            # fallback. A downstream caveat cannot collapse to a false RHS of
+            # an exclusion; unsupported graphs must use the tri-state evaluator
+            # for the entire permission expression.
+            self.relation(definition, relation, None, Value(""), seen, target=target)
+            return Q(
+                **{
+                    f"{identity}__in": ConvertedRelationIds(
+                        self,
+                        definition,
+                        relation,
+                        model,
+                        identity,
+                        target,
+                    )
+                }
             )
         rows = self.relationships.filter(
             **{
@@ -234,6 +320,14 @@ class LocalQueryScope:
                     )
             allowed_rows |= shape & member
         return Q(Exists(rows.filter(allowed_rows)))
+
+    def native_identity(self, model: type[models.Model], identity: str) -> bool:
+        field = model._meta.pk if identity == "pk" else model._meta.get_field(identity)
+        return (
+            isinstance(field, (models.CharField, models.TextField, models.IntegerField))
+            and field.concrete
+            and not field.get_db_converters(connections[self.using])
+        )
 
     @staticmethod
     def subject_shape(allowed: AllowedSubject) -> Q:

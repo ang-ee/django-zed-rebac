@@ -7,6 +7,8 @@ from django.db import models
 
 from rebac import RebacMixin
 
+from .fields import EncodedIntegerField
+
 
 class Folder(RebacMixin, models.Model):
     name = models.CharField(max_length=100)
@@ -63,3 +65,37 @@ class AuthoredPost(RebacMixin, models.Model):
     class Meta:
         app_label = "testapp"
         rebac_resource_type = "blog/authoredpost"
+
+
+class EncodedFolder(RebacMixin, models.Model):
+    public_id = EncodedIntegerField(unique=True)
+    name = models.CharField(max_length=100)
+    author = models.ForeignKey(settings.AUTH_USER_MODEL, on_delete=models.CASCADE)
+
+    class Meta:
+        app_label = "testapp"
+        rebac_resource_type = "blog/encodedfolder"
+        rebac_id_attr = "public_id"
+
+
+class EncodedPost(RebacMixin, models.Model):
+    public_id = EncodedIntegerField(unique=True)
+    title = models.CharField(max_length=200)
+    author = models.ForeignKey(settings.AUTH_USER_MODEL, on_delete=models.CASCADE)
+    folder = models.ForeignKey(EncodedFolder, null=True, on_delete=models.SET_NULL)
+
+    class Meta:
+        app_label = "testapp"
+        rebac_resource_type = "blog/encodedpost"
+        rebac_id_attr = "public_id"
+
+
+class EncodedPrimaryPost(RebacMixin, models.Model):
+    id = EncodedIntegerField(primary_key=True)
+    title = models.CharField(max_length=200)
+    author = models.ForeignKey(settings.AUTH_USER_MODEL, on_delete=models.CASCADE)
+    folder = models.ForeignKey(EncodedFolder, null=True, on_delete=models.SET_NULL)
+
+    class Meta:
+        app_label = "testapp"
+        rebac_resource_type = "blog/encodedprimarypost"
