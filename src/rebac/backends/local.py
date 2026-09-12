@@ -1192,6 +1192,25 @@ class LocalBackend(Backend):
             return None
         return verdict
 
+    @staticmethod
+    def _maybe_using(manager: Any, using: str | None) -> Any:
+        """Route a manager/queryset to ``using`` when a DB alias is pinned.
+
+        ``None`` keeps the model's routed/default database — the behaviour of
+        the ``accessible()`` / ``check_access()`` entry points, which pass no
+        alias. The lazy queryset compiler passes the queryset's own alias so
+        tuple-grant resolution reads relationship rows from the same database
+        its EXISTS subqueries join against (see ``local_query.ConvertedRelationIds``).
+
+        Note: this consistency covers the resolution helpers only. Sub-branches
+        that dispatch into the tri-state evaluator — subject-set membership
+        (``_has_direct_relation``), the negative arm of an exclusion and
+        const-arrow targets (``_eval_permission`` / ``_eval_permission_on``) —
+        still resolve against the default database; see
+        ``docs/ARCHITECTURE.md`` (multi-database resolution).
+        """
+        return manager if using is None else manager.using(using)
+
     def _resources_for_expr(
         self,
         expr: PermExpr,
@@ -1201,6 +1220,7 @@ class LocalBackend(Backend):
         cache: dict[tuple[str, str], set[str] | None],
         context: dict[str, Any] | None = None,
         seen: frozenset[str] = frozenset(),
+        using: str | None = None,
     ) -> set[str]:
         if depth > app_settings.REBAC_DEPTH_LIMIT:
             raise PermissionDepthExceeded(f"Depth limit {app_settings.REBAC_DEPTH_LIMIT} exceeded")
@@ -1222,6 +1242,7 @@ class LocalBackend(Backend):
                     depth=depth,
                     cache=cache,
                     context=context,
+                    using=using,
                 )
             sub_perm = next((p for p in definition.permissions if p.name == expr.name), None)
             if sub_perm is not None and expr.name not in seen:
@@ -1233,6 +1254,7 @@ class LocalBackend(Backend):
                     cache,
                     context,
                     seen | {expr.name},
+                    using,
                 )
             return set()
         if isinstance(expr, PermArrow):
@@ -1252,6 +1274,7 @@ class LocalBackend(Backend):
                     depth=depth,
                     cache=cache,
                     context=context,
+                    using=using,
                 )
             const_backing = self._resolve_declared_const_backing(definition, via_rel)
             if const_backing is not None:
@@ -1261,6 +1284,7 @@ class LocalBackend(Backend):
                     subject=subject,
                     depth=depth,
                     context=context,
+                    using=using,
                 )
             results: set[str] = set()
             target_types = sorted({s.type for s in via_rel.allowed_subjects})
@@ -1269,11 +1293,11 @@ class LocalBackend(Backend):
                 if target_def is None:
                     continue
                 target_resource_ids = self._compute_accessible_for(
-                    target_type, expr.target, target_def, subject, depth + 1, cache, context
+                    target_type, expr.target, target_def, subject, depth + 1, cache, context, using
                 )
                 if not target_resource_ids:
                     continue
-                rows = RelationshipModel.objects.filter(
+                rows = self._maybe_using(RelationshipModel.objects, using).filter(
                     resource_type=definition.resource_type,
                     relation=expr.via,
                     subject_type=target_type,
@@ -1289,7 +1313,7 @@ class LocalBackend(Backend):
             return results
         if isinstance(expr, PermBinOp):
             left = self._resources_for_expr(
-                expr.left, definition, subject, depth, cache, context, seen
+                expr.left, definition, subject, depth, cache, context, seen, using
             )
             if expr.op == "-":
                 # Enumerating the RHS drops conditional matches and cannot
@@ -1304,7 +1328,7 @@ class LocalBackend(Backend):
                     is True
                 }
             right = self._resources_for_expr(
-                expr.right, definition, subject, depth, cache, context, seen
+                expr.right, definition, subject, depth, cache, context, seen, using
             )
             if expr.op == "+":
                 return left | right
@@ -1322,6 +1346,7 @@ class LocalBackend(Backend):
         depth: int,
         cache: dict[tuple[str, str], set[str] | None],
         context: dict[str, Any] | None,
+        using: str | None = None,
     ) -> set[str]:
         target_def = self.schema().get_definition(field_backing.target_resource_type)
         if target_def is None:
@@ -1334,10 +1359,11 @@ class LocalBackend(Backend):
             depth + 1,
             cache,
             context,
+            using,
         )
         if not target_resource_ids:
             return set()
-        rows = field_backing.source_model._base_manager.filter(
+        rows = self._maybe_using(field_backing.source_model._base_manager, using).filter(
             **field_backing.target_in_filter(target_resource_ids)
         )
         return {
@@ -1352,6 +1378,7 @@ class LocalBackend(Backend):
         subject: SubjectRef,
         depth: int,
         context: dict[str, Any] | None,
+        using: str | None = None,
     ) -> set[str]:
         # The target object is fixed, so this is one check, not an enumeration:
         # either the subject holds `target` on `const:default` — in which case
@@ -1374,9 +1401,9 @@ class LocalBackend(Backend):
             return set()
         return {
             str(value)
-            for value in const_backing.source_model._base_manager.values_list(
-                const_backing.source_values_path(), flat=True
-            )
+            for value in self._maybe_using(
+                const_backing.source_model._base_manager, using
+            ).values_list(const_backing.source_values_path(), flat=True)
         }
 
     def _compute_accessible_for(
@@ -1388,6 +1415,7 @@ class LocalBackend(Backend):
         depth: int,
         cache: dict[tuple[str, str], set[str] | None],
         context: dict[str, Any] | None = None,
+        using: str | None = None,
     ) -> set[str]:
         """Memoised entry into `_resources_for_expr` keyed by (type, action).
 
@@ -1411,6 +1439,7 @@ class LocalBackend(Backend):
                 depth=depth,
                 cache=cache,
                 context=context,
+                using=using,
             )
             cache[key] = result
             return result
@@ -1421,7 +1450,7 @@ class LocalBackend(Backend):
         for _ in range(app_settings.REBAC_DEPTH_LIMIT + 1):
             cache[key] = prev
             current = self._resources_for_expr(
-                target_perm.expression, definition, subject, depth, cache, context
+                target_perm.expression, definition, subject, depth, cache, context, using=using
             )
             if current == prev:
                 break
@@ -1437,6 +1466,7 @@ class LocalBackend(Backend):
         depth: int,
         cache: dict[tuple[str, str], set[str] | None] | None = None,
         context: dict[str, Any] | None = None,
+        using: str | None = None,
     ) -> set[str]:
         if depth > app_settings.REBAC_DEPTH_LIMIT:
             raise PermissionDepthExceeded(f"Depth limit {app_settings.REBAC_DEPTH_LIMIT} exceeded")
@@ -1453,7 +1483,7 @@ class LocalBackend(Backend):
         if field_backing is not None:
             if not _subject_allowed_by_relation(relation_def, subject):
                 return set()
-            rows = field_backing.source_model._base_manager.filter(
+            rows = self._maybe_using(field_backing.source_model._base_manager, using).filter(
                 **field_backing.target_filter(subject)
             )
             return {
@@ -1473,9 +1503,9 @@ class LocalBackend(Backend):
                 return set()
             return {
                 str(value)
-                for value in const_backing.source_model._base_manager.values_list(
-                    const_backing.source_values_path(), flat=True
-                )
+                for value in self._maybe_using(
+                    const_backing.source_model._base_manager, using
+                ).values_list(const_backing.source_values_path(), flat=True)
             }
 
         RelationshipModel = active_relationship_model()
@@ -1486,7 +1516,7 @@ class LocalBackend(Backend):
         sink: set[str] = set()
 
         # Direct rows
-        direct = RelationshipModel.objects.filter(
+        direct = self._maybe_using(RelationshipModel.objects, using).filter(
             resource_type=resource_type,
             relation=relation,
             subject_type=subject.subject_type,
@@ -1505,7 +1535,7 @@ class LocalBackend(Backend):
         if not subject.optional_relation and _subject_allowed_by_relation(
             relation_def, SubjectRef.of(subject.subject_type, "*")
         ):
-            wildcard = RelationshipModel.objects.filter(
+            wildcard = self._maybe_using(RelationshipModel.objects, using).filter(
                 resource_type=resource_type,
                 relation=relation,
                 subject_type=subject.subject_type,
@@ -1521,9 +1551,11 @@ class LocalBackend(Backend):
         # require the subject to actually be a member of group X.
         if not any(allowed.relation for allowed in relation_def.allowed_subjects):
             return result
-        subject_set_rows = RelationshipModel.objects.filter(
-            resource_type=resource_type, relation=relation
-        ).exclude(optional_subject_relation="")
+        subject_set_rows = (
+            self._maybe_using(RelationshipModel.objects, using)
+            .filter(resource_type=resource_type, relation=relation)
+            .exclude(optional_subject_relation="")
+        )
         for row in subject_set_rows:
             if not _row_allowed_by_relation(relation_def, row):
                 continue

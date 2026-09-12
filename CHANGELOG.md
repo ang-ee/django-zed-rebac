@@ -3,6 +3,28 @@
 All notable changes to `django-zed-rebac` are tracked here. The project is in
 pre-1.0; breaking changes within a minor version are explicitly called out.
 
+## [0.16.3] — 2026-09-12
+
+### Fixed
+
+- Compile the queryset expiration predicate against the application clock
+  (`timezone.now()`) rather than the database clock (`Now()`). The graph and
+  enumeration paths already filter expiry with `timezone.now()`, so the SQL
+  path could previously disagree with `accessible()` inside the app/DB
+  clock-skew window; both strategies now bind the same instant.
+- Resolve tuple-derived grants for non-native identities from the queryset's
+  own database alias instead of the default one, so the ids and the
+  surrounding `EXISTS` subqueries agree on where relationship rows live. Only
+  affects multi-database setups; single-database projects are unchanged. The
+  tri-state-evaluator sub-branches remain a documented boundary — see
+  ARCHITECTURE.md "Open questions" (multi-database relationship resolution).
+
+### Removed
+
+- `REBAC_PK_IN_THRESHOLD` setting. It had no readers after local queryset SQL
+  scoping became schema-driven rather than size-driven; tuning it changed
+  nothing. Projects that set it can drop it (unknown settings are ignored).
+
 ## [0.16.2] — 2026-09-12
 
 ### Fixed

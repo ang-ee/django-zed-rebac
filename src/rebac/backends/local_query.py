@@ -6,7 +6,8 @@ from typing import TYPE_CHECKING, Any, cast
 
 from django.db import connections, models
 from django.db.models import Exists, F, OuterRef, Q, Subquery, Value
-from django.db.models.functions import Cast, Now
+from django.db.models.functions import Cast
+from django.utils import timezone
 
 from .._id import resource_id_attr
 from ..conf import app_settings
@@ -63,6 +64,13 @@ class ConvertedRelationIds(models.Expression):
         self.target = target
 
     def as_sql(self, compiler: Any, connection: Any) -> tuple[str, tuple[Any, ...]]:
+        # Resolve tuple-derived grants from the SAME database the surrounding
+        # predicate joins against (``self.scope.using``), not the default alias,
+        # so multi-database scoping stays consistent with the native EXISTS
+        # subqueries. Sub-branches that dispatch into the tri-state evaluator
+        # still resolve against the default DB — see ``docs/ARCHITECTURE.md``
+        # (multi-database resolution).
+        using = self.scope.using
         if self.target is None:
             ids = self.scope.backend._resources_via_relation(
                 resource_type=self.definition.resource_type,
@@ -70,6 +78,7 @@ class ConvertedRelationIds(models.Expression):
                 subject=self.scope.subject,
                 depth=0,
                 cache={},
+                using=using,
             )
         else:
             ids = self.scope.backend._resources_for_expr(
@@ -78,6 +87,7 @@ class ConvertedRelationIds(models.Expression):
                 self.scope.subject,
                 0,
                 {},
+                using=using,
             )
         rows = (
             self.model._base_manager.using(connection.alias)
@@ -294,7 +304,13 @@ class LocalQueryScope:
             }
         )
         if relation.with_expiration:
-            rows = rows.filter(Q(expires_at__isnull=True) | Q(expires_at__gt=Now()))
+            # Bind the app-server clock (``timezone.now()``) rather than the
+            # database clock (``Now()``): the graph/enumeration path filters
+            # expiry with ``timezone.now()`` (see ``local._filter_active``), so
+            # using the DB clock here would let the two evaluation strategies
+            # disagree inside the app/DB clock-skew window and break the
+            # ``accessible() == queryset`` parity contract.
+            rows = rows.filter(Q(expires_at__isnull=True) | Q(expires_at__gt=timezone.now()))
         else:
             rows = rows.filter(expires_at__isnull=True)
         allowed_rows = _truth(False)

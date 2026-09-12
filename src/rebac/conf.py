@@ -23,7 +23,6 @@ _DEFAULTS: dict[str, Any] = {
     "REBAC_DEFAULT_CONSISTENCY": "minimize_latency",
     "REBAC_CACHE_ALIAS": "default",
     "REBAC_LOOKUP_CACHE_TTL": 60,
-    "REBAC_PK_IN_THRESHOLD": 10000,
     "REBAC_STRICT_MODE": True,
     "REBAC_REQUIRE_SUDO_REASON": True,
     "REBAC_ALLOW_SUDO": True,
