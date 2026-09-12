@@ -3,6 +3,14 @@
 All notable changes to `django-zed-rebac` are tracked here. The project is in
 pre-1.0; breaking changes within a minor version are explicitly called out.
 
+## [0.16.2] — 2026-09-12
+
+### Fixed
+
+- Match Django's SQL-expression parameter tuple contract under current strict
+  type checking. Version 0.16.1 was tagged but its PyPI publication was blocked
+  by this type-check failure; 0.16.2 includes the encoded-ID corrections below.
+
 ## [0.16.1] — 2026-09-12
 
 ### Fixed

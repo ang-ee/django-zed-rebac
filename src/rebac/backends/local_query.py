@@ -62,7 +62,7 @@ class ConvertedRelationIds(models.Expression):
         self.id_attr = identity
         self.target = target
 
-    def as_sql(self, compiler: Any, connection: Any) -> tuple[str, list[Any]]:
+    def as_sql(self, compiler: Any, connection: Any) -> tuple[str, tuple[Any, ...]]:
         if self.target is None:
             ids = self.scope.backend._resources_via_relation(
                 resource_type=self.definition.resource_type,
@@ -86,7 +86,7 @@ class ConvertedRelationIds(models.Expression):
             .values(self.id_attr)
         )
         sql, params = compiler.compile(Subquery(rows))
-        return str(sql), list(params)
+        return str(sql), tuple(params)
 
 
 class LocalQueryScope:
