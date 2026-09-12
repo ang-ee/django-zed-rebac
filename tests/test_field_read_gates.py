@@ -11,8 +11,10 @@ import pickle
 from typing import Any, cast
 
 import pytest
+from django.db import connection
 from django.db.models import Count, F, Min
 from django.test import override_settings
+from django.test.utils import CaptureQueriesContext
 
 from rebac import (
     ObjectRef,
@@ -25,6 +27,7 @@ from rebac import (
 )
 from rebac.backends import reset_backend
 from rebac.schema import parse_zed
+from tests.testapp.models import Post
 
 SCHEMA_TEXT = """
 definition auth/user {}
@@ -354,10 +357,9 @@ def test_aggregate_cannot_return_a_gated_field(alice):
 
 
 def test_no_read_gates_do_not_add_field_accessible_calls(alice, monkeypatch):
-    from tests.testapp.models import Post
-
     backend().set_schema(parse_zed(NO_READ_GATE_SCHEMA_TEXT))
     post = _post(title="plain")
+    _post(title="hidden")
     _grant(post.pk, alice, "owner")
     active_backend = backend()
     actions: list[str] = []
@@ -369,10 +371,17 @@ def test_no_read_gates_do_not_add_field_accessible_calls(alice, monkeypatch):
 
     monkeypatch.setattr(active_backend, "accessible", counting_accessible)
 
-    with override_settings(REBAC_FIELD_READ_MODE="redact"):
-        assert list(Post.objects.as_user(alice)) != []
+    with (
+        override_settings(REBAC_FIELD_READ_MODE="redact"),
+        CaptureQueriesContext(connection) as queries,
+    ):
+        assert [row.pk for row in Post.objects.as_user(alice)] == [post.pk]
 
-    assert actions == ["read"]
+    assert actions == []
+    post_table = connection.ops.quote_name(Post._meta.db_table)
+    row_queries = [query["sql"] for query in queries if f"FROM {post_table}" in query["sql"]]
+    assert len(row_queries) == 1
+    assert "EXISTS" in row_queries[0]
 
 
 @override_settings(REBAC_FIELD_READ_MODE="redact")

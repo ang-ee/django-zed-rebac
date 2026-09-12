@@ -9,12 +9,10 @@ rows in the `Relationship` table. Implementation strategy:
   - For `check_access()`: same walk, but bounded by the specific resource_id.
   - Recursion depth bounded by `REBAC_DEPTH_LIMIT`.
 
-This is intentionally a clean Python implementation — fully correct against
-the SpiceDB semantics for the subset of the schema language the parser
-accepts. A recursive-CTE optimisation path is layered on for `accessible()`
-when `REBAC_PK_IN_THRESHOLD` is exceeded; for v0.1 we use the Python walk
-with prefetched relationship rows. The same code path runs on Postgres / MySQL
-/ SQLite identically.
+Read querysets use lazy ORM predicates for acyclic, non-caveated permissions;
+unsupported expressions retain the conservative Python evaluator. Explicit
+`accessible()` calls still enumerate resource IDs. Both paths use the effective
+schema and run through Django on supported databases.
 
 Caveats are tri-state:
 
@@ -39,6 +37,7 @@ from threading import Lock
 from typing import Any
 from weakref import WeakSet
 
+from django.db import models
 from django.db.models import QuerySet
 
 from ..conf import app_settings
@@ -49,6 +48,7 @@ from ..field_backing import (
     resolve_const_backing,
     resolve_field_backing,
 )
+from ..resources import model_resource_type
 from ..schema.ast import (
     BUILTIN_ACTOR_TYPES,
     AllowedSubject,
@@ -95,6 +95,7 @@ from ..types import (
     Zookie,
 )
 from .base import Backend
+from .local_query import LocalQueryScope, UnsupportedScope
 
 _backend_registry_lock = Lock()
 _db_loaded_backends: WeakSet[LocalBackend] = WeakSet()
@@ -443,6 +444,23 @@ class LocalBackend(Backend):
         if allowed is None:
             return CheckResult.conditional(missing=tuple(sorted(missing)))
         return CheckResult.no()
+
+    @_schema_operation
+    def queryset_filter(
+        self,
+        *,
+        model: type[models.Model],
+        subject: SubjectRef,
+        action: str,
+        using: str,
+    ) -> models.Q | None:
+        resource_type = model_resource_type(model)
+        if resource_type is None:
+            return None
+        try:
+            return LocalQueryScope(self, subject, using).predicate(model, action, resource_type)
+        except UnsupportedScope:
+            return None
 
     @_schema_operation
     def accessible(
@@ -1182,6 +1200,7 @@ class LocalBackend(Backend):
         depth: int,
         cache: dict[tuple[str, str], set[str] | None],
         context: dict[str, Any] | None = None,
+        seen: frozenset[str] = frozenset(),
     ) -> set[str]:
         if depth > app_settings.REBAC_DEPTH_LIMIT:
             raise PermissionDepthExceeded(f"Depth limit {app_settings.REBAC_DEPTH_LIMIT} exceeded")
@@ -1205,9 +1224,15 @@ class LocalBackend(Backend):
                     context=context,
                 )
             sub_perm = next((p for p in definition.permissions if p.name == expr.name), None)
-            if sub_perm is not None:
+            if sub_perm is not None and expr.name not in seen:
                 return self._resources_for_expr(
-                    sub_perm.expression, definition, subject, depth, cache, context
+                    sub_perm.expression,
+                    definition,
+                    subject,
+                    depth,
+                    cache,
+                    context,
+                    seen | {expr.name},
                 )
             return set()
         if isinstance(expr, PermArrow):
@@ -1263,7 +1288,9 @@ class LocalBackend(Backend):
                         results.add(r.resource_id)
             return results
         if isinstance(expr, PermBinOp):
-            left = self._resources_for_expr(expr.left, definition, subject, depth, cache, context)
+            left = self._resources_for_expr(
+                expr.left, definition, subject, depth, cache, context, seen
+            )
             if expr.op == "-":
                 # Enumerating the RHS drops conditional matches and cannot
                 # enumerate built-in actor grants. Subtracting that incomplete
@@ -1276,7 +1303,9 @@ class LocalBackend(Backend):
                     if self._eval_permission(expr, definition, resource_id, subject, depth, context)
                     is True
                 }
-            right = self._resources_for_expr(expr.right, definition, subject, depth, cache, context)
+            right = self._resources_for_expr(
+                expr.right, definition, subject, depth, cache, context, seen
+            )
             if expr.op == "+":
                 return left | right
             if expr.op == "&":

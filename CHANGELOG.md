@@ -3,6 +3,26 @@
 All notable changes to `django-zed-rebac` are tracked here. The project is in
 pre-1.0; breaking changes within a minor version are explicitly called out.
 
+## [0.16.0] — 2026-09-12
+
+### Added
+
+- Local queryset authorization compiles acyclic, non-caveated permissions to
+  native SQL predicates. Field ownership, tuple sharing, subject sets, arrows,
+  constant roles, unions, intersections and exclusions no longer enumerate all
+  readable resource IDs in Python. Both relationship storage modes are supported.
+- Permission predicates remain lazy and retain actor/action rebinding and
+  aggregate cardinality. Tuple revocation before SQL evaluation is reflected in
+  pending queries and scoped subqueries, without a permission-result cache.
+- Other backends retain the existing resource-enumeration path. Recursive and
+  caveated expressions fall back as a whole to the conservative evaluator;
+  explicit `accessible()` enumeration and write authorization are unchanged.
+
+### Fixed
+
+- Same-definition permission-alias cycles terminate in the enumeration fallback,
+  matching the existing individual-check rule that denies a repeated branch.
+
 ## [0.15.2] — 2026-09-05
 
 ### Fixed

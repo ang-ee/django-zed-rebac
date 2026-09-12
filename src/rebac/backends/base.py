@@ -6,6 +6,8 @@ from abc import ABC, abstractmethod
 from collections.abc import Iterable
 from typing import Any
 
+from django.db import models
+
 from ..schema.ast import Schema
 from ..types import (
     CheckResult,
@@ -76,6 +78,17 @@ class Backend(ABC):
         at_zookie: Zookie | None = None,
     ) -> Iterable[str]:
         """Set of resource_ids the subject has `action` on."""
+
+    def queryset_filter(
+        self,
+        *,
+        model: type[models.Model],
+        subject: SubjectRef,
+        action: str,
+        using: str,
+    ) -> models.Q | None:
+        """Optional ORM execution strategy; None preserves resource enumeration."""
+        return None
 
     @abstractmethod
     def lookup_subjects(

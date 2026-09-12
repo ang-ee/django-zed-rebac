@@ -47,6 +47,10 @@ _REGISTRY_WIRE_FIELD_MAP = {
 class RelationshipQuerySet(models.QuerySet["Relationship"]):
     """Mode-agnostic queryset helpers for denormalized relationship rows."""
 
+    def with_wire_ids(self) -> RelationshipQuerySet:
+        """Expose IDs for correlated expressions without storage-specific paths."""
+        return self.alias(_scope_subject_id=F("subject_id"))
+
     def for_resource(self, resource_type: str, resource_id: str) -> RelationshipQuerySet:
         return self.filter(resource_type=resource_type, resource_id=resource_id)
 
@@ -312,6 +316,10 @@ class RelationshipRegistryQuerySet(models.QuerySet["RelationshipRegistry"]):
         for value in (*args, *kwargs.values()):
             _raise_for_wire_field_expression(value, surface="annotate()")
         return super().annotate(*args, **kwargs)
+
+    def with_wire_ids(self) -> RelationshipRegistryQuerySet:
+        """Expose the same correlated identity as denormalized storage."""
+        return self.alias(_scope_subject_id=F(_REGISTRY_WIRE_FIELD_MAP["subject_id"]))
 
     def for_resource(self, resource_type: str, resource_id: str) -> RelationshipRegistryQuerySet:
         return self.filter(**{"resource_type": resource_type, "resource_id": resource_id})

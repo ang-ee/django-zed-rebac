@@ -827,7 +827,7 @@ All settings prefixed `REBAC_`. No nested dict. Read via the public `app_setting
 | `REBAC_DEFAULT_CONSISTENCY` | `"minimize_latency"` | `str` | Default `Consistency` for checks. |
 | `REBAC_CACHE_ALIAS` | `"default"` | `str` | Django cache backend name for `accessible()` cache. |
 | `REBAC_LOOKUP_CACHE_TTL` | `60` (s) | `int` | TTL for `accessible()` cache. Invalidated on relationship writes for the matching `(subject, action, resource_type)`. |
-| `REBAC_PK_IN_THRESHOLD` | `10000` | `int` | Above this size, `accessible()` returns a JOIN instead of materialising `pk__in`. |
+| `REBAC_PK_IN_THRESHOLD` | `10000` | `int` | Reserved legacy threshold; local queryset SQL scoping is schema-driven, not size-driven. |
 | `REBAC_STRICT_MODE` | `True` | `bool` | If `True`, queryset construction without an actor (and not in `sudo()`) raises `MissingActorError`. **Production default.** |
 | `REBAC_REQUIRE_SUDO_REASON` | `True` | `bool` | If `True`, `sudo()` calls without a `reason=...` raise. |
 | `REBAC_ALLOW_SUDO` | `True` | `bool` | Globally disable the request-path `sudo()` bypass. Strict tenants set `False`. **Does NOT gate `system_context()`** — framework-owned jobs (migrations, fixture seeders, asset loaders) must still be able to bypass even on strict tenants; the two surfaces are deliberately split. Every block-scoped `system_context()` entry still emits a `KIND_SUDO_BYPASS` audit row, same as block-scoped `sudo()`. |
@@ -1130,6 +1130,32 @@ return a plain unscoped manager. Native `resource_id_attr` and
 `subject_id_attr` are public top-level exports with distinct resource/user setting
 fallbacks.
 
+### Lazy local queryset authorization
+
+The backend may supply an internal `queryset_filter(model, subject, action,
+using)` ORM predicate; the base backend returns `None`, preserving the existing
+`grants_all()` / `accessible()` integration for other backends. This changes
+execution shape, not the public CheckPermission / LookupResources semantics.
+
+LocalBackend compiles acyclic, non-caveated permissions into native Django
+`Q`, `Exists` and `Subquery` expressions. Stored relations, subject sets, arrows,
+explicit field/constant bindings, actor terms and union/intersection/exclusion
+retain their schema meaning. Field bindings use their declared columns; tuple
+predicates validate allowed subject shapes and expiration. Relationship storage
+owns wire-id aliases so the compiler works in both storage modes. No resource-ID
+list or permission-result cache is needed on this path. Predicates preserve row
+cardinality, caller filters, database alias and removable actor/action scope.
+Tuple changes made before SQL evaluation are therefore observed by pending
+querysets; already evaluated Django result caches retain Django's normal behavior.
+
+Recursion, caveats or unsupported expression shapes fall back for the entire
+permission expression to the existing conservative evaluator. In particular, an
+unsupported exclusion arm must never be treated as false. This optimization
+makes no claim to eliminate enumeration for recursive/caveated schemas, and does
+not change the explicit `accessible()` enumeration API or write authorization.
+Same-definition permission-alias cycles deny the repeated branch in both
+queryset fallback and individual checks; they cannot cause Python recursion.
+
 ### Schema introspection
 
 Tooling that needs to answer "which relation or role reaches this permission?"
@@ -1286,7 +1312,7 @@ A pinned actor (path 2) **always wins** over ambient state (paths 3-4) — there
 
 | Operation | Permission checked | Where |
 |---|---|---|
-| `Model.objects.all()` / `.filter(...)` / `.get()` / `.count()` / `.exists()` | `read` (or `Meta.rebac_default_action`; override per chain with `.with_action(action)`) | `RebacQuerySet.get_queryset()` injects a `pk__in=<accessible(actor, action, type)>` clause (or a JOIN above the threshold). |
+| `Model.objects.all()` / `.filter(...)` / `.get()` / `.count()` / `.exists()` | `read` (or `Meta.rebac_default_action`; override per chain with `.with_action(action)`) | The queryset injects the backend's lazy permission predicate, falling back to `resource_id__in=<accessible(actor, action, type)>` when unavailable. |
 | `Model.objects.create(**fields)` | `create` on the model class | `RebacManager.create()` calls `check_access(actor, "create", ObjectRef(type, ""))` first. |
 | `Model.objects.bulk_create(rows)` | `create` once per page | Single class-level check. |
 | `instance.save()` (PK present) | `write` on the row | Pre-save signal handler. |

@@ -371,6 +371,16 @@ class RebacQuerySet(models.QuerySet[_M]):
 
         action = str(self._rebac_action or getattr(model._meta, "rebac_default_action", "read"))
         active_backend = backend()
+        predicate = active_backend.queryset_filter(
+            model=model,
+            subject=actor,
+            action=action,
+            using=self.db,
+        )
+        if predicate is not None:
+            restriction = query.build_where(predicate)
+            query.where = WhereNode([query.where, _ScopeWhere(children=[restriction])])
+            return
         if backend_grants_all(
             active_backend,
             subject=actor,
