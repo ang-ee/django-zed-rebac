@@ -12,8 +12,12 @@ pre-1.0; breaking changes within a minor version are explicitly called out.
 - Live backing accepts ORM-queryable scalar virtual identities, including
   public IDs encoded from an existing integer primary key. Django fields own
   lookup preparation and result conversion; graph IDs and stored tuples keep
-  their existing identity. Missing, relational and non-queryable identity
-  fields remain invalid.
+  their existing identity. Missing, model-object and non-queryable identity
+  attributes remain invalid.
+- Accept scalar `pk` identities on multi-table children and explicit relation
+  ID attributes such as `parent_ptr_id`. Django's parent-link primary keys
+  retain their native scalar conversion; relation descriptors that return
+  model objects remain invalid.
 - Preserve the native column optimization for unfiltered forward FK/O2O
   relations. Filtered, reverse and M2M paths correlate source rows by their
   primary key, without casting encoded public IDs. A foreign key targeting a

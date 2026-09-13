@@ -272,16 +272,42 @@ def _validate_filters(model: type[models.Model], filters: tuple[tuple[str, Any],
         raise ValueError(f"invalid filters on {model.__name__}: {exc}") from exc
 
 
+def model_identity_fields(
+    model: type[models.Model], attr: str
+) -> tuple[models.Field[Any, Any], models.Field[Any, Any]]:
+    """Return the query field and scalar conversion owner for an identity.
+
+    Django exposes an MTI child primary key as its parent-link ``OneToOneField``.
+    Relation attnames likewise address the stored scalar, while relation names
+    materialize model instances and cannot be wire identities.
+    """
+
+    field = model._meta.pk if attr == "pk" else model._meta.get_field(attr)
+    if not isinstance(field, models.Field) or isinstance(field, models.CompositePrimaryKey):
+        raise ValueError(f"{model.__name__} identity {attr!r} must be a scalar field")
+    scalar_field = field
+    if field.is_relation:
+        if not isinstance(field, (models.ForeignKey, models.OneToOneField)) or (
+            attr != "pk" and attr != field.attname
+        ):
+            raise ValueError(f"{model.__name__} identity {attr!r} must be a scalar field")
+    seen: set[int] = set()
+    while scalar_field.is_relation:
+        if id(scalar_field) in seen or not isinstance(
+            scalar_field, (models.ForeignKey, models.OneToOneField)
+        ):
+            raise ValueError(f"{model.__name__} identity {attr!r} must be a scalar field")
+        seen.add(id(scalar_field))
+        scalar_field = scalar_field.target_field
+    if isinstance(scalar_field, models.CompositePrimaryKey):
+        raise ValueError(f"{model.__name__} identity {attr!r} must be a scalar field")
+    return field, scalar_field
+
+
 def _validate_model_identity(model: type[models.Model], attr: str) -> None:
     """Require a scalar identity that Django can project and look up."""
 
-    field = model._meta.pk if attr == "pk" else model._meta.get_field(attr)
-    if (
-        not isinstance(field, models.Field)
-        or isinstance(field, models.CompositePrimaryKey)
-        or field.is_relation
-    ):
-        raise ValueError(f"{model.__name__} identity {attr!r} must be a scalar field")
+    field, _scalar_field = model_identity_fields(model, attr)
     try:
         expression = field.get_col(model._meta.db_table)
     except (AttributeError, TypeError, ValueError) as exc:

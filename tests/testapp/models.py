@@ -202,3 +202,62 @@ class SlugReference(RebacMixin, models.Model):
         app_label = "testapp"
         rebac_resource_type = "test/slugreference"
         rebac_id_attr = "virtual_id"
+
+
+class ParentLinkedResource(RebacMixin, models.Model):
+    id = EncodedIntegerField(primary_key=True)
+    name = models.CharField(max_length=100)
+
+    class Meta:
+        app_label = "testapp"
+        rebac_resource_type = "test/parentlinkedresource"
+
+
+class ParentLinkedChild(ParentLinkedResource):
+    owner = models.ForeignKey(settings.AUTH_USER_MODEL, on_delete=models.CASCADE)
+
+    class Meta:
+        app_label = "testapp"
+        rebac_resource_type = "test/parentlinkedchild"
+        rebac_id_attr = "pk"
+
+
+class ParentLinkedRecord(RebacMixin, models.Model):
+    child = models.ForeignKey(
+        ParentLinkedChild,
+        on_delete=models.CASCADE,
+        related_name="records",
+    )
+
+    class Meta:
+        app_label = "testapp"
+        rebac_resource_type = "test/parentlinkedrecord"
+
+
+class NativeParentLinkedResource(RebacMixin, models.Model):
+    name = models.CharField(max_length=100)
+
+    class Meta:
+        app_label = "testapp"
+        rebac_resource_type = "test/nativeparentlinkedresource"
+
+
+class NativeParentLinkedChild(NativeParentLinkedResource):
+    owner = models.ForeignKey(settings.AUTH_USER_MODEL, on_delete=models.CASCADE)
+
+    class Meta:
+        app_label = "testapp"
+        rebac_resource_type = "test/nativeparentlinkedchild"
+        rebac_id_attr = "pk"
+
+
+class NativeParentLinkedRecord(RebacMixin, models.Model):
+    child = models.ForeignKey(
+        NativeParentLinkedChild,
+        on_delete=models.CASCADE,
+        related_name="records",
+    )
+
+    class Meta:
+        app_label = "testapp"
+        rebac_resource_type = "test/nativeparentlinkedrecord"

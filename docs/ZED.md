@@ -164,6 +164,10 @@ encoded from the existing primary key. The field must support SQL projection
 and exact/`in` lookups; Django owns both lookup preparation and result
 conversion. A separate identity column or tuple-ID migration is unnecessary.
 Properties without an ORM field and composite identities are not supported.
+The ordinary `pk` identity also works on a multi-table child whose primary key
+is a Django parent link. An explicit relation ID attribute such as
+`parent_ptr_id` is scalar; the corresponding `parent_ptr` model-object accessor
+is not a valid identity.
 
 An **attribute backing** derives virtual container membership from a subject
 column. The single allowed subject type selects its Django model:

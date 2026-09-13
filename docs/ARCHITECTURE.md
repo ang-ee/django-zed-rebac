@@ -1211,6 +1211,11 @@ return a plain unscoped manager. Native `resource_id_attr` and
 `subject_id_attr` are public top-level exports. A registered model uses its one
 resource identifier for both object and subject identity; legacy User/Group models
 without resource metadata retain the separate user-setting fallback.
+Identity attributes must read scalar instance values: `pk` includes Django's
+multi-table parent-link primary keys, and relation `attname` attributes expose
+their stored values. Relation descriptors returning model objects are rejected.
+The relation's underlying target field owns column conversion; a parent-link
+primary key needs no consumer-specific identity override.
 `REBAC_TYPE_PREFIX` applies when model metadata, configured
 User/Group/anonymous types, or decorators generate identity. Already canonical
 `ObjectRef` and `SubjectRef` values retain their wire types unchanged.

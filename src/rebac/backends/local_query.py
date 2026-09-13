@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from typing import TYPE_CHECKING, Any, cast
 
+from django.core.exceptions import FieldDoesNotExist
 from django.db import connections, models
 from django.db.models import Exists, F, OuterRef, Q, Subquery, Value
 from django.db.models.expressions import Combinable
@@ -12,6 +13,7 @@ from django.utils import timezone
 
 from .._id import resource_id_attr
 from ..conf import app_settings
+from ..field_backing import model_identity_fields
 from ..schema.ast import (
     BUILTIN_ACTOR_TYPES,
     AllowedSubject,
@@ -40,11 +42,15 @@ def _truth(value: bool) -> Q:
 
 
 def _concrete_field(model: type[models.Model], identity: str) -> models.Field[Any, Any]:
-    """The concrete column behind ``identity``; reverse relations cannot be compiled."""
-    field = model._meta.pk if identity == "pk" else model._meta.get_field(identity)
-    if not isinstance(field, models.Field) or not field.concrete:
+    """The scalar conversion owner behind a concrete identity lookup."""
+
+    try:
+        query_field, scalar_field = model_identity_fields(model, identity)
+    except FieldDoesNotExist, ValueError:
+        raise UnsupportedScope from None
+    if not query_field.concrete:
         raise UnsupportedScope
-    return field
+    return scalar_field
 
 
 # Field classes whose Python and database conversions are the identity, so a
