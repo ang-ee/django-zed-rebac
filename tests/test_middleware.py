@@ -19,8 +19,10 @@ import pytest
 from django.contrib.auth import get_user_model, login
 from django.contrib.auth.middleware import AuthenticationMiddleware
 from django.contrib.sessions.middleware import SessionMiddleware
+from django.db import connection
 from django.http import HttpResponse
 from django.test import RequestFactory, override_settings
+from django.test.utils import CaptureQueriesContext
 from django.utils.functional import SimpleLazyObject
 
 from rebac import ANONYMOUS_ACTOR, SubjectRef
@@ -164,8 +166,12 @@ def test_authentication_middleware_lazy_model_user_resolves_and_tears_down(monke
         captured["actor"] = current_actor()
         return HttpResponse("ok")
 
-    response = ActorMiddleware(view)(request)
+    with CaptureQueriesContext(connection) as queries:
+        response = ActorMiddleware(view)(request)
 
+    # The lazy user is materialised exactly once, by the resolver; identity
+    # resolution itself reads only instance metadata and issues no query.
+    assert len(queries.captured_queries) == 1, [q["sql"] for q in queries.captured_queries]
     assert response.status_code == 200
     assert captured["actor"] == SubjectRef.of(
         "accounts/member",

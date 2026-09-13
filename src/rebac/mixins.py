@@ -376,7 +376,7 @@ class RebacMixin(models.Model, metaclass=RebacModelBase):
         """
         from .backends import backend
 
-        rebac_type = model_resource_type(type(self))
+        rebac_type = model_resource_type(self)
         if not rebac_type:
             # Model isn't wired into REBAC — answer permissively to mirror
             # the manager's no-op behaviour.
@@ -500,7 +500,7 @@ class RebacMixin(models.Model, metaclass=RebacModelBase):
         return names
 
     def _rebac_resource_id_for_checks(self) -> str:
-        attr = resource_id_attr(type(self))
+        attr = resource_id_attr(self)
         redacted = frozenset(getattr(self, "_rebac_redacted_fields", frozenset()) or frozenset())
         field_names = {attr}
         try:

@@ -24,9 +24,13 @@ def _resolve_dotted(obj: Any, attr_path: str) -> Any:
     return value
 
 
-def model_resource_type(model_cls: Any) -> str | None:
-    """Return the wire resource type from a model class or instance's metadata."""
-    meta = getattr(model_cls, "_meta", None)
+def model_resource_type(model_or_instance: Any) -> str | None:
+    """Return the wire resource type from a model class or instance's metadata.
+
+    Instances resolve through lazy wrappers (see ``rebac._id``); classes are
+    read directly. Returns ``None`` for anything without REBAC metadata.
+    """
+    meta = getattr(model_or_instance, "_meta", None)
     if meta is None:
         return None
     rebac_type = getattr(meta, "rebac_resource_type", None)
@@ -77,12 +81,12 @@ def model_resource_id(obj: Any) -> str:
         value = _resolve_dotted(obj, attr)
     except AttributeError as exc:
         raise TypeError(
-            f"Cannot resolve {type(obj).__name__} to ObjectRef: "
+            f"Cannot resolve {obj.__class__.__name__} to ObjectRef: "
             f"rebac_id_attr={attr!r} not found on instance ({exc})."
         ) from exc
     if value is None or (isinstance(value, str) and not value):
         raise TypeError(
-            f"Cannot resolve {type(obj).__name__} to ObjectRef: "
+            f"Cannot resolve {obj.__class__.__name__} to ObjectRef: "
             f"rebac_id_attr={attr!r} resolved to an empty value."
         )
     return str(value)
@@ -152,7 +156,7 @@ def to_object_ref(obj: Any) -> ObjectRef:
         return ObjectRef(type_with_prefix(resource_type), str(resource_id))
 
     raise TypeError(
-        f"Cannot resolve {type(obj).__name__} to ObjectRef. "
+        f"Cannot resolve {obj.__class__.__name__} to ObjectRef. "
         f"Add Meta.rebac_resource_type, decorate with @rebac_resource, "
         f"or pass an ObjectRef directly."
     )

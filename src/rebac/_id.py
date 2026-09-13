@@ -4,6 +4,13 @@ Single source of truth for *which* attribute the engine reads when
 building a resource_id (signals + manager) or a subject_id (the
 ``to_subject_ref`` Django-User / Group branches).
 
+Every helper accepts a model class **or** a model instance and reads only
+``._meta``. Pass the instance when you hold one: ``instance._meta`` resolves
+through Django's ``SimpleLazyObject`` (``request.user``) to the wrapped
+model's metadata, whereas ``type(instance)`` is the wrapper class and has no
+``_meta``. Class-level callers (signal ``sender``, ``queryset.model``) pass
+the class.
+
 Resolution order, narrowest to broadest:
 
 1. Per-model ``Meta.rebac_id_attr`` — recognised by
@@ -29,32 +36,39 @@ def type_with_prefix(rebac_type: str) -> str:
     return f"{prefix}{rebac_type}" if prefix else rebac_type
 
 
-def resource_id_attr(model_cls: Any) -> str:
-    """Return the attribute name used to source a resource's id."""
-    attr = getattr(model_cls._meta, "rebac_id_attr", None)
+def resource_id_attr(model_or_instance: Any) -> str:
+    """Return the attribute name used to source a resource's id.
+
+    Accepts a model class or instance; see the module docstring.
+    """
+    attr = getattr(model_or_instance._meta, "rebac_id_attr", None)
     return str(attr or app_settings.REBAC_RESOURCE_ID_ATTR)
 
 
-def subject_id_attr(model_cls: Any) -> str:
+def subject_id_attr(model_or_instance: Any) -> str:
     """Return the attribute name used to source a subject's id.
 
+    Accepts a model class or instance; see the module docstring.
     A model declaring ``Meta.rebac_resource_type`` has one object identity, so
     it follows :func:`resource_id_attr`, including its resource-setting
     fallback. Legacy User/Group models without resource metadata retain the
     actor-side ``REBAC_USER_ID_ATTR`` fallback.
     """
-    attr = getattr(model_cls._meta, "rebac_id_attr", None)
+    attr = getattr(model_or_instance._meta, "rebac_id_attr", None)
     if attr:
         return str(attr)
-    if getattr(model_cls._meta, "rebac_resource_type", None):
-        return resource_id_attr(model_cls)
+    if getattr(model_or_instance._meta, "rebac_resource_type", None):
+        return resource_id_attr(model_or_instance)
     return str(app_settings.REBAC_USER_ID_ATTR)
 
 
-def subject_relation(model_cls: Any) -> str:
-    """Return the optional subject-set relation declared by a Django model."""
+def subject_relation(model_or_instance: Any) -> str:
+    """Return the optional subject-set relation declared by a Django model.
 
-    relation = getattr(model_cls._meta, "rebac_subject_relation", "")
+    Accepts a model class or instance; see the module docstring.
+    """
+
+    relation = getattr(model_or_instance._meta, "rebac_subject_relation", "")
     return str(relation or "")
 
 

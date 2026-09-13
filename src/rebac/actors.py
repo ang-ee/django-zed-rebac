@@ -141,9 +141,15 @@ def model_can_resolve_subject(model_cls: type[Any]) -> bool:
     resolve an instance or maintaining a second registry.
 
     Co-maintained with :func:`to_subject_ref`: the branches below mirror the
-    resolver's model-class dispatch (resource type, User/Group, registered
-    subject). Adding a subject category there without adding it here silently
-    disables delete-time relationship cleanup for that category.
+    resolver's dispatch (resource type, User/Group, registered subject).
+    Adding a subject category there without adding it here silently disables
+    delete-time relationship cleanup for that category.
+
+    This preflight is **class-only**: pass a concrete model class such as a
+    signal's ``sender`` or ``queryset.model``. Never pass ``type()`` of an
+    object that may be a ``SimpleLazyObject``; that is the wrapper class and
+    would answer ``False`` for a user the resolver handles. The resolver
+    accepts instances, lazy wrappers included.
     """
     from django.contrib.auth.models import Group
 
@@ -179,9 +185,12 @@ def to_subject_ref(actor: ActorLike) -> SubjectRef:
     raw ``None`` is a framework error (the resolver chain failed) and still
     raises.
 
-    Co-maintained with :func:`model_can_resolve_subject`: every model-class
+    Co-maintained with :func:`model_can_resolve_subject`: every model
     branch added here (resource type, User/Group, registered subject) needs
-    its non-raising counterpart there, or delete-time cleanup skips it.
+    its non-raising counterpart there, or delete-time cleanup skips it. This
+    resolver dispatches on the instance (``actor._meta``), so Django's
+    ``SimpleLazyObject`` wrappers resolve to the wrapped model; the preflight
+    dispatches on a concrete model class.
     """
     # Imported inside the function, not at module top: ``actors`` is
     # imported during ``INSTALLED_APPS`` boot (via ``rebac/__init__``),
@@ -212,7 +221,7 @@ def to_subject_ref(actor: ActorLike) -> SubjectRef:
         # remains the fail-safe via its ``except NoActorResolvedError`` path.
         if actor.pk is None or not getattr(actor, "is_authenticated", False):
             raise NoActorResolvedError(
-                f"{type(actor).__name__} instance is unsaved or has is_authenticated=False. "
+                f"{actor.__class__.__name__} instance is unsaved or has is_authenticated=False. "
                 "Pass AnonymousUser explicitly for the anonymous actor, or "
                 "save/load a real user row."
             )
@@ -230,7 +239,8 @@ def to_subject_ref(actor: ActorLike) -> SubjectRef:
             # A principal must be a persisted row, as for the User branch;
             # an unsaved instance would otherwise resolve to the id "None".
             raise NoActorResolvedError(
-                f"{type(actor).__name__} instance is unsaved; save it before using it as a subject."
+                f"{actor.__class__.__name__} instance is unsaved; "
+                "save it before using it as a subject."
             )
         resource = to_object_ref(actor)
         return SubjectRef(resource, subject_relation(actor))
@@ -250,7 +260,7 @@ def to_subject_ref(actor: ActorLike) -> SubjectRef:
             return SubjectRef.of(type_with_prefix(type_), str(value))
 
     raise NoActorResolvedError(
-        f"Cannot resolve {type(actor).__name__} instance to SubjectRef. "
+        f"Cannot resolve {actor.__class__.__name__} instance to SubjectRef. "
         f"Decorate the class with @rebac_subject(type=..., id_attr=...) "
         f"or pass a SubjectRef directly."
     )

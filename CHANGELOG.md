@@ -5,6 +5,20 @@ pre-1.0; breaking changes within a minor version are explicitly called out.
 
 ## [Unreleased]
 
+### Fixed
+
+- Identity errors name the wrapped model instead of `SimpleLazyObject` when
+  a lazy user or model wrapper is unsaved, unauthenticated or unresolvable.
+
+### Changed
+
+- The identity helpers in `rebac._id` and `model_resource_type` document
+  their class-or-instance contract once at the owner and take a
+  `model_or_instance` parameter; `RebacMixin` and field-visibility call
+  sites pass the instance they hold. `model_can_resolve_subject` is
+  documented as class-only, paired with the instance-based resolver.
+- The lazy-user middleware regression bounds the request to a single query.
+
 ## [0.17.2] — 2026-09-13
 
 ### Fixed
