@@ -230,7 +230,7 @@ def apply_field_visibility(
 
     for inst in batch:
         denied: set[str] = set()
-        resource_id = _instance_resource_id(inst, model)
+        resource_id = _instance_resource_id(inst)
         for field_name in fields:
             ids = visible.get(field_name)
             if ids is None or resource_id in ids:
@@ -310,15 +310,15 @@ def projection_field_names(
     return frozenset(names)
 
 
-def _instance_resource_id(instance: models.Model, model: type[models.Model]) -> str:
-    return str(getattr(instance, resource_id_attr(model)))
+def _instance_resource_id(instance: models.Model) -> str:
+    return str(getattr(instance, resource_id_attr(instance)))
 
 
 def _remember_resource_id(instance: models.Model) -> None:
     if getattr(instance, "_rebac_resource_id", None) is not None:
         return
     try:
-        instance._rebac_resource_id = _instance_resource_id(instance, type(instance))  # type: ignore[attr-defined]
+        instance._rebac_resource_id = _instance_resource_id(instance)  # type: ignore[attr-defined]
     except Exception:
         return
 
