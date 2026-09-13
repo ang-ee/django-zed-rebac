@@ -1950,19 +1950,14 @@ These four are highest-impact. The full Odoo 19 research note (with file/line ci
 Three layers of tests define the project target:
 
 1. **Unit tests** (`pytest`): pure-Python, no database. Schema parsing, expression compilation, codename mapping, build determinism.
-2. **Integration tests** (`pytest-django`, `@pytest.mark.django_db`): in-memory SQLite + real Postgres. `RebacMixin` end-to-end, manager scoping, signal handlers.
+2. **Integration tests** (`pytest-django`, `@pytest.mark.django_db`): in-memory SQLite. `RebacMixin` end-to-end, manager scoping, signal handlers.
 3. **Future cross-backend contract tests**: once `SpiceDBBackend` lands, run the same suite against `LocalBackend` and SpiceDB (for example via [`testcontainers-spicedb`](https://pypi.org/project/testcontainers-spicedb/)).
 
-GitHub CI gates Ruff lint and formatting, strict mypy, Pyright, and pytest on
-Python 3.14 + Django 6.0. The
-target compatibility matrix is:
-
-```
-Python:  3.14
-Django:  6.0
-DB:      sqlite (unit) · postgres-15 (integration) · postgres-16 (integration)
-Backend: local
-```
+GitHub CI gates Ruff lint and formatting, strict mypy, Pyright, and pytest.
+The supported matrix is declared once, in `pyproject.toml` (`requires-python`,
+the Django pin) and `.github/workflows/ci.yml`; at the time of writing that is
+Python 3.14 × Django 6.0 × SQLite with the `local` backend. Broader matrices
+are a release decision, not the current contract.
 
 The package ships `py.typed` (PEP 561). `make check` runs the same formatting,
 lint, type-checking, and runtime checks locally. Integration tests exercise

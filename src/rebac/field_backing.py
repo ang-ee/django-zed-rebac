@@ -145,7 +145,7 @@ class ResolvedAttributeBacking:
         """
         try:
             value = self.field.to_python(resource_id)
-        except (ValidationError, ValueError, TypeError):  # fmt: skip
+        except ValidationError, ValueError, TypeError:
             return None
         if self.container_id_of(value) != resource_id:
             return None

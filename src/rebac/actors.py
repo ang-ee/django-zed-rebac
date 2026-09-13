@@ -139,6 +139,11 @@ def model_can_resolve_subject(model_cls: type[Any]) -> bool:
     This is the non-raising class-level preflight for global lifecycle hooks.
     It deliberately shares the resolver's owning metadata instead of trying to
     resolve an instance or maintaining a second registry.
+
+    Co-maintained with :func:`to_subject_ref`: the branches below mirror the
+    resolver's model-class dispatch (resource type, User/Group, registered
+    subject). Adding a subject category there without adding it here silently
+    disables delete-time relationship cleanup for that category.
     """
     from django.contrib.auth.models import Group
 
@@ -173,6 +178,10 @@ def to_subject_ref(actor: ActorLike) -> SubjectRef:
     (``REBAC_ANONYMOUS_TYPE:*``) — see :func:`is_anonymous_actor`. Passing
     raw ``None`` is a framework error (the resolver chain failed) and still
     raises.
+
+    Co-maintained with :func:`model_can_resolve_subject`: every model-class
+    branch added here (resource type, User/Group, registered subject) needs
+    its non-raising counterpart there, or delete-time cleanup skips it.
     """
     # Imported inside the function, not at module top: ``actors`` is
     # imported during ``INSTALLED_APPS`` boot (via ``rebac/__init__``),

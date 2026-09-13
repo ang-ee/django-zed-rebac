@@ -326,7 +326,11 @@ Per `docs/ARCHITECTURE.md § Testing`:
   opt-in marker.
 - **CI matrix:** Python 3.14 × Django 6.0 × SQLite, as declared in
   `.github/workflows/ci.yml` and `pyproject.toml`. Broader matrices are a
-  release decision, not the current contract.
+  release decision, not the current contract. `ruff` targets 3.14, so
+  3.14-only syntax is in play and `ruff format` emits it: an unparenthesised
+  multi-exception clause (`except A, B:`, PEP 758) is the formatter's
+  canonical form, not a Python 2 leftover. Don't add `# fmt: skip` to fight
+  it.
 - **DjangoVer** for releases:
   `<DJANGO_MAJOR>.<DJANGO_FEATURE>.<PACKAGE_VERSION>`.
 

@@ -46,7 +46,7 @@ def _concrete_field(model: type[models.Model], identity: str) -> models.Field[An
 
     try:
         query_field, scalar_field = model_identity_fields(model, identity)
-    except (FieldDoesNotExist, ValueError):  # fmt: skip
+    except FieldDoesNotExist, ValueError:
         raise UnsupportedScope from None
     if not query_field.concrete:
         raise UnsupportedScope
@@ -325,7 +325,7 @@ class LocalQueryScope:
                     if model is not None:
                         try:
                             _concrete_field(model, identity).get_prep_value(resource_id)
-                        except (TypeError, ValueError):  # fmt: skip
+                        except TypeError, ValueError:
                             raise UnsupportedScope from None
                     resource_match = Q(**{identity: resource_id})
             else:

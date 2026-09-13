@@ -15,10 +15,11 @@ pre-1.0; breaking changes within a minor version are explicitly called out.
 - Unrelated Django model deletions skip subject resolution and relationship
   cleanup. Resource, User, Group and registered-subject cleanup retains the
   canonical identity resolver and deletion database alias.
-- Repair the virtual-identity fixture so Django initialization cannot shadow
-  its computed value, and retain surviving direct grants in the revocation
-  regression. Clarify that consumer schemas own agent delegation and update
-  the contributor CI matrix to Python 3.14 and Django 6.0.
+- Repair the virtual-identity test fixture so Django initialization cannot
+  shadow its computed value; the virtual live-backing regression suite now
+  runs.
+- The revocation regression keeps surviving direct grants in its expected
+  scope instead of asserting they disappear.
 - Live backing accepts ORM-queryable scalar virtual identities, including
   public IDs encoded from an existing integer primary key. Django fields own
   lookup preparation and result conversion; graph IDs and stored tuples keep
@@ -39,6 +40,16 @@ pre-1.0; breaking changes within a minor version are explicitly called out.
 - Relationship cleanup covers configured Django User and Group subjects as
   well as model resources, using the deletion database alias in both storage
   modes. Unrelated identities and grants remain intact.
+
+### Documentation
+
+- Clarify that consumer schemas own agent delegation: the engine builds the
+  grant subject but neither impersonates the grant's owner nor derives
+  permissions from an agent's identity. `README.md`, `docs/ARCHITECTURE.md`,
+  `docs/ZED.md` and both contributor guides now state the same contract.
+- State the contributor CI matrix once: Python 3.14 × Django 6.0 × SQLite as
+  declared in `pyproject.toml` and the CI workflow. `docs/ARCHITECTURE.md`
+  no longer lists a Postgres integration matrix that CI does not run.
 
 ### Corrected contract — consumer migration required
 
