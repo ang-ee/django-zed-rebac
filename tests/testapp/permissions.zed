@@ -1,7 +1,7 @@
 // Test schema for the synthetic Post / Folder models.
 // @rebac_package: testapp
 // @rebac_package_version: 0.1.0
-// @rebac_schema_revision: 1
+// @rebac_schema_revision: 2
 
 definition blog/post {
     relation owner: auth/user
@@ -20,4 +20,9 @@ definition blog/folder {
 
     permission read = owner + viewer + parent->read
     permission write = owner + parent->write
+}
+
+definition blog/subjectcontainer {
+    relation member: auth/user
+    permission read = member
 }

@@ -177,12 +177,9 @@ class RebacPermissionsMixin(models.Model):
     def has_perm(self, perm: str, obj: Any = None) -> bool:
         """Return True if any backend grants ``perm`` (optionally on ``obj``).
 
-        Active superusers short-circuit to True — matches contrib.auth
-        so admin behaves identically for superuser sessions. Anyone
-        else walks :setting:`AUTHENTICATION_BACKENDS`.
+        Every user walks :setting:`AUTHENTICATION_BACKENDS`. The configured
+        permission backend owns any superuser bypass policy.
         """
-        if self.is_active and self.is_superuser:
-            return True
         return _walk_backends("has_perm", self, perm, obj)
 
     def has_perms(self, perm_list: Iterable[str], obj: Any = None) -> bool:
@@ -202,10 +199,8 @@ class RebacPermissionsMixin(models.Model):
         """Return True if any backend grants any permission on ``app_label``.
 
         Used by the admin index to decide whether to render an app's
-        section. Superusers bypass.
+        section. The configured permission backend owns superuser policy.
         """
-        if self.is_active and self.is_superuser:
-            return True
         return _walk_backends("has_module_perms", self, app_label)
 
     # ---------- Async siblings (Django 4.1+) ----------
@@ -220,8 +215,6 @@ class RebacPermissionsMixin(models.Model):
         return await _awalk_get_permissions(self, obj, "all")
 
     async def ahas_perm(self, perm: str, obj: Any = None) -> bool:
-        if self.is_active and self.is_superuser:
-            return True
         return await _awalk_backends("ahas_perm", self, perm, obj)
 
     async def ahas_perms(self, perm_list: Iterable[str], obj: Any = None) -> bool:
@@ -233,8 +226,6 @@ class RebacPermissionsMixin(models.Model):
         return True
 
     async def ahas_module_perms(self, app_label: str) -> bool:
-        if self.is_active and self.is_superuser:
-            return True
         return await _awalk_backends("ahas_module_perms", self, app_label)
 
 

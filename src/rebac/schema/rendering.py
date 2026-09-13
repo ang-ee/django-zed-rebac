@@ -1,7 +1,10 @@
 """Canonical Zed rendering of the native schema AST."""
 
+import json
+
 from .ast import (
     AllowedSubject,
+    AttributeBinding,
     Caveat,
     ConstBinding,
     Definition,
@@ -13,6 +16,7 @@ from .ast import (
     PermRef,
     Relation,
     Schema,
+    backing_to_dict,
 )
 
 
@@ -68,7 +72,18 @@ def _render_relation(relation: Relation, *, include_backing: bool) -> str:
     if isinstance(backing, ConstBinding):
         return f"{line} // rebac:const={backing.target_id}"
     if isinstance(backing, FieldBinding):
-        return f"{line} // rebac:field={backing.attname}"
+        if not backing.filters:
+            return f"{line} // rebac:field={backing.attname}"
+        data = backing_to_dict(backing)
+        assert data is not None
+        data.pop("kind")
+        data["path"] = data.pop("attname")
+        return f"{line} // rebac:field={json.dumps(data, sort_keys=True, separators=(',', ':'))}"
+    if isinstance(backing, AttributeBinding):
+        data = backing_to_dict(backing)
+        assert data is not None
+        data.pop("kind")
+        return f"{line} // rebac:attribute={json.dumps(data, sort_keys=True, separators=(',', ':'))}"
     raise TypeError(f"{relation.name}: unsupported relation backing kind {backing.kind!r}")
 
 

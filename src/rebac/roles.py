@@ -94,7 +94,8 @@ from __future__ import annotations
 from collections.abc import Iterator
 from typing import TYPE_CHECKING, Any, cast
 
-from .actors import ActorLike, to_subject_ref
+from .actors import ActorLike
+from .memberships import MEMBER_RELATION
 from .types import ObjectRef, RelationshipTuple, SubjectRef
 
 if TYPE_CHECKING:  # pragma: no cover
@@ -106,7 +107,7 @@ else:  # pragma: no cover
     RelationshipRow = Any
 
 
-ROLE_RELATION = "member"
+ROLE_RELATION = MEMBER_RELATION
 """The single relation used for role membership. Convention, not configurable.
 
 If a consumer needs a different relation name for some bespoke role-shape,
@@ -192,39 +193,9 @@ def grant(*, actor: ActorLike, role: str | ObjectRef) -> RelationshipRow:
 
     Returns the :class:`Relationship` row (newly created or pre-existing).
     """
-    from django.db import transaction
+    from .memberships import grant as grant_membership
 
-    from .models import active_relationship_model
-    from .relationships import write_relationships
-
-    Relationship = active_relationship_model()
-
-    actor_ref = to_subject_ref(actor)
-    role_ref = _parse_role(role)
-    # Wrap write + read-back in one atomic so a concurrent revoke between
-    # the upsert and the .get() can't surface as DoesNotExist.
-    with transaction.atomic():
-        write_relationships(
-            [
-                RelationshipTuple(
-                    resource=role_ref,
-                    relation=ROLE_RELATION,
-                    subject=actor_ref,
-                )
-            ]
-        )
-        # `Relationship` is the active model — a union of the two storage
-        # shapes; mypy narrows it via django-stubs, pyright keeps the union.
-        row = Relationship.objects.get(
-            resource_type=role_ref.resource_type,
-            resource_id=role_ref.resource_id,
-            relation=ROLE_RELATION,
-            subject_type=actor_ref.subject_type,
-            subject_id=actor_ref.subject_id,
-            optional_subject_relation=actor_ref.optional_relation,
-            caveat_name="",
-        )
-        return cast("RelationshipRow", row)
+    return cast("RelationshipRow", grant_membership(subject=actor, container=_parse_role(role)))
 
 
 def revoke(*, actor: ActorLike, role: str | ObjectRef) -> int:
@@ -234,36 +205,9 @@ def revoke(*, actor: ActorLike, role: str | ObjectRef) -> int:
     otherwise — the unique constraint on :class:`Relationship` guarantees
     at most one matching row).
     """
-    from django.db import transaction
+    from .memberships import revoke as revoke_membership
 
-    from .models import active_relationship_model
-    from .relationships import delete_relationship
-
-    Relationship = active_relationship_model()
-
-    actor_ref = to_subject_ref(actor)
-    role_ref = _parse_role(role)
-    # Wrap presence-check + delete in one atomic so the returned count
-    # reflects the same row state both operations saw — otherwise a
-    # concurrent grant/revoke between the two queries can make this lie.
-    with transaction.atomic():
-        exists = Relationship.objects.filter(
-            resource_type=role_ref.resource_type,
-            resource_id=role_ref.resource_id,
-            relation=ROLE_RELATION,
-            subject_type=actor_ref.subject_type,
-            subject_id=actor_ref.subject_id,
-            optional_subject_relation=actor_ref.optional_relation,
-            caveat_name="",
-        ).exists()
-        delete_relationship(
-            RelationshipTuple(
-                resource=role_ref,
-                relation=ROLE_RELATION,
-                subject=actor_ref,
-            )
-        )
-    return 1 if exists else 0
+    return revoke_membership(subject=actor, container=_parse_role(role))
 
 
 def roles_of(actor: ActorLike) -> Iterator[ObjectRef]:
@@ -274,26 +218,9 @@ def roles_of(actor: ActorLike) -> Iterator[ObjectRef]:
     use the engine (``has_access`` / ``accessible``), which traverses
     ``role:editor#member`` subject-sets at check time.
     """
-    from .models import active_relationship_model
+    from .memberships import containers_of
 
-    Relationship = active_relationship_model()
-
-    actor_ref = to_subject_ref(actor)
-    # Iterate via property accessors rather than values_list — the registry
-    # manager's translator rewrites lookup *filter* kwargs, but
-    # values_list("resource_type", ...) asks for raw field names that don't
-    # exist on RelationshipRegistry. The manager's default
-    # select_related("resource_fk", "subject_fk") makes the property
-    # access free.
-    rows = Relationship.objects.filter(
-        relation=ROLE_RELATION,
-        subject_type=actor_ref.subject_type,
-        subject_id=actor_ref.subject_id,
-        optional_subject_relation=actor_ref.optional_relation,
-        resource_type__endswith="/role",
-    )
-    for row in rows:
-        yield ObjectRef(row.resource_type, row.resource_id)
+    yield from (container for container in containers_of(actor) if container.resource_type.endswith("/role"))
 
 
 def members_of(role: str | ObjectRef) -> Iterator[SubjectRef]:
@@ -305,18 +232,9 @@ def members_of(role: str | ObjectRef) -> Iterator[SubjectRef]:
     enumerate ``accessible()`` on a resource that references the role
     in its permission expression.
     """
-    from .models import active_relationship_model
+    from .memberships import members_of as membership_members_of
 
-    Relationship = active_relationship_model()
-
-    role_ref = _parse_role(role)
-    rows = Relationship.objects.filter(
-        resource_type=role_ref.resource_type,
-        resource_id=role_ref.resource_id,
-        relation=ROLE_RELATION,
-    )
-    for row in rows:
-        yield SubjectRef.of(row.subject_type, row.subject_id, row.optional_subject_relation)
+    yield from membership_members_of(_parse_role(role))
 
 
 def imply(*, parent: str | ObjectRef, child: str | ObjectRef) -> RelationshipRow:

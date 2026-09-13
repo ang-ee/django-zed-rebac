@@ -6,6 +6,7 @@ import pytest
 
 from rebac.schema import (
     PermBinOp,
+    named_object_refs,
     parse_zed,
     permission_object_sources,
     render_zed,
@@ -72,6 +73,18 @@ def test_object_sources_follow_arrows_relations_subject_sets_and_cycles():
     assert sources == frozenset(
         ObjectRef("access/role", name) for name in ("admin", "direct", "editor")
     )
+
+
+def test_named_object_refs_collects_all_literal_schema_objects():
+    assert named_object_refs(parse_zed(SOURCE)) == frozenset(
+        ObjectRef("access/role", name) for name in ("admin", "blocked", "direct", "editor")
+    )
+
+
+def test_named_object_refs_filters_types_and_never_invents_generic_ids():
+    schema = parse_zed(SOURCE)
+    assert named_object_refs(schema, object_type="access/role") == named_object_refs(schema)
+    assert not named_object_refs(schema, object_type="auth/user")
 
 
 @pytest.mark.parametrize(

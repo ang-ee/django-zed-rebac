@@ -51,6 +51,17 @@ class SluggedPost(RebacMixin, models.Model):
         rebac_id_attr = "slug"
 
 
+class SubjectContainer(SluggedPost):
+    """Proxy exercising model-owned subject-set identity without another table."""
+
+    class Meta:
+        proxy = True
+        app_label = "testapp"
+        rebac_resource_type = "blog/subjectcontainer"
+        rebac_id_attr = "slug"
+        rebac_subject_relation = "member"
+
+
 class AuthoredPost(RebacMixin, models.Model):
     title = models.CharField(max_length=200)
     folder = models.ForeignKey(

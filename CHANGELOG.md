@@ -3,6 +3,36 @@
 All notable changes to `django-zed-rebac` are tracked here. The project is in
 pre-1.0; breaking changes within a minor version are explicitly called out.
 
+## [Unreleased]
+
+## [0.17.0] — 2026-09-13
+
+### Added
+
+- Native `rebac.memberships` operations over any `member` container, with
+  exact caveat revocation and compatibility delegates from `rebac.roles`.
+- Model-owned default subject relations and canonical registered-model
+  identity, including field-backed lookup and configured type prefixes.
+- Live filtered ORM relation paths and scalar attribute-backed membership,
+  with shared parsing, persistence, direct evaluation and lazy SQL scoping.
+- Schema introspection of named object references without a second catalogue.
+- Native resource/subject tuple cleanup in both local storage modes and the
+  deleting model's database alias.
+
+### Changed
+
+- `RebacPermissionsMixin` delegates Django permission checks to installed
+  backends without an unconditional superuser shortcut. Django backend
+  chaining still applies; login policy remains with the application.
+- Permission-named subject sets resolve through the permission evaluator.
+- Local decision caches are bypassed for live ORM-backed schemas so bulk
+  writes and membership changes take effect immediately.
+
+### Removed
+
+- The unimplemented `REBAC_SYNC_DJANGO_GROUPS` setting. Use live field backing
+  for Django-owned membership or native membership tuples as the sole store.
+
 ## [0.16.3] — 2026-09-12
 
 ### Fixed

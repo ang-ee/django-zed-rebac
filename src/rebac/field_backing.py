@@ -1,19 +1,23 @@
-"""Resolution helpers for schema-declared field-backed relations."""
+"""Resolve schema-declared live ORM and constant relations."""
 
 from __future__ import annotations
 
-from collections.abc import Iterator
+from collections.abc import Iterable, Iterator
 from dataclasses import dataclass
 from typing import Any
 
 from django.contrib.auth import get_user_model
-from django.core.exceptions import FieldDoesNotExist
+from django.core.exceptions import FieldDoesNotExist, FieldError, ValidationError
 from django.db import models
+from django.db.models import Q, QuerySet
+from django.db.models.expressions import BaseExpression
+from django.db.models.fields.reverse_related import ForeignObjectRel
 
-from ._id import resource_id_attr, subject_id_attr
+from ._id import resource_id_attr, subject_id_attr, type_with_prefix
 from .conf import app_settings
 from .resources import model_for_resource_type, model_resource_type
 from .schema.ast import (
+    AttributeBinding,
     ConstBinding,
     Definition,
     FieldBinding,
@@ -25,53 +29,134 @@ from .schema.ast import (
 )
 from .types import SubjectRef
 
+ModelField = models.Field[Any, Any] | ForeignObjectRel
+
 
 @dataclass(frozen=True, slots=True)
 class ResolvedFieldBacking:
+    """A forward/reverse ORM path with filters anchored on its source model."""
+
     source_model: type[models.Model]
     target_model: type[models.Model]
-    field: models.Field[Any, Any]
+    field: ModelField
     relation: Relation
     target_resource_type: str
     target_id_attr: str
+    path: str
 
     @property
     def source_id_attr(self) -> str:
         return resource_id_attr(self.source_model)
 
+    @property
+    def filters(self) -> dict[str, Any]:
+        backing = self.relation.backing
+        return dict(backing.filters) if isinstance(backing, FieldBinding) else {}
+
     def source_filter(self, resource_id: str) -> dict[str, str]:
         return {self.source_id_attr: resource_id}
 
     def target_filter(self, subject: SubjectRef) -> dict[str, str]:
-        if self.target_id_attr == "pk":
-            return {self.field.attname: subject.subject_id}
-        return {f"{self.field.name}__{self.target_id_attr}": subject.subject_id}
+        return {self.target_values_path(): subject.subject_id}
 
-    def target_in_filter(self, resource_ids: set[str]) -> dict[str, list[str]]:
-        values = list(resource_ids)
-        if self.target_id_attr == "pk":
-            return {f"{self.field.attname}__in": values}
-        return {f"{self.field.name}__{self.target_id_attr}__in": values}
+    def target_in_filter(self, resource_ids: Iterable[str]) -> dict[str, Iterable[str]]:
+        return {f"{self.target_values_path()}__in": resource_ids}
 
     def source_values_path(self) -> str:
         return self.source_id_attr
 
     def target_values_path(self) -> str:
-        if self.target_id_attr == "pk":
-            return self.field.attname
-        return f"{self.field.name}__{self.target_id_attr}"
+        if "__" not in self.path and self.target_id_attr == "pk":
+            if isinstance(self.field, (models.ForeignKey, models.OneToOneField)):
+                return self.field.attname
+        return f"{self.path}__{self.target_id_attr}"
+
+    def queryset(
+        self,
+        *,
+        resource_id: str | None = None,
+        subject: SubjectRef | None = None,
+        target_ids: Iterable[str] | None = None,
+        using: str | None = None,
+    ) -> QuerySet[Any]:
+        """Constrain the target and through-row predicates in the same SQL join."""
+
+        predicate = Q(**self.filters)
+        if resource_id is not None:
+            predicate &= Q(**self.source_filter(resource_id))
+        if subject is not None:
+            predicate &= Q(**self.target_filter(subject))
+        if target_ids is not None:
+            predicate &= Q(**self.target_in_filter(target_ids))
+        return self.source_model._base_manager.db_manager(using).filter(predicate)
+
+
+@dataclass(frozen=True, slots=True)
+class ResolvedAttributeBacking:
+    """A virtual container derived from a scalar field on its subject model."""
+
+    target_model: type[models.Model]
+    target_resource_type: str
+    target_id_attr: str
+    field: models.Field[Any, Any]
+    resource: str | None
+    value: Any
+    filters: dict[str, Any]
+
+    def applies_to(self, resource_id: str) -> bool:
+        return self.resource is None or self.resource == resource_id
+
+    def subjects_filter(self, resource_id: str | BaseExpression) -> Q:
+        """Select current subject rows belonging to the virtual container."""
+
+        if isinstance(resource_id, str) and not self.applies_to(resource_id):
+            return Q(pk__in=[])
+        if self.resource is None and isinstance(resource_id, str):
+            try:
+                value = self.field.to_python(resource_id)
+            except (ValidationError, ValueError, TypeError):
+                return Q(pk__in=[])
+            if str(value) != resource_id:
+                return Q(pk__in=[])
+        else:
+            value = resource_id if self.resource is None else self.value
+        return Q(**self.filters) & Q(**{self.field.name: value})
+
+    def target_filter(self, resource_id: str, subject: SubjectRef) -> Q:
+        if subject.subject_type != self.target_resource_type or subject.optional_relation:
+            return Q(pk__in=[])
+        return self.subjects_filter(resource_id) & Q(**{self.target_id_attr: subject.subject_id})
+
+    def resource_ids_for_subject(
+        self, subject: SubjectRef, using: str | None = None
+    ) -> set[str]:
+        if subject.subject_type != self.target_resource_type or subject.optional_relation:
+            return set()
+        return self.resource_ids_for_targets((subject.subject_id,), using=using)
+
+    def resource_ids_for_targets(
+        self, target_ids: Iterable[str], using: str | None = None
+    ) -> set[str]:
+        """Project live subject rows back to their virtual resource IDs."""
+
+        predicate = Q(**self.filters) & Q(**{f"{self.target_id_attr}__in": target_ids})
+        rows = self.target_model._base_manager.db_manager(using).filter(predicate)
+        if self.resource is not None:
+            return (
+                {self.resource}
+                if rows.filter(**{self.field.name: self.value}).exists()
+                else set()
+            )
+        return {
+            str(value)
+            for value in rows.values_list(self.field.name, flat=True).distinct()
+            if value is not None and str(value)
+        }
 
 
 @dataclass(frozen=True, slots=True)
 class ResolvedConstBacking:
-    """A const-backed relation resolved against the declaring Django model.
-
-    Unlike :class:`ResolvedFieldBacking` there is no source field and the
-    target object id is fixed for every row, so the forward direction needs no
-    query at all; only the reverse (``accessible``) direction touches the DB,
-    to enumerate every row of the source type when the constant target grants
-    access.
-    """
+    """A fixed target with source rows needed only for reverse enumeration."""
 
     source_model: type[models.Model]
     relation: Relation
@@ -86,41 +171,139 @@ class ResolvedConstBacking:
         return self.source_id_attr
 
 
-def resolve_field_backing(
-    definition: Definition,
-    relation: Relation,
-) -> ResolvedFieldBacking | None:
-    """Resolve a field binding to concrete Django model metadata.
+def _relation_path(
+    source_model: type[models.Model], path: str
+) -> tuple[type[models.Model], ModelField, str]:
+    """Resolve every path segment through Django's native relation metadata."""
 
-    Returns ``None`` when the schema names a backing that cannot be resolved
-    against loaded Django models. System checks report that mismatch at
-    startup; hot-path authorization calls fail closed.
-    """
+    current = source_model
+    names: list[str] = []
+    last: ModelField | None = None
+    for part in path.split("__"):
+        try:
+            last = current._meta.get_field(part)
+        except FieldDoesNotExist as exc:
+            raise ValueError(f"missing field {part!r} on {current.__name__}") from exc
+        target = getattr(last, "related_model", None)
+        if not last.is_relation or not isinstance(target, type):
+            raise ValueError(f"{current.__name__}.{part} must be a model relation")
+        names.append(last.name)
+        current = target
+    if last is None:
+        raise ValueError("field path must not be empty")
+    return current, last, "__".join(names)
+
+
+def _validate_filters(model: type[models.Model], filters: tuple[tuple[str, Any], ...]) -> None:
+    """Let Django resolve complete lookup paths without executing the query."""
+
+    try:
+        model._base_manager.filter(Q(**dict(filters)))
+    except (FieldError, ValueError, TypeError, ValidationError) as exc:
+        raise ValueError(f"invalid filters on {model.__name__}: {exc}") from exc
+
+
+def _validate_model_identity(model: type[models.Model], attr: str) -> None:
+    """Require an ORM-addressable scalar identity for live backing queries."""
+
+    field = model._meta.pk if attr == "pk" else model._meta.get_field(attr)
+    if not field.concrete or field.is_relation:
+        raise ValueError(
+            f"{model.__name__} identity {attr!r} must be a concrete scalar field"
+        )
+
+
+def _resolve_field_backing(definition: Definition, relation: Relation) -> ResolvedFieldBacking:
     backing = relation.backing
     if not isinstance(backing, FieldBinding) or len(relation.allowed_subjects) != 1:
-        return None
-
+        raise ValueError("field-backed relation must declare exactly one subject type")
     allowed = relation.allowed_subjects[0]
     source_model = model_for_resource_type(definition.resource_type)
     target_model, target_id_attr = _target_model_and_id_attr(allowed.type)
     if source_model is None or target_model is None:
+        raise ValueError("field-backed relation requires matching source and target Django models")
+    try:
+        _validate_model_identity(source_model, resource_id_attr(source_model))
+        _validate_model_identity(target_model, target_id_attr)
+    except FieldDoesNotExist as exc:
+        raise ValueError(f"missing identity field {exc.args[0]!r}") from exc
+    actual_model, field, path = _relation_path(source_model, backing.attname)
+    if actual_model._meta.concrete_model is not target_model._meta.concrete_model:
+        raise ValueError(
+            f"field path {backing.attname!r} points at {model_resource_type(actual_model)!r}, "
+            f"but schema allows {allowed.type!r}"
+        )
+    _validate_filters(source_model, backing.filters)
+    return ResolvedFieldBacking(
+        source_model, target_model, field, relation, allowed.type, target_id_attr, path
+    )
+
+
+def resolve_field_backing(
+    definition: Definition, relation: Relation
+) -> ResolvedFieldBacking | None:
+    """Resolve a field path, returning None for declarations checks will reject."""
+
+    if not isinstance(relation.backing, FieldBinding):
         return None
     try:
-        field = source_model._meta.get_field(backing.attname)
-    except FieldDoesNotExist:
+        return _resolve_field_backing(definition, relation)
+    except ValueError:
         return None
-    if not isinstance(field, (models.ForeignKey, models.OneToOneField)):
-        return None
-    if field.remote_field is None or field.remote_field.model is not target_model:
-        return None
-    return ResolvedFieldBacking(
-        source_model,
-        target_model,
-        field,
-        relation,
-        allowed.type,
-        target_id_attr,
+
+
+def _resolve_attribute_backing(
+    definition: Definition, relation: Relation
+) -> ResolvedAttributeBacking:
+    backing = relation.backing
+    if not isinstance(backing, AttributeBinding) or len(relation.allowed_subjects) != 1:
+        raise ValueError("attribute-backed relation must declare exactly one subject type")
+    allowed = relation.allowed_subjects[0]
+    target_model, target_id_attr = _target_model_and_id_attr(allowed.type)
+    if target_model is None:
+        raise ValueError("attribute-backed relation requires a matching subject Django model")
+    try:
+        _validate_model_identity(target_model, target_id_attr)
+    except FieldDoesNotExist as exc:
+        raise ValueError(f"missing identity field {exc.args[0]!r}") from exc
+    try:
+        field = target_model._meta.get_field(backing.field)
+    except FieldDoesNotExist as exc:
+        raise ValueError(f"missing attribute {backing.field!r} on {target_model.__name__}") from exc
+    if not isinstance(field, models.Field) or not field.concrete or field.is_relation:
+        raise ValueError("attribute backing requires a concrete scalar subject field")
+    _validate_filters(target_model, backing.filters)
+    if backing.resource is not None:
+        _validate_filters(target_model, ((field.name, backing.value),))
+    return ResolvedAttributeBacking(
+        target_model, allowed.type, target_id_attr, field,
+        backing.resource, backing.value, dict(backing.filters)
     )
+
+
+def resolve_attribute_backing(
+    definition: Definition, relation: Relation
+) -> ResolvedAttributeBacking | None:
+    """Resolve live subject-column membership independently of a container table."""
+
+    if not isinstance(relation.backing, AttributeBinding):
+        return None
+    try:
+        return _resolve_attribute_backing(definition, relation)
+    except ValueError:
+        return None
+
+
+def attribute_backing_model_errors(definition: Definition, relation: Relation) -> list[str]:
+    """Return model errors for a live subject-column declaration."""
+
+    if not isinstance(relation.backing, AttributeBinding):
+        return []
+    try:
+        _resolve_attribute_backing(definition, relation)
+    except ValueError as exc:
+        return [f"{definition.resource_type}#{relation.name}: attribute backing: {exc}"]
+    return []
 
 
 def resolve_const_backing(
@@ -273,59 +456,26 @@ def _find_const_arrow_cycle(
 
 
 def field_backing_model_errors(definition: Definition, relation: Relation) -> list[str]:
-    """Return Django-model validation errors for a field-backed relation."""
-    backing = relation.backing
-    if not isinstance(backing, FieldBinding):
+    """Return model errors for a live relation path and its source filters."""
+
+    if not isinstance(relation.backing, FieldBinding):
         return []
-
-    errors: list[str] = []
-    source_model = model_for_resource_type(definition.resource_type)
-    if source_model is None:
-        return [
-            f"{definition.resource_type}#{relation.name}: field-backed relation "
-            "requires a Django model with matching Meta.rebac_resource_type"
-        ]
-
     try:
-        field = source_model._meta.get_field(backing.attname)
-    except FieldDoesNotExist:
-        return [
-            f"{definition.resource_type}#{relation.name}: field-backed relation "
-            f"references missing field {backing.attname!r} on {source_model.__name__}"
-        ]
-
-    if not isinstance(field, (models.ForeignKey, models.OneToOneField)):
-        errors.append(
-            f"{definition.resource_type}#{relation.name}: field {source_model.__name__}."
-            f"{field.name} must be a ForeignKey or OneToOneField"
-        )
-        return errors
-
-    if len(relation.allowed_subjects) != 1:
-        return errors
-
-    allowed = relation.allowed_subjects[0]
-    target_model = getattr(field.remote_field, "model", None)
-    allowed_model, _target_id_attr = _target_model_and_id_attr(allowed.type)
-    if target_model is not allowed_model:
-        actual_type = model_resource_type(target_model)
-        errors.append(
-            f"{definition.resource_type}#{relation.name}: field {source_model.__name__}."
-            f"{field.name} points at resource type {actual_type!r}, "
-            f"but schema allows {allowed.type!r}"
-        )
-    return errors
+        _resolve_field_backing(definition, relation)
+    except ValueError as exc:
+        return [f"{definition.resource_type}#{relation.name}: field backing: {exc}"]
+    return []
 
 
 def _target_model_and_id_attr(subject_type: str) -> tuple[type[models.Model] | None, str]:
-    if subject_type == app_settings.REBAC_USER_TYPE:
+    model = model_for_resource_type(subject_type)
+    if model is not None:
+        return model, resource_id_attr(model)
+    if subject_type == type_with_prefix(app_settings.REBAC_USER_TYPE):
         user_model = get_user_model()
         return user_model, subject_id_attr(user_model)
-    if subject_type == app_settings.REBAC_GROUP_TYPE:
+    if subject_type == type_with_prefix(app_settings.REBAC_GROUP_TYPE):
         from django.contrib.auth.models import Group
 
         return Group, subject_id_attr(Group)
-    model = model_for_resource_type(subject_type)
-    if model is None:
-        return None, ""
-    return model, resource_id_attr(model)
+    return None, ""

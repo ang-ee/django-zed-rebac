@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import pytest
+import rebac.field_backing as field_backing
 from django.contrib.auth import get_user_model
 from django.db import connection
 from django.test import override_settings
@@ -56,6 +57,23 @@ def _folder_subject(folder: Folder) -> SubjectRef:
 
 def _post_ref(post: Post) -> ObjectRef:
     return ObjectRef("blog/post", str(post.pk))
+
+
+def test_explicit_model_identity_wins_over_builtin_subject_mapping(monkeypatch):
+    class RegisteredGroup:
+        class _meta:
+            rebac_id_attr = "public_id"
+
+    monkeypatch.setattr(
+        field_backing,
+        "model_for_resource_type",
+        lambda resource_type: RegisteredGroup if resource_type == "auth/group" else None,
+    )
+
+    model, id_attr = field_backing._target_model_and_id_attr("auth/group")
+
+    assert model is RegisteredGroup
+    assert id_attr == "public_id"
 
 
 @pytest.fixture

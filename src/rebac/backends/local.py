@@ -43,13 +43,16 @@ from django.db.models import QuerySet
 from ..conf import app_settings
 from ..errors import PermissionDepthExceeded, SchemaError
 from ..field_backing import (
+    ResolvedAttributeBacking,
     ResolvedConstBacking,
     ResolvedFieldBacking,
+    resolve_attribute_backing,
     resolve_const_backing,
     resolve_field_backing,
 )
 from ..resources import model_resource_type
 from ..schema.ast import (
+    AttributeBinding,
     BUILTIN_ACTOR_TYPES,
     AllowedSubject,
     ConstBinding,
@@ -172,13 +175,13 @@ class LocalBackend(Backend):
         """Install the in-memory schema. Called by the sync command."""
         from ..schema.parser import validate_schema
 
-        field_backing_errors = [
+        backing_errors = [
             error
             for error in validate_schema(schema)
-            if "field-backed relation" in error or "field backing" in error
+            if "backed relation" in error or "backing" in error
         ]
-        if field_backing_errors:
-            raise SchemaError("; ".join(field_backing_errors))
+        if backing_errors:
+            raise SchemaError("; ".join(backing_errors))
         with self._schema_lock:
             self._schema = schema
             self._schema_is_manual = True
@@ -242,6 +245,15 @@ class LocalBackend(Backend):
             return None
         snapshot = self._schema_snapshot()
         schema = snapshot.schema
+        if any(
+            isinstance(relation.backing, (FieldBinding, AttributeBinding))
+            for definition in schema.definitions
+            for relation in definition.relations
+        ):
+            # ORM-backed facts can change through update(), M2M, reverse
+            # relations, or another process without a Relationship generation
+            # bump. Never retain permission answers across those live reads.
+            return None
         if any(relation.with_expiration for d in schema.definitions for relation in d.relations):
             # A relationship deadline can pass with no write or schema change.
             # Dependency-specific expiry tracking is not implemented yet.
@@ -270,12 +282,11 @@ class LocalBackend(Backend):
         from ..schema.ast import (
             Caveat,
             CaveatParam,
-            ConstBinding,
             Definition,
-            FieldBinding,
             Permission,
             Relation,
             Schema,
+            backing_from_dict,
         )
         from ..schema.parser import parse_permission_expression
 
@@ -300,17 +311,12 @@ class LocalBackend(Backend):
                     )
                     for item in (r.allowed_subjects or [])
                 )
-                backing: FieldBinding | ConstBinding | None = None
-                if r.backing:
-                    kind = str(r.backing.get("kind", "fk"))
-                    if kind == "const":
-                        backing = ConstBinding(target_id=str(r.backing["target_id"]))
-                    elif kind == "fk":
-                        backing = FieldBinding(attname=str(r.backing["attname"]), kind="fk")
-                    else:
-                        raise SchemaError(
-                            f"{d.resource_type}#{r.name}: unknown relation backing kind {kind!r}"
-                        )
+                try:
+                    backing = backing_from_dict(r.backing)
+                except (TypeError, ValueError, KeyError) as exc:
+                    raise SchemaError(
+                        f"{d.resource_type}#{r.name}: invalid relation backing: {exc}"
+                    ) from exc
                 relations.append(Relation(r.name, allowed, r.with_expiration, backing))
             permissions: list[Permission] = []
             for p in d.permissions.all():
@@ -598,14 +604,32 @@ class LocalBackend(Backend):
             if field_backing is not None:
                 if subject_type != field_backing.target_resource_type:
                     continue
-                values = field_backing.source_model._base_manager.filter(
-                    **field_backing.source_filter(resource.resource_id)
+                values = field_backing.queryset(
+                    resource_id=resource.resource_id
                 ).values_list(field_backing.target_values_path(), flat=True)
                 for value in values:
                     if value is not None:
                         synthetic_subjects.append(
                             SubjectRef.of(field_backing.target_resource_type, str(value))
                         )
+                continue
+            attribute_backing = self._resolve_declared_attribute_backing(
+                definition, relation_def
+            )
+            if attribute_backing is not None:
+                if not attribute_backing.applies_to(resource.resource_id):
+                    stored_relation_names.append(relation_name)
+                    continue
+                if subject_type != attribute_backing.target_resource_type:
+                    continue
+                values = attribute_backing.target_model._base_manager.filter(
+                    attribute_backing.subjects_filter(resource.resource_id)
+                ).values_list(attribute_backing.target_id_attr, flat=True).distinct()
+                synthetic_subjects.extend(
+                    SubjectRef.of(attribute_backing.target_resource_type, str(value))
+                    for value in values
+                    if value is not None
+                )
                 continue
             const_backing = self._resolve_declared_const_backing(definition, relation_def)
             if const_backing is not None:
@@ -689,7 +713,9 @@ class LocalBackend(Backend):
         from ..models import active_relationship_model
 
         RelationshipModel = active_relationship_model()
-        backed = self._field_backed_relation_for_filter(filter_.resource_type, filter_.relation)
+        backed = self._backed_relation_for_filter(
+            filter_.resource_type, filter_.resource_id, filter_.relation
+        )
         if backed is not None:
             resource_type, relation = backed
             raise self._backed_write_error(resource_type, relation)
@@ -731,7 +757,7 @@ class LocalBackend(Backend):
         definition = self.schema().get_definition(tuple_.resource.resource_type)
         if definition is not None:
             relation = _find_relation(definition, tuple_.relation)
-            if relation is not None and relation.backing is not None:
+            if relation is not None and relation.has_backing(tuple_.resource.resource_id):
                 raise self._backed_write_error(tuple_.resource.resource_type, relation)
         with transaction.atomic():
             RelationshipModel.objects.filter(
@@ -832,6 +858,17 @@ class LocalBackend(Backend):
                 target=target,
                 depth=depth,
             )
+        attribute_backing = self._resolve_declared_attribute_backing(
+            definition, via_relation
+        )
+        if attribute_backing is not None and attribute_backing.applies_to(resource_id):
+            return self._walk_attribute_backed_arrow(
+                ctx=ctx,
+                resource_id=resource_id,
+                attribute_backing=attribute_backing,
+                target=target,
+                depth=depth,
+            )
 
         const_backing = self._resolve_declared_const_backing(definition, via_relation)
         if const_backing is not None:
@@ -886,9 +923,7 @@ class LocalBackend(Backend):
         target: str,
         depth: int,
     ) -> bool | None:
-        qs = field_backing.source_model._base_manager.filter(
-            **field_backing.source_filter(resource_id)
-        )
+        qs = field_backing.queryset(resource_id=resource_id)
         target_values = list(qs.values_list(field_backing.target_values_path(), flat=True))
         saw_conditional = False
         for target_id in target_values:
@@ -913,6 +948,41 @@ class LocalBackend(Backend):
         if saw_conditional:
             return None
         return False
+
+    def _walk_attribute_backed_arrow(
+        self,
+        ctx: WalkContext,
+        resource_id: str,
+        attribute_backing: ResolvedAttributeBacking,
+        target: str,
+        depth: int,
+    ) -> bool | None:
+        target_definition = ctx.schema.get_definition(
+            attribute_backing.target_resource_type
+        )
+        if target_definition is None:
+            return False
+        values = attribute_backing.target_model._base_manager.filter(
+            attribute_backing.subjects_filter(resource_id)
+        ).values_list(attribute_backing.target_id_attr, flat=True)
+        saw_conditional = False
+        for target_id in values:
+            if target_id is None:
+                continue
+            verdict = self._eval_permission_on(
+                permission_name=target,
+                definition=target_definition,
+                resource_id=str(target_id),
+                subject=ctx.subject,
+                depth=depth + 1,
+                context=ctx.context,
+                missing=ctx.missing,
+            )
+            if verdict is True:
+                return True
+            if verdict is None:
+                saw_conditional = True
+        return None if saw_conditional else False
 
     def _walk_const_arrow(
         self,
@@ -1064,8 +1134,6 @@ class LocalBackend(Backend):
             raise PermissionDepthExceeded(f"Depth limit {app_settings.REBAC_DEPTH_LIMIT} exceeded")
         if missing is None:
             missing = set()
-        from ..models import active_relationship_model
-
         definition = self.schema().get_definition(resource_type)
         if definition is None:
             return False
@@ -1077,9 +1145,18 @@ class LocalBackend(Backend):
         if field_backing is not None:
             if not _subject_allowed_by_relation(relation_def, subject):
                 return False
-            return field_backing.source_model._base_manager.filter(
-                **field_backing.source_filter(resource_id),
-                **field_backing.target_filter(subject),
+            return field_backing.queryset(
+                resource_id=resource_id, subject=subject
+            ).exists()
+
+        attribute_backing = self._resolve_declared_attribute_backing(
+            definition, relation_def
+        )
+        if attribute_backing is not None and attribute_backing.applies_to(resource_id):
+            if not _subject_allowed_by_relation(relation_def, subject):
+                return False
+            return attribute_backing.target_model._base_manager.filter(
+                attribute_backing.target_filter(resource_id, subject)
             ).exists()
 
         const_backing = self._resolve_declared_const_backing(definition, relation_def)
@@ -1145,10 +1222,13 @@ class LocalBackend(Backend):
             hop = self._evaluate_row_caveat(row, context, missing)
             if hop is False:
                 continue
-            inner = self._has_direct_relation(
-                resource_type=row.subject_type,
+            target_definition = self.schema().get_definition(row.subject_type)
+            if target_definition is None:
+                continue
+            inner = self._eval_permission_on(
+                permission_name=row.optional_subject_relation,
+                definition=target_definition,
                 resource_id=row.subject_id,
-                relation=row.optional_subject_relation,
                 subject=subject,
                 depth=depth + 1,
                 context=context,
@@ -1258,10 +1338,6 @@ class LocalBackend(Backend):
                 )
             return set()
         if isinstance(expr, PermArrow):
-            from ..models import active_relationship_model
-
-            RelationshipModel = active_relationship_model()
-
             via_rel = _find_relation(definition, expr.via)
             if via_rel is None:
                 return set()
@@ -1276,6 +1352,38 @@ class LocalBackend(Backend):
                     context=context,
                     using=using,
                 )
+            attribute_backing = self._resolve_declared_attribute_backing(
+                definition, via_rel
+            )
+            if attribute_backing is not None:
+                target_definition = self.schema().get_definition(
+                    attribute_backing.target_resource_type
+                )
+                if target_definition is None:
+                    return set()
+                target_ids = self._compute_accessible_for(
+                    attribute_backing.target_resource_type,
+                    expr.target,
+                    target_definition,
+                    subject,
+                    depth + 1,
+                    cache,
+                    context,
+                    using,
+                )
+                results = attribute_backing.resource_ids_for_targets(
+                    target_ids, using=using
+                )
+                if attribute_backing.resource is None:
+                    return results
+                # The named anchor is derived; other resource ids still use
+                # ordinary stored arrows below.
+                stored_results = self._resources_via_stored_arrow(
+                    definition, via_rel, expr.target, subject, depth,
+                    cache, context, using,
+                )
+                stored_results.discard(attribute_backing.resource)
+                return results | stored_results
             const_backing = self._resolve_declared_const_backing(definition, via_rel)
             if const_backing is not None:
                 return self._resources_via_const_arrow(
@@ -1286,31 +1394,16 @@ class LocalBackend(Backend):
                     context=context,
                     using=using,
                 )
-            results: set[str] = set()
-            target_types = sorted({s.type for s in via_rel.allowed_subjects})
-            for target_type in target_types:
-                target_def = self.schema().get_definition(target_type)
-                if target_def is None:
-                    continue
-                target_resource_ids = self._compute_accessible_for(
-                    target_type, expr.target, target_def, subject, depth + 1, cache, context, using
-                )
-                if not target_resource_ids:
-                    continue
-                rows = self._maybe_using(RelationshipModel.objects, using).filter(
-                    resource_type=definition.resource_type,
-                    relation=expr.via,
-                    subject_type=target_type,
-                    subject_id__in=list(target_resource_ids),
-                )
-                for r in _filter_active(rows):
-                    if not _row_allowed_by_relation(via_rel, r):
-                        continue
-                    # Hop-row caveat must evaluate True (silent on conditional).
-                    sink: set[str] = set()
-                    if self._evaluate_row_caveat(r, context, sink) is True:
-                        results.add(r.resource_id)
-            return results
+            return self._resources_via_stored_arrow(
+                definition,
+                via_rel,
+                expr.target,
+                subject,
+                depth,
+                cache,
+                context,
+                using,
+            )
         if isinstance(expr, PermBinOp):
             left = self._resources_for_expr(
                 expr.left, definition, subject, depth, cache, context, seen, using
@@ -1363,9 +1456,7 @@ class LocalBackend(Backend):
         )
         if not target_resource_ids:
             return set()
-        rows = self._maybe_using(field_backing.source_model._base_manager, using).filter(
-            **field_backing.target_in_filter(target_resource_ids)
-        )
+        rows = field_backing.queryset(target_ids=target_resource_ids, using=using)
         return {
             str(value) for value in rows.values_list(field_backing.source_values_path(), flat=True)
         }
@@ -1470,8 +1561,6 @@ class LocalBackend(Backend):
     ) -> set[str]:
         if depth > app_settings.REBAC_DEPTH_LIMIT:
             raise PermissionDepthExceeded(f"Depth limit {app_settings.REBAC_DEPTH_LIMIT} exceeded")
-        from ..models import active_relationship_model
-
         definition = self.schema().get_definition(resource_type)
         if definition is None:
             return set()
@@ -1483,13 +1572,26 @@ class LocalBackend(Backend):
         if field_backing is not None:
             if not _subject_allowed_by_relation(relation_def, subject):
                 return set()
-            rows = self._maybe_using(field_backing.source_model._base_manager, using).filter(
-                **field_backing.target_filter(subject)
-            )
+            rows = field_backing.queryset(subject=subject, using=using)
             return {
                 str(value)
                 for value in rows.values_list(field_backing.source_values_path(), flat=True)
             }
+
+        attribute_backing = self._resolve_declared_attribute_backing(
+            definition, relation_def
+        )
+        if attribute_backing is not None:
+            derived = attribute_backing.resource_ids_for_subject(subject, using=using)
+            if attribute_backing.resource is None:
+                return derived
+            # A fixed binding owns only its named anchor. Stored tuples remain
+            # authoritative for every other object id on this relation.
+            stored = self._resources_via_stored_relation(
+                resource_type, relation_def, subject, depth, context, using
+            )
+            stored.discard(attribute_backing.resource)
+            return derived | stored
 
         const_backing = self._resolve_declared_const_backing(definition, relation_def)
         if const_backing is not None:
@@ -1508,74 +1610,9 @@ class LocalBackend(Backend):
                 ).values_list(const_backing.source_values_path(), flat=True)
             }
 
-        RelationshipModel = active_relationship_model()
-
-        result: set[str] = set()
-        # Local sink: caveat-conditional rows feeding accessible() are
-        # excluded silently, so the missing-param names go nowhere.
-        sink: set[str] = set()
-
-        # Direct rows
-        direct = self._maybe_using(RelationshipModel.objects, using).filter(
-            resource_type=resource_type,
-            relation=relation,
-            subject_type=subject.subject_type,
-            subject_id=subject.subject_id,
-            optional_subject_relation=subject.optional_relation,
+        return self._resources_via_stored_relation(
+            resource_type, relation_def, subject, depth, context, using
         )
-        if not _subject_allowed_by_relation(relation_def, subject):
-            direct = direct.none()
-        for r in _filter_active(direct):
-            if not _row_allowed_by_relation(relation_def, r):
-                continue
-            if self._evaluate_row_caveat(r, context, sink) is True:
-                result.add(r.resource_id)
-
-        # Wildcard rows
-        if not subject.optional_relation and _subject_allowed_by_relation(
-            relation_def, SubjectRef.of(subject.subject_type, "*")
-        ):
-            wildcard = self._maybe_using(RelationshipModel.objects, using).filter(
-                resource_type=resource_type,
-                relation=relation,
-                subject_type=subject.subject_type,
-                subject_id="*",
-            )
-            for r in _filter_active(wildcard):
-                if not _row_allowed_by_relation(relation_def, r):
-                    continue
-                if self._evaluate_row_caveat(r, context, sink) is True:
-                    result.add(r.resource_id)
-
-        # Subject-set rows: e.g. resources granted to `auth/group:X#member`
-        # require the subject to actually be a member of group X.
-        if not any(allowed.relation for allowed in relation_def.allowed_subjects):
-            return result
-        subject_set_rows = (
-            self._maybe_using(RelationshipModel.objects, using)
-            .filter(resource_type=resource_type, relation=relation)
-            .exclude(optional_subject_relation="")
-        )
-        for row in subject_set_rows:
-            if not _row_allowed_by_relation(relation_def, row):
-                continue
-            if not _is_active(row):
-                continue
-            hop = self._evaluate_row_caveat(row, context, sink)
-            if hop is not True:
-                continue
-            inner = self._has_direct_relation(
-                resource_type=row.subject_type,
-                resource_id=row.subject_id,
-                relation=row.optional_subject_relation,
-                subject=subject,
-                depth=depth + 1,
-                context=context,
-                missing=sink,
-            )
-            if inner is True:
-                result.add(row.resource_id)
-        return result
 
     # ---------- helpers ----------
 
@@ -1593,7 +1630,7 @@ class LocalBackend(Backend):
         relation = _find_relation(definition, tup.relation)
         if relation is None:
             raise ValueError(f"unknown relation: {tup.resource.resource_type}#{tup.relation}")
-        if relation.backing is not None:
+        if relation.has_backing(tup.resource.resource_id):
             raise self._backed_write_error(tup.resource.resource_type, relation)
         if not _subject_allowed_by_relation(relation, tup.subject):
             raise ValueError(
@@ -1617,6 +1654,12 @@ class LocalBackend(Backend):
             return SchemaError(
                 f"relation `{relation.name}` on `{resource_type}` is const-backed "
                 f"(rebac:const={relation.backing.target_id}); it is synthetic and holds no tuples"
+            )
+        if isinstance(relation.backing, AttributeBinding):
+            return SchemaError(
+                f"relation `{relation.name}` on `{resource_type}` is "
+                f"attribute-backed; set the subject model's "
+                f"`{relation.backing.field}` field instead"
             )
         model_hint = resource_type
         field_hint = (
@@ -1665,9 +1708,139 @@ class LocalBackend(Backend):
             )
         return const_backing
 
-    def _field_backed_relation_for_filter(
+    def _resolve_declared_attribute_backing(
+        self,
+        definition: Definition,
+        relation: Relation,
+    ) -> ResolvedAttributeBacking | None:
+        if not isinstance(relation.backing, AttributeBinding):
+            return None
+        backing = resolve_attribute_backing(definition, relation)
+        if backing is None:
+            raise SchemaError(
+                f"{definition.resource_type}#{relation.name}: attribute-backed "
+                "relation could not be resolved; run `manage.py check --tag rebac`"
+            )
+        return backing
+
+    def _resources_via_stored_relation(
         self,
         resource_type: str,
+        relation: Relation,
+        subject: SubjectRef,
+        depth: int,
+        context: dict[str, Any] | None,
+        using: str | None,
+    ) -> set[str]:
+        """Evaluate persisted rows for ordinary and fixed-backing fallback paths."""
+        from ..models import active_relationship_model
+
+        RelationshipModel = active_relationship_model()
+        result: set[str] = set()
+        # Caveat-conditional rows feeding accessible() are excluded silently.
+        sink: set[str] = set()
+
+        direct = self._maybe_using(RelationshipModel.objects, using).filter(
+            resource_type=resource_type,
+            relation=relation.name,
+            subject_type=subject.subject_type,
+            subject_id=subject.subject_id,
+            optional_subject_relation=subject.optional_relation,
+        )
+        if not _subject_allowed_by_relation(relation, subject):
+            direct = direct.none()
+        for row in _filter_active(direct):
+            if not _row_allowed_by_relation(relation, row):
+                continue
+            if self._evaluate_row_caveat(row, context, sink) is True:
+                result.add(row.resource_id)
+
+        if not subject.optional_relation and _subject_allowed_by_relation(
+            relation, SubjectRef.of(subject.subject_type, "*")
+        ):
+            wildcard = self._maybe_using(RelationshipModel.objects, using).filter(
+                resource_type=resource_type,
+                relation=relation.name,
+                subject_type=subject.subject_type,
+                subject_id="*",
+            )
+            for row in _filter_active(wildcard):
+                if not _row_allowed_by_relation(relation, row):
+                    continue
+                if self._evaluate_row_caveat(row, context, sink) is True:
+                    result.add(row.resource_id)
+
+        if not any(allowed.relation for allowed in relation.allowed_subjects):
+            return result
+        subject_sets = (
+            self._maybe_using(RelationshipModel.objects, using)
+            .filter(resource_type=resource_type, relation=relation.name)
+            .exclude(optional_subject_relation="")
+        )
+        for row in subject_sets:
+            if not _row_allowed_by_relation(relation, row):
+                continue
+            if not _is_active(row):
+                continue
+            hop = self._evaluate_row_caveat(row, context, sink)
+            if hop is not True:
+                continue
+            target_definition = self.schema().get_definition(row.subject_type)
+            if target_definition is None:
+                continue
+            inner = self._eval_permission_on(
+                permission_name=row.optional_subject_relation,
+                definition=target_definition,
+                resource_id=row.subject_id,
+                subject=subject,
+                depth=depth + 1,
+                context=context,
+                missing=sink,
+            )
+            if inner is True:
+                result.add(row.resource_id)
+        return result
+
+    def _resources_via_stored_arrow(
+        self,
+        definition: Definition,
+        via_relation: Relation,
+        target: str,
+        subject: SubjectRef,
+        depth: int,
+        cache: dict[tuple[str, str], set[str] | None],
+        context: dict[str, Any] | None,
+        using: str | None,
+    ) -> set[str]:
+        from ..models import active_relationship_model
+
+        RelationshipModel = active_relationship_model()
+        results: set[str] = set()
+        for target_type in sorted({item.type for item in via_relation.allowed_subjects}):
+            target_definition = self.schema().get_definition(target_type)
+            if target_definition is None:
+                continue
+            target_ids = self._compute_accessible_for(
+                target_type, target, target_definition, subject,
+                depth + 1, cache, context, using,
+            )
+            rows = self._maybe_using(RelationshipModel.objects, using).filter(
+                resource_type=definition.resource_type,
+                relation=via_relation.name,
+                subject_type=target_type,
+                subject_id__in=target_ids,
+            )
+            for row in _filter_active(rows):
+                if _row_allowed_by_relation(via_relation, row):
+                    sink: set[str] = set()
+                    if self._evaluate_row_caveat(row, context, sink) is True:
+                        results.add(row.resource_id)
+        return results
+
+    def _backed_relation_for_filter(
+        self,
+        resource_type: str,
+        resource_id: str,
         relation_name: str,
     ) -> tuple[str, Relation] | None:
         if not relation_name:
@@ -1681,7 +1854,7 @@ class LocalBackend(Backend):
             definitions.extend(self.schema().definitions)
         for definition in definitions:
             relation = _find_relation(definition, relation_name)
-            if relation is not None and relation.backing is not None:
+            if relation is not None and relation.has_backing(resource_id or None):
                 return definition.resource_type, relation
         return None
 

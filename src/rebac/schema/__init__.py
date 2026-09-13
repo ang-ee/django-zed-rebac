@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from .ast import (
     AllowedSubject,
+    AttributeBinding,
     Caveat,
     CaveatParam,
     ConstBinding,
@@ -20,10 +21,12 @@ from .ast import (
 )
 from .introspection import (
     PermissionSources,
+    named_object_refs,
     permission_object_sources,
     permission_sources,
     permissions_reaching_relation,
     relation_dependencies,
+    relation_is_writable,
 )
 from .parser import ParseError, parse_permission_expression, parse_zed, validate_schema
 from .rendering import render_allowed_subject, render_zed
@@ -31,6 +34,7 @@ from .sources import resolve_schema_path
 
 __all__ = [
     "AllowedSubject",
+    "AttributeBinding",
     "Caveat",
     "CaveatParam",
     "ConstBinding",
@@ -46,12 +50,14 @@ __all__ = [
     "PermissionSources",
     "Relation",
     "Schema",
+    "named_object_refs",
     "parse_permission_expression",
     "parse_zed",
     "permission_object_sources",
     "permission_sources",
     "permissions_reaching_relation",
     "relation_dependencies",
+    "relation_is_writable",
     "render_allowed_subject",
     "render_zed",
     "resolve_schema_path",

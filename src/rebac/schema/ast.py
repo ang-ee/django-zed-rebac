@@ -12,8 +12,11 @@ single-line schema fragments without parens are a footgun even when they parse.
 
 from __future__ import annotations
 
+import math
+import re
 from collections.abc import Sequence
 from dataclasses import dataclass, field
+from typing import Any, cast
 
 BUILTIN_ACTOR_TYPES = frozenset({"anonymous", "authenticated"})
 
@@ -49,8 +52,26 @@ class AllowedSubject:
 
 @dataclass(frozen=True, slots=True)
 class FieldBinding:
+    """A Django relation path with source-model predicates."""
+
     attname: str
     kind: str = "fk"
+    filters: tuple[tuple[str, Any], ...] = ()
+
+
+@dataclass(frozen=True, slots=True)
+class AttributeBinding:
+    """Live container membership from a scalar field on the subject model.
+
+    With resource/value, only that fixed container is derived; other IDs keep
+    stored tuples. Without them the subject field determines the container ID.
+    """
+
+    field: str
+    resource: str | None = None
+    value: Any = None
+    filters: tuple[tuple[str, Any], ...] = ()
+    kind: str = "attribute"
 
 
 @dataclass(frozen=True, slots=True)
@@ -77,7 +98,112 @@ class Relation:
     name: str
     allowed_subjects: tuple[AllowedSubject, ...]
     with_expiration: bool = False
-    backing: FieldBinding | ConstBinding | None = None
+    backing: FieldBinding | ConstBinding | AttributeBinding | None = None
+
+    def has_backing(self, resource_id: str | None = None) -> bool:
+        """Whether the relation is live-backed for this resource scope.
+
+        An omitted ID is an unqualified scope and therefore includes a fixed
+        attribute's derived anchor. Concrete non-anchor IDs retain stored
+        tuples.
+        """
+
+        if self.backing is None:
+            return False
+        if (
+            resource_id is not None
+            and isinstance(self.backing, AttributeBinding)
+            and self.backing.resource is not None
+        ):
+            return resource_id == self.backing.resource
+        return True
+
+
+def _binding_filters(value: Any) -> tuple[tuple[str, Any], ...]:
+    """Validate immutable, deterministic scalar ORM predicates."""
+
+    if not isinstance(value, dict):
+        raise ValueError("backing filters must be a JSON object")
+    for key, item in value.items():
+        if not isinstance(key, str) or not re.fullmatch(
+            r"[A-Za-z_][A-Za-z0-9_]*(?:__[A-Za-z_][A-Za-z0-9_]*)*", key
+        ):
+            raise ValueError("backing filters require ORM lookup names")
+        if item is not None and not isinstance(item, (str, int, float, bool)):
+            raise ValueError("backing filter values must be JSON scalars")
+        if isinstance(item, float) and not math.isfinite(item):
+            raise ValueError("backing filter values must be finite")
+    return tuple(sorted(value.items()))
+
+
+def backing_from_dict(
+    value: dict[str, Any] | None,
+) -> FieldBinding | ConstBinding | AttributeBinding | None:
+    """Decode and validate the native persisted relation-backing contract."""
+
+    if value is None:
+        return None
+    if not isinstance(value, dict):
+        raise ValueError("relation backing must be a JSON object")
+    kind = value.get("kind", "fk")
+    if kind == "const":
+        if set(value) - {"kind", "target_id"}:
+            raise ValueError("unknown constant backing fields")
+        target = value.get("target_id")
+        if not isinstance(target, str) or not re.fullmatch(r"[A-Za-z0-9/_|=+-]{1,1024}", target):
+            raise ValueError("constant backing requires a concrete object ID")
+        return ConstBinding(target_id=target)
+    if kind == "fk":
+        if set(value) - {"kind", "attname", "filters"}:
+            raise ValueError("unknown field backing fields")
+        path = value.get("attname")
+        if not isinstance(path, str) or not re.fullmatch(
+            r"[A-Za-z_][A-Za-z0-9_]*(?:__[A-Za-z_][A-Za-z0-9_]*)*", path
+        ):
+            raise ValueError("field backing requires a Django relation path")
+        return FieldBinding(attname=path, filters=_binding_filters(value.get("filters", {})))
+    if kind == "attribute":
+        if set(value) - {"kind", "field", "resource", "value", "filters"}:
+            raise ValueError("unknown attribute backing fields")
+        name = value.get("field")
+        if not isinstance(name, str) or not re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", name):
+            raise ValueError("attribute backing requires a scalar field name")
+        if ("resource" in value) != ("value" in value):
+            raise ValueError("attribute backing resource and value must appear together")
+        resource = value.get("resource")
+        if "resource" in value:
+            if not isinstance(resource, str) or not re.fullmatch(
+                r"[A-Za-z0-9/_|=+-]{1,1024}", resource
+            ):
+                raise ValueError("attribute backing requires a concrete resource ID")
+            _binding_filters({"value": value["value"]})
+        return AttributeBinding(
+            field=name, resource=cast(str | None, resource),
+            value=value.get("value"), filters=_binding_filters(value.get("filters", {}))
+        )
+    raise ValueError(f"unsupported relation backing kind {kind!r}")
+
+
+def backing_to_dict(
+    backing: FieldBinding | ConstBinding | AttributeBinding | None,
+) -> dict[str, Any] | None:
+    """Encode one backing without losing filters, fixed IDs, or false/null values."""
+
+    if backing is None:
+        return None
+    if isinstance(backing, ConstBinding):
+        return {"kind": "const", "target_id": backing.target_id}
+    if isinstance(backing, FieldBinding):
+        result: dict[str, Any] = {"kind": "fk", "attname": backing.attname}
+    elif isinstance(backing, AttributeBinding):
+        result = {"kind": "attribute", "field": backing.field}
+        if backing.resource is not None:
+            result.update(resource=backing.resource, value=backing.value)
+    else:
+        raise TypeError(f"unsupported backing {type(backing).__name__}")
+    if backing.filters:
+        result["filters"] = dict(backing.filters)
+    return result
 
 
 # ---------- Permission expression AST ----------

@@ -20,8 +20,8 @@ equivalent. The column and the row are two sources of truth for one fact.
   SpiceDB's datastore across a gRPC boundary, with no shared transaction and Zookie lag. The sync is
   most fragile exactly where the stakes are highest.
 
-The package already ships no FK→tuple sync except the opt-in `REBAC_SYNC_DJANGO_GROUPS` exception
-(one-way, `User.groups`). Every other consumer hand-rolls the sync per model: duplicated,
+The package ships no FK→tuple sync. The former `REBAC_SYNC_DJANGO_GROUPS`
+setting had no implementation. Consumers hand-rolled sync per model: duplicated,
 unvalidated, and easy to get subtly wrong (a missed `update_fields`, a bulk write that skips
 signals, a partial failure that desynchronizes the two stores).
 
@@ -128,7 +128,7 @@ required for correctness and is out of scope here.
 
 SpiceDB cannot read a Postgres column, so under SpiceDB a backed relation must still exist as tuples
 in SpiceDB's datastore. The same `backing` declaration drives a **library-owned write-through
-projector** — a generalization of `REBAC_SYNC_DJANGO_GROUPS` — that mirrors column changes into
+projector** that mirrors column changes into
 SpiceDB tuples (post-commit, with Zookie handling), implemented once here rather than per consumer.
 The `WriteSchema` push prints a backed relation as an ordinary relation; SpiceDB never sees the
 directive.

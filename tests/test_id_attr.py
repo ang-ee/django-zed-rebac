@@ -105,6 +105,13 @@ def test_subject_id_attr_honours_setting():
     assert subject_id_attr(get_user_model()) == "username"
 
 
+@override_settings(REBAC_RESOURCE_ID_ATTR="public_id", REBAC_USER_ID_ATTR="username")
+def test_registered_model_subject_id_matches_object_identity():
+    from tests.testapp.models import Post
+
+    assert subject_id_attr(Post) == "public_id"
+
+
 # ---------------------------------------------------------------------------
 # to_subject_ref — User branch reads the configured attr
 # ---------------------------------------------------------------------------

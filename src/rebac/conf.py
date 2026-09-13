@@ -39,7 +39,6 @@ _DEFAULTS: dict[str, Any] = {
     "REBAC_MCP_ACTOR_RESOLVER": "rebac.mcp.default_actor_resolver",
     "REBAC_TYPE_PREFIX": "",
     "REBAC_SUPERUSER_BYPASS": True,
-    "REBAC_SYNC_DJANGO_GROUPS": False,
     "REBAC_USER_TYPE": "auth/user",
     "REBAC_GROUP_TYPE": "auth/group",
     # Subject type representing an unauthenticated request. The default

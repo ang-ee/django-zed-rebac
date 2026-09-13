@@ -217,12 +217,20 @@ so application default managers cannot move the authorization boundary. Tuple
 writes/deletes targeting the backed relation raise `SchemaError` with the
 actionable Django field to update instead.
 
-Only explicit forward FK/one-to-one bindings are supported in this tier. The
-schema validator rejects field-backed relations with multiple subject types,
-subject sets, wildcards, specific ids, caveats, or expiration; the `rebac.E009`
-system check verifies that the Django field exists and points at the declared
-resource type. A future `SpiceDBBackend` projector should use the same
-metadata to materialize those structural relations into SpiceDB tuples.
+The same field backing supports forward, reverse, and many-to-many lookup
+paths with source-model filters. Target predicates and filters are composed
+in one Django `.filter()` so they constrain the same through row. Attribute
+backing exposes virtual containers derived from a scalar subject column;
+fixed `resource`/`value` bindings own just that container, leaving other IDs
+tuple-backed. The native AST codec owns parsing and schema persistence.
+
+The schema validator rejects backed relations with multiple subject types,
+subject sets, wildcards, specific ids, caveats, or expiration. `rebac.E009`
+validates every Django path, lookup, and target model. Direct checks, arrows,
+subject lookup, eager enumeration, and lazy SQL scopes share these resolved
+owners. Queryset reads use their database alias. A future `SpiceDBBackend`
+projector should use this metadata to materialize structural relations into
+remote tuples; exporting Zed alone does not supply that projection.
 
 ### Const-backed (synthetic) relations
 
@@ -617,8 +625,9 @@ registered Django model; unknown types and missing rows are omitted.
 - FK cascade: when a Django row backed by `RebacMixin` is deleted, the
   `post_delete` signal handler drops the matching `RebacResource` row,
   and the FK CASCADE on `RelationshipRegistry` sweeps every tuple that
-  referenced it. Denormalized mode requires the caller to issue a
-  follow-up `Relationship.objects.filter(...).delete()`.
+  referenced it. Denormalized mode deletes matching resource-side and
+  subject-side tuples directly. Both paths use the deleted instance's Django
+  database alias and participate in that alias's deletion transaction.
 - Referential integrity: writes to `RelationshipRegistry` reference
   registered `(type, id)` pairs only — typos surface as constraint
   violations instead of orphan tuples that never match a check.
@@ -1126,8 +1135,12 @@ the left queryset actor/action policy across all operands; rebinding replaces
 the restriction on each operand without mutating the original querysets.
 Boolean combinations require REBAC querysets so empty-query fast paths cannot
 return a plain unscoped manager. Native `resource_id_attr` and
-`subject_id_attr` are public top-level exports with distinct resource/user setting
-fallbacks.
+`subject_id_attr` are public top-level exports. A registered model uses its one
+resource identifier for both object and subject identity; legacy User/Group models
+without resource metadata retain the separate user-setting fallback.
+`REBAC_TYPE_PREFIX` applies when model metadata, configured
+User/Group/anonymous types, or decorators generate identity. Already canonical
+`ObjectRef` and `SubjectRef` values retain their wire types unchanged.
 
 ### Lazy local queryset authorization
 
@@ -1462,11 +1475,13 @@ different backends. Context keys preserve scalar types (`True`, `1`, and `1.0` d
 Complex context values bypass caching, including nested dictionaries and lists.
 
 LocalBackend bypasses evaluator caching inside database transactions and when
-the active schema declares expiring relationships. This prevents rolled-back
-grants and expired tuples from surviving as cached decisions. Backend relationship
+the active schema declares expiring relationships or live field/attribute
+backing. Django bulk and M2M changes do not advance the relationship generation,
+so decisions must read them again. This prevents rolled-back grants, expired
+tuples and changed ORM facts from surviving as cached decisions. Backend relationship
 writes invalidate decision generations across local backend instances in this
-process, including evaluators suspended by a nested scope. Expiration schemas
-therefore trade repeated graph reads for deadline-correct authorization.
+process, including evaluators suspended by a nested scope. These schemas trade
+repeated graph reads for current authorization; lazy queryset scopes remain SQL.
 
 The old `accessible_cached`, `enable_accessible_cache`, and
 `disable_accessible_cache` helpers were removed in 0.5. Use

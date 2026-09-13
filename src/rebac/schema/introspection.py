@@ -12,6 +12,7 @@ from dataclasses import dataclass
 from ..types import ObjectRef
 from .ast import (
     BUILTIN_ACTOR_TYPES,
+    AttributeBinding,
     ConstBinding,
     Definition,
     PermArrow,
@@ -186,6 +187,39 @@ def permission_object_sources(
     return frozenset(refs)
 
 
+def named_object_refs(schema: Schema, *, object_type: str | None = None) -> frozenset[ObjectRef]:
+    """Return every concrete object reference named literally by ``schema``.
+
+    Const-backed targets, fixed attribute containers, and fixed-id allowed
+    subjects are declarations, not evidence of effective permission reach. Generic types and wildcards have no
+    object id and therefore contribute nothing.
+    """
+    refs: set[ObjectRef] = set()
+    for definition in schema.definitions:
+        for relation in definition.relations:
+            if isinstance(relation.backing, AttributeBinding) and relation.backing.resource:
+                if object_type is None or definition.resource_type == object_type:
+                    refs.add(ObjectRef(definition.resource_type, relation.backing.resource))
+            const_id = relation.backing.target_id if isinstance(relation.backing, ConstBinding) else ""
+            for allowed in relation.allowed_subjects:
+                object_id = const_id or allowed.id
+                if object_id and not allowed.wildcard and (object_type is None or allowed.type == object_type):
+                    refs.add(ObjectRef(allowed.type, object_id))
+    return frozenset(refs)
+
+
+def relation_is_writable(
+    schema: Schema, *, resource: ObjectRef, relation: str
+) -> bool:
+    """Return whether a declared relation accepts tuples for this object."""
+
+    definition = schema.get_definition(resource.resource_type)
+    if definition is None:
+        return False
+    declared = find_relation(definition, relation)
+    return declared is not None and not declared.has_backing(resource.resource_id)
+
+
 def _collect_sources(
     expr: PermExpr,
     *,
@@ -247,6 +281,7 @@ def _collect_sources(
 
 __all__ = [
     "PermissionSources",
+    "named_object_refs",
     "permission_object_sources",
     "permission_sources",
     "permissions_reaching_relation",
