@@ -6,6 +6,7 @@ from typing import TYPE_CHECKING, Any, cast
 
 from django.db import connections, models
 from django.db.models import Exists, F, OuterRef, Q, Subquery, Value
+from django.db.models.expressions import Combinable
 from django.db.models.functions import Cast
 from django.utils import timezone
 
@@ -36,6 +37,23 @@ class UnsupportedScope(Exception):
 
 def _truth(value: bool) -> Q:
     return Q(Value(value, output_field=models.BooleanField()))
+
+
+def _concrete_field(model: type[models.Model], identity: str) -> models.Field[Any, Any]:
+    """The concrete column behind ``identity``; reverse relations cannot be compiled."""
+    field = model._meta.pk if identity == "pk" else model._meta.get_field(identity)
+    if not isinstance(field, models.Field) or not field.concrete:
+        raise UnsupportedScope
+    return field
+
+
+# Field classes whose Python and database conversions are the identity, so a
+# correlated SQL comparison agrees with the evaluator's Python comparison.
+_NATIVE_FIELD_CLASSES: tuple[type[models.Field[Any, Any]], ...] = (
+    models.CharField,
+    models.TextField,
+    models.IntegerField,
+)
 
 
 class ConvertedRelationIds(models.Expression):
@@ -212,24 +230,14 @@ class LocalQueryScope:
             raise UnsupportedScope
         backing = self.backend._resolve_declared_field_backing(definition, relation)
         if backing is not None:
-            source = backing.source_model._base_manager.using(self.using)
-            field = cast("models.ForeignKey[Any, Any]", backing.field)
+            if model is not backing.source_model and not self.native_identity(
+                backing.source_model, backing.source_id_attr
+            ):
+                raise UnsupportedScope
             if target is None:
                 if not subject_allowed_by_relation(relation, self.subject):
                     return _truth(False)
-                if backing.target_id_attr == "pk":
-                    condition = Q(**backing.target_filter(self.subject))
-                else:
-                    destination = backing.target_model._base_manager.using(self.using).filter(
-                        **{backing.target_id_attr: self.subject.subject_id}
-                    )
-                    condition = Q(
-                        **{
-                            f"{field.attname}__in": Subquery(
-                                destination.order_by().values(field.target_field.name)
-                            )
-                        }
-                    )
+                source = backing.queryset(subject=self.subject, using=self.using)
             else:
                 destination = backing.target_model._base_manager.using(self.using).filter(
                     self.permission(
@@ -240,26 +248,78 @@ class LocalQueryScope:
                         seen,
                     )
                 )
-                condition = Q(
-                    **{
-                        f"{field.attname}__in": Subquery(
-                            destination.order_by().values(field.target_field.name)
-                        )
-                    }
-                )
-            if model is backing.source_model:
-                return condition
-            if not self.native_identity(backing.source_model, backing.source_id_attr):
-                raise UnsupportedScope
+                target_ids = destination.order_by().values_list(backing.target_id_attr, flat=True)
+                source = backing.queryset(target_ids=target_ids, using=self.using)
             return Q(
                 Exists(
                     source.alias(
                         _scope_resource_id=Cast(F(backing.source_id_attr), models.TextField())
-                    )
-                    .filter(_scope_resource_id=self.reference(identity))
-                    .filter(condition)
+                    ).filter(_scope_resource_id=self.reference(identity))
                 )
             )
+        attribute = self.backend._resolve_declared_attribute_backing(definition, relation)
+        if attribute is not None:
+            if (
+                model is not None
+                and isinstance(identity, str)
+                and not self.native_identity(model, identity)
+            ):
+                raise UnsupportedScope
+            resource_id: str | Combinable
+            if isinstance(identity, Value):
+                resource_id = str(identity.value)
+                resource_match = _truth(attribute.applies_to(resource_id))
+            elif isinstance(identity, str):
+                if attribute.resource is None:
+                    if not self.native_identity(attribute.target_model, attribute.field.name):
+                        raise UnsupportedScope
+                    if isinstance(attribute.field, (models.CharField, models.TextField)):
+                        resource_id = self.reference(identity)
+                    elif model is not None:
+                        source_field = _concrete_field(model, identity)
+                        if source_field.get_internal_type() != attribute.field.get_internal_type():
+                            raise UnsupportedScope
+                        resource_id = OuterRef(identity)
+                    else:
+                        # Stored subject ids are wire strings. Comparing them to
+                        # a non-text model column needs that field's Python/DB
+                        # conversion, which cannot be expressed safely here.
+                        raise UnsupportedScope
+                    resource_match = _truth(True)
+                else:
+                    resource_id = attribute.resource
+                    if model is not None:
+                        try:
+                            _concrete_field(model, identity).get_prep_value(resource_id)
+                        except TypeError, ValueError:
+                            raise UnsupportedScope from None
+                    resource_match = Q(**{identity: resource_id})
+            else:
+                raise UnsupportedScope
+            if target is None:
+                if not subject_allowed_by_relation(relation, self.subject):
+                    return _truth(False)
+                target_condition = attribute.target_filter(resource_id, self.subject)
+            else:
+                target_condition = attribute.subjects_filter(resource_id) & self.permission(
+                    attribute.target_resource_type,
+                    target,
+                    attribute.target_model,
+                    attribute.target_id_attr,
+                    seen,
+                )
+            targets = attribute.target_model._base_manager.using(self.using).filter(
+                target_condition
+            )
+            derived = resource_match & Q(Exists(targets))
+            if attribute.resource is None:
+                return derived
+            stored = self._stored_relation(definition, relation, identity, seen, target=target)
+            if isinstance(identity, Value):
+                fallback = _truth(str(identity.value) != attribute.resource)
+            else:
+                fallback = ~Q(**{identity: attribute.resource})
+            return derived | (fallback & stored)
         const = self.backend._resolve_declared_const_backing(definition, relation)
         if const is not None:
             if target is None:
@@ -295,6 +355,19 @@ class LocalQueryScope:
                     )
                 }
             )
+        return self._stored_relation(definition, relation, identity, seen, target=target)
+
+    def _stored_relation(
+        self,
+        definition: Definition,
+        relation: Relation,
+        identity: str | Value,
+        seen: frozenset[tuple[str, str]],
+        *,
+        target: str | None,
+    ) -> Q:
+        """Compile the persisted-tuple path shared by ordinary and fallback reads."""
+
         rows = self.relationships.filter(
             **{
                 "resource_type": definition.resource_type,
@@ -338,10 +411,25 @@ class LocalQueryScope:
         return Q(Exists(rows.filter(allowed_rows)))
 
     def native_identity(self, model: type[models.Model], identity: str) -> bool:
-        field = model._meta.pk if identity == "pk" else model._meta.get_field(identity)
+        """Whether ``identity`` compares in SQL exactly as the evaluator compares it in Python.
+
+        Requires a concrete text or integer column whose ``to_python`` /
+        ``get_prep_value`` are the stock implementations and which has no
+        database converters: a transforming subclass (case folding, encoded
+        ids) would let the correlated SQL comparison and the Python
+        round-trip disagree, so such identities fall back to enumeration.
+        """
+        try:
+            field = _concrete_field(model, identity)
+        except UnsupportedScope:
+            return False
+        stock = next((cls for cls in _NATIVE_FIELD_CLASSES if isinstance(field, cls)), None)
+        if stock is None:
+            return False
+        field_class = type(field)
         return (
-            isinstance(field, (models.CharField, models.TextField, models.IntegerField))
-            and field.concrete
+            field_class.to_python is stock.to_python
+            and field_class.get_prep_value is stock.get_prep_value
             and not field.get_db_converters(connections[self.using])
         )
 

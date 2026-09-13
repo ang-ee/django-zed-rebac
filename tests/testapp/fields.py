@@ -14,6 +14,31 @@ else:
     _IntegerField = models.BigIntegerField
 
 
+if TYPE_CHECKING:
+    _CharField = models.CharField[str | None, str]
+else:
+    _CharField = models.CharField
+
+
+class LowercaseCharField(_CharField):
+    """A text column whose Python conversion is not the identity.
+
+    Exercises the rule that only stock text/integer conversions may be
+    compiled into a correlated SQL comparison; anything else must fall back to
+    Python evaluation so every read path agrees.
+    """
+
+    def to_python(self, value: Any) -> str | None:
+        if value is None:
+            return None
+        return str(value).lower()
+
+    def get_prep_value(self, value: Any) -> str | None:
+        if value is None:
+            return None
+        return str(value).lower()
+
+
 class EncodedIntegerField(_IntegerField):
     """Store an integer while exposing an opaque, reversible public identity."""
 

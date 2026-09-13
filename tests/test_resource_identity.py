@@ -3,7 +3,18 @@ from __future__ import annotations
 import pytest
 from django.test import override_settings
 
-from rebac import ObjectRef, RelationshipTuple, SubjectRef, backend, sudo, to_object_ref
+from rebac import (
+    ObjectRef,
+    RelationshipTuple,
+    SubjectRef,
+    anonymous_actor,
+    backend,
+    is_anonymous_actor,
+    rebac_subject,
+    sudo,
+    to_object_ref,
+    to_subject_ref,
+)
 from rebac.backends import reset_backend
 from rebac.schema import parse_zed
 
@@ -35,10 +46,10 @@ def test_model_refs_managers_and_signals_share_prefixed_type_policy() -> None:
     backend().set_schema(
         parse_zed(
             """
-            definition auth/user {}
+            definition tenantA/auth/user {}
 
             definition tenantA/blog/sluggedpost {
-                relation owner: auth/user
+                relation owner: tenantA/auth/user
                 permission read = owner
                 permission write = owner
                 permission delete = owner
@@ -47,7 +58,9 @@ def test_model_refs_managers_and_signals_share_prefixed_type_policy() -> None:
         )
     )
     user = get_user_model().objects.create(username="alice", is_active=True)
-    subject = SubjectRef.of("auth/user", str(user.pk))
+    # Configured User/Group types follow the prefix like every generated identity.
+    subject = SubjectRef.of("tenantA/auth/user", str(user.pk))
+    assert to_subject_ref(user) == subject
 
     with sudo(reason="test.fixture"):
         post = SluggedPost.objects.create(slug="prefixed", title="Hello")
@@ -71,3 +84,16 @@ def test_model_refs_managers_and_signals_share_prefixed_type_policy() -> None:
 
     post.refresh_from_db()
     assert post.title == "Updated"
+
+
+@override_settings(REBAC_TYPE_PREFIX="tenantA/")
+def test_all_generated_subject_types_share_prefixed_type_policy() -> None:
+    class ApiKey:
+        def __init__(self, public_id: str) -> None:
+            self.public_id = public_id
+
+    rebac_subject(type="auth/apikey", id_attr="public_id")(ApiKey)
+
+    assert to_subject_ref(ApiKey("key-1")) == SubjectRef.of("tenantA/auth/apikey", "key-1")
+    assert anonymous_actor() == SubjectRef.of("tenantA/auth/anonymous", "*")
+    assert is_anonymous_actor(anonymous_actor())

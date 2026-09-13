@@ -8,8 +8,7 @@ from typing import Any
 from django.db import models
 from django.db.models import QuerySet
 
-from ._id import resource_id_attr
-from .resources import model_for_resource_type, model_resource_id
+from .resources import model_for_subject_type
 from .types import RelationshipFilter, RelationshipTuple, SubjectRef, Zookie
 
 
@@ -202,10 +201,11 @@ def delete_relationship(tuple_: RelationshipTuple) -> Zookie:
 
 
 def resolve_subjects(refs: Iterable[SubjectRef | str]) -> dict[SubjectRef, models.Model]:
-    """Resolve subject refs whose object type maps to a registered Django model.
+    """Resolve subject refs whose type maps onto a Django model.
 
-    This is the inverse of the public ``SubjectRef`` creation path for resource
-    types the library can map back to a model. Unknown resource types and
+    Inverse of :func:`rebac.actors.to_subject_ref` for model-backed subjects,
+    using :func:`rebac.resources.model_for_subject_type`: registered models,
+    then the configured user and contrib group types. Unknown subject types and
     missing rows are omitted. ``optional_relation`` is ignored for lookup
     purposes: ``auth/group:eng#member`` and ``auth/group:eng`` both point at
     the same underlying object id.
@@ -218,12 +218,13 @@ def resolve_subjects(refs: Iterable[SubjectRef | str]) -> dict[SubjectRef, model
 
     resolved: dict[SubjectRef, models.Model] = {}
     for subject_type, refs_for_type in refs_by_type.items():
-        model = model_for_resource_type(subject_type)
-        if model is None:
+        mapping = model_for_subject_type(subject_type)
+        if mapping is None:
             continue
+        model, id_attr = mapping
         ids = {ref.subject_id for ref in refs_for_type}
-        rows = model._base_manager.filter(**{f"{resource_id_attr(model)}__in": list(ids)})
-        by_id = {model_resource_id(row): row for row in rows}
+        rows = model._base_manager.filter(**{f"{id_attr}__in": list(ids)})
+        by_id = {str(getattr(row, id_attr)): row for row in rows}
         for ref in refs_for_type:
             row = by_id.get(ref.subject_id)
             if row is not None:

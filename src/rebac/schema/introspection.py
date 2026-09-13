@@ -12,8 +12,10 @@ from dataclasses import dataclass
 from ..types import ObjectRef
 from .ast import (
     BUILTIN_ACTOR_TYPES,
+    AttributeBinding,
     ConstBinding,
     Definition,
+    FieldBinding,
     PermArrow,
     PermBinOp,
     PermExpr,
@@ -186,6 +188,109 @@ def permission_object_sources(
     return frozenset(refs)
 
 
+def named_object_refs(schema: Schema, *, object_type: str | None = None) -> frozenset[ObjectRef]:
+    """Return every concrete object reference named literally by ``schema``.
+
+    Const-backed targets, fixed attribute containers, and fixed-id allowed
+    subjects are declarations, not evidence of effective permission reach. Generic types and wildcards have no
+    object id and therefore contribute nothing.
+    """
+    refs: set[ObjectRef] = set()
+    for definition in schema.definitions:
+        for relation in definition.relations:
+            if isinstance(relation.backing, AttributeBinding) and relation.backing.resource:
+                if object_type is None or definition.resource_type == object_type:
+                    refs.add(ObjectRef(definition.resource_type, relation.backing.resource))
+            const_id = (
+                relation.backing.target_id if isinstance(relation.backing, ConstBinding) else ""
+            )
+            for allowed in relation.allowed_subjects:
+                object_id = const_id or allowed.id
+                if (
+                    object_id
+                    and not allowed.wildcard
+                    and (object_type is None or allowed.type == object_type)
+                ):
+                    refs.add(ObjectRef(allowed.type, object_id))
+    return frozenset(refs)
+
+
+def relation_is_writable(schema: Schema, *, resource: ObjectRef, relation: str) -> bool:
+    """Return whether a declared relation accepts tuples for this object."""
+
+    definition = schema.get_definition(resource.resource_type)
+    if definition is None:
+        return False
+    declared = find_relation(definition, relation)
+    return declared is not None and not declared.has_backing(resource.resource_id)
+
+
+def accessible_is_exact(schema: Schema) -> bool:
+    """Whether enumerating ``accessible()`` answers every check exactly.
+
+    Enumeration silently drops caveat-conditional rows and cannot list the
+    rows of a built-in actor grant (``authenticated`` / ``anonymous``), so it
+    is only interchangeable with a per-row check when the schema declares no
+    caveated subject and no permission references a built-in actor term.
+    """
+    if schema.caveats or any(
+        allowed.with_caveat
+        for definition in schema.definitions
+        for relation in definition.relations
+        for allowed in relation.allowed_subjects
+    ):
+        return False
+    return not any(
+        _references_builtin_actor(permission.expression)
+        for definition in schema.definitions
+        for permission in definition.permissions
+    )
+
+
+def _references_builtin_actor(expr: PermExpr) -> bool:
+    if isinstance(expr, PermRef):
+        return expr.name in BUILTIN_ACTOR_TYPES
+    if isinstance(expr, PermBinOp):
+        return _references_builtin_actor(expr.left) or _references_builtin_actor(expr.right)
+    return False
+
+
+def live_backed_resource_types(schema: Schema) -> frozenset[str]:
+    """Resource types whose permission evaluation may read live ORM backing.
+
+    A type is live when one of its relations is field- or attribute-backed, or
+    when one of its relations admits an allowed subject whose type is live
+    (fixed point). Allowed-subject types cover every way evaluation crosses a
+    definition boundary — arrows (``via->perm`` walks ``via``'s subject types),
+    subject sets (``group#member``) and const targets — so the result is a
+    conservative over-approximation: it may name a type that never actually
+    reaches a backing, but never omits one that can. Const backings are
+    static and are not live seeds on their own.
+    """
+    live = {
+        definition.resource_type
+        for definition in schema.definitions
+        if any(
+            isinstance(relation.backing, (FieldBinding, AttributeBinding))
+            for relation in definition.relations
+        )
+    }
+    changed = bool(live)
+    while changed:
+        changed = False
+        for definition in schema.definitions:
+            if definition.resource_type in live:
+                continue
+            if any(
+                allowed.type in live
+                for relation in definition.relations
+                for allowed in relation.allowed_subjects
+            ):
+                live.add(definition.resource_type)
+                changed = True
+    return frozenset(live)
+
+
 def _collect_sources(
     expr: PermExpr,
     *,
@@ -247,8 +352,12 @@ def _collect_sources(
 
 __all__ = [
     "PermissionSources",
+    "accessible_is_exact",
+    "live_backed_resource_types",
+    "named_object_refs",
     "permission_object_sources",
     "permission_sources",
     "permissions_reaching_relation",
     "relation_dependencies",
+    "relation_is_writable",
 ]

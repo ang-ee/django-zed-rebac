@@ -504,3 +504,73 @@ def test_resolve_subjects_maps_registered_models_to_rows():
     refs = [post_ref, SubjectRef.of("missing/type", "1")]
 
     assert resolve_subjects(refs) == {post_ref: post}
+
+
+# ---------------------------------------------------------------------------
+# model_for_subject_type — the one owner of "subject type → model + id attr"
+# ---------------------------------------------------------------------------
+
+
+def test_model_for_subject_type_prefers_registered_model(monkeypatch):
+    from rebac import resources
+
+    class RegisteredGroup:
+        class _meta:
+            rebac_id_attr = "public_id"
+
+    monkeypatch.setattr(
+        resources,
+        "model_for_resource_type",
+        lambda resource_type: RegisteredGroup if resource_type == "auth/group" else None,
+    )
+
+    assert resources.model_for_subject_type("auth/group") == (RegisteredGroup, "public_id")
+
+
+@override_settings(REBAC_USER_ID_ATTR="username", REBAC_TYPE_PREFIX="tenantA/")
+def test_model_for_subject_type_maps_configured_user_and_group_types():
+    from django.contrib.auth import get_user_model
+    from django.contrib.auth.models import Group
+
+    from rebac.resources import model_for_subject_type
+
+    assert model_for_subject_type("tenantA/auth/user") == (get_user_model(), "username")
+    assert model_for_subject_type("tenantA/auth/group") == (Group, "username")
+    assert model_for_subject_type("auth/user") is None
+    assert model_for_subject_type("missing/type") is None
+
+
+@pytest.mark.django_db
+@override_settings(REBAC_USER_ID_ATTR="username")
+def test_resolve_subjects_maps_legacy_user_refs_by_actor_identity():
+    from django.contrib.auth import get_user_model
+
+    from rebac import to_subject_ref
+    from rebac.relationships import resolve_subjects
+    from tests.testapp.models import Post
+
+    user = get_user_model().objects.create(username="alice", is_active=True)
+    with sudo(reason="test.fixture"):
+        post = Post.objects.create(title="subject")
+    user_ref = to_subject_ref(user)
+    post_ref = to_subject_ref(post)
+    assert user_ref.subject_id == "alice"
+    assert post_ref.subject_id == str(post.pk)
+
+    resolved = resolve_subjects([user_ref, post_ref, SubjectRef.of("auth/user", "ghost")])
+
+    assert resolved == {user_ref: user, post_ref: post}
+
+
+@pytest.mark.django_db
+def test_resolve_subjects_maps_group_member_refs_to_group_rows():
+    from django.contrib.auth.models import Group
+
+    from rebac import to_subject_ref
+    from rebac.relationships import resolve_subjects
+
+    group = Group.objects.create(name="eng")
+    group_ref = to_subject_ref(group)
+    assert group_ref.optional_relation == "member"
+
+    assert resolve_subjects([group_ref]) == {group_ref: group}

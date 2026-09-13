@@ -126,7 +126,7 @@ relation viewer: auth/user | auth/user:*                // union with wildcard
 relation viewer: auth/user with ip_in_cidr              // with caveat
 ```
 
-Structural to-one relations that already exist as Django fields can be
+Structural relations that already exist as Django fields can be
 declared as field-backed:
 
 ```zed
@@ -145,6 +145,59 @@ specific ids, caveats, or expiration. The `rebac.E009` system check verifies
 that the named field exists and points at the schema's declared type. The
 `rebac build-zed` output omits the comment directive, so the emitted schema
 remains valid SpiceDB `.zed`.
+
+Forward, reverse, and many-to-many paths use the same declaration. Optional
+filters are anchored on the **source model**, including the through row:
+
+```zed
+relation member: auth/user // rebac:field={"path":"roster__user","filters":{"roster__active":true,"roster__role":"editor"}}
+```
+
+The target predicate and filters share one Django join. An active editor's
+roster row cannot accidentally authorize a different user's inactive row.
+Filter values are JSON scalars; Django validates the complete lookup paths.
+Both direct checks and lazy queryset scopes read the current rows, including
+changes made through bulk updates or the M2M manager.
+
+An **attribute backing** derives virtual container membership from a subject
+column. The single allowed subject type selects its Django model:
+
+```zed
+definition accounts/kind {
+    relation member: auth/user // rebac:attribute={"field":"kind"}
+    relation active_member: auth/user // rebac:attribute={"field":"kind","filters":{"is_active":true}}
+}
+
+definition platform/role {
+    relation member: auth/user // rebac:attribute={"field":"is_superuser","resource":"admin","value":true}
+}
+```
+
+Without `resource`/`value`, the column value is the container ID. With both,
+the declared comparison applies only to that fixed container; other IDs on
+the same relation retain stored tuples. Tuple writes/deletes against the live
+container are rejected. The subject column is the writer; no reconciliation
+command is needed. Attribute filters apply to the subject model.
+
+Two rules keep every read path in agreement. A dynamic container is named by
+the column value's canonical Python spelling only (`"1"` is integer container
+`1`; `"01"` is nothing). Text attribute columns need a deterministic,
+case-sensitive collation, because the lazy queryset scope compares them in SQL
+while direct checks compare exact strings; see ARCHITECTURE.md § Field-backed
+structural relations.
+
+**Anti-pattern:** do not derive ownership from an audit column such as
+`created_by` (`relation owner: auth/user // rebac:attribute={"field":"created_by"}`).
+Ownership must be transferable and revocable independently of who wrote the
+row; keep it an explicit `owner` tuple (see ARCHITECTURE.md § No implicit
+"owner from `create_uid`"). Attribute backing is for genuine membership
+attributes such as a kind, plan or role flag.
+
+Live ORM backing is implemented by `LocalBackend` in either storage mode.
+Exporting valid Zed does not project the derived edges into remote SpiceDB;
+until the roadmap projector ships, every backed relation holds no edges under
+`REBAC_BACKEND = "spicedb"` (ARCHITECTURE.md lists the projection burden per
+backing kind).
 
 A relation can instead be declared **const-backed** — resolving to one fixed
 object id for *every* row of the declaring type, with no stored tuple and no
@@ -311,12 +364,13 @@ write_relationships([
 ])
 ```
 
-#### Auto-syncing Django's `User.groups`
+#### Choosing the membership owner
 
-`REBAC_SYNC_DJANGO_GROUPS` is reserved for a planned adapter; no M2M signal
-handler is shipped. Applications must maintain
-`auth/group:<id>#member @ auth/user:<id>` relationships explicitly when Django
-group memberships change, including deleting the tuples on membership removal.
+Use `rebac.memberships` when relationship tuples are the membership store.
+If membership already lives in a Django M2M, declare its path as field backing
+on the container instead. These are alternative owners for the same relation;
+do not mirror one into the other. The unused `REBAC_SYNC_DJANGO_GROUPS` setting
+has been removed.
 
 #### Public read access
 
@@ -803,7 +857,11 @@ For projects where one Django DB serves multiple tenants, set `REBAC_TYPE_PREFIX
 REBAC_TYPE_PREFIX = "tenant_acme/"
 ```
 
-Every resource type emitted becomes `tenant_acme/blog/post`. Relationships from one tenant cannot be referenced by another.
+Every generated identity carries the prefix: model resource types become
+`tenant_acme/blog/post`, and the configured user, group and anonymous subject
+types plus `@rebac_subject` types become `tenant_acme/auth/user`,
+`tenant_acme/auth/group`, and so on. Declare the prefixed types in the tenant
+schema. Relationships from one tenant cannot be referenced by another.
 
 For hard-tenant isolation (separate databases or schemas), use `django-tenants` and let each tenant own its own `Relationship` table — no schema changes needed.
 

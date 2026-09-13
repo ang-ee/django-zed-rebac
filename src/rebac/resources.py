@@ -6,7 +6,7 @@ import builtins
 from collections.abc import Callable
 from typing import Any
 
-from ._id import resource_id_attr
+from ._id import resource_id_attr, subject_id_attr, type_with_prefix
 from .conf import app_settings
 from .types import ObjectRef
 
@@ -24,17 +24,6 @@ def _resolve_dotted(obj: Any, attr_path: str) -> Any:
     return value
 
 
-def _apply_prefix(rebac_type: str) -> str:
-    """Prepend ``app_settings.REBAC_TYPE_PREFIX`` to ``rebac_type`` (if set).
-
-    Single point of policy so every branch of :func:`to_object_ref` agrees
-    on the wire form. Multi-package deployments rely on prefix isolation;
-    a branch that bypassed it would silently emit cross-tenant collisions.
-    """
-    prefix = app_settings.REBAC_TYPE_PREFIX or ""
-    return f"{prefix}{rebac_type}" if prefix else rebac_type
-
-
 def model_resource_type(model_cls: Any) -> str | None:
     """Return the generated wire resource type for a REBAC-bound model class."""
     meta = getattr(model_cls, "_meta", None)
@@ -43,7 +32,7 @@ def model_resource_type(model_cls: Any) -> str | None:
     rebac_type = getattr(meta, "rebac_resource_type", None)
     if not rebac_type:
         return None
-    return _apply_prefix(str(rebac_type))
+    return type_with_prefix(str(rebac_type))
 
 
 def model_for_resource_type(resource_type: str) -> Any | None:
@@ -53,6 +42,31 @@ def model_for_resource_type(resource_type: str) -> Any | None:
     for model in apps.get_models():
         if model_resource_type(model) == resource_type:
             return model
+    return None
+
+
+def model_for_subject_type(subject_type: str) -> tuple[Any, str] | None:
+    """Return ``(model, id_attr)`` for a subject type that maps onto a Django model.
+
+    Inverse of :func:`rebac.actors.to_subject_ref` for model-backed subjects,
+    with the same precedence: a loaded model declaring ``subject_type`` as its
+    ``Meta.rebac_resource_type`` wins (its object identity is its subject
+    identity); the configured ``REBAC_USER_TYPE`` / ``REBAC_GROUP_TYPE`` then
+    map onto Django's user model and contrib ``Group`` with the actor-side id
+    attribute. ``None`` when nothing maps.
+    """
+    model = model_for_resource_type(subject_type)
+    if model is not None:
+        return model, resource_id_attr(model)
+    if subject_type == type_with_prefix(app_settings.REBAC_USER_TYPE):
+        from django.contrib.auth import get_user_model
+
+        user_model = get_user_model()
+        return user_model, subject_id_attr(user_model)
+    if subject_type == type_with_prefix(app_settings.REBAC_GROUP_TYPE):
+        from django.contrib.auth.models import Group
+
+        return Group, subject_id_attr(Group)
     return None
 
 
@@ -116,7 +130,7 @@ def to_object_ref(obj: Any) -> ObjectRef:
     for cls, (type_, id_attr) in _resource_registry.items():
         if isinstance(obj, cls):
             value = getattr(obj, id_attr)
-            return ObjectRef(_apply_prefix(type_), str(value))
+            return ObjectRef(type_with_prefix(type_), str(value))
 
     # 3. RebacObjectMeta — class-level _rebac_resource_type (views, menus, etc.)
     cls_obj = type(obj)
@@ -130,7 +144,7 @@ def to_object_ref(obj: Any) -> ObjectRef:
                 f"Cannot resolve {cls_obj.__name__} to ObjectRef: "
                 f"rebac_id_attr={id_attr!r} not found on instance ({exc})."
             ) from exc
-        return ObjectRef(_apply_prefix(resource_type), str(resource_id))
+        return ObjectRef(type_with_prefix(resource_type), str(resource_id))
 
     raise TypeError(
         f"Cannot resolve {type(obj).__name__} to ObjectRef. "

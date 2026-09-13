@@ -22,6 +22,7 @@ from django.utils import timezone
 
 from ...models.resource import RebacResource
 from ...schema import Schema, render_zed, resolve_schema_path
+from ...schema.ast import backing_to_dict
 from ...schema.parser import parse_zed, validate_schema
 
 
@@ -224,13 +225,7 @@ class Command(BaseCommand):
                             natural_key={"definition": schema_def, "name": r.name},
                             payload={
                                 "allowed_subjects": allowed,
-                                "backing": (
-                                    None
-                                    if r.backing is None
-                                    else {"kind": "const", "target_id": r.backing.target_id}
-                                    if r.backing.kind == "const"
-                                    else {"attname": r.backing.attname, "kind": r.backing.kind}
-                                ),
+                                "backing": backing_to_dict(r.backing),
                                 "caveat": "",
                                 "with_expiration": r.with_expiration,
                             },

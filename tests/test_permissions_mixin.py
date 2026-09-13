@@ -9,7 +9,7 @@ The mixin must:
   to False).
 - Skip backends that don't define a given method (NOT every backend
   has ``has_module_perms``).
-- Bypass for active superusers.
+- Delegate active-superuser policy to the configured backends.
 """
 
 from __future__ import annotations
@@ -152,13 +152,11 @@ def test_has_perm_skips_backends_without_method():
     assert user.has_perm("any.perm") is True
 
 
-def test_has_perm_active_superuser_bypasses():
-    """Active superusers always get True without consulting backends.
-    Matches contrib.auth.models.PermissionsMixin.has_perm."""
+@override_settings(AUTHENTICATION_BACKENDS=["tests.test_permissions_mixin._AlwaysFalseBackend"])
+def test_has_perm_active_superuser_is_answered_by_backends():
+    """The mixin adds no superuser shortcut: the backend chain owns that policy."""
     user = _FakeUser(is_active=True, is_superuser=True)
-    # Even without any backends configured, superuser wins.
-    with override_settings(AUTHENTICATION_BACKENDS=[]):
-        assert user.has_perm("any.perm") is True
+    assert user.has_perm("any.perm") is False
 
 
 @override_settings(AUTHENTICATION_BACKENDS=["tests.test_permissions_mixin._GrantBackend"])
@@ -222,7 +220,7 @@ def test_has_module_perms_short_circuits_on_permission_denied():
     assert user.has_module_perms("any_app") is False
 
 
-def test_has_module_perms_active_superuser_bypasses():
+@override_settings(AUTHENTICATION_BACKENDS=["tests.test_permissions_mixin._AlwaysFalseBackend"])
+def test_has_module_perms_active_superuser_is_answered_by_backends():
     user = _FakeUser(is_active=True, is_superuser=True)
-    with override_settings(AUTHENTICATION_BACKENDS=[]):
-        assert user.has_module_perms("any_app") is True
+    assert user.has_module_perms("any_app") is False

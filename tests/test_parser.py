@@ -105,7 +105,7 @@ def test_relation_comment_directive_lifts_field_binding():
     )
 
     folder = next(r for r in _relations(schema, "blog/post") if r.name == "folder")
-    assert folder.backing == FieldBinding(attname="folder")
+    assert folder.backing == FieldBinding(path="folder")
 
 
 @pytest.mark.parametrize(
@@ -182,7 +182,7 @@ def test_relation_declaring_both_field_and_const_backing_is_rejected() -> None:
     # A relation has exactly one backing slot; both directives in the relation's
     # line span is a ParseError (they cannot share one line — each anchors to
     # end-of-comment — so this spreads them across a two-line subject union).
-    with pytest.raises(ParseError, match=r"both rebac:field and rebac:const"):
+    with pytest.raises(ParseError, match=r"Multiple backing directives"):
         parse_zed(
             """
             definition auth/user {}

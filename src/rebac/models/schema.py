@@ -33,8 +33,10 @@ class SchemaRelation(models.Model):
     name = models.CharField(max_length=64)
     # Array of `{"type": "...", "relation": "...", "wildcard": bool}`.
     allowed_subjects = models.JSONField(default=list)
-    # Optional `{"attname": "folder", "kind": "fk"}` binding for relations
-    # sourced from a Django model field instead of stored tuple rows.
+    # Optional relation backing in the codec shape owned by
+    # ``rebac.schema.ast.backing_to_dict`` — ``{"kind": "fk", "path": ...}``,
+    # ``{"kind": "const", "target_id": ...}`` or ``{"kind": "attribute", ...}``
+    # — for relations resolved live instead of from stored tuple rows.
     backing = models.JSONField(null=True, blank=True, default=None)
     caveat = models.CharField(max_length=64, blank=True, default="")
     with_expiration = models.BooleanField(default=False)

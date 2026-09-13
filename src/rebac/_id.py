@@ -9,7 +9,8 @@ Resolution order, narrowest to broadest:
 1. Per-model ``Meta.rebac_id_attr`` — recognised by
    :class:`RebacModelBase` and re-attached onto ``cls._meta``.
 2. The corresponding global setting (``REBAC_RESOURCE_ID_ATTR`` for
-   resources, ``REBAC_USER_ID_ATTR`` for the actor side).
+   resources and registered model subjects, ``REBAC_USER_ID_ATTR`` for legacy
+   User/Group subjects without resource metadata).
 3. ``"pk"`` — the historical default; kept so existing consumers
    behave identically without opt-in.
 """
@@ -21,6 +22,13 @@ from typing import Any
 from .conf import app_settings
 
 
+def type_with_prefix(rebac_type: str) -> str:
+    """Return the configured wire type for an unprefixed declaration."""
+
+    prefix = str(app_settings.REBAC_TYPE_PREFIX or "")
+    return f"{prefix}{rebac_type}" if prefix else rebac_type
+
+
 def resource_id_attr(model_cls: Any) -> str:
     """Return the attribute name used to source a resource's id."""
     attr = getattr(model_cls._meta, "rebac_id_attr", None)
@@ -30,13 +38,24 @@ def resource_id_attr(model_cls: Any) -> str:
 def subject_id_attr(model_cls: Any) -> str:
     """Return the attribute name used to source a subject's id.
 
-    Differs from :func:`resource_id_attr` only in the global fallback —
-    actor-side resolution falls through to ``REBAC_USER_ID_ATTR`` so a
-    consumer can flip resources without flipping subjects (or vice
-    versa). Per-model ``Meta.rebac_id_attr`` still wins on either side.
+    A model declaring ``Meta.rebac_resource_type`` has one object identity, so
+    it follows :func:`resource_id_attr`, including its resource-setting
+    fallback. Legacy User/Group models without resource metadata retain the
+    actor-side ``REBAC_USER_ID_ATTR`` fallback.
     """
     attr = getattr(model_cls._meta, "rebac_id_attr", None)
-    return str(attr or app_settings.REBAC_USER_ID_ATTR)
+    if attr:
+        return str(attr)
+    if getattr(model_cls._meta, "rebac_resource_type", None):
+        return resource_id_attr(model_cls)
+    return str(app_settings.REBAC_USER_ID_ATTR)
 
 
-__all__ = ["resource_id_attr", "subject_id_attr"]
+def subject_relation(model_cls: Any) -> str:
+    """Return the optional subject-set relation declared by a Django model."""
+
+    relation = getattr(model_cls._meta, "rebac_subject_relation", "")
+    return str(relation or "")
+
+
+__all__ = ["resource_id_attr", "subject_id_attr", "subject_relation", "type_with_prefix"]

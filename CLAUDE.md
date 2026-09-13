@@ -9,8 +9,8 @@ Guidance for Claude Code working in the `django-zed-rebac` repository.
 
 ## Project overview
 
-`django-zed-rebac` is a **standalone, drop-in REBAC plugin for any Django 4.2 /
-5.2 / 6.0 project**. SpiceDB-compatible schema language, two interchangeable
+`django-zed-rebac` is a **standalone, drop-in REBAC plugin for any Django 6.0
+project** (the supported matrix is pinned in `pyproject.toml`; see § Tooling). SpiceDB-compatible schema language, two interchangeable
 backends (`LocalBackend` recursive-CTE in pure Django; `SpiceDBBackend` over
 `authzed-py`), strict-by-default queryset scoping, AI-agent Grant pattern,
 MCP / Celery / DRF / GraphQL adapters.
@@ -325,8 +325,10 @@ Per `docs/ARCHITECTURE.md § Testing`:
 - **Test:** `pytest` + `pytest-django` for integration; pure-Python `pytest`
   for unit. Cross-backend contract tests via `testcontainers-spicedb`,
   opt-in marker.
-- **CI matrix:** Python 3.11/3.12/3.13/3.14 × Django 4.2/5.2/6.0 × DB
-  (sqlite for unit, postgres-15/16 for integration).
+- **CI matrix:** Python 3.14 × Django 6.0 (`requires-python = ">=3.14"`,
+  `django>=6.0,<6.1`; `ruff`/`mypy` target 3.14, so 3.14-only syntax such as
+  PEP 758 `except A, B:` is in play) × sqlite for unit tests. Broader
+  matrices are a release decision, not the current contract.
 - **DjangoVer** for releases:
   `<DJANGO_MAJOR>.<DJANGO_FEATURE>.<PACKAGE_VERSION>`.
 

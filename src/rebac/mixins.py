@@ -24,9 +24,10 @@ from .managers import RebacManager
 from .resources import model_resource_type
 from .types import CheckResult, Consistency, FieldDenyMode, ObjectRef, SubjectRef
 
-_RECOGNISED_META = (
+REBAC_META_OPTIONS = (
     "rebac_resource_type",
     "rebac_default_action",
+    "rebac_subject_relation",
     # Per-model override for the attribute the engine reads when
     # building a resource_id (signals + manager) or a subject_id
     # (``to_subject_ref`` for User / Group). Default resolution order
@@ -54,7 +55,7 @@ def _capture_rebac_meta(attrs: dict[str, Any]) -> dict[str, Any]:
     if meta is None:
         return captured
     own = vars(meta)
-    for key in _RECOGNISED_META:
+    for key in REBAC_META_OPTIONS:
         if key in own:
             captured[key] = own[key]
             delattr(meta, key)
@@ -66,7 +67,7 @@ def _capture_rebac_meta(attrs: dict[str, Any]) -> dict[str, Any]:
 class RebacObjectMeta(type):
     """Registration metaclass for non-model REBAC resources (views, menus, etc.).
 
-    Captures the same ``_RECOGNISED_META`` keys as ``RebacModelBase`` but
+    Captures the same :data:`REBAC_META_OPTIONS` keys as ``RebacModelBase`` but
     stores them directly on the class as ``_rebac_<key>`` attributes rather
     than on ``._meta`` (which only exists on Django models).
 
@@ -90,6 +91,9 @@ class RebacObjectMeta(type):
     _rebac_resource_type: str | None
     _rebac_id_attr: str
     _rebac_default_action: str
+    # Captured for parity with the model metaclass; only Django models act as
+    # subjects, so ``to_subject_ref`` never reads it here (proposal 0006).
+    _rebac_subject_relation: str
 
     def __new__(
         mcs,

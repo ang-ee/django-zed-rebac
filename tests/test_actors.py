@@ -48,6 +48,24 @@ def test_django_group_to_subject_ref():
     assert ref.optional_relation == "member"
 
 
+@pytest.mark.django_db
+def test_rebac_model_subject_identity_uses_object_metadata():
+    from rebac import sudo
+    from tests.testapp.models import SubjectContainer
+
+    with sudo(reason="test.fixture"):
+        subject = SubjectContainer.objects.create(slug="reviewers", title="Reviewers")
+
+    assert to_subject_ref(subject) == SubjectRef.of("blog/subjectcontainer", "reviewers", "member")
+
+
+def test_unsaved_rebac_model_subject_raises():
+    from tests.testapp.models import SubjectContainer
+
+    with pytest.raises(NoActorResolvedError, match="unsaved"):
+        to_subject_ref(SubjectContainer(slug="reviewers", title="Reviewers"))
+
+
 def test_unknown_actor_raises():
     with pytest.raises(NoActorResolvedError):
         to_subject_ref(object())
@@ -86,6 +104,13 @@ def test_unauthenticated_user_instance_raises():
 
     with pytest.raises(NoActorResolvedError, match="is_authenticated=False"):
         to_subject_ref(_UnauthUser(username="ghost"))
+
+
+def test_unsaved_user_instance_raises():
+    from django.contrib.auth import get_user_model
+
+    with pytest.raises(NoActorResolvedError, match="unsaved"):
+        to_subject_ref(get_user_model()(username="ghost"))
 
 
 # ---------- Anonymous actor ----------

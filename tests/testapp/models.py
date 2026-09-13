@@ -7,11 +7,12 @@ from django.db import models
 
 from rebac import RebacMixin
 
-from .fields import EncodedIntegerField
+from .fields import EncodedIntegerField, LowercaseCharField
 
 
 class Folder(RebacMixin, models.Model):
     name = models.CharField(max_length=100)
+    kind = LowercaseCharField(max_length=32, blank=True, default="")
     parent = models.ForeignKey(
         "self", null=True, blank=True, on_delete=models.CASCADE, related_name="children"
     )
@@ -49,6 +50,17 @@ class SluggedPost(RebacMixin, models.Model):
         app_label = "testapp"
         rebac_resource_type = "blog/sluggedpost"
         rebac_id_attr = "slug"
+
+
+class SubjectContainer(SluggedPost):
+    """Proxy exercising model-owned subject-set identity without another table."""
+
+    class Meta:
+        proxy = True
+        app_label = "testapp"
+        rebac_resource_type = "blog/subjectcontainer"
+        rebac_id_attr = "slug"
+        rebac_subject_relation = "member"
 
 
 class AuthoredPost(RebacMixin, models.Model):
