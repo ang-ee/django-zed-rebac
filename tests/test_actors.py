@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import pytest
 from django.test import override_settings
+from django.utils.functional import SimpleLazyObject
 
 from rebac import (
     ANONYMOUS_ACTOR,
@@ -57,6 +58,46 @@ def test_rebac_model_subject_identity_uses_object_metadata():
         subject = SubjectContainer.objects.create(slug="reviewers", title="Reviewers")
 
     assert to_subject_ref(subject) == SubjectRef.of("blog/subjectcontainer", "reviewers", "member")
+
+
+@pytest.mark.django_db
+def test_lazy_rebac_proxy_model_keeps_custom_identity_and_subject_relation():
+    from rebac import sudo
+    from tests.testapp.models import SubjectContainer
+
+    with sudo(reason="lazy subject fixture"):
+        subject = SubjectContainer.objects.create(slug="reviewers", title="Reviewers")
+    lazy_subject = SimpleLazyObject(
+        lambda: SubjectContainer.objects.sudo(reason="resolve lazy subject").get(pk=subject.pk)
+    )
+
+    assert to_subject_ref(lazy_subject) == SubjectRef.of(
+        "blog/subjectcontainer", "reviewers", "member"
+    )
+
+
+@pytest.mark.django_db
+def test_lazy_model_mapped_user_uses_custom_resource_identity(monkeypatch):
+    from django.contrib.auth import get_user_model
+
+    User = get_user_model()
+    monkeypatch.setattr(User._meta, "rebac_resource_type", "accounts/member", raising=False)
+    monkeypatch.setattr(User._meta, "rebac_id_attr", "username", raising=False)
+    monkeypatch.setattr(User._meta, "rebac_subject_relation", "participant", raising=False)
+    user = User.objects.create_user(username="lazy-alice")
+    lazy_user = SimpleLazyObject(lambda: User.objects.get(pk=user.pk))
+
+    assert to_subject_ref(lazy_user) == SubjectRef.of(
+        "accounts/member", "lazy-alice", "participant"
+    )
+
+
+def test_lazy_unsaved_user_still_raises():
+    from django.contrib.auth import get_user_model
+
+    lazy_user = SimpleLazyObject(lambda: get_user_model()(username="ghost"))
+    with pytest.raises(NoActorResolvedError, match="unsaved"):
+        to_subject_ref(lazy_user)
 
 
 def test_unsaved_rebac_model_subject_raises():

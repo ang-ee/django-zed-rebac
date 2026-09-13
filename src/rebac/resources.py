@@ -25,7 +25,7 @@ def _resolve_dotted(obj: Any, attr_path: str) -> Any:
 
 
 def model_resource_type(model_cls: Any) -> str | None:
-    """Return the generated wire resource type for a REBAC-bound model class."""
+    """Return the wire resource type from a model class or instance's metadata."""
     meta = getattr(model_cls, "_meta", None)
     if meta is None:
         return None
@@ -72,7 +72,7 @@ def model_for_subject_type(subject_type: str) -> tuple[Any, str] | None:
 
 def model_resource_id(obj: Any) -> str:
     """Resolve a model instance's configured REBAC id attribute."""
-    attr = resource_id_attr(type(obj))
+    attr = resource_id_attr(obj)
     try:
         value = _resolve_dotted(obj, attr)
     except AttributeError as exc:
@@ -127,7 +127,7 @@ def to_object_ref(obj: Any) -> ObjectRef:
     Raises :class:`TypeError` if no path resolves ``obj``.
     """
     # 1. Django model with RebacMixin
-    rebac_type = model_resource_type(type(obj))
+    rebac_type = model_resource_type(obj)
     if rebac_type:
         return ObjectRef(rebac_type, model_resource_id(obj))
 

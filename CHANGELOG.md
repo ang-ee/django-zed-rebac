@@ -5,6 +5,13 @@ pre-1.0; breaking changes within a minor version are explicitly called out.
 
 ## [Unreleased]
 
+### Fixed
+
+- Resolve model resource and subject identity through instance metadata, so
+  Django's lazy user and model wrappers retain the wrapped model's type, ID
+  attribute and subject relation. Authenticated requests using a model-backed
+  user no longer fail while resolving `AuthenticationMiddleware`'s lazy user.
+
 ## [0.17.1] — 2026-09-13
 
 ### Fixed
