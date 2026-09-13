@@ -174,3 +174,26 @@ def test_live_backed_resource_types_is_empty_without_live_backings():
     from rebac.schema.introspection import live_backed_resource_types
 
     assert live_backed_resource_types(parse_zed(SCHEMA_TEXT)) == frozenset()
+
+
+def test_accessible_is_exact_requires_no_caveats_and_no_builtin_actor_terms():
+    from rebac.schema.introspection import accessible_is_exact
+
+    assert accessible_is_exact(parse_zed(LIVE_SCHEMA_TEXT))
+    assert not accessible_is_exact(
+        parse_zed(
+            LIVE_SCHEMA_TEXT.replace(
+                "permission read = owner\n}", "permission read = owner + authenticated\n}", 1
+            )
+        )
+    )
+    assert not accessible_is_exact(
+        parse_zed(
+            'caveat present(token string) {\n token == "x"\n}\n'
+            + LIVE_SCHEMA_TEXT.replace(
+                "relation owner: auth/user\n    permission read = owner",
+                "relation owner: auth/user | auth/user with present\n    permission read = owner",
+                1,
+            )
+        )
+    )

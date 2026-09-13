@@ -76,3 +76,35 @@ def test_attribute_backing_model_errors_are_reported_as_e009(db, install_schema)
     assert any(
         issue.id == "rebac.E009" and "missing attribute 'missing'" in issue.msg for issue in issues
     )
+
+
+def test_case_insensitive_attribute_collation_is_warned(db, install_schema, monkeypatch):
+    from django.contrib.auth import get_user_model
+
+    install_schema(
+        """
+        definition auth/user {}
+        definition sample/kind {
+            relation member: auth/user // rebac:attribute={"field":"username"}
+        }
+        """
+    )
+    field = get_user_model()._meta.get_field("username")
+    monkeypatch.setattr(field, "db_collation", "utf8mb4_general_ci")
+
+    issues = check_field_backed_relations()
+
+    assert any(issue.id == "rebac.W009" and "username" in issue.msg for issue in issues)
+
+
+def test_case_sensitive_attribute_collation_passes(db, install_schema):
+    install_schema(
+        """
+        definition auth/user {}
+        definition sample/kind {
+            relation member: auth/user // rebac:attribute={"field":"username"}
+        }
+        """
+    )
+
+    assert not any(issue.id == "rebac.W009" for issue in check_field_backed_relations())

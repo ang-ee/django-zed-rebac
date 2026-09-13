@@ -21,8 +21,10 @@ pre-1.0; breaking changes within a minor version are explicitly called out.
 - Live filtered ORM relation paths (`rebac:field={"path":...,"filters":...}`)
   and scalar attribute-backed containers (`rebac:attribute=...`), with shared
   parsing, persistence, direct evaluation, enumeration and lazy SQL scoping.
-- `rebac.schema.introspection.named_object_refs`, `relation_is_writable` and
-  `live_backed_resource_types`.
+- `rebac.schema.introspection.named_object_refs`, `relation_is_writable`,
+  `live_backed_resource_types` and `accessible_is_exact`.
+- `rebac.W009` warns about case-insensitive collations on text attribute
+  columns (best effort).
 - Migration `0004_field_backing_path`, which rewrites stored field backings to
   the new `path` key (see Changed).
 
@@ -42,9 +44,10 @@ pre-1.0; breaking changes within a minor version are explicitly called out.
 - **Decision-cache bypass is per resource type.** `LocalBackend` declines to
   cache decisions only for resource types that can reach live field or
   attribute backing (conservative schema reachability), instead of for the
-  whole schema; transaction and expiration bypasses are unchanged. The public
-  `mark_relationships_changed()` invalidates decisions after out-of-band row
-  changes.
+  whole schema; transaction and expiration bypasses are unchanged.
+  `rebac.backends.local.mark_relationships_changed()` is the LocalBackend seam
+  that invalidates decisions after out-of-band row changes (the `post_delete`
+  cascade uses it); it is not part of the top-level `rebac` export surface.
 - **Relationship garbage collection on delete.** Deleting a `RebacMixin` row
   now removes every tuple naming it, as resource or subject, in both storage
   modes on the deleting alias. Denormalized deployments can drop their manual
@@ -55,6 +58,11 @@ pre-1.0; breaking changes within a minor version are explicitly called out.
   permission-level bypass to apply.
 - Permission-named subject sets (`type:id#permission`) resolve through the
   permission evaluator.
+- Arrows through field- or attribute-backed relations cost a bounded number
+  of queries in direct checks when the schema declares no caveats and no
+  built-in actor terms; otherwise they keep the per-target tri-state walk.
+- Unsaved `RebacMixin` instances raise `NoActorResolvedError` when used as a
+  subject, as unsaved users already did.
 - `FieldBinding`, `ConstBinding` and `AttributeBinding` no longer carry a
   `kind` attribute; the class is the discriminator and the codec owns the
   persisted `kind` key.

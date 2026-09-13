@@ -91,6 +91,8 @@ class RebacObjectMeta(type):
     _rebac_resource_type: str | None
     _rebac_id_attr: str
     _rebac_default_action: str
+    # Captured for parity with the model metaclass; only Django models act as
+    # subjects, so ``to_subject_ref`` never reads it here (proposal 0006).
     _rebac_subject_relation: str
 
     def __new__(

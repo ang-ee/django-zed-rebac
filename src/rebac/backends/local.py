@@ -34,7 +34,7 @@ from contextvars import ContextVar
 from datetime import datetime
 from functools import wraps
 from threading import Lock
-from typing import Any
+from typing import Any, NamedTuple
 from weakref import WeakSet
 
 from django.db import models
@@ -102,6 +102,16 @@ from .local_query import LocalQueryScope, UnsupportedScope
 
 _backend_registry_lock = Lock()
 _db_loaded_backends: WeakSet[LocalBackend] = WeakSet()
+
+
+class _SchemaFacts(NamedTuple):
+    """Whole-schema facts memoised per schema generation (see ``_schema_facts``)."""
+
+    generation: int
+    live_types: frozenset[str]
+    accessible_is_exact: bool
+
+
 _relationship_generation = 0
 _schema_operation_scope: ContextVar[SchemaScope | None] = ContextVar(
     "rebac_schema_operation", default=None
@@ -163,7 +173,7 @@ class LocalBackend(Backend):
         self._schema_is_manual = False
         self._schema_generation = 0
         self._schema_invalidation_generation = 0
-        self._live_types: tuple[int, frozenset[str]] | None = None
+        self._schema_facts_memo: _SchemaFacts | None = None
         # Counter used as a stable monotonic xid on backends (e.g. SQLite test
         # mode) without `txid_current()`.
         self._xid_counter = 0
@@ -256,7 +266,7 @@ class LocalBackend(Backend):
             return None
         snapshot = self._schema_snapshot()
         schema = snapshot.schema
-        if resource_type in self._live_types_for(snapshot):
+        if resource_type in self._schema_facts(snapshot).live_types:
             return None
         if any(relation.with_expiration for d in schema.definitions for relation in d.relations):
             # A relationship deadline can pass with no write or schema change.
@@ -264,18 +274,22 @@ class LocalBackend(Backend):
             return None
         return snapshot.generation, _relationship_generation
 
-    def _live_types_for(self, snapshot: SchemaSnapshot) -> frozenset[str]:
-        """Resource types whose decisions may read live ORM backing, per schema generation."""
-        from ..schema.introspection import live_backed_resource_types
+    def _schema_facts(self, snapshot: SchemaSnapshot) -> _SchemaFacts:
+        """Whole-schema facts derived once per schema generation."""
+        from ..schema.introspection import accessible_is_exact, live_backed_resource_types
 
         with self._schema_lock:
-            cached = self._live_types
-            if cached is not None and cached[0] == snapshot.generation:
-                return cached[1]
-        live = live_backed_resource_types(snapshot.schema)
+            cached = self._schema_facts_memo
+            if cached is not None and cached.generation == snapshot.generation:
+                return cached
+        facts = _SchemaFacts(
+            snapshot.generation,
+            live_backed_resource_types(snapshot.schema),
+            accessible_is_exact(snapshot.schema),
+        )
         with self._schema_lock:
-            self._live_types = (snapshot.generation, live)
-        return live
+            self._schema_facts_memo = facts
+        return facts
 
     def mark_schema_stale(self) -> None:
         """Drop a DB-loaded schema cache after Schema* row changes."""
@@ -933,14 +947,31 @@ class LocalBackend(Backend):
         target: str,
         depth: int,
     ) -> bool | None:
+        target_def = ctx.schema.get_definition(field_backing.target_resource_type)
+        if target_def is None:
+            return False
+        if self._schema_facts(self._schema_snapshot()).accessible_is_exact:
+            # No row can be conditional and no built-in actor term is in
+            # play, so the tri-state collapses to a set intersection: resolve
+            # the targets the subject holds ``target`` on once, then one
+            # bounded EXISTS against the live path instead of a walk per row.
+            targets = self._compute_accessible_for(
+                field_backing.target_resource_type,
+                target,
+                target_def,
+                ctx.subject,
+                depth + 1,
+                {},
+                ctx.context,
+            )
+            if not targets:
+                return False
+            return field_backing.queryset(resource_id=resource_id, target_ids=targets).exists()
         qs = field_backing.queryset(resource_id=resource_id)
         target_values = list(qs.values_list(field_backing.target_values_path(), flat=True))
         saw_conditional = False
         for target_id in target_values:
             if target_id is None:
-                continue
-            target_def = ctx.schema.get_definition(field_backing.target_resource_type)
-            if target_def is None:
                 continue
             inner = self._eval_permission_on(
                 permission_name=target,
@@ -970,6 +1001,22 @@ class LocalBackend(Backend):
         target_definition = ctx.schema.get_definition(attribute_backing.target_resource_type)
         if target_definition is None:
             return False
+        if self._schema_facts(self._schema_snapshot()).accessible_is_exact:
+            # Same collapse as the field-backed arrow: the container can be
+            # arbitrarily wide, so never walk it row by row when one bounded
+            # EXISTS against the resolved target set is exact.
+            targets = self._compute_accessible_for(
+                attribute_backing.target_resource_type,
+                target,
+                target_definition,
+                ctx.subject,
+                depth + 1,
+                {},
+                ctx.context,
+            )
+            if not targets:
+                return False
+            return attribute_backing.has_any_subject(resource_id, targets)
         saw_conditional = False
         for target_id in attribute_backing.subject_ids(resource_id):
             if target_id is None:

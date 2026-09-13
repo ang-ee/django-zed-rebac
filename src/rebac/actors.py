@@ -82,8 +82,9 @@ def anonymous_actor() -> SubjectRef:
 
 
 # Module-level convenience constant. Uses the default ``REBAC_ANONYMOUS_TYPE``
-# at import time; consumers that override the setting should call
-# :func:`anonymous_actor` instead.
+# and no ``REBAC_TYPE_PREFIX`` at import time, so it is only the anonymous actor
+# (per :func:`is_anonymous_actor`) in deployments that keep both defaults;
+# consumers that override either setting must call :func:`anonymous_actor`.
 ANONYMOUS_ACTOR: SubjectRef = SubjectRef.of("auth/anonymous", "*")
 
 
@@ -200,6 +201,12 @@ def to_subject_ref(actor: ActorLike) -> SubjectRef:
         )
 
     if model_resource_type(type(actor)):
+        if actor.pk is None:
+            # A principal must be a persisted row, as for the User branch;
+            # an unsaved instance would otherwise resolve to the id "None".
+            raise NoActorResolvedError(
+                f"{type(actor).__name__} instance is unsaved; save it before using it as a subject."
+            )
         resource = to_object_ref(actor)
         return SubjectRef(resource, subject_relation(type(actor)))
 

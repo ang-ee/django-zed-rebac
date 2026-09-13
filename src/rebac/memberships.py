@@ -1,4 +1,9 @@
-"""Generic direct membership operations over canonical ``member`` tuples."""
+"""Generic direct membership operations over canonical ``member`` tuples.
+
+Parameters are named at the tuple level (``subject`` / ``container``), matching
+``SubjectRef`` and ``ObjectRef``; :mod:`rebac.roles` composes these helpers and
+names the same ``ActorLike`` argument ``actor`` because it speaks in grants.
+"""
 
 from __future__ import annotations
 

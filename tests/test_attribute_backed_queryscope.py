@@ -264,19 +264,72 @@ def test_direct_live_checks_cost_one_query(django_user_model, django_assert_num_
         )
 
 
-@pytest.mark.django_db
-def test_attribute_arrow_walk_is_bounded_by_distinct_targets(
-    django_user_model, django_assert_num_queries
-):
-    """The arrow enumerates each container subject once, even when filters join duplicates.
+CAVEATED_ARROW_SCHEMA = ARROW_SCHEMA.replace(
+    "definition auth/user {\n    relation self: auth/user",
+    'caveat present(token string) {\n    token == "x"\n}\n\n'
+    "definition auth/user {\n    relation self: auth/user | auth/user with present",
+)
 
-    Cost model: one query for the distinct container subjects, then the target
-    permission per subject. ``reach = self`` is a stored relation, which the
-    tri-state evaluator resolves with three queries (direct, wildcard, subject
-    set) when it denies. Denied targets keep the walk from short-circuiting.
+
+@pytest.mark.django_db
+@pytest.mark.parametrize("members", [1, 3])
+def test_attribute_arrow_check_is_bounded_when_enumeration_is_exact(
+    django_user_model, django_assert_num_queries, members
+):
+    """Without caveats or built-in actor terms the arrow costs a fixed number of queries.
+
+    Resolving the targets the subject holds ``reach`` on costs one query when
+    the set is empty (the check then denies without touching the container)
+    and two when it is not (the enumeration's fix-point confirms the set is
+    closed); one EXISTS then intersects it with the live container. Neither
+    depends on how wide the container is or on filters joining duplicate rows.
     """
     reset_backend()
     backend().set_schema(parse_zed(ARROW_SCHEMA))
+    reader = django_user_model.objects.create(username="reader", is_active=True)
+    staff = [
+        django_user_model.objects.create(username=f"staff{i}", is_active=True, is_staff=True)
+        for i in range(members)
+    ]
+    with sudo(reason="test.fixture"):
+        folder = Folder.objects.create(name="Shared")
+        for member in staff:
+            AuthoredPost.objects.create(title="k-one", folder=folder, author=member)
+            AuthoredPost.objects.create(title="k-two", folder=folder, author=member)
+    subject = to_subject_ref(reader)
+
+    with django_assert_num_queries(1):
+        assert (
+            not backend()
+            .check_access(subject=subject, action="read", resource=ObjectRef("blog/post", "one"))
+            .allowed
+        )
+
+    write_relationships(
+        [RelationshipTuple(ObjectRef("auth/user", str(staff[0].pk)), "self", subject)]
+    )
+    with django_assert_num_queries(3):
+        assert (
+            backend()
+            .check_access(subject=subject, action="read", resource=ObjectRef("blog/post", "one"))
+            .allowed
+        )
+
+
+@pytest.mark.django_db
+def test_attribute_arrow_walk_keeps_tri_state_per_target_under_caveats(
+    django_user_model, django_assert_num_queries
+):
+    """With a caveated subject in the schema the arrow evaluates each distinct target.
+
+    Enumeration drops conditional rows, so the walk must stay per target to
+    preserve CONDITIONAL. Cost model: one query for the distinct container
+    subjects, then the target permission per subject; ``reach = self`` is a
+    stored relation the tri-state evaluator denies with three queries.
+    Duplicate-producing filters must not multiply that.
+    """
+    reset_backend()
+    backend().set_schema(parse_zed(CAVEATED_ARROW_SCHEMA))
     reader = django_user_model.objects.create(username="reader", is_active=True)
     staff = [
         django_user_model.objects.create(username=f"staff{i}", is_active=True, is_staff=True)
@@ -285,7 +338,6 @@ def test_attribute_arrow_walk_is_bounded_by_distinct_targets(
     with sudo(reason="test.fixture"):
         folder = Folder.objects.create(name="Shared")
         for member in staff:
-            # Two matching posts per member: the filter join yields duplicate rows.
             AuthoredPost.objects.create(title="k-one", folder=folder, author=member)
             AuthoredPost.objects.create(title="k-two", folder=folder, author=member)
     subject = to_subject_ref(reader)

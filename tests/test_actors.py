@@ -48,12 +48,22 @@ def test_django_group_to_subject_ref():
     assert ref.optional_relation == "member"
 
 
+@pytest.mark.django_db
 def test_rebac_model_subject_identity_uses_object_metadata():
+    from rebac import sudo
     from tests.testapp.models import SubjectContainer
 
-    subject = SubjectContainer(slug="reviewers", title="Reviewers")
+    with sudo(reason="test.fixture"):
+        subject = SubjectContainer.objects.create(slug="reviewers", title="Reviewers")
 
     assert to_subject_ref(subject) == SubjectRef.of("blog/subjectcontainer", "reviewers", "member")
+
+
+def test_unsaved_rebac_model_subject_raises():
+    from tests.testapp.models import SubjectContainer
+
+    with pytest.raises(NoActorResolvedError, match="unsaved"):
+        to_subject_ref(SubjectContainer(slug="reviewers", title="Reviewers"))
 
 
 def test_unknown_actor_raises():

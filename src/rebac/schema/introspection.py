@@ -225,6 +225,36 @@ def relation_is_writable(schema: Schema, *, resource: ObjectRef, relation: str) 
     return declared is not None and not declared.has_backing(resource.resource_id)
 
 
+def accessible_is_exact(schema: Schema) -> bool:
+    """Whether enumerating ``accessible()`` answers every check exactly.
+
+    Enumeration silently drops caveat-conditional rows and cannot list the
+    rows of a built-in actor grant (``authenticated`` / ``anonymous``), so it
+    is only interchangeable with a per-row check when the schema declares no
+    caveated subject and no permission references a built-in actor term.
+    """
+    if schema.caveats or any(
+        allowed.with_caveat
+        for definition in schema.definitions
+        for relation in definition.relations
+        for allowed in relation.allowed_subjects
+    ):
+        return False
+    return not any(
+        _references_builtin_actor(permission.expression)
+        for definition in schema.definitions
+        for permission in definition.permissions
+    )
+
+
+def _references_builtin_actor(expr: PermExpr) -> bool:
+    if isinstance(expr, PermRef):
+        return expr.name in BUILTIN_ACTOR_TYPES
+    if isinstance(expr, PermBinOp):
+        return _references_builtin_actor(expr.left) or _references_builtin_actor(expr.right)
+    return False
+
+
 def live_backed_resource_types(schema: Schema) -> frozenset[str]:
     """Resource types whose permission evaluation may read live ORM backing.
 
@@ -322,10 +352,12 @@ def _collect_sources(
 
 __all__ = [
     "PermissionSources",
+    "accessible_is_exact",
     "live_backed_resource_types",
     "named_object_refs",
     "permission_object_sources",
     "permission_sources",
     "permissions_reaching_relation",
     "relation_dependencies",
+    "relation_is_writable",
 ]

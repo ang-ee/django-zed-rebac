@@ -165,6 +165,16 @@ class ResolvedAttributeBacking:
         rows = self.target_model._base_manager.db_manager(using)
         return rows.filter(self.target_filter(resource_id, subject)).exists()
 
+    def has_any_subject(
+        self, resource_id: str, target_ids: Iterable[str], using: str | None = None
+    ) -> bool:
+        """Whether any subject identified in ``target_ids`` is in the virtual container."""
+        rows = self.target_model._base_manager.db_manager(using)
+        predicate = self.subjects_filter(resource_id) & Q(
+            **{f"{self.target_id_attr}__in": target_ids}
+        )
+        return rows.filter(predicate).exists()
+
     def subject_ids(self, resource_id: str, using: str | None = None) -> QuerySet[Any, Any]:
         """Distinct identities of the subjects currently in the virtual container."""
         rows = self.target_model._base_manager.db_manager(using)

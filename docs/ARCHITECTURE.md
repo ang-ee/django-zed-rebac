@@ -240,6 +240,15 @@ collation (MySQL's default `*_ci` collations are not) so both paths agree. A
 field whose `to_python` / `get_prep_value` are not the stock `CharField`,
 `TextField` or `IntegerField` implementations is never compiled; the scope
 falls back to enumeration so every read path applies the same conversion.
+`rebac.W009` warns, best-effort, about case-insensitive attribute collations.
+
+Arrows through a live backing (`member->reach` on a field- or attribute-backed
+`member`) are evaluated in bounded queries when the schema declares no caveated
+subject and no built-in actor term (`rebac.schema.introspection.accessible_is_exact`):
+the backend resolves the targets the subject holds the arrow permission on once
+and intersects them with the live path in one `EXISTS`, however wide the
+container is. Otherwise the walk evaluates each distinct target with the
+tri-state evaluator so `CONDITIONAL` results survive.
 
 #### Backings are `LocalBackend`-only until the projector ships
 
@@ -920,7 +929,7 @@ System checks (in `rebac/checks.py`):
 | `rebac.E006` | Error | `REBAC_LOCAL_BACKEND_STORAGE` is `"denormalized"` or `"registry"`. |
 | `rebac.E007` | Error | `REBAC_ZOOKIE_TRANSPORT` is `"none"`, `"header"`, or `"session"`. |
 | `rebac.E008` | Error | `REBAC_FIELD_READ_MODE` is not one of `"allow"`, `"redact"`, `"omit"`, or `"raise"`. |
-| `rebac.E009` | Error | A field-, attribute- or const-backed relation cannot be resolved against Django: missing model, identity field, relation path, attribute, filter lookup, or a path that ends on a different model than the declared subject type. |
+| `rebac.E009` | Error | A field-, attribute- or const-backed relation cannot be resolved: missing Django model, identity field, relation path, attribute or filter lookup; a path that ends on a different model than the declared subject type; or a const-backed relation whose target type has no schema definition. |
 | `rebac.E010` | Error | Const-backed arrows form an evaluation cycle that would recurse to the depth limit on every check. |
 | `rebac.E011` | Error | `Meta.rebac_subject_relation` names a relation the model's effective schema definition does not declare. |
 | `rebac.W001` | Warning | `rebac.backends.RebacBackend` not in `AUTHENTICATION_BACKENDS`. |
@@ -930,6 +939,7 @@ System checks (in `rebac/checks.py`):
 | `rebac.W005` | Warning | LocalBackend is still on denormalized storage and registry migration is recommended for large tables. |
 | `rebac.W006` | Warning | `REBAC_ZOOKIE_TRANSPORT = "session"` without `django.contrib.sessions`. |
 | `rebac.W008` | Warning | `REBAC_FIELD_READ_MODE = "raise"` currently degrades to `"redact"` until descriptor-based protected fields land. |
+| `rebac.W009` | Warning | A text attribute-backed column declares a case-insensitive collation (`*_ci`, or the MySQL default), so SQL scoping and Python checks could disagree on container ids. Best-effort detection. |
 | `rebac.W101` | Warning (`--deploy`) | `REBAC_SPICEDB_TLS = False` in production. |
 
 Users silence individual checks via Django's `SILENCED_SYSTEM_CHECKS = ["rebac.W001"]`.
