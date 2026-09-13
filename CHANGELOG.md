@@ -9,6 +9,16 @@ pre-1.0; breaking changes within a minor version are explicitly called out.
 
 ### Fixed
 
+- Model identity resolution rejects `None` and empty strings before they can
+  become shared invalid graph IDs. Valid zero-valued and UUID identities keep
+  their existing wire representation.
+- Unrelated Django model deletions skip subject resolution and relationship
+  cleanup. Resource, User, Group and registered-subject cleanup retains the
+  canonical identity resolver and deletion database alias.
+- Repair the virtual-identity fixture so Django initialization cannot shadow
+  its computed value, and retain surviving direct grants in the revocation
+  regression. Clarify that consumer schemas own agent delegation and update
+  the contributor CI matrix to Python 3.14 and Django 6.0.
 - Live backing accepts ORM-queryable scalar virtual identities, including
   public IDs encoded from an existing integer primary key. Django fields own
   lookup preparation and result conversion; graph IDs and stored tuples keep

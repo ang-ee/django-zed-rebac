@@ -164,6 +164,8 @@ encoded from the existing primary key. The field must support SQL projection
 and exact/`in` lookups; Django owns both lookup preparation and result
 conversion. A separate identity column or tuple-ID migration is unnecessary.
 Properties without an ORM field and composite identities are not supported.
+Loaded instances must expose a nonempty identity; model reference resolution
+rejects `None` and empty strings rather than constructing a shared invalid ID.
 The ordinary `pk` identity also works on a multi-table child whose primary key
 is a Django parent link. An explicit relation ID attribute such as
 `parent_ptr_id` is scalar; the corresponding `parent_ptr` model-object accessor
@@ -774,10 +776,10 @@ Post.objects.with_actor(SubjectRef.of("auth/apikey", apikey.public_id))
 Post.objects.with_actor(my_apikey_instance)
 ```
 
-Inside an MCP tool gated by `rebac_mcp_tool`, the canonical actor is an
-`agents/grant` resolved from the request context; the decorator opens
-`actor_context(actor)` around the body, so ORM work scopes to that grant
-automatically:
+Inside an MCP tool gated by `rebac_mcp_tool`, the actor comes from trusted
+request context or the configured resolver. It may be a user, grant or another
+canonical subject. The decorator opens `actor_context(actor)` around the body;
+the ORM uses that actor's declared permissions:
 
 ```python
 from rebac.mcp import rebac_mcp_tool
@@ -785,9 +787,9 @@ from rebac.mcp import rebac_mcp_tool
 @mcp.tool
 @rebac_mcp_tool(resource_type="blog/post", action="write", id_arg="post_id")
 async def edit_post(post_id: str, body: str, ctx: Context = CurrentContext()) -> dict:
-    post = await Post.objects.aget(pk=post_id)   # scoped to the resolved grant
+    post = await Post.objects.aget(pk=post_id)   # scoped to the resolved actor
     post.body = body
-    await post.asave()                           # re-checks `write` against the grant
+    await post.asave()                           # re-checks `write` against that actor
     return {"ok": True}
 ```
 

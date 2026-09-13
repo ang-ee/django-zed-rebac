@@ -71,6 +71,16 @@ class _VirtualEncodedIdentityDescriptor:
             return self
         return self.field.to_python(instance.pk)
 
+    def __set__(self, instance: models.Model, value: Any) -> None:
+        """Absorb Django's default/hydration assignment; the PK owns the value."""
+
+        instance.__dict__.pop(self.field.attname, None)
+
+    def __delete__(self, instance: models.Model) -> None:
+        """Discard stale shadow state without changing the underlying PK."""
+
+        instance.__dict__.pop(self.field.attname, None)
+
 
 class VirtualEncodedIdentityField(EncodedIntegerField):
     """A queryable public identity projected from the model's existing PK column."""

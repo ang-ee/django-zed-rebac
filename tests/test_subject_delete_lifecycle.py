@@ -7,9 +7,10 @@ import pytest
 from django.contrib.auth import get_user_model
 from django.contrib.auth.models import Group
 from django.db import models
+from django.test.utils import isolate_apps
 
-from rebac import RelationshipTuple, backend, sudo, write_relationships
-from rebac.actors import to_subject_ref
+from rebac import RelationshipTuple, backend, rebac_subject, sudo, write_relationships
+from rebac.actors import _subject_registry, to_subject_ref
 from rebac.backends import reset_backend
 from rebac.models import active_relationship_model
 from rebac.schema import parse_zed
@@ -116,3 +117,47 @@ def test_subject_cleanup_uses_signal_database_alias(settings) -> None:
     relationship_model.objects.using.assert_called_once_with("replica")
     relationship_model.objects.using.return_value.filter.return_value.delete.assert_called_once_with()
     invalidated.assert_called_once_with()
+
+
+@isolate_apps("tests")
+def test_unrelated_model_delete_skips_subject_resolution() -> None:
+    class Unrelated(models.Model):
+        class Meta:
+            app_label = "tests"
+
+    instance = Unrelated(pk=1)
+    with (
+        patch("rebac.signals.to_subject_ref") as resolve_subject,
+        patch("rebac.models.active_relationship_model") as relationship_model,
+    ):
+        _rebac_cascade_resource(sender=Unrelated, instance=instance)
+
+    resolve_subject.assert_not_called()
+    relationship_model.assert_not_called()
+
+
+@isolate_apps("tests")
+def test_registered_model_subject_delete_still_uses_canonical_resolver(settings) -> None:
+    settings.REBAC_LOCAL_BACKEND_STORAGE = "denormalized"
+
+    @rebac_subject(type="auth/device", id_attr="serial")
+    class Device(models.Model):
+        serial = models.CharField(max_length=32)
+
+        class Meta:
+            app_label = "tests"
+
+    instance = Device(pk=1, serial="sensor-1")
+    relationship_model = MagicMock()
+    try:
+        with (
+            patch("rebac.signals.to_subject_ref", wraps=to_subject_ref) as resolve_subject,
+            patch("rebac.models.active_relationship_model", return_value=relationship_model),
+            patch("rebac.backends.local.mark_relationships_changed"),
+        ):
+            _rebac_cascade_resource(sender=Device, instance=instance)
+    finally:
+        _subject_registry.pop(Device, None)
+
+    resolve_subject.assert_called_once_with(instance)
+    relationship_model.objects.using.return_value.filter.return_value.delete.assert_called_once_with()

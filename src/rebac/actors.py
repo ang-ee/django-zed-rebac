@@ -133,6 +133,22 @@ _subject_registry: dict[type, tuple[str, str]] = {}
 """Mapping `cls -> (rebac_type, id_attr)` populated by `@rebac_subject`."""
 
 
+def model_can_resolve_subject(model_cls: type[Any]) -> bool:
+    """Whether instances of ``model_cls`` can use the canonical subject resolver.
+
+    This is the non-raising class-level preflight for global lifecycle hooks.
+    It deliberately shares the resolver's owning metadata instead of trying to
+    resolve an instance or maintaining a second registry.
+    """
+    from django.contrib.auth.models import Group
+
+    if model_resource_type(model_cls):
+        return True
+    if issubclass(model_cls, (get_user_model(), Group)):
+        return True
+    return any(issubclass(model_cls, registered) for registered in _subject_registry)
+
+
 def rebac_subject(*, type: str, id_attr: str = "pk") -> Callable[[type], type]:
     """Decorator: register a class as a subject type.
 
@@ -234,14 +250,13 @@ def to_subject_ref(actor: ActorLike) -> SubjectRef:
 def grant_subject_ref(agent: Any, on_behalf_of: Any | None) -> SubjectRef:
     """Build a Grant subject for `agent` acting on behalf of `on_behalf_of`.
 
-    The resolution requires the consumer to have registered both an `agents/agent`
-    and `agents/grant` subject type via `@rebac_subject`. The plugin itself doesn't
-    ship those types — they live in the consumer's `agents` app. We synthesise
-    a deterministic grant id from the (agent_id, user_id) pair.
+    Resolve the agent and user through ``to_subject_ref`` and construct a
+    deterministic ``agents/grant:<user-id>.<agent-id>#valid`` subject. The
+    application owns the compatible ``valid`` relation and grant relationships;
+    this helper neither registers a grant type nor creates its permissions.
 
-    For systems where grants live in the DB, override
-    `REBAC_ACTOR_RESOLVER` to translate (request, agent, user) into the
-    persisted grant id.
+    For persisted grants, configure ``REBAC_ACTOR_RESOLVER`` to resolve trusted
+    request context to the grant's canonical ``SubjectRef``.
     """
     agent_ref = to_subject_ref(agent)
     if on_behalf_of is None:

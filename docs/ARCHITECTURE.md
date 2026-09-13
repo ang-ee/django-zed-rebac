@@ -27,9 +27,9 @@ Core capabilities:
 - **One unified check API:** `check_access(op)` / `has_access(op)` / `accessible(op)` (borrowed from Odoo 18's PR #179148 unification). No model-level vs record-level split at the call site.
 - **`Model.objects.with_actor(actor)` / `instance.sudo(reason=...)`** — distinct verbs for distinct intents. The actor is any `SubjectRef` — a Django `User`, a registered `Agent`, an `agents/grant` (agent-acting-on-behalf-of-user), an `auth/apikey`, or any `@rebac_subject`-registered object. `as_user(u)` and `as_agent(agent, on_behalf_of=u)` are typed shorthands. Mandatory `reason` on bypass, originating uid preserved through bypass for audit (Odoo `env.su` / `env.user` independence).
 
-Subject types named `auth/<x>` (`auth/user`, `auth/group`) are emitted by the plugin because they map onto `django.contrib.auth.User` / `Group`. Everything else — `auth/apikey`, `agents/agent`, `agents/grant`, custom service-account types, etc. — lives in the consumer's own apps (`auth/apikey` in your auth-extension app; `agents/agent` and `agents/grant` in an `agents` app you control). The plugin ships no `Agent` / `Grant` / `Service` schema fragment.
+The plugin maps Django User/Group objects onto configured subject types, defaulting to `auth/user` and `auth/group`. Applications declare every subject definition their relations reference; automatic base-schema emission is not implemented. Agent, grant, API-key and service-account definitions likewise belong to consumer apps.
 - **Strict-by-default**: a queryset that escapes its actor scope raises `MissingActorError` rather than silently returning all rows.
-- **Designed-for-AI-agents**: the canonical Authzed *Grant* pattern is supported out of the box. The agent's effective permission on any resource is the structural intersection of (a) the user's grants, (b) the agent's declared capabilities — enforced by the schema graph, not by app-layer ANDs.
+- **Consumer-defined agent delegation:** applications can express delegation and capability conditions through grant objects, relations and permission intersections. The engine evaluates the declared graph; resolving a grant subject neither creates its relationships nor inherits the user's permissions.
 
 What `django-zed-rebac` deliberately does **not** ship: a `User` model, auth providers, login UI, session handling, GraphQL admin endpoints. Those are orthogonal — use `django.contrib.auth` (default) or any of `django-allauth` / `dj-rest-auth` / your own. Downstream frameworks may layer on top to provide polymorphic Subject types (`auth/apikey`, `agents/agent`, `agents/grant`, …), GraphQL admin surfaces, and Grant-pattern wiring; nothing here is coupled to any specific framework.
 
@@ -1216,6 +1216,9 @@ multi-table parent-link primary keys, and relation `attname` attributes expose
 their stored values. Relation descriptors returning model objects are rejected.
 The relation's underlying target field owns column conversion; a parent-link
 primary key needs no consumer-specific identity override.
+Model identity resolution rejects `None` and empty strings before constructing
+an object reference. Empty IDs used for pre-save create checks are explicit
+model-level sentinels, not the identities of saved rows.
 `REBAC_TYPE_PREFIX` applies when model metadata, configured
 User/Group/anonymous types, or decorators generate identity. Already canonical
 `ObjectRef` and `SubjectRef` values retain their wire types unchanged.
@@ -1352,14 +1355,14 @@ The three actor verbs are sugar over the same primitive:
 |---|---|---|
 | `with_actor(actor)` | Resolves `actor` to a `SubjectRef` and pins it on the queryset clone. | The default. Works for any subject type. |
 | `as_user(user)` | Equivalent to `with_actor(to_subject_ref(user))` for a Django `User`. | The HTTP request path: `Post.objects.as_user(request.user)`. |
-| `as_agent(agent, on_behalf_of=u)` | Equivalent to `with_actor(grant_subject_ref(agent, u))` — resolves to an `agents/grant:<id>#valid` subject. | Agent runtimes and MCP servers where a Grant is the canonical actor. |
+| `as_agent(agent, on_behalf_of=u)` | Equivalent to `with_actor(grant_subject_ref(agent, u))` — constructs the conventional `agents/grant:<id>#valid` subject. The application must declare `valid` as a relation and provide its relationships. | Applications whose delegation schema uses this subject convention. |
 | `with_action(action)` | Pins the permission used for read-side queryset scoping instead of `read` / `Meta.rebac_default_action`. | Alternate read views such as `credential_lookup`, `list_admin`, or capability-specific resolver scopes. |
 | `on_field_deny(mode)` | Pins the field-read deny mode for `read__<field>` gates instead of the global setting. | Projection-sensitive paths that want `"omit"` while the global default stays `"allow"` or `"redact"`. |
 | `for_write()` | `on_field_deny("allow")` named for intent: keeps actor row scope but turns off `read__<field>` redaction so a load-then-mutate target carries every column. | Resolving an update/delete target while `REBAC_FIELD_READ_MODE` is `"redact"`/`"omit"`, where a redacted column must not be hidden from the row being written. |
 | `rebac_select_related(*fields)` | Applies Django `select_related` and batch-checks selected REBAC-bound related rows before serialization. | To-one relation optimization when an unreadable related object should fail the field/query instead of leaking. |
 | `rebac_prefetch_related(*lookups)` | Applies Django `prefetch_related`, rewriting bare protected lookups to `Prefetch(queryset=Related.objects.with_actor(actor))`. | Reverse, M2M, and to-many loading where protected children should be scoped rather than loaded via `_base_manager`. |
 
-`as_agent(agent)` without `on_behalf_of` resolves to a bare `agents/agent:<id>` subject (the agent acting standalone, with only its declared capabilities — no user grants). Use this only for system-initiated agent runs; for end-user-driven agent runs always pass `on_behalf_of=user`. The `agents/agent` and `agents/grant` definitions are NOT auto-emitted — they live in the consumer's own `agents` app, which references this plugin's `auth/user`.
+`as_agent(agent)` without `on_behalf_of` uses `to_subject_ref(agent)` unchanged. Its resource type and grants come from the consumer's identity and schema declarations. Passing `on_behalf_of=user` constructs a deterministic grant subject; it does not create a grant, intersect permissions or impersonate the user. Applications that use a different grant identity pass their own subject through `with_actor`.
 
 `rebac_select_related()` preserves Django's to-one join optimization, then
 checks every selected REBAC-bound related object in batches. If the actor cannot

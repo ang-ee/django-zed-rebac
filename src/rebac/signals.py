@@ -11,7 +11,7 @@ from django.dispatch import receiver
 
 from ._id import resource_id_attr
 from .actors import current_actor as _current_actor
-from .actors import to_subject_ref
+from .actors import model_can_resolve_subject, to_subject_ref
 from .conf import app_settings
 from .errors import NoActorResolvedError, PermissionDenied
 from .field_visibility import backend_schema
@@ -417,18 +417,19 @@ def _rebac_cascade_resource(
 ) -> None:
     """Remove every relationship occurrence of a deleted model identity.
 
-    Listens on every model's ``post_delete``; short-circuits in O(1) when
-    neither the resource nor actor resolver owns an identity for it. This
-    includes configured Django User/Group subjects as well as RebacMixin
-    resources and model-owned subjects.
+    Listens on every model's ``post_delete`` and uses class metadata to skip
+    rows for which neither the resource nor actor resolver owns an identity.
+    This includes configured Django User/Group subjects as well as RebacMixin
+    resources and model-owned or explicitly registered subjects.
     """
     identities: set[ObjectRef] = set()
     if isinstance(instance, RebacMixin) and model_resource_type(sender):
         identities.add(to_object_ref(instance))
-    try:
-        identities.add(to_subject_ref(instance).object)
-    except NoActorResolvedError:
-        pass
+    if model_can_resolve_subject(sender):
+        try:
+            identities.add(to_subject_ref(instance).object)
+        except NoActorResolvedError:
+            pass
     if not identities:
         return
     from .backends.local import mark_relationships_changed

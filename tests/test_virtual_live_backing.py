@@ -179,8 +179,8 @@ def test_virtual_scope_keeps_union_intersection_exclusion_and_revocation_lazy(ac
     pending = VirtualPost.objects.with_actor(alice).order_by("pk")
     with sudo(reason="revoke virtual roster fixture"):
         roster.delete()
-    assert list(pending.values_list("pk", flat=True)) == [manual.pk]
-    assert list(eager.values_list("pk", flat=True)) == [manual.pk]
+    assert set(pending.values_list("pk", flat=True)) == {both.pk, manual.pk}
+    assert set(eager.values_list("pk", flat=True)) == {both.pk, manual.pk}
     assert active.has_access(
         subject=to_subject_ref(bob), action="read", resource=to_object_ref(manual)
     )
