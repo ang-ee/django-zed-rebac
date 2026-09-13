@@ -179,9 +179,25 @@ the same relation retain stored tuples. Tuple writes/deletes against the live
 container are rejected. The subject column is the writer; no reconciliation
 command is needed. Attribute filters apply to the subject model.
 
+Two rules keep every read path in agreement. A dynamic container is named by
+the column value's canonical Python spelling only (`"1"` is integer container
+`1`; `"01"` is nothing). Text attribute columns need a deterministic,
+case-sensitive collation, because the lazy queryset scope compares them in SQL
+while direct checks compare exact strings; see ARCHITECTURE.md § Field-backed
+structural relations.
+
+**Anti-pattern:** do not derive ownership from an audit column such as
+`created_by` (`relation owner: auth/user // rebac:attribute={"field":"created_by"}`).
+Ownership must be transferable and revocable independently of who wrote the
+row; keep it an explicit `owner` tuple (see ARCHITECTURE.md § No implicit
+"owner from `create_uid`"). Attribute backing is for genuine membership
+attributes such as a kind, plan or role flag.
+
 Live ORM backing is implemented by `LocalBackend` in either storage mode.
 Exporting valid Zed does not project the derived edges into remote SpiceDB;
-that adapter remains future work.
+until the roadmap projector ships, every backed relation holds no edges under
+`REBAC_BACKEND = "spicedb"` (ARCHITECTURE.md lists the projection burden per
+backing kind).
 
 A relation can instead be declared **const-backed** — resolving to one fixed
 object id for *every* row of the declaring type, with no stored tuple and no
@@ -841,7 +857,11 @@ For projects where one Django DB serves multiple tenants, set `REBAC_TYPE_PREFIX
 REBAC_TYPE_PREFIX = "tenant_acme/"
 ```
 
-Every resource type emitted becomes `tenant_acme/blog/post`. Relationships from one tenant cannot be referenced by another.
+Every generated identity carries the prefix: model resource types become
+`tenant_acme/blog/post`, and the configured user, group and anonymous subject
+types plus `@rebac_subject` types become `tenant_acme/auth/user`,
+`tenant_acme/auth/group`, and so on. Declare the prefixed types in the tenant
+schema. Relationships from one tenant cannot be referenced by another.
 
 For hard-tenant isolation (separate databases or schemas), use `django-tenants` and let each tenant own its own `Relationship` table — no schema changes needed.
 

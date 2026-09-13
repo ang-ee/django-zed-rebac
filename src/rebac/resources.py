@@ -6,7 +6,8 @@ import builtins
 from collections.abc import Callable
 from typing import Any
 
-from ._id import resource_id_attr, type_with_prefix
+from ._id import resource_id_attr, subject_id_attr, type_with_prefix
+from .conf import app_settings
 from .types import ObjectRef
 
 
@@ -41,6 +42,31 @@ def model_for_resource_type(resource_type: str) -> Any | None:
     for model in apps.get_models():
         if model_resource_type(model) == resource_type:
             return model
+    return None
+
+
+def model_for_subject_type(subject_type: str) -> tuple[Any, str] | None:
+    """Return ``(model, id_attr)`` for a subject type that maps onto a Django model.
+
+    Inverse of :func:`rebac.actors.to_subject_ref` for model-backed subjects,
+    with the same precedence: a loaded model declaring ``subject_type`` as its
+    ``Meta.rebac_resource_type`` wins (its object identity is its subject
+    identity); the configured ``REBAC_USER_TYPE`` / ``REBAC_GROUP_TYPE`` then
+    map onto Django's user model and contrib ``Group`` with the actor-side id
+    attribute. ``None`` when nothing maps.
+    """
+    model = model_for_resource_type(subject_type)
+    if model is not None:
+        return model, resource_id_attr(model)
+    if subject_type == type_with_prefix(app_settings.REBAC_USER_TYPE):
+        from django.contrib.auth import get_user_model
+
+        user_model = get_user_model()
+        return user_model, subject_id_attr(user_model)
+    if subject_type == type_with_prefix(app_settings.REBAC_GROUP_TYPE):
+        from django.contrib.auth.models import Group
+
+        return Group, subject_id_attr(Group)
     return None
 
 

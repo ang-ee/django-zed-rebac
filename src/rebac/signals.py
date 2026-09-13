@@ -5,7 +5,6 @@ from __future__ import annotations
 from collections.abc import Iterable
 from typing import Any
 
-from django.db import transaction
 from django.db.models import Model, Q
 from django.db.models.signals import post_delete, post_save, pre_delete, pre_save
 from django.dispatch import receiver
@@ -406,7 +405,8 @@ def _rebac_override_post_delete(sender: type[Model], instance: Any, **_: Any) ->
 # by deleting its ``RebacResource`` row and relying on both FK cascades.
 #
 # Denormalized storage has no foreign keys, so this handler deletes both
-# resource-side and subject-side occurrences explicitly.
+# resource-side and subject-side occurrences explicitly. Both paths run on the
+# deleting instance's database alias inside Django's own delete transaction.
 
 
 @receiver(post_delete)
@@ -426,25 +426,23 @@ def _rebac_cascade_resource(
     if not rebac_type:
         return
     resource_id = str(getattr(instance, resource_id_attr(sender)))
-    from .backends.local import _advance_relationship_generation
+    from .backends.local import mark_relationships_changed
 
+    # ``post_delete`` fires inside the deleting Collector's atomic block on
+    # ``using``; the queryset deletes below join that transaction.
     if app_settings.REBAC_LOCAL_BACKEND_STORAGE == "registry":
         from .models import RebacResource
 
-        with transaction.atomic(using=using):
-            RebacResource.objects.using(using).filter(
-                resource_type=rebac_type,
-                resource_id=resource_id,
-            ).delete()
-        _advance_relationship_generation()
-        return
+        RebacResource.objects.using(using).filter(
+            resource_type=rebac_type,
+            resource_id=resource_id,
+        ).delete()
+    else:
+        from .models import active_relationship_model
 
-    from .models import active_relationship_model
-
-    relationship_model = active_relationship_model()
-    with transaction.atomic(using=using):
-        relationship_model.objects.using(using).filter(
+        active_relationship_model().objects.using(using).filter(
             Q(resource_type=rebac_type, resource_id=resource_id)
             | Q(subject_type=rebac_type, subject_id=resource_id)
         ).delete()
-    _advance_relationship_generation()
+    # The rows changed outside the backend's own write path; drop decisions.
+    mark_relationships_changed()

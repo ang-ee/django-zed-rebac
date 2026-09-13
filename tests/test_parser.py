@@ -105,7 +105,7 @@ def test_relation_comment_directive_lifts_field_binding():
     )
 
     folder = next(r for r in _relations(schema, "blog/post") if r.name == "folder")
-    assert folder.backing == FieldBinding(attname="folder")
+    assert folder.backing == FieldBinding(path="folder")
 
 
 @pytest.mark.parametrize(

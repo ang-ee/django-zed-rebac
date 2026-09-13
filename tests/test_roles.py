@@ -465,3 +465,31 @@ def test_roles_helpers_work_without_an_ambient_actor():
     assert {(r.resource_type, r.resource_id) for r in roles_of(actor)} == {
         ("storage/role", "object_editor"),
     }
+
+
+@pytest.mark.django_db
+@pytest.mark.parametrize("storage", ["denormalized", "registry"])
+def test_roles_of_filters_role_containers_in_sql(settings, storage):
+    from django.db import connection
+    from django.test.utils import CaptureQueriesContext
+
+    from rebac.memberships import grant as grant_membership
+
+    settings.REBAC_LOCAL_BACKEND_STORAGE = storage
+    reset_backend()
+    backend().set_schema(
+        parse_zed(ROLE_SCHEMA_TEXT + "definition auth/team {\n relation member: auth/user\n}\n")
+    )
+    actor = SubjectRef.of("auth/user", "42")
+    grant(actor=actor, role="storage/role:object_viewer")
+    # A non-role container with a ``member`` tuple: the membership predicate
+    # alone would keep it, so only the SQL-side type filter can exclude it.
+    grant_membership(subject=actor, container=ObjectRef("auth/team", "core"))
+
+    with CaptureQueriesContext(connection) as captured:
+        roles = list(roles_of(actor))
+
+    assert roles == [ObjectRef("storage/role", "object_viewer")]
+    assert len(captured) == 1
+    sql = captured[0]["sql"]
+    assert "LIKE" in sql.upper() and "/role" in sql

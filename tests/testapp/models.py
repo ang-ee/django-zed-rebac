@@ -7,11 +7,12 @@ from django.db import models
 
 from rebac import RebacMixin
 
-from .fields import EncodedIntegerField
+from .fields import EncodedIntegerField, LowercaseCharField
 
 
 class Folder(RebacMixin, models.Model):
     name = models.CharField(max_length=100)
+    kind = LowercaseCharField(max_length=32, blank=True, default="")
     parent = models.ForeignKey(
         "self", null=True, blank=True, on_delete=models.CASCADE, related_name="children"
     )

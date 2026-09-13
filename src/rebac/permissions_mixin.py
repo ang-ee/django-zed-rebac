@@ -135,10 +135,13 @@ class RebacPermissionsMixin(models.Model):
     with :class:`rebac.backends.auth.RebacBackend` to route
     permission checks through the REBAC engine.
 
-    Active superusers always pass; the ``REBAC_SUPERUSER_BYPASS``
-    setting is honoured by the auth backend itself, so a project that
-    flips the setting off can still keep this mixin — the engine
-    simply receives the call and answers per relationship rows.
+    The mixin adds no unconditional superuser bypass: every call walks the
+    configured backend chain. Superuser policy is owned by
+    :class:`rebac.backends.auth.RebacBackend` (``REBAC_SUPERUSER_BYPASS``),
+    the permission-level surface of the two-surface carve-out described in
+    ``docs/ARCHITECTURE.md``; the other is ``ActorMiddleware``. A project
+    that uses this mixin without ``RebacBackend`` in
+    ``AUTHENTICATION_BACKENDS`` gets whatever its remaining backends answer.
     """
 
     is_superuser = models.BooleanField(

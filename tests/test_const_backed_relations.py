@@ -80,7 +80,7 @@ def test_const_directive_parses_to_const_binding():
     definition = parse_zed(SCHEMA_TEXT).get_definition("blog/post")
     assert definition is not None
     admin = next(r for r in definition.relations if r.name == "admin")
-    assert admin.backing == ConstBinding(target_id="admin", kind="const")
+    assert admin.backing == ConstBinding(target_id="admin")
 
 
 def test_const_arrow_grants_every_row_from_one_membership_without_tuples(backend, posts):

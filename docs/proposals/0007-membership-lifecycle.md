@@ -17,8 +17,9 @@ by `RebacBackend`, defeating `REBAC_SUPERUSER_BYPASS=False`.
 direct enumeration. It delegates persistence to the existing relationship API
 and creates no catalogue or membership store. Caveated revocation identifies
 the exact tuple by caveat name; it never broad-deletes other memberships between
-the same subject and container. `rebac.roles` retains its historical API as a
-narrow compatibility layer and continues to own role parsing and hierarchy.
+the same subject and container. `rebac.roles` is a first-class public API that
+composes `rebac.memberships` and continues to own role-spec parsing and
+hierarchy; it is not a deprecated shim.
 
 Deleting a registered Django resource removes every tuple in which its object
 reference appears, as resource or subject. Registry storage keeps using its

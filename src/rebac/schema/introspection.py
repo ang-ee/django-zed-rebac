@@ -15,6 +15,7 @@ from .ast import (
     AttributeBinding,
     ConstBinding,
     Definition,
+    FieldBinding,
     PermArrow,
     PermBinOp,
     PermExpr,
@@ -200,17 +201,21 @@ def named_object_refs(schema: Schema, *, object_type: str | None = None) -> froz
             if isinstance(relation.backing, AttributeBinding) and relation.backing.resource:
                 if object_type is None or definition.resource_type == object_type:
                     refs.add(ObjectRef(definition.resource_type, relation.backing.resource))
-            const_id = relation.backing.target_id if isinstance(relation.backing, ConstBinding) else ""
+            const_id = (
+                relation.backing.target_id if isinstance(relation.backing, ConstBinding) else ""
+            )
             for allowed in relation.allowed_subjects:
                 object_id = const_id or allowed.id
-                if object_id and not allowed.wildcard and (object_type is None or allowed.type == object_type):
+                if (
+                    object_id
+                    and not allowed.wildcard
+                    and (object_type is None or allowed.type == object_type)
+                ):
                     refs.add(ObjectRef(allowed.type, object_id))
     return frozenset(refs)
 
 
-def relation_is_writable(
-    schema: Schema, *, resource: ObjectRef, relation: str
-) -> bool:
+def relation_is_writable(schema: Schema, *, resource: ObjectRef, relation: str) -> bool:
     """Return whether a declared relation accepts tuples for this object."""
 
     definition = schema.get_definition(resource.resource_type)
@@ -218,6 +223,42 @@ def relation_is_writable(
         return False
     declared = find_relation(definition, relation)
     return declared is not None and not declared.has_backing(resource.resource_id)
+
+
+def live_backed_resource_types(schema: Schema) -> frozenset[str]:
+    """Resource types whose permission evaluation may read live ORM backing.
+
+    A type is live when one of its relations is field- or attribute-backed, or
+    when one of its relations admits an allowed subject whose type is live
+    (fixed point). Allowed-subject types cover every way evaluation crosses a
+    definition boundary — arrows (``via->perm`` walks ``via``'s subject types),
+    subject sets (``group#member``) and const targets — so the result is a
+    conservative over-approximation: it may name a type that never actually
+    reaches a backing, but never omits one that can. Const backings are
+    static and are not live seeds on their own.
+    """
+    live = {
+        definition.resource_type
+        for definition in schema.definitions
+        if any(
+            isinstance(relation.backing, (FieldBinding, AttributeBinding))
+            for relation in definition.relations
+        )
+    }
+    changed = bool(live)
+    while changed:
+        changed = False
+        for definition in schema.definitions:
+            if definition.resource_type in live:
+                continue
+            if any(
+                allowed.type in live
+                for relation in definition.relations
+                for allowed in relation.allowed_subjects
+            ):
+                live.add(definition.resource_type)
+                changed = True
+    return frozenset(live)
 
 
 def _collect_sources(
@@ -281,6 +322,7 @@ def _collect_sources(
 
 __all__ = [
     "PermissionSources",
+    "live_backed_resource_types",
     "named_object_refs",
     "permission_object_sources",
     "permission_sources",

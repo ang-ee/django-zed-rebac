@@ -67,8 +67,16 @@ raise `SchemaError`; the Django relation or attribute is the only writer.
 
 This proposal implements live resolution for `LocalBackend`. The directive is
 preserved in local schema serialization and omitted from SpiceDB schema text.
-Remote SpiceDB projection remains a separate future capability, matching the
-existing forward-field backing limit.
+Remote SpiceDB projection remains a separate future capability, and its burden
+is larger than the forward-FK case: a filtered or set-valued path projects one
+edge per distinct `(source, target)` pair whose through rows satisfy the
+filters; a dynamic attribute container projects one edge per qualifying subject
+row into the container named by its column value; a fixed container projects
+one edge per subject whose column matches the declared value. ARCHITECTURE.md
+carries the consolidated per-kind table.
+
+Decision caching is declined only for resource types that can reach a live
+backing (conservative schema reachability), so unrelated types keep caching.
 
 ## Compatibility
 

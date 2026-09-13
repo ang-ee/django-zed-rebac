@@ -12,11 +12,7 @@ from .resources import to_object_ref
 from .types import ObjectRef, RelationshipTuple, SubjectRef
 
 if TYPE_CHECKING:
-    from .models import Relationship, RelationshipRegistry
-
-    RelationshipRow = Relationship | RelationshipRegistry
-else:  # pragma: no cover
-    RelationshipRow = Any
+    from .models import RelationshipRow
 
 MEMBER_RELATION = "member"
 
@@ -111,8 +107,14 @@ def members_of(container: Any) -> Iterator[SubjectRef]:
         yield SubjectRef.of(row.subject_type, row.subject_id, row.optional_subject_relation)
 
 
-def containers_of(subject: ActorLike) -> Iterator[ObjectRef]:
-    """Yield containers in which ``subject`` has direct membership."""
+def containers_of(subject: ActorLike, **container_lookups: Any) -> Iterator[ObjectRef]:
+    """Yield containers in which ``subject`` has direct membership.
+
+    ``container_lookups`` are Django lookups on the container side of the
+    relationship row (``resource_type`` / ``resource_id``, with any lookup
+    suffix), applied in SQL on top of the fixed subject and ``member``
+    predicates — for example ``resource_type__endswith="/role"``.
+    """
     from .models import active_relationship_model
 
     subject_ref = to_subject_ref(subject)
@@ -122,6 +124,8 @@ def containers_of(subject: ActorLike) -> Iterator[ObjectRef]:
         subject_id=subject_ref.subject_id,
         optional_subject_relation=subject_ref.optional_relation,
     )
+    if container_lookups:
+        rows = rows.filter(**container_lookups)
     for row in rows:
         yield ObjectRef(row.resource_type, row.resource_id)
 

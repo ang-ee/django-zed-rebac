@@ -16,7 +16,7 @@ import math
 import re
 from collections.abc import Sequence
 from dataclasses import dataclass, field
-from typing import Any, cast
+from typing import Any, TypeGuard, cast
 
 BUILTIN_ACTOR_TYPES = frozenset({"anonymous", "authenticated"})
 
@@ -52,10 +52,14 @@ class AllowedSubject:
 
 @dataclass(frozen=True, slots=True)
 class FieldBinding:
-    """A Django relation path with source-model predicates."""
+    """A Django relation path with source-model predicates.
 
-    attname: str
-    kind: str = "fk"
+    ``path`` is a Django lookup path from the declaring model to the single
+    allowed subject model (``folder``, ``roster__user``); ``filters`` are
+    source-model lookups applied in the same join.
+    """
+
+    path: str
     filters: tuple[tuple[str, Any], ...] = ()
 
 
@@ -71,7 +75,6 @@ class AttributeBinding:
     resource: str | None = None
     value: Any = None
     filters: tuple[tuple[str, Any], ...] = ()
-    kind: str = "attribute"
 
 
 @dataclass(frozen=True, slots=True)
@@ -84,13 +87,9 @@ class ConstBinding:
     It is the schema-level "static relationship" SpiceDB never shipped (issue
     #346 / #1266); the local backend synthesises the edge at evaluation time, so
     a tuple-only backend would have to materialise it instead.
-
-    Mirrors :class:`FieldBinding`'s ``kind`` discriminator so ``Relation.backing``
-    stays one switchable slot.
     """
 
     target_id: str
-    kind: str = "const"
 
 
 @dataclass(frozen=True, slots=True)
@@ -119,15 +118,23 @@ class Relation:
         return True
 
 
+def _is_lookup_path(value: object) -> TypeGuard[str]:
+    """Whether ``value`` is a Django lookup path: identifier segments joined by ``__``.
+
+    Segments follow Python's identifier rule (Django field names are Python
+    identifiers, Unicode included); an empty segment (``a____b``) is rejected
+    because Django would raise ``FieldError`` on it.
+    """
+    return isinstance(value, str) and all(part.isidentifier() for part in value.split("__"))
+
+
 def _binding_filters(value: Any) -> tuple[tuple[str, Any], ...]:
     """Validate immutable, deterministic scalar ORM predicates."""
 
     if not isinstance(value, dict):
         raise ValueError("backing filters must be a JSON object")
     for key, item in value.items():
-        if not isinstance(key, str) or not re.fullmatch(
-            r"[A-Za-z_][A-Za-z0-9_]*(?:__[A-Za-z_][A-Za-z0-9_]*)*", key
-        ):
+        if not _is_lookup_path(key):
             raise ValueError("backing filters require ORM lookup names")
         if item is not None and not isinstance(item, (str, int, float, bool)):
             raise ValueError("backing filter values must be JSON scalars")
@@ -154,19 +161,17 @@ def backing_from_dict(
             raise ValueError("constant backing requires a concrete object ID")
         return ConstBinding(target_id=target)
     if kind == "fk":
-        if set(value) - {"kind", "attname", "filters"}:
+        if set(value) - {"kind", "path", "filters"}:
             raise ValueError("unknown field backing fields")
-        path = value.get("attname")
-        if not isinstance(path, str) or not re.fullmatch(
-            r"[A-Za-z_][A-Za-z0-9_]*(?:__[A-Za-z_][A-Za-z0-9_]*)*", path
-        ):
+        path = value.get("path")
+        if not _is_lookup_path(path):
             raise ValueError("field backing requires a Django relation path")
-        return FieldBinding(attname=path, filters=_binding_filters(value.get("filters", {})))
+        return FieldBinding(path=path, filters=_binding_filters(value.get("filters", {})))
     if kind == "attribute":
         if set(value) - {"kind", "field", "resource", "value", "filters"}:
             raise ValueError("unknown attribute backing fields")
         name = value.get("field")
-        if not isinstance(name, str) or not re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", name):
+        if not isinstance(name, str) or not name.isidentifier():
             raise ValueError("attribute backing requires a scalar field name")
         if ("resource" in value) != ("value" in value):
             raise ValueError("attribute backing resource and value must appear together")
@@ -178,8 +183,10 @@ def backing_from_dict(
                 raise ValueError("attribute backing requires a concrete resource ID")
             _binding_filters({"value": value["value"]})
         return AttributeBinding(
-            field=name, resource=cast(str | None, resource),
-            value=value.get("value"), filters=_binding_filters(value.get("filters", {}))
+            field=name,
+            resource=cast(str | None, resource),
+            value=value.get("value"),
+            filters=_binding_filters(value.get("filters", {})),
         )
     raise ValueError(f"unsupported relation backing kind {kind!r}")
 
@@ -187,14 +194,18 @@ def backing_from_dict(
 def backing_to_dict(
     backing: FieldBinding | ConstBinding | AttributeBinding | None,
 ) -> dict[str, Any] | None:
-    """Encode one backing without losing filters, fixed IDs, or false/null values."""
+    """Encode one backing without losing filters, fixed IDs, or false/null values.
+
+    The ``kind`` key is the persisted discriminator; the AST discriminates by
+    class. Consumers of ``SchemaRelation.backing`` read this shape.
+    """
 
     if backing is None:
         return None
     if isinstance(backing, ConstBinding):
         return {"kind": "const", "target_id": backing.target_id}
     if isinstance(backing, FieldBinding):
-        result: dict[str, Any] = {"kind": "fk", "attname": backing.attname}
+        result: dict[str, Any] = {"kind": "fk", "path": backing.path}
     elif isinstance(backing, AttributeBinding):
         result = {"kind": "attribute", "field": backing.field}
         if backing.resource is not None:

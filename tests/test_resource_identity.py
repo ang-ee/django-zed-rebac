@@ -46,10 +46,10 @@ def test_model_refs_managers_and_signals_share_prefixed_type_policy() -> None:
     backend().set_schema(
         parse_zed(
             """
-            definition auth/user {}
+            definition tenantA/auth/user {}
 
             definition tenantA/blog/sluggedpost {
-                relation owner: auth/user
+                relation owner: tenantA/auth/user
                 permission read = owner
                 permission write = owner
                 permission delete = owner
@@ -58,7 +58,9 @@ def test_model_refs_managers_and_signals_share_prefixed_type_policy() -> None:
         )
     )
     user = get_user_model().objects.create(username="alice", is_active=True)
-    subject = SubjectRef.of("auth/user", str(user.pk))
+    # Configured User/Group types follow the prefix like every generated identity.
+    subject = SubjectRef.of("tenantA/auth/user", str(user.pk))
+    assert to_subject_ref(user) == subject
 
     with sudo(reason="test.fixture"):
         post = SluggedPost.objects.create(slug="prefixed", title="Hello")

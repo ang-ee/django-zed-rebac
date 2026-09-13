@@ -52,9 +52,9 @@ from ..field_backing import (
 )
 from ..resources import model_resource_type
 from ..schema.ast import (
-    AttributeBinding,
     BUILTIN_ACTOR_TYPES,
     AllowedSubject,
+    AttributeBinding,
     ConstBinding,
     Definition,
     FieldBinding,
@@ -163,6 +163,7 @@ class LocalBackend(Backend):
         self._schema_is_manual = False
         self._schema_generation = 0
         self._schema_invalidation_generation = 0
+        self._live_types: tuple[int, frozenset[str]] | None = None
         # Counter used as a stable monotonic xid on backends (e.g. SQLite test
         # mode) without `txid_current()`.
         self._xid_counter = 0
@@ -235,8 +236,18 @@ class LocalBackend(Backend):
                 snapshots[self] = snapshot
             return snapshot
 
-    def _cache_generation(self) -> tuple[int, int] | None:
-        """Return a decision generation, or bypass time/transaction-sensitive caching."""
+    def _cache_generation(self, resource_type: str) -> tuple[int, int] | None:
+        """Return a decision generation for ``resource_type``, or ``None`` to bypass caching.
+
+        Decisions are not cached inside a transaction (a rollback would leave
+        stale answers), when the schema declares expiring relationships (a
+        deadline can pass with no write), or when evaluating ``resource_type``
+        can read live ORM backing (``update()``, M2M and reverse writes never
+        advance the relationship generation). The live set is the conservative
+        reachability closure computed by
+        :func:`rebac.schema.introspection.live_backed_resource_types`, so
+        types that cannot reach a field or attribute backing keep caching.
+        """
         from django.db import connection
 
         if connection.in_atomic_block or (
@@ -245,20 +256,26 @@ class LocalBackend(Backend):
             return None
         snapshot = self._schema_snapshot()
         schema = snapshot.schema
-        if any(
-            isinstance(relation.backing, (FieldBinding, AttributeBinding))
-            for definition in schema.definitions
-            for relation in definition.relations
-        ):
-            # ORM-backed facts can change through update(), M2M, reverse
-            # relations, or another process without a Relationship generation
-            # bump. Never retain permission answers across those live reads.
+        if resource_type in self._live_types_for(snapshot):
             return None
         if any(relation.with_expiration for d in schema.definitions for relation in d.relations):
             # A relationship deadline can pass with no write or schema change.
             # Dependency-specific expiry tracking is not implemented yet.
             return None
         return snapshot.generation, _relationship_generation
+
+    def _live_types_for(self, snapshot: SchemaSnapshot) -> frozenset[str]:
+        """Resource types whose decisions may read live ORM backing, per schema generation."""
+        from ..schema.introspection import live_backed_resource_types
+
+        with self._schema_lock:
+            cached = self._live_types
+            if cached is not None and cached[0] == snapshot.generation:
+                return cached[1]
+        live = live_backed_resource_types(snapshot.schema)
+        with self._schema_lock:
+            self._live_types = (snapshot.generation, live)
+        return live
 
     def mark_schema_stale(self) -> None:
         """Drop a DB-loaded schema cache after Schema* row changes."""
@@ -604,30 +621,25 @@ class LocalBackend(Backend):
             if field_backing is not None:
                 if subject_type != field_backing.target_resource_type:
                     continue
-                values = field_backing.queryset(
-                    resource_id=resource.resource_id
-                ).values_list(field_backing.target_values_path(), flat=True)
+                values = field_backing.queryset(resource_id=resource.resource_id).values_list(
+                    field_backing.target_values_path(), flat=True
+                )
                 for value in values:
                     if value is not None:
                         synthetic_subjects.append(
                             SubjectRef.of(field_backing.target_resource_type, str(value))
                         )
                 continue
-            attribute_backing = self._resolve_declared_attribute_backing(
-                definition, relation_def
-            )
+            attribute_backing = self._resolve_declared_attribute_backing(definition, relation_def)
             if attribute_backing is not None:
                 if not attribute_backing.applies_to(resource.resource_id):
                     stored_relation_names.append(relation_name)
                     continue
                 if subject_type != attribute_backing.target_resource_type:
                     continue
-                values = attribute_backing.target_model._base_manager.filter(
-                    attribute_backing.subjects_filter(resource.resource_id)
-                ).values_list(attribute_backing.target_id_attr, flat=True).distinct()
                 synthetic_subjects.extend(
                     SubjectRef.of(attribute_backing.target_resource_type, str(value))
-                    for value in values
+                    for value in attribute_backing.subject_ids(resource.resource_id)
                     if value is not None
                 )
                 continue
@@ -703,7 +715,7 @@ class LocalBackend(Backend):
         # An empty batch returns a token for the current local clock.
         if max_xid == 0:
             return self._zookie()
-        _advance_relationship_generation()
+        mark_relationships_changed()
         return Zookie(self.kind, str(max_xid))
 
     @_schema_operation
@@ -737,7 +749,7 @@ class LocalBackend(Backend):
             if filter_.caveat_name:
                 qs = qs.filter(caveat_name=filter_.caveat_name)
             qs.delete()
-        _advance_relationship_generation()
+        mark_relationships_changed()
         return self._zookie()
 
     @_schema_operation
@@ -769,7 +781,7 @@ class LocalBackend(Backend):
                 optional_subject_relation=tuple_.subject.optional_relation,
                 caveat_name=tuple_.caveat_name,
             ).delete()
-        _advance_relationship_generation()
+        mark_relationships_changed()
         return self._zookie()
 
     # ---------- Internal evaluation ----------
@@ -858,9 +870,7 @@ class LocalBackend(Backend):
                 target=target,
                 depth=depth,
             )
-        attribute_backing = self._resolve_declared_attribute_backing(
-            definition, via_relation
-        )
+        attribute_backing = self._resolve_declared_attribute_backing(definition, via_relation)
         if attribute_backing is not None and attribute_backing.applies_to(resource_id):
             return self._walk_attribute_backed_arrow(
                 ctx=ctx,
@@ -957,16 +967,11 @@ class LocalBackend(Backend):
         target: str,
         depth: int,
     ) -> bool | None:
-        target_definition = ctx.schema.get_definition(
-            attribute_backing.target_resource_type
-        )
+        target_definition = ctx.schema.get_definition(attribute_backing.target_resource_type)
         if target_definition is None:
             return False
-        values = attribute_backing.target_model._base_manager.filter(
-            attribute_backing.subjects_filter(resource_id)
-        ).values_list(attribute_backing.target_id_attr, flat=True)
         saw_conditional = False
-        for target_id in values:
+        for target_id in attribute_backing.subject_ids(resource_id):
             if target_id is None:
                 continue
             verdict = self._eval_permission_on(
@@ -1134,6 +1139,8 @@ class LocalBackend(Backend):
             raise PermissionDepthExceeded(f"Depth limit {app_settings.REBAC_DEPTH_LIMIT} exceeded")
         if missing is None:
             missing = set()
+        from ..models import active_relationship_model
+
         definition = self.schema().get_definition(resource_type)
         if definition is None:
             return False
@@ -1145,19 +1152,13 @@ class LocalBackend(Backend):
         if field_backing is not None:
             if not _subject_allowed_by_relation(relation_def, subject):
                 return False
-            return field_backing.queryset(
-                resource_id=resource_id, subject=subject
-            ).exists()
+            return field_backing.queryset(resource_id=resource_id, subject=subject).exists()
 
-        attribute_backing = self._resolve_declared_attribute_backing(
-            definition, relation_def
-        )
+        attribute_backing = self._resolve_declared_attribute_backing(definition, relation_def)
         if attribute_backing is not None and attribute_backing.applies_to(resource_id):
             if not _subject_allowed_by_relation(relation_def, subject):
                 return False
-            return attribute_backing.target_model._base_manager.filter(
-                attribute_backing.target_filter(resource_id, subject)
-            ).exists()
+            return attribute_backing.has_subject(resource_id, subject)
 
         const_backing = self._resolve_declared_const_backing(definition, relation_def)
         if const_backing is not None:
@@ -1352,9 +1353,7 @@ class LocalBackend(Backend):
                     context=context,
                     using=using,
                 )
-            attribute_backing = self._resolve_declared_attribute_backing(
-                definition, via_rel
-            )
+            attribute_backing = self._resolve_declared_attribute_backing(definition, via_rel)
             if attribute_backing is not None:
                 target_definition = self.schema().get_definition(
                     attribute_backing.target_resource_type
@@ -1371,16 +1370,20 @@ class LocalBackend(Backend):
                     context,
                     using,
                 )
-                results = attribute_backing.resource_ids_for_targets(
-                    target_ids, using=using
-                )
+                results = attribute_backing.resource_ids_for_targets(target_ids, using=using)
                 if attribute_backing.resource is None:
                     return results
                 # The named anchor is derived; other resource ids still use
                 # ordinary stored arrows below.
                 stored_results = self._resources_via_stored_arrow(
-                    definition, via_rel, expr.target, subject, depth,
-                    cache, context, using,
+                    definition,
+                    via_rel,
+                    expr.target,
+                    subject,
+                    depth,
+                    cache,
+                    context,
+                    using,
                 )
                 stored_results.discard(attribute_backing.resource)
                 return results | stored_results
@@ -1578,9 +1581,7 @@ class LocalBackend(Backend):
                 for value in rows.values_list(field_backing.source_values_path(), flat=True)
             }
 
-        attribute_backing = self._resolve_declared_attribute_backing(
-            definition, relation_def
-        )
+        attribute_backing = self._resolve_declared_attribute_backing(definition, relation_def)
         if attribute_backing is not None:
             derived = attribute_backing.resource_ids_for_subject(subject, using=using)
             if attribute_backing.resource is None:
@@ -1663,9 +1664,7 @@ class LocalBackend(Backend):
             )
         model_hint = resource_type
         field_hint = (
-            relation.backing.attname
-            if isinstance(relation.backing, FieldBinding)
-            else relation.name
+            relation.backing.path if isinstance(relation.backing, FieldBinding) else relation.name
         )
         definition = self.schema().get_definition(resource_type)
         if definition is not None:
@@ -1821,8 +1820,14 @@ class LocalBackend(Backend):
             if target_definition is None:
                 continue
             target_ids = self._compute_accessible_for(
-                target_type, target, target_definition, subject,
-                depth + 1, cache, context, using,
+                target_type,
+                target,
+                target_definition,
+                subject,
+                depth + 1,
+                cache,
+                context,
+                using,
             )
             rows = self._maybe_using(RelationshipModel.objects, using).filter(
                 resource_type=definition.resource_type,
@@ -1862,8 +1867,14 @@ class LocalBackend(Backend):
 # ---------- Module-level helpers ----------
 
 
-def _advance_relationship_generation() -> None:
-    """Invalidate decisions across backend instances and nested evaluator scopes."""
+def mark_relationships_changed() -> None:
+    """Invalidate cached permission decisions after relationship rows changed.
+
+    Backend writes call this themselves. Lifecycle code that changes rows
+    outside ``write_relationships`` / ``delete_relationships`` (for example
+    the ``post_delete`` cascade) calls it so every local backend instance and
+    every evaluator scope in this process drops its decisions.
+    """
     global _relationship_generation
     with _backend_registry_lock:
         _relationship_generation += 1

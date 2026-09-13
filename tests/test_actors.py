@@ -53,9 +53,7 @@ def test_rebac_model_subject_identity_uses_object_metadata():
 
     subject = SubjectContainer(slug="reviewers", title="Reviewers")
 
-    assert to_subject_ref(subject) == SubjectRef.of(
-        "blog/subjectcontainer", "reviewers", "member"
-    )
+    assert to_subject_ref(subject) == SubjectRef.of("blog/subjectcontainer", "reviewers", "member")
 
 
 def test_unknown_actor_raises():

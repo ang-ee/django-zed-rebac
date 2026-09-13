@@ -9,24 +9,57 @@ pre-1.0; breaking changes within a minor version are explicitly called out.
 
 ### Added
 
-- Native `rebac.memberships` operations over any `member` container, with
-  exact caveat revocation and compatibility delegates from `rebac.roles`.
-- Model-owned default subject relations and canonical registered-model
-  identity, including field-backed lookup and configured type prefixes.
-- Live filtered ORM relation paths and scalar attribute-backed membership,
-  with shared parsing, persistence, direct evaluation and lazy SQL scoping.
-- Schema introspection of named object references without a second catalogue.
-- Native resource/subject tuple cleanup in both local storage modes and the
-  deleting model's database alias.
+- `rebac.memberships`: direct `member`-tuple grant, exact (caveat-aware)
+  revocation and enumeration for any container type; `containers_of` accepts
+  Django lookups on the container so callers filter in SQL. `rebac.roles`
+  composes it and keeps owning role-spec parsing and hierarchy.
+- Model-owned subject identity: a `RebacMixin` model converts to a `SubjectRef`
+  from its own `Meta.rebac_resource_type` / `rebac_id_attr`, optionally as a
+  subject set via `Meta.rebac_subject_relation` (`rebac.E011` checks it).
+  `rebac.resources.model_for_subject_type` is the single inverse mapping used
+  by field/attribute backing and `resolve_subjects`.
+- Live filtered ORM relation paths (`rebac:field={"path":...,"filters":...}`)
+  and scalar attribute-backed containers (`rebac:attribute=...`), with shared
+  parsing, persistence, direct evaluation, enumeration and lazy SQL scoping.
+- `rebac.schema.introspection.named_object_refs`, `relation_is_writable` and
+  `live_backed_resource_types`.
+- Migration `0004_field_backing_path`, which rewrites stored field backings to
+  the new `path` key (see Changed).
 
 ### Changed
 
-- `RebacPermissionsMixin` delegates Django permission checks to installed
-  backends without an unconditional superuser shortcut. Django backend
-  chaining still applies; login policy remains with the application.
-- Permission-named subject sets resolve through the permission evaluator.
-- Local decision caches are bypassed for live ORM-backed schemas so bulk
-  writes and membership changes take effect immediately.
+- **Stored field-backing key.** `SchemaRelation.backing` spells the Django
+  lookup path `path` instead of `attname` (`FieldBinding.path`). Run
+  `manage.py migrate` (migration 0004 rewrites existing rows), then an
+  ordinary `manage.py rebac sync`, which refreshes the provenance hash; admin
+  edits under `no_update` are still reported as drift. The loader accepts only
+  the new key.
+- **Type prefix applies to every generated identity.** With
+  `REBAC_TYPE_PREFIX` set, the configured user, group and anonymous subject
+  types and `@rebac_subject` types are prefixed like model resource types.
+  Prefixed deployments must declare the prefixed subject types in their
+  schema and migrate stored subject tuples (no automatic retyping).
+- **Decision-cache bypass is per resource type.** `LocalBackend` declines to
+  cache decisions only for resource types that can reach live field or
+  attribute backing (conservative schema reachability), instead of for the
+  whole schema; transaction and expiration bypasses are unchanged. The public
+  `mark_relationships_changed()` invalidates decisions after out-of-band row
+  changes.
+- **Relationship garbage collection on delete.** Deleting a `RebacMixin` row
+  now removes every tuple naming it, as resource or subject, in both storage
+  modes on the deleting alias. Denormalized deployments can drop their manual
+  `post_delete` `Relationship.objects.filter(...).delete()` sweep.
+- `RebacPermissionsMixin` adds no unconditional superuser shortcut; it walks
+  the configured backend chain. `REBAC_SUPERUSER_BYPASS` governs
+  `RebacBackend`, so that backend must be in `AUTHENTICATION_BACKENDS` for the
+  permission-level bypass to apply.
+- Permission-named subject sets (`type:id#permission`) resolve through the
+  permission evaluator.
+- `FieldBinding`, `ConstBinding` and `AttributeBinding` no longer carry a
+  `kind` attribute; the class is the discriminator and the codec owns the
+  persisted `kind` key.
+- Backing directive JSON is rendered with `ensure_ascii=False`, matching the
+  project's JSON convention; output remains byte-stable.
 
 ### Removed
 

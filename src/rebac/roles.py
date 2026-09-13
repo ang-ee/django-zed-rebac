@@ -1,10 +1,11 @@
 """Role-as-namespace helpers — the GCP-style role-grant convention.
 
-This module is a **convention layer** on top of :mod:`rebac.relationships`.
-It does not introduce a new storage type, change the engine, or add
-schema syntax. It packages the "role-as-resource" pattern — a standard
-SpiceDB recipe — into ergonomic helpers so every consumer doesn't
-hand-roll the same four CRUD wrappers around :class:`Relationship`.
+This module is a **convention layer** composed on :mod:`rebac.memberships`
+(direct ``member`` tuples) and :mod:`rebac.relationships`. It does not
+introduce a new storage type, change the engine, or add schema syntax. It
+packages the "role-as-resource" pattern — a standard SpiceDB recipe — into
+ergonomic helpers that add role-spec parsing and role hierarchy on top of the
+generic membership operations.
 
 The convention
 ==============
@@ -92,19 +93,15 @@ helpers here are exclusively for **actor-grantable** roles (the GCP
 from __future__ import annotations
 
 from collections.abc import Iterator
-from typing import TYPE_CHECKING, Any, cast
+from typing import TYPE_CHECKING, cast
 
 from .actors import ActorLike
 from .memberships import MEMBER_RELATION
 from .types import ObjectRef, RelationshipTuple, SubjectRef
 
 if TYPE_CHECKING:  # pragma: no cover
-    from .models import Relationship, RelationshipRegistry
+    from .models import RelationshipRow
     from .schema.ast import Schema
-
-    RelationshipRow = Relationship | RelationshipRegistry
-else:  # pragma: no cover
-    RelationshipRow = Any
 
 
 ROLE_RELATION = MEMBER_RELATION
@@ -195,7 +192,7 @@ def grant(*, actor: ActorLike, role: str | ObjectRef) -> RelationshipRow:
     """
     from .memberships import grant as grant_membership
 
-    return cast("RelationshipRow", grant_membership(subject=actor, container=_parse_role(role)))
+    return grant_membership(subject=actor, container=_parse_role(role))
 
 
 def revoke(*, actor: ActorLike, role: str | ObjectRef) -> int:
@@ -220,7 +217,8 @@ def roles_of(actor: ActorLike) -> Iterator[ObjectRef]:
     """
     from .memberships import containers_of
 
-    yield from (container for container in containers_of(actor) if container.resource_type.endswith("/role"))
+    # The convention filter stays in SQL; ``containers_of`` owns the row query.
+    yield from containers_of(actor, resource_type__endswith="/role")
 
 
 def members_of(role: str | ObjectRef) -> Iterator[SubjectRef]:

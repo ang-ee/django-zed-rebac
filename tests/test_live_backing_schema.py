@@ -22,7 +22,7 @@ from rebac.types import ObjectRef
 @pytest.mark.parametrize(
     "directive",
     [
-        'field=members',
+        "field=members",
         'field={"path":"roster__user","filters":{"roster__active":true,"roster__role":"editor"}}',
         'attribute={"field":"kind"}',
         'attribute={"field":"is_active","resource":"inactive","value":false}',
@@ -50,7 +50,7 @@ def test_backing_round_trip_preserves_schema_and_persistence(directive: str) -> 
 @pytest.mark.parametrize(
     "directive",
     [
-        'field=members.invalid',
+        "field=members.invalid",
         'field={"path":"members","unexpected":true}',
         'field={"path":"members","filters":{"active":[true]}}',
         'attribute={"field":"kind","resource":"person"}',
@@ -97,26 +97,26 @@ def test_fixed_attribute_names_its_container_without_tuple_evidence() -> None:
 
 def test_filters_have_canonical_order_without_mutable_schema_state() -> None:
     backing = backing_from_dict(
-        {"kind": "fk", "attname": "roster__user", "filters": {"z": False, "a": 1}}
+        {"kind": "fk", "path": "roster__user", "filters": {"z": False, "a": 1}}
     )
-    assert backing == FieldBinding(attname="roster__user", filters=(("a", 1), ("z", False)))
-    assert isinstance(
-        backing_from_dict({"kind": "attribute", "field": "kind"}), AttributeBinding
-    )
+    assert backing == FieldBinding(path="roster__user", filters=(("a", 1), ("z", False)))
+    assert isinstance(backing_from_dict({"kind": "attribute", "field": "kind"}), AttributeBinding)
 
 
 def test_filter_lookup_paths_are_preserved_for_same_join_resolution() -> None:
-    backing = backing_from_dict({
-        "kind": "fk",
-        "attname": "memberships__user",
-        "filters": {
-            "memberships__role": "editor",
-            "memberships__is_confirmed": True,
-        },
-    })
+    backing = backing_from_dict(
+        {
+            "kind": "fk",
+            "path": "memberships__user",
+            "filters": {
+                "memberships__role": "editor",
+                "memberships__is_confirmed": True,
+            },
+        }
+    )
 
     assert backing == FieldBinding(
-        attname="memberships__user",
+        path="memberships__user",
         filters=(
             ("memberships__is_confirmed", True),
             ("memberships__role", "editor"),
@@ -126,11 +126,13 @@ def test_filter_lookup_paths_are_preserved_for_same_join_resolution() -> None:
 
 def test_filter_keys_reject_empty_lookup_segments() -> None:
     with pytest.raises(ValueError, match="ORM lookup names"):
-        backing_from_dict({
-            "kind": "fk",
-            "attname": "memberships__user",
-            "filters": {"memberships____role": "editor"},
-        })
+        backing_from_dict(
+            {
+                "kind": "fk",
+                "path": "memberships__user",
+                "filters": {"memberships____role": "editor"},
+            }
+        )
 
 
 def test_fixed_attribute_writeability_is_scoped_to_its_named_resource() -> None:
@@ -187,6 +189,27 @@ def test_dynamic_integer_container_rejects_leading_zero_spelling() -> None:
     )
 
     assert backing.subjects_filter("01").children == [("pk__in", [])]
-    assert backing.subjects_filter("1").children == [
-        (user_model._meta.pk.name, 1)
-    ]
+    assert backing.subjects_filter("1").children == [(user_model._meta.pk.name, 1)]
+
+
+def test_backing_render_is_deterministic_for_unicode_and_reordered_filters() -> None:
+    first = parse_zed(
+        "definition auth/user {}\n"
+        "definition sample/container {\n"
+        ' relation member: auth/user // rebac:field={"path":"roster__user","filters":{"roster__team":"équipe","roster__active":true}}\n'
+        ' relation kind: auth/user // rebac:attribute={"field":"kind","filters":{"région":"Île-de-France"}}\n'
+        "}\n"
+    )
+    second = parse_zed(
+        "definition auth/user {}\n"
+        "definition sample/container {\n"
+        ' relation kind: auth/user // rebac:attribute={"field":"kind","filters":{"r\\u00e9gion":"\\u00cele-de-France"}}\n'
+        ' relation member: auth/user // rebac:field={"path":"roster__user","filters":{"roster__active":true,"roster__team":"\\u00e9quipe"}}\n'
+        "}\n"
+    )
+
+    rendered = render_zed(first)
+    assert rendered == render_zed(second)
+    assert "équipe" in rendered and "\\u00e9" not in rendered
+    # Canonical form is a fixed point: relations sort by name on every render.
+    assert render_zed(parse_zed(rendered)) == rendered

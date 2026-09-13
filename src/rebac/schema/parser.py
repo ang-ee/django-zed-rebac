@@ -250,17 +250,15 @@ class _Parser:
                 if kind == "const":
                     data = {"kind": "const", "target_id": raw}
                 elif kind == "field" and not raw.startswith("{"):
-                    data = {"kind": "fk", "attname": raw}
+                    data = {"kind": "fk", "path": raw}
                 else:
                     data = json.loads(raw)
                     if not isinstance(data, dict):
                         raise ValueError("backing directive must be a JSON object")
                     if "kind" in data:
                         raise ValueError("the directive name owns its backing kind")
-                    if kind == "field":
-                        if "attname" in data or "path" not in data:
-                            raise ValueError("field backing JSON requires path")
-                        data["attname"] = data.pop("path")
+                    if kind == "field" and "path" not in data:
+                        raise ValueError("field backing JSON requires path")
                     data["kind"] = "fk" if kind == "field" else "attribute"
                 backing = backing_from_dict(data)
             except (ValueError, TypeError) as exc:
@@ -320,9 +318,7 @@ class _Parser:
                 )
             with_expiration = True
         last_token = self.tokens[self.pos - 1]
-        backing = self._backing_between(
-            start_line=relation_tok.line, end_line=last_token.line
-        )
+        backing = self._backing_between(start_line=relation_tok.line, end_line=last_token.line)
         return Relation(name, tuple(subjects), with_expiration, backing)
 
     def _parse_subject_union(self) -> list[AllowedSubject]:
@@ -575,11 +571,6 @@ def validate_schema(schema: Schema) -> list[str]:
                     "reserved built-in actors cannot be declared as relations"
                 )
             if relation.backing is not None:
-                if relation.backing.kind not in ("fk", "const", "attribute"):
-                    errors.append(
-                        f"{definition.resource_type}#{relation.name}: "
-                        f"unsupported relation backing kind {relation.backing.kind!r}"
-                    )
                 try:
                     backing_from_dict(backing_to_dict(relation.backing))
                 except (ValueError, TypeError) as exc:

@@ -21,6 +21,7 @@ from .ast import (
 )
 from .introspection import (
     PermissionSources,
+    live_backed_resource_types,
     named_object_refs,
     permission_object_sources,
     permission_sources,
@@ -50,6 +51,7 @@ __all__ = [
     "PermissionSources",
     "Relation",
     "Schema",
+    "live_backed_resource_types",
     "named_object_refs",
     "parse_permission_expression",
     "parse_zed",

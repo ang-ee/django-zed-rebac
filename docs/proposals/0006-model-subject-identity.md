@@ -1,5 +1,7 @@
 # Proposal 0006: model-owned subject identity
 
+Status: accepted for implementation.
+
 ## Problem
 
 `RebacMixin` models already own their REBAC object type and identifier through
@@ -45,10 +47,12 @@ User/Group mappings serving only as fallbacks.
 
 ## Validation
 
-The system-check owner should report a model whose non-empty
-`rebac_subject_relation` is absent from its effective schema definition. Runtime
-conversion remains a pure metadata operation and performs no schema or database
-lookup.
+The system-check owner reports a model whose non-empty
+`rebac_subject_relation` is absent from its effective schema definition as
+`rebac.E011`. Runtime conversion remains a pure metadata operation and performs
+no schema or database lookup. The inverse mapping — subject type to Django
+model and id attribute — has one owner, `rebac.resources.model_for_subject_type`,
+shared by backing resolution and `resolve_subjects`.
 
 ## Compatibility
 

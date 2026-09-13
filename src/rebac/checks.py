@@ -102,6 +102,7 @@ def check_field_backed_relations(
 ) -> list[checks.CheckMessage]:
     """Validate live relation backings and model-owned subject identity."""
     try:
+        from ._id import subject_relation
         from .backends import backend as _backend
         from .backends.base import Backend
         from .field_backing import (
@@ -146,14 +147,14 @@ def check_field_backed_relations(
     from django.apps import apps
 
     for model in apps.get_models():
-        relation_name = getattr(model._meta, "rebac_subject_relation", "")
+        relation_name = subject_relation(model)
         if not relation_name:
             continue
         resource_type = model_resource_type(model)
-        definition = schema.get_definition(resource_type) if resource_type else None
+        subject_definition = schema.get_definition(resource_type) if resource_type else None
         relation_names = (
-            {relation.name for relation in definition.relations}
-            if definition
+            {relation.name for relation in subject_definition.relations}
+            if subject_definition
             else set()
         )
         if relation_name not in relation_names:
