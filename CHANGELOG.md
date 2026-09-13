@@ -3,6 +3,121 @@
 All notable changes to `django-zed-rebac` are tracked here. The project is in
 pre-1.0; breaking changes within a minor version are explicitly called out.
 
+## [Unreleased]
+
+## [0.17.1] — 2026-09-13
+
+### Fixed
+
+- Live backing accepts ORM-queryable scalar virtual identities, including
+  public IDs encoded from an existing integer primary key. Django fields own
+  lookup preparation and result conversion; graph IDs and stored tuples keep
+  their existing identity. Missing, relational and non-queryable identity
+  fields remain invalid.
+- Preserve the native column optimization for unfiltered forward FK/O2O
+  relations. Filtered, reverse and M2M paths correlate source rows by their
+  primary key, without casting encoded public IDs. A foreign key targeting a
+  different field from the REBAC identity resolves through the target model.
+- Schema-dependent system checks defer unreadable persisted data while REBAC
+  migrations are pending, so the ordinary migration command can apply
+  `0004_field_backing_path`. Runtime evaluation remains strict, and the
+  released migration is unchanged.
+- Relationship cleanup covers configured Django User and Group subjects as
+  well as model resources, using the deletion database alias in both storage
+  modes. Unrelated identities and grants remain intact.
+
+### Corrected contract — consumer migration required
+
+- Removed the permission-named subject-set behavior added in 0.17.0.
+  Relationship subjects may reference a declared relation (`group:id#member`),
+  never a computed permission (`role:id#effective_member`). Schema loading and
+  tuple writes reject that shape. Checking a permission or evaluating a
+  `relation->permission` arrow remains supported.
+- Runtime role hierarchy uses `relation includes: role` and
+  `permission effective_member = member + includes->effective_member`.
+  `rebac.roles.imply` writes a direct child-role object. Resource schemas
+  likewise grant a plain role object and arrow to its `effective_member`.
+- Consumers must migrate their schema and corresponding tuples together.
+  Rewrite known implication edges from `@role:id#effective_member` to
+  `@role:id`; move computed-role grants to the matching direct role relation.
+  Preserve caveats, context and expiration. There is no generic suffix rewrite
+  or automatic deletion of incompatible grants. See the role-hierarchy upgrade
+  guidance in `docs/ARCHITECTURE.md`.
+
+The native membership API, model-owned subject identity, filtered live field
+and attribute backings, and cache-freshness protections introduced in 0.17.0
+remain available. The original 0.16.3 FK/SQL scoping and encoded-ID optimizations
+are retained.
+
+## [0.17.0] — 2026-09-13
+
+### Added
+
+- `rebac.memberships`: direct `member`-tuple grant, exact (caveat-aware)
+  revocation and enumeration for any container type; `containers_of` accepts
+  Django lookups on the container so callers filter in SQL. `rebac.roles`
+  composes it and keeps owning role-spec parsing and hierarchy.
+- Model-owned subject identity: a `RebacMixin` model converts to a `SubjectRef`
+  from its own `Meta.rebac_resource_type` / `rebac_id_attr`, optionally as a
+  subject set via `Meta.rebac_subject_relation` (`rebac.E011` checks it).
+  `rebac.resources.model_for_subject_type` is the single inverse mapping used
+  by field/attribute backing and `resolve_subjects`.
+- Live filtered ORM relation paths (`rebac:field={"path":...,"filters":...}`)
+  and scalar attribute-backed containers (`rebac:attribute=...`), with shared
+  parsing, persistence, direct evaluation, enumeration and lazy SQL scoping.
+- `rebac.schema.introspection.named_object_refs`, `relation_is_writable`,
+  `live_backed_resource_types` and `accessible_is_exact`.
+- `rebac.W009` warns about case-insensitive collations on text attribute
+  columns (best effort).
+- Migration `0004_field_backing_path`, which rewrites stored field backings to
+  the new `path` key (see Changed).
+
+### Changed
+
+- **Stored field-backing key.** `SchemaRelation.backing` spells the Django
+  lookup path `path` instead of `attname` (`FieldBinding.path`). Run
+  `manage.py migrate` (migration 0004 rewrites existing rows), then an
+  ordinary `manage.py rebac sync`, which refreshes the provenance hash; admin
+  edits under `no_update` are still reported as drift. The loader accepts only
+  the new key.
+- **Type prefix applies to every generated identity.** With
+  `REBAC_TYPE_PREFIX` set, the configured user, group and anonymous subject
+  types and `@rebac_subject` types are prefixed like model resource types.
+  Prefixed deployments must declare the prefixed subject types in their
+  schema and migrate stored subject tuples (no automatic retyping).
+- **Decision-cache bypass is per resource type.** `LocalBackend` declines to
+  cache decisions only for resource types that can reach live field or
+  attribute backing (conservative schema reachability), instead of for the
+  whole schema; transaction and expiration bypasses are unchanged.
+  `rebac.backends.local.mark_relationships_changed()` is the LocalBackend seam
+  that invalidates decisions after out-of-band row changes (the `post_delete`
+  cascade uses it); it is not part of the top-level `rebac` export surface.
+- **Relationship garbage collection on delete.** Deleting a `RebacMixin` row
+  now removes every tuple naming it, as resource or subject, in both storage
+  modes on the deleting alias. Denormalized deployments can drop their manual
+  `post_delete` `Relationship.objects.filter(...).delete()` sweep.
+- `RebacPermissionsMixin` adds no unconditional superuser shortcut; it walks
+  the configured backend chain. `REBAC_SUPERUSER_BYPASS` governs
+  `RebacBackend`, so that backend must be in `AUTHENTICATION_BACKENDS` for the
+  permission-level bypass to apply.
+- Permission-named subject sets (`type:id#permission`) resolve through the
+  permission evaluator.
+- Arrows through field- or attribute-backed relations cost a bounded number
+  of queries in direct checks when the schema declares no caveats and no
+  built-in actor terms; otherwise they keep the per-target tri-state walk.
+- Unsaved `RebacMixin` instances raise `NoActorResolvedError` when used as a
+  subject, as unsaved users already did.
+- `FieldBinding`, `ConstBinding` and `AttributeBinding` no longer carry a
+  `kind` attribute; the class is the discriminator and the codec owns the
+  persisted `kind` key.
+- Backing directive JSON is rendered with `ensure_ascii=False`, matching the
+  project's JSON convention; output remains byte-stable.
+
+### Removed
+
+- The unimplemented `REBAC_SYNC_DJANGO_GROUPS` setting. Use live field backing
+  for Django-owned membership or native membership tuples as the sole store.
+
 ## [0.16.3] — 2026-09-12
 
 ### Fixed

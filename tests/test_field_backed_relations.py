@@ -276,7 +276,7 @@ def test_db_loaded_schema_preserves_field_backing(db):
         definition=post_def,
         name="folder",
         allowed_subjects=[{"type": "blog/folder"}],
-        backing={"attname": "folder", "kind": "fk"},
+        backing={"kind": "fk", "path": "folder"},
     )
     SchemaPermission.objects.create(
         definition=post_def,

@@ -76,12 +76,16 @@ class _BackendKey:
         return isinstance(other, _BackendKey) and self.backend is other.backend
 
 
-def _backend_cache_key(backend: Backend) -> tuple[_BackendKey, Hashable | None] | None:
+def _backend_cache_key(
+    backend: Backend, resource_type: str
+) -> tuple[_BackendKey, Hashable | None] | None:
     # LocalBackend refreshes expired or invalidated schema snapshots before
-    # a cached permission answer can be reused. Other backends need no hook.
+    # a cached permission answer can be reused, and declines caching for
+    # resource types whose evaluation reads live ORM facts. Other backends
+    # need no hook.
     generation = getattr(backend, "_cache_generation", None)
     if callable(generation):
-        value = generation()
+        value = generation(resource_type)
         if value is None:
             return None
         return _BackendKey(backend), value
@@ -137,7 +141,7 @@ class PermissionEvaluator:
                 consistency=consistency,
                 at_zookie=at_zookie,
             )
-        backend_key = _backend_cache_key(backend)
+        backend_key = _backend_cache_key(backend, resource.resource_type)
         if backend_key is None:
             return backend.check_access(
                 subject=subject, action=action, resource=resource, context=context
@@ -183,7 +187,7 @@ class PermissionEvaluator:
                     at_zookie=at_zookie,
                 )
             )
-        backend_key = _backend_cache_key(backend)
+        backend_key = _backend_cache_key(backend, resource_type)
         if backend_key is None:
             return tuple(
                 backend.accessible(subject=subject, action=action, resource_type=resource_type)

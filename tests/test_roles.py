@@ -10,11 +10,10 @@ from __future__ import annotations
 
 import pytest
 
-from rebac import SubjectRef, backend
+from rebac import RelationshipTuple, SubjectRef, backend
 from rebac.backends import reset_backend
 from rebac.models import Relationship
 from rebac.roles import (
-    ROLE_EFFECTIVE_MEMBER,
     ROLE_INCLUDES_RELATION,
     ROLE_RELATION,
     grant,
@@ -38,8 +37,8 @@ definition auth/group {
 
 definition angee/role {
     relation member: auth/user | auth/group#member
-    relation includes: angee/role#effective_member
-    permission effective_member = member + includes
+    relation includes: angee/role
+    permission effective_member = member + includes->effective_member
 }
 
 definition knowledge/role {
@@ -48,8 +47,13 @@ definition knowledge/role {
 
 definition storage/role {
     relation member: auth/user | auth/group#member | angee/role:admin#member
-    relation includes: storage/role#effective_member | angee/role#effective_member
-    permission effective_member = member + includes
+    relation includes: storage/role | angee/role
+    permission effective_member = member + includes->effective_member
+}
+
+definition storage/document {
+    relation role: storage/role
+    permission read = role->effective_member
 }
 """
 
@@ -272,7 +276,7 @@ def test_imply_writes_includes_tuple():
     assert row.relation == ROLE_INCLUDES_RELATION
     assert row.subject_type == "storage/role"
     assert row.subject_id == "object_admin"
-    assert row.optional_subject_relation == ROLE_EFFECTIVE_MEMBER
+    assert row.optional_subject_relation == ""
 
     assert (
         Relationship.objects.filter(
@@ -282,6 +286,22 @@ def test_imply_writes_includes_tuple():
         ).count()
         == 1
     )
+
+
+@pytest.mark.django_db
+def test_imply_composes_recursive_role_permission_through_arrows():
+    actor = SubjectRef.of("auth/user", "42")
+    admin = ObjectRef("storage/role", "object_admin")
+    editor = ObjectRef("storage/role", "object_editor")
+    viewer = ObjectRef("storage/role", "object_viewer")
+    document = ObjectRef("storage/document", "one")
+
+    grant(actor=actor, role=admin)
+    imply(parent=editor, child=admin)
+    imply(parent=viewer, child=editor)
+    backend().write_relationships([RelationshipTuple(document, "role", SubjectRef(viewer))])
+
+    assert backend().has_access(subject=actor, action="read", resource=document)
 
 
 @pytest.mark.django_db
@@ -413,7 +433,7 @@ def test_grant_and_roles_of_route_through_active_model_in_registry_mode():
 
 @pytest.mark.django_db
 def test_imply_routes_through_active_model_in_registry_mode():
-    """``imply`` writes the includes/effective_member edge into the active table."""
+    """``imply`` writes the direct includes edge into the active table."""
     from django.test import override_settings
 
     from rebac.models import Relationship, RelationshipRegistry
@@ -424,7 +444,7 @@ def test_imply_routes_through_active_model_in_registry_mode():
             resource_type="storage/role",
             resource_id="editor",
             relation=ROLE_INCLUDES_RELATION,
-            optional_subject_relation=ROLE_EFFECTIVE_MEMBER,
+            optional_subject_relation="",
         ).exists()
         assert not Relationship.objects.filter(
             resource_type="storage/role",
@@ -465,3 +485,31 @@ def test_roles_helpers_work_without_an_ambient_actor():
     assert {(r.resource_type, r.resource_id) for r in roles_of(actor)} == {
         ("storage/role", "object_editor"),
     }
+
+
+@pytest.mark.django_db
+@pytest.mark.parametrize("storage", ["denormalized", "registry"])
+def test_roles_of_filters_role_containers_in_sql(settings, storage):
+    from django.db import connection
+    from django.test.utils import CaptureQueriesContext
+
+    from rebac.memberships import grant as grant_membership
+
+    settings.REBAC_LOCAL_BACKEND_STORAGE = storage
+    reset_backend()
+    backend().set_schema(
+        parse_zed(ROLE_SCHEMA_TEXT + "definition auth/team {\n relation member: auth/user\n}\n")
+    )
+    actor = SubjectRef.of("auth/user", "42")
+    grant(actor=actor, role="storage/role:object_viewer")
+    # A non-role container with a ``member`` tuple: the membership predicate
+    # alone would keep it, so only the SQL-side type filter can exclude it.
+    grant_membership(subject=actor, container=ObjectRef("auth/team", "core"))
+
+    with CaptureQueriesContext(connection) as captured:
+        roles = list(roles_of(actor))
+
+    assert roles == [ObjectRef("storage/role", "object_viewer")]
+    assert len(captured) == 1
+    sql = captured[0]["sql"]
+    assert "LIKE" in sql.upper() and "/role" in sql

@@ -29,6 +29,9 @@ from .schema import (
     SchemaRelation,
 )
 
+RelationshipRow = Relationship | RelationshipRegistry
+"""A row of whichever relationship storage model is active."""
+
 __all__ = [
     "PackageManagedRecord",
     "PermissionAuditEvent",
@@ -37,6 +40,7 @@ __all__ = [
     "RelationshipManager",
     "RelationshipRegistry",
     "RelationshipRegistryManager",
+    "RelationshipRow",
     "SchemaCaveat",
     "SchemaDefinition",
     "SchemaOverride",

@@ -135,10 +135,13 @@ class RebacPermissionsMixin(models.Model):
     with :class:`rebac.backends.auth.RebacBackend` to route
     permission checks through the REBAC engine.
 
-    Active superusers always pass; the ``REBAC_SUPERUSER_BYPASS``
-    setting is honoured by the auth backend itself, so a project that
-    flips the setting off can still keep this mixin — the engine
-    simply receives the call and answers per relationship rows.
+    The mixin adds no unconditional superuser bypass: every call walks the
+    configured backend chain. Superuser policy is owned by
+    :class:`rebac.backends.auth.RebacBackend` (``REBAC_SUPERUSER_BYPASS``),
+    the permission-level surface of the two-surface carve-out described in
+    ``docs/ARCHITECTURE.md``; the other is ``ActorMiddleware``. A project
+    that uses this mixin without ``RebacBackend`` in
+    ``AUTHENTICATION_BACKENDS`` gets whatever its remaining backends answer.
     """
 
     is_superuser = models.BooleanField(
@@ -177,12 +180,9 @@ class RebacPermissionsMixin(models.Model):
     def has_perm(self, perm: str, obj: Any = None) -> bool:
         """Return True if any backend grants ``perm`` (optionally on ``obj``).
 
-        Active superusers short-circuit to True — matches contrib.auth
-        so admin behaves identically for superuser sessions. Anyone
-        else walks :setting:`AUTHENTICATION_BACKENDS`.
+        Every user walks :setting:`AUTHENTICATION_BACKENDS`. The configured
+        permission backend owns any superuser bypass policy.
         """
-        if self.is_active and self.is_superuser:
-            return True
         return _walk_backends("has_perm", self, perm, obj)
 
     def has_perms(self, perm_list: Iterable[str], obj: Any = None) -> bool:
@@ -202,10 +202,8 @@ class RebacPermissionsMixin(models.Model):
         """Return True if any backend grants any permission on ``app_label``.
 
         Used by the admin index to decide whether to render an app's
-        section. Superusers bypass.
+        section. The configured permission backend owns superuser policy.
         """
-        if self.is_active and self.is_superuser:
-            return True
         return _walk_backends("has_module_perms", self, app_label)
 
     # ---------- Async siblings (Django 4.1+) ----------
@@ -220,8 +218,6 @@ class RebacPermissionsMixin(models.Model):
         return await _awalk_get_permissions(self, obj, "all")
 
     async def ahas_perm(self, perm: str, obj: Any = None) -> bool:
-        if self.is_active and self.is_superuser:
-            return True
         return await _awalk_backends("ahas_perm", self, perm, obj)
 
     async def ahas_perms(self, perm_list: Iterable[str], obj: Any = None) -> bool:
@@ -233,8 +229,6 @@ class RebacPermissionsMixin(models.Model):
         return True
 
     async def ahas_module_perms(self, app_label: str) -> bool:
-        if self.is_active and self.is_superuser:
-            return True
         return await _awalk_backends("ahas_module_perms", self, app_label)
 
 

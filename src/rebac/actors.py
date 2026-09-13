@@ -19,13 +19,14 @@ from typing import Any
 
 from django.contrib.auth import get_user_model
 
-from ._id import subject_id_attr
+from ._id import subject_id_attr, subject_relation, type_with_prefix
 from .conf import app_settings
 from .errors import (
     NoActorResolvedError,
     SudoNotAllowedError,
     SudoReasonRequiredError,
 )
+from .resources import model_resource_type, to_object_ref
 from .types import ObjectRef, SubjectRef
 
 # ---------- ContextVar ----------
@@ -77,12 +78,13 @@ def anonymous_actor() -> SubjectRef:
     consumer overrides ``REBAC_ANONYMOUS_TYPE`` — this function reads the
     current setting each call.
     """
-    return SubjectRef.of(app_settings.REBAC_ANONYMOUS_TYPE, "*")
+    return SubjectRef.of(type_with_prefix(app_settings.REBAC_ANONYMOUS_TYPE), "*")
 
 
 # Module-level convenience constant. Uses the default ``REBAC_ANONYMOUS_TYPE``
-# at import time; consumers that override the setting should call
-# :func:`anonymous_actor` instead.
+# and no ``REBAC_TYPE_PREFIX`` at import time, so it is only the anonymous actor
+# (per :func:`is_anonymous_actor`) in deployments that keep both defaults;
+# consumers that override either setting must call :func:`anonymous_actor`.
 ANONYMOUS_ACTOR: SubjectRef = SubjectRef.of("auth/anonymous", "*")
 
 
@@ -96,7 +98,7 @@ def is_anonymous_actor(subject: SubjectRef | None) -> bool:
     if subject is None:
         return False
     return (
-        subject.subject_type == app_settings.REBAC_ANONYMOUS_TYPE
+        subject.subject_type == type_with_prefix(app_settings.REBAC_ANONYMOUS_TYPE)
         and subject.subject_id == "*"
         and not subject.optional_relation
     )
@@ -119,8 +121,10 @@ ActorLike = SubjectRef | Any
 
 Concretely accepts:
   - `SubjectRef` (passed through)
-  - Django `User` instance (→ `auth/user:<pk>`)
-  - Django `Group` instance (→ `auth/group:<pk>#member`)
+  - A REBAC-bound Django model (type/id from its object identity and an optional
+    `Meta.rebac_subject_relation`)
+  - Legacy Django `User` instance (→ configured user type/id)
+  - Legacy Django `Group` instance (→ configured group type/id `#member`)
   - Any class decorated with `@rebac_subject(...)` (→ `<type>:<id_attr_value>`)
 """
 
@@ -181,19 +185,35 @@ def to_subject_ref(actor: ActorLike) -> SubjectRef:
         # to it would mask the bug class the strict posture is meant to
         # surface. The request-path resolver (:func:`default_resolver`)
         # remains the fail-safe via its ``except NoActorResolvedError`` path.
-        if not getattr(actor, "is_authenticated", False):
+        if actor.pk is None or not getattr(actor, "is_authenticated", False):
             raise NoActorResolvedError(
-                f"{type(actor).__name__} instance has is_authenticated=False. "
+                f"{type(actor).__name__} instance is unsaved or has is_authenticated=False. "
                 "Pass AnonymousUser explicitly for the anonymous actor, or "
                 "save/load a real user row."
             )
+        if model_resource_type(user_model):
+            resource = to_object_ref(actor)
+            return SubjectRef(resource, subject_relation(user_model))
         attr = subject_id_attr(user_model)
-        return SubjectRef.of(app_settings.REBAC_USER_TYPE, str(getattr(actor, attr)))
+        return SubjectRef.of(
+            type_with_prefix(app_settings.REBAC_USER_TYPE),
+            str(getattr(actor, attr)),
+        )
+
+    if model_resource_type(type(actor)):
+        if actor.pk is None:
+            # A principal must be a persisted row, as for the User branch;
+            # an unsaved instance would otherwise resolve to the id "None".
+            raise NoActorResolvedError(
+                f"{type(actor).__name__} instance is unsaved; save it before using it as a subject."
+            )
+        resource = to_object_ref(actor)
+        return SubjectRef(resource, subject_relation(type(actor)))
 
     if isinstance(actor, Group):
         attr = subject_id_attr(Group)
         return SubjectRef.of(
-            app_settings.REBAC_GROUP_TYPE,
+            type_with_prefix(app_settings.REBAC_GROUP_TYPE),
             str(getattr(actor, attr)),
             "member",
         )
@@ -202,7 +222,7 @@ def to_subject_ref(actor: ActorLike) -> SubjectRef:
     for cls, (type_, id_attr) in _subject_registry.items():
         if isinstance(actor, cls):
             value = getattr(actor, id_attr)
-            return SubjectRef.of(type_, str(value))
+            return SubjectRef.of(type_with_prefix(type_), str(value))
 
     raise NoActorResolvedError(
         f"Cannot resolve {type(actor).__name__} instance to SubjectRef. "
@@ -230,7 +250,7 @@ def grant_subject_ref(agent: Any, on_behalf_of: Any | None) -> SubjectRef:
     user_ref = to_subject_ref(on_behalf_of)
     grant_id = f"{user_ref.subject_id}.{agent_ref.subject_id}"
     return SubjectRef(
-        object=ObjectRef("agents/grant", grant_id),
+        object=ObjectRef(type_with_prefix("agents/grant"), grant_id),
         optional_relation="valid",
     )
 

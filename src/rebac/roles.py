@@ -1,10 +1,11 @@
 """Role-as-namespace helpers — the GCP-style role-grant convention.
 
-This module is a **convention layer** on top of :mod:`rebac.relationships`.
-It does not introduce a new storage type, change the engine, or add
-schema syntax. It packages the "role-as-resource" pattern — a standard
-SpiceDB recipe — into ergonomic helpers so every consumer doesn't
-hand-roll the same four CRUD wrappers around :class:`Relationship`.
+This module is a **convention layer** composed on :mod:`rebac.memberships`
+(direct ``member`` tuples) and :mod:`rebac.relationships`. It does not
+introduce a new storage type, change the engine, or add schema syntax. It
+packages the "role-as-resource" pattern — a standard SpiceDB recipe — into
+ergonomic helpers that add role-spec parsing and role hierarchy on top of the
+generic membership operations.
 
 The convention
 ==============
@@ -92,21 +93,18 @@ helpers here are exclusively for **actor-grantable** roles (the GCP
 from __future__ import annotations
 
 from collections.abc import Iterator
-from typing import TYPE_CHECKING, Any, cast
+from typing import TYPE_CHECKING, cast
 
-from .actors import ActorLike, to_subject_ref
+from .actors import ActorLike
+from .memberships import MEMBER_RELATION
 from .types import ObjectRef, RelationshipTuple, SubjectRef
 
 if TYPE_CHECKING:  # pragma: no cover
-    from .models import Relationship, RelationshipRegistry
+    from .models import RelationshipRow
     from .schema.ast import Schema
 
-    RelationshipRow = Relationship | RelationshipRegistry
-else:  # pragma: no cover
-    RelationshipRow = Any
 
-
-ROLE_RELATION = "member"
+ROLE_RELATION = MEMBER_RELATION
 """The single relation used for role membership. Convention, not configurable.
 
 If a consumer needs a different relation name for some bespoke role-shape,
@@ -124,14 +122,15 @@ hierarchy declare their roles as::
 
     definition <namespace>/role {
         relation member:   auth/user | auth/group#member | platform/role:admin#member
-        relation includes: <namespace>/role#effective_member
+        relation includes: <namespace>/role
 
-        permission effective_member = member + includes
+        permission effective_member = member + includes->effective_member
     }
 
-…and resources reference ``<namespace>/role:<name>#effective_member``
-instead of ``#member``. :func:`imply` then writes the ``includes`` tuple
-that wires one role's effective_member into another's.
+…and resources hold a direct role relation, then arrow to
+``effective_member``. :func:`imply` writes the ``includes`` tuple that wires
+one role object's computed membership into another's without placing a
+permission name in a relationship subject.
 
 Addons that don't need runtime-editable hierarchy can skip the
 ``includes`` relation entirely and use per-resource permission composition
@@ -192,39 +191,9 @@ def grant(*, actor: ActorLike, role: str | ObjectRef) -> RelationshipRow:
 
     Returns the :class:`Relationship` row (newly created or pre-existing).
     """
-    from django.db import transaction
+    from .memberships import grant as grant_membership
 
-    from .models import active_relationship_model
-    from .relationships import write_relationships
-
-    Relationship = active_relationship_model()
-
-    actor_ref = to_subject_ref(actor)
-    role_ref = _parse_role(role)
-    # Wrap write + read-back in one atomic so a concurrent revoke between
-    # the upsert and the .get() can't surface as DoesNotExist.
-    with transaction.atomic():
-        write_relationships(
-            [
-                RelationshipTuple(
-                    resource=role_ref,
-                    relation=ROLE_RELATION,
-                    subject=actor_ref,
-                )
-            ]
-        )
-        # `Relationship` is the active model — a union of the two storage
-        # shapes; mypy narrows it via django-stubs, pyright keeps the union.
-        row = Relationship.objects.get(
-            resource_type=role_ref.resource_type,
-            resource_id=role_ref.resource_id,
-            relation=ROLE_RELATION,
-            subject_type=actor_ref.subject_type,
-            subject_id=actor_ref.subject_id,
-            optional_subject_relation=actor_ref.optional_relation,
-            caveat_name="",
-        )
-        return cast("RelationshipRow", row)
+    return grant_membership(subject=actor, container=_parse_role(role))
 
 
 def revoke(*, actor: ActorLike, role: str | ObjectRef) -> int:
@@ -234,36 +203,9 @@ def revoke(*, actor: ActorLike, role: str | ObjectRef) -> int:
     otherwise — the unique constraint on :class:`Relationship` guarantees
     at most one matching row).
     """
-    from django.db import transaction
+    from .memberships import revoke as revoke_membership
 
-    from .models import active_relationship_model
-    from .relationships import delete_relationship
-
-    Relationship = active_relationship_model()
-
-    actor_ref = to_subject_ref(actor)
-    role_ref = _parse_role(role)
-    # Wrap presence-check + delete in one atomic so the returned count
-    # reflects the same row state both operations saw — otherwise a
-    # concurrent grant/revoke between the two queries can make this lie.
-    with transaction.atomic():
-        exists = Relationship.objects.filter(
-            resource_type=role_ref.resource_type,
-            resource_id=role_ref.resource_id,
-            relation=ROLE_RELATION,
-            subject_type=actor_ref.subject_type,
-            subject_id=actor_ref.subject_id,
-            optional_subject_relation=actor_ref.optional_relation,
-            caveat_name="",
-        ).exists()
-        delete_relationship(
-            RelationshipTuple(
-                resource=role_ref,
-                relation=ROLE_RELATION,
-                subject=actor_ref,
-            )
-        )
-    return 1 if exists else 0
+    return revoke_membership(subject=actor, container=_parse_role(role))
 
 
 def roles_of(actor: ActorLike) -> Iterator[ObjectRef]:
@@ -274,26 +216,10 @@ def roles_of(actor: ActorLike) -> Iterator[ObjectRef]:
     use the engine (``has_access`` / ``accessible``), which traverses
     ``role:editor#member`` subject-sets at check time.
     """
-    from .models import active_relationship_model
+    from .memberships import containers_of
 
-    Relationship = active_relationship_model()
-
-    actor_ref = to_subject_ref(actor)
-    # Iterate via property accessors rather than values_list — the registry
-    # manager's translator rewrites lookup *filter* kwargs, but
-    # values_list("resource_type", ...) asks for raw field names that don't
-    # exist on RelationshipRegistry. The manager's default
-    # select_related("resource_fk", "subject_fk") makes the property
-    # access free.
-    rows = Relationship.objects.filter(
-        relation=ROLE_RELATION,
-        subject_type=actor_ref.subject_type,
-        subject_id=actor_ref.subject_id,
-        optional_subject_relation=actor_ref.optional_relation,
-        resource_type__endswith="/role",
-    )
-    for row in rows:
-        yield ObjectRef(row.resource_type, row.resource_id)
+    # The convention filter stays in SQL; ``containers_of`` owns the row query.
+    yield from containers_of(actor, resource_type__endswith="/role")
 
 
 def members_of(role: str | ObjectRef) -> Iterator[SubjectRef]:
@@ -305,18 +231,9 @@ def members_of(role: str | ObjectRef) -> Iterator[SubjectRef]:
     enumerate ``accessible()`` on a resource that references the role
     in its permission expression.
     """
-    from .models import active_relationship_model
+    from .memberships import members_of as membership_members_of
 
-    Relationship = active_relationship_model()
-
-    role_ref = _parse_role(role)
-    rows = Relationship.objects.filter(
-        resource_type=role_ref.resource_type,
-        resource_id=role_ref.resource_id,
-        relation=ROLE_RELATION,
-    )
-    for row in rows:
-        yield SubjectRef.of(row.subject_type, row.subject_id, row.optional_subject_relation)
+    yield from membership_members_of(_parse_role(role))
 
 
 def imply(*, parent: str | ObjectRef, child: str | ObjectRef) -> RelationshipRow:
@@ -324,8 +241,9 @@ def imply(*, parent: str | ObjectRef, child: str | ObjectRef) -> RelationshipRow
 
     Requires both role definitions to use the ``includes`` /
     ``effective_member`` pattern (see :data:`ROLE_INCLUDES_RELATION`).
-    Resources that reference ``parent#effective_member`` will then resolve
-    grants of ``child`` as if they were ``parent`` grants.
+    Resources whose permissions arrow through ``parent`` to
+    ``effective_member`` will then resolve grants of ``child`` as if they were
+    ``parent`` grants.
 
     The membership row written is::
 
@@ -335,7 +253,7 @@ def imply(*, parent: str | ObjectRef, child: str | ObjectRef) -> RelationshipRow
             relation="includes",
             subject_type=<child.resource_type>,
             subject_id=<child.resource_id>,
-            optional_subject_relation="effective_member",
+            optional_subject_relation="",
         )
 
     Idempotent — re-implying an existing edge returns the existing row.
@@ -363,11 +281,7 @@ def imply(*, parent: str | ObjectRef, child: str | ObjectRef) -> RelationshipRow
     tuple_ = RelationshipTuple(
         resource=parent_ref,
         relation=ROLE_INCLUDES_RELATION,
-        subject=SubjectRef.of(
-            child_ref.resource_type,
-            child_ref.resource_id,
-            ROLE_EFFECTIVE_MEMBER,
-        ),
+        subject=SubjectRef(child_ref),
     )
     # Wrap write + read-back: same DoesNotExist race as ``grant``.
     with transaction.atomic():
@@ -378,14 +292,14 @@ def imply(*, parent: str | ObjectRef, child: str | ObjectRef) -> RelationshipRow
             relation=ROLE_INCLUDES_RELATION,
             subject_type=child_ref.resource_type,
             subject_id=child_ref.resource_id,
-            optional_subject_relation=ROLE_EFFECTIVE_MEMBER,
+            optional_subject_relation="",
             caveat_name="",
         )
         return cast("RelationshipRow", row)
 
 
 def unimply(*, parent: str | ObjectRef, child: str | ObjectRef) -> int:
-    """Remove the implication ``child#effective_member → parent``.
+    """Remove the direct ``child → parent#includes`` implication edge.
 
     Returns the number of rows deleted (0 or 1).
     """
@@ -401,11 +315,7 @@ def unimply(*, parent: str | ObjectRef, child: str | ObjectRef) -> int:
     tuple_ = RelationshipTuple(
         resource=parent_ref,
         relation=ROLE_INCLUDES_RELATION,
-        subject=SubjectRef.of(
-            child_ref.resource_type,
-            child_ref.resource_id,
-            ROLE_EFFECTIVE_MEMBER,
-        ),
+        subject=SubjectRef(child_ref),
     )
     # Wrap presence-check + delete: same TOCTOU as ``revoke``.
     with transaction.atomic():
@@ -415,7 +325,7 @@ def unimply(*, parent: str | ObjectRef, child: str | ObjectRef) -> int:
             relation=ROLE_INCLUDES_RELATION,
             subject_type=child_ref.resource_type,
             subject_id=child_ref.resource_id,
-            optional_subject_relation=ROLE_EFFECTIVE_MEMBER,
+            optional_subject_relation="",
             caveat_name="",
         ).exists()
         delete_relationship(tuple_)
@@ -440,7 +350,7 @@ def implies_of(role: str | ObjectRef) -> Iterator[ObjectRef]:
         relation=ROLE_INCLUDES_RELATION,
         subject_type=role_ref.resource_type,
         subject_id=role_ref.resource_id,
-        optional_subject_relation=ROLE_EFFECTIVE_MEMBER,
+        optional_subject_relation="",
     )
     for row in rows:
         yield ObjectRef(row.resource_type, row.resource_id)
@@ -461,7 +371,7 @@ def implied_by_of(role: str | ObjectRef) -> Iterator[ObjectRef]:
         resource_type=role_ref.resource_type,
         resource_id=role_ref.resource_id,
         relation=ROLE_INCLUDES_RELATION,
-        optional_subject_relation=ROLE_EFFECTIVE_MEMBER,
+        optional_subject_relation="",
     )
     for row in rows:
         yield ObjectRef(row.subject_type, row.subject_id)

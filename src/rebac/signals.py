@@ -5,17 +5,18 @@ from __future__ import annotations
 from collections.abc import Iterable
 from typing import Any
 
-from django.db.models import Model
+from django.db.models import Model, Q
 from django.db.models.signals import post_delete, post_save, pre_delete, pre_save
 from django.dispatch import receiver
 
 from ._id import resource_id_attr
 from .actors import current_actor as _current_actor
+from .actors import to_subject_ref
 from .conf import app_settings
-from .errors import PermissionDenied
+from .errors import NoActorResolvedError, PermissionDenied
 from .field_visibility import backend_schema
 from .mixins import RebacMixin
-from .resources import model_resource_type
+from .resources import model_resource_type, to_object_ref
 from .schema.walker import field_gated_actions
 from .types import ObjectRef, SubjectRef
 
@@ -400,43 +401,62 @@ def _rebac_override_post_delete(sender: type[Model], instance: Any, **_: Any) ->
 
 # ---------- RebacResource cascade ----------
 #
-# When a Django row backed by ``RebacMixin`` is deleted in registry mode,
-# its corresponding ``RebacResource`` row must die with it so the
-# ``RelationshipRegistry.resource_fk`` / ``subject_fk`` CASCADE constraint
-# can sweep every tuple it appeared in. Without this handler the registry
-# row would be orphaned and tuples would persist past the underlying
-# resource's lifetime — exactly the leak the registry shape was meant to
-# fix.
+# When a Django row with a resource or subject identity is deleted, every
+# relationship occurrence of that identity must disappear with it. Registry
+# storage does so by deleting its ``RebacResource`` row and relying on both FK
+# cascades.
 #
-# In denormalized mode the handler is a no-op (there are no FKs to
-# cascade through); callers do their own ``Relationship.objects.filter(
-# resource_type=..., resource_id=...).delete()`` post_delete sweep when
-# they need it.
+# Denormalized storage has no foreign keys, so this handler deletes both
+# resource-side and subject-side occurrences explicitly. Both paths run on the
+# deleting instance's database alias inside Django's own delete transaction.
 
 
 @receiver(post_delete)
-def _rebac_cascade_resource(sender: type[Model], instance: Any, **_: Any) -> None:
-    """Drop the ``RebacResource`` registry row for a deleted ``RebacMixin`` row.
+def _rebac_cascade_resource(
+    sender: type[Model], instance: Any, using: str = "default", **_: Any
+) -> None:
+    """Remove every relationship occurrence of a deleted model identity.
 
     Listens on every model's ``post_delete``; short-circuits in O(1) when
-    the sender is not REBAC-bound (the ``getattr(meta,
-    rebac_resource_type, None)`` lookup is the only work done in the
-    common-case false branch).
+    neither the resource nor actor resolver owns an identity for it. This
+    includes configured Django User/Group subjects as well as RebacMixin
+    resources and model-owned subjects.
     """
-    if app_settings.REBAC_LOCAL_BACKEND_STORAGE != "registry":
+    identities: set[ObjectRef] = set()
+    if isinstance(instance, RebacMixin) and model_resource_type(sender):
+        identities.add(to_object_ref(instance))
+    try:
+        identities.add(to_subject_ref(instance).object)
+    except NoActorResolvedError:
+        pass
+    if not identities:
         return
-    if not isinstance(instance, RebacMixin):
-        return
-    rebac_type = model_resource_type(sender)
-    if not rebac_type:
-        return
-    # Lazy import — ``RebacResource`` lives in ``rebac.models`` which is
-    # available by signal-fire time but importing eagerly would be a
-    # heavy top-level dependency for a no-op in denormalized mode.
-    from .models import RebacResource
+    from .backends.local import mark_relationships_changed
 
-    resource_id = str(getattr(instance, resource_id_attr(sender)))
-    RebacResource.objects.filter(
-        resource_type=rebac_type,
-        resource_id=resource_id,
-    ).delete()
+    # ``post_delete`` fires inside the deleting Collector's atomic block on
+    # ``using``; the queryset deletes below join that transaction.
+    if app_settings.REBAC_LOCAL_BACKEND_STORAGE == "registry":
+        from .models import RebacResource
+
+        identity_filter = Q()
+        for identity in sorted(identities, key=lambda ref: (ref.resource_type, ref.resource_id)):
+            identity_filter |= Q(
+                resource_type=identity.resource_type,
+                resource_id=identity.resource_id,
+            )
+        RebacResource.objects.using(using).filter(identity_filter).delete()
+    else:
+        from .models import active_relationship_model
+
+        relationship_filter = Q()
+        for identity in sorted(identities, key=lambda ref: (ref.resource_type, ref.resource_id)):
+            relationship_filter |= Q(
+                resource_type=identity.resource_type,
+                resource_id=identity.resource_id,
+            ) | Q(
+                subject_type=identity.resource_type,
+                subject_id=identity.resource_id,
+            )
+        active_relationship_model().objects.using(using).filter(relationship_filter).delete()
+    # The rows changed outside the backend's own write path; drop decisions.
+    mark_relationships_changed()

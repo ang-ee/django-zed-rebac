@@ -126,7 +126,7 @@ relation viewer: auth/user | auth/user:*                // union with wildcard
 relation viewer: auth/user with ip_in_cidr              // with caveat
 ```
 
-Structural to-one relations that already exist as Django fields can be
+Structural relations that already exist as Django fields can be
 declared as field-backed:
 
 ```zed
@@ -145,6 +145,65 @@ specific ids, caveats, or expiration. The `rebac.E009` system check verifies
 that the named field exists and points at the schema's declared type. The
 `rebac build-zed` output omits the comment directive, so the emitted schema
 remains valid SpiceDB `.zed`.
+
+Forward, reverse, and many-to-many paths use the same declaration. Optional
+filters are anchored on the **source model**, including the through row:
+
+```zed
+relation member: auth/user // rebac:field={"path":"roster__user","filters":{"roster__active":true,"roster__role":"editor"}}
+```
+
+The target predicate and filters share one Django join. An active editor's
+roster row cannot accidentally authorize a different user's inactive row.
+Filter values are JSON scalars; Django validates the complete lookup paths.
+Both direct checks and lazy queryset scopes read the current rows, including
+changes made through bulk updates or the M2M manager.
+
+Source and target identities may be virtual scalar fields, such as a public ID
+encoded from the existing primary key. The field must support SQL projection
+and exact/`in` lookups; Django owns both lookup preparation and result
+conversion. A separate identity column or tuple-ID migration is unnecessary.
+Properties without an ORM field and composite identities are not supported.
+
+An **attribute backing** derives virtual container membership from a subject
+column. The single allowed subject type selects its Django model:
+
+```zed
+definition accounts/kind {
+    relation member: auth/user // rebac:attribute={"field":"kind"}
+    relation active_member: auth/user // rebac:attribute={"field":"kind","filters":{"is_active":true}}
+}
+
+definition platform/role {
+    relation member: auth/user // rebac:attribute={"field":"is_superuser","resource":"admin","value":true}
+}
+```
+
+Without `resource`/`value`, the column value is the container ID. With both,
+the declared comparison applies only to that fixed container; other IDs on
+the same relation retain stored tuples. Tuple writes/deletes against the live
+container are rejected. The subject column is the writer; no reconciliation
+command is needed. Attribute filters apply to the subject model.
+
+Two rules keep every read path in agreement. A dynamic container is named by
+the column value's canonical Python spelling only (`"1"` is integer container
+`1`; `"01"` is nothing). Text attribute columns need a deterministic,
+case-sensitive collation, because the lazy queryset scope compares them in SQL
+while direct checks compare exact strings; see ARCHITECTURE.md § Field-backed
+structural relations.
+
+**Anti-pattern:** do not derive ownership from an audit column such as
+`created_by` (`relation owner: auth/user // rebac:attribute={"field":"created_by"}`).
+Ownership must be transferable and revocable independently of who wrote the
+row; keep it an explicit `owner` tuple (see ARCHITECTURE.md § No implicit
+"owner from `create_uid`"). Attribute backing is for genuine membership
+attributes such as a kind, plan or role flag.
+
+Live ORM backing is implemented by `LocalBackend` in either storage mode.
+Exporting valid Zed does not project the derived edges into remote SpiceDB;
+until the roadmap projector ships, every backed relation holds no edges under
+`REBAC_BACKEND = "spicedb"` (ARCHITECTURE.md lists the projection burden per
+backing kind).
 
 A relation can instead be declared **const-backed** — resolving to one fixed
 object id for *every* row of the declaring type, with no stored tuple and no
@@ -311,12 +370,13 @@ write_relationships([
 ])
 ```
 
-#### Auto-syncing Django's `User.groups`
+#### Choosing the membership owner
 
-`REBAC_SYNC_DJANGO_GROUPS` is reserved for a planned adapter; no M2M signal
-handler is shipped. Applications must maintain
-`auth/group:<id>#member @ auth/user:<id>` relationships explicitly when Django
-group memberships change, including deleting the tuples on membership removal.
+Use `rebac.memberships` when relationship tuples are the membership store.
+If membership already lives in a Django M2M, declare its path as field backing
+on the container instead. These are alternative owners for the same relation;
+do not mirror one into the other. The unused `REBAC_SYNC_DJANGO_GROUPS` setting
+has been removed.
 
 #### Public read access
 
@@ -566,11 +626,16 @@ so admins can grant them in bulk.
 
 ### Agents acting on behalf of users (the Grant pattern)
 
-The canonical Authzed-recommended pattern for AI agents. An agent's effective permission on any resource is automatically the **structural intersection** of (a) the user's grants on that resource and (b) the agent's declared capabilities — enforced by the schema graph, not by app-layer ANDs.
+Applications can represent delegation as grant objects and combine delegation
+and capability conditions in their permission expressions. The graph must
+declare those conditions explicitly: the engine does not impersonate an owner
+or automatically inherit the owner's permissions.
 
 #### Definitions live in YOUR `agents` app, not in the plugin
 
-`agents/agent` and `agents/grant` are **not** auto-emitted. They live in a separate `agents` app you ship (or in a downstream framework that supplies them). The plugin only emits `auth/user` and `auth/group`.
+`agents/agent` and `agents/grant` are **not** auto-emitted. They live in an
+application you ship. Declare any User/Group definitions your schema uses too;
+automatic base-schema emission is not implemented.
 
 A typical `agents/permissions.zed`:
 
@@ -588,52 +653,63 @@ definition agents/agent {
 definition agents/capability {}        // marker type
 
 definition agents/grant {
-    relation user:  auth/user
+    relation valid: auth/user
     relation agent: agents/agent
 
-    permission active = user & agent
+    permission active = valid
 }
 ```
 
-A `Grant` row encodes "user U has delegated to agent A". Both relations must be present for `active` to resolve true.
+A `Grant` row records "user U has delegated to agent A". This illustrative
+`active` permission follows the `valid` relation to authorize the checked user;
+the `agent` relation records which agent the grant belongs to. Consumer schemas
+that combine several arms in
+`active` must make those arms accept the same checked subject type. For example,
+`user & agent` cannot match because those relations accept different types.
 
 #### Targeting resources from grants
 
-Add `agents/grant#active` to the type union of any relation that should accept agent invocation:
+Store the grant object in its own relation, then follow an arrow to `active`:
 
 ```zed
 // blog/permissions.zed
 definition blog/post {
     relation owner:  auth/user
-    relation viewer: auth/user | auth/group#member | agents/grant#active
+    relation viewer: auth/user | auth/group#member
+    relation viewer_grant: agents/grant
 
-    permission read  = owner + viewer
-    permission write = owner                         // agents can't write
+    permission read  = owner + viewer + viewer_grant->active
+    permission write = owner                         // only owners can write
 }
 ```
 
-The clever bit: when the subject is `agents/grant:G123`, SpiceDB's evaluator walks the grant's `user` relation, recursively asks "is *that user* a viewer/owner?", and only returns `true` if so. The agent **inherits** the user's view but can never exceed it.
+The resource tuple names `agents/grant:G123` directly. The arrow evaluates the
+grant's `active` permission for the subject being checked. Relationship subjects
+may use only relation suffixes; a permission such as `#active` belongs after an
+arrow in the resource permission.
 
 #### Bounding the agent further by capability
 
-To restrict a specific agent to a subset of actions even when the user can do more:
+To require a capability as well as delegation for the same checked user,
+extend the grant's permission with an explicit capability relation:
 
 ```zed
-definition blog/post_capability {
-    relation read_capability:  agents/capability
-    relation write_capability: agents/capability
+definition agents/capability {
+    relation member: auth/user
+    permission use = member
 }
 
-definition blog/post {
-    relation owner:  auth/user
-    relation viewer: auth/user | agents/grant#active
+definition agents/grant {
+    relation valid: auth/user
+    relation capability: agents/capability
 
-    permission read  = owner + (viewer & blog/post_capability:_self->read_capability)
-    permission write = owner & blog/post_capability:_self->write_capability
+    permission active = valid & capability->use
 }
 ```
 
-The `agent->has_capability` walk inside the permission expression intersects the user's grant with the agent's declared capabilities.
+The resource's `viewer_grant->active` arrow now requires both conditions.
+Creating a grant alone does not establish capability membership. Applications
+own which grants, capabilities and resource links a caller may create.
 
 #### Per-grant exceptions via caveats
 
@@ -645,11 +721,14 @@ caveat grant_constraints(now timestamp, expires_at timestamp, model_kind string,
 }
 ```
 
+Declare `relation valid: auth/user with grant_constraints` on the grant before
+writing a caveated membership:
+
 ```python
 write_relationships([
     RelationshipTuple(
         resource=ObjectRef("agents/grant", str(grant.pk)),
-        relation="user",
+        relation="valid",
         subject=SubjectRef.of("auth/user", str(user.pk)),
         caveat_name="grant_constraints",
         caveat_context={
@@ -664,7 +743,13 @@ When the agent invokes a tool, the request passes `now` and `model_kind` as runt
 
 #### Querying as an agent
 
-`with_actor(actor)` is the generic verb; `as_agent(agent, on_behalf_of=user)` is the typed shorthand:
+`with_actor(actor)` is the generic verb; `as_agent(agent, on_behalf_of=user)`
+constructs the conventional `agents/grant:<id>#valid` subject. In schemas using
+that shorthand, `valid` must be a declared relation. The application must
+authorize this subject shape explicitly; constructing it neither impersonates
+the requester nor copies the requester's grants. The user-subject examples
+above illustrate permission arrows, not an automatic mapping from this grant
+subject back to a user.
 
 ```python
 # Common case: HTTP request from a Django user
@@ -675,7 +760,7 @@ Post.objects.as_user(request.user)
 # Agent acting on behalf of a user (canonical Grant pattern)
 Post.objects.as_agent(agent, on_behalf_of=request.user)
 # expands to: Post.objects.with_actor(grant_subject_ref(agent, request.user))
-#                       → SubjectRef(agents/grant:<grant_id>#active)
+#                       → SubjectRef(agents/grant:<grant_id>#valid)
 
 # Or pass any SubjectRef directly:
 Post.objects.with_actor(SubjectRef.of("agents/grant", str(grant.pk)))
@@ -803,7 +888,11 @@ For projects where one Django DB serves multiple tenants, set `REBAC_TYPE_PREFIX
 REBAC_TYPE_PREFIX = "tenant_acme/"
 ```
 
-Every resource type emitted becomes `tenant_acme/blog/post`. Relationships from one tenant cannot be referenced by another.
+Every generated identity carries the prefix: model resource types become
+`tenant_acme/blog/post`, and the configured user, group and anonymous subject
+types plus `@rebac_subject` types become `tenant_acme/auth/user`,
+`tenant_acme/auth/group`, and so on. Declare the prefixed types in the tenant
+schema. Relationships from one tenant cannot be referenced by another.
 
 For hard-tenant isolation (separate databases or schemas), use `django-tenants` and let each tenant own its own `Relationship` table — no schema changes needed.
 
@@ -894,7 +983,9 @@ definition blog/post {
 }
 ```
 
-The Grant pattern (`agents/grant#active`) is canonical because the agent's permission flows through the user's grants — they can never exceed the user. Modeling agents as direct principals is a security smell.
+Store an `agents/grant` object directly on the resource and evaluate its
+permission with `grant_relation->active`. The grant's permission must explicitly
+encode the consumer's delegation policy for the subject being checked.
 
 ### 7. Don't omit the required headers
 
@@ -993,10 +1084,11 @@ definition docs/document {
 ```zed
 definition docs/document {
     relation owner:  auth/user
-    relation viewer: auth/user | auth/group#member | agents/grant#active
+    relation viewer: auth/user | auth/group#member
+    relation viewer_grant: agents/grant
 
-    permission read  = owner + viewer
-    permission write = owner                       // agents can read but not write
+    permission read  = owner + viewer + viewer_grant->active
+    permission write = owner                       // grant alone does not permit writes
 }
 ```
 

@@ -227,6 +227,40 @@ def test_sync_package_rejects_duplicate_caveats_before_writing(monkeypatch, tmp_
     assert not SchemaCaveat.objects.filter(name="duplicate_caveat").exists()
 
 
+@pytest.mark.django_db
+def test_sync_rejects_cross_package_permission_subject_before_writing(
+    monkeypatch, tmp_path
+) -> None:
+    group_app = tmp_path / "group_app"
+    docs_app = tmp_path / "docs_app"
+    group_app.mkdir()
+    docs_app.mkdir()
+    (group_app / "permissions.zed").write_text(
+        "definition auth/user {}\n"
+        "definition auth/group {\n"
+        " relation member: auth/user\n"
+        " permission effective_member = member\n"
+        "}\n",
+        encoding="utf-8",
+    )
+    (docs_app / "permissions.zed").write_text(
+        "definition docs/document {\n relation viewer: auth/group#effective_member\n}\n",
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(
+        "rebac.management.commands.rebac.apps.get_app_configs",
+        lambda: [
+            SimpleNamespace(name="app.groups", path=str(group_app)),
+            SimpleNamespace(name="app.docs", path=str(docs_app)),
+        ],
+    )
+
+    with pytest.raises(CommandError, match="Effective schema validation failed"):
+        call_command("rebac", "sync", stdout=io.StringIO())
+
+    assert not SchemaDefinition.objects.exists()
+
+
 def _managed_record(external_id: str, target: Any) -> None:
     PackageManagedRecord.objects.create(
         package="tests.testapp",

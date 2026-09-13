@@ -332,6 +332,12 @@ def _candidate_matches(
     if not candidate.optional_relation:
         return False
     # Subject-set candidate: walk via the backend on the (real) target row.
+    target_definition = ctx.schema.get_definition(candidate.subject_type)
+    if (
+        target_definition is None
+        or find_relation(target_definition, candidate.optional_relation) is None
+    ):
+        return False
     new_depth = depth + 1
     if new_depth > ctx.depth_limit:
         raise PermissionDepthExceeded(f"Depth limit {ctx.depth_limit} exceeded")

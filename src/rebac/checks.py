@@ -1,15 +1,49 @@
-"""System checks — registered at app-ready. No DB queries; no model instantiation."""
+"""System checks registered at app-ready; database reads happen only when invoked."""
 
 from __future__ import annotations
 
 import logging
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 from django.core import checks
 from django.db.utils import DatabaseError
 
 from .conf import app_settings
+from .errors import SchemaError
 from .field_visibility import FIELD_DENY_MODES
+
+if TYPE_CHECKING:
+    from .schema.ast import Schema
+
+
+def _schema_for_checks() -> Schema | None:
+    """Load current schema, allowing Django to migrate an older stored format.
+
+    Runtime permission evaluation remains strict. Only schema-dependent system
+    checks defer unreadable data while the owning app has pending migrations.
+    """
+    from django.db import DEFAULT_DB_ALIAS, connections
+    from django.db.migrations.executor import MigrationExecutor
+
+    from .backends import backend
+
+    try:
+        try:
+            return backend().schema()
+        except SchemaError:
+            executor = MigrationExecutor(connections[DEFAULT_DB_ALIAS])
+            targets = executor.loader.graph.leaf_nodes("rebac")
+            if not executor.migration_plan(targets):
+                raise
+            logging.getLogger("rebac.checks").debug(
+                "Schema checks deferred until pending REBAC migrations are applied"
+            )
+            return None
+    except (DatabaseError, RuntimeError) as exc:
+        logging.getLogger("rebac.checks").debug(
+            "Schema checks skipped: schema unavailable (%s)", exc
+        )
+        return None
 
 
 @checks.register("rebac")
@@ -100,31 +134,27 @@ def check_field_backed_relations(
     app_configs: Any = None,
     **kwargs: Any,
 ) -> list[checks.CheckMessage]:
-    """Validate schema-declared ``// rebac:field=...`` model bindings."""
-    try:
-        from .backends import backend as _backend
-        from .backends.base import Backend
-        from .field_backing import (
-            const_arrow_cycle_errors,
-            const_backing_model_errors,
-            const_target_definition_errors,
-            field_backing_model_errors,
-        )
+    """Validate live relation backings and model-owned subject identity."""
+    from ._id import subject_relation
+    from .field_backing import (
+        attribute_backing_model_errors,
+        const_arrow_cycle_errors,
+        const_backing_model_errors,
+        const_target_definition_errors,
+        field_backing_model_errors,
+    )
+    from .resources import model_resource_type
 
-        b: Backend = _backend()
-        if not hasattr(b, "schema"):
-            return []
-        schema = b.schema()
-    except (DatabaseError, RuntimeError) as exc:  # pragma: no cover — install/test paths
-        logging.getLogger("rebac.checks").debug(
-            "Field-backed relation check skipped: schema unavailable (%s)", exc
-        )
+    schema = _schema_for_checks()
+    if schema is None:
         return []
 
     issues: list[checks.CheckMessage] = []
     for definition in schema.definitions:
         for relation in definition.relations:
             for error in field_backing_model_errors(definition, relation):
+                issues.append(checks.Error(error, id="rebac.E009"))
+            for error in attribute_backing_model_errors(definition, relation):
                 issues.append(checks.Error(error, id="rebac.E009"))
             for error in const_backing_model_errors(definition, relation):
                 issues.append(checks.Error(error, id="rebac.E009"))
@@ -135,6 +165,75 @@ def check_field_backed_relations(
         issues.append(checks.Error(error, id="rebac.E009"))
     for error in const_arrow_cycle_errors(schema):
         issues.append(checks.Error(error, id="rebac.E010"))
+    issues.extend(_attribute_collation_warnings(schema))
+
+    # RebacModelBase owns this metadata and Django's app registry owns the
+    # concrete model inventory. Resolve the prefixed type through the same
+    # public owner used by to_object_ref; do not maintain a second registry.
+    from django.apps import apps
+
+    for model in apps.get_models():
+        relation_name = subject_relation(model)
+        if not relation_name:
+            continue
+        resource_type = model_resource_type(model)
+        subject_definition = schema.get_definition(resource_type) if resource_type else None
+        relation_names = (
+            {relation.name for relation in subject_definition.relations}
+            if subject_definition
+            else set()
+        )
+        if relation_name not in relation_names:
+            issues.append(
+                checks.Error(
+                    f"{model._meta.label}: Meta.rebac_subject_relation "
+                    f"{relation_name!r} is not a declared relation on "
+                    f"{resource_type or '<unregistered>'}",
+                    id="rebac.E011",
+                )
+            )
+    return issues
+
+
+def _attribute_collation_warnings(schema: Any) -> list[checks.CheckMessage]:
+    """W009 — text attribute containers need a deterministic, case-sensitive collation.
+
+    The lazy queryset scope compares a text attribute column in SQL (which
+    follows the column collation) while direct checks and ``accessible()``
+    compare Python strings exactly. Best-effort detection only: an explicit
+    ``db_collation`` ending in ``_ci``, or no explicit collation on MySQL,
+    whose defaults are case-insensitive. Other databases and collations are
+    left to the documented rule.
+    """
+    from django.db import DEFAULT_DB_ALIAS, connections, models
+
+    from .field_backing import resolve_attribute_backing
+
+    vendor = connections[DEFAULT_DB_ALIAS].vendor
+    issues: list[checks.CheckMessage] = []
+    for definition in schema.definitions:
+        for relation in definition.relations:
+            backing = resolve_attribute_backing(definition, relation)
+            if backing is None or not isinstance(
+                backing.field, (models.CharField, models.TextField)
+            ):
+                continue
+            collation: str | None = getattr(backing.field, "db_collation", None)
+            if collation is None and vendor != "mysql":
+                continue
+            if collation is not None and not collation.lower().endswith("_ci"):
+                continue
+            column = f"{backing.target_model._meta.label}.{backing.field.name}"
+            issues.append(
+                checks.Warning(
+                    f"{definition.resource_type}#{relation.name}: attribute column {column} "
+                    f"uses collation {collation or 'the MySQL default'}, which is "
+                    "case-insensitive; SQL scoping and Python checks would disagree on "
+                    "container ids that differ only by case.",
+                    hint="Give the column a deterministic, case-sensitive db_collation.",
+                    id="rebac.W009",
+                )
+            )
     return issues
 
 
@@ -293,32 +392,8 @@ def check_universal_admin_in_roles(
         ]
     expected_type, expected_id = universal.split(":", 1)
 
-    # Pull the schema via the singleton backend so tests / manual
-    # ``set_schema`` calls land in the same instance the check inspects.
-    # System checks run in three states where the schema is unloadable
-    # and the check must be a no-op rather than aborting startup:
-    #   - fresh install before migrations (``DatabaseError``)
-    #   - pytest without the ``django_db`` mark (``RuntimeError`` from
-    #     the pytest-django access guard)
-    #   - any unanticipated env where the singleton backend isn't ready.
-    # The broad catch is deliberate, but we log the exception at DEBUG
-    # so a real parser bug or backend misconfiguration is still
-    # diagnosable rather than fully silenced.
-    try:
-        # Lazy import — `rebac.backends` triggers schema loading on first
-        # touch and module-level import would break app-registry boot
-        # order during `python manage.py migrate`.
-        from .backends import backend as _backend
-        from .backends.base import Backend
-
-        b: Backend = _backend()
-        if not hasattr(b, "schema"):
-            return []
-        schema = b.schema()
-    except (DatabaseError, RuntimeError) as exc:  # pragma: no cover — install/test paths
-        logging.getLogger("rebac.checks").debug(
-            "Universal-admin check skipped: schema unavailable (%s)", exc
-        )
+    schema = _schema_for_checks()
+    if schema is None:
         return []
 
     issues: list[checks.CheckMessage] = []

@@ -32,7 +32,9 @@ from rebac.schema import parse_zed
 SCHEMA_TEXT = """
 definition auth/user {}
 
-definition agents/grant {}
+definition agents/grant {
+    relation valid: auth/user
+}
 
 definition mcp/tool/edit_post {
     relation invoker: auth/user | agents/grant#valid

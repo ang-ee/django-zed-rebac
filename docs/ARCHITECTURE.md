@@ -217,12 +217,55 @@ so application default managers cannot move the authorization boundary. Tuple
 writes/deletes targeting the backed relation raise `SchemaError` with the
 actionable Django field to update instead.
 
-Only explicit forward FK/one-to-one bindings are supported in this tier. The
-schema validator rejects field-backed relations with multiple subject types,
-subject sets, wildcards, specific ids, caveats, or expiration; the `rebac.E009`
-system check verifies that the Django field exists and points at the declared
-resource type. A future `SpiceDBBackend` projector should use the same
-metadata to materialize those structural relations into SpiceDB tuples.
+The same field backing supports forward, reverse, and many-to-many lookup
+paths with source-model filters. Target predicates and filters are composed
+in one Django `.filter()` so they constrain the same through row. Attribute
+backing exposes virtual containers derived from a scalar subject column;
+fixed `resource`/`value` bindings own just that container, leaving other IDs
+tuple-backed. The native AST codec owns parsing and schema persistence.
+
+The schema validator rejects backed relations with multiple subject types,
+subject sets, wildcards, specific ids, caveats, or expiration. `rebac.E009`
+validates every Django path, lookup, and target model. Direct checks, arrows,
+subject lookup, eager enumeration, and lazy SQL scopes share these resolved
+owners. Queryset reads use their database alias.
+
+Dynamic attribute containers are named by the canonical Python spelling of the
+column value (`ResolvedAttributeBacking.container_id_of`); a non-canonical id
+such as `"01"` for integer `1` names no container on any read path. The lazy
+SQL scope compiles a text attribute as a correlated column comparison, which
+follows the column's database collation, while the evaluator compares Python
+strings exactly. Give attribute columns a deterministic, case-sensitive
+collation (MySQL's default `*_ci` collations are not) so both paths agree. A
+field whose `to_python` / `get_prep_value` are not the stock `CharField`,
+`TextField` or `IntegerField` implementations is never compiled; the scope
+falls back to enumeration so every read path applies the same conversion.
+`rebac.W009` warns, best-effort, about case-insensitive attribute collations.
+
+Arrows through a live backing (`member->reach` on a field- or attribute-backed
+`member`) are evaluated in bounded queries when the schema declares no caveated
+subject and no built-in actor term (`rebac.schema.introspection.accessible_is_exact`):
+the backend resolves the targets the subject holds the arrow permission on once
+and intersects them with the live path in one `EXISTS`, however wide the
+container is. Otherwise the walk evaluates each distinct target with the
+tri-state evaluator so `CONDITIONAL` results survive.
+
+#### Backings are `LocalBackend`-only until the projector ships
+
+Every backing kind below is resolved live by `LocalBackend` and omitted from
+the exported `.zed`, so with `REBAC_BACKEND = "spicedb"` these relations hold
+no edges until the roadmap's library-owned projector materializes them as
+ordinary tuples. This is the one place the "backend swap is a configuration
+change" contract (`CLAUDE.md` invariant 1) is currently conditional; the
+projection burden differs per kind:
+
+| Backing | Edges the projector must maintain |
+|---|---|
+| Forward FK / one-to-one (`rebac:field=folder`) | one per source row holding the FK |
+| Reverse, many-to-many and filtered paths (`rebac:field={"path":...}`) | one per distinct `(source, target)` pair whose through rows satisfy the filters |
+| Dynamic attribute container (`rebac:attribute={"field":...}`) | one per qualifying subject row, into the container named by its column value |
+| Fixed attribute container (`rebac:attribute={...,"resource":...,"value":...}`) | one per subject row whose column matches the declared value |
+| Const (`rebac:const=<id>`) | one per source row, all pointing at the fixed target |
 
 ### Const-backed (synthetic) relations
 
@@ -262,7 +305,8 @@ Resolution is fixed-target rather than per-row, which has two consequences in
   one-tuple-per-FK, a `SpiceDBBackend` projector must materialize the synthetic
   edge for every row of the source type (or model it as a `parent`/`platform`
   hierarchy), since SpiceDB has no static-relationship primitive. The local
-  synthesis stays free of that cost.
+  synthesis stays free of that cost. See the per-kind table under
+  [Backings are `LocalBackend`-only until the projector ships](#backings-are-localbackend-only-until-the-projector-ships).
 
 ---
 
@@ -359,8 +403,14 @@ from rebac import (
 from rebac.drf    import RebacPermission, RebacFilterBackend
 from rebac.mcp    import rebac_mcp_tool, default_actor_resolver, get_mcp_actor_resolver
 from rebac.schema import parse_zed, validate_schema   # for tooling
+from rebac.memberships import grant, revoke, members_of, containers_of   # direct `member` tuples
 from rebac.roles  import grant, revoke, roles_of, members_of   # role-as-namespace helpers
 ```
+
+`rebac.memberships` owns direct `member`-tuple creation, exact (caveat-aware)
+revocation and enumeration for any container type. `rebac.roles` composes it
+and adds role-spec parsing and role hierarchy; both are first-class, semver-stable
+public APIs.
 
 Everything else (`rebac._internal.*`) is private and may change in any minor release.
 
@@ -461,7 +511,28 @@ engine changes:
 |---|---|
 | **Type-union inclusion** | Fixed compile-time hierarchy. Add the narrower role's `:<id>#member` to the wider role's type union: `relation member: auth/user \| storage/role:object_admin#member`. The narrower-role members flow through to every role declaring this union entry. Best for universal-admin (`platform/role:admin#member`). |
 | **Per-resource permission composition** | Per-resource viewer/editor/admin tiers. Each resource declares `permission read = viewer + editor + admin` so granting `object_admin` lights up read/write/delete automatically. Most explicit; grep-able. Default choice for CRUD-shape roles. |
-| **Runtime-editable `includes` + `effective_member`** | Hierarchy editable at runtime without a schema PR. Roles declare `relation includes` + `permission effective_member = member + includes`; resources reference `#effective_member`. `rebac.roles.imply(parent=..., child=...)` writes the tuple. Adds one engine hop per check. |
+| **Runtime-editable `includes` + `effective_member`** | Hierarchy editable at runtime without a schema PR. Roles declare `relation includes: <namespace>/role` + `permission effective_member = member + includes->effective_member`; resources hold a direct role object and arrow to `effective_member`. `rebac.roles.imply(parent=..., child=...)` writes the direct child-role tuple. Adds one engine hop per check. |
+
+Relationship subjects may name only relations, as required by SpiceDB's
+[subject relation contract](https://authzed.com/docs/spicedb/concepts/schema#subject-relations);
+they cannot name computed permissions. Consumers upgrading an earlier
+``includes: role#effective_member`` experiment must change it to
+``includes: role``, change ``member + includes`` to
+``member + includes->effective_member``, and rewrite each stored implication
+tuple from ``@role:<child>#effective_member`` to ``@role:<child>``. Resource
+grants follow the same shape: store the role object in a relation and arrow
+from the resource permission to the role's ``effective_member`` permission.
+No automatic tuple migration is provided because stripping a subject suffix
+without its matching schema rewrite would change authorization semantics.
+
+Use a consumer-owned data migration over historical relationship models to
+rewrite only the affected grants, preserving caveats, context and expiration.
+If the old persisted schema prevents system checks from loading, run that
+migration with Django's `migrate --skip-checks`, then synchronize the corrected
+schema with `rebac --skip-checks sync` under the normal provenance rules.
+Do not resume serving until the migrations, schema synchronization and ordinary
+checks complete. The runtime rejects the incompatible shape throughout;
+`--skip-checks` only bypasses management-command startup checks.
 
 **System / framework roles** (migrations, asset loaders) use
 `rebac.actors.sudo` / `system_context` — they are not modelled as
@@ -617,8 +688,9 @@ registered Django model; unknown types and missing rows are omitted.
 - FK cascade: when a Django row backed by `RebacMixin` is deleted, the
   `post_delete` signal handler drops the matching `RebacResource` row,
   and the FK CASCADE on `RelationshipRegistry` sweeps every tuple that
-  referenced it. Denormalized mode requires the caller to issue a
-  follow-up `Relationship.objects.filter(...).delete()`.
+  referenced it. Denormalized mode deletes matching resource-side and
+  subject-side tuples directly. Both paths use the deleted instance's Django
+  database alias and participate in that alias's deletion transaction.
 - Referential integrity: writes to `RelationshipRegistry` reference
   registered `(type, id)` pairs only — typos surface as constraint
   violations instead of orphan tuples that never match a check.
@@ -866,6 +938,12 @@ class RebacConfig(AppConfig):
 
 **No queries. No model instantiation. No backend resolution at import time.** The backend singleton is constructed lazily on first access via `rebac.backend()` — this avoids `AppRegistryNotReady` and keeps `migrate` fast.
 
+Schema-dependent checks defer an unreadable persisted schema while Django's
+migration graph reports pending REBAC migrations. This lets `migrate` upgrade
+old backing payloads before the current runtime validates them. Once those
+migrations are applied, malformed schema data remains an error; permission
+evaluation never adopts this startup tolerance.
+
 System checks (in `rebac/checks.py`):
 
 | ID | Severity | What it validates |
@@ -878,6 +956,9 @@ System checks (in `rebac/checks.py`):
 | `rebac.E006` | Error | `REBAC_LOCAL_BACKEND_STORAGE` is `"denormalized"` or `"registry"`. |
 | `rebac.E007` | Error | `REBAC_ZOOKIE_TRANSPORT` is `"none"`, `"header"`, or `"session"`. |
 | `rebac.E008` | Error | `REBAC_FIELD_READ_MODE` is not one of `"allow"`, `"redact"`, `"omit"`, or `"raise"`. |
+| `rebac.E009` | Error | A field-, attribute- or const-backed relation cannot be resolved: missing Django model, identity field, relation path, attribute or filter lookup; a path that ends on a different model than the declared subject type; or a const-backed relation whose target type has no schema definition. |
+| `rebac.E010` | Error | Const-backed arrows form an evaluation cycle that would recurse to the depth limit on every check. |
+| `rebac.E011` | Error | `Meta.rebac_subject_relation` names a relation the model's effective schema definition does not declare. |
 | `rebac.W001` | Warning | `rebac.backends.RebacBackend` not in `AUTHENTICATION_BACKENDS`. |
 | `rebac.W002` | Warning | A model with `Meta.rebac_resource_type` is missing `RebacMixin`. |
 | `rebac.W003` | Warning | An RBAC-bound relation exists where bare `select_related("rel")` / `prefetch_related("rel")` can be unsafe outside the REBAC helpers or Strawberry-Django optimizer. |
@@ -885,6 +966,7 @@ System checks (in `rebac/checks.py`):
 | `rebac.W005` | Warning | LocalBackend is still on denormalized storage and registry migration is recommended for large tables. |
 | `rebac.W006` | Warning | `REBAC_ZOOKIE_TRANSPORT = "session"` without `django.contrib.sessions`. |
 | `rebac.W008` | Warning | `REBAC_FIELD_READ_MODE = "raise"` currently degrades to `"redact"` until descriptor-based protected fields land. |
+| `rebac.W009` | Warning | A text attribute-backed column declares a case-insensitive collation (`*_ci`, or the MySQL default), so SQL scoping and Python checks could disagree on container ids. Best-effort detection. |
 | `rebac.W101` | Warning (`--deploy`) | `REBAC_SPICEDB_TLS = False` in production. |
 
 Users silence individual checks via Django's `SILENCED_SYSTEM_CHECKS = ["rebac.W001"]`.
@@ -1126,8 +1208,12 @@ the left queryset actor/action policy across all operands; rebinding replaces
 the restriction on each operand without mutating the original querysets.
 Boolean combinations require REBAC querysets so empty-query fast paths cannot
 return a plain unscoped manager. Native `resource_id_attr` and
-`subject_id_attr` are public top-level exports with distinct resource/user setting
-fallbacks.
+`subject_id_attr` are public top-level exports. A registered model uses its one
+resource identifier for both object and subject identity; legacy User/Group models
+without resource metadata retain the separate user-setting fallback.
+`REBAC_TYPE_PREFIX` applies when model metadata, configured
+User/Group/anonymous types, or decorators generate identity. Already canonical
+`ObjectRef` and `SubjectRef` values retain their wire types unchanged.
 
 ### Lazy local queryset authorization
 
@@ -1201,7 +1287,7 @@ The headline feature. By inclusion, every model operation is gated against the e
 3. Pre-save signal handler — `create` before INSERT and `write` before UPDATE.
 4. Pre-delete signal handler — `delete` permission check.
 5. Queryset materialisation hooks (`_fetch_all()` and iterators) stamp the resolved actor onto every loaded instance. `from_db()` snapshots original field values for write checks.
-6. `Meta` extension — the metaclass reads `rebac_resource_type` and registers the model with the type registry.
+6. `Meta` extension — the metaclass captures `rebac_resource_type`, `rebac_id_attr`, `rebac_default_action` and `rebac_subject_relation` (the `REBAC_META_OPTIONS` tuple), strips them before Django's `Options` sees them, and re-attaches them on `_meta`. `rebac_subject_relation` makes `to_subject_ref(instance)` emit the model's object reference as a subject set (`auth/group:<id>#member`); `rebac.E011` checks the relation exists. See [proposal 0006](./proposals/0006-model-subject-identity.md).
 
 ### Manager and queryset surface
 
@@ -1461,12 +1547,22 @@ Cache keys include backend instance identity, including reentrant checks through
 different backends. Context keys preserve scalar types (`True`, `1`, and `1.0` differ).
 Complex context values bypass caching, including nested dictionaries and lists.
 
-LocalBackend bypasses evaluator caching inside database transactions and when
-the active schema declares expiring relationships. This prevents rolled-back
-grants and expired tuples from surviving as cached decisions. Backend relationship
-writes invalidate decision generations across local backend instances in this
-process, including evaluators suspended by a nested scope. Expiration schemas
-therefore trade repeated graph reads for deadline-correct authorization.
+LocalBackend declines to cache a decision under three independent conditions:
+inside a database transaction (a rollback would leave stale answers), when the
+active schema declares expiring relationships (a deadline can pass with no
+write), and when the decision's resource type can reach live field or attribute
+backing. Django bulk, M2M and reverse-relation writes do not advance the
+relationship generation, so those decisions must read the rows again. The live
+set is `rebac.schema.introspection.live_backed_resource_types(schema)`: a type
+is live when one of its relations is field- or attribute-backed, or when one of
+its relations admits an allowed subject whose type is live. Allowed-subject
+types cover arrows, subject sets and const targets, so the closure is a
+conservative over-approximation; types that cannot reach a backing keep caching.
+Backend relationship writes and the `post_delete` cascade
+(`mark_relationships_changed()`) invalidate decision generations across local
+backend instances in this process, including evaluators suspended by a nested
+scope. Live-reachable types trade repeated graph reads for current
+authorization; lazy queryset scopes remain SQL either way.
 
 The old `accessible_cached`, `enable_accessible_cache`, and
 `disable_accessible_cache` helpers were removed in 0.5. Use

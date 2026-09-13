@@ -22,7 +22,8 @@ from django.utils import timezone
 
 from ...models.resource import RebacResource
 from ...schema import Schema, render_zed, resolve_schema_path
-from ...schema.parser import parse_zed, validate_schema
+from ...schema.ast import backing_to_dict
+from ...schema.parser import parse_zed, subject_relation_errors, validate_schema
 
 
 def _stale_record_prune_order(external_id: str) -> tuple[int, str]:
@@ -123,6 +124,7 @@ class Command(BaseCommand):
                 raise CommandError("Schema overwrite cancelled; no changes made.")
 
         sources: list[tuple[Any, Path, Any]] = []
+        installed_schemas: list[Schema] = []
         seen_definitions: dict[str, str] = {}
         seen_caveats: dict[str, str] = {}
         for app_config in apps.get_app_configs():
@@ -134,6 +136,7 @@ class Command(BaseCommand):
 
             text = schema_path.read_text(encoding="utf-8")
             schema = parse_zed(text)
+            installed_schemas.append(schema)
             errors = validate_schema(schema)
             if errors:
                 for e in errors:
@@ -156,6 +159,18 @@ class Command(BaseCommand):
                 seen_caveats[caveat.name] = package_name
             if selected:
                 sources.append((app_config, schema_path, schema))
+
+        effective = Schema(
+            definitions=[
+                definition for schema in installed_schemas for definition in schema.definitions
+            ],
+            caveats=[caveat for schema in installed_schemas for caveat in schema.caveats],
+        )
+        effective_errors = subject_relation_errors(effective)
+        if effective_errors:
+            for error in effective_errors:
+                self.stderr.write(self.style.ERROR(f"  effective schema: {error}"))
+            raise CommandError("Effective schema validation failed")
 
         any_drift = False
         for app_config, schema_path, schema in sources:
@@ -224,13 +239,7 @@ class Command(BaseCommand):
                             natural_key={"definition": schema_def, "name": r.name},
                             payload={
                                 "allowed_subjects": allowed,
-                                "backing": (
-                                    None
-                                    if r.backing is None
-                                    else {"kind": "const", "target_id": r.backing.target_id}
-                                    if r.backing.kind == "const"
-                                    else {"attname": r.backing.attname, "kind": r.backing.kind}
-                                ),
+                                "backing": backing_to_dict(r.backing),
                                 "caveat": "",
                                 "with_expiration": r.with_expiration,
                             },
