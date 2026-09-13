@@ -21,7 +21,9 @@ from rebac.schema import parse_zed
 SCHEMA_TEXT = """
 definition auth/user {}
 definition agents/agent {}
-definition agents/grant {}
+definition agents/grant {
+    relation valid: auth/user
+}
 definition auth/group {
     relation member: auth/user
 }

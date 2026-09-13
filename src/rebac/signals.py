@@ -11,11 +11,12 @@ from django.dispatch import receiver
 
 from ._id import resource_id_attr
 from .actors import current_actor as _current_actor
+from .actors import model_can_resolve_subject, to_subject_ref
 from .conf import app_settings
-from .errors import PermissionDenied
+from .errors import NoActorResolvedError, PermissionDenied
 from .field_visibility import backend_schema
 from .mixins import RebacMixin
-from .resources import model_resource_type
+from .resources import model_resource_type, to_object_ref
 from .schema.walker import field_gated_actions
 from .types import ObjectRef, SubjectRef
 
@@ -400,9 +401,10 @@ def _rebac_override_post_delete(sender: type[Model], instance: Any, **_: Any) ->
 
 # ---------- RebacResource cascade ----------
 #
-# When a Django row backed by ``RebacMixin`` is deleted, every relationship
-# occurrence of its identity must disappear with it. Registry storage does so
-# by deleting its ``RebacResource`` row and relying on both FK cascades.
+# When a Django row with a resource or subject identity is deleted, every
+# relationship occurrence of that identity must disappear with it. Registry
+# storage does so by deleting its ``RebacResource`` row and relying on both FK
+# cascades.
 #
 # Denormalized storage has no foreign keys, so this handler deletes both
 # resource-side and subject-side occurrences explicitly. Both paths run on the
@@ -413,19 +415,23 @@ def _rebac_override_post_delete(sender: type[Model], instance: Any, **_: Any) ->
 def _rebac_cascade_resource(
     sender: type[Model], instance: Any, using: str = "default", **_: Any
 ) -> None:
-    """Remove relationship resource and subject occurrences for a deleted row.
+    """Remove every relationship occurrence of a deleted model identity.
 
-    Listens on every model's ``post_delete``; short-circuits in O(1) when
-    the sender is not REBAC-bound (the ``getattr(meta,
-    rebac_resource_type, None)`` lookup is the only work done in the
-    common-case false branch).
+    Listens on every model's ``post_delete`` and uses class metadata to skip
+    rows for which neither the resource nor actor resolver owns an identity.
+    This includes configured Django User/Group subjects as well as RebacMixin
+    resources and model-owned or explicitly registered subjects.
     """
-    if not isinstance(instance, RebacMixin):
+    identities: set[ObjectRef] = set()
+    if isinstance(instance, RebacMixin) and model_resource_type(sender):
+        identities.add(to_object_ref(instance))
+    if model_can_resolve_subject(sender):
+        try:
+            identities.add(to_subject_ref(instance).object)
+        except NoActorResolvedError:
+            pass
+    if not identities:
         return
-    rebac_type = model_resource_type(sender)
-    if not rebac_type:
-        return
-    resource_id = str(getattr(instance, resource_id_attr(sender)))
     from .backends.local import mark_relationships_changed
 
     # ``post_delete`` fires inside the deleting Collector's atomic block on
@@ -433,16 +439,25 @@ def _rebac_cascade_resource(
     if app_settings.REBAC_LOCAL_BACKEND_STORAGE == "registry":
         from .models import RebacResource
 
-        RebacResource.objects.using(using).filter(
-            resource_type=rebac_type,
-            resource_id=resource_id,
-        ).delete()
+        identity_filter = Q()
+        for identity in sorted(identities, key=lambda ref: (ref.resource_type, ref.resource_id)):
+            identity_filter |= Q(
+                resource_type=identity.resource_type,
+                resource_id=identity.resource_id,
+            )
+        RebacResource.objects.using(using).filter(identity_filter).delete()
     else:
         from .models import active_relationship_model
 
-        active_relationship_model().objects.using(using).filter(
-            Q(resource_type=rebac_type, resource_id=resource_id)
-            | Q(subject_type=rebac_type, subject_id=resource_id)
-        ).delete()
+        relationship_filter = Q()
+        for identity in sorted(identities, key=lambda ref: (ref.resource_type, ref.resource_id)):
+            relationship_filter |= Q(
+                resource_type=identity.resource_type,
+                resource_id=identity.resource_id,
+            ) | Q(
+                subject_type=identity.resource_type,
+                subject_id=identity.resource_id,
+            )
+        active_relationship_model().objects.using(using).filter(relationship_filter).delete()
     # The rows changed outside the backend's own write path; drop decisions.
     mark_relationships_changed()

@@ -47,7 +47,9 @@ definition auth/group {
 }
 
 definition agents/agent {}
-definition agents/grant {}
+definition agents/grant {
+    relation valid: auth/user
+}
 
 definition blog/folder {
     relation owner: auth/user

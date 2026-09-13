@@ -80,6 +80,11 @@ def model_resource_id(obj: Any) -> str:
             f"Cannot resolve {type(obj).__name__} to ObjectRef: "
             f"rebac_id_attr={attr!r} not found on instance ({exc})."
         ) from exc
+    if value is None or (isinstance(value, str) and not value):
+        raise TypeError(
+            f"Cannot resolve {type(obj).__name__} to ObjectRef: "
+            f"rebac_id_attr={attr!r} resolved to an empty value."
+        )
     return str(value)
 
 

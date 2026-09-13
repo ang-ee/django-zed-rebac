@@ -552,7 +552,7 @@ def validate_schema(schema: Schema) -> list[str]:
 
     Empty list means valid.
     """
-    errors: list[str] = []
+    errors = subject_relation_errors(schema)
     caveat_names = {c.name for c in schema.caveats}
 
     for definition in schema.definitions:
@@ -603,9 +603,11 @@ def validate_schema(schema: Schema) -> list[str]:
                         f"reserved built-in actor {sub.type!r} is valid only "
                         "inside permission expressions"
                     )
-                # Cross-package references are validated at sync time, not here —
-                # we don't know what other packages are loaded. We DO check that
-                # caveat names referenced inline exist (when present in the same file).
+                # An unresolved target definition may belong to another package,
+                # so fragment validation defers it until the effective schema is
+                # loaded. When the target is present, however, its
+                # relation/permission namespace is authoritative. We also check
+                # that caveat names referenced inline exist in this schema.
                 if sub.with_caveat and sub.with_caveat not in caveat_names:
                     errors.append(
                         f"{definition.resource_type}#{relation.name}: "
@@ -623,6 +625,39 @@ def validate_schema(schema: Schema) -> list[str]:
                 f"{definition.resource_type}: name collision between relations and permissions"
             )
 
+    return errors
+
+
+def subject_relation_errors(schema: Schema) -> list[str]:
+    """Validate SpiceDB's relation-only relationship-subject contract.
+
+    Source fragments may refer to a type supplied by another package, so an
+    absent target definition is deferred until the effective schema is built.
+    A present target definition owns its relation namespace completely.
+    """
+    errors: list[str] = []
+    for definition in schema.definitions:
+        for relation in definition.relations:
+            for subject in relation.allowed_subjects:
+                if not subject.relation:
+                    continue
+                target = schema.get_definition(subject.type)
+                if target is None:
+                    continue
+                if any(item.name == subject.relation for item in target.relations):
+                    continue
+                target_kind = (
+                    "names a permission"
+                    if any(item.name == subject.relation for item in target.permissions)
+                    else "does not name a declared relation"
+                )
+                errors.append(
+                    f"{definition.resource_type}#{relation.name}: subject relation "
+                    f"{subject.type}#{subject.relation} {target_kind}; relationship subjects "
+                    "may reference relations only. Store a direct object in the relation, "
+                    "use relation->permission in the resource permission, and migrate existing "
+                    "tuples together with the schema"
+                )
     return errors
 
 

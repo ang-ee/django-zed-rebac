@@ -122,14 +122,15 @@ hierarchy declare their roles as::
 
     definition <namespace>/role {
         relation member:   auth/user | auth/group#member | platform/role:admin#member
-        relation includes: <namespace>/role#effective_member
+        relation includes: <namespace>/role
 
-        permission effective_member = member + includes
+        permission effective_member = member + includes->effective_member
     }
 
-…and resources reference ``<namespace>/role:<name>#effective_member``
-instead of ``#member``. :func:`imply` then writes the ``includes`` tuple
-that wires one role's effective_member into another's.
+…and resources hold a direct role relation, then arrow to
+``effective_member``. :func:`imply` writes the ``includes`` tuple that wires
+one role object's computed membership into another's without placing a
+permission name in a relationship subject.
 
 Addons that don't need runtime-editable hierarchy can skip the
 ``includes`` relation entirely and use per-resource permission composition
@@ -240,8 +241,9 @@ def imply(*, parent: str | ObjectRef, child: str | ObjectRef) -> RelationshipRow
 
     Requires both role definitions to use the ``includes`` /
     ``effective_member`` pattern (see :data:`ROLE_INCLUDES_RELATION`).
-    Resources that reference ``parent#effective_member`` will then resolve
-    grants of ``child`` as if they were ``parent`` grants.
+    Resources whose permissions arrow through ``parent`` to
+    ``effective_member`` will then resolve grants of ``child`` as if they were
+    ``parent`` grants.
 
     The membership row written is::
 
@@ -251,7 +253,7 @@ def imply(*, parent: str | ObjectRef, child: str | ObjectRef) -> RelationshipRow
             relation="includes",
             subject_type=<child.resource_type>,
             subject_id=<child.resource_id>,
-            optional_subject_relation="effective_member",
+            optional_subject_relation="",
         )
 
     Idempotent — re-implying an existing edge returns the existing row.
@@ -279,11 +281,7 @@ def imply(*, parent: str | ObjectRef, child: str | ObjectRef) -> RelationshipRow
     tuple_ = RelationshipTuple(
         resource=parent_ref,
         relation=ROLE_INCLUDES_RELATION,
-        subject=SubjectRef.of(
-            child_ref.resource_type,
-            child_ref.resource_id,
-            ROLE_EFFECTIVE_MEMBER,
-        ),
+        subject=SubjectRef(child_ref),
     )
     # Wrap write + read-back: same DoesNotExist race as ``grant``.
     with transaction.atomic():
@@ -294,14 +292,14 @@ def imply(*, parent: str | ObjectRef, child: str | ObjectRef) -> RelationshipRow
             relation=ROLE_INCLUDES_RELATION,
             subject_type=child_ref.resource_type,
             subject_id=child_ref.resource_id,
-            optional_subject_relation=ROLE_EFFECTIVE_MEMBER,
+            optional_subject_relation="",
             caveat_name="",
         )
         return cast("RelationshipRow", row)
 
 
 def unimply(*, parent: str | ObjectRef, child: str | ObjectRef) -> int:
-    """Remove the implication ``child#effective_member → parent``.
+    """Remove the direct ``child → parent#includes`` implication edge.
 
     Returns the number of rows deleted (0 or 1).
     """
@@ -317,11 +315,7 @@ def unimply(*, parent: str | ObjectRef, child: str | ObjectRef) -> int:
     tuple_ = RelationshipTuple(
         resource=parent_ref,
         relation=ROLE_INCLUDES_RELATION,
-        subject=SubjectRef.of(
-            child_ref.resource_type,
-            child_ref.resource_id,
-            ROLE_EFFECTIVE_MEMBER,
-        ),
+        subject=SubjectRef(child_ref),
     )
     # Wrap presence-check + delete: same TOCTOU as ``revoke``.
     with transaction.atomic():
@@ -331,7 +325,7 @@ def unimply(*, parent: str | ObjectRef, child: str | ObjectRef) -> int:
             relation=ROLE_INCLUDES_RELATION,
             subject_type=child_ref.resource_type,
             subject_id=child_ref.resource_id,
-            optional_subject_relation=ROLE_EFFECTIVE_MEMBER,
+            optional_subject_relation="",
             caveat_name="",
         ).exists()
         delete_relationship(tuple_)
@@ -356,7 +350,7 @@ def implies_of(role: str | ObjectRef) -> Iterator[ObjectRef]:
         relation=ROLE_INCLUDES_RELATION,
         subject_type=role_ref.resource_type,
         subject_id=role_ref.resource_id,
-        optional_subject_relation=ROLE_EFFECTIVE_MEMBER,
+        optional_subject_relation="",
     )
     for row in rows:
         yield ObjectRef(row.resource_type, row.resource_id)
@@ -377,7 +371,7 @@ def implied_by_of(role: str | ObjectRef) -> Iterator[ObjectRef]:
         resource_type=role_ref.resource_type,
         resource_id=role_ref.resource_id,
         relation=ROLE_INCLUDES_RELATION,
-        optional_subject_relation=ROLE_EFFECTIVE_MEMBER,
+        optional_subject_relation="",
     )
     for row in rows:
         yield ObjectRef(row.subject_type, row.subject_id)

@@ -118,6 +118,18 @@ _schema_operation_scope: ContextVar[SchemaScope | None] = ContextVar(
 )
 
 
+def _enforced_schema_errors(schema: Schema) -> list[str]:
+    """Return contracts the local runtime must reject before evaluation."""
+    from ..schema.parser import subject_relation_errors, validate_schema
+
+    backing_errors = [
+        error
+        for error in validate_schema(schema)
+        if "backed relation" in error or "backing" in error
+    ]
+    return backing_errors + subject_relation_errors(schema)
+
+
 def _schema_operation[**P, R](method: Callable[P, R]) -> Callable[P, R]:
     """Reuse one schema within a public backend operation and nested reads."""
 
@@ -184,15 +196,9 @@ class LocalBackend(Backend):
 
     def set_schema(self, schema: Schema) -> None:
         """Install the in-memory schema. Called by the sync command."""
-        from ..schema.parser import validate_schema
-
-        backing_errors = [
-            error
-            for error in validate_schema(schema)
-            if "backed relation" in error or "backing" in error
-        ]
-        if backing_errors:
-            raise SchemaError("; ".join(backing_errors))
+        schema_errors = _enforced_schema_errors(schema)
+        if schema_errors:
+            raise SchemaError("; ".join(schema_errors))
         with self._schema_lock:
             self._schema = schema
             self._schema_is_manual = True
@@ -377,7 +383,11 @@ class LocalBackend(Backend):
             (row.expires_at for row in overrides if row.expires_at is not None),
             default=None,
         )
-        return compose(baseline, overrides), expires_at
+        effective = compose(baseline, overrides)
+        schema_errors = _enforced_schema_errors(effective)
+        if schema_errors:
+            raise SchemaError("; ".join(schema_errors))
+        return effective, expires_at
 
     # ---------- Public API ----------
 
@@ -1270,13 +1280,10 @@ class LocalBackend(Backend):
             hop = self._evaluate_row_caveat(row, context, missing)
             if hop is False:
                 continue
-            target_definition = self.schema().get_definition(row.subject_type)
-            if target_definition is None:
-                continue
-            inner = self._eval_permission_on(
-                permission_name=row.optional_subject_relation,
-                definition=target_definition,
+            inner = self._has_direct_relation(
+                resource_type=row.subject_type,
                 resource_id=row.subject_id,
+                relation=row.optional_subject_relation,
                 subject=subject,
                 depth=depth + 1,
                 context=context,
@@ -1680,6 +1687,18 @@ class LocalBackend(Backend):
             raise ValueError(f"unknown relation: {tup.resource.resource_type}#{tup.relation}")
         if relation.has_backing(tup.resource.resource_id):
             raise self._backed_write_error(tup.resource.resource_type, relation)
+        if tup.subject.optional_relation:
+            subject_definition = self.schema().get_definition(tup.subject.subject_type)
+            if (
+                subject_definition is not None
+                and _find_relation(subject_definition, tup.subject.optional_relation) is None
+            ):
+                raise ValueError(
+                    f"subject {tup.subject} does not name a declared relation; "
+                    "relationship subjects cannot reference permissions. Migrate the "
+                    "schema to a direct object relation and use an arrow to compute "
+                    "the target permission"
+                )
         if not _subject_allowed_by_relation(relation, tup.subject):
             raise ValueError(
                 f"subject {tup.subject} is not allowed for "
@@ -1831,13 +1850,10 @@ class LocalBackend(Backend):
             hop = self._evaluate_row_caveat(row, context, sink)
             if hop is not True:
                 continue
-            target_definition = self.schema().get_definition(row.subject_type)
-            if target_definition is None:
-                continue
-            inner = self._eval_permission_on(
-                permission_name=row.optional_subject_relation,
-                definition=target_definition,
+            inner = self._has_direct_relation(
+                resource_type=row.subject_type,
                 resource_id=row.subject_id,
+                relation=row.optional_subject_relation,
                 subject=subject,
                 depth=depth + 1,
                 context=context,

@@ -9,8 +9,8 @@ Guidance for Codex working in the `django-zed-rebac` repository.
 
 ## Project overview
 
-`django-zed-rebac` is a **standalone, drop-in REBAC plugin for any Django 4.2 /
-5.2 / 6.0 project**. SpiceDB-compatible schema language, two interchangeable
+`django-zed-rebac` is a **standalone, drop-in REBAC plugin for any Django 6.0
+project** (the supported matrix is pinned in `pyproject.toml`; see § Tooling). SpiceDB-compatible schema language, two interchangeable
 backends (`LocalBackend` recursive-CTE in pure Django; `SpiceDBBackend` over
 `authzed-py`), strict-by-default queryset scoping, AI-agent Grant pattern,
 MCP / Celery / DRF / GraphQL adapters.
@@ -241,19 +241,18 @@ write/delete/create permissions. The schema doctor (`rebac.W001`-class)
 emits a warning at build time when a wildcard relation feeds a non-read
 permission. Don't suppress the check; fix the schema.
 
-### 9. AI agents go through the Grant pattern (consumer-shipped types)
+### 9. Agent delegation belongs to consumer schemas
 
-An agent acting on behalf of a user gets the **structural intersection** of
-(a) the user's grants and (b) the agent's declared capabilities — enforced
-by the `agents/grant#valid` SubjectSet pattern in target-resource type
-unions. **Don't** model agents as direct REBAC principals
-(`relation viewer: agents/agent`) — that bypasses the user's grants entirely
-and is the canonical anti-pattern.
+Consumer schemas must explicitly model any intersection of requester grants
+and agent capabilities. The engine does not impersonate a grant's owner or
+derive permissions from an agent's identity. Use declared relation subject sets
+and relation-to-permission arrows; a suffix such as `#valid` is valid only when
+`valid` is a relation, never when it names a computed permission.
 
 `agents/agent` and `agents/grant` (and `auth/apikey`, `auth/service`, etc.)
 are NOT shipped by this plugin. They live in the consumer's apps. The
-plugin's auto-emitted base schema is limited to `auth/user` and `auth/group`
-(which map onto `django.contrib.auth`). When you reject a PR that adds an
+plugin's configured User/Group mappings default to `auth/user` and `auth/group`;
+automatic base-schema emission is not implemented. When you reject a PR that adds an
 `agents/*` definition to `rebac/permissions.py`, this is why.
 
 ---
@@ -325,8 +324,13 @@ Per `docs/ARCHITECTURE.md § Testing`:
 - **Test:** `pytest` + `pytest-django` for integration; pure-Python `pytest`
   for unit. Cross-backend contract tests via `testcontainers-spicedb`,
   opt-in marker.
-- **CI matrix:** Python 3.11/3.12/3.13/3.14 × Django 4.2/5.2/6.0 × DB
-  (sqlite for unit, postgres-15/16 for integration).
+- **CI matrix:** Python 3.14 × Django 6.0 × SQLite, as declared in
+  `.github/workflows/ci.yml` and `pyproject.toml`. Broader matrices are a
+  release decision, not the current contract. `ruff` targets 3.14, so
+  3.14-only syntax is in play and `ruff format` emits it: an unparenthesised
+  multi-exception clause (`except A, B:`, PEP 758) is the formatter's
+  canonical form, not a Python 2 leftover. Don't add `# fmt: skip` to fight
+  it.
 - **DjangoVer** for releases:
   `<DJANGO_MAJOR>.<DJANGO_FEATURE>.<PACKAGE_VERSION>`.
 

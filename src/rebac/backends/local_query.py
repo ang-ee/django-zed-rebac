@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from typing import TYPE_CHECKING, Any, cast
 
+from django.core.exceptions import FieldDoesNotExist
 from django.db import connections, models
 from django.db.models import Exists, F, OuterRef, Q, Subquery, Value
 from django.db.models.expressions import Combinable
@@ -12,6 +13,7 @@ from django.utils import timezone
 
 from .._id import resource_id_attr
 from ..conf import app_settings
+from ..field_backing import model_identity_fields
 from ..schema.ast import (
     BUILTIN_ACTOR_TYPES,
     AllowedSubject,
@@ -40,11 +42,15 @@ def _truth(value: bool) -> Q:
 
 
 def _concrete_field(model: type[models.Model], identity: str) -> models.Field[Any, Any]:
-    """The concrete column behind ``identity``; reverse relations cannot be compiled."""
-    field = model._meta.pk if identity == "pk" else model._meta.get_field(identity)
-    if not isinstance(field, models.Field) or not field.concrete:
+    """The scalar conversion owner behind a concrete identity lookup."""
+
+    try:
+        query_field, scalar_field = model_identity_fields(model, identity)
+    except FieldDoesNotExist, ValueError:
+        raise UnsupportedScope from None
+    if not query_field.concrete:
         raise UnsupportedScope
-    return field
+    return scalar_field
 
 
 # Field classes whose Python and database conversions are the identity, so a
@@ -230,13 +236,31 @@ class LocalQueryScope:
             raise UnsupportedScope
         backing = self.backend._resolve_declared_field_backing(definition, relation)
         if backing is not None:
-            if model is not backing.source_model and not self.native_identity(
-                backing.source_model, backing.source_id_attr
-            ):
-                raise UnsupportedScope
+            direct_field = (
+                backing.field
+                if model is backing.source_model
+                and isinstance(identity, str)
+                and "__" not in backing.path
+                and not backing.filters
+                and isinstance(backing.field, (models.ForeignKey, models.OneToOneField))
+                else None
+            )
             if target is None:
                 if not subject_allowed_by_relation(relation, self.subject):
                     return _truth(False)
+                if direct_field is not None:
+                    if backing.targets_identity_directly():
+                        return Q(**{direct_field.attname: self.subject.subject_id})
+                    destination = backing.target_model._base_manager.using(self.using).filter(
+                        **{backing.target_id_attr: self.subject.subject_id}
+                    )
+                    return Q(
+                        **{
+                            f"{direct_field.attname}__in": Subquery(
+                                destination.order_by().values(direct_field.target_field.name)
+                            )
+                        }
+                    )
                 source = backing.queryset(subject=self.subject, using=self.using)
             else:
                 destination = backing.target_model._base_manager.using(self.using).filter(
@@ -248,15 +272,25 @@ class LocalQueryScope:
                         seen,
                     )
                 )
+                if direct_field is not None:
+                    return Q(
+                        **{
+                            f"{direct_field.attname}__in": Subquery(
+                                destination.order_by().values(direct_field.target_field.name)
+                            )
+                        }
+                    )
                 target_ids = destination.order_by().values_list(backing.target_id_attr, flat=True)
                 source = backing.queryset(target_ids=target_ids, using=self.using)
-            return Q(
-                Exists(
-                    source.alias(
-                        _scope_resource_id=Cast(F(backing.source_id_attr), models.TextField())
-                    ).filter(_scope_resource_id=self.reference(identity))
-                )
-            )
+            if model is backing.source_model and isinstance(identity, str):
+                source = source.filter(pk=OuterRef("pk"))
+            else:
+                if not self.native_identity(backing.source_model, backing.source_id_attr):
+                    raise UnsupportedScope
+                source = source.alias(
+                    _scope_resource_id=Cast(F(backing.source_id_attr), models.TextField())
+                ).filter(_scope_resource_id=self.reference(identity))
+            return Q(Exists(source))
         attribute = self.backend._resolve_declared_attribute_backing(definition, relation)
         if attribute is not None:
             if (
@@ -400,6 +434,12 @@ class LocalQueryScope:
                 if allowed.wildcard and not self.subject.optional_relation:
                     member |= _truth(self.subject.subject_type == allowed.type)
                 if allowed.relation:
+                    target_definition = self.schema.get_definition(allowed.type)
+                    if (
+                        target_definition is None
+                        or find_relation(target_definition, allowed.relation) is None
+                    ):
+                        raise UnsupportedScope
                     member |= self.permission(
                         allowed.type,
                         allowed.relation,

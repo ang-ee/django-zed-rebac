@@ -9,7 +9,7 @@ from typing import TYPE_CHECKING, Any
 from django.core.exceptions import FieldDoesNotExist, FieldError, ValidationError
 from django.db import models
 from django.db.models import Q, QuerySet
-from django.db.models.expressions import Combinable
+from django.db.models.expressions import BaseExpression, Col, ColPairs, Combinable
 
 from ._id import resource_id_attr
 from .resources import model_for_resource_type, model_for_subject_type, model_resource_type
@@ -68,10 +68,25 @@ class ResolvedFieldBacking:
     def source_values_path(self) -> str:
         return self.source_id_attr
 
+    def targets_identity_directly(self) -> bool:
+        """Whether a forward FK column stores the target's REBAC identity."""
+
+        if not isinstance(self.field, (models.ForeignKey, models.OneToOneField)):
+            return False
+        target_identity = (
+            self.target_model._meta.pk
+            if self.target_id_attr == "pk"
+            else self.target_model._meta.get_field(self.target_id_attr)
+        )
+        return self.field.target_field is target_identity
+
     def target_values_path(self) -> str:
-        if "__" not in self.path and self.target_id_attr == "pk":
-            if isinstance(self.field, (models.ForeignKey, models.OneToOneField)):
-                return self.field.attname
+        if (
+            "__" not in self.path
+            and isinstance(self.field, (models.ForeignKey, models.OneToOneField))
+            and self.targets_identity_directly()
+        ):
+            return self.field.attname
         return f"{self.path}__{self.target_id_attr}"
 
     def queryset(
@@ -257,12 +272,58 @@ def _validate_filters(model: type[models.Model], filters: tuple[tuple[str, Any],
         raise ValueError(f"invalid filters on {model.__name__}: {exc}") from exc
 
 
-def _validate_model_identity(model: type[models.Model], attr: str) -> None:
-    """Require an ORM-addressable scalar identity for live backing queries."""
+def model_identity_fields(
+    model: type[models.Model], attr: str
+) -> tuple[models.Field[Any, Any], models.Field[Any, Any]]:
+    """Return the query field and scalar conversion owner for an identity.
+
+    Django exposes an MTI child primary key as its parent-link ``OneToOneField``.
+    Relation attnames likewise address the stored scalar, while relation names
+    materialize model instances and cannot be wire identities.
+    """
 
     field = model._meta.pk if attr == "pk" else model._meta.get_field(attr)
-    if not field.concrete or field.is_relation:
-        raise ValueError(f"{model.__name__} identity {attr!r} must be a concrete scalar field")
+    if not isinstance(field, models.Field) or isinstance(field, models.CompositePrimaryKey):
+        raise ValueError(f"{model.__name__} identity {attr!r} must be a scalar field")
+    scalar_field = field
+    if field.is_relation:
+        if not isinstance(field, (models.ForeignKey, models.OneToOneField)) or (
+            attr != "pk" and attr != field.attname
+        ):
+            raise ValueError(f"{model.__name__} identity {attr!r} must be a scalar field")
+    seen: set[int] = set()
+    while scalar_field.is_relation:
+        if id(scalar_field) in seen or not isinstance(
+            scalar_field, (models.ForeignKey, models.OneToOneField)
+        ):
+            raise ValueError(f"{model.__name__} identity {attr!r} must be a scalar field")
+        seen.add(id(scalar_field))
+        scalar_field = scalar_field.target_field
+    if isinstance(scalar_field, models.CompositePrimaryKey):
+        raise ValueError(f"{model.__name__} identity {attr!r} must be a scalar field")
+    return field, scalar_field
+
+
+def _validate_model_identity(model: type[models.Model], attr: str) -> None:
+    """Require a scalar identity that Django can project and look up."""
+
+    field, _scalar_field = model_identity_fields(model, attr)
+    try:
+        expression = field.get_col(model._meta.db_table)
+    except (AttributeError, TypeError, ValueError) as exc:
+        raise ValueError(
+            f"{model.__name__} identity {attr!r} must provide a queryable column expression"
+        ) from exc
+    if (
+        isinstance(expression, ColPairs)
+        or not isinstance(expression, BaseExpression)
+        or (isinstance(expression, Col) and expression.target.column is None)
+    ):
+        raise ValueError(
+            f"{model.__name__} identity {attr!r} must provide a queryable column expression"
+        )
+    if field.get_lookup("exact") is None or field.get_lookup("in") is None:
+        raise ValueError(f"{model.__name__} identity {attr!r} must support exact and in lookups")
 
 
 def _resolve_field_backing(definition: Definition, relation: Relation) -> ResolvedFieldBacking:

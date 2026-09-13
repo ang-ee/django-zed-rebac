@@ -5,6 +5,75 @@ pre-1.0; breaking changes within a minor version are explicitly called out.
 
 ## [Unreleased]
 
+## [0.17.1] — 2026-09-13
+
+### Fixed
+
+- Model identity resolution rejects `None` and empty strings before they can
+  become shared invalid graph IDs. Valid zero-valued and UUID identities keep
+  their existing wire representation.
+- Unrelated Django model deletions skip subject resolution and relationship
+  cleanup. Resource, User, Group and registered-subject cleanup retains the
+  canonical identity resolver and deletion database alias.
+- Repair the virtual-identity test fixture so Django initialization cannot
+  shadow its computed value; the virtual live-backing regression suite now
+  runs.
+- The revocation regression keeps surviving direct grants in its expected
+  scope instead of asserting they disappear.
+- Live backing accepts ORM-queryable scalar virtual identities, including
+  public IDs encoded from an existing integer primary key. Django fields own
+  lookup preparation and result conversion; graph IDs and stored tuples keep
+  their existing identity. Missing, model-object and non-queryable identity
+  attributes remain invalid.
+- Accept scalar `pk` identities on multi-table children and explicit relation
+  ID attributes such as `parent_ptr_id`. Django's parent-link primary keys
+  retain their native scalar conversion; relation descriptors that return
+  model objects remain invalid.
+- Preserve the native column optimization for unfiltered forward FK/O2O
+  relations. Filtered, reverse and M2M paths correlate source rows by their
+  primary key, without casting encoded public IDs. A foreign key targeting a
+  different field from the REBAC identity resolves through the target model.
+- Schema-dependent system checks defer unreadable persisted data while REBAC
+  migrations are pending, so the ordinary migration command can apply
+  `0004_field_backing_path`. Runtime evaluation remains strict, and the
+  released migration is unchanged.
+- Relationship cleanup covers configured Django User and Group subjects as
+  well as model resources, using the deletion database alias in both storage
+  modes. Unrelated identities and grants remain intact.
+
+### Documentation
+
+- Clarify that consumer schemas own agent delegation: the engine builds the
+  grant subject but neither impersonates the grant's owner nor derives
+  permissions from an agent's identity. `README.md`, `docs/ARCHITECTURE.md`,
+  `docs/ZED.md` and both contributor guides now state the same contract.
+- State the contributor CI matrix once: Python 3.14 × Django 6.0 × SQLite as
+  declared in `pyproject.toml` and the CI workflow. `docs/ARCHITECTURE.md`
+  no longer lists a Postgres integration matrix that CI does not run.
+
+### Corrected contract — consumer migration required
+
+- Removed the permission-named subject-set behavior added in 0.17.0.
+  Relationship subjects may reference a declared relation (`group:id#member`),
+  never a computed permission (`role:id#effective_member`). Schema loading and
+  tuple writes reject that shape. Checking a permission or evaluating a
+  `relation->permission` arrow remains supported.
+- Runtime role hierarchy uses `relation includes: role` and
+  `permission effective_member = member + includes->effective_member`.
+  `rebac.roles.imply` writes a direct child-role object. Resource schemas
+  likewise grant a plain role object and arrow to its `effective_member`.
+- Consumers must migrate their schema and corresponding tuples together.
+  Rewrite known implication edges from `@role:id#effective_member` to
+  `@role:id`; move computed-role grants to the matching direct role relation.
+  Preserve caveats, context and expiration. There is no generic suffix rewrite
+  or automatic deletion of incompatible grants. See the role-hierarchy upgrade
+  guidance in `docs/ARCHITECTURE.md`.
+
+The native membership API, model-owned subject identity, filtered live field
+and attribute backings, and cache-freshness protections introduced in 0.17.0
+remain available. The original 0.16.3 FK/SQL scoping and encoded-ID optimizations
+are retained.
+
 ## [0.17.0] — 2026-09-13
 
 ### Added

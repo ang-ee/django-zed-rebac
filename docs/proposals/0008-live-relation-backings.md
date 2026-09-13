@@ -58,6 +58,20 @@ expiration. Field paths must terminate at that subject model. Attribute fields
 and filters must resolve on that model. Invalid JSON, options, paths, fields,
 lookups, or value shapes fail schema validation and Django system checks.
 
+Model identities are queryable scalar Django fields, including virtual fields
+whose public value encodes an existing primary key. The identity need not own
+a database column. Django owns lookup preparation and projected-value
+conversion; REBAC never substitutes a raw primary key for a public graph ID.
+Native model-to-model SQL correlations use the underlying columns. Hops that
+require a wire-ID conversion unavailable in SQL retain evaluator fallback.
+
+An identity attribute must return a scalar value on the model instance. Django's
+`pk` remains valid when multi-table inheritance makes its field a parent-link
+`OneToOneField`; a relation's scalar `attname` (such as `parent_ptr_id`) is valid
+as well. The relation descriptor (`parent_ptr`) returns a model object and is
+not an identity. Django's underlying target field owns scalar conversion for
+relational columns, including primary keys.
+
 All direct checks, arrows, resource and subject lookup, eager enumeration, and
 lazy local queryset scope read the same resolved backing. Reads honor the
 queryset database alias. Tuple writes and deletes targeting the live container

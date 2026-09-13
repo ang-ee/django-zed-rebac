@@ -150,7 +150,11 @@ def permission_object_sources(
             target = arrow_target if arrow_target is not None else allowed.relation
             if target:
                 definition = schema.get_definition(allowed.type)
-                if definition is None or (
+                if definition is None:
+                    continue
+                if arrow_target is None and find_relation(definition, target) is None:
+                    continue
+                if arrow_target is not None and (
                     find_relation(definition, target) is None
                     and find_permission(definition, target) is None
                 ):

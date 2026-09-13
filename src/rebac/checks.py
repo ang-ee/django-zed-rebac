@@ -1,15 +1,49 @@
-"""System checks — registered at app-ready. No DB queries; no model instantiation."""
+"""System checks registered at app-ready; database reads happen only when invoked."""
 
 from __future__ import annotations
 
 import logging
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 from django.core import checks
 from django.db.utils import DatabaseError
 
 from .conf import app_settings
+from .errors import SchemaError
 from .field_visibility import FIELD_DENY_MODES
+
+if TYPE_CHECKING:
+    from .schema.ast import Schema
+
+
+def _schema_for_checks() -> Schema | None:
+    """Load current schema, allowing Django to migrate an older stored format.
+
+    Runtime permission evaluation remains strict. Only schema-dependent system
+    checks defer unreadable data while the owning app has pending migrations.
+    """
+    from django.db import DEFAULT_DB_ALIAS, connections
+    from django.db.migrations.executor import MigrationExecutor
+
+    from .backends import backend
+
+    try:
+        try:
+            return backend().schema()
+        except SchemaError:
+            executor = MigrationExecutor(connections[DEFAULT_DB_ALIAS])
+            targets = executor.loader.graph.leaf_nodes("rebac")
+            if not executor.migration_plan(targets):
+                raise
+            logging.getLogger("rebac.checks").debug(
+                "Schema checks deferred until pending REBAC migrations are applied"
+            )
+            return None
+    except (DatabaseError, RuntimeError) as exc:
+        logging.getLogger("rebac.checks").debug(
+            "Schema checks skipped: schema unavailable (%s)", exc
+        )
+        return None
 
 
 @checks.register("rebac")
@@ -101,27 +135,18 @@ def check_field_backed_relations(
     **kwargs: Any,
 ) -> list[checks.CheckMessage]:
     """Validate live relation backings and model-owned subject identity."""
-    try:
-        from ._id import subject_relation
-        from .backends import backend as _backend
-        from .backends.base import Backend
-        from .field_backing import (
-            attribute_backing_model_errors,
-            const_arrow_cycle_errors,
-            const_backing_model_errors,
-            const_target_definition_errors,
-            field_backing_model_errors,
-        )
-        from .resources import model_resource_type
+    from ._id import subject_relation
+    from .field_backing import (
+        attribute_backing_model_errors,
+        const_arrow_cycle_errors,
+        const_backing_model_errors,
+        const_target_definition_errors,
+        field_backing_model_errors,
+    )
+    from .resources import model_resource_type
 
-        b: Backend = _backend()
-        if not hasattr(b, "schema"):
-            return []
-        schema = b.schema()
-    except (DatabaseError, RuntimeError) as exc:  # pragma: no cover — install/test paths
-        logging.getLogger("rebac.checks").debug(
-            "Field-backed relation check skipped: schema unavailable (%s)", exc
-        )
+    schema = _schema_for_checks()
+    if schema is None:
         return []
 
     issues: list[checks.CheckMessage] = []
@@ -367,32 +392,8 @@ def check_universal_admin_in_roles(
         ]
     expected_type, expected_id = universal.split(":", 1)
 
-    # Pull the schema via the singleton backend so tests / manual
-    # ``set_schema`` calls land in the same instance the check inspects.
-    # System checks run in three states where the schema is unloadable
-    # and the check must be a no-op rather than aborting startup:
-    #   - fresh install before migrations (``DatabaseError``)
-    #   - pytest without the ``django_db`` mark (``RuntimeError`` from
-    #     the pytest-django access guard)
-    #   - any unanticipated env where the singleton backend isn't ready.
-    # The broad catch is deliberate, but we log the exception at DEBUG
-    # so a real parser bug or backend misconfiguration is still
-    # diagnosable rather than fully silenced.
-    try:
-        # Lazy import — `rebac.backends` triggers schema loading on first
-        # touch and module-level import would break app-registry boot
-        # order during `python manage.py migrate`.
-        from .backends import backend as _backend
-        from .backends.base import Backend
-
-        b: Backend = _backend()
-        if not hasattr(b, "schema"):
-            return []
-        schema = b.schema()
-    except (DatabaseError, RuntimeError) as exc:  # pragma: no cover — install/test paths
-        logging.getLogger("rebac.checks").debug(
-            "Universal-admin check skipped: schema unavailable (%s)", exc
-        )
+    schema = _schema_for_checks()
+    if schema is None:
         return []
 
     issues: list[checks.CheckMessage] = []

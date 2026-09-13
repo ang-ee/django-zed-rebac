@@ -24,8 +24,8 @@ definition test/role {
     permission access = member
 }
 definition test/doc {
-    relation reader: auth/user#effective_member
-    permission read = reader
+    relation reader: auth/user
+    permission read = reader->effective_member
 }
 """
 
@@ -78,24 +78,6 @@ def test_fixed_attribute_owns_only_its_anchor(live_backend):
         live_backend.delete_relationships(
             RelationshipFilter(resource_type="test/role", resource_id="admin", relation="member")
         )
-
-
-def test_subject_set_dispatch_accepts_a_permission_name(live_backend):
-    user = get_user_model().objects.create_user(username="reader")
-    subject = SubjectRef.of("auth/user", str(user.pk))
-    live_backend.write_relationships(
-        [
-            RelationshipTuple(ObjectRef("auth/user", "set"), "self", subject),
-            RelationshipTuple(
-                ObjectRef("test/doc", "one"),
-                "reader",
-                SubjectRef.of("auth/user", "set", "effective_member"),
-            ),
-        ]
-    )
-    assert live_backend.has_access(
-        subject=subject, action="read", resource=ObjectRef("test/doc", "one")
-    )
 
 
 @pytest.mark.django_db(transaction=True)
