@@ -5,6 +5,22 @@ pre-1.0; breaking changes within a minor version are explicitly called out.
 
 ## [Unreleased]
 
+## [0.17.2] — 2026-09-13
+
+### Fixed
+
+- Resolve model resource and subject identity through instance metadata, so
+  Django's lazy user and model wrappers retain the wrapped model's type, ID
+  attribute and subject relation. Authenticated requests using a model-backed
+  user no longer fail while resolving `AuthenticationMiddleware`'s lazy user.
+
+### Documentation
+
+- The 0.17.1 corrected contract also applies when upgrading from 0.16.3, not
+  only from 0.17.0: 0.16.3's `rebac.roles` documentation and `imply` used the
+  `includes: role#effective_member` shape that 0.17.1 rejects. The 0.17.1
+  entry below now says so; the migration steps are unchanged.
+
 ## [0.17.1] — 2026-09-13
 
 ### Fixed
@@ -53,7 +69,10 @@ pre-1.0; breaking changes within a minor version are explicitly called out.
 
 ### Corrected contract — consumer migration required
 
-- Removed the permission-named subject-set behavior added in 0.17.0.
+- Removed the permission-named subject-set behavior. 0.17.0 routed such
+  subjects through the permission evaluator, and 0.16.3's `rebac.roles`
+  documentation and `imply` already wrote `includes: role#effective_member`
+  edges, so consumers upgrading from either release are affected.
   Relationship subjects may reference a declared relation (`group:id#member`),
   never a computed permission (`role:id#effective_member`). Schema loading and
   tuple writes reject that shape. Checking a permission or evaluating a

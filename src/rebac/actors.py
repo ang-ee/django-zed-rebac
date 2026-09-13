@@ -225,7 +225,7 @@ def to_subject_ref(actor: ActorLike) -> SubjectRef:
             str(getattr(actor, attr)),
         )
 
-    if model_resource_type(type(actor)):
+    if model_resource_type(actor):
         if actor.pk is None:
             # A principal must be a persisted row, as for the User branch;
             # an unsaved instance would otherwise resolve to the id "None".
@@ -233,7 +233,7 @@ def to_subject_ref(actor: ActorLike) -> SubjectRef:
                 f"{type(actor).__name__} instance is unsaved; save it before using it as a subject."
             )
         resource = to_object_ref(actor)
-        return SubjectRef(resource, subject_relation(type(actor)))
+        return SubjectRef(resource, subject_relation(actor))
 
     if isinstance(actor, Group):
         attr = subject_id_attr(Group)

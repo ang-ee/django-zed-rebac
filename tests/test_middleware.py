@@ -16,9 +16,14 @@ These tests pin three things the bypass must guarantee:
 from __future__ import annotations
 
 import pytest
-from django.contrib.auth import get_user_model
-from django.test import override_settings
+from django.contrib.auth import get_user_model, login
+from django.contrib.auth.middleware import AuthenticationMiddleware
+from django.contrib.sessions.middleware import SessionMiddleware
+from django.http import HttpResponse
+from django.test import RequestFactory, override_settings
+from django.utils.functional import SimpleLazyObject
 
+from rebac import ANONYMOUS_ACTOR, SubjectRef
 from rebac.actors import current_actor, is_sudo
 from rebac.middleware import ActorMiddleware
 from rebac.models import PermissionAuditEvent
@@ -136,4 +141,55 @@ def test_exception_in_view_still_resets_actor_and_sudo(superuser):
 
     # Both ContextVars must be torn down even on exception.
     assert is_sudo() is False
+    assert current_actor() is None
+
+
+@pytest.mark.django_db
+@override_settings(SESSION_ENGINE="django.contrib.sessions.backends.signed_cookies")
+@pytest.mark.parametrize("id_attr", ["pk", "username"])
+def test_authentication_middleware_lazy_model_user_resolves_and_tears_down(monkeypatch, id_attr):
+    User = get_user_model()
+    monkeypatch.setattr(User._meta, "rebac_resource_type", "accounts/member", raising=False)
+    monkeypatch.setattr(User._meta, "rebac_id_attr", id_attr, raising=False)
+    monkeypatch.setattr(User._meta, "rebac_subject_relation", "participant", raising=False)
+    user = User.objects.create_user(username="session-alice", password="secret")
+    request = RequestFactory().get("/")
+    SessionMiddleware(lambda _: None).process_request(request)
+    login(request, user, backend="django.contrib.auth.backends.ModelBackend")
+    AuthenticationMiddleware(lambda _: None).process_request(request)
+    assert isinstance(request.user, SimpleLazyObject)
+    captured = {}
+
+    def view(_request):
+        captured["actor"] = current_actor()
+        return HttpResponse("ok")
+
+    response = ActorMiddleware(view)(request)
+
+    assert response.status_code == 200
+    assert captured["actor"] == SubjectRef.of(
+        "accounts/member",
+        str(user.pk) if id_attr == "pk" else "session-alice",
+        "participant",
+    )
+    assert current_actor() is None
+
+
+@pytest.mark.django_db
+@override_settings(SESSION_ENGINE="django.contrib.sessions.backends.signed_cookies")
+def test_authentication_middleware_lazy_anonymous_user_is_unchanged():
+    request = RequestFactory().get("/")
+    SessionMiddleware(lambda _: None).process_request(request)
+    AuthenticationMiddleware(lambda _: None).process_request(request)
+    assert isinstance(request.user, SimpleLazyObject)
+    captured = {}
+
+    def view(_request):
+        captured["actor"] = current_actor()
+        return HttpResponse("ok")
+
+    response = ActorMiddleware(view)(request)
+
+    assert response.status_code == 200
+    assert captured["actor"] == ANONYMOUS_ACTOR
     assert current_actor() is None

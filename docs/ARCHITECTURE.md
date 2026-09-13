@@ -1219,6 +1219,9 @@ primary key needs no consumer-specific identity override.
 Model identity resolution rejects `None` and empty strings before constructing
 an object reference. Empty IDs used for pre-save create checks are explicit
 model-level sentinels, not the identities of saved rows.
+Object and subject resolution read Django metadata through the instance, so
+lazy wrappers such as `AuthenticationMiddleware`'s `request.user` retain the
+wrapped model's resource type, ID attribute and subject relation.
 `REBAC_TYPE_PREFIX` applies when model metadata, configured
 User/Group/anonymous types, or decorators generate identity. Already canonical
 `ObjectRef` and `SubjectRef` values retain their wire types unchanged.
