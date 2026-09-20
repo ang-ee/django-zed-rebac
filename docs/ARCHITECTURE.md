@@ -1414,6 +1414,15 @@ What `sudo()` does NOT bypass:
 - Signals attached to `pre_save` / `post_save` that aren't part of the REBAC pipeline.
 - `@require_permission` decorators that resolve their own actor.
 
+`@require_permission(..., actor_arg="actor", resource_arg="resource")` binds
+those names through the decorated callable's native signature, so positional,
+keyword, instance-method, class-method, static-method, and defaulted arguments
+have the same meaning. A configured explicit actor is always checked and takes
+precedence over ambient sudo; an explicit or defaulted `None` actor fails closed
+instead of falling back to ambient scope. Ambient sudo bypass applies only when
+the decorator has no `actor_arg`. Named actor and resource arguments must be
+declared parameters of the callable.
+
 **Sudo does NOT propagate through relationship traversal.** This is the single largest deliberate divergence from Odoo's `env.su` semantics. In Odoo, `record.sudo().lines.user_id` reads BOTH `lines` AND `user_id` in sudo because the `env` propagates. We don't do that — see [§ Lessons from Odoo 19 — footguns we avoid](#lessons-from-odoo-19--footguns-we-avoid).
 
 ### Three actor-resolution paths
