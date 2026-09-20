@@ -826,6 +826,22 @@ The example requires a task wrapper that opens `actor_context()` from a trusted
 producer-supplied actor before invoking the decorated function. Without that
 scope the permission decorator denies the call.
 
+For callables that receive an actor or resource explicitly, name their declared
+parameters on the decorator:
+
+```python
+@require_permission("write", actor_arg="actor", resource_arg="post")
+def revise(post, actor, body):
+    ...
+```
+
+The decorator uses Python's native signature binding, so `post` and `actor` may
+be passed positionally or by keyword and work the same way on methods. The
+explicit actor takes precedence over ambient sudo and is always checked;
+`actor=None` fails closed and never falls back to the ambient actor. Without
+`actor_arg`, the decorator continues to use `current_actor()` and permits the
+ambient sudo bypass.
+
 ### DRF viewsets
 
 DRF integration requires NO additional schema authoring. The model's `rebac_resource_type` is the source of truth; `RebacPermission` and `RebacFilterBackend` consult the schema:
