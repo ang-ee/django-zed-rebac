@@ -159,6 +159,22 @@ Filter values are JSON scalars; Django validates the complete lookup paths.
 Both direct checks and lazy queryset scopes read the current rows, including
 changes made through bulk updates or the M2M manager.
 
+Before inserting a new model, the Django `create()`, `save()`, and
+`bulk_create()` gates project direct forward `ForeignKey` and `OneToOneField`
+backings from the constructed candidate into `check_new()`. Python defaults
+are therefore visible to `permission create = parent->write`, and each bulk
+row is checked before any insert. Reverse, many-to-many, filtered, and
+database-default relations are not resolved on an unsaved candidate and fail
+closed; authorize those shapes through an explicit checked command after their
+relationship facts exist.
+Adding REBAC model instances are insert-only, including candidates with an
+explicit primary key. Load an existing row before updating it; a constructed
+candidate cannot turn a successful create preflight into an update.
+Actor-scoped multi-table child creation also inserts every parent table and
+therefore fails if a parent row already exists. Existing-parent attachment is a
+trusted bypass or application-command operation because it can update parent
+fields and needs a separate parent write decision.
+
 Source and target identities may be virtual scalar fields, such as a public ID
 encoded from the existing primary key. The field must support SQL projection
 and exact/`in` lookups; Django owns both lookup preparation and result

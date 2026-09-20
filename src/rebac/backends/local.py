@@ -415,9 +415,9 @@ class LocalBackend(Backend):
         # Empty resource_id → model-level check (any row of this type the subject
         # has the action on). First honour resource-independent grants — built-in
         # actor terms (``authenticated`` / ``anonymous``) and const arrows — by
-        # evaluating the permission against an empty row: a create/list permission
+        # evaluating the permission against an empty row: a row-independent permission
         # like ``create = authenticated`` has no accessible row yet but still grants
-        # (this is the gate the pre_save create signal relies on). Otherwise fall
+        # (``check_new`` composes this behavior into proposed-row create checks). Otherwise fall
         # back to "is the accessible() set non-empty?".
         if not resource.resource_id:
             definition = self.schema().get_definition(resource.resource_type)

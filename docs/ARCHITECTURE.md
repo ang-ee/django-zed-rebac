@@ -1046,7 +1046,8 @@ class Backend(ABC):
     ) -> CheckResult:
         """Three-state: HAS / NO / CONDITIONAL.
            Combines model-level and record-level checks.
-           Works on empty references (model-level only) — pass an empty resource_id."""
+           Empty references evaluate only row-independent terms; proposed-row
+           create authorization uses check_new() with candidate relationships."""
 
     def has_access(self, *, subject, action, resource, context=None) -> bool:
         """Boolean shorthand. CONDITIONAL collapses to False."""
@@ -1153,6 +1154,23 @@ backend store. Callers must not supply virtual tuples for const-backed
 relations; those are synthetic schema facts, so `check_new()` raises
 `SchemaError` for non-empty caller entries on a const-backed relation name.
 
+Django create paths construct the candidate first, including Python field
+defaults, then project schema-declared direct forward `ForeignKey` and
+`OneToOneField` values into this same overlay. `create()`, a new instance's
+`save()`, and every row of `bulk_create()` therefore use `check_new` as the
+single evaluator. Reverse, many-to-many, filtered, database-default, or
+otherwise unresolved candidate relations fail before any insert; callers must
+use an explicit checked command once those facts can be resolved.
+An actor-scoped adding `RebacMixin` instance is always saved as an insert, even
+when its primary key is already populated; `force_update` and `update_fields`
+are invalid for all adding instances. Load an existing row before updating it.
+`bulk_create()` accepts only instances whose exact model class matches its
+queryset model.
+For actor-scoped multi-table inheritance, every table in the inheritance chain
+is insert-only: a child `create` grant cannot authorize updates to an existing
+parent row. Attaching a child table to an existing parent requires an explicit
+trusted bypass or an application command that separately checks the parent write.
+
 **Deliberately outside the ``Backend`` ABC.** ``check_new`` is a free
 function, not a backend RPC, because SpiceDB ships no "check with
 proposed tuples" call. A SpiceDB-mode strategy when 0.5 lands is to
@@ -1217,8 +1235,9 @@ their stored values. Relation descriptors returning model objects are rejected.
 The relation's underlying target field owns column conversion; a parent-link
 primary key needs no consumer-specific identity override.
 Model identity resolution rejects `None` and empty strings before constructing
-an object reference. Empty IDs used for pre-save create checks are explicit
-model-level sentinels, not the identities of saved rows.
+an object reference. Empty IDs are row-independent backend-check sentinels, not
+the identities of saved rows; proposed-row create checks use `check_new()` with
+the candidate's relationship overlay.
 Object and subject resolution read Django metadata through the instance, so
 lazy wrappers such as `AuthenticationMiddleware`'s `request.user` retain the
 wrapped model's resource type, ID attribute and subject relation.
@@ -1424,10 +1443,10 @@ A pinned actor (path 2) **always wins** over ambient state (paths 3-4) — there
 | Operation | Permission checked | Where |
 |---|---|---|
 | `Model.objects.all()` / `.filter(...)` / `.get()` / `.count()` / `.exists()` | `read` (or `Meta.rebac_default_action`; override per chain with `.with_action(action)`) | The queryset injects the backend's lazy permission predicate, falling back to `resource_id__in=<accessible(actor, action, type)>` when unavailable. |
-| `Model.objects.create(**fields)` | `create` on the model class | `RebacManager.create()` calls `check_access(actor, "create", ObjectRef(type, ""))` first. |
-| `Model.objects.bulk_create(rows)` | `create` once per page | Single class-level check. |
-| `instance.save()` (PK present) | `write` on the row | Pre-save signal handler. |
-| `instance.save()` (new instance) | `create` on the model class | Pre-save handler dispatches based on `_state.adding`. |
+| `Model.objects.create(**fields)` | `create` on the proposed row's forward relations | The constructed instance reaches the pre-save `check_new` gate. |
+| `Model.objects.bulk_create(rows)` | `create` on each proposed row's forward relations | Every candidate is preflighted before Django issues insert SQL. |
+| `instance.save()` (loaded/non-adding instance) | `write` on the row | Pre-save signal handler. |
+| `instance.save()` (new instance) | `create` on the proposed row's forward relations | Pre-save handler projects the constructed candidate into `check_new`. |
 | `instance.delete()` | `delete` on the row | Pre-delete signal handler. |
 | `Model.objects.update(**kwargs)` | `write` on each affected row | Manager intersects the queryset PK set with `accessible(actor, "write", type)`; raises if any in-scope row is excluded. |
 | `Model.objects.delete()` | `delete` on each row | Same pattern. |
@@ -1435,7 +1454,7 @@ A pinned actor (path 2) **always wins** over ambient state (paths 3-4) — there
 **Failure mode for writes:** *all-or-nothing*. Any denied row in a bulk write raises and rolls back. **Failure mode for reads:** denied rows are absent from the queryset; no raise. List endpoints return `[]` rather than 403 when the user has no rows.
 
 Actor-scoped `bulk_create(update_conflicts=True)` raises `PermissionDenied`
-before writing: a class-level create check cannot authorize updates to existing
+before writing: a proposed-row create check cannot authorize updates to existing
 rows or their protected fields. Use checked instance saves for those updates,
 or explicitly bypass with `.sudo(reason=...)` for a trusted bulk import.
 
@@ -2005,7 +2024,7 @@ stable across patch releases. `rebac._internal.*` is private.
 
 2. **Swappable User dependency.** `auth/user` is hardcoded as a subject type label. Projects with `AUTH_USER_MODEL` aliases (`accounts.User`) need... what? Lean: a `REBAC_USER_TYPE` setting (default `"auth/user"`), plus `to_subject_ref()` consults `settings.AUTH_USER_MODEL` to decide. Settle in 0.1.
 
-3. **Async ORM support.** *Resolved (0.11.x).* No separate async manager API is needed. Django implements every async `QuerySet` method (`aget` / `acount` / `aexists` / `afirst` / `aupdate` / `adelete` / `acreate` / `__aiter__` / `ain_bulk` / `aget_or_create` / …) as a `sync_to_async` wrapper around the sync method `RebacQuerySet` already overrides, so scoping is inherited and the `current_actor()` ContextVar carries into the worker thread — `await Post.objects.as_user(u).aget(...)` enforces with no extra code. The two methods that compute *without* routing through the sync `iterator` / `_fetch_all` path are overridden to re-apply scope: `aiterator()` (builds the row iterable directly) and `aggregate()` / `aaggregate()` (summarises the query without materialising rows). `bulk_create()` and `abulk_create()` enforce the class-level `create` permission and stamp the queryset actor onto inserted instances. Actor-scoped conflict updates (`update_conflicts=True`) fail closed because a create grant cannot authorize changes to existing rows; use checked individual saves or explicit sudo for those upserts.
+3. **Async ORM support.** *Resolved (0.11.x).* No separate async manager API is needed. Django implements every async `QuerySet` method (`aget` / `acount` / `aexists` / `afirst` / `aupdate` / `adelete` / `acreate` / `__aiter__` / `ain_bulk` / `aget_or_create` / …) as a `sync_to_async` wrapper around the sync method `RebacQuerySet` already overrides, so scoping is inherited and the `current_actor()` ContextVar carries into the worker thread — `await Post.objects.as_user(u).aget(...)` enforces with no extra code. The two methods that compute *without* routing through the sync `iterator` / `_fetch_all` path are overridden to re-apply scope: `aiterator()` (builds the row iterable directly) and `aggregate()` / `aaggregate()` (summarises the query without materialising rows). `bulk_create()` and `abulk_create()` preflight every proposed row through `check_new()` and stamp the queryset actor onto inserted instances. Actor-scoped conflict updates (`update_conflicts=True`) fail closed because a create grant cannot authorize changes to existing rows; use checked individual saves or explicit sudo for those upserts.
 
 4. **Override layer precedence vs caveats.** When a `SchemaOverride` tightens a permission AND a caveat returns `CONDITIONAL`, what wins? Lean: tightening wins (security-fail-closed). Documented as a doctor warning.
 

@@ -47,7 +47,7 @@ Limitations (v0.4):
 from __future__ import annotations
 
 from collections.abc import Mapping, Sequence
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Any
 
 from .conf import app_settings
 from .errors import PermissionDepthExceeded, SchemaError
@@ -64,6 +64,48 @@ from .types import CheckResult, ObjectRef, PermissionResult, SubjectRef
 if TYPE_CHECKING:  # pragma: no cover
     from .backends.base import Backend
     from .schema.ast import Definition, Schema
+
+
+def _check_new_model(
+    instance: Any,
+    *,
+    subject: SubjectRef,
+    using: str | None = None,
+    backend: Backend | None = None,
+) -> CheckResult:
+    """Evaluate one constructed Django candidate through :func:`check_new`."""
+
+    from .backends import backend as _current_backend
+    from .field_backing import _proposed_forward_relationships
+    from .resources import model_resource_type
+
+    active_backend = backend if backend is not None else _current_backend()
+    resource_type = model_resource_type(type(instance))
+    if resource_type is None:
+        return CheckResult.has()
+    try:
+        definition = active_backend.schema().get_definition(resource_type)
+    except NotImplementedError:
+        # Preserve check_new's backend-specific fail-closed diagnostic.
+        return check_new(
+            subject=subject,
+            action="create",
+            resource_type=resource_type,
+            backend=active_backend,
+        )
+    relationships = (
+        _proposed_forward_relationships(instance, definition, using=using)
+        if definition is not None
+        else {}
+    )
+    return check_new(
+        subject=subject,
+        action="create",
+        resource_type=resource_type,
+        relationships=relationships,
+        backend=active_backend,
+    )
+
 
 # The new row doesn't exist yet — eval_expr threads a resource_id through
 # its dispatcher but the preflight callbacks never query it (relations are

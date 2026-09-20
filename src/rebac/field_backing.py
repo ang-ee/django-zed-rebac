@@ -109,6 +109,85 @@ class ResolvedFieldBacking:
         return self.source_model._base_manager.db_manager(using).filter(predicate)
 
 
+def _proposed_forward_relationships(
+    instance: models.Model,
+    definition: Definition,
+    *,
+    using: str | None = None,
+) -> dict[str, tuple[SubjectRef, ...]]:
+    """Project schema-declared forward relations from one unsaved candidate.
+
+    Create authorization can only use facts already resolved on the candidate.
+    Reverse, many-valued, filtered, and database-default-backed relations need
+    a persisted row or database evaluation, so they fail closed before write.
+    """
+
+    relationships: dict[str, tuple[SubjectRef, ...]] = {}
+    for relation in definition.relations:
+        if not isinstance(relation.backing, FieldBinding):
+            continue
+        resolved = resolve_field_backing(definition, relation)
+        if resolved is None:
+            raise ValueError(
+                f"Cannot preflight {definition.resource_type}#{relation.name}: "
+                "its field backing is not resolvable."
+            )
+        field = resolved.field
+        if (
+            "__" in resolved.path
+            or not isinstance(field, (models.ForeignKey, models.OneToOneField))
+            or field.model._meta.concrete_model is not type(instance)._meta.concrete_model
+        ):
+            raise ValueError(
+                f"Cannot preflight {definition.resource_type}#{relation.name}: "
+                "create candidates support only direct forward ForeignKey or OneToOneField backings."
+            )
+        if resolved.filters:
+            raise ValueError(
+                f"Cannot preflight {definition.resource_type}#{relation.name}: "
+                "filtered field backings require persisted query evaluation."
+            )
+        raw_target = getattr(instance, field.attname)
+        if isinstance(raw_target, BaseExpression):
+            raise ValueError(
+                f"Cannot preflight {definition.resource_type}#{relation.name}: "
+                "expression-backed relationships are unresolved before insert."
+            )
+        if raw_target is None:
+            relationships[relation.name] = ()
+            continue
+        prepared_target = field.target_field.get_prep_value(raw_target)
+        if isinstance(prepared_target, BaseExpression):
+            raise ValueError(
+                f"Cannot preflight {definition.resource_type}#{relation.name}: "
+                "the proposed foreign-key identity did not resolve to a scalar value."
+            )
+        if resolved.targets_identity_directly():
+            target_id = field.target_field.to_python(prepared_target)
+        else:
+            target = (
+                resolved.target_model._base_manager.db_manager(using)
+                .filter(**{field.target_field.name: prepared_target})
+                .first()
+            )
+            if target is None:
+                raise ValueError(
+                    f"Cannot preflight {definition.resource_type}#{relation.name}: "
+                    "the proposed related object is unavailable."
+                )
+            target_id = getattr(target, resolved.target_id_attr)
+        if target_id is None:
+            raise ValueError(
+                f"Cannot preflight {definition.resource_type}#{relation.name}: "
+                "the proposed related object has no REBAC identity."
+            )
+        allowed = relation.allowed_subjects[0]
+        relationships[relation.name] = (
+            SubjectRef.of(allowed.type, str(target_id), allowed.relation),
+        )
+    return relationships
+
+
 @dataclass(frozen=True, slots=True)
 class ResolvedAttributeBacking:
     """A virtual container derived from a scalar field on its subject model."""
