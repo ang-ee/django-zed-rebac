@@ -8,6 +8,7 @@ from rebac import (
     CheckResult,
     ObjectRef,
     PermissionResult,
+    RelationshipTuple,
     SubjectRef,
     Zookie,
 )
@@ -36,6 +37,34 @@ def test_subject_ref_round_trip():
     raw = "agents/grant:abc#valid"
     s = SubjectRef.parse(raw)
     assert str(s) == raw
+
+
+@pytest.mark.parametrize(
+    ("subject", "caveat_name", "expected"),
+    [
+        ("auth/user:alice", "", "blog/post:1#viewer @ auth/user:alice"),
+        ("auth/group:eng#member", "", "blog/post:1#viewer @ auth/group:eng#member"),
+        (
+            "auth/user:alice",
+            "during_business_hours",
+            "blog/post:1#viewer @ auth/user:alice with during_business_hours",
+        ),
+        (
+            "auth/group:eng#member",
+            "during_business_hours",
+            "blog/post:1#viewer @ auth/group:eng#member with during_business_hours",
+        ),
+    ],
+)
+def test_relationship_tuple_str(subject, caveat_name, expected):
+    tuple_ = RelationshipTuple(
+        resource=ObjectRef("blog/post", "1"),
+        relation="viewer",
+        subject=SubjectRef.parse(subject),
+        caveat_name=caveat_name,
+    )
+
+    assert str(tuple_) == expected
 
 
 def test_check_result_helpers():

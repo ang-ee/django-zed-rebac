@@ -11,6 +11,7 @@ from django.db import models
 from django.db.models import Q, QuerySet
 from django.db.models.expressions import BaseExpression, Col, ColPairs, Combinable
 
+from ._candidate_filters import _filter_candidate_targets, _value_is_unresolved
 from ._id import resource_id_attr
 from .resources import model_for_resource_type, model_for_subject_type, model_resource_type
 from .schema.ast import (
@@ -107,6 +108,107 @@ class ResolvedFieldBacking:
         if target_ids is not None:
             predicate &= Q(**self.target_in_filter(target_ids))
         return self.source_model._base_manager.db_manager(using).filter(predicate)
+
+
+def _proposed_forward_relationships(
+    instance: models.Model,
+    definition: Definition,
+    *,
+    required_relations: frozenset[str],
+    using: str | None = None,
+) -> dict[str, tuple[SubjectRef, ...] | None]:
+    """Project only field-backed relations required by the create decision.
+
+    required_relations includes named-permission and arrow-source dependencies.
+    Other backings are not resolved, queried, filtered, or marked unknown.
+    A reverse or many-valued first hop is genuinely empty on a new row. Forward
+    paths (including inherited MTI fields) and filters use known candidate
+    values and persisted targets on the write alias. Unfiltered single-hop FKs
+    storing the REBAC identity project their prepared scalar without a query.
+    Database values not known before insertion, or later reverse/many-valued
+    hops that insertion can change, contribute None: an unknown relation,
+    never an empty one.
+    check_new denies unknown arms even under intersection or exclusion; an
+    independent allowed union arm can still grant. Configuration/data faults
+    on referenced backings continue to raise before write; missing targets
+    raise where a fetch is performed.
+    """
+
+    relationships: dict[str, tuple[SubjectRef, ...] | None] = {}
+    for relation in definition.relations:
+        if relation.name not in required_relations or not isinstance(
+            relation.backing, FieldBinding
+        ):
+            continue
+        resolved = resolve_field_backing(definition, relation)
+        if resolved is None:
+            raise ValueError(
+                f"Cannot preflight {definition.resource_type}#{relation.name}: "
+                "its field backing is not resolvable."
+            )
+        relationships[relation.name] = _proposed_field_subjects(instance, resolved, using=using)
+    return relationships
+
+
+def _proposed_field_subjects(
+    instance: models.Model,
+    resolved: ResolvedFieldBacking,
+    *,
+    using: str | None,
+) -> tuple[SubjectRef, ...] | None:
+    """Follow scalar forward FKs without consulting related-object caches."""
+
+    relation = resolved.relation
+    label = f"{model_resource_type(instance)}#{relation.name}"
+    current = instance
+    parts = resolved.path.split("__")
+    for index, part in enumerate(parts):
+        field = current._meta.get_field(part)
+        if not isinstance(field, (models.ForeignKey, models.OneToOneField)):
+            return () if index == 0 else None
+        # concrete_fields includes fields declared on every MTI parent table.
+        if field not in current._meta.concrete_fields:
+            return None
+        raw_target = getattr(current, field.attname)
+        if _value_is_unresolved(field, raw_target):
+            return None
+        if raw_target is None:
+            return ()
+        prepared_target = field.target_field.get_prep_value(raw_target)
+        if isinstance(prepared_target, (BaseExpression, Combinable)):
+            raise ValueError(
+                f"Cannot preflight {label}: "
+                "the proposed foreign-key identity did not resolve to a scalar value."
+            )
+        if len(parts) == 1 and not resolved.filters and resolved.targets_identity_directly():
+            target_id = field.target_field.to_python(prepared_target)
+            break
+        target_model = resolved.target_model if index == len(parts) - 1 else field.related_model
+        targets = target_model._base_manager.db_manager(using).filter(
+            **{field.target_field.name: prepared_target}
+        )
+        target = targets.first()
+        if target is None:
+            raise ValueError(
+                f"Cannot preflight {label}: the proposed related object is unavailable."
+            )
+        if index == 0 and resolved.filters:
+            filtered = _filter_candidate_targets(
+                instance, field, targets, resolved.filters, using=using
+            )
+            if filtered is None:
+                return None
+            if not filtered.exists():
+                return ()
+        current = target
+    else:
+        target_id = getattr(current, resolved.target_id_attr)
+    if target_id is None:
+        raise ValueError(
+            f"Cannot preflight {label}: the proposed related object has no REBAC identity."
+        )
+    allowed = relation.allowed_subjects[0]
+    return (SubjectRef.of(allowed.type, str(target_id), allowed.relation),)
 
 
 @dataclass(frozen=True, slots=True)

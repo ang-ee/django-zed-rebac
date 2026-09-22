@@ -39,7 +39,7 @@ from .field_visibility import (
     warn_raise_mode_degrades,
 )
 from .resources import model_resource_type
-from .types import FieldDenyMode, ObjectRef, SubjectRef
+from .types import FieldDenyMode, SubjectRef
 
 _M = TypeVar("_M", bound=models.Model)
 
@@ -692,9 +692,7 @@ class RebacQuerySet(models.QuerySet[_M]):
     # ----- Write ops: enforce all-or-nothing -----
 
     def create(self, **kwargs: Any) -> _M:
-        """Carry queryset scope into the instance before its save signals run."""
-        actor, unscoped = self._resolve_effective_actor()
-        self._guard_create(actor, unscoped=unscoped)
+        """Construct an instance and persist it through ``insert()``."""
         reverse_one_to_one_fields = frozenset(kwargs).intersection(
             self.model._meta._reverse_one_to_one_field_names  # type: ignore[attr-defined]
         )
@@ -703,31 +701,47 @@ class RebacQuerySet(models.QuerySet[_M]):
                 "The following fields do not exist in this model: "
                 + ", ".join(sorted(reverse_one_to_one_fields))
             )
-        obj = self.model(**kwargs)
-        obj._rebac_actor = actor  # type: ignore[attr-defined]
+        return self.insert(self.model(**kwargs))
+
+    def insert(self, obj: _M) -> _M:
+        """Persist a prepared, unsaved instance on this queryset's database.
+
+        This is the seam for callers that prepare instances before persistence,
+        such as GraphQL mutation resolvers and forms. Domain factories that
+        must run for every insert override this queryset method, not ``create``
+        on the manager, so kwargs and prepared-instance creation converge here.
+        The pre-save signal remains the sole create authorization gate.
+
+        Queryset scope owns the write: any actor or sudo pinned on ``obj``
+        itself is replaced by this queryset's actor and sudo reason. A prepared
+        instance that carries its own scope saves through ``instance.save()``
+        or ``Model.objects.with_actor(actor).insert(obj)``. This public verb is
+        unrelated to Django's private bulk ``QuerySet._insert``.
+        """
+        if type(obj) is not self.model:
+            raise TypeError(
+                f"{self.model.__name__}.insert() accepts only exact "
+                f"{self.model.__name__} instances; got {type(obj).__name__}."
+            )
+        if not obj._state.adding:
+            raise ValueError(f"{self.model.__name__}.insert() requires an unsaved instance.")
         self._for_write = True
+        if obj._state.db is not None and obj._state.db != self.db:
+            raise ValueError(
+                f"{self.model.__name__}.insert() cannot insert an instance bound to "
+                f"database {obj._state.db!r} on database {self.db!r}."
+            )
+        actor, _unscoped = self._resolve_effective_actor()
+        obj._rebac_actor = actor  # type: ignore[attr-defined]
         # The signal layer needs the explicit queryset bypass for this insert.
         # Clear it afterwards, just as reading through a sudo queryset does not
         # leave its returned instances permanently elevated.
-        if self._rebac_sudo_reason is not None:
-            obj._rebac_sudo_reason = self._rebac_sudo_reason  # type: ignore[attr-defined]
+        obj._rebac_sudo_reason = self._rebac_sudo_reason  # type: ignore[attr-defined]
         try:
             obj.save(force_insert=True, using=self.db)
         finally:
             obj._rebac_sudo_reason = None  # type: ignore[attr-defined]
         return obj
-
-    def _guard_create(self, actor: SubjectRef | None, *, unscoped: bool) -> None:
-        rebac_type = model_resource_type(self.model)
-        if unscoped or not rebac_type:
-            return
-        if actor is None:
-            raise MissingActorError(f"{self.model.__name__}.create() called with no actor.")
-        from .backends import backend
-
-        resource = ObjectRef(rebac_type, "")
-        if not backend().check_access(subject=actor, action="create", resource=resource).allowed:
-            raise PermissionDenied(f"Denied: {actor} cannot create {resource}")
 
     def bulk_create(
         self,
@@ -739,15 +753,36 @@ class RebacQuerySet(models.QuerySet[_M]):
         unique_fields: Collection[str] | None = None,
     ) -> list[_M]:
         """Authorize inserts before Django's signal-free bulk path runs."""
+        self._for_write = True
+        candidates = list(objs)
+        for candidate in candidates:
+            if type(candidate) is not self.model:
+                raise TypeError(
+                    f"{self.model.__name__}.bulk_create() accepts only exact "
+                    f"{self.model.__name__} instances; got {type(candidate).__name__}."
+                )
         actor, unscoped = self._resolve_effective_actor()
-        self._guard_create(actor, unscoped=unscoped)
+        rebac_type = model_resource_type(self.model)
+        if not unscoped and rebac_type:
+            if actor is None:
+                raise MissingActorError(
+                    f"{self.model.__name__}.bulk_create() called with no actor."
+                )
+            from .preflight import _check_new_model
+
+            for candidate in candidates:
+                result = _check_new_model(candidate, subject=actor, using=self.db)
+                if not result.allowed:
+                    raise PermissionDenied(
+                        f"Denied: {actor} cannot create a proposed {rebac_type} row."
+                    )
         if update_conflicts and not unscoped and model_resource_type(self.model):
             raise PermissionDenied(
                 "Actor-scoped bulk_create(update_conflicts=True) cannot check write "
                 "permissions on conflicting rows. Use checked saves or explicit sudo."
             )
         rows = super().bulk_create(
-            objs,
+            candidates,
             batch_size=batch_size,
             ignore_conflicts=ignore_conflicts,
             update_conflicts=update_conflicts,

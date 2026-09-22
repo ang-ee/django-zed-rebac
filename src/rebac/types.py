@@ -146,6 +146,13 @@ class RelationshipTuple:
     caveat_context: dict[str, Any] = field(default_factory=dict)
     expires_at: Any | None = None  # datetime — typed loosely to keep types.py import-light
 
+    def __str__(self) -> str:
+        """Render the canonical wire string, including any subject relation and caveat."""
+        target = f"{self.resource}#{self.relation} @ {self.subject}"
+        if self.caveat_name:
+            target = f"{target} with {self.caveat_name}"
+        return target
+
     def canonical_key(self) -> tuple[str, str, str, str, str, str, str]:
         return (
             self.resource.resource_type,

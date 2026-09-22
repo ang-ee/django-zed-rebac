@@ -9,25 +9,12 @@ from django.db import models
 from django.db.models import QuerySet
 
 from .resources import model_for_subject_type
-from .types import RelationshipFilter, RelationshipTuple, SubjectRef, Zookie
+from .types import ObjectRef, RelationshipFilter, RelationshipTuple, SubjectRef, Zookie
 
 
 def _format_target(tup: RelationshipTuple) -> str:
-    """Render a `RelationshipTuple` as the canonical wire string used in audit rows.
-
-    Format: ``<rt>:<id>#<rel> @ <st>:<sid>[#<sr>][ with <caveat>]``. The
-    optional ``with <caveat>`` suffix is appended when ``caveat_name`` is
-    non-empty so caveated grants/revokes are distinguishable in the audit
-    log from their uncaveated counterparts.
-    """
-    res = f"{tup.resource.resource_type}:{tup.resource.resource_id}#{tup.relation}"
-    sub = f"{tup.subject.subject_type}:{tup.subject.subject_id}"
-    if tup.subject.optional_relation:
-        sub = f"{sub}#{tup.subject.optional_relation}"
-    target = f"{res} @ {sub}"
-    if tup.caveat_name:
-        target = f"{target} with {tup.caveat_name}"
-    return target
+    """Render a relationship's canonical wire string for audit rows."""
+    return str(tup)
 
 
 def write_relationships(writes: Iterable[RelationshipTuple]) -> Zookie:
@@ -139,17 +126,19 @@ def delete_relationships(filter_: RelationshipFilter) -> Zookie:
 
     actor = current_actor()
     for row in snapshot:
-        sub = f"{row['subject_type']}:{row['subject_id']}"
-        if row["optional_subject_relation"]:
-            sub = f"{sub}#{row['optional_subject_relation']}"
-        target = f"{row['resource_type']}:{row['resource_id']}#{row['relation']} @ {sub}"
-        if row["caveat_name"]:
-            target = f"{target} with {row['caveat_name']}"
+        tuple_ = RelationshipTuple(
+            resource=ObjectRef(row["resource_type"], row["resource_id"]),
+            relation=row["relation"],
+            subject=SubjectRef.of(
+                row["subject_type"], row["subject_id"], row["optional_subject_relation"]
+            ),
+            caveat_name=row["caveat_name"],
+        )
         emit_audit(
             PermissionAuditEvent.KIND_RELATIONSHIP_REVOKE,
             actor=actor,
             origin=actor,
-            target_repr=target,
+            target_repr=_format_target(tuple_),
             defer_to_commit=True,
         )
     return zookie

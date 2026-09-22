@@ -159,6 +159,37 @@ Filter values are JSON scalars; Django validates the complete lookup paths.
 Both direct checks and lazy queryset scopes read the current rows, including
 changes made through bulk updates or the M2M manager.
 
+Before inserting a new model, the Django `create()`, `save()`, and
+`bulk_create()` gates project only the field-backed relations that `create`
+depends on, including named-permission dependencies and arrow sources, from
+the constructed candidate into `check_new()`. Unreferenced backings are not
+resolved, queried, filtered, or marked unknown. Python defaults are therefore
+visible to `permission create = parent->write`, and each bulk row is checked
+before any insert. A reverse FK, reverse O2O, or many-to-many **first hop**
+contributes an empty subject tuple. Forward paths, including
+multi-hop paths and MTI parent-declared FKs, are resolved on the write alias,
+except that an unfiltered single-hop FK/O2O storing the target's REBAC identity
+projects its prepared scalar without a query. Filters on resolved targets and
+known candidate scalar values are evaluated by Django on that alias.
+Database-default/expression values, unset insert-assigned MTI parent links,
+and other facts that cannot be established before insertion
+are **unknown**, represented by `None` in the `check_new()` overlay. A forward
+path with a later reverse or many-to-many hop is unknown because that set can
+change on insertion.
+Unknown relations deny any arm referencing them, even under intersection or
+exclusion; an independent allowed union arm can still authorize creation.
+Unreferenced unknown relations have no effect. Configuration and data errors
+on referenced backings still raise before write; missing targets raise where
+a fetch is performed. The direct-identity fast path leaves target-existence
+validation to database FK constraints.
+Adding REBAC model instances are insert-only, including candidates with an
+explicit primary key. Load an existing row before updating it; a constructed
+candidate cannot turn a successful create preflight into an update.
+Actor-scoped multi-table child creation also inserts every parent table and
+therefore fails if a parent row already exists. Existing-parent attachment is a
+trusted bypass or application-command operation because it can update parent
+fields and needs a separate parent write decision.
+
 Source and target identities may be virtual scalar fields, such as a public ID
 encoded from the existing primary key. The field must support SQL projection
 and exact/`in` lookups; Django owns both lookup preparation and result
@@ -825,6 +856,22 @@ def reindex_posts():
 The example requires a task wrapper that opens `actor_context()` from a trusted
 producer-supplied actor before invoking the decorated function. Without that
 scope the permission decorator denies the call.
+
+For callables that receive an actor or resource explicitly, name their declared
+parameters on the decorator:
+
+```python
+@require_permission("write", actor_arg="actor", resource_arg="post")
+def revise(post, actor, body):
+    ...
+```
+
+The decorator uses Python's native signature binding, so `post` and `actor` may
+be passed positionally or by keyword and work the same way on methods. The
+explicit actor takes precedence over ambient sudo and is always checked;
+`actor=None` fails closed and never falls back to the ambient actor. Without
+`actor_arg`, the decorator continues to use `current_actor()` and permits the
+ambient sudo bypass.
 
 ### DRF viewsets
 

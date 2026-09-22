@@ -25,6 +25,7 @@ from django.db.models import F, Q
 
 from ..conf import app_settings
 from ..errors import RelationshipReadError
+from ..types import ObjectRef, RelationshipTuple, SubjectRef
 
 WIRE_VALUE_FIELDS = (
     "resource_type",
@@ -148,10 +149,15 @@ class Relationship(models.Model):
         ]
 
     def __str__(self) -> str:
-        rel = f"#{self.optional_subject_relation}" if self.optional_subject_relation else ""
-        return (
-            f"{self.resource_type}:{self.resource_id}#{self.relation} "
-            f"@ {self.subject_type}:{self.subject_id}{rel}"
+        return str(
+            RelationshipTuple(
+                resource=ObjectRef(self.resource_type, self.resource_id),
+                relation=self.relation,
+                subject=SubjectRef.of(
+                    self.subject_type, self.subject_id, self.optional_subject_relation
+                ),
+                caveat_name=self.caveat_name,
+            )
         )
 
 
@@ -552,10 +558,15 @@ class RelationshipRegistry(models.Model):
         return self.subject_fk.resource_id
 
     def __str__(self) -> str:
-        rel = f"#{self.optional_subject_relation}" if self.optional_subject_relation else ""
-        return (
-            f"{self.resource_type}:{self.resource_id}#{self.relation} "
-            f"@ {self.subject_type}:{self.subject_id}{rel}"
+        return str(
+            RelationshipTuple(
+                resource=ObjectRef(self.resource_type, self.resource_id),
+                relation=self.relation,
+                subject=SubjectRef.of(
+                    self.subject_type, self.subject_id, self.optional_subject_relation
+                ),
+                caveat_name=self.caveat_name,
+            )
         )
 
 

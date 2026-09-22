@@ -412,6 +412,15 @@ revocation and enumeration for any container type. `rebac.roles` composes it
 and adds role-spec parsing and role hierarchy; both are first-class, semver-stable
 public APIs.
 
+Role `grant` forwards optional `caveat_name` and `caveat_context` to memberships;
+role `revoke` forwards `caveat_name` for exact revocation.
+`rebac.roles.is_role_type(resource_type)` recognises the role convention using
+`ROLE_TYPE_SUFFIX`; SQL convention filters use the same constant.
+
+`str(RelationshipTuple(...))` renders the canonical wire string
+`<type>:<id>#<relation> @ <subject_type>:<id>[#<subject_relation>][ with <caveat>]`.
+Relationship model strings and relationship audit targets use this renderer.
+
 Everything else (`rebac._internal.*`) is private and may change in any minor release.
 
 ### Anonymous subject — built-in
@@ -1046,7 +1055,8 @@ class Backend(ABC):
     ) -> CheckResult:
         """Three-state: HAS / NO / CONDITIONAL.
            Combines model-level and record-level checks.
-           Works on empty references (model-level only) — pass an empty resource_id."""
+           Empty references evaluate only row-independent terms; proposed-row
+           create authorization uses check_new() with candidate relationships."""
 
     def has_access(self, *, subject, action, resource, context=None) -> bool:
         """Boolean shorthand. CONDITIONAL collapses to False."""
@@ -1151,7 +1161,59 @@ rebac:const=admin`, `check_new()` behaves as if the proposed object carried
 `#admin @ platform/role:admin`, then evaluates `admin->member` through the real
 backend store. Callers must not supply virtual tuples for const-backed
 relations; those are synthetic schema facts, so `check_new()` raises
-`SchemaError` for non-empty caller entries on a const-backed relation name.
+`SchemaError` for non-empty or unknown caller entries on a const-backed relation name.
+
+Django create paths construct the candidate first, including Python field
+defaults, then project only the field-backed relations that `create` depends
+on, including dependencies through named permissions and arrow sources, into
+this same overlay. Unreferenced backings are not resolved, queried, filtered,
+or marked unknown during create preflight.
+`create()`, `insert(obj)`, a new instance's `save()`, and every row of
+`bulk_create()` use `check_new` as the single evaluator. A backing whose first
+hop is reverse FK, reverse O2O, or many-to-many is genuinely empty on the new
+row and contributes `()`. A single-hop, unfiltered forward FK/O2O that stores
+the target's REBAC identity projects its prepared scalar without a query,
+including fields inherited from concrete MTI parents. Non-direct identities,
+forward multi-hop paths, and filtered backings resolve their targets on the
+write alias; filters on resolved targets and known candidate scalar values
+are evaluated by Django on that alias.
+
+Unknown is distinct from empty: database-default/expression values, unset
+insert-assigned MTI parent links, and paths or filters whose facts cannot be
+established before insertion contribute `None` in
+`check_new(relationships=...)`. A forward path with a later reverse
+or many-to-many hop is also unknown, since that set can change on insertion.
+An unknown relation denies an arm referencing it directly, through an arrow,
+or through a named permission, including under intersection or exclusion.
+The shared walker preserves this structural unknown through `&` and `-`;
+only an independently allowed union arm can authorize without it. Unreferenced
+unknown relations have no effect. This structural uncertainty is a denial,
+not a caveat whose missing context the caller can supply.
+
+For referenced backings, unresolvable configuration, non-scalar prepared FK
+identities, missing targets where a fetch is performed, and missing target
+REBAC identities still raise before any insert. The direct-identity fast path
+does not query target existence; database FK constraints remain authoritative.
+An actor-scoped adding `RebacMixin` instance is always saved as an insert, even
+when its primary key is already populated; `force_update` and `update_fields`
+are invalid for all adding instances. Load an existing row before updating it.
+`bulk_create()` accepts only instances whose exact model class matches its
+queryset model.
+For actor-scoped multi-table inheritance, every table in the inheritance chain
+is insert-only: a child `create` grant cannot authorize updates to an existing
+parent row. Attaching a child table to an existing parent requires an explicit
+trusted bypass or an application command that separately checks the parent write.
+
+`insert(obj)` is the persistence seam for prepared instances from forms or
+GraphQL mutation resolvers; `create(**kwargs)` constructs an instance and calls
+it. It accepts only unsaved instances of the queryset's exact model, rejects a
+conflicting database alias, and saves on the queryset's write alias with its actor
+pinned and its explicit sudo reason cleared after the save. Queryset scope owns
+the write: an actor or sudo pinned on the instance itself is replaced, so a
+prepared instance carrying its own scope saves through `instance.save()` or
+`Model.objects.with_actor(actor).insert(obj)`. Domain factories that must run
+for both paths override `insert` on their queryset, not `create` on the
+manager; `RebacManager.from_queryset` exposes the override automatically.
 
 **Deliberately outside the ``Backend`` ABC.** ``check_new`` is a free
 function, not a backend RPC, because SpiceDB ships no "check with
@@ -1163,9 +1225,9 @@ backend's ``schema()`` is not implemented.
 
 Limitations (0.4):
 
-* Caveats on the **top-level virtual tuples** are not supported — the
-  ``relationships`` overlay is a bare ``SubjectRef`` sequence with no
-  caveat name or pinned context. A virtual tuple is therefore uncaveated:
+* Caveats on the **top-level virtual tuples** are not supported — known
+  relations in the ``relationships`` overlay are bare ``SubjectRef`` sequences
+  with no caveat name or pinned context. A virtual tuple is therefore uncaveated:
   it must match an explicitly uncaveated allowed-subject alternative or is
   treated as absent, including on virtual arrow hops. Request context cannot
   make an unsupported virtual caveated tuple valid. Caveat-conditional ``create`` permissions still
@@ -1217,8 +1279,9 @@ their stored values. Relation descriptors returning model objects are rejected.
 The relation's underlying target field owns column conversion; a parent-link
 primary key needs no consumer-specific identity override.
 Model identity resolution rejects `None` and empty strings before constructing
-an object reference. Empty IDs used for pre-save create checks are explicit
-model-level sentinels, not the identities of saved rows.
+an object reference. Empty IDs are row-independent backend-check sentinels, not
+the identities of saved rows; proposed-row create checks use `check_new()` with
+the candidate's relationship overlay.
 Object and subject resolution read Django metadata through the instance, so
 lazy wrappers such as `AuthenticationMiddleware`'s `request.user` retain the
 wrapped model's resource type, ID attribute and subject relation.
@@ -1344,6 +1407,8 @@ class RebacQuerySet:
     def system_context(self, *, reason: str) -> Self: ...               # framework-job bypass, NOT gated
     def effective_actor(self, *, strict: bool = False) -> tuple[SubjectRef | None, bool]: ...
 
+    def insert(self, obj): ...                                       # persist a prepared instance
+
     # Standard queryset ops with REBAC-aware overrides:
     def update(self, **kwargs) -> int: ...
     def delete(self) -> tuple[int, dict]: ...
@@ -1395,6 +1460,15 @@ What `sudo()` does NOT bypass:
 - Signals attached to `pre_save` / `post_save` that aren't part of the REBAC pipeline.
 - `@require_permission` decorators that resolve their own actor.
 
+`@require_permission(..., actor_arg="actor", resource_arg="resource")` binds
+those names through the decorated callable's native signature, so positional,
+keyword, instance-method, class-method, static-method, and defaulted arguments
+have the same meaning. A configured explicit actor is always checked and takes
+precedence over ambient sudo; an explicit or defaulted `None` actor fails closed
+instead of falling back to ambient scope. Ambient sudo bypass applies only when
+the decorator has no `actor_arg`. Named actor and resource arguments must be
+declared parameters of the callable.
+
 **Sudo does NOT propagate through relationship traversal.** This is the single largest deliberate divergence from Odoo's `env.su` semantics. In Odoo, `record.sudo().lines.user_id` reads BOTH `lines` AND `user_id` in sudo because the `env` propagates. We don't do that — see [§ Lessons from Odoo 19 — footguns we avoid](#lessons-from-odoo-19--footguns-we-avoid).
 
 ### Three actor-resolution paths
@@ -1424,10 +1498,11 @@ A pinned actor (path 2) **always wins** over ambient state (paths 3-4) — there
 | Operation | Permission checked | Where |
 |---|---|---|
 | `Model.objects.all()` / `.filter(...)` / `.get()` / `.count()` / `.exists()` | `read` (or `Meta.rebac_default_action`; override per chain with `.with_action(action)`) | The queryset injects the backend's lazy permission predicate, falling back to `resource_id__in=<accessible(actor, action, type)>` when unavailable. |
-| `Model.objects.create(**fields)` | `create` on the model class | `RebacManager.create()` calls `check_access(actor, "create", ObjectRef(type, ""))` first. |
-| `Model.objects.bulk_create(rows)` | `create` once per page | Single class-level check. |
-| `instance.save()` (PK present) | `write` on the row | Pre-save signal handler. |
-| `instance.save()` (new instance) | `create` on the model class | Pre-save handler dispatches based on `_state.adding`. |
+| `Model.objects.create(**fields)` | `create` on the proposed row's forward relations | Constructs the instance and delegates to `insert()`. |
+| `Model.objects.insert(obj)` | `create` on the proposed row's forward relations | Pins queryset scope on the prepared instance; the pre-save `check_new` gate authorizes the insert. |
+| `Model.objects.bulk_create(rows)` | `create` on each proposed row's forward relations | Every candidate is preflighted before Django issues insert SQL. |
+| `instance.save()` (loaded/non-adding instance) | `write` on the row | Pre-save signal handler. |
+| `instance.save()` (new instance) | `create` on the proposed row's forward relations | Pre-save handler projects the constructed candidate into `check_new`. |
 | `instance.delete()` | `delete` on the row | Pre-delete signal handler. |
 | `Model.objects.update(**kwargs)` | `write` on each affected row | Manager intersects the queryset PK set with `accessible(actor, "write", type)`; raises if any in-scope row is excluded. |
 | `Model.objects.delete()` | `delete` on each row | Same pattern. |
@@ -1435,7 +1510,7 @@ A pinned actor (path 2) **always wins** over ambient state (paths 3-4) — there
 **Failure mode for writes:** *all-or-nothing*. Any denied row in a bulk write raises and rolls back. **Failure mode for reads:** denied rows are absent from the queryset; no raise. List endpoints return `[]` rather than 403 when the user has no rows.
 
 Actor-scoped `bulk_create(update_conflicts=True)` raises `PermissionDenied`
-before writing: a class-level create check cannot authorize updates to existing
+before writing: a proposed-row create check cannot authorize updates to existing
 rows or their protected fields. Use checked instance saves for those updates,
 or explicitly bypass with `.sudo(reason=...)` for a trusted bulk import.
 
@@ -1847,7 +1922,20 @@ python manage.py rebac sync --force-overwrite --package=blog
 python manage.py rebac check                      # doctor: validate without writes
 python manage.py rebac build-zed                  # emit effective.zed for SpiceDB
 python manage.py rebac explain blog/post.read     # print compiled expression
+python manage.py rebac grant storage/role:viewer auth/user:42  # idempotent member grant; --caveat NAME --caveat-context JSON
+python manage.py rebac revoke storage/role:viewer auth/user:42 # print deleted count; --caveat NAME; --strict fails on 0
+python manage.py rebac relationships --resource storage/role:viewer # tuple listing; --subject TYPE:ID[#rel] --relation NAME --limit N
 ```
+
+`grant` and `revoke` route `<namespace>/role` containers through `rebac.roles`
+and other containers through `rebac.memberships`. Both keep the helpers' ambient
+actor, audit and Zookie behavior. `--caveat-context` requires a non-empty
+`--caveat` name. Listing reads the active relationship model,
+ordered by the canonical tuple key; supplied filters are exact (including an
+empty subject relation), omitted filters match all rows. An omitted limit lists
+all rows; zero lists none and negative limits are errors. Reference parse errors
+fail with a command error. Grant/revoke reject types absent from the loaded schema;
+listing accepts them so orphaned tuples remain inspectable after schema changes.
 
 The `write-schema`, `gc-expired`, `retype-relationships`, `build-zed --check`,
 and `sync --target` interfaces are planned and not implemented. Use
@@ -2005,7 +2093,7 @@ stable across patch releases. `rebac._internal.*` is private.
 
 2. **Swappable User dependency.** `auth/user` is hardcoded as a subject type label. Projects with `AUTH_USER_MODEL` aliases (`accounts.User`) need... what? Lean: a `REBAC_USER_TYPE` setting (default `"auth/user"`), plus `to_subject_ref()` consults `settings.AUTH_USER_MODEL` to decide. Settle in 0.1.
 
-3. **Async ORM support.** *Resolved (0.11.x).* No separate async manager API is needed. Django implements every async `QuerySet` method (`aget` / `acount` / `aexists` / `afirst` / `aupdate` / `adelete` / `acreate` / `__aiter__` / `ain_bulk` / `aget_or_create` / …) as a `sync_to_async` wrapper around the sync method `RebacQuerySet` already overrides, so scoping is inherited and the `current_actor()` ContextVar carries into the worker thread — `await Post.objects.as_user(u).aget(...)` enforces with no extra code. The two methods that compute *without* routing through the sync `iterator` / `_fetch_all` path are overridden to re-apply scope: `aiterator()` (builds the row iterable directly) and `aggregate()` / `aaggregate()` (summarises the query without materialising rows). `bulk_create()` and `abulk_create()` enforce the class-level `create` permission and stamp the queryset actor onto inserted instances. Actor-scoped conflict updates (`update_conflicts=True`) fail closed because a create grant cannot authorize changes to existing rows; use checked individual saves or explicit sudo for those upserts.
+3. **Async ORM support.** *Resolved (0.11.x).* No separate async manager API is needed. Django implements every async `QuerySet` method (`aget` / `acount` / `aexists` / `afirst` / `aupdate` / `adelete` / `acreate` / `__aiter__` / `ain_bulk` / `aget_or_create` / …) as a `sync_to_async` wrapper around the sync method `RebacQuerySet` already overrides, so scoping is inherited and the `current_actor()` ContextVar carries into the worker thread — `await Post.objects.as_user(u).aget(...)` enforces with no extra code. The two methods that compute *without* routing through the sync `iterator` / `_fetch_all` path are overridden to re-apply scope: `aiterator()` (builds the row iterable directly) and `aggregate()` / `aaggregate()` (summarises the query without materialising rows). `bulk_create()` and `abulk_create()` preflight every proposed row through `check_new()` and stamp the queryset actor onto inserted instances. Actor-scoped conflict updates (`update_conflicts=True`) fail closed because a create grant cannot authorize changes to existing rows; use checked individual saves or explicit sudo for those upserts.
 
 4. **Override layer precedence vs caveats.** When a `SchemaOverride` tightens a permission AND a caveat returns `CONDITIONAL`, what wins? Lean: tightening wins (security-fail-closed). Documented as a doctor warning.
 

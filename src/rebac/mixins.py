@@ -14,7 +14,7 @@ overrides where the captured values land.
 
 from __future__ import annotations
 
-from typing import TYPE_CHECKING, Any, Self
+from typing import TYPE_CHECKING, Any, Self, cast
 
 from django.db import models
 from django.db.models.base import ModelBase
@@ -469,11 +469,31 @@ class RebacMixin(models.Model, metaclass=RebacModelBase):
         return self
 
     def save(self, *args: Any, **kwargs: Any) -> None:
-        """Exclude redacted fields from full-row updates.
+        """Keep new instances insert-only and exclude redacted update fields.
 
         Explicit ``save(update_fields=[...])`` remains visible to the signal
         layer, which fails closed if a redacted field is named.
         """
+        if self._state.adding:
+            if kwargs.get("force_update") or kwargs.get("update_fields") is not None:
+                raise ValueError(
+                    "A new REBAC model instance must be inserted; "
+                    "force_update and update_fields are not allowed."
+                )
+            _actor, unscoped = self.effective_actor(strict=True)
+            if not unscoped:
+                # Django otherwise attempts UPDATE first for populated primary
+                # keys, including parent-table updates during multi-table
+                # inheritance saves. An actor's child-create grant cannot
+                # authorize those parent writes, so name every concrete table
+                # explicitly. Django normalizes force_insert=True to the leaf
+                # model only; _save_parents() forces a parent only when that
+                # parent is present in this tuple.
+                concrete_model = cast(type[models.Model], self._meta.concrete_model)
+                kwargs["force_insert"] = (
+                    *concrete_model._meta.all_parents,
+                    concrete_model,
+                )
         if not args and not self._state.adding and kwargs.get("update_fields") is None:
             redacted = frozenset(
                 getattr(self, "_rebac_redacted_fields", frozenset()) or frozenset()

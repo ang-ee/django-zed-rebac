@@ -5,6 +5,20 @@ pre-1.0; breaking changes within a minor version are explicitly called out.
 
 ## [Unreleased]
 
+## [0.18.0] — 2026-09-22
+
+### Added
+
+- `rebac grant`, `revoke` and `relationships` management subcommands for
+  membership grants, exact revocation and filtered tuple listing. Role helpers
+  forward optional caveat parameters to the membership API.
+- Public `rebac.roles.is_role_type` and `ROLE_TYPE_SUFFIX` share the role
+  convention; `RelationshipTuple.__str__` supplies caveat-aware wire rendering
+  for relationship models, audit targets and command output.
+- Queryset/manager `insert(obj)` persists a prepared unsaved instance under
+  queryset scope. `create(**kwargs)` delegates to it so domain factories can
+  override one queryset method for both paths.
+
 ### Fixed
 
 - Identity errors name the wrapped model instead of `SimpleLazyObject` when
@@ -12,6 +26,31 @@ pre-1.0; breaking changes within a minor version are explicitly called out.
 
 ### Changed
 
+- **Breaking.** Create authorization evaluates the proposed row itself. The
+  pre-save gate projects the candidate's schema-declared relations into
+  `check_new` instead of checking `create` against an empty resource id, so
+  owning some other row of the type no longer grants creating a new one. The
+  queryset-level create guard is deleted; direct `save()`, `create()` and
+  `bulk_create()` share the one candidate preflight, and `bulk_create()`
+  accepts only exact instances of the queryset model.
+- **Breaking.** Actor-scoped saves of a new instance are insert-only on every
+  concrete table, including multi-table-inheritance parents; `force_update`
+  and `update_fields` on an adding instance raise.
+- `require_permission` binds declared `actor_arg` / `resource_arg` parameters
+  from the call signature, positionally or by keyword, validates the names at
+  decoration time, and lets an explicit actor take precedence over ambient
+  sudo.
+- Create preflight projects only relations that `create` depends on, including
+  named-permission and arrow-source dependencies. Unfiltered single-hop FKs
+  storing the target REBAC identity project without queries. Referenced
+  reverse/many-valued first hops are empty; forward multi-hop paths, filtered
+  relations, and non-direct identities resolve on the write alias, including
+  MTI parent-declared FKs.
+  Database-default/expression values and other unresolved facts use `None` in
+  the `check_new` overlay; unknown arms fail closed under intersection and
+  exclusion, while independent allowed union arms still grant. Configuration
+  and data errors on referenced backings still raise before write; missing
+  targets raise where a fetch is performed.
 - The identity helpers in `rebac._id` and `model_resource_type` document
   their class-or-instance contract once at the owner and take a
   `model_or_instance` parameter; `RebacMixin` and field-visibility call

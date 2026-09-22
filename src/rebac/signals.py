@@ -16,6 +16,7 @@ from .conf import app_settings
 from .errors import NoActorResolvedError, PermissionDenied
 from .field_visibility import backend_schema
 from .mixins import RebacMixin
+from .preflight import _check_new_model
 from .resources import model_resource_type, to_object_ref
 from .schema.walker import field_gated_actions
 from .types import ObjectRef, SubjectRef
@@ -79,16 +80,19 @@ def _rebac_pre_save(
 
     from .backends import backend
 
-    # Empty resource_id on create — even when the configured attr is
-    # something like ``sqid`` (a virtual field computed from PK), the
-    # value isn't computable until after the insert. Same sentinel as
-    # the pk-default path.
     if is_create:
-        resource_id = ""
+        active_backend = backend()
+        result = _check_new_model(
+            instance,
+            subject=actor,
+            using=using,
+            backend=active_backend,
+        )
+        resource = ObjectRef(rebac_type, "")
     else:
         resource_id = _resource_id_for_existing_instance(sender=sender, instance=instance)
-    resource = ObjectRef(rebac_type, resource_id)
-    result = backend().check_access(subject=actor, action=action, resource=resource)
+        resource = ObjectRef(rebac_type, resource_id)
+        result = backend().check_access(subject=actor, action=action, resource=resource)
     if not result.allowed:
         _maybe_audit_denial(actor=actor, action=action, resource=resource)
         raise PermissionDenied(f"Denied: {actor} cannot {action} {resource}")

@@ -118,7 +118,7 @@ def containers_of(subject: ActorLike, **container_lookups: Any) -> Iterator[Obje
     ``container_lookups`` are Django lookups on the container side of the
     relationship row (``resource_type`` / ``resource_id``, with any lookup
     suffix), applied in SQL on top of the fixed subject and ``member``
-    predicates — for example ``resource_type__endswith="/role"``.
+    predicates — for example ``resource_type__endswith=roles.ROLE_TYPE_SUFFIX``.
     """
     from .models import active_relationship_model
 
