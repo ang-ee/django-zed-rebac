@@ -14,6 +14,7 @@ overrides where the captured values land.
 
 from __future__ import annotations
 
+from collections.abc import Iterable, Mapping
 from typing import TYPE_CHECKING, Any, Self, cast
 
 from django.db import models
@@ -199,6 +200,30 @@ class RebacMixin(models.Model, metaclass=RebacModelBase):
 
     class Meta:
         abstract = True
+
+    def proposed_relationships(
+        self, *, using: str | None = None
+    ) -> Mapping[str, Iterable[SubjectRef | models.Model]]:
+        """Relations this row will carry once persisted that are not derivable
+        from its fields, keyed by relation name; consulted by the create gate
+        before insert. The complementary owner for field-backed relations is
+        ``rebac.field_backing._proposed_forward_relationships``; field-backed
+        and const-backed relations belong to the library and must not be
+        returned here. Use the supplied write database alias ``using`` when
+        resolving subjects. Unreferenced subject iterables are not evaluated.
+
+        This hook is trusted self-assertion. Contributing a fact the row does
+        not actually carry after the write can silently grant access; omitting
+        a fact it does carry can deny access. The gate does not verify these
+        promises after writing. Persist the promised tuples in the same
+        transaction. ``bulk_create()`` never calls ``save()``, so bulk paths
+        must write the promised tuples themselves.
+
+        Unknown, field-backed, or const-backed relation names raise
+        ``SchemaError``. Subject resolution can raise ``NoActorResolvedError``
+        for an unsaved or unresolvable proposed model instance.
+        """
+        return {}
 
     @classmethod
     def from_db(cls, db: Any, field_names: Any, values: Any) -> RebacMixin:

@@ -182,6 +182,29 @@ Unreferenced unknown relations have no effect. Configuration and data errors
 on referenced backings still raise before write; missing targets raise where
 a fetch is performed. The direct-identity fast path leaves target-existence
 validation to database FK constraints.
+
+Field-backed relations are projected by the library. For tuple facts the model
+writes after insertion in the same transaction, override
+`proposed_relationships(self, *, using: str | None = None) -> Mapping[str, Iterable[SubjectRef | Model]]`
+(default `{}`) to return subjects keyed by relation name; other post-insert
+facts remain unknown to the candidate gate. Omitted tuple relations retain
+`check_new`'s empty/no-row semantics. Referenced model instances resolve
+through `to_subject_ref`; contributions may use any subject form the schema
+accepts for that relation, subject to the [wildcard rule](#public-read-access).
+A hook that resolves subjects must use the supplied write database alias
+`using`. Unknown relation names or field-backed or const-backed entries raise
+`SchemaError`; valid relations that `create` does not depend on are ignored
+without resolving or querying their subjects. `save()`, `create()`, `insert(obj)`,
+and each `bulk_create()` candidate share this hook. For example, a model that
+writes a `contributor` tuple for the creating actor after save can propose
+`{"contributor": [actor]}` for `relation contributor: auth/user`. The hook is
+trusted self-assertion: contributing a fact the row does not actually carry
+after the write can silently grant access; omitting a fact it does carry can
+deny access. The gate does not verify these promises after writing. The
+application must persist the promised tuples in the same transaction.
+`bulk_create()` never calls `save()`, so bulk paths must write the promised
+tuples themselves.
+
 Adding REBAC model instances are insert-only, including candidates with an
 explicit primary key. Load an existing row before updating it; a constructed
 candidate cannot turn a successful create preflight into an update.
@@ -440,7 +463,7 @@ write_relationships([
 
 **Wildcard rules:**
 
-- Only on read-shaped permissions. The schema doctor (`rebac.W001`) emits a warning when a wildcard relation participates in a `write`/`delete`/`create` permission.
+- Only on read-shaped permissions. Schema authors must ensure wildcard relations never feed `write`/`delete`/`create` permissions; no automated check currently enforces this rule.
 - Cannot be transitively included — `auth/user:*` cannot flow through a subject set like `auth/group#member`. SpiceDB rejects this at `WriteSchema` time.
 - Cheap for `CheckPermission`; expensive for `LookupSubjects`. Prefer narrow shares when listing matters.
 
@@ -982,7 +1005,9 @@ definition blog/post {
 }
 ```
 
-The schema doctor (`rebac.W001`) warns when a wildcard relation participates in a `write`/`delete`/`create` permission. Wildcards are for read-shaped, public-share patterns only.
+Wildcards are for read-shaped, public-share patterns only. Schema authors must
+keep wildcard relations out of `write`/`delete`/`create` permissions; no
+automated check currently enforces this rule.
 
 ### 2. Don't smuggle wildcards transitively
 

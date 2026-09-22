@@ -1178,6 +1178,28 @@ forward multi-hop paths, and filtered backings resolve their targets on the
 write alias; filters on resolved targets and known candidate scalar values
 are evaluated by Django on that alias.
 
+Models contribute post-save tuple facts through
+`RebacMixin.proposed_relationships(self, *, using: str | None = None) -> Mapping[str, Iterable[SubjectRef | Model]]`,
+which defaults to `{}`. A hook that resolves subjects must use the supplied
+write database alias `using`. Field-backed relations remain library projections;
+the hook declares other relations the row will carry once persisted, while
+other post-insert facts remain unknown to the candidate gate. Omitted tuple
+relations retain `check_new`'s empty/no-row semantics. `_check_new_model`
+merges these contributions for `save()`, `create()`, `insert(obj)`, and each
+`bulk_create()` candidate. Unknown relation names and field-backed or const-backed
+entries raise `SchemaError`, even when unreferenced or empty. Valid unreferenced
+relations are ignored without iterating or resolving their subjects; referenced
+model instances use `to_subject_ref` and accept any subject form the schema
+accepts for that relation, subject to the [wildcard rule](./ZED.md#public-read-access).
+For example, a model that writes a `contributor` tuple for the creating actor
+after save can propose `{"contributor": [actor]}` for
+`relation contributor: auth/user`. The hook is trusted self-assertion: a fact
+the row does not actually carry after the write can silently grant access;
+omitting a fact it does carry can deny access. The gate does not verify these
+promises after writing. The application must persist the promised tuples in
+the same transaction. `bulk_create()` never calls `save()`, so bulk paths must
+write the promised tuples themselves.
+
 Unknown is distinct from empty: database-default/expression values, unset
 insert-assigned MTI parent links, and paths or filters whose facts cannot be
 established before insertion contribute `None` in

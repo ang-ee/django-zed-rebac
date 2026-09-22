@@ -51,7 +51,7 @@ from typing import TYPE_CHECKING, Any
 
 from .conf import app_settings
 from .errors import PermissionDepthExceeded, SchemaError
-from .schema.ast import ConstBinding
+from .schema.ast import ConstBinding, FieldBinding
 from .schema.introspection import relation_dependencies
 from .schema.walker import (
     WalkContext,
@@ -77,6 +77,7 @@ def _check_new_model(
 ) -> CheckResult:
     """Evaluate one constructed Django candidate through :func:`check_new`."""
 
+    from .actors import to_subject_ref
     from .backends import backend as _current_backend
     from .field_backing import _proposed_forward_relationships
     from .resources import model_resource_type
@@ -96,16 +97,32 @@ def _check_new_model(
             resource_type=resource_type,
             backend=active_backend,
         )
-    relationships = (
-        _proposed_forward_relationships(
+    relationships: dict[str, tuple[SubjectRef, ...] | None] = {}
+    if definition is not None:
+        required_relations = relation_dependencies(schema, resource_type, "create")
+        relationships = _proposed_forward_relationships(
             instance,
             definition,
-            required_relations=relation_dependencies(schema, resource_type, "create"),
+            required_relations=required_relations,
             using=using,
         )
-        if definition is not None
-        else {}
-    )
+        proposed = instance.proposed_relationships(using=using)
+        for name in sorted(proposed):
+            relation = find_relation(definition, name)
+            if relation is None:
+                raise SchemaError(
+                    f"{resource_type}#{name} is not a declared relation; "
+                    "proposed_relationships() must name schema relations"
+                )
+            if isinstance(relation.backing, (FieldBinding, ConstBinding)):
+                backing_kind = "field" if isinstance(relation.backing, FieldBinding) else "const"
+                raise SchemaError(
+                    f"{resource_type}#{name} is {backing_kind}-backed; "
+                    "proposed_relationships() must not supply library-owned relations"
+                )
+            if name not in required_relations:
+                continue
+            relationships[name] = tuple(to_subject_ref(candidate) for candidate in proposed[name])
     return check_new(
         subject=subject,
         action="create",
