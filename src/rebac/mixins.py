@@ -494,12 +494,12 @@ class RebacMixin(models.Model, metaclass=RebacModelBase):
         return self
 
     def save(self, *args: Any, **kwargs: Any) -> None:
-        """Keep new instances insert-only and exclude redacted update fields.
+        """Keep new resource instances insert-only and exclude redacted update fields.
 
         Explicit ``save(update_fields=[...])`` remains visible to the signal
         layer, which fails closed if a redacted field is named.
         """
-        if self._state.adding:
+        if self._state.adding and model_resource_type(self):
             if kwargs.get("force_update") or kwargs.get("update_fields") is not None:
                 raise ValueError(
                     "A new REBAC model instance must be inserted; "

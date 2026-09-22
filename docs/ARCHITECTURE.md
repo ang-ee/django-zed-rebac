@@ -1216,9 +1216,11 @@ For referenced backings, unresolvable configuration, non-scalar prepared FK
 identities, missing targets where a fetch is performed, and missing target
 REBAC identities still raise before any insert. The direct-identity fast path
 does not query target existence; database FK constraints remain authoritative.
-An actor-scoped adding `RebacMixin` instance is always saved as an insert, even
-when its primary key is already populated; `force_update` and `update_fields`
-are invalid for all adding instances. Load an existing row before updating it.
+An actor-scoped adding `RebacMixin` resource instance is always saved as an
+insert, even when its primary key is already populated; `force_update` and
+`update_fields` are invalid for all adding resource instances. Models without
+a REBAC resource type retain Django's ordinary save behavior without resolving
+an actor or rewriting `force_insert`. Load an existing resource row before updating it.
 `bulk_create()` accepts only instances whose exact model class matches its
 queryset model.
 For actor-scoped multi-table inheritance, every table in the inheritance chain

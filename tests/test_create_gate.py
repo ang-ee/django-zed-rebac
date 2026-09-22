@@ -172,6 +172,94 @@ def _django_user(username: str):
     return get_user_model().objects.create(username=username, is_active=True)
 
 
+@pytest.fixture
+def non_resource_models(transactional_db):
+    from django.db import connection, models
+    from django.test.utils import isolate_apps
+
+    from rebac import RebacMixin
+    from rebac.resources import model_resource_type
+
+    with isolate_apps("tests.testapp"):
+
+        class HelperRecord(RebacMixin, models.Model):
+            name = models.CharField(max_length=100)
+            # Helper tables use Django's ordinary manager, without REBAC scope.
+            objects = models.Manager()
+
+            class Meta:
+                app_label = "testapp"
+
+        class HelperChild(HelperRecord):
+            detail = models.CharField(max_length=100)
+
+            class Meta:
+                app_label = "testapp"
+
+        assert model_resource_type(HelperRecord) is None
+        assert model_resource_type(HelperChild) is None
+        with connection.schema_editor() as editor:
+            editor.create_model(HelperRecord)
+            editor.create_model(HelperChild)
+        try:
+            yield HelperRecord, HelperChild
+        finally:
+            with connection.schema_editor() as editor:
+                editor.delete_model(HelperChild)
+                editor.delete_model(HelperRecord)
+
+
+@pytest.mark.parametrize("manager_name", ["objects", "_base_manager"])
+@pytest.mark.parametrize("child", [False, True], ids=["record", "mti-child"])
+def test_non_resource_create_needs_no_actor(non_resource_models, manager_name, child) -> None:
+    model = non_resource_models[int(child)]
+
+    row = getattr(model, manager_name).create(name="helper")
+
+    assert row.pk is not None
+    assert model._base_manager.get(pk=row.pk).name == "helper"
+
+
+@pytest.mark.parametrize("save_kwargs", [{}, {"force_update": True}, {"update_fields": ["name"]}])
+def test_non_resource_adding_instance_keeps_django_update_semantics(
+    non_resource_models, save_kwargs
+) -> None:
+    model, _child_model = non_resource_models
+    stored = model.objects.create(name="original")
+    replacement = model(pk=stored.pk, name="updated")
+
+    replacement.save(**save_kwargs)
+
+    assert model.objects.count() == 1
+    assert model.objects.get(pk=stored.pk).name == "updated"
+
+
+def test_non_resource_child_can_attach_to_existing_parent(non_resource_models) -> None:
+    parent_model, child_model = non_resource_models
+    parent = parent_model.objects.create(name="parent")
+
+    child = child_model.objects.create(helperrecord_ptr=parent, name="updated", detail="child")
+
+    assert child.pk == parent.pk
+    assert parent_model.objects.count() == 1
+    assert parent_model.objects.get(pk=parent.pk).name == "updated"
+    assert child_model.objects.get(pk=parent.pk).detail == "child"
+
+
+@pytest.mark.django_db
+@pytest.mark.parametrize("operation", ["save", "create", "base_create"])
+def test_resource_create_still_requires_actor(operation) -> None:
+    from tests.testapp.models import Post
+
+    with pytest.raises(MissingActorError):
+        if operation == "save":
+            Post(title="forbidden").save()
+        else:
+            manager = Post.objects if operation == "create" else Post._base_manager
+            manager.create(title="forbidden")
+    assert not Post._base_manager.exists()
+
+
 @pytest.mark.django_db
 def test_authenticated_actor_can_create_through_pre_save_gate(_global_backend) -> None:
     from tests.testapp.models import Post
