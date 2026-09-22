@@ -5,6 +5,8 @@ pre-1.0; breaking changes within a minor version are explicitly called out.
 
 ## [Unreleased]
 
+## [0.18.1] — 2026-09-22
+
 ### Added
 
 - `RebacMixin.proposed_relationships(*, using=None)` lets models contribute post-save tuple
