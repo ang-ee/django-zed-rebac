@@ -24,6 +24,17 @@ pre-1.0; breaking changes within a minor version are explicitly called out.
 
 ### Changed
 
+- Create preflight projects only relations that `create` depends on, including
+  named-permission and arrow-source dependencies. Unfiltered single-hop FKs
+  storing the target REBAC identity project without queries. Referenced
+  reverse/many-valued first hops are empty; forward multi-hop paths, filtered
+  relations, and non-direct identities resolve on the write alias, including
+  MTI parent-declared FKs.
+  Database-default/expression values and other unresolved facts use `None` in
+  the `check_new` overlay; unknown arms fail closed under intersection and
+  exclusion, while independent allowed union arms still grant. Configuration
+  and data errors on referenced backings still raise before write; missing
+  targets raise where a fetch is performed.
 - The identity helpers in `rebac._id` and `model_resource_type` document
   their class-or-instance contract once at the owner and take a
   `model_or_instance` parameter; `RebacMixin` and field-visibility call

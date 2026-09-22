@@ -74,6 +74,11 @@ class ResolveArrow(Protocol):
     ) -> bool | None: ...
 
 
+# Preflight uses this signal to deny unresolved candidate-relation arms.
+class _UnknownRelation(Exception):
+    """An unavailable proposed-row relation must not grant through negation."""
+
+
 @dataclass(slots=True)
 class WalkContext:
     """State threaded through the recursive walker.
@@ -91,6 +96,11 @@ class WalkContext:
     depth_limit: int
     resolve_relation: ResolveRelation
     resolve_arrow: ResolveArrow
+    # Proposed-row overlays can contain facts unavailable before insertion.
+    # Inspect both sides of AND/MINUS so a False side cannot conceal an
+    # unknown relation inside a later exclusion. Persisted checks retain
+    # their normal tri-state short-circuiting.
+    has_unknown_relations: bool = False
 
 
 def eval_expr(
@@ -113,6 +123,10 @@ def eval_expr(
     operators don't increment depth — they're tree shape, not dispatch
     hops. Arrow walks and subject-set traversals do; the callbacks
     typically pass ``depth + 1`` when they recurse into another type.
+
+    Proposed-row callbacks can raise ``_UnknownRelation`` for subjects that
+    cannot be resolved before insertion. It propagates through intersections
+    and exclusions; a union can settle it only through an independent True.
     """
     if depth > ctx.depth_limit:
         raise PermissionDepthExceeded(f"Depth limit {ctx.depth_limit} exceeded")
@@ -144,14 +158,32 @@ def eval_expr(
             return False
         return ctx.resolve_arrow(ctx, definition, resource_id, expr.via, expr.target, depth)
     if isinstance(expr, PermBinOp):
-        left = eval_expr(
-            expr.left,
-            definition=definition,
-            resource_id=resource_id,
-            depth=depth,
-            ctx=ctx,
-            seen=seen,
-        )
+        try:
+            left = eval_expr(
+                expr.left,
+                definition=definition,
+                resource_id=resource_id,
+                depth=depth,
+                ctx=ctx,
+                seen=seen,
+            )
+        except _UnknownRelation:
+            if expr.op != "+":
+                raise
+            # Only an independently granted union arm can settle an unknown
+            # proposed relation. Treating it as False would authorize a later
+            # exclusion, e.g. authenticated - (unknown + nil).
+            right = eval_expr(
+                expr.right,
+                definition=definition,
+                resource_id=resource_id,
+                depth=depth,
+                ctx=ctx,
+                seen=seen,
+            )
+            if right is True:
+                return True
+            raise
         if expr.op == "+":
             if left is True:
                 return True
@@ -165,7 +197,7 @@ def eval_expr(
             )
             return tri_or(left, right)
         if expr.op == "&":
-            if left is False:
+            if left is False and not ctx.has_unknown_relations:
                 return False
             right = eval_expr(
                 expr.right,
@@ -177,7 +209,7 @@ def eval_expr(
             )
             return tri_and(left, right)
         if expr.op == "-":
-            if left is False:
+            if left is False and not ctx.has_unknown_relations:
                 return False
             right = eval_expr(
                 expr.right,

@@ -160,13 +160,28 @@ Both direct checks and lazy queryset scopes read the current rows, including
 changes made through bulk updates or the M2M manager.
 
 Before inserting a new model, the Django `create()`, `save()`, and
-`bulk_create()` gates project direct forward `ForeignKey` and `OneToOneField`
-backings from the constructed candidate into `check_new()`. Python defaults
-are therefore visible to `permission create = parent->write`, and each bulk
-row is checked before any insert. Reverse, many-to-many, filtered, and
-database-default relations are not resolved on an unsaved candidate and fail
-closed; authorize those shapes through an explicit checked command after their
-relationship facts exist.
+`bulk_create()` gates project only the field-backed relations that `create`
+depends on, including named-permission dependencies and arrow sources, from
+the constructed candidate into `check_new()`. Unreferenced backings are not
+resolved, queried, filtered, or marked unknown. Python defaults are therefore
+visible to `permission create = parent->write`, and each bulk row is checked
+before any insert. A reverse FK, reverse O2O, or many-to-many **first hop**
+contributes an empty subject tuple. Forward paths, including
+multi-hop paths and MTI parent-declared FKs, are resolved on the write alias,
+except that an unfiltered single-hop FK/O2O storing the target's REBAC identity
+projects its prepared scalar without a query. Filters on resolved targets and
+known candidate scalar values are evaluated by Django on that alias.
+Database-default/expression values, unset insert-assigned MTI parent links,
+and other facts that cannot be established before insertion
+are **unknown**, represented by `None` in the `check_new()` overlay. A forward
+path with a later reverse or many-to-many hop is unknown because that set can
+change on insertion.
+Unknown relations deny any arm referencing them, even under intersection or
+exclusion; an independent allowed union arm can still authorize creation.
+Unreferenced unknown relations have no effect. Configuration and data errors
+on referenced backings still raise before write; missing targets raise where
+a fetch is performed. The direct-identity fast path leaves target-existence
+validation to database FK constraints.
 Adding REBAC model instances are insert-only, including candidates with an
 explicit primary key. Load an existing row before updating it; a constructed
 candidate cannot turn a successful create preflight into an update.

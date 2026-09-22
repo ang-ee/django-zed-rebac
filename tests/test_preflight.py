@@ -640,3 +640,205 @@ def test_create_via_parent_arrow_denies_when_actor_can_create_elsewhere(db):
     )
 
     assert not result.allowed
+
+
+@pytest.mark.parametrize(
+    "expression",
+    [
+        "blocked",
+        "blocked_arm",
+        "vault->write",
+        "authenticated - blocked",
+        "authenticated - blocked_arm",
+        "authenticated - vault->write",
+        "authenticated & blocked",
+        "blocked & authenticated",
+        "authenticated - (blocked & nil)",
+        "authenticated - (nil & blocked)",
+        "authenticated - (blocked - authenticated)",
+        "authenticated - (nil - blocked)",
+        "authenticated - (blocked + nil)",
+        "authenticated - (nil + blocked)",
+    ],
+)
+def test_unknown_candidate_relation_denies_dependent_arm(backend, expression):
+    backend.set_schema(
+        parse_zed(
+            f"""
+            definition auth/user {{}}
+            definition blog/vault {{
+                relation writer: auth/user
+                permission write = writer
+            }}
+            definition draft/row {{
+                relation blocked: auth/user
+                relation vault: blog/vault
+                permission blocked_arm = blocked
+                permission create = {expression}
+            }}
+            """
+        )
+    )
+
+    result = check_new(
+        subject=_user("alice"),
+        action="create",
+        resource_type="draft/row",
+        relationships={"blocked": None, "vault": None},
+        backend=backend,
+    )
+
+    assert result.result is PermissionResult.NO_PERMISSION
+    assert result.reason and "unknown proposed relation" in result.reason
+
+
+@pytest.mark.parametrize(
+    "expression",
+    [
+        "authenticated",
+        "(authenticated - blocked) + authenticated",
+        "authenticated + (authenticated - blocked)",
+        "blocked + authenticated",
+        "authenticated + blocked",
+        "(nil & blocked) + authenticated",
+        "authenticated + (nil & blocked)",
+    ],
+)
+def test_unknown_candidate_relation_allows_independent_union_arm(backend, expression):
+    backend.set_schema(
+        parse_zed(
+            f"""
+            definition auth/user {{}}
+            definition draft/row {{
+                relation blocked: auth/user
+                permission create = {expression}
+            }}
+            """
+        )
+    )
+
+    result = check_new(
+        subject=_user("alice"),
+        action="create",
+        resource_type="draft/row",
+        relationships={"blocked": None},
+        backend=backend,
+    )
+
+    assert result.result is PermissionResult.HAS_PERMISSION
+
+
+def test_unknown_candidate_relation_direct_action_denies(backend):
+    result = check_new(
+        subject=_user("alice"),
+        action="author",
+        resource_type="blog/post",
+        relationships={"author": None},
+        backend=backend,
+    )
+
+    assert result.result is PermissionResult.NO_PERMISSION
+
+
+@pytest.mark.parametrize(
+    "expression",
+    ["vault->write", "blocked + vault->write", "vault->write + blocked"],
+)
+def test_unknown_candidate_relation_preserves_independent_caveat_checks(backend, expression):
+    # An unreferenced unknown must not turn a real caveat condition into a
+    # structural denial. A referenced one requires an independent definite
+    # grant, so a conditional union arm alone cannot bypass it.
+    backend.set_schema(
+        parse_zed(
+            SCHEMA_TEXT
+            + f"""
+            definition draft/row {{
+                relation blocked: auth/user
+                relation vault: blog/vault
+                permission create = {expression}
+            }}
+            """
+        )
+    )
+    backend.write_relationships(
+        [
+            RelationshipTuple(
+                resource=ObjectRef("blog/vault", "v1"),
+                relation="writer",
+                subject=_user("alice"),
+                caveat_name="link_not_expired",
+                caveat_context={"expires_at": "2099-01-01T00:00:00Z"},
+            )
+        ]
+    )
+
+    unresolved = check_new(
+        subject=_user("alice"),
+        action="create",
+        resource_type="draft/row",
+        relationships={"blocked": None, "vault": [_vault("v1")]},
+        backend=backend,
+    )
+    resolved = check_new(
+        subject=_user("alice"),
+        action="create",
+        resource_type="draft/row",
+        relationships={"blocked": None, "vault": [_vault("v1")]},
+        backend=backend,
+        context={"now": "1999-01-01T00:00:00Z"},
+    )
+
+    references_unknown = "blocked" in expression
+    expected = (
+        PermissionResult.NO_PERMISSION
+        if references_unknown
+        else PermissionResult.CONDITIONAL_PERMISSION
+    )
+    assert unresolved.result is expected
+    if not references_unknown:
+        assert unresolved.conditional_on == ("now",)
+    assert resolved.result is PermissionResult.HAS_PERMISSION
+
+
+def test_create_rejects_unknown_const_relation_overlay(db):
+    with pytest.raises(SchemaError, match="const-backed"):
+        check_new(
+            subject=_user("alice"),
+            action="create_admin",
+            resource_type="blog/post",
+            relationships={"admin": None},
+            backend=_const_backend(),
+        )
+
+
+@pytest.mark.parametrize("expression", ["nil & vault->write", "nil - vault->write"])
+def test_unreferenced_unknown_candidate_relation_preserves_short_circuit(
+    backend, monkeypatch, expression
+):
+    backend.set_schema(
+        parse_zed(
+            SCHEMA_TEXT
+            + f"""
+            definition draft/row {{
+                relation blocked: auth/user
+                relation vault: blog/vault
+                permission create = {expression}
+            }}
+            """
+        )
+    )
+
+    def unexpected_target_check(**kwargs):
+        pytest.fail("An unreferenced unknown must not force a skipped arrow lookup")
+
+    monkeypatch.setattr(backend, "check_access", unexpected_target_check)
+
+    result = check_new(
+        subject=_user("alice"),
+        action="create",
+        resource_type="draft/row",
+        relationships={"blocked": None, "vault": [_vault("v1")]},
+        backend=backend,
+    )
+
+    assert result.result is PermissionResult.NO_PERMISSION

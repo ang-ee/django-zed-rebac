@@ -1161,15 +1161,39 @@ rebac:const=admin`, `check_new()` behaves as if the proposed object carried
 `#admin @ platform/role:admin`, then evaluates `admin->member` through the real
 backend store. Callers must not supply virtual tuples for const-backed
 relations; those are synthetic schema facts, so `check_new()` raises
-`SchemaError` for non-empty caller entries on a const-backed relation name.
+`SchemaError` for non-empty or unknown caller entries on a const-backed relation name.
 
 Django create paths construct the candidate first, including Python field
-defaults, then project schema-declared direct forward `ForeignKey` and
-`OneToOneField` values into this same overlay. `create()`, `insert(obj)`, a new
-instance's `save()`, and every row of `bulk_create()` therefore use `check_new` as the
-single evaluator. Reverse, many-to-many, filtered, database-default, or
-otherwise unresolved candidate relations fail before any insert; callers must
-use an explicit checked command once those facts can be resolved.
+defaults, then project only the field-backed relations that `create` depends
+on, including dependencies through named permissions and arrow sources, into
+this same overlay. Unreferenced backings are not resolved, queried, filtered,
+or marked unknown during create preflight.
+`create()`, `insert(obj)`, a new instance's `save()`, and every row of
+`bulk_create()` use `check_new` as the single evaluator. A backing whose first
+hop is reverse FK, reverse O2O, or many-to-many is genuinely empty on the new
+row and contributes `()`. A single-hop, unfiltered forward FK/O2O that stores
+the target's REBAC identity projects its prepared scalar without a query,
+including fields inherited from concrete MTI parents. Non-direct identities,
+forward multi-hop paths, and filtered backings resolve their targets on the
+write alias; filters on resolved targets and known candidate scalar values
+are evaluated by Django on that alias.
+
+Unknown is distinct from empty: database-default/expression values, unset
+insert-assigned MTI parent links, and paths or filters whose facts cannot be
+established before insertion contribute `None` in
+`check_new(relationships=...)`. A forward path with a later reverse
+or many-to-many hop is also unknown, since that set can change on insertion.
+An unknown relation denies an arm referencing it directly, through an arrow,
+or through a named permission, including under intersection or exclusion.
+The shared walker preserves this structural unknown through `&` and `-`;
+only an independently allowed union arm can authorize without it. Unreferenced
+unknown relations have no effect. This structural uncertainty is a denial,
+not a caveat whose missing context the caller can supply.
+
+For referenced backings, unresolvable configuration, non-scalar prepared FK
+identities, missing targets where a fetch is performed, and missing target
+REBAC identities still raise before any insert. The direct-identity fast path
+does not query target existence; database FK constraints remain authoritative.
 An actor-scoped adding `RebacMixin` instance is always saved as an insert, even
 when its primary key is already populated; `force_update` and `update_fields`
 are invalid for all adding instances. Load an existing row before updating it.
@@ -1201,9 +1225,9 @@ backend's ``schema()`` is not implemented.
 
 Limitations (0.4):
 
-* Caveats on the **top-level virtual tuples** are not supported — the
-  ``relationships`` overlay is a bare ``SubjectRef`` sequence with no
-  caveat name or pinned context. A virtual tuple is therefore uncaveated:
+* Caveats on the **top-level virtual tuples** are not supported — known
+  relations in the ``relationships`` overlay are bare ``SubjectRef`` sequences
+  with no caveat name or pinned context. A virtual tuple is therefore uncaveated:
   it must match an explicitly uncaveated allowed-subject alternative or is
   treated as absent, including on virtual arrow hops. Request context cannot
   make an unsupported virtual caveated tuple valid. Caveat-conditional ``create`` permissions still
