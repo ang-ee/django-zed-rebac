@@ -7,6 +7,12 @@ pre-1.0; breaking changes within a minor version are explicitly called out.
 
 ### Added
 
+- `rebac grant`, `revoke` and `relationships` management subcommands for
+  membership grants, exact revocation and filtered tuple listing. Role helpers
+  forward optional caveat parameters to the membership API.
+- Public `rebac.roles.is_role_type` and `ROLE_TYPE_SUFFIX` share the role
+  convention; `RelationshipTuple.__str__` supplies caveat-aware wire rendering
+  for relationship models, audit targets and command output.
 - Queryset/manager `insert(obj)` persists a prepared unsaved instance under
   queryset scope. `create(**kwargs)` delegates to it so domain factories can
   override one queryset method for both paths.

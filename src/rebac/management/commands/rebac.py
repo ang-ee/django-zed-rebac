@@ -7,23 +7,62 @@ python manage.py rebac check                    # validate without writes
 python manage.py rebac build-zed                # emit effective.zed
 python manage.py rebac explain <type>.<perm>    # print compiled expression
 python manage.py rebac migrate-storage --to registry   # registry-storage cutover
+python manage.py rebac grant storage/role:viewer auth/user:42
+python manage.py rebac revoke storage/role:viewer auth/user:42
+python manage.py rebac relationships --resource storage/role:viewer
 """
 
 from __future__ import annotations
 
 import hashlib
+import json
 import sys
 from pathlib import Path
-from typing import Any
+from typing import TYPE_CHECKING, Any, cast
 
 from django.apps import apps
 from django.core.management.base import BaseCommand, CommandError
 from django.utils import timezone
 
+from ...errors import SchemaError
 from ...models.resource import RebacResource
 from ...schema import Schema, render_zed, resolve_schema_path
 from ...schema.ast import backing_to_dict
 from ...schema.parser import parse_zed, subject_relation_errors, validate_schema
+from ...types import ObjectRef, SubjectRef
+
+if TYPE_CHECKING:
+    from ...models.relationship import RelationshipQuerySet, RelationshipRegistryQuerySet
+
+
+def _container_ref(value: str) -> ObjectRef:
+    from ...roles import _parse_role, is_role_type
+
+    ref = _parse_role(value) if is_role_type(value.partition(":")[0]) else ObjectRef.parse(value)
+    if not ref.resource_type or not ref.resource_id or "#" in value:
+        raise ValueError(f"Invalid ObjectRef: {value!r} (expected '<type>:<id>')")
+    return ref
+
+
+def _subject_ref(value: str) -> SubjectRef:
+    ref = SubjectRef.parse(value)
+    if (
+        not ref.subject_type
+        or not ref.subject_id
+        or ("#" in value and not ref.optional_relation)
+        or "#" in ref.optional_relation
+    ):
+        raise ValueError(f"Invalid SubjectRef: {value!r} (expected '<type>:<id>[#relation]')")
+    return ref
+
+
+def _require_known_types(*resource_types: str) -> None:
+    from ...backends import backend
+
+    schema = backend().schema()
+    for resource_type in resource_types:
+        if schema.get_definition(resource_type) is None:
+            raise ValueError(f"unknown resource type: {resource_type}")
 
 
 def _stale_record_prune_order(external_id: str) -> tuple[int, str]:
@@ -38,7 +77,7 @@ def _stale_record_prune_order(external_id: str) -> tuple[int, str]:
 
 
 class Command(BaseCommand):
-    help = "Manage rebac schema (sync / check / build-zed / explain)."
+    help = "Manage rebac schema and relationships."
 
     def add_arguments(self, parser: Any) -> None:
         sub = parser.add_subparsers(dest="cmd", required=True)
@@ -84,6 +123,24 @@ class Command(BaseCommand):
         p_mig.add_argument("--batch", type=int, default=None, help="Override batch size.")
         p_mig.add_argument("--dry-run", action="store_true", help="Report counts without writes.")
 
+        p_grant = sub.add_parser("grant", help="Grant direct membership idempotently.")
+        p_grant.add_argument("container", help="Container or role as TYPE:ID.")
+        p_grant.add_argument("subject", help="Subject as TYPE:ID[#relation].")
+        p_grant.add_argument("--caveat", default="", help="Caveat name.")
+        p_grant.add_argument("--caveat-context", help="Caveat context as a JSON object.")
+
+        p_revoke = sub.add_parser("revoke", help="Revoke exact direct membership.")
+        p_revoke.add_argument("container", help="Container or role as TYPE:ID.")
+        p_revoke.add_argument("subject", help="Subject as TYPE:ID[#relation].")
+        p_revoke.add_argument("--caveat", default="", help="Caveat name.")
+        p_revoke.add_argument("--strict", action="store_true", help="Fail if no membership exists.")
+
+        p_rels = sub.add_parser("relationships", help="List stored relationship tuples.")
+        p_rels.add_argument("--resource", help="Exact resource as TYPE:ID.")
+        p_rels.add_argument("--subject", help="Exact subject as TYPE:ID[#relation].")
+        p_rels.add_argument("--relation", help="Exact relation name.")
+        p_rels.add_argument("--limit", type=int, help="Maximum rows (default: unlimited).")
+
     def handle(self, *args: Any, **options: Any) -> None:
         cmd = options["cmd"]
         if cmd == "sync":
@@ -96,8 +153,100 @@ class Command(BaseCommand):
             self._handle_explain(options)
         elif cmd == "migrate-storage":
             self._handle_migrate_storage(options)
+        elif cmd in {"grant", "revoke", "relationships"}:
+            try:
+                if cmd == "grant":
+                    self._handle_grant(options)
+                elif cmd == "revoke":
+                    self._handle_revoke(options)
+                else:
+                    self._handle_relationships(options)
+            except (ValueError, SchemaError) as exc:
+                raise CommandError(str(exc)) from exc
         else:
             raise CommandError(f"Unknown subcommand: {cmd}")
+
+    # ---------- relationships ----------
+
+    def _handle_grant(self, options: dict[str, Any]) -> None:
+        from ... import memberships, roles
+
+        container = _container_ref(options["container"])
+        subject = _subject_ref(options["subject"])
+        context = None
+        if options["caveat_context"] is not None:
+            if not options["caveat"]:
+                raise CommandError("--caveat-context requires a non-empty --caveat")
+            try:
+                context = json.loads(options["caveat_context"])
+            except ValueError as exc:
+                raise CommandError(f"--caveat-context must be valid JSON: {exc}") from exc
+            if not isinstance(context, dict):
+                raise CommandError("--caveat-context must be a JSON object")
+        _require_known_types(container.resource_type, subject.subject_type)
+        if roles.is_role_type(container.resource_type):
+            row = roles.grant(
+                actor=subject,
+                role=container,
+                caveat_name=options["caveat"],
+                caveat_context=context,
+            )
+        else:
+            row = memberships.grant(
+                subject=subject,
+                container=container,
+                caveat_name=options["caveat"],
+                caveat_context=context,
+            )
+        self.stdout.write(str(row))
+
+    def _handle_revoke(self, options: dict[str, Any]) -> None:
+        from ... import memberships, roles
+
+        container = _container_ref(options["container"])
+        subject = _subject_ref(options["subject"])
+        _require_known_types(container.resource_type, subject.subject_type)
+        if roles.is_role_type(container.resource_type):
+            count = roles.revoke(actor=subject, role=container, caveat_name=options["caveat"])
+        else:
+            count = memberships.revoke(
+                subject=subject, container=container, caveat_name=options["caveat"]
+            )
+        if options["strict"] and count == 0:
+            raise CommandError(
+                f"No membership found: {container}#{memberships.MEMBER_RELATION} @ {subject}"
+            )
+        self.stdout.write(str(count))
+
+    def _handle_relationships(self, options: dict[str, Any]) -> None:
+        from ...models import RelationshipRegistry, active_relationship_model
+
+        limit = options["limit"]
+        if limit is not None and limit < 0:
+            raise CommandError("--limit must be non-negative")
+        relationship_model = active_relationship_model()
+        rows = cast(
+            "RelationshipQuerySet | RelationshipRegistryQuerySet",
+            relationship_model.objects.all(),
+        ).order_by_resource()
+        if relationship_model is RelationshipRegistry:
+            rows = cast("RelationshipRegistryQuerySet", rows).select_related(
+                "resource_fk", "subject_fk"
+            )
+        if options["resource"] is not None:
+            resource = _container_ref(options["resource"])
+            rows = rows.for_resource(resource.resource_type, resource.resource_id)
+        if options["subject"] is not None:
+            subject = _subject_ref(options["subject"])
+            rows = rows.for_subject(
+                subject.subject_type, subject.subject_id, subject.optional_relation
+            )
+        if options["relation"] is not None:
+            rows = rows.filter(relation=options["relation"])
+        if limit is not None:
+            rows = rows[:limit]
+        for row in rows.iterator():
+            self.stdout.write(str(row))
 
     # ---------- sync ----------
 

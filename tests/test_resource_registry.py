@@ -38,6 +38,31 @@ def test_active_model_with_registry_setting():
         assert active_relationship_model() is RelationshipRegistry
 
 
+@pytest.mark.django_db
+@pytest.mark.parametrize("model_cls", [Relationship, RelationshipRegistry])
+@pytest.mark.parametrize("subject_relation", ["", "member"])
+@pytest.mark.parametrize("caveat_name", ["", "during_business_hours"])
+def test_relationship_str_includes_subject_relation_and_caveat(
+    model_cls, subject_relation, caveat_name
+):
+    row = model_cls.objects.create(
+        resource_type="storage/file",
+        resource_id="a",
+        relation="viewer",
+        subject_type="auth/group",
+        subject_id="eng",
+        optional_subject_relation=subject_relation,
+        caveat_name=caveat_name,
+    )
+    expected = "storage/file:a#viewer @ auth/group:eng"
+    if subject_relation:
+        expected += "#member"
+    if caveat_name:
+        expected += " with during_business_hours"
+
+    assert str(row) == expected
+
+
 # ---------- RebacResource.upsert_ref ----------
 
 

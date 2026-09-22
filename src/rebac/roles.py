@@ -92,8 +92,8 @@ helpers here are exclusively for **actor-grantable** roles (the GCP
 
 from __future__ import annotations
 
-from collections.abc import Iterator
-from typing import TYPE_CHECKING, cast
+from collections.abc import Iterator, Mapping
+from typing import TYPE_CHECKING, Any, cast
 
 from .actors import ActorLike
 from .memberships import MEMBER_RELATION
@@ -102,6 +102,15 @@ from .types import ObjectRef, RelationshipTuple, SubjectRef
 if TYPE_CHECKING:  # pragma: no cover
     from .models import RelationshipRow
     from .schema.ast import Schema
+
+
+ROLE_TYPE_SUFFIX = "/role"
+"""Resource-type suffix for the module's ``<namespace>/role`` convention."""
+
+
+def is_role_type(resource_type: str) -> bool:
+    """Return whether a resource type follows the role namespace convention."""
+    return resource_type.endswith(ROLE_TYPE_SUFFIX)
 
 
 ROLE_RELATION = MEMBER_RELATION
@@ -171,7 +180,13 @@ def _parse_role(role: str | ObjectRef) -> ObjectRef:
     return ObjectRef(rtype, rid)
 
 
-def grant(*, actor: ActorLike, role: str | ObjectRef) -> RelationshipRow:
+def grant(
+    *,
+    actor: ActorLike,
+    role: str | ObjectRef,
+    caveat_name: str = "",
+    caveat_context: Mapping[str, Any] | None = None,
+) -> RelationshipRow:
     """Grant ``actor`` membership in ``role``.
 
     ``role`` is either an :class:`ObjectRef` or a
@@ -193,10 +208,15 @@ def grant(*, actor: ActorLike, role: str | ObjectRef) -> RelationshipRow:
     """
     from .memberships import grant as grant_membership
 
-    return grant_membership(subject=actor, container=_parse_role(role))
+    return grant_membership(
+        subject=actor,
+        container=_parse_role(role),
+        caveat_name=caveat_name,
+        caveat_context=caveat_context,
+    )
 
 
-def revoke(*, actor: ActorLike, role: str | ObjectRef) -> int:
+def revoke(*, actor: ActorLike, role: str | ObjectRef, caveat_name: str = "") -> int:
     """Revoke ``actor``'s membership in ``role``.
 
     Returns the number of rows deleted (0 if no membership existed, 1
@@ -205,7 +225,7 @@ def revoke(*, actor: ActorLike, role: str | ObjectRef) -> int:
     """
     from .memberships import revoke as revoke_membership
 
-    return revoke_membership(subject=actor, container=_parse_role(role))
+    return revoke_membership(subject=actor, container=_parse_role(role), caveat_name=caveat_name)
 
 
 def roles_of(actor: ActorLike) -> Iterator[ObjectRef]:
@@ -219,7 +239,7 @@ def roles_of(actor: ActorLike) -> Iterator[ObjectRef]:
     from .memberships import containers_of
 
     # The convention filter stays in SQL; ``containers_of`` owns the row query.
-    yield from containers_of(actor, resource_type__endswith="/role")
+    yield from containers_of(actor, resource_type__endswith=ROLE_TYPE_SUFFIX)
 
 
 def members_of(role: str | ObjectRef) -> Iterator[SubjectRef]:
@@ -415,10 +435,12 @@ __all__ = [
     "ROLE_EFFECTIVE_MEMBER",
     "ROLE_INCLUDES_RELATION",
     "ROLE_RELATION",
+    "ROLE_TYPE_SUFFIX",
     "grant",
     "implied_by_of",
     "implies_of",
     "imply",
+    "is_role_type",
     "members_of",
     "revoke",
     "roles_of",

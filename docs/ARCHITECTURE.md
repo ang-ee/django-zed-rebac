@@ -412,6 +412,15 @@ revocation and enumeration for any container type. `rebac.roles` composes it
 and adds role-spec parsing and role hierarchy; both are first-class, semver-stable
 public APIs.
 
+Role `grant` forwards optional `caveat_name` and `caveat_context` to memberships;
+role `revoke` forwards `caveat_name` for exact revocation.
+`rebac.roles.is_role_type(resource_type)` recognises the role convention using
+`ROLE_TYPE_SUFFIX`; SQL convention filters use the same constant.
+
+`str(RelationshipTuple(...))` renders the canonical wire string
+`<type>:<id>#<relation> @ <subject_type>:<id>[#<subject_relation>][ with <caveat>]`.
+Relationship model strings and relationship audit targets use this renderer.
+
 Everything else (`rebac._internal.*`) is private and may change in any minor release.
 
 ### Anonymous subject — built-in
@@ -1889,7 +1898,20 @@ python manage.py rebac sync --force-overwrite --package=blog
 python manage.py rebac check                      # doctor: validate without writes
 python manage.py rebac build-zed                  # emit effective.zed for SpiceDB
 python manage.py rebac explain blog/post.read     # print compiled expression
+python manage.py rebac grant storage/role:viewer auth/user:42  # idempotent member grant; --caveat NAME --caveat-context JSON
+python manage.py rebac revoke storage/role:viewer auth/user:42 # print deleted count; --caveat NAME; --strict fails on 0
+python manage.py rebac relationships --resource storage/role:viewer # tuple listing; --subject TYPE:ID[#rel] --relation NAME --limit N
 ```
+
+`grant` and `revoke` route `<namespace>/role` containers through `rebac.roles`
+and other containers through `rebac.memberships`. Both keep the helpers' ambient
+actor, audit and Zookie behavior. `--caveat-context` requires a non-empty
+`--caveat` name. Listing reads the active relationship model,
+ordered by the canonical tuple key; supplied filters are exact (including an
+empty subject relation), omitted filters match all rows. An omitted limit lists
+all rows; zero lists none and negative limits are errors. Reference parse errors
+fail with a command error. Grant/revoke reject types absent from the loaded schema;
+listing accepts them so orphaned tuples remain inspectable after schema changes.
 
 The `write-schema`, `gc-expired`, `retype-relationships`, `build-zed --check`,
 and `sync --target` interfaces are planned and not implemented. Use

@@ -11,6 +11,7 @@ from django.db.utils import DatabaseError
 from .conf import app_settings
 from .errors import SchemaError
 from .field_visibility import FIELD_DENY_MODES
+from .roles import is_role_type
 
 if TYPE_CHECKING:
     from .schema.ast import Schema
@@ -400,7 +401,7 @@ def check_universal_admin_in_roles(
     for definition in schema.definitions:
         # Only role definitions — by convention these live under
         # ``<namespace>/role`` resource types.
-        if not definition.resource_type.endswith("/role"):
+        if not is_role_type(definition.resource_type):
             continue
         # The universal-admin role itself is exempt (it would otherwise
         # reference itself, creating a self-loop with no semantic).
