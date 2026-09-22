@@ -5,6 +5,13 @@ pre-1.0; breaking changes within a minor version are explicitly called out.
 
 ## [Unreleased]
 
+### Fixed
+
+- `RebacMixin.save()` skips adding-instance authorization rules for models
+  without a REBAC resource type, preserving ordinary Django saves without an
+  actor or sudo, including multi-table inheritance. Resource models retain
+  insert-only saves and rejection of `force_update` / `update_fields` on new instances.
+
 ## [0.18.1] — 2026-09-22
 
 ### Added
