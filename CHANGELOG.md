@@ -5,6 +5,8 @@ pre-1.0; breaking changes within a minor version are explicitly called out.
 
 ## [Unreleased]
 
+## [0.18.2] — 2026-09-22
+
 ### Fixed
 
 - `RebacMixin.save()` skips adding-instance authorization rules for models
