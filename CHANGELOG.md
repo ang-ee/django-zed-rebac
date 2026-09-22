@@ -5,6 +5,8 @@ pre-1.0; breaking changes within a minor version are explicitly called out.
 
 ## [Unreleased]
 
+## [0.18.0] — 2026-09-22
+
 ### Added
 
 - `rebac grant`, `revoke` and `relationships` management subcommands for
@@ -24,6 +26,20 @@ pre-1.0; breaking changes within a minor version are explicitly called out.
 
 ### Changed
 
+- **Breaking.** Create authorization evaluates the proposed row itself. The
+  pre-save gate projects the candidate's schema-declared relations into
+  `check_new` instead of checking `create` against an empty resource id, so
+  owning some other row of the type no longer grants creating a new one. The
+  queryset-level create guard is deleted; direct `save()`, `create()` and
+  `bulk_create()` share the one candidate preflight, and `bulk_create()`
+  accepts only exact instances of the queryset model.
+- **Breaking.** Actor-scoped saves of a new instance are insert-only on every
+  concrete table, including multi-table-inheritance parents; `force_update`
+  and `update_fields` on an adding instance raise.
+- `require_permission` binds declared `actor_arg` / `resource_arg` parameters
+  from the call signature, positionally or by keyword, validates the names at
+  decoration time, and lets an explicit actor take precedence over ambient
+  sudo.
 - Create preflight projects only relations that `create` depends on, including
   named-permission and arrow-source dependencies. Unfiltered single-hop FKs
   storing the target REBAC identity project without queries. Referenced
