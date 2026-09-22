@@ -199,17 +199,19 @@ def test_editor_save_with_update_fields_includes_gated(alice, bob, post):
         instance.save(update_fields=["title"])
 
 
-def test_handbuilt_instance_with_pinned_actor(alice, post):
+def test_handbuilt_instance_with_pinned_actor(alice):
     """A hand-built instance with ``_rebac_actor`` pinned saves through
     the create path (no per-field gate fires on INSERT).
     """
     from tests.testapp.models import Post
 
+    backend().set_schema(
+        parse_zed(
+            SCHEMA_TEXT.replace("permission create = owner", "permission create = authenticated")
+        )
+    )
     instance = Post(title="from-thin-air", body="b")
     instance._rebac_actor = SubjectRef.of("auth/user", str(alice.pk))
-    # This schema's create gate requires ownership of an existing resource.
-    # Grant it explicitly so the pinned actor can authorize the insert.
-    _grant(post.pk, alice, "owner")
     instance.save()
     assert instance.pk is not None
 

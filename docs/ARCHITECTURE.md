@@ -1156,8 +1156,8 @@ relations; those are synthetic schema facts, so `check_new()` raises
 
 Django create paths construct the candidate first, including Python field
 defaults, then project schema-declared direct forward `ForeignKey` and
-`OneToOneField` values into this same overlay. `create()`, a new instance's
-`save()`, and every row of `bulk_create()` therefore use `check_new` as the
+`OneToOneField` values into this same overlay. `create()`, `insert(obj)`, a new
+instance's `save()`, and every row of `bulk_create()` therefore use `check_new` as the
 single evaluator. Reverse, many-to-many, filtered, database-default, or
 otherwise unresolved candidate relations fail before any insert; callers must
 use an explicit checked command once those facts can be resolved.
@@ -1170,6 +1170,17 @@ For actor-scoped multi-table inheritance, every table in the inheritance chain
 is insert-only: a child `create` grant cannot authorize updates to an existing
 parent row. Attaching a child table to an existing parent requires an explicit
 trusted bypass or an application command that separately checks the parent write.
+
+`insert(obj)` is the persistence seam for prepared instances from forms or
+GraphQL mutation resolvers; `create(**kwargs)` constructs an instance and calls
+it. It accepts only unsaved instances of the queryset's exact model, rejects a
+conflicting database alias, and saves on the queryset's write alias with its actor
+pinned and its explicit sudo reason cleared after the save. Queryset scope owns
+the write: an actor or sudo pinned on the instance itself is replaced, so a
+prepared instance carrying its own scope saves through `instance.save()` or
+`Model.objects.with_actor(actor).insert(obj)`. Domain factories that must run
+for both paths override `insert` on their queryset, not `create` on the
+manager; `RebacManager.from_queryset` exposes the override automatically.
 
 **Deliberately outside the ``Backend`` ABC.** ``check_new`` is a free
 function, not a backend RPC, because SpiceDB ships no "check with
@@ -1363,6 +1374,8 @@ class RebacQuerySet:
     def system_context(self, *, reason: str) -> Self: ...               # framework-job bypass, NOT gated
     def effective_actor(self, *, strict: bool = False) -> tuple[SubjectRef | None, bool]: ...
 
+    def insert(self, obj): ...                                       # persist a prepared instance
+
     # Standard queryset ops with REBAC-aware overrides:
     def update(self, **kwargs) -> int: ...
     def delete(self) -> tuple[int, dict]: ...
@@ -1452,7 +1465,8 @@ A pinned actor (path 2) **always wins** over ambient state (paths 3-4) — there
 | Operation | Permission checked | Where |
 |---|---|---|
 | `Model.objects.all()` / `.filter(...)` / `.get()` / `.count()` / `.exists()` | `read` (or `Meta.rebac_default_action`; override per chain with `.with_action(action)`) | The queryset injects the backend's lazy permission predicate, falling back to `resource_id__in=<accessible(actor, action, type)>` when unavailable. |
-| `Model.objects.create(**fields)` | `create` on the proposed row's forward relations | The constructed instance reaches the pre-save `check_new` gate. |
+| `Model.objects.create(**fields)` | `create` on the proposed row's forward relations | Constructs the instance and delegates to `insert()`. |
+| `Model.objects.insert(obj)` | `create` on the proposed row's forward relations | Pins queryset scope on the prepared instance; the pre-save `check_new` gate authorizes the insert. |
 | `Model.objects.bulk_create(rows)` | `create` on each proposed row's forward relations | Every candidate is preflighted before Django issues insert SQL. |
 | `instance.save()` (loaded/non-adding instance) | `write` on the row | Pre-save signal handler. |
 | `instance.save()` (new instance) | `create` on the proposed row's forward relations | Pre-save handler projects the constructed candidate into `check_new`. |

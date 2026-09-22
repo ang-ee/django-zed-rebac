@@ -13,6 +13,8 @@ grant via the row-independent path.
 
 from __future__ import annotations
 
+from unittest.mock import patch
+
 import pytest
 from django.test import override_settings
 
@@ -34,7 +36,9 @@ from rebac.schema import parse_zed
 
 class CreateWriteRouter:
     def db_for_read(self, model, **hints):
-        del model, hints
+        del hints
+        if model._meta.app_label == "rebac":
+            return "default"
         return "missing-read-replica"
 
     def db_for_write(self, model, **hints):
@@ -187,20 +191,26 @@ def test_anonymous_actor_cannot_create_when_create_is_authenticated(_global_back
 
 
 @pytest.mark.django_db
-def test_queryset_create_pins_actor_without_ambient_context(_global_backend) -> None:
+@pytest.mark.parametrize("operation", ["create", "insert"])
+def test_queryset_create_pins_actor_without_ambient_context(_global_backend, operation) -> None:
     from tests.testapp.models import Post
 
     actor = SubjectRef.of("auth/user", "alice")
-    post = Post.objects.with_actor(actor).create(title="hello")
+    queryset = Post.objects.with_actor(actor)
+    candidate = Post(title="hello").with_actor(_user("original"))
+    post = queryset.create(title="hello") if operation == "create" else queryset.insert(candidate)
 
     assert post.pk is not None
     assert post.actor() == actor
+    if operation == "insert":
+        assert post is candidate
 
 
 @pytest.mark.django_db
 @pytest.mark.parametrize("ambient_bypass", [False, True])
+@pytest.mark.parametrize("operation", ["create", "insert"])
 def test_queryset_create_explicit_denied_actor_beats_ambient_scope(
-    _global_backend, ambient_bypass
+    _global_backend, ambient_bypass, operation
 ) -> None:
     from tests.testapp.models import Post
 
@@ -210,21 +220,166 @@ def test_queryset_create_explicit_denied_actor_beats_ambient_scope(
         else actor_context(SubjectRef.of("auth/user", "alice"))
     )
     with context:
+        queryset = Post.objects.with_actor(anonymous_actor())
         with pytest.raises(PermissionDenied):
-            Post.objects.with_actor(anonymous_actor()).create(title="forbidden")
+            if operation == "create":
+                queryset.create(title="forbidden")
+            else:
+                queryset.insert(Post(title="forbidden").sudo(reason="test.prepared"))
     assert not Post.objects.sudo(reason="test.verify").exists()
 
 
 @pytest.mark.django_db
+@pytest.mark.parametrize("operation", ["create", "insert"])
 def test_explicit_queryset_sudo_allows_create_without_leaving_instance_elevated(
-    _global_backend,
+    _global_backend, operation
 ) -> None:
     from tests.testapp.models import Post
 
-    post = Post.objects.sudo(reason="test.create").create(title="fixture")
+    queryset = Post.objects.sudo(reason="test.create")
+    post = (
+        queryset.create(title="fixture")
+        if operation == "create"
+        else queryset.insert(Post(title="fixture"))
+    )
 
     assert post.pk is not None
     assert not post.is_sudo()
+
+
+@pytest.mark.django_db
+def test_queryset_insert_clears_sudo_after_save_failure(_global_backend) -> None:
+    from django.db import IntegrityError, transaction
+
+    from tests.testapp.models import Post
+
+    stored = Post.objects.sudo(reason="test.fixture").create(title="stored")
+    candidate = Post(pk=stored.pk, title="duplicate")
+    with pytest.raises(IntegrityError), transaction.atomic():
+        Post.objects.sudo(reason="test.insert").insert(candidate)
+
+    assert not candidate.is_sudo()
+    assert candidate._state.adding
+    assert Post.objects.sudo(reason="test.verify").get(pk=stored.pk).title == "stored"
+
+
+@pytest.mark.django_db
+def test_queryset_insert_rejects_saved_instance(_global_backend) -> None:
+    from tests.testapp.models import Post
+
+    stored = Post.objects.sudo(reason="test.fixture").create(title="stored")
+    with pytest.raises(ValueError, match="unsaved"):
+        Post.objects.insert(stored)
+
+    assert Post.objects.sudo(reason="test.verify").count() == 1
+
+
+@pytest.mark.parametrize(
+    ("queryset_model", "candidate_model"),
+    [("Post", "Folder"), ("Post", "VirtualPost"), ("VirtualPost", "Post")],
+)
+def test_queryset_insert_rejects_wrong_and_proxy_models(queryset_model, candidate_model) -> None:
+    from tests.testapp import models
+
+    model = getattr(models, queryset_model)
+    candidate = getattr(models, candidate_model)()
+    with pytest.raises(TypeError, match=f"exact {queryset_model} instances"):
+        model.objects.insert(candidate)
+    assert candidate._state.adding
+
+
+def test_queryset_insert_rejects_conflicting_database_alias() -> None:
+    from tests.testapp.models import Post
+
+    candidate = Post(title="wrong database")
+    candidate._state.db = "other"
+    with pytest.raises(ValueError, match=r"other.*default"):
+        Post.objects.insert(candidate)
+    assert candidate._state.db == "other"
+    assert candidate._state.adding
+
+
+@pytest.mark.django_db
+@pytest.mark.parametrize("operation", ["create", "insert"])
+@pytest.mark.parametrize("allowed", [False, True])
+def test_queryset_insert_factory_runs_once_and_keeps_companion_write_atomic(
+    _global_backend, monkeypatch: pytest.MonkeyPatch, operation, allowed
+) -> None:
+    from django.db import transaction
+
+    from rebac.managers import RebacManager, RebacQuerySet
+    from tests.testapp.models import Folder, Post
+
+    calls = []
+
+    class FactoryQuerySet(RebacQuerySet):
+        def insert(self, obj):
+            calls.append(obj)
+            with transaction.atomic(using=self.db):
+                obj.folder = (
+                    Folder.objects.sudo(reason="test.factory")
+                    .using(self.db)
+                    .create(name="companion")
+                )
+                return super().insert(obj)
+
+    manager = RebacManager.from_queryset(FactoryQuerySet)()
+    manager.model = Post
+    monkeypatch.setattr(Post, "objects", manager)
+    candidate = Post(title="factory")
+
+    def persist():
+        if operation == "create":
+            return Post.objects.create(title=candidate.title)
+        return Post.objects.insert(candidate)
+
+    with actor_context(_user("allowed") if allowed else anonymous_actor()):
+        if allowed:
+            result = persist()
+            assert calls == [result]
+            assert result.folder.name == "companion"
+            if operation == "insert":
+                assert result is candidate
+        else:
+            with pytest.raises(PermissionDenied):
+                persist()
+            assert len(calls) == 1
+
+    assert Post.objects.sudo(reason="test.verify").count() == int(allowed)
+    assert Folder.objects.sudo(reason="test.verify").count() == int(allowed)
+
+
+@pytest.mark.django_db
+@pytest.mark.parametrize("bound_to_alias", [False, True])
+def test_manager_insert_uses_db_manager_alias(
+    _global_backend, django_db_blocker, tmp_path, bound_to_alias
+) -> None:
+    from django.db import connection, connections
+
+    from tests.testapp.models import Folder, Post
+
+    alias = "insert_target"
+    target = connection.copy(alias=alias)
+    target.settings_dict["NAME"] = str(tmp_path / "insert.sqlite3")
+    connections[alias] = target
+    try:
+        with django_db_blocker.unblock():
+            with target.schema_editor() as editor:
+                editor.create_model(Folder)
+                editor.create_model(Post)
+            candidate = Post(title="other database")
+            if bound_to_alias:
+                candidate._state.db = alias
+            with actor_context(_user("alice")):
+                result = Post.objects.db_manager(alias).insert(candidate)
+            assert result is candidate
+            assert result._state.db == alias
+            assert Post._base_manager.using(alias).get(pk=result.pk).title == "other database"
+    finally:
+        target.close()
+        del connections[alias]
+
+    assert not Post.objects.sudo(reason="test.verify").exists()
 
 
 @pytest.mark.django_db
@@ -317,19 +472,42 @@ def test_parent_arrow_create_uses_the_proposed_forward_relation(parent_create_ba
 
 
 @pytest.mark.django_db
-def test_direct_save_and_queryset_create_share_candidate_preflight(parent_create_backend) -> None:
+@pytest.mark.parametrize("operation", ["save", "create", "insert"])
+@pytest.mark.parametrize("allowed", [False, True])
+def test_direct_save_and_queryset_create_share_candidate_preflight(
+    parent_create_backend, operation, allowed
+) -> None:
+    from rebac import preflight
     from tests.testapp.models import Post
 
-    actor = _user("allowed")
-    folder = _owned_folder(parent_create_backend, actor)
-    direct = Post(title="direct", folder=folder).with_actor(actor)
-    direct.save()
-    assert direct.pk is not None
+    folder = _owned_folder(parent_create_backend, _user("allowed"))
+    actor = _user("allowed" if allowed else "denied")
+    candidate = Post(title="candidate", folder=folder)
 
-    denied = Post(title="denied", folder=folder).with_actor(_user("denied"))
-    with pytest.raises(PermissionDenied):
-        denied.save()
-    assert denied.pk is None
+    def persist():
+        if operation == "save":
+            candidate.with_actor(actor).save()
+            return candidate
+        queryset = Post.objects.with_actor(actor)
+        if operation == "create":
+            return queryset.create(title=candidate.title, folder=folder)
+        return queryset.insert(candidate)
+
+    with patch("rebac.preflight.check_new", wraps=preflight.check_new) as check:
+        if allowed:
+            result = persist()
+            assert result.pk is not None
+            assert result.actor() == actor
+        else:
+            with pytest.raises(PermissionDenied):
+                persist()
+            assert candidate.pk is None
+        check.assert_called_once()
+        assert check.call_args.kwargs["subject"] == actor
+        assert check.call_args.kwargs["relationships"] == {
+            "folder": (SubjectRef.of("blog/folder", str(folder.pk)),)
+        }
+    assert Post.objects.sudo(reason="test.verify").count() == int(allowed)
 
 
 @pytest.mark.django_db
@@ -422,7 +600,10 @@ def test_database_default_candidate_relation_fails_before_write(parent_create_ba
 
 
 @pytest.mark.django_db
-def test_bulk_candidate_lookup_and_insert_share_write_router_alias(parent_create_backend) -> None:
+@pytest.mark.parametrize("operation", ["bulk_create", "insert"])
+def test_bulk_candidate_lookup_and_insert_share_write_router_alias(
+    parent_create_backend, operation
+) -> None:
     from tests.testapp.models import VirtualFolder, VirtualPost
 
     actor = _user("allowed")
@@ -454,12 +635,15 @@ def test_bulk_candidate_lookup_and_insert_share_write_router_alias(parent_create
     )
 
     with override_settings(DATABASE_ROUTERS=[CreateWriteRouter()]):
-        rows = VirtualPost.objects.with_actor(actor).bulk_create(
-            [VirtualPost(title="routed", folder_id=folder.pk)]
-        )
+        queryset = VirtualPost.objects.with_actor(actor)
+        candidate = VirtualPost(title="routed", folder_id=folder.pk)
+        if operation == "bulk_create":
+            row = queryset.bulk_create([candidate])[0]
+        else:
+            row = queryset.insert(candidate)
 
-    assert rows[0]._state.db == "default"
-    assert VirtualPost.objects.sudo(reason="test.verify").filter(pk=rows[0].pk).exists()
+    assert row._state.db == "default"
+    assert VirtualPost.objects.sudo(reason="test.verify").filter(pk=row.pk).exists()
 
 
 @pytest.mark.django_db

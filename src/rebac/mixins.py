@@ -14,7 +14,7 @@ overrides where the captured values land.
 
 from __future__ import annotations
 
-from typing import TYPE_CHECKING, Any, Self
+from typing import TYPE_CHECKING, Any, Self, cast
 
 from django.db import models
 from django.db.models.base import ModelBase
@@ -489,7 +489,7 @@ class RebacMixin(models.Model, metaclass=RebacModelBase):
                 # explicitly. Django normalizes force_insert=True to the leaf
                 # model only; _save_parents() forces a parent only when that
                 # parent is present in this tuple.
-                concrete_model = self._meta.concrete_model
+                concrete_model = cast(type[models.Model], self._meta.concrete_model)
                 kwargs["force_insert"] = (
                     *concrete_model._meta.all_parents,
                     concrete_model,

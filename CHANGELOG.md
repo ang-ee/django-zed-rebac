@@ -5,6 +5,12 @@ pre-1.0; breaking changes within a minor version are explicitly called out.
 
 ## [Unreleased]
 
+### Added
+
+- Queryset/manager `insert(obj)` persists a prepared unsaved instance under
+  queryset scope. `create(**kwargs)` delegates to it so domain factories can
+  override one queryset method for both paths.
+
 ### Fixed
 
 - Identity errors name the wrapped model instead of `SimpleLazyObject` when
