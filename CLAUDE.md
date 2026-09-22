@@ -237,9 +237,9 @@ parens are a footgun even when they parse.
 ### 8. Wildcards only on read-shaped permissions
 
 `auth/user:*` (or any `type:*` wildcard) **must not appear** in
-write/delete/create permissions. The schema doctor (`rebac.W001`-class)
-emits a warning at build time when a wildcard relation feeds a non-read
-permission. Don't suppress the check; fix the schema.
+write/delete/create permissions. Schema authors must ensure wildcard relations
+never feed these permissions. No automated check currently enforces this rule;
+`rebac.W001` checks `AUTHENTICATION_BACKENDS`, not wildcard usage.
 
 ### 9. Agent delegation belongs to consumer schemas
 

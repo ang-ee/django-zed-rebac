@@ -5,6 +5,15 @@ pre-1.0; breaking changes within a minor version are explicitly called out.
 
 ## [Unreleased]
 
+### Added
+
+- `RebacMixin.proposed_relationships(*, using=None)` lets models contribute post-save tuple
+  facts to create preflight for `save()`, `create()`, `insert()` and each
+  `bulk_create()` candidate. Field-backed, const-backed and unknown relation
+  names are rejected; only subjects for relations referenced by `create` are
+  resolved. Hooks receive the write alias and may return lazy subject iterables;
+  applications must persist the promised tuples, including on bulk paths.
+
 ## [0.18.0] — 2026-09-22
 
 ### Added

@@ -21,9 +21,11 @@ from django.test import override_settings
 from rebac import (
     LocalBackend,
     MissingActorError,
+    NoActorResolvedError,
     ObjectRef,
     PermissionDenied,
     RelationshipTuple,
+    SchemaError,
     SubjectRef,
     actor_context,
     backend,
@@ -455,6 +457,341 @@ def _owned_folder(active, actor: SubjectRef):
         [RelationshipTuple(ObjectRef("blog/folder", str(folder.pk)), "owner", actor)]
     )
     return folder
+
+
+PROPOSED_RELATIONSHIPS_SCHEMA = """
+definition auth/user {}
+definition blog/folder {
+    relation owner: auth/user
+    permission write = owner
+}
+definition blog/post {
+    relation folder: blog/folder // rebac:field=folder
+    relation contributor: auth/user
+    permission contributor_create = contributor
+    permission create = (folder->write & contributor_create)
+}
+"""
+
+
+def test_model_proposed_relationships_default_is_empty() -> None:
+    from tests.testapp.models import Post
+
+    candidate = Post(title="no tuple contributions")
+    assert candidate.proposed_relationships() == {}
+    assert candidate.proposed_relationships(using="write-target") == {}
+
+
+@pytest.mark.django_db
+@pytest.mark.parametrize("operation", ["save", "create", "insert"])
+@pytest.mark.parametrize("contributes", [False, True])
+def test_model_proposed_contributor_merges_with_fields_in_each_create_path(
+    parent_create_backend, monkeypatch: pytest.MonkeyPatch, operation, contributes
+) -> None:
+    from django.db import transaction
+
+    from rebac import preflight
+    from tests.testapp.models import Post
+
+    actor = _user("allowed")
+    folder = _owned_folder(parent_create_backend, actor)
+    parent_create_backend.set_schema(parse_zed(PROPOSED_RELATIONSHIPS_SCHEMA))
+    consulted = []
+
+    def proposed_relationships(self, *, using: str | None = None):
+        assert self._state.adding and self.pk is None
+        assert using == "default"
+        consulted.append(self)
+        return {"contributor": iter([actor])} if self.body == "contributor" else {}
+
+    original_save = Post.save
+
+    def save(self, *args, **kwargs):
+        with transaction.atomic(using="default"):
+            original_save(self, *args, **kwargs)
+            if self.body == "contributor":
+                parent_create_backend.write_relationships(
+                    [RelationshipTuple(ObjectRef("blog/post", str(self.pk)), "contributor", actor)]
+                )
+
+    monkeypatch.setattr(Post, "proposed_relationships", proposed_relationships)
+    monkeypatch.setattr(Post, "save", save)
+    candidate = Post(
+        title="proposed tuple", folder=folder, body="contributor" if contributes else ""
+    )
+
+    def persist():
+        if operation == "save":
+            candidate.with_actor(actor).save()
+            return candidate
+        queryset = Post.objects.with_actor(actor)
+        if operation == "create":
+            return queryset.create(title=candidate.title, folder=folder, body=candidate.body)
+        return queryset.insert(candidate)
+
+    with (
+        override_settings(DATABASE_ROUTERS=[CreateWriteRouter()]),
+        patch("rebac.preflight.check_new", wraps=preflight.check_new) as check,
+    ):
+        if contributes:
+            result = persist()
+            assert result.pk is not None
+            assert result.actor() == actor
+            assert consulted == [result]
+            assert parent_create_backend.has_access(
+                subject=actor, action="contributor", resource=ObjectRef("blog/post", str(result.pk))
+            )
+        else:
+            with pytest.raises(PermissionDenied):
+                persist()
+            assert consulted[0].pk is None
+        assert len(consulted) == 1
+        check.assert_called_once()
+        expected = {"folder": (SubjectRef.of("blog/folder", str(folder.pk)),)}
+        if contributes:
+            expected["contributor"] = (actor,)
+        assert check.call_args.kwargs["relationships"] == expected
+    assert Post.objects.sudo(reason="test.verify").count() == int(contributes)
+
+
+@pytest.mark.django_db
+def test_check_new_wildcard_subject_round_trips_for_read(parent_create_backend) -> None:
+    from rebac import check_new
+
+    parent_create_backend.set_schema(
+        parse_zed(
+            """
+            definition auth/user {}
+            definition blog/post {
+                relation shared: auth/user:*
+                permission read = shared
+            }
+            """
+        )
+    )
+    wildcard = SubjectRef.of("auth/user", "*")
+    assert SubjectRef.parse(str(wildcard)) == wildcard
+    relationships = {"shared": [wildcard]}
+    result = check_new(
+        subject=_user("reader"),
+        action="read",
+        resource_type="blog/post",
+        relationships=relationships,
+        backend=parent_create_backend,
+    )
+    assert result.allowed
+    assert relationships == {"shared": [wildcard]}
+
+
+@pytest.mark.django_db
+@pytest.mark.parametrize("operation", ["save", "create", "insert", "bulk_create"])
+@pytest.mark.parametrize("referenced", [False, True])
+@pytest.mark.parametrize("empty", [False, True])
+@pytest.mark.parametrize("backing", ["field", "const"])
+def test_model_proposed_library_owned_relation_raises_before_write(
+    parent_create_backend, monkeypatch: pytest.MonkeyPatch, operation, referenced, empty, backing
+) -> None:
+    from tests.testapp.models import Post
+
+    parent_create_backend.set_schema(
+        parse_zed(
+            PROPOSED_RELATIONSHIPS_SCHEMA.replace(
+                "(folder->write & contributor_create)",
+                "folder->write" if referenced else "authenticated",
+            ).replace("rebac:field=folder", f"rebac:{backing}=folder")
+        )
+    )
+
+    def proposed_relationships(self, *, using: str | None = None):
+        assert using == "default"
+        return {"folder": [] if empty else [SubjectRef.of("blog/folder", "forged")]}
+
+    monkeypatch.setattr(Post, "proposed_relationships", proposed_relationships)
+    candidate = Post(title="cannot replace field projection")
+    queryset = Post.objects.with_actor(_user("allowed"))
+    with pytest.raises(
+        SchemaError, match=r"proposed_relationships\(\) must not supply library-owned relations"
+    ):
+        if operation == "save":
+            candidate.with_actor(_user("allowed")).save()
+        elif operation == "create":
+            queryset.create(title=candidate.title)
+        elif operation == "insert":
+            queryset.insert(candidate)
+        else:
+            queryset.bulk_create([candidate])
+    assert candidate.pk is None
+    assert Post.objects.sudo(reason="test.verify").count() == 0
+
+
+@pytest.mark.django_db
+@pytest.mark.parametrize("relation", ["missing", "create"])
+@pytest.mark.parametrize("empty", [False, True])
+def test_model_proposed_unknown_relation_raises_before_write(
+    parent_create_backend, monkeypatch: pytest.MonkeyPatch, relation, empty
+) -> None:
+    from tests.testapp.models import Post
+
+    parent_create_backend.set_schema(parse_zed(INTEGRATION_SCHEMA))
+
+    def proposed_relationships(self, *, using: str | None = None):
+        assert using == "default"
+        return {relation: [] if empty else [_user("allowed")]}
+
+    monkeypatch.setattr(Post, "proposed_relationships", proposed_relationships)
+    with pytest.raises(SchemaError, match=relation):
+        Post.objects.with_actor(_user("allowed")).create(title="invalid relation")
+    assert Post.objects.sudo(reason="test.verify").count() == 0
+
+
+@pytest.mark.django_db
+def test_model_proposed_unreferenced_relation_does_not_evaluate_queryset(
+    parent_create_backend, monkeypatch: pytest.MonkeyPatch, django_assert_num_queries
+) -> None:
+    from django.contrib.auth import get_user_model
+
+    from rebac import preflight
+    from tests.testapp.models import Post
+
+    parent_create_backend.set_schema(
+        parse_zed(
+            PROPOSED_RELATIONSHIPS_SCHEMA.replace(
+                "(folder->write & contributor_create)", "authenticated"
+            )
+        )
+    )
+    unreferenced_subjects = get_user_model().objects.all()
+
+    def proposed_relationships(self, *, using: str | None = None):
+        assert using == "write-target"
+        return {"contributor": unreferenced_subjects}
+
+    monkeypatch.setattr(Post, "proposed_relationships", proposed_relationships)
+    with (
+        django_assert_num_queries(0),
+        patch("rebac.preflight.check_new", wraps=preflight.check_new) as check,
+    ):
+        result = preflight._check_new_model(
+            Post(title="unused tuples"), subject=_user("allowed"), using="write-target"
+        )
+    assert result.allowed
+    assert unreferenced_subjects._result_cache is None
+    check.assert_called_once()
+    assert check.call_args.kwargs["relationships"] == {}
+
+
+@pytest.mark.django_db
+@pytest.mark.parametrize("all_allowed", [False, True])
+def test_bulk_create_checks_each_model_proposed_relationship_before_any_insert(
+    parent_create_backend, monkeypatch: pytest.MonkeyPatch, all_allowed
+) -> None:
+    from tests.testapp.models import Post
+
+    actor = _user("allowed")
+    folder = _owned_folder(parent_create_backend, actor)
+    parent_create_backend.set_schema(parse_zed(PROPOSED_RELATIONSHIPS_SCHEMA))
+    consulted = []
+
+    def proposed_relationships(self, *, using: str | None = None):
+        assert using == "default"
+        consulted.append(self)
+        assert self.pk is None
+        assert Post.objects.sudo(reason="test.before-insert").count() == 0
+        return {"contributor": [actor]} if self.body == "contributor" else {}
+
+    monkeypatch.setattr(Post, "proposed_relationships", proposed_relationships)
+    candidates = [
+        Post(title="first", body="contributor", folder=folder),
+        Post(title="second", body="contributor" if all_allowed else "", folder=folder),
+    ]
+    queryset = Post.objects.with_actor(actor)
+    if all_allowed:
+        rows = queryset.bulk_create(candidates)
+        assert rows == candidates
+        assert all(row.pk is not None and row.actor() == actor for row in rows)
+    else:
+        with pytest.raises(PermissionDenied):
+            queryset.bulk_create(candidates)
+        assert all(candidate.pk is None for candidate in candidates)
+    assert consulted == candidates
+    assert Post.objects.sudo(reason="test.verify").count() == (2 if all_allowed else 0)
+
+
+@pytest.mark.django_db
+@pytest.mark.parametrize("subject_kind", ["user", "subject-set"])
+@pytest.mark.parametrize("storage", ["denormalized", "registry"])
+def test_model_proposed_instances_use_canonical_subject_resolution(
+    parent_create_backend, monkeypatch: pytest.MonkeyPatch, subject_kind, settings, storage
+) -> None:
+    from rebac import preflight
+    from tests.testapp.models import Post, SubjectContainer
+
+    settings.REBAC_LOCAL_BACKEND_STORAGE = storage
+    parent_create_backend.set_schema(
+        parse_zed(
+            """
+            definition auth/user {}
+            definition blog/subjectcontainer { relation member: auth/user }
+            definition blog/post {
+                relation owner: auth/user | blog/subjectcontainer#member
+                permission create = owner
+            }
+            """
+        )
+    )
+    user = _django_user("proposed-owner")
+    actor = _user(str(user.pk))
+    subject = user
+    expected = actor
+    if subject_kind == "subject-set":
+        subject = SubjectContainer.objects.sudo(reason="test.fixture").create(
+            slug="members", title="subject set"
+        )
+        expected = SubjectRef.of("blog/subjectcontainer", "members", "member")
+        parent_create_backend.write_relationships(
+            [RelationshipTuple(expected.object, "member", actor)]
+        )
+
+    def proposed_relationships(self, *, using: str | None = None):
+        assert using == "default"
+        return {"owner": [subject]}
+
+    monkeypatch.setattr(Post, "proposed_relationships", proposed_relationships)
+    with patch("rebac.preflight.check_new", wraps=preflight.check_new) as check:
+        created = Post.objects.with_actor(actor).create(title="model-owned subjects")
+    assert created.pk is not None
+    check.assert_called_once()
+    assert check.call_args.kwargs["relationships"] == {"owner": (expected,)}
+
+
+@pytest.mark.django_db
+@pytest.mark.parametrize("subject_kind", ["unsaved-user", "unsaved-resource", "unresolvable"])
+def test_model_proposed_invalid_subject_raises_before_write(
+    parent_create_backend, monkeypatch: pytest.MonkeyPatch, subject_kind
+) -> None:
+    from django.contrib.auth import get_user_model
+    from django.contrib.contenttypes.models import ContentType
+
+    from tests.testapp.models import Post
+
+    parent_create_backend.set_schema(
+        parse_zed(INTEGRATION_SCHEMA.replace("authenticated", "owner"))
+    )
+    if subject_kind == "unsaved-user":
+        subject = get_user_model()(username="unsaved")
+    elif subject_kind == "unsaved-resource":
+        subject = Post(title="unsaved subject")
+    else:
+        subject = ContentType.objects.get_for_model(Post)
+
+    def proposed_relationships(self, *, using: str | None = None):
+        assert using == "default"
+        return {"owner": [subject]}
+
+    monkeypatch.setattr(Post, "proposed_relationships", proposed_relationships)
+    with pytest.raises(NoActorResolvedError):
+        Post.objects.with_actor(_user("allowed")).create(title="invalid contributed subject")
+    assert Post.objects.sudo(reason="test.verify").count() == 0
 
 
 @pytest.mark.django_db
