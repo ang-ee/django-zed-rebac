@@ -9,8 +9,8 @@ rows in the `Relationship` table. Implementation strategy:
   - For `check_access()`: same walk, but bounded by the specific resource_id.
   - Recursion depth bounded by `REBAC_DEPTH_LIMIT`.
 
-Read querysets use lazy ORM predicates for acyclic, non-caveated permissions;
-unsupported expressions retain the conservative Python evaluator. Explicit
+Read querysets use lazy ORM predicates for non-caveated acyclic and self-recursive
+permissions; unsupported expressions retain the conservative Python evaluator. Explicit
 `accessible()` calls still enumerate resource IDs. Both paths use the effective
 schema and run through Django on supported databases.
 
@@ -1054,8 +1054,8 @@ class LocalBackend(Backend):
         if target_def is None:
             return False
         if self._schema_facts(self._schema_snapshot()).accessible_is_exact:
-            # No row can be conditional and no built-in actor term is in
-            # play, so the tri-state collapses to a set intersection: resolve
+            # No conditional, builtin, or arrow recursion is in play, so
+            # the check collapses to an exact set intersection: resolve
             # the targets the subject holds ``target`` on once, then one
             # bounded EXISTS against the live path instead of a walk per row.
             targets = self._compute_accessible_for(

@@ -3,6 +3,10 @@
 // @rebac_package_version: 0.1.0
 // @rebac_schema_revision: 2
 
+definition auth/group {
+    relation member: auth/user
+}
+
 definition blog/post {
     relation owner: auth/user
     relation viewer: auth/user | auth/group#member | auth/user:*

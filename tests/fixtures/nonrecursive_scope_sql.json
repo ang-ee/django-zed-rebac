@@ -1,0 +1,12 @@
+{
+  "denormalized/AuthoredPost/read": "be4992db00448c9b2a40a83b3201c27a83d100db5751e990a9840a13ab4e471d",
+  "denormalized/Post/inherited_read": "dd555f46c4883cf6169baca0db1948adab98ab265f057bc17a3335a9dd4e14ad",
+  "denormalized/Post/intersection_read": "135d2f0c50bbf2a459f7ba18b46b73cfedba8d20ce20e6677300b67208df3bb0",
+  "denormalized/Post/read": "adfc917370cfb76613e87b0f38d098513e7dd1c92aaa4db943ab1f8c6c0e9453",
+  "denormalized/Post/union_read": "8a8072dbab5a170caaa78d5f4a094e7c399f700ab5f19aaa4850f6b6aa4ace21",
+  "registry/AuthoredPost/read": "ca8d760cc9a5cd957c5ef39f6fb0813eb23485aa72bcd05e598e65d751ccb220",
+  "registry/Post/inherited_read": "01582754621d71501c2159685194bfb20acfa6c08816a2142d5c7bd4f0ea5971",
+  "registry/Post/intersection_read": "a56d2a78d5b8de4ab7adc08d0a69133de0c12881eaca8b2eeac25092bdfbeeec",
+  "registry/Post/read": "e7a8d06b11bf48b2aaf3b7b1fb54293115692945f90db5dbc5869c6287987e89",
+  "registry/Post/union_read": "c1e3c531bcfeb1002a3391a299e862e3e410941be097661a4931f0cf1e1da822"
+}

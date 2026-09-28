@@ -1413,7 +1413,8 @@ using)` ORM predicate; the base backend returns `None`, preserving the existing
 `grants_all()` / `accessible()` integration for other backends. This changes
 execution shape, not the public CheckPermission / LookupResources semantics.
 
-LocalBackend compiles acyclic, non-caveated permissions into native Django
+LocalBackend compiles non-caveated acyclic permissions and self-recursive
+relation-to-permission arrows into native Django
 `Q`, `Exists` and `Subquery` expressions. Stored relations, subject sets, arrows,
 explicit field/constant bindings, actor terms and union/intersection/exclusion
 retain their schema meaning. Field bindings use their declared columns; tuple
@@ -1424,11 +1425,61 @@ cardinality, caller filters, database alias and removable actor/action scope.
 Tuple changes made before SQL evaluation are therefore observed by pending
 querysets; already evaluated Django result caches retain Django's normal behavior.
 
-Recursion, caveats or unsupported expression shapes fall back for the entire
-permission expression to the existing conservative evaluator. In particular, an
-unsupported exclusion arm must never be treated as false. This optimization
-makes no claim to eliminate enumeration for recursive/caveated schemas, and does
-not change the explicit `accessible()` enumeration API or write authorization.
+Self-recursive arrows (role inclusion and parent hierarchies) reuse the same
+field/path joins and stored-tuple subqueries, unrolled through
+`REBAC_DEPTH_LIMIT`. Depth follows the check walker: arrows and subject-set
+traversals consume one frame; aliases and boolean operators consume none. A
+terminal node at the bound is evaluated; an additional reachable hop is never
+silently truncated. Recursive predicates carry a deferred SQL boundary probe
+on the queryset database. It selects only potential overflow candidates; the
+existing per-resource walker validates those candidates, preserving early
+returns and multi-target branch order and raising the same
+`PermissionDepthExceeded`. Valid bounded chains require one boundary query in
+addition to the scoped read, independent of row count. Validation runs again at
+SQL compilation, so pending scopes see relationship and live-field changes.
+Caller filters constrain boundary candidates; SQL slicing does not conceal an
+invalid candidate. Correlated subqueries conservatively validate the resource
+type when outer references cannot be evaluated independently. As with existing
+multi-query authorization, concurrent writes between validation and execution
+require application-provided transaction isolation for a shared snapshot.
+Field/attribute direct checks retain the walker for cycles containing an arrow
+instead of substituting fixpoint enumeration, which does not preserve depth
+errors. Subject-set-only cycles (such as nested `auth/group#member`) keep the
+exact enumeration optimization; that traversal already enforces the depth bound.
+
+SQL size is independent of data row count, but grows with the unroll bound:
+
+- One self-arrow, for example `read = reader + parent->read`, grows linearly
+  in the bound per self-arrow (the verification fixture adds about 812 bytes per level).
+- Composed recursions on one definition, for example
+  `effective_member = member + includes->effective_member` and
+  `read = (reader + effective_member) + parent->read`, grow quadratically
+  because each parent level expands the member recursion. This remains supported
+  (about 44 KB at bound eight in the verification fixture).
+- More than one self-arrow in the same permission, for example
+  `read = (reader + parent->read) + includes->read`, grows exponentially
+  (about 600 KB at bound eight, for each of the grant and frontier predicates).
+  The compiler refuses this shape with `UnsupportedScope` before unrolling,
+  selecting whole-expression evaluator fallback. Count occurrences after alias
+  expansion, including repeated identical arrows, but count recursion into each
+  permission separately so the quadratic composition above remains supported.
+
+An internal `dispatch_edges(schema, resource_type, action)` owns dispatch-edge
+extraction, retaining arrow/subject-set provenance and arrow multiplicity after
+alias expansion. Cycle classification, self-arrow reachability and the expansion
+guard share it. Compilation carries depth and frontier mode in a frozen context;
+each recursive compiler reads `REBAC_DEPTH_LIMIT` once during construction.
+A recursive CTE seam is the eventual owner of structural sharing for these
+growth classes; this release adds neither a CTE dependency nor a compilation cache.
+Missing subject-set target definitions compile to a constant-false branch,
+matching the walker's missing-definition result without abandoning other arms.
+
+Caveats, recursive subject-set schemas without a supported self-arrow, and
+unsupported expression shapes still fall back for the entire permission
+expression to the conservative evaluator. In particular, an unsupported
+exclusion arm must never be treated as false. The explicit `accessible()`
+enumeration API and write authorization are unchanged. Previously supported
+non-recursive scopes keep their SQL byte for byte.
 Field-backed arrows compare native foreign-key target columns, independently of
 public resource-ID encoding. If a stored relation targets a resource field whose
 Python/wire value differs from SQL storage (custom converters, virtual fields or

@@ -54,10 +54,6 @@ def synced(request, settings):
     settings.REBAC_LOCAL_BACKEND_STORAGE = request.param
     call_command("rebac", "sync", stdout=StringIO())
     SchemaDefinition.objects.create(resource_type="auth/user")
-    group = SchemaDefinition.objects.create(resource_type="auth/group")
-    SchemaRelation.objects.create(
-        definition=group, name="member", allowed_subjects=[{"type": "auth/user"}]
-    )
     with sudo(reason="schema revision fixture"):
         post = Post.objects.create(title="cached schema")
     reset_backend()

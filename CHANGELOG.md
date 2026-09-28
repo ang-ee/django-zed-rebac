@@ -5,6 +5,51 @@ pre-1.0; breaking changes within a minor version are explicitly called out.
 
 ## [Unreleased]
 
+## [0.21.0] — 2026-09-28
+
+### Added
+
+- Local queryset scopes compile self-recursive role-inclusion and parent arrows
+  to bounded SQL in both relationship stores. Tuple hops and live field/path
+  hops reuse the existing predicates, including permissions combining recursion
+  with `authenticated` or filtered constants. Public signatures are unchanged.
+- Recursive scopes use the existing `REBAC_DEPTH_LIMIT` dispatch frames. A
+  deferred SQL boundary probe delegates potential overflow candidates to the
+  check walker, preserving short-circuit behavior and `PermissionDepthExceeded`
+  instead of silently truncating a long chain. Bounded graphs add one validation
+  query, independent of row count. SQL size is linear in the bound per self-arrow;
+  composing role and parent recursion can be quadratic. Multiple self-arrows in
+  one permission are refused with `UnsupportedScope` before exponential SQL
+  expansion. Non-recursive scopes retain byte-identical SQL. A recursive CTE
+  seam is the eventual owner of structural sharing.
+- Reproducible synced-schema SQL/parity and enumeration-versus-SQL measurements
+  in `python -m tests.probe_recursive_scope`.
+
+### Fixed
+
+- Recursive field/attribute arrow checks retain per-resource traversal instead
+  of the enumeration shortcut, so direct checks enforce the same dispatch bound.
+  Subject-set-only cycles keep the exact enumeration optimization and its
+  existing depth enforcement; nested-group checks retain their prior query cost.
+- Dispatch-graph analysis has one shared edge extractor. Recursive compilation
+  uses immutable frame context with a construction-time depth limit. Missing
+  subject-set target definitions compile to false without forcing fallback.
+
+### Known gaps
+
+- **RG-01 — enumeration/bulk depth parity:** `accessible()` and the bulk
+  `update()` authorization guard can silently truncate recursive arrows at the
+  bound where `check_access()` raises. Unresolved in 0.21.0.
+- **RG-02 — implicit subquery scoping (highest priority, next release):** a bare
+  `with_actor()` queryset consumed by `Subquery`, `Exists`, `__in`, or `Prefetch`
+  is unscoped unless `.scoped()` is called. Use explicit `.scoped()` at these
+  boundaries until the integration is corrected.
+- **RG-03 — correlated frontier scope:** correlated `Exists(scoped())` validates
+  the whole resource type. One over-deep row anywhere can raise for every
+  correlated use, even when the outer query would exclude that row.
+- **RG-04 — repeated frontier probes:** frontier validation re-runs at each SQL
+  compilation, including `count()`, materialization and rendering `str(query)`.
+
 ## [0.20.0] — 2026-09-28
 
 ### Fixed

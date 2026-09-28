@@ -1,7 +1,8 @@
-"""Compile non-caveated, acyclic local permissions into lazy ORM predicates."""
+"""Compile non-caveated local permissions into lazy ORM predicates."""
 
 from __future__ import annotations
 
+from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any, cast
 
 from django.core.exceptions import FieldDoesNotExist
@@ -34,6 +35,15 @@ if TYPE_CHECKING:
 
 class UnsupportedScope(Exception):
     """Use the existing evaluator for the entire permission expression."""
+
+
+@dataclass(frozen=True, slots=True)
+class _CompileContext:
+    depth: int = 0
+    boundary: bool = False
+
+
+_ROOT_CONTEXT = _CompileContext()
 
 
 def _truth(value: bool) -> Q:
@@ -142,7 +152,18 @@ class LocalQueryScope:
         self.relationships = rows.with_wire_ids()
 
     def predicate(self, model: type[models.Model], action: str, resource_type: str) -> Q:
-        return self.permission(resource_type, action, model, resource_id_attr(model), frozenset())
+        try:
+            return self.permission(
+                resource_type, action, model, resource_id_attr(model), frozenset()
+            )
+        except UnsupportedScope:
+            from .local_recursive import RecursiveQueryScope, reaches_self_arrow
+
+            if not reaches_self_arrow(self.schema, resource_type, action):
+                raise
+            return RecursiveQueryScope(self.backend, self.subject, self.using).predicate(
+                model, action, resource_type
+            )
 
     def permission(
         self,
@@ -151,6 +172,7 @@ class LocalQueryScope:
         model: type[models.Model] | None,
         identity: str | Value,
         seen: frozenset[tuple[str, str]],
+        context: _CompileContext = _ROOT_CONTEXT,
     ) -> Q:
         key = (resource_type, action)
         if key in seen or len(seen) > app_settings.REBAC_DEPTH_LIMIT:
@@ -160,7 +182,7 @@ class LocalQueryScope:
             return _truth(False)
         permission = self.schema.get_permission(resource_type, action)
         expr = permission.expression if permission is not None else PermRef(action)
-        return self.branch(expr, definition, model, identity, seen | {key})
+        return self.branch(expr, definition, model, identity, seen | {key}, context)
 
     def expression(
         self,
@@ -169,6 +191,7 @@ class LocalQueryScope:
         model: type[models.Model] | None,
         identity: str | Value,
         seen: frozenset[tuple[str, str]],
+        context: _CompileContext = _ROOT_CONTEXT,
     ) -> Q:
         if isinstance(expr, PermNil):
             return _truth(False)
@@ -177,14 +200,16 @@ class LocalQueryScope:
                 return _truth(builtin_actor_matches(expr.name, self.subject))
             relation = find_relation(definition, expr.name)
             if relation is not None:
-                return self.relation(definition, relation, model, identity, seen)
+                return self.relation(definition, relation, model, identity, seen, context)
             permission = self.schema.get_permission(definition.resource_type, expr.name)
             if permission is None:
                 return _truth(False)
-            return self.permission(definition.resource_type, expr.name, model, identity, seen)
+            return self.permission(
+                definition.resource_type, expr.name, model, identity, seen, context
+            )
         if isinstance(expr, PermBinOp):
-            left = self.branch(expr.left, definition, model, identity, seen)
-            right = self.branch(expr.right, definition, model, identity, seen)
+            left = self.branch(expr.left, definition, model, identity, seen, context)
+            right = self.branch(expr.right, definition, model, identity, seen, context)
             if expr.op == "+":
                 return left | right
             if expr.op == "&":
@@ -196,7 +221,9 @@ class LocalQueryScope:
             relation = find_relation(definition, expr.via)
             if relation is None:
                 return _truth(False)
-            return self.relation(definition, relation, model, identity, seen, target=expr.target)
+            return self.relation(
+                definition, relation, model, identity, seen, context, target=expr.target
+            )
         raise UnsupportedScope
 
     def branch(
@@ -206,12 +233,15 @@ class LocalQueryScope:
         model: type[models.Model] | None,
         identity: str | Value,
         seen: frozenset[tuple[str, str]],
+        context: _CompileContext = _ROOT_CONTEXT,
     ) -> Q:
         if isinstance(expr, PermRef) and self.schema.get_permission(
             definition.resource_type, expr.name
         ):
-            return self.permission(definition.resource_type, expr.name, model, identity, seen)
-        return self.expression(expr, definition, model, identity, seen)
+            return self.permission(
+                definition.resource_type, expr.name, model, identity, seen, context
+            )
+        return self.expression(expr, definition, model, identity, seen, context)
 
     @staticmethod
     def reference(identity: str | Value) -> Any:
@@ -237,6 +267,7 @@ class LocalQueryScope:
         model: type[models.Model] | None,
         identity: str | Value,
         seen: frozenset[tuple[str, str]],
+        context: _CompileContext = _ROOT_CONTEXT,
         *,
         target: str | None = None,
     ) -> Q:
@@ -272,12 +303,13 @@ class LocalQueryScope:
                 source = backing.queryset(subject=self.subject, using=self.using)
             else:
                 destination = backing.target_model._base_manager.using(self.using).filter(
-                    self.permission(
+                    self.hop(
                         backing.target_resource_type,
                         target,
                         backing.target_model,
                         backing.target_id_attr,
                         seen,
+                        context,
                     )
                 )
                 if direct_field is not None:
@@ -339,12 +371,13 @@ class LocalQueryScope:
                     return _truth(False)
                 target_condition = attribute.target_filter(resource_id, self.subject)
             else:
-                target_condition = attribute.subjects_filter(resource_id) & self.permission(
+                target_condition = attribute.subjects_filter(resource_id) & self.hop(
                     attribute.target_resource_type,
                     target,
                     attribute.target_model,
                     attribute.target_id_attr,
                     seen,
+                    context,
                 )
             targets = attribute.target_model._base_manager.using(self.using).filter(
                 target_condition
@@ -352,7 +385,9 @@ class LocalQueryScope:
             derived = resource_match & Q(Exists(targets))
             if attribute.resource is None:
                 return derived
-            stored = self._stored_relation(definition, relation, identity, seen, target=target)
+            stored = self._stored_relation(
+                definition, relation, identity, seen, context, target=target
+            )
             if isinstance(identity, Value):
                 fallback = _truth(str(identity.value) != attribute.resource)
             else:
@@ -365,12 +400,13 @@ class LocalQueryScope:
                     self.subject == SubjectRef.of(const.target_resource_type, const.target_id)
                 )
             else:
-                constant_match = self.permission(
+                constant_match = self.hop(
                     const.target_resource_type,
                     target,
                     None,
                     Value(const.target_id),
                     seen,
+                    context,
                 )
             if const.filters:
                 if model is const.source_model and isinstance(identity, str):
@@ -393,7 +429,7 @@ class LocalQueryScope:
             # fallback. A downstream caveat cannot collapse to a false RHS of
             # an exclusion; unsupported graphs must use the tri-state evaluator
             # for the entire permission expression.
-            self.relation(definition, relation, None, Value(""), seen, target=target)
+            self.relation(definition, relation, None, Value(""), seen, context, target=target)
             return Q(
                 **{
                     f"{identity}__in": ConvertedRelationIds(
@@ -406,7 +442,7 @@ class LocalQueryScope:
                     )
                 }
             )
-        return self._stored_relation(definition, relation, identity, seen, target=target)
+        return self._stored_relation(definition, relation, identity, seen, context, target=target)
 
     def _stored_relation(
         self,
@@ -414,6 +450,7 @@ class LocalQueryScope:
         relation: Relation,
         identity: str | Value,
         seen: frozenset[tuple[str, str]],
+        context: _CompileContext = _ROOT_CONTEXT,
         *,
         target: str | None,
     ) -> Q:
@@ -440,32 +477,52 @@ class LocalQueryScope:
         allowed_rows = _truth(False)
         for allowed in relation.allowed_subjects:
             shape = self.subject_shape(allowed)
-            if target is not None:
-                member = self.permission(allowed.type, target, None, "_scope_subject_id", seen)
-            else:
-                member = Q(
-                    subject_type=self.subject.subject_type,
-                    subject_id=self.subject.subject_id,
-                    optional_subject_relation=self.subject.optional_relation,
-                )
-                if allowed.wildcard and not self.subject.optional_relation:
-                    member |= _truth(self.subject.subject_type == allowed.type)
-                if allowed.relation:
-                    target_definition = self.schema.get_definition(allowed.type)
-                    if (
-                        target_definition is None
-                        or find_relation(target_definition, allowed.relation) is None
-                    ):
-                        raise UnsupportedScope
-                    member |= self.permission(
-                        allowed.type,
-                        allowed.relation,
-                        None,
-                        "_scope_subject_id",
-                        seen,
-                    )
+            member = self.subject_membership(allowed, target, seen, context)
             allowed_rows |= shape & member
         return Q(Exists(rows.filter(allowed_rows)))
+
+    def hop(
+        self,
+        resource_type: str,
+        action: str,
+        model: type[models.Model] | None,
+        identity: str | Value,
+        seen: frozenset[tuple[str, str]],
+        context: _CompileContext = _ROOT_CONTEXT,
+    ) -> Q:
+        return self.permission(resource_type, action, model, identity, seen, context)
+
+    def subject_membership(
+        self,
+        allowed: AllowedSubject,
+        target: str | None,
+        seen: frozenset[tuple[str, str]],
+        context: _CompileContext = _ROOT_CONTEXT,
+    ) -> Q:
+        if target is not None:
+            return self.hop(allowed.type, target, None, "_scope_subject_id", seen, context)
+        member = Q(
+            subject_type=self.subject.subject_type,
+            subject_id=self.subject.subject_id,
+            optional_subject_relation=self.subject.optional_relation,
+        )
+        if allowed.wildcard and not self.subject.optional_relation:
+            member |= _truth(self.subject.subject_type == allowed.type)
+        if allowed.relation:
+            target_definition = self.schema.get_definition(allowed.type)
+            if target_definition is None:
+                return _truth(False)
+            if find_relation(target_definition, allowed.relation) is None:
+                raise UnsupportedScope
+            member |= self.hop(
+                allowed.type,
+                allowed.relation,
+                None,
+                "_scope_subject_id",
+                seen,
+                context,
+            )
+        return member
 
     def native_identity(self, model: type[models.Model], identity: str) -> bool:
         """Whether ``identity`` compares in SQL exactly as the evaluator compares it in Python.

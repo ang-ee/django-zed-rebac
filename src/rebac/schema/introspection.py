@@ -37,6 +37,16 @@ class PermissionSources:
     subpermissions: frozenset[str]
 
 
+@dataclass(frozen=True, slots=True)
+class DispatchEdge:
+    """Internal dispatch destination and the relation/edge kind that reaches it."""
+
+    resource_type: str
+    action: str
+    via: str
+    is_arrow: bool
+
+
 def _empty_sources() -> PermissionSources:
     return PermissionSources(frozenset(), frozenset(), frozenset(), frozenset())
 
@@ -47,22 +57,30 @@ def permission_sources(
     permission: str,
 ) -> PermissionSources:
     """Return relation, arrow, builtin, and sub-permission sources for a permission."""
+    return _permission_sources(schema, resource_type, permission)[0]
+
+
+def _permission_sources(
+    schema: Schema, resource_type: str, permission: str
+) -> tuple[PermissionSources, list[tuple[str, str]]]:
+    """Share alias expansion while retaining arrow occurrences for SQL growth checks."""
     definition = schema.get_definition(resource_type)
     if definition is None:
-        return _empty_sources()
+        return _empty_sources(), []
 
     relation = find_relation(definition, permission)
     if relation is not None:
-        return PermissionSources(frozenset({permission}), frozenset(), frozenset(), frozenset())
+        return PermissionSources(frozenset({permission}), frozenset(), frozenset(), frozenset()), []
 
     permission_def = find_permission(definition, permission)
     if permission_def is None:
-        return _empty_sources()
+        return _empty_sources(), []
 
     direct_relations: set[str] = set()
     arrows: set[tuple[str, str]] = set()
     builtins: set[str] = set()
     subpermissions: set[str] = set()
+    arrow_occurrences: list[tuple[str, str]] = []
     _collect_sources(
         permission_def.expression,
         definition=definition,
@@ -71,13 +89,49 @@ def permission_sources(
         builtins=builtins,
         subpermissions=subpermissions,
         seen=frozenset({permission}),
+        arrow_occurrences=arrow_occurrences,
     )
     return PermissionSources(
         frozenset(direct_relations),
         frozenset(arrows),
         frozenset(builtins),
         frozenset(subpermissions),
-    )
+    ), arrow_occurrences
+
+
+def dispatch_edges(schema: Schema, resource_type: str, action: str) -> tuple[DispatchEdge, ...]:
+    """Extract dispatches after alias expansion, preserving arrow occurrences.
+
+    Multiple allowed IDs/caveats of the same target shape are one dispatch.
+    Repeated arrow expressions remain separate edges: SQL expands each copy.
+    Missing targets remain edges; their destination has no outgoing dispatches.
+    """
+    definition = schema.get_definition(resource_type)
+    if definition is None:
+        return ()
+    sources, arrows = _permission_sources(schema, resource_type, action)
+    edges: list[DispatchEdge] = []
+    for via, target in arrows:
+        relation = find_relation(definition, via)
+        if relation is not None:
+            edges.extend(
+                DispatchEdge(target_type, target, via, True)
+                for target_type in sorted({allowed.type for allowed in relation.allowed_subjects})
+            )
+    for name in sorted(sources.direct_relations):
+        relation = find_relation(definition, name)
+        if relation is not None:
+            edges.extend(
+                DispatchEdge(target_type, target, name, False)
+                for target_type, target in sorted(
+                    {
+                        (allowed.type, allowed.relation)
+                        for allowed in relation.allowed_subjects
+                        if allowed.relation
+                    }
+                )
+            )
+    return tuple(edges)
 
 
 def relation_dependencies(
@@ -235,7 +289,9 @@ def accessible_is_exact(schema: Schema) -> bool:
     Enumeration silently drops caveat-conditional rows and cannot list the
     rows of a built-in actor grant (``authenticated`` / ``anonymous``), so it
     is only interchangeable with a per-row check when the schema declares no
-    caveated subject and no permission references a built-in actor term.
+    caveated subject, no cycle containing an arrow, and no permission references a
+    built-in actor term. Recursive fixpoint enumeration does not preserve the
+    per-resource walker's depth errors.
     """
     if schema.caveats or any(
         allowed.with_caveat
@@ -244,10 +300,40 @@ def accessible_is_exact(schema: Schema) -> bool:
         for allowed in relation.allowed_subjects
     ):
         return False
-    return not any(
+    return not _has_recursive_dispatch(schema) and not any(
         _references_builtin_actor(permission.expression)
         for definition in schema.definitions
         for permission in definition.permissions
+    )
+
+
+def _has_recursive_dispatch(schema: Schema) -> bool:
+    """An arrow participates in a cycle exactly when its target reaches its source.
+
+    Subject-set-only cycles already enforce enumeration depth. Testing return
+    reachability per arrow also handles mixed cycles and parallel edge kinds,
+    which a DFS that ignores pure subject-set back edges can otherwise miss.
+    """
+
+    def reaches(key: tuple[str, str], goal: tuple[str, str], seen: set[tuple[str, str]]) -> bool:
+        if key == goal:
+            return True
+        if key in seen:
+            return False
+        seen.add(key)
+        return any(
+            reaches((edge.resource_type, edge.action), goal, seen)
+            for edge in dispatch_edges(schema, *key)
+        )
+
+    return any(
+        edge.is_arrow
+        and reaches(
+            (edge.resource_type, edge.action), (definition.resource_type, permission.name), set()
+        )
+        for definition in schema.definitions
+        for permission in definition.permissions
+        for edge in dispatch_edges(schema, definition.resource_type, permission.name)
     )
 
 
@@ -305,6 +391,7 @@ def _collect_sources(
     builtins: set[str],
     subpermissions: set[str],
     seen: frozenset[str],
+    arrow_occurrences: list[tuple[str, str]],
 ) -> None:
     if isinstance(expr, PermNil):
         return
@@ -327,10 +414,12 @@ def _collect_sources(
             builtins=builtins,
             subpermissions=subpermissions,
             seen=seen | {expr.name},
+            arrow_occurrences=arrow_occurrences,
         )
         return
     if isinstance(expr, PermArrow):
         arrows.add((expr.via, expr.target))
+        arrow_occurrences.append((expr.via, expr.target))
         return
     if isinstance(expr, PermBinOp):
         _collect_sources(
@@ -341,6 +430,7 @@ def _collect_sources(
             builtins=builtins,
             subpermissions=subpermissions,
             seen=seen,
+            arrow_occurrences=arrow_occurrences,
         )
         _collect_sources(
             expr.right,
@@ -350,6 +440,7 @@ def _collect_sources(
             builtins=builtins,
             subpermissions=subpermissions,
             seen=seen,
+            arrow_occurrences=arrow_occurrences,
         )
         return
     raise TypeError(f"unknown PermExpr: {expr!r}")
