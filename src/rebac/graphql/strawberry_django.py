@@ -9,7 +9,6 @@ from typing import Any, cast
 from django.db import models
 from django.db.models import QuerySet
 from django.db.models.manager import BaseManager
-from graphql import GraphQLResolveInfo
 from graphql.language.ast import OperationType
 from strawberry.types import Info
 from strawberry_django.optimizer import (
@@ -78,7 +77,9 @@ class RebacDjangoOptimizerExtension(_DjangoOptimizerExtension):
         self,
         next_: Callable[..., Any],
         root: Any,
-        info: GraphQLResolveInfo,
+        # graphql-core made ``GraphQLResolveInfo`` generic in newer releases; the
+        # extension only forwards ``info``, so it stays untyped across both.
+        info: Any,
         *args: Any,
         **kwargs: Any,
     ) -> Any:
