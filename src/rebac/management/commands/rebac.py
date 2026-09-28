@@ -446,9 +446,14 @@ class Command(BaseCommand):
             self.stdout.write(self.style.SUCCESS("OK — no drift."))
             return
 
-        # Reset cached backend so the next access reloads the schema from DB.
-        from ...backends import reset_backend
+        # Publish even an unchanged sync: TRUNCATE does not fire DML triggers.
+        from django.db import connections
 
+        from ...backends import reset_backend
+        from ...models import SchemaDefinition
+        from ...schema.generation import refresh_schema_revision
+
+        refresh_schema_revision(connections[SchemaDefinition.objects.db])
         reset_backend()
         self.stdout.write(self.style.SUCCESS("Sync complete."))
 

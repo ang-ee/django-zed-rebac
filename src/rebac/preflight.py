@@ -52,6 +52,7 @@ from typing import TYPE_CHECKING, Any
 from .conf import app_settings
 from .errors import PermissionDepthExceeded, SchemaError
 from .schema.ast import ConstBinding, FieldBinding
+from .schema.cache import schema_operation
 from .schema.introspection import relation_dependencies
 from .schema.walker import (
     WalkContext,
@@ -68,6 +69,7 @@ if TYPE_CHECKING:  # pragma: no cover
     from .schema.ast import Definition, Schema
 
 
+@schema_operation
 def _check_new_model(
     instance: Any,
     *,
@@ -138,6 +140,7 @@ def _check_new_model(
 _VIRTUAL_RESOURCE_ID = ""
 
 
+@schema_operation
 def check_new(
     *,
     subject: SubjectRef,

@@ -29,15 +29,15 @@ Caveats are tri-state:
 from __future__ import annotations
 
 import time
-from collections.abc import Callable, Iterable
-from contextvars import ContextVar
+from collections.abc import Iterable
+from concurrent.futures import Future
 from datetime import datetime
-from functools import wraps
 from threading import Lock
 from typing import Any, NamedTuple
 from weakref import WeakSet
 
 from django.db import models
+from django.db.backends.base.base import BaseDatabaseWrapper
 from django.db.models import QuerySet
 
 from ..conf import app_settings
@@ -66,7 +66,9 @@ from ..schema.ast import (
     Relation,
     Schema,
 )
-from ..schema.cache import SchemaScope, SchemaSnapshot
+from ..schema.cache import SchemaSnapshot
+from ..schema.cache import operation_scope as _schema_operation_scope
+from ..schema.cache import schema_operation as _schema_operation
 from ..schema.walker import (
     WalkContext,
 )
@@ -113,9 +115,6 @@ class _SchemaFacts(NamedTuple):
 
 
 _relationship_generation = 0
-_schema_operation_scope: ContextVar[SchemaScope | None] = ContextVar(
-    "rebac_schema_operation", default=None
-)
 
 
 def _enforced_schema_errors(schema: Schema) -> list[str]:
@@ -128,26 +127,6 @@ def _enforced_schema_errors(schema: Schema) -> list[str]:
         if "backed relation" in error or "backing" in error
     ]
     return backing_errors + subject_relation_errors(schema)
-
-
-def _schema_operation[**P, R](method: Callable[P, R]) -> Callable[P, R]:
-    """Reuse one schema within a public backend operation and nested reads."""
-
-    @wraps(method)
-    def wrapped(*args: P.args, **kwargs: P.kwargs) -> R:
-        token = None
-        if _schema_operation_scope.get() is None:
-            token = _schema_operation_scope.set(SchemaScope())
-        try:
-            return method(*args, **kwargs)
-        finally:
-            if token is not None:
-                scope = _schema_operation_scope.get()
-                if scope is not None:
-                    scope.clear()
-                _schema_operation_scope.reset(token)
-
-    return wrapped
 
 
 class LocalBackend(Backend):
@@ -181,11 +160,17 @@ class LocalBackend(Backend):
 
     def __init__(self) -> None:
         self._schema_lock = Lock()
+        # Signals can run while their transaction holds database write locks.
+        # They must not wait on a loader that might be waiting on that database.
+        self._schema_invalidation_lock = Lock()
         self._schema: Schema | None = None
         self._schema_is_manual = False
+        self._schema_snapshots: dict[tuple[str, str], SchemaSnapshot] = {}
+        self._schema_loads: dict[tuple[str, str], Future[SchemaSnapshot | None]] = {}
+        self._uncacheable_aliases: set[str] = set()
         self._schema_generation = 0
         self._schema_invalidation_generation = 0
-        self._schema_facts_memo: _SchemaFacts | None = None
+        self._schema_facts_memo: dict[int, _SchemaFacts] = {}
         # Counter used as a stable monotonic xid on backends (e.g. SQLite test
         # mode) without `txid_current()`.
         self._xid_counter = 0
@@ -199,58 +184,142 @@ class LocalBackend(Backend):
         schema_errors = _enforced_schema_errors(schema)
         if schema_errors:
             raise SchemaError("; ".join(schema_errors))
-        with self._schema_lock:
+        with self._schema_lock, self._schema_invalidation_lock:
             self._schema = schema
             self._schema_is_manual = True
+            self._schema_snapshots.clear()
+            self._schema_facts_memo.clear()
             self._schema_generation += 1
 
     def schema(self) -> Schema:
         return self._schema_snapshot().schema
 
     def _schema_snapshot(self) -> SchemaSnapshot:
-        from django.db import DEFAULT_DB_ALIAS, connections
+        from django.db import connections
         from django.utils import timezone
 
         from ..evaluator import current_evaluator
+        from ..models import SchemaDefinition
+        from ..schema.generation import schema_triggers_verified
 
-        evaluator = current_evaluator()
         with self._schema_lock:
             if self._schema_is_manual and self._schema is not None:
-                return SchemaSnapshot(
-                    self._schema,
-                    None,
-                    self._schema_generation,
-                    self._schema_invalidation_generation,
-                )
-            connection = connections[DEFAULT_DB_ALIAS]
-            # Manual transaction management has no on_commit lifecycle to
-            # observe. Preserve operation-only snapshots in that mode.
-            scoped = connection.get_autocommit() or (
-                connection.in_atomic_block and connection.commit_on_exit
-            )
-            scope = (
-                evaluator._schema_scope
-                if evaluator is not None and scoped
-                else _schema_operation_scope.get()
-            )
-            snapshots = scope.snapshots(connection) if scope is not None else None
-            snapshot = snapshots.get(self) if snapshots is not None else None
+                return SchemaSnapshot(self._schema, None, self._schema_generation, 0)
+        with self._schema_invalidation_lock:
+            invalidation = self._schema_invalidation_generation
+        connection = connections[SchemaDefinition.objects.db]
+        evaluator = current_evaluator()
+        operation = _schema_operation_scope.get()
+        # Manual transactions have no observable on_commit lifecycle. Keep
+        # their pins operation-local, as before revision caching was added.
+        scoped = connection.get_autocommit() or (
+            connection.in_atomic_block and connection.commit_on_exit
+        )
+        scope = evaluator._schema_scope if evaluator is not None and scoped else operation
+        pins = scope.snapshots(connection) if scope is not None else None
+        operation_pins = operation.snapshots(connection) if operation is not None else None
+        with self._schema_lock:
+            degraded = connection.alias in self._uncacheable_aliases
+        for candidate in (operation_pins,) if degraded else (pins, operation_pins):
+            snapshot = candidate.get(self) if candidate is not None else None
             if (
                 snapshot is not None
-                and snapshot.invalidation_generation == self._schema_invalidation_generation
+                and snapshot.invalidation_generation == invalidation
                 and (snapshot.expires_at is None or snapshot.expires_at > timezone.now())
             ):
                 return snapshot
-            schema, expires_at = self._load_schema_from_db()
-            self._schema = schema
-            self._schema_is_manual = False
-            self._schema_generation += 1
-            snapshot = SchemaSnapshot(
-                schema, expires_at, self._schema_generation, self._schema_invalidation_generation
-            )
-            if snapshots is not None:
-                snapshots[self] = snapshot
-            return snapshot
+
+        # Database I/O and waiting for another loader happen outside the process
+        # lock. An evaluator validates once per scope / transaction boundary;
+        # unscoped operations validate on every call.
+        for _attempt in range(3):
+            with self._schema_invalidation_lock:
+                invalidation = self._schema_invalidation_generation
+            with self._schema_lock:
+                degraded = connection.alias in self._uncacheable_aliases
+            revision = None if degraded else self._read_schema_revision(connection)
+            if revision is None or not schema_triggers_verified(connection):
+                with self._schema_lock:
+                    self._uncacheable_aliases.add(connection.alias)
+                    self._evict_schema_alias(connection.alias)
+                schema, expires_at = self._load_schema_from_db(connection.alias)
+                snapshot = SchemaSnapshot(schema, expires_at, -1, invalidation)
+                # Share nested reads for ONE operation, never an evaluator scope
+                # or a decision cache. Later operations read all live schema rows.
+                if operation_pins is not None:
+                    operation_pins[self] = snapshot
+                return snapshot
+            key = (connection.alias, revision)
+            with self._schema_lock:
+                snapshot = self._schema_snapshots.get(key)
+                if snapshot is not None and (
+                    snapshot.expires_at is None or snapshot.expires_at > timezone.now()
+                ):
+                    pending = None
+                    owner = False
+                else:
+                    pending = self._schema_loads.get(key)
+                    owner = pending is None
+                    if pending is None:
+                        pending = Future()
+                        self._schema_loads[key] = pending
+            if pending is not None:
+                if owner:
+                    try:
+                        try:
+                            schema, expires_at = self._load_schema_from_db(connection.alias)
+                        except SchemaError:
+                            if self._read_schema_revision(connection) == revision:
+                                raise
+                            snapshot = None
+                        else:
+                            after = self._read_schema_revision(connection)
+                            snapshot = None
+                            if after == revision:
+                                with self._schema_lock, self._schema_invalidation_lock:
+                                    if invalidation == self._schema_invalidation_generation:
+                                        self._evict_schema_alias(connection.alias)
+                                        self._schema_generation += 1
+                                        snapshot = SchemaSnapshot(
+                                            schema, expires_at, self._schema_generation, 0, revision
+                                        )
+                                        self._schema_snapshots[key] = snapshot
+                        pending.set_result(snapshot)
+                    except BaseException as exc:
+                        pending.set_exception(exc)
+                        raise
+                    finally:
+                        with self._schema_lock:
+                            self._schema_loads.pop(key, None)
+                else:
+                    snapshot = pending.result()
+            with self._schema_invalidation_lock:
+                if invalidation != self._schema_invalidation_generation:
+                    continue
+            if snapshot is not None:
+                pin = snapshot._replace(invalidation_generation=invalidation)
+                if pins is not None:
+                    pins[self] = pin
+                return pin
+        # Sustained schema writes must not turn retry exhaustion into a request
+        # error. This final read has no trustworthy revision: do not retain it.
+        schema, expires_at = self._load_schema_from_db(connection.alias)
+        return SchemaSnapshot(schema, expires_at, -1, invalidation)
+
+    def _evict_schema_alias(self, alias: str) -> None:
+        """Caller holds _schema_lock; in-flight scope pins own their old trees."""
+        for key in list(self._schema_snapshots):
+            if key[0] == alias:
+                snapshot = self._schema_snapshots.pop(key)
+                self._schema_facts_memo.pop(snapshot.generation, None)
+
+    def _read_schema_revision(self, connection: BaseDatabaseWrapper) -> str | None:
+        """Read the witness, degrading to uncached evaluation before migration."""
+        from ..schema.generation import read_schema_revision
+
+        with self._schema_lock:
+            known = any(alias == connection.alias for alias, _ in self._schema_snapshots)
+        return read_schema_revision(connection, known_table=known)
 
     def _cache_generation(self, resource_type: str) -> tuple[int, int] | None:
         """Return a decision generation for ``resource_type``, or ``None`` to bypass caching.
@@ -264,13 +333,18 @@ class LocalBackend(Backend):
         :func:`rebac.schema.introspection.live_backed_resource_types`, so
         types that cannot reach a field or attribute backing keep caching.
         """
-        from django.db import connection
+        from django.db import connection, connections
 
-        if connection.in_atomic_block or (
-            connection.connection is not None and not connection.get_autocommit()
-        ):
-            return None
+        from ..models import SchemaDefinition
+
+        for candidate in (connection, connections[SchemaDefinition.objects.db]):
+            if candidate.in_atomic_block or (
+                candidate.connection is not None and not candidate.get_autocommit()
+            ):
+                return None
         snapshot = self._schema_snapshot()
+        if snapshot.revision is None and not self._schema_is_manual:
+            return None
         schema = snapshot.schema
         if resource_type in self._schema_facts(snapshot).live_types:
             return None
@@ -285,26 +359,32 @@ class LocalBackend(Backend):
         from ..schema.introspection import accessible_is_exact, live_backed_resource_types
 
         with self._schema_lock:
-            cached = self._schema_facts_memo
-            if cached is not None and cached.generation == snapshot.generation:
+            cached = self._schema_facts_memo.get(snapshot.generation)
+            if cached is not None:
                 return cached
-        facts = _SchemaFacts(
-            snapshot.generation,
-            live_backed_resource_types(snapshot.schema),
-            accessible_is_exact(snapshot.schema),
-        )
-        with self._schema_lock:
-            self._schema_facts_memo = facts
-        return facts
+            facts = _SchemaFacts(
+                snapshot.generation,
+                live_backed_resource_types(snapshot.schema),
+                accessible_is_exact(snapshot.schema),
+            )
+            current = (
+                self._schema_is_manual and snapshot.generation == self._schema_generation
+            ) or any(s.generation == snapshot.generation for s in self._schema_snapshots.values())
+            if snapshot.generation != -1 and current:
+                self._schema_facts_memo[snapshot.generation] = facts
+            return facts
 
     def mark_schema_stale(self) -> None:
         """Drop a DB-loaded schema cache after Schema* row changes."""
-        with self._schema_lock:
+        # Loaders perform no database I/O under this lock, so a signal holding
+        # database write locks can safely evict shared snapshots here.
+        with self._schema_lock, self._schema_invalidation_lock:
             if not self._schema_is_manual:
-                self._schema = None
                 self._schema_invalidation_generation += 1
+                self._schema_snapshots.clear()
+                self._schema_facts_memo.clear()
 
-    def _load_schema_from_db(self) -> tuple[Schema, datetime | None]:
+    def _load_schema_from_db(self, using: str) -> tuple[Schema, datetime | None]:
         from django.db.models import Prefetch, Q
         from django.utils import timezone
 
@@ -331,10 +411,18 @@ class LocalBackend(Backend):
         # is reused; a bare `d.relations.all().order_by(...)` per definition
         # is N+1 on schema load.
         defs: list[Definition] = []
-        defs_qs = SchemaDefinition.objects.prefetch_related(
-            Prefetch("relations", queryset=SchemaRelation.objects.order_by("name")),
-            Prefetch("permissions", queryset=SchemaPermission.objects.order_by("name")),
-        ).order_by("resource_type")
+        defs_qs = (
+            SchemaDefinition.objects.using(using)
+            .prefetch_related(
+                Prefetch(
+                    "relations", queryset=SchemaRelation.objects.using(using).order_by("name")
+                ),
+                Prefetch(
+                    "permissions", queryset=SchemaPermission.objects.using(using).order_by("name")
+                ),
+            )
+            .order_by("resource_type")
+        )
         for d in defs_qs:
             relations = []
             for r in d.relations.all():
@@ -362,7 +450,7 @@ class LocalBackend(Backend):
             defs.append(Definition(d.resource_type, tuple(relations), tuple(permissions)))
 
         caveats = []
-        for c in SchemaCaveat.objects.order_by("name"):
+        for c in SchemaCaveat.objects.using(using).order_by("name"):
             params = tuple(CaveatParam(p["name"], p["type"]) for p in (c.params or []))
             caveats.append(Caveat(c.name, params, c.expression))
 
@@ -373,9 +461,8 @@ class LocalBackend(Backend):
         # (created_at, pk) per kind), so the loader-side order_by is just
         # cosmetic; we keep it for readable EXPLAIN plans.
         overrides = list(
-            SchemaOverride.objects.filter(
-                Q(expires_at__isnull=True) | Q(expires_at__gt=timezone.now())
-            )
+            SchemaOverride.objects.using(using)
+            .filter(Q(expires_at__isnull=True) | Q(expires_at__gt=timezone.now()))
             .select_related("target_ct")
             .order_by("kind", "created_at", "pk")
         )

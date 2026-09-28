@@ -852,27 +852,80 @@ effective_expr = (baseline_expr + extends) AND tightens
                                  with caveats merged from recaveats
 ```
 
-Compiled lazily into the in-memory expression tree. Each evaluator/request owns
-its snapshots, separated by backend and actual Django database connection.
-Concurrent requests cannot replace each other's snapshots or decision generations.
-A temporary public backend-operation scope serves callers without an evaluator.
-Nested graph reads reuse that scope. A new scope reloads DB schema rows, so
-updates made by another worker are visible on the next request without relying
-on process-local signals. Standalone `schema()` calls reload DB state. Signals
-also invalidate same-process caches within a scope. In-flight request snapshots
-are intentional; transaction isolation and database routing determine which
-committed schema is visible. App startup performs no schema queries.
+#### Effective schema loading and generation
 
-Evaluator invalidation opens a new schema snapshot, including on subscription
-emissions. Read-only work inside Django `atomic()` reuses the evaluator's AST.
-A connection-local observer on Django's SQL execution seam discards that AST
-before non-SELECT SQL in both autocommit and transactions, including bulk writes
-and manual savepoint rollback. A
-pending native `on_commit` marker identifies outer transaction completion,
-including rollback and repeated use of an Atomic object. These observers are
-removed when the evaluator scope exits, including exception exits. Manually
-managed transactions (autocommit disabled by the caller) retain only temporary
-backend-operation snapshots. Permission decisions remain uncached in transactions.
+`LocalBackend` owns parsed effective-schema snapshots keyed by `(database alias,
+revision)`. Threads that see the same revision share one tree and one decision
+generation; whole-schema facts are memoised by that generation. Concurrent cold
+readers coordinate one load. Revision reads and schema loading run outside the
+process lock; locks protect lookup/publication and fact construction only.
+After three racing loads, evaluation falls back to one unpinned, uncached load.
+Revision churn alone never raises to the caller; malformed schemas still fail
+closed. Only the latest observed revision per alias remains in the shared
+snapshot and facts dictionaries; in-flight pins retain any older trees they need.
+Override expiry can refresh a revision's composed tree and decision generation.
+
+Schema reads use the alias selected by the `SchemaDefinition` read router; all
+component and override-target reads stay on that alias. No schema queries run at
+app startup. A warm operation outside an evaluator performs **one primary-key
+SELECT of a 32-character revision token**. Scoped queryset authorization shares
+one operation across `grants_all` and `queryset_filter`. Nested graph/preflight
+reads reuse the operation pin. A cold load adds the component reads and a second
+revision read to reject a load straddling a commit. PostgreSQL additionally
+checks table existence before its first witnessed load inside a transaction,
+so pre-migration reads cannot abort that transaction.
+
+Inside an evaluator scope the revision is validated **once per scope and
+transaction boundary**, through the existing connection observer. Repeated
+permission decision-cache hits cost zero queries; warm scoped querysets need
+only their result query. In-flight request snapshots are intentional: another
+process's schema commit appears on the next scope, explicit invalidation, or
+transaction boundary. Outside an evaluator it appears on the next operation.
+A zero-read unscoped check cannot detect another process's commit without an
+external invalidation service.
+
+The internal `SchemaGeneration` singleton extends the existing generation to the
+database. Transactional triggers on the four baseline tables and
+`SchemaOverride` replace its token on INSERT/UPDATE/DELETE, including sync, admin,
+bulk ORM and raw DML writes. Package provenance hashes cannot witness admin edits
+or overrides. Tokens are fresh identities rather than rollback-reusable counters;
+an uncommitted token is visible only to its originating transaction. Database
+isolation determines which revision a connection can see. Runtime tokens never
+enter generated schema output or its deterministic hashes.
+
+On the first witnessed load per alias/database in a process, the loader verifies
+the enabled triggers once, outside the process lock. A missing trigger, witness
+row or table is **never cacheable**: each operation loads the current schema and
+pins it only for that operation, never for an evaluator scope. Facts and permission
+decisions are not retained. A backend that detects a missing witness remains in
+this conservative mode until replaced (normally by a worker restart after repair),
+avoiding repeated witness probes and preserving the old per-operation query cost.
+Thus code running before migration degrades to uncached evaluation, preserving
+validation errors for malformed schemas. `manage.py check --database <schema-alias>`
+reports `rebac.E012` for an absent/empty witness or missing/disabled triggers.
+Only an absent table with migration `0005_schema_generation` still pending is
+deferred, allowing `migrate` to install it. Apply migrations before serving and
+run the database check after restoring databases or schema metadata. Runtime
+trigger verification is a one-time catalog query, not a per-permission query.
+Restart workers after repairing trigger metadata. Same-process schema
+signals also evict the backend's shared snapshots and facts, even when a broken
+trigger leaves the token unchanged. `TRUNCATE` fires none of these DML triggers;
+run `rebac sync` afterwards to restore the declared schema and advance its witness
+before serving requests again. Every explicit sync publishes a fresh token even
+when its declared schema is unchanged; `sync --check` remains read-only.
+Unsupported database vendors receive no witness and use uncached evaluation;
+the database check reports that schema caching is unsupported.
+
+Evaluator invalidation clears its pins, including on subscription emissions;
+an unchanged database revision can reuse the shared parsed tree. The existing
+connection-local SQL observer clears pins before non-SELECT SQL, including bulk
+writes and savepoint rollback. Its native `on_commit` marker identifies outer
+transaction completion, rollback and reused Atomic objects. Observers are removed
+on scope exit, including exception exits. Manual transaction management retains
+only operation pins because it has no native `on_commit` lifecycle. Permission
+decisions remain uncached in transactions. Live field, attribute and filtered
+constant rows are never retained by the schema cache; their decision-cache
+exclusion remains defined under `PermissionEvaluator` below.
 
 The observer covers ordinary Django ORM writes and raw DML executed through
 Django cursors. SQL `SELECT` statements invoking application-defined mutating
@@ -996,6 +1049,7 @@ System checks (in `rebac/checks.py`):
 | `rebac.E009` | Error | A field-, attribute- or const-backed relation cannot be resolved: missing Django model, identity field, relation path, attribute or filter lookup; a path that ends on a different model than the declared subject type; or a const-backed relation whose target type has no schema definition. |
 | `rebac.E010` | Error | Const-backed arrows form an evaluation cycle that would recurse to the depth limit on every check. |
 | `rebac.E011` | Error | `Meta.rebac_subject_relation` names a relation the model's effective schema definition does not declare. |
+| `rebac.E012` | Error | Database checks find an incomplete schema revision witness on the routed schema alias; see [Effective schema loading and generation](#effective-schema-loading-and-generation). |
 | `rebac.W001` | Warning | `rebac.backends.RebacBackend` not in `AUTHENTICATION_BACKENDS`. |
 | `rebac.W002` | Warning | A model with `Meta.rebac_resource_type` is missing `RebacMixin`. |
 | `rebac.W003` | Warning | An RBAC-bound relation exists where bare `select_related("rel")` / `prefetch_related("rel")` can be unsafe outside the REBAC helpers or Strawberry-Django optimizer. |

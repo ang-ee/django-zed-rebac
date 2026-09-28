@@ -34,19 +34,23 @@ def test_migrate_can_upgrade_legacy_backing_with_system_checks_enabled(settings)
         reset_backend()
         assert check_field_backed_relations() == []
         assert check_universal_admin_in_roles() == []
-        # Only the system-check lifecycle may defer. Serving still rejects
-        # unreadable schema instead of making authorization permissive.
+        # Missing revision metadata degrades to uncached loading; malformed
+        # backing still fails closed before and after the upgrade.
         with pytest.raises(SchemaError, match="backing"):
             backend().schema()
 
-        call_command("migrate", "rebac", "0004", skip_checks=False, verbosity=0, stdout=output)
+        call_command("migrate", "rebac", "0005", skip_checks=False, verbosity=0, stdout=output)
 
         row.refresh_from_db()
         assert row.backing == {"kind": "fk", "path": "folder"}
         reset_backend()
         assert backend().schema().get_definition("blog/post") is not None
+        row.backing = {"kind": "fk", "attname": "folder"}
+        row.save(update_fields=["backing"])
+        with pytest.raises(SchemaError, match="backing"):
+            backend().schema()
     finally:
-        call_command("migrate", "rebac", "0004", skip_checks=True, verbosity=0, stdout=output)
+        call_command("migrate", "rebac", "0005", skip_checks=True, verbosity=0, stdout=output)
         reset_backend()
 
 

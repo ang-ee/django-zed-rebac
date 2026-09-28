@@ -5,6 +5,45 @@ pre-1.0; breaking changes within a minor version are explicitly called out.
 
 ## [Unreleased]
 
+## [0.20.0] — 2026-09-28
+
+### Fixed
+
+- LocalBackend shares parsed effective schemas and schema facts by database alias
+  and revision across threads. Unscoped operations validate one revision token;
+  evaluator scopes retain zero-query decision-cache hits and querysets share one
+  schema snapshot across authorization steps. Public signatures and schema
+  semantics are unchanged; generated headers reflect the package version.
+- Transactional schema-generation triggers cover sync, admin, bulk and raw schema
+  writes, with rollback-safe revision identities. Override composition reads all
+  targets on the schema alias. Live field, attribute and filtered-constant rows
+  continue to be evaluated on every check.
+- The first witnessed load verifies triggers once per alias/process. Missing
+  metadata disables shared schema and decision caching; nested reads share one
+  operation-local schema. Same-process schema saves also evict shared snapshots.
+  Only the latest revision per alias remains in the snapshot and facts caches.
+- Schema loads retry racing revisions at most three times, then fall back to an
+  uncached load without raising for retry exhaustion. Database I/O stays outside
+  the process lock. Database system check `rebac.E012` verifies the revision row
+  and installed triggers on the routed schema database.
+- `rebac.__version__` reads installed package metadata, so generated schema
+  headers correctly identify 0.20.0.
+
+### Upgrade
+
+- Apply `0005_schema_generation` **before serving** with 0.20.0, then run
+  `manage.py check --database <schema-alias>`. The migration installs internal
+  revision metadata and triggers; its reverse tolerates partially removed
+  triggers. The new code on an unmigrated database loads schemas uncached rather
+  than raising for the absent revision table. Malformed schemas still fail closed.
+  Restart workers after repairing missing metadata to re-enable caching.
+- `TRUNCATE` fires none of the schema DML triggers. Run `rebac sync` afterwards,
+  before resuming requests; every explicit sync now publishes a revision even
+  when the declared schema is unchanged. `sync --check` remains read-only.
+- Evaluator scopes preserve their existing in-flight snapshot contract. Commits
+  from another process become visible at the next scope, explicit invalidation
+  or transaction boundary; unscoped operations see them on the next check.
+
 ## [0.19.0] — 2026-09-28
 
 ### Added
@@ -1171,4 +1210,3 @@ adapter for GraphQL-over-WebSocket subscriptions (proposal 0002).
 ## [0.2.0]
 
 Prior releases — see git history.
-

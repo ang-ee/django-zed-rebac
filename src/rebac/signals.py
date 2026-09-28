@@ -302,8 +302,8 @@ def _normalise_update_field_names(
 # ---------------------------------------------------------------------------
 #
 # Schema* CRUD invalidates DB-loaded LocalBackend schemas within the current
-# process and scope. New request/backend-operation scopes also reload schema
-# rows, so another worker's commits do not require a process-local signal.
+# process and operation. The persisted generation validates snapshots across
+# processes; see docs/ARCHITECTURE.md "Effective schema loading and generation".
 # Tier-2 override CRUD also resets the cached global backend and emits a
 # PermissionAuditEvent via the single audit-emission helper.
 

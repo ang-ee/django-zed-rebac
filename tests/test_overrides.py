@@ -466,7 +466,7 @@ def test_override_create_invalidates_global_backend_cache() -> None:
     reset_backend()
     b1 = backend()
     _ = b1.schema()  # trigger lazy load
-    assert b1._schema is not None  # type: ignore[attr-defined]
+    assert b1._schema_snapshots  # type: ignore[attr-defined]
 
     # Create an override -- the post_save signal must reset the cached backend.
     SchemaOverride.objects.create(

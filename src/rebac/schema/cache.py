@@ -1,9 +1,11 @@
-"""Evaluator-owned schema snapshots and Django transaction invalidation."""
+"""Schema snapshots, operation boundaries and Django transaction invalidation."""
 
 from __future__ import annotations
 
 from collections.abc import Callable
+from contextvars import ContextVar
 from datetime import datetime
+from functools import wraps
 from typing import Any, NamedTuple
 from weakref import WeakKeyDictionary
 
@@ -17,6 +19,7 @@ class SchemaSnapshot(NamedTuple):
     expires_at: datetime | None
     generation: int
     invalidation_generation: int
+    revision: str | None = None
 
 
 class _ConnectionSchemas:
@@ -90,3 +93,26 @@ class SchemaScope:
                     entry for entry in connection.run_on_commit if entry[1] is not state.marker
                 ]
         self.connections.clear()
+
+
+operation_scope: ContextVar[SchemaScope | None] = ContextVar("rebac_schema_operation", default=None)
+
+
+def schema_operation[**P, R](method: Callable[P, R]) -> Callable[P, R]:
+    """Pin one validated schema during an operation, including nested checks."""
+
+    @wraps(method)
+    def wrapped(*args: P.args, **kwargs: P.kwargs) -> R:
+        token = None
+        if operation_scope.get() is None:
+            token = operation_scope.set(SchemaScope())
+        try:
+            return method(*args, **kwargs)
+        finally:
+            if token is not None:
+                scope = operation_scope.get()
+                if scope is not None:
+                    scope.clear()
+                operation_scope.reset(token)
+
+    return wrapped

@@ -11,6 +11,7 @@ one is *active* per process, selected by ``REBAC_LOCAL_BACKEND_STORAGE`` via
 
 from __future__ import annotations
 
+from . import generation as _generation  # noqa: F401 — register the internal model
 from .audit import PermissionAuditEvent
 from .overrides import SchemaOverride
 from .provenance import PackageManagedRecord

@@ -166,13 +166,18 @@ def _group_overrides(
             caveat_pks.add(row.target_pk)
 
     perm_lookup: dict[int, tuple[str, str]] = {}
+    using = rows[0]._state.db if rows else None
     if perm_pks:
-        for sp in SchemaPermission.objects.filter(pk__in=perm_pks).select_related("definition"):
+        for sp in (
+            SchemaPermission.objects.using(using)
+            .filter(pk__in=perm_pks)
+            .select_related("definition")
+        ):
             perm_lookup[sp.pk] = (sp.definition.resource_type, sp.name)
 
     caveat_lookup: dict[int, str] = {}
     if caveat_pks:
-        for sc in SchemaCaveat.objects.filter(pk__in=caveat_pks):
+        for sc in SchemaCaveat.objects.using(using).filter(pk__in=caveat_pks):
             caveat_lookup[sc.pk] = sc.name
 
     for row in rows:

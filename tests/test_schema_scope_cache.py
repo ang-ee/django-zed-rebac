@@ -83,7 +83,8 @@ def test_readonly_atomic_reuses_one_persisted_schema(persisted_schema):
         with CaptureQueriesContext(connection) as queries:
             for _ in range(4):
                 assert not _allowed(local)
-        assert _schema_loads(queries) == 1
+        # The relationship-write validation already loaded this revision.
+        assert _schema_loads(queries) == 0
 
 
 def test_interleaved_evaluators_keep_their_schema_and_decision_cache(persisted_schema):
@@ -95,10 +96,10 @@ def test_interleaved_evaluators_keep_their_schema_and_decision_cache(persisted_s
             first_schema = first.run(local.schema)
             assert not second.run(_cached_allowed, second_evaluator, local)
             second_schema = second.run(local.schema)
-            assert first_schema is not second_schema
+            assert first_schema is second_schema
             assert first.run(local.schema) is first_schema
             assert second.run(local.schema) is second_schema
-        assert _schema_loads(queries) == 2
+        assert _schema_loads(queries) == 0
         with CaptureQueriesContext(connection) as repeated:
             assert not first.run(_cached_allowed, first_evaluator, local)
             assert not second.run(_cached_allowed, second_evaluator, local)
@@ -297,7 +298,7 @@ def test_copied_evaluator_context_does_not_share_snapshot_between_connections(pe
         with ThreadPoolExecutor(max_workers=1) as executor:
             worker_schema, worker_connection = executor.submit(context.run, load_on_worker).result()
         assert worker_connection is not parent_connection
-        assert worker_schema is not parent_schema
+        assert worker_schema is parent_schema
         assert local.schema() is parent_schema
 
 

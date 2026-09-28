@@ -39,6 +39,7 @@ from .field_visibility import (
     warn_raise_mode_degrades,
 )
 from .resources import model_resource_type
+from .schema.cache import schema_operation
 from .types import FieldDenyMode, SubjectRef
 
 _M = TypeVar("_M", bound=models.Model)
@@ -350,6 +351,7 @@ class RebacQuerySet(models.QuerySet[_M]):
             return
         self._scope_query(self.query, actor)
 
+    @schema_operation
     def _scope_query(self, query: Query, actor: SubjectRef | None) -> None:
         if query.combined_queries:
             for part in query.combined_queries:

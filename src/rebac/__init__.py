@@ -13,9 +13,13 @@ that's the supported import.
 
 from __future__ import annotations
 
+from importlib.metadata import PackageNotFoundError, version
 from typing import TYPE_CHECKING, Any
 
-__version__ = "0.19.0"
+try:
+    __version__ = version("django-zed-rebac")
+except PackageNotFoundError:
+    __version__ = "0.20.0"
 
 default_app_config = "rebac.apps.RebacConfig"
 

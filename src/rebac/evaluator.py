@@ -35,7 +35,7 @@ from contextlib import contextmanager
 from contextvars import ContextVar
 from typing import TYPE_CHECKING, Any
 
-from .schema.cache import SchemaScope
+from .schema.cache import SchemaScope, schema_operation
 from .types import CheckResult, Consistency, ObjectRef, PermissionResult, SubjectRef, Zookie
 
 if TYPE_CHECKING:  # pragma: no cover
@@ -110,6 +110,7 @@ class PermissionEvaluator:
 
     # ----- public API -----
 
+    @schema_operation
     def check(
         self,
         backend: Backend,
@@ -160,6 +161,7 @@ class PermissionEvaluator:
             self._store_check(key, result)
         return result
 
+    @schema_operation
     def accessible(
         self,
         backend: Backend,
