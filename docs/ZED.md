@@ -150,11 +150,11 @@ Forward, reverse, and many-to-many paths use the same declaration. Optional
 filters are anchored on the **source model**, including the through row:
 
 ```zed
-relation member: auth/user // rebac:field={"path":"roster__user","filters":{"roster__active":true,"roster__role":"editor"}}
+relation member: auth/user // rebac:field={"path":"membership__user","filters":{"membership__active":true,"membership__role":"editor"}}
 ```
 
 The target predicate and filters share one Django join. An active editor's
-roster row cannot accidentally authorize a different user's inactive row.
+membership row cannot accidentally authorize a different user's inactive row.
 Filter values are JSON scalars; Django validates the complete lookup paths.
 Both direct checks and lazy queryset scopes read the current rows, including
 changes made through bulk updates or the M2M manager.
@@ -171,17 +171,8 @@ multi-hop paths and MTI parent-declared FKs, are resolved on the write alias,
 except that an unfiltered single-hop FK/O2O storing the target's REBAC identity
 projects its prepared scalar without a query. Filters on resolved targets and
 known candidate scalar values are evaluated by Django on that alias.
-Database-default/expression values, unset insert-assigned MTI parent links,
-and other facts that cannot be established before insertion
-are **unknown**, represented by `None` in the `check_new()` overlay. A forward
-path with a later reverse or many-to-many hop is unknown because that set can
-change on insertion.
-Unknown relations deny any arm referencing them, even under intersection or
-exclusion; an independent allowed union arm can still authorize creation.
-Unreferenced unknown relations have no effect. Configuration and data errors
-on referenced backings still raise before write; missing targets raise where
-a fetch is performed. The direct-identity fast path leaves target-existence
-validation to database FK constraints.
+See [candidate preflight](./ARCHITECTURE.md#check_new--preflight-against-not-yet-persisted-resources)
+for unknown-fact handling and validation boundaries.
 
 Field-backed relations are projected by the library. For tuple facts the model
 writes after insertion in the same transaction, override
@@ -292,13 +283,29 @@ the intended "covers any `<type>`" semantics. Like field-backing, this is a
 `LocalBackend` synthesis with no SpiceDB equivalent; a SpiceDB backend would
 need the edge materialised as tuples.
 
-Create preflight (`rebac.check_new`) injects const-backed relations from the
-schema into its virtual tuple overlay. For the `admin` relation above, a create
-check behaves as if the not-yet-persisted post already carried
-`#admin @ platform/role:admin`, then evaluates `admin->member` through the real
-relationship store. Callers must not supply virtual tuples for const-backed
-relation names; those relations are synthetic schema facts, and
-`check_new()` raises `SchemaError` for non-empty caller entries on them.
+To expose only rows marked public, use a filtered constant and arrow to a
+permission on its fixed target:
+
+```zed
+definition site/audience {
+    permission read = authenticated
+}
+definition blog/post {
+    relation public: site/audience // rebac:const={"target_id":"public","filters":{"is_public":true}}
+    permission read = public->read
+}
+```
+
+Here the Django post model declares an `is_public` column. Changing it immediately
+changes read access, with no relationship tuple. The target ID stays concrete;
+the target permission determines the audience. Filters accept JSON scalars
+(including false and null), using Django lookups on the resource's own concrete
+local concrete columns (including `pk`), without related-row or inherited MTI column joins. A bare ID or empty filters retain
+the unfiltered behavior. This remains a `LocalBackend` projection.
+
+Django create paths project filtered constants from the proposed local column
+values; see [candidate preflight](./ARCHITECTURE.md#check_new--preflight-against-not-yet-persisted-resources)
+for the shared unknown-fact rules and direct `check_new` overlay contract.
 
 **Permissions** — computed expressions over relations:
 

@@ -69,17 +69,17 @@ def _render_relation(relation: Relation, *, include_backing: bool) -> str:
     backing = relation.backing
     if backing is None or not include_backing:
         return line
-    if isinstance(backing, ConstBinding):
+    if isinstance(backing, ConstBinding) and not backing.filters:
         return f"{line} // rebac:const={backing.target_id}"
     if isinstance(backing, FieldBinding) and not backing.filters:
         return f"{line} // rebac:field={backing.path}"
-    if isinstance(backing, (FieldBinding, AttributeBinding)):
+    if isinstance(backing, (FieldBinding, AttributeBinding, ConstBinding)):
         # The directive name carries the kind; the JSON body is the codec shape
         # minus that key, canonically ordered so rendering is byte-stable.
         data = backing_to_dict(backing)
         assert data is not None
-        data.pop("kind")
-        directive = "field" if isinstance(backing, FieldBinding) else "attribute"
+        kind = data.pop("kind")
+        directive = "field" if kind == "fk" else kind
         body = json.dumps(data, sort_keys=True, separators=(",", ":"), ensure_ascii=False)
         return f"{line} // rebac:{directive}={body}"
     raise TypeError(f"{relation.name}: unsupported relation backing {type(backing).__name__}")

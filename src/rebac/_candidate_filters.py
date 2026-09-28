@@ -8,7 +8,19 @@ from django.core.exceptions import FieldDoesNotExist
 from django.db import models
 from django.db.models import QuerySet, Value
 from django.db.models.expressions import BaseExpression, Combinable
-from django.db.models.functions import Cast
+from django.db.models.functions import Cast, Collate
+
+
+def _candidate_literal(scalar_field: models.Field[Any, Any], value: Any) -> BaseExpression:
+    """Prepare a candidate value with its stored column's type and collation."""
+    # Python None is SQL NULL, including for JSONField (not JSON null).
+    literal = (
+        Cast(Value(None), output_field=scalar_field)
+        if value is None
+        else Value(value, output_field=scalar_field)
+    )
+    collation = getattr(scalar_field, "db_collation", None)
+    return Collate(literal, collation) if collation else literal
 
 
 def _forward_lookup(
@@ -75,13 +87,7 @@ def _filter_candidate_targets(
         while alias in unavailable_aliases:
             alias += "_"
         unavailable_aliases.add(alias)
-        # Python None is saved as SQL NULL. In particular, typing Value(None)
-        # as JSONField would instead encode JSON null and change membership.
-        annotations[alias] = (
-            Cast(Value(None), output_field=field)
-            if value is None
-            else Value(value, output_field=field)
-        )
+        annotations[alias] = _candidate_literal(field, value)
         predicates[f"{alias}__{suffix}" if suffix else alias] = expected
 
     for lookup, expected in sorted(filters.items()):

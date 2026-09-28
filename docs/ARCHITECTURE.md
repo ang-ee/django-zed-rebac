@@ -292,7 +292,35 @@ expiration), parses to `ConstBinding` on `Relation.backing`, persists as
 type to have a Django model (the const *target* need not — it is typically a
 virtual role namespace).
 
-Resolution is fixed-target rather than per-row, which has two consequences in
+The additive object form restricts the edge to matching source rows:
+`// rebac:const={"target_id":"public","filters":{"is_public":true}}`.
+`ConstBinding(target_id: str, filters: tuple[tuple[str, Any], ...] = ())`
+stores these predicates. Filters use the existing scalar backing grammar
+(including false and null), and refer only to the declaring model’s local
+concrete fields, with Django transforms/lookups. Inherited MTI columns requiring
+a parent join and related-row traversals are rejected by `rebac.E009`. The
+`pk` alias resolves through `_meta.pk`, including MTI parent-link primary keys;
+FK attnames may address their stored scalar values. Empty filters
+are equivalent to a bare ID and retain its existing serialized and rendered form.
+Nonempty filters persist under `filters` beside `kind` and `target_id`. Field
+and constant bindings sort native filter tuples at construction so equality
+agrees with deterministic rendering. Malformed source IDs select no rows for
+field and filtered-constant checks; conversion belongs to the shared identity
+helper.
+
+Direct checks, subject lookup and enumeration require the source row to match.
+Lazy scopes conjoin `Q(**filters)` with the constant target predicate, including
+under exclusion and through arrows. Filtered constants never grant a whole type
+through `grants_all()`, and seed the live-backing cache policy so column updates
+take effect without tuple writes. Native `.zed` rendering retains the JSON
+directive deterministically; SpiceDB export continues to omit backing metadata.
+The existing built-in-actor enumeration limit still applies: for example,
+`authenticated & public->read` lists no IDs when it falls back to enumeration,
+because `authenticated` supplies no enumerable set. SQL queryset scope remains
+exact; filtered constants do not change the enumeration contract.
+
+For **unfiltered** constants, resolution is fixed-target rather than per-row,
+which has two consequences in
 `LocalBackend`:
 
 - **`accessible()` is whole-type, not enumerated.** Because the target object is
@@ -1155,19 +1183,29 @@ detection, ``anonymous`` / ``authenticated`` built-ins, tri-state
 combinators, ``REBAC_DEPTH_LIMIT``) reuses the shared walker that
 backs ``LocalBackend._eval_permission``.
 
-Const-backed relations are injected into the virtual overlay from the schema.
-If a new `blog/post` declares `relation admin: platform/role //
+Unfiltered const-backed relations are injected into the virtual overlay from the
+schema. If a new `blog/post` declares `relation admin: platform/role //
 rebac:const=admin`, `check_new()` behaves as if the proposed object carried
 `#admin @ platform/role:admin`, then evaluates `admin->member` through the real
-backend store. Callers must not supply virtual tuples for const-backed
-relations; those are synthetic schema facts, so `check_new()` raises
-`SchemaError` for non-empty or unknown caller entries on a const-backed relation name.
+backend store. Non-empty or unknown caller entries for these bare-ID constants
+raise `SchemaError`.
 
-Django create paths construct the candidate first, including Python field
-defaults, then project only the field-backed relations that `create` depends
-on, including dependencies through named permissions and arrow sources, into
-this same overlay. Unreferenced backings are not resolved, queried, filtered,
-or marked unknown during create preflight.
+`check_new` retains its existing virtual-relationship-only signature. Django
+create paths construct the candidate first, including Python defaults, then
+`_proposed_forward_relationships` projects the field-backed and filtered-constant
+relations that `create` depends on, including dependencies through named
+permissions and arrow sources. A resolved constant owns `matches_candidate`;
+its predicates use typed SQL literals, including declared column collations, on
+the write alias without reading a persisted source row. Unreferenced backings
+are not resolved, queried, filtered or marked unknown.
+
+Direct `check_new` callers supply filtered-constant facts through the existing
+`relationships` overlay, just as they supply field-backed facts. They must
+project the matching fixed target, an empty tuple, or `None` truthfully;
+`check_new` evaluates those supplied facts without reading a candidate. Omitted
+filtered-constant facts are unknown. Model hooks still cannot supply any
+library-owned backing, and bare-ID constants cannot be overridden.
+
 `create()`, `insert(obj)`, a new instance's `save()`, and every row of
 `bulk_create()` use `check_new` as the single evaluator. A backing whose first
 hop is reverse FK, reverse O2O, or many-to-many is genuinely empty on the new
@@ -1200,7 +1238,8 @@ promises after writing. The application must persist the promised tuples in
 the same transaction. `bulk_create()` never calls `save()`, so bulk paths must
 write the promised tuples themselves.
 
-Unknown is distinct from empty: database-default/expression values, unset
+Unknown is distinct from empty: missing filtered-constant candidate facts,
+database-default/expression values, unset
 insert-assigned MTI parent links, and paths or filters whose facts cannot be
 established before insertion contribute `None` in
 `check_new(relationships=...)`. A forward path with a later reverse
@@ -1660,11 +1699,12 @@ Complex context values bypass caching, including nested dictionaries and lists.
 LocalBackend declines to cache a decision under three independent conditions:
 inside a database transaction (a rollback would leave stale answers), when the
 active schema declares expiring relationships (a deadline can pass with no
-write), and when the decision's resource type can reach live field or attribute
-backing. Django bulk, M2M and reverse-relation writes do not advance the
+write), and when the decision's resource type can reach live field, attribute
+or filtered-constant backing. Django bulk, M2M and reverse-relation writes do not advance the
 relationship generation, so those decisions must read the rows again. The live
 set is `rebac.schema.introspection.live_backed_resource_types(schema)`: a type
-is live when one of its relations is field- or attribute-backed, or when one of
+is live when one of its relations is field- or attribute-backed or a filtered
+constant, or when one of
 its relations admits an allowed subject whose type is live. Allowed-subject
 types cover arrows, subject sets and const targets, so the closure is a
 conservative over-approximation; types that cannot reach a backing keep caching.
@@ -2127,7 +2167,18 @@ stable across patch releases. `rebac._internal.*` is private.
 
 7. **Web admin for the override layer.** v1.0 ships a Django admin form. A standalone admin SPA (separate optional package, `django-zed-rebac-admin`) could be more usable. Defer — gather user feedback first.
 
-8. **Multi-database relationship resolution.** The lazy SQL predicate joins relationship rows against the scoped model *inside one SQL statement*, so relationship rows must be **co-located on the queryset's own database** (Django cannot join across databases). Given that, the tuple-grant resolver behind non-native identities (`local_query.ConvertedRelationIds`) must read those rows from the same alias the surrounding `EXISTS` subqueries use. As of 0.16.2 the resolution helpers (`_resources_via_relation` / `_resources_for_expr` / the arrow helpers / `_compute_accessible_for`) thread that alias via the `using=` parameter, gated by `LocalBackend._maybe_using`. **Boundary (deliberate, documented):** sub-branches that dispatch into the tri-state evaluator — subject-set membership (`_has_direct_relation`), the negative arm of an exclusion, and const-arrow targets (`_eval_permission` / `_eval_permission_on`) — still resolve against the default database, as do the enumeration fallback and the public `accessible()` (whose SpiceDB-compatible signature carries no alias). For a queryset bound to a **non-default** alias whose permission reaches one of those branches, the SQL predicate *under-approximates* — it can only return fewer rows, never more (**fail-closed, never a leak**). Single-database projects (the default) are unaffected: the alias resolves to `"default"`, a no-op. Lean: thread the alias through the whole evaluator + add a cross-database contract test as its own change, driven by real multi-DB demand.
+8. **Multi-database relationship resolution.** The lazy SQL predicate joins
+relationship rows against the scoped model inside one SQL statement, so the
+relationships must be co-located on the queryset's database. The tuple-grant
+resolver for non-native identities and the shared evaluator thread that alias
+through source-row checks, field/attribute/constant arrows, subject sets and
+exclusion branches. This includes `ResolvedConstBacking.matches(using=...)`.
+The public `check_access()` / `accessible()` signatures still have no alias;
+the enumeration fallback and direct preflight arrow checks therefore retain
+their default-database boundary. Candidate-column projection itself uses the
+write alias. Projects must not infer cross-database authorization from these
+alias-free public calls.
+
 
 9. **Structural SQL sharing for shared sub-permissions.** The lazy compiler expands each referenced sub-permission/relation at *every* occurrence, so a permission DAG in which a sub-expression is reachable by N paths emits N copies of its predicate — Django's SQL compiler does not deduplicate structurally-identical, or even object-identical, subqueries (an `Exists` object OR'd with itself compiles twice). The blow-up is bounded by `REBAC_DEPTH_LIMIT`; realistic DAGs bloat by a small constant factor, but degenerate identical-sibling schemas can produce large queries and slow planning. Note: memoizing the schema *walk* would cut compile-time CPU but **not** the emitted SQL size, so it does not address the planner cost. Lean: real reduction needs CTE-based structural sharing (`WITH` clauses), tracked alongside the `select_related` SQL compiler (1.x); until then the depth limit caps the expansion.
 

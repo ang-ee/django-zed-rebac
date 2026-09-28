@@ -101,6 +101,7 @@ class WalkContext:
     # unknown relation inside a later exclusion. Persisted checks retain
     # their normal tri-state short-circuiting.
     has_unknown_relations: bool = False
+    using: str | None = None
 
 
 def eval_expr(

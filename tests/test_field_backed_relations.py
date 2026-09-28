@@ -339,3 +339,52 @@ def test_system_check_reports_missing_field_binding(db):
     assert any(
         issue.id == "rebac.E009" and "missing field 'missing'" in issue.msg for issue in issues
     )
+
+
+@pytest.mark.django_db
+def test_reverse_one_to_one_read_scope_and_exclusion(django_user_model):
+    from rebac.backends import backend as active_backend
+    from rebac.backends import reset_backend
+    from tests.testapp.models import NativeParentLinkedChild, NativeParentLinkedResource
+
+    reset_backend()
+    backend = active_backend()
+    backend.set_schema(
+        parse_zed("""
+        definition auth/user {}
+        definition test/nativeparentlinkedchild {
+            relation owner: auth/user // rebac:field=owner
+            permission read = owner
+        }
+        definition test/nativeparentlinkedresource {
+            relation child: test/nativeparentlinkedchild // rebac:field=nativeparentlinkedchild
+            permission read = child->read
+            permission excluded = authenticated - child->read
+        }
+    """)
+    )
+    alice = django_user_model.objects.create_user(username="reverse-alice")
+    bob = django_user_model.objects.create_user(username="reverse-bob")
+    with sudo(reason="reverse one-to-one fixtures"):
+        visible = NativeParentLinkedChild.objects.create(name="visible", owner=alice)
+        hidden = NativeParentLinkedChild.objects.create(name="hidden", owner=bob)
+        missing = NativeParentLinkedResource.objects.create(name="no child")
+    subject = _user(str(alice.pk))
+    try:
+        for row, allowed in [(visible, True), (hidden, False), (missing, False)]:
+            resource = ObjectRef("test/nativeparentlinkedresource", str(row.pk))
+            assert backend.has_access(subject=subject, action="read", resource=resource) is allowed
+            assert (
+                backend.has_access(subject=subject, action="excluded", resource=resource)
+                is not allowed
+            )
+        assert list(
+            NativeParentLinkedResource.objects.with_actor(alice).values_list("pk", flat=True)
+        ) == [visible.pk]
+        assert set(
+            NativeParentLinkedResource.objects.with_actor(alice)
+            .with_action("excluded")
+            .values_list("pk", flat=True)
+        ) == {hidden.pk, missing.pk}
+    finally:
+        reset_backend()

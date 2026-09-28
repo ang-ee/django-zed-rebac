@@ -198,6 +198,7 @@ def check_new(
         return CheckResult.no(reason=f"unknown action: {resource_type}#{action}")
 
     rels = _merge_const_backed_relationships(definition, rels)
+    required_relations = relation_dependencies(schema, resource_type, action)
 
     missing: set[str] = set()
     ctx = _build_ctx(
@@ -207,10 +208,7 @@ def check_new(
         context=context,
         missing=missing,
         relationships=rels,
-        has_unknown_relations=any(
-            rels.get(name, ()) is None
-            for name in relation_dependencies(schema, resource_type, action)
-        ),
+        has_unknown_relations=any(rels.get(name, ()) is None for name in required_relations),
     )
 
     try:
@@ -247,6 +245,10 @@ def _merge_const_backed_relationships(
     for relation in definition.relations:
         backing = relation.backing
         if not isinstance(backing, ConstBinding):
+            continue
+        if backing.filters:
+            # A missing projection is unknown, not an empty edge set.
+            merged.setdefault(relation.name, None)
             continue
         supplied = merged.get(relation.name, ())
         if supplied is None or supplied:

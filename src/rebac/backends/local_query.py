@@ -6,14 +6,13 @@ from typing import TYPE_CHECKING, Any, cast
 
 from django.core.exceptions import FieldDoesNotExist
 from django.db import connections, models
-from django.db.models import Exists, F, OuterRef, Q, Subquery, Value
+from django.db.models import Exists, F, OuterRef, Q, QuerySet, Subquery, Value
 from django.db.models.expressions import Combinable
 from django.db.models.functions import Cast
 from django.utils import timezone
 
-from .._id import resource_id_attr
+from .._id import model_identity_fields, resource_id_attr
 from ..conf import app_settings
-from ..field_backing import model_identity_fields
 from ..schema.ast import (
     BUILTIN_ACTOR_TYPES,
     AllowedSubject,
@@ -91,9 +90,7 @@ class ConvertedRelationIds(models.Expression):
         # Resolve tuple-derived grants from the SAME database the surrounding
         # predicate joins against (``self.scope.using``), not the default alias,
         # so multi-database scoping stays consistent with the native EXISTS
-        # subqueries. Sub-branches that dispatch into the tri-state evaluator
-        # still resolve against the default DB — see ``docs/ARCHITECTURE.md``
-        # (multi-database resolution).
+        # subqueries. The shared evaluator retains this alias on nested walks.
         using = self.scope.using
         if self.target is None:
             ids = self.scope.backend._resources_via_relation(
@@ -222,6 +219,17 @@ class LocalQueryScope:
             Cast(OuterRef(identity), models.TextField()) if isinstance(identity, str) else identity
         )
 
+    def _source_by_identity(
+        self, queryset: QuerySet[Any], id_attr: str, identity: str | Value
+    ) -> QuerySet[Any]:
+        """Correlate a backing source with a wire identity in the surrounding query."""
+        if not self.native_identity(queryset.model, id_attr):
+            raise UnsupportedScope
+        source: QuerySet[Any] = queryset.alias(
+            _scope_resource_id=Cast(F(id_attr), models.TextField())
+        ).filter(_scope_resource_id=self.reference(identity))
+        return source
+
     def relation(
         self,
         definition: Definition,
@@ -285,11 +293,7 @@ class LocalQueryScope:
             if model is backing.source_model and isinstance(identity, str):
                 source = source.filter(pk=OuterRef("pk"))
             else:
-                if not self.native_identity(backing.source_model, backing.source_id_attr):
-                    raise UnsupportedScope
-                source = source.alias(
-                    _scope_resource_id=Cast(F(backing.source_id_attr), models.TextField())
-                ).filter(_scope_resource_id=self.reference(identity))
+                source = self._source_by_identity(source, backing.source_id_attr, identity)
             return Q(Exists(source))
         attribute = self.backend._resolve_declared_attribute_backing(definition, relation)
         if attribute is not None:
@@ -357,16 +361,29 @@ class LocalQueryScope:
         const = self.backend._resolve_declared_const_backing(definition, relation)
         if const is not None:
             if target is None:
-                return _truth(
+                constant_match = _truth(
                     self.subject == SubjectRef.of(const.target_resource_type, const.target_id)
                 )
-            return self.permission(
-                const.target_resource_type,
-                target,
-                None,
-                Value(const.target_id),
-                seen,
-            )
+            else:
+                constant_match = self.permission(
+                    const.target_resource_type,
+                    target,
+                    None,
+                    Value(const.target_id),
+                    seen,
+                )
+            if const.filters:
+                if model is const.source_model and isinstance(identity, str):
+                    row_match = Q(**const.filters)
+                else:
+                    source = self._source_by_identity(
+                        const.source_model._base_manager.using(self.using).filter(**const.filters),
+                        const.source_id_attr,
+                        identity,
+                    )
+                    row_match = Q(Exists(source))
+                return row_match & constant_match
+            return constant_match
         if (
             model is not None
             and isinstance(identity, str)

@@ -819,6 +819,7 @@ class LocalBackend(Backend):
         depth: int,
         context: dict[str, Any] | None = None,
         missing: set[str] | None = None,
+        using: str | None = None,
     ) -> bool | None:
         """Tri-state permission evaluation.
 
@@ -843,6 +844,7 @@ class LocalBackend(Backend):
             depth_limit=app_settings.REBAC_DEPTH_LIMIT,
             resolve_relation=self._walk_resolve_relation,
             resolve_arrow=self._walk_resolve_arrow,
+            using=using,
         )
         return _walk_eval_expr(
             expr,
@@ -868,6 +870,7 @@ class LocalBackend(Backend):
             depth=depth,
             context=ctx.context,
             missing=ctx.missing,
+            using=ctx.using,
         )
 
     def _walk_resolve_arrow(
@@ -906,6 +909,8 @@ class LocalBackend(Backend):
 
         const_backing = self._resolve_declared_const_backing(definition, via_relation)
         if const_backing is not None:
+            if not const_backing.matches(resource_id, using=ctx.using):
+                return False
             return self._walk_const_arrow(
                 ctx=ctx,
                 const_backing=const_backing,
@@ -914,7 +919,7 @@ class LocalBackend(Backend):
             )
 
         RelationshipModel = active_relationship_model()
-        targets = RelationshipModel.objects.filter(
+        targets = self._maybe_using(RelationshipModel.objects, ctx.using).filter(
             resource_type=definition.resource_type,
             resource_id=resource_id,
             relation=via,
@@ -939,6 +944,7 @@ class LocalBackend(Backend):
                 depth=depth + 1,
                 context=ctx.context,
                 missing=ctx.missing,
+                using=ctx.using,
             )
             combined = _and(hop, inner)
             if combined is True:
@@ -973,11 +979,14 @@ class LocalBackend(Backend):
                 depth + 1,
                 {},
                 ctx.context,
+                using=ctx.using,
             )
             if not targets:
                 return False
-            return field_backing.queryset(resource_id=resource_id, target_ids=targets).exists()
-        qs = field_backing.queryset(resource_id=resource_id)
+            return field_backing.queryset(
+                resource_id=resource_id, target_ids=targets, using=ctx.using
+            ).exists()
+        qs = field_backing.queryset(resource_id=resource_id, using=ctx.using)
         target_values = list(qs.values_list(field_backing.target_values_path(), flat=True))
         saw_conditional = False
         for target_id in target_values:
@@ -991,6 +1000,7 @@ class LocalBackend(Backend):
                 depth=depth + 1,
                 context=ctx.context,
                 missing=ctx.missing,
+                using=ctx.using,
             )
             if inner is True:
                 return True
@@ -1023,12 +1033,13 @@ class LocalBackend(Backend):
                 depth + 1,
                 {},
                 ctx.context,
+                using=ctx.using,
             )
             if not targets:
                 return False
-            return attribute_backing.has_any_subject(resource_id, targets)
+            return attribute_backing.has_any_subject(resource_id, targets, using=ctx.using)
         saw_conditional = False
-        for target_id in attribute_backing.subject_ids(resource_id):
+        for target_id in attribute_backing.subject_ids(resource_id, using=ctx.using):
             if target_id is None:
                 continue
             verdict = self._eval_permission_on(
@@ -1039,6 +1050,7 @@ class LocalBackend(Backend):
                 depth=depth + 1,
                 context=ctx.context,
                 missing=ctx.missing,
+                using=ctx.using,
             )
             if verdict is True:
                 return True
@@ -1067,6 +1079,7 @@ class LocalBackend(Backend):
             depth=depth + 1,
             context=ctx.context,
             missing=ctx.missing,
+            using=ctx.using,
         )
 
     def _expr_grants_all(
@@ -1102,7 +1115,7 @@ class LocalBackend(Backend):
             if via_relation is None:
                 return False
             const_backing = resolve_const_backing(definition, via_relation)
-            if const_backing is None:
+            if const_backing is None or const_backing.filters:
                 # Field-backed / stored arrows resolve to a per-row target, so
                 # they cannot grant the whole type uniformly — defer to the
                 # per-row enumeration in `accessible()`.
@@ -1155,6 +1168,7 @@ class LocalBackend(Backend):
         depth: int,
         context: dict[str, Any] | None = None,
         missing: set[str] | None = None,
+        using: str | None = None,
     ) -> bool | None:
         permission = next((p for p in definition.permissions if p.name == permission_name), None)
         if permission is None:
@@ -1169,9 +1183,10 @@ class LocalBackend(Backend):
                 depth=depth,
                 context=context,
                 missing=missing,
+                using=using,
             )
         return self._eval_permission(
-            permission.expression, definition, resource_id, subject, depth, context, missing
+            permission.expression, definition, resource_id, subject, depth, context, missing, using
         )
 
     def _has_direct_relation(
@@ -1183,6 +1198,7 @@ class LocalBackend(Backend):
         depth: int,
         context: dict[str, Any] | None = None,
         missing: set[str] | None = None,
+        using: str | None = None,
     ) -> bool | None:
         """Tri-state direct-relation lookup.
 
@@ -1209,27 +1225,29 @@ class LocalBackend(Backend):
         if field_backing is not None:
             if not _subject_allowed_by_relation(relation_def, subject):
                 return False
-            return field_backing.queryset(resource_id=resource_id, subject=subject).exists()
+            return field_backing.queryset(
+                resource_id=resource_id, subject=subject, using=using
+            ).exists()
 
         attribute_backing = self._resolve_declared_attribute_backing(definition, relation_def)
         if attribute_backing is not None and attribute_backing.applies_to(resource_id):
             if not _subject_allowed_by_relation(relation_def, subject):
                 return False
-            return attribute_backing.has_subject(resource_id, subject)
+            return attribute_backing.has_subject(resource_id, subject, using=using)
 
         const_backing = self._resolve_declared_const_backing(definition, relation_def)
         if const_backing is not None:
             # Every row behaves as if it held `#<relation> @ <const target>`, so
-            # the relation is held only by that fixed subject. No tuple, no query.
+            # the relation is held only by that fixed subject on matching rows.
             if not _subject_allowed_by_relation(relation_def, subject):
                 return False
             return subject == SubjectRef.of(
                 const_backing.target_resource_type, const_backing.target_id
-            )
+            ) and const_backing.matches(resource_id, using=using)
 
         RelationshipModel = active_relationship_model()
 
-        rows = RelationshipModel.objects.filter(
+        rows = self._maybe_using(RelationshipModel.objects, using).filter(
             resource_type=resource_type,
             resource_id=resource_id,
             relation=relation,
@@ -1288,6 +1306,7 @@ class LocalBackend(Backend):
                 depth=depth + 1,
                 context=context,
                 missing=missing,
+                using=using,
             )
             combined = _and(hop, inner)
             if combined is True:
@@ -1337,12 +1356,8 @@ class LocalBackend(Backend):
         tuple-grant resolution reads relationship rows from the same database
         its EXISTS subqueries join against (see ``local_query.ConvertedRelationIds``).
 
-        Note: this consistency covers the resolution helpers only. Sub-branches
-        that dispatch into the tri-state evaluator — subject-set membership
-        (``_has_direct_relation``), the negative arm of an exclusion and
-        const-arrow targets (``_eval_permission`` / ``_eval_permission_on``) —
-        still resolve against the default database; see
-        ``docs/ARCHITECTURE.md`` (multi-database resolution).
+        Nested evaluator walks retain the pinned alias. Alias-free public
+        calls keep the boundary documented in ARCHITECTURE's multi-database section.
         """
         return manager if using is None else manager.using(using)
 
@@ -1474,7 +1489,9 @@ class LocalBackend(Backend):
                 return {
                     resource_id
                     for resource_id in left
-                    if self._eval_permission(expr, definition, resource_id, subject, depth, context)
+                    if self._eval_permission(
+                        expr, definition, resource_id, subject, depth, context, using=using
+                    )
                     is True
                 }
             right = self._resources_for_expr(
@@ -1544,14 +1561,15 @@ class LocalBackend(Backend):
             depth=depth + 1,
             context=context,
             missing=None,
+            using=using,
         )
         if granted is not True:
             return set()
         return {
             str(value)
-            for value in self._maybe_using(
-                const_backing.source_model._base_manager, using
-            ).values_list(const_backing.source_values_path(), flat=True)
+            for value in self._maybe_using(const_backing.source_model._base_manager, using)
+            .filter(**const_backing.filters)
+            .values_list(const_backing.source_values_path(), flat=True)
         }
 
     def _compute_accessible_for(
@@ -1660,9 +1678,9 @@ class LocalBackend(Backend):
                 return set()
             return {
                 str(value)
-                for value in self._maybe_using(
-                    const_backing.source_model._base_manager, using
-                ).values_list(const_backing.source_values_path(), flat=True)
+                for value in self._maybe_using(const_backing.source_model._base_manager, using)
+                .filter(**const_backing.filters)
+                .values_list(const_backing.source_values_path(), flat=True)
             }
 
         return self._resources_via_stored_relation(
@@ -1858,6 +1876,7 @@ class LocalBackend(Backend):
                 depth=depth + 1,
                 context=context,
                 missing=sink,
+                using=using,
             )
             if inner is True:
                 result.add(row.resource_id)

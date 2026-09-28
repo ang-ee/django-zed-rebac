@@ -5,6 +5,16 @@ pre-1.0; breaking changes within a minor version are explicitly called out.
 
 ## [Unreleased]
 
+## [0.19.0] — 2026-09-28
+
+### Added
+
+- Schema: filtered `rebac:const` JSON annotations and canonical `ConstBinding.filters`, preserving bare-ID syntax and serialization.
+- Runtime: matching-row checks, subject lookup, enumeration and lazy SQL scopes with live column freshness.
+- Create preflight: filtered constants project through the existing candidate-relation owner; field and constant filters share typed, collated literals.
+- Regression coverage: generic/reverse paths, same-row filters, MTI links, malformed identities and candidate/check/scope parity.
+- Documentation: candidate rules have one architecture owner; structural examples and design-note references use generic names.
+
 ## [0.18.2] — 2026-09-22
 
 ### Fixed
@@ -1161,3 +1171,4 @@ adapter for GraphQL-over-WebSocket subscriptions (proposal 0002).
 ## [0.2.0]
 
 Prior releases — see git history.
+

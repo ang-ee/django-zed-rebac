@@ -55,12 +55,15 @@ class FieldBinding:
     """A Django relation path with source-model predicates.
 
     ``path`` is a Django lookup path from the declaring model to the single
-    allowed subject model (``folder``, ``roster__user``); ``filters`` are
+    allowed subject model (``folder``, ``membership__user``); ``filters`` are
     source-model lookups applied in the same join.
     """
 
     path: str
     filters: tuple[tuple[str, Any], ...] = ()
+
+    def __post_init__(self) -> None:
+        object.__setattr__(self, "filters", tuple(sorted(self.filters, key=lambda item: item[0])))
 
 
 @dataclass(frozen=True, slots=True)
@@ -79,7 +82,7 @@ class AttributeBinding:
 
 @dataclass(frozen=True, slots=True)
 class ConstBinding:
-    """A synthetic relation that resolves to one fixed object id for every row.
+    """A synthetic fixed target, optionally restricted by source-column filters.
 
     Declared with ``// rebac:const=<id>`` on a single-subject relation: every
     object of the declaring type behaves as if it held
@@ -87,9 +90,15 @@ class ConstBinding:
     It is the schema-level "static relationship" SpiceDB never shipped (issue
     #346 / #1266); the local backend synthesises the edge at evaluation time, so
     a tuple-only backend would have to materialise it instead.
+    The JSON directive form accepts scalar ``filters``; only matching source
+    rows carry the edge. Empty filters preserve the bare-ID semantics.
     """
 
     target_id: str
+    filters: tuple[tuple[str, Any], ...] = ()
+
+    def __post_init__(self) -> None:
+        object.__setattr__(self, "filters", tuple(sorted(self.filters, key=lambda item: item[0])))
 
 
 @dataclass(frozen=True, slots=True)
@@ -154,12 +163,12 @@ def backing_from_dict(
         raise ValueError("relation backing must be a JSON object")
     kind = value.get("kind", "fk")
     if kind == "const":
-        if set(value) - {"kind", "target_id"}:
+        if set(value) - {"kind", "target_id", "filters"}:
             raise ValueError("unknown constant backing fields")
         target = value.get("target_id")
         if not isinstance(target, str) or not re.fullmatch(r"[A-Za-z0-9/_|=+-]{1,1024}", target):
             raise ValueError("constant backing requires a concrete object ID")
-        return ConstBinding(target_id=target)
+        return ConstBinding(target_id=target, filters=_binding_filters(value.get("filters", {})))
     if kind == "fk":
         if set(value) - {"kind", "path", "filters"}:
             raise ValueError("unknown field backing fields")
@@ -203,9 +212,9 @@ def backing_to_dict(
     if backing is None:
         return None
     if isinstance(backing, ConstBinding):
-        return {"kind": "const", "target_id": backing.target_id}
-    if isinstance(backing, FieldBinding):
-        result: dict[str, Any] = {"kind": "fk", "path": backing.path}
+        result: dict[str, Any] = {"kind": "const", "target_id": backing.target_id}
+    elif isinstance(backing, FieldBinding):
+        result = {"kind": "fk", "path": backing.path}
     elif isinstance(backing, AttributeBinding):
         result = {"kind": "attribute", "field": backing.field}
         if backing.resource is not None:

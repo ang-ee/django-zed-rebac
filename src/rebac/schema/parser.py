@@ -247,7 +247,7 @@ class _Parser:
                 continue
             kind, raw = match.groups()
             try:
-                if kind == "const":
+                if kind == "const" and not raw.startswith("{"):
                     data = {"kind": "const", "target_id": raw}
                 elif kind == "field" and not raw.startswith("{"):
                     data = {"kind": "fk", "path": raw}
@@ -259,7 +259,7 @@ class _Parser:
                         raise ValueError("the directive name owns its backing kind")
                     if kind == "field" and "path" not in data:
                         raise ValueError("field backing JSON requires path")
-                    data["kind"] = "fk" if kind == "field" else "attribute"
+                    data["kind"] = "fk" if kind == "field" else kind
                 backing = backing_from_dict(data)
             except (ValueError, TypeError) as exc:
                 raise ParseError(f"Invalid rebac:{kind} directive at line {lineno}: {exc}") from exc

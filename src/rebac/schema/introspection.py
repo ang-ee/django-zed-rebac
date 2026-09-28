@@ -269,13 +269,14 @@ def live_backed_resource_types(schema: Schema) -> frozenset[str]:
     subject sets (``group#member``) and const targets — so the result is a
     conservative over-approximation: it may name a type that never actually
     reaches a backing, but never omits one that can. Const backings are
-    static and are not live seeds on their own.
+    static unless filtered on source columns; filtered constants are live seeds.
     """
     live = {
         definition.resource_type
         for definition in schema.definitions
         if any(
             isinstance(relation.backing, (FieldBinding, AttributeBinding))
+            or (isinstance(relation.backing, ConstBinding) and bool(relation.backing.filters))
             for relation in definition.relations
         )
     }

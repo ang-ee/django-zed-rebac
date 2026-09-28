@@ -7,12 +7,15 @@ from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any
 
 from django.core.exceptions import FieldDoesNotExist, FieldError, ValidationError
-from django.db import models
-from django.db.models import Q, QuerySet
+from django.db import DEFAULT_DB_ALIAS, models
+from django.db.models import Q, QuerySet, Value
 from django.db.models.expressions import BaseExpression, Col, ColPairs, Combinable
+from django.db.models.functions import Coalesce
+from django.db.models.sql import Query
+from django.db.models.sql.constants import SINGLE
 
-from ._candidate_filters import _filter_candidate_targets, _value_is_unresolved
-from ._id import resource_id_attr
+from ._candidate_filters import _candidate_literal, _filter_candidate_targets, _value_is_unresolved
+from ._id import model_identity_fields, model_identity_filter, resource_id_attr
 from .resources import model_for_resource_type, model_for_subject_type, model_resource_type
 from .schema.ast import (
     AttributeBinding,
@@ -36,8 +39,20 @@ if TYPE_CHECKING:
     ModelField = models.Field[Any, Any] | ForeignObjectRel
 
 
+class _SourceFilters:
+    """Source-column predicates shared by field and constant backings."""
+
+    __slots__ = ()
+    relation: Relation
+
+    @property
+    def filters(self) -> dict[str, Any]:
+        backing = self.relation.backing
+        return dict(backing.filters) if isinstance(backing, (FieldBinding, ConstBinding)) else {}
+
+
 @dataclass(frozen=True, slots=True)
-class ResolvedFieldBacking:
+class ResolvedFieldBacking(_SourceFilters):
     """A forward/reverse ORM path with filters anchored on its source model."""
 
     source_model: type[models.Model]
@@ -52,13 +67,8 @@ class ResolvedFieldBacking:
     def source_id_attr(self) -> str:
         return resource_id_attr(self.source_model)
 
-    @property
-    def filters(self) -> dict[str, Any]:
-        backing = self.relation.backing
-        return dict(backing.filters) if isinstance(backing, FieldBinding) else {}
-
-    def source_filter(self, resource_id: str) -> dict[str, str]:
-        return {self.source_id_attr: resource_id}
+    def source_filter(self, resource_id: str) -> Q:
+        return model_identity_filter(self.source_model, self.source_id_attr, resource_id)
 
     def target_filter(self, subject: SubjectRef) -> dict[str, str]:
         return {self.target_values_path(): subject.subject_id}
@@ -102,7 +112,7 @@ class ResolvedFieldBacking:
 
         predicate = Q(**self.filters)
         if resource_id is not None:
-            predicate &= Q(**self.source_filter(resource_id))
+            predicate &= self.source_filter(resource_id)
         if subject is not None:
             predicate &= Q(**self.target_filter(subject))
         if target_ids is not None:
@@ -117,7 +127,7 @@ def _proposed_forward_relationships(
     required_relations: frozenset[str],
     using: str | None = None,
 ) -> dict[str, tuple[SubjectRef, ...] | None]:
-    """Project only field-backed relations required by the create decision.
+    """Project required field-backed and filtered-constant candidate facts.
 
     required_relations includes named-permission and arrow-source dependencies.
     Other backings are not resolved, queried, filtered, or marked unknown.
@@ -136,9 +146,25 @@ def _proposed_forward_relationships(
 
     relationships: dict[str, tuple[SubjectRef, ...] | None] = {}
     for relation in definition.relations:
-        if relation.name not in required_relations or not isinstance(
-            relation.backing, FieldBinding
-        ):
+        if relation.name not in required_relations:
+            continue
+        if isinstance(relation.backing, ConstBinding) and relation.backing.filters:
+            const = resolve_const_backing(definition, relation)
+            if const is None:
+                raise ValueError(
+                    f"Cannot preflight {definition.resource_type}#{relation.name}: "
+                    "its const backing is not resolvable."
+                )
+            matches = const.matches_candidate(instance, using=using)
+            relationships[relation.name] = (
+                None
+                if matches is None
+                else (SubjectRef.of(const.target_resource_type, const.target_id),)
+                if matches
+                else ()
+            )
+            continue
+        if not isinstance(relation.backing, FieldBinding):
             continue
         resolved = resolve_field_backing(definition, relation)
         if resolved is None:
@@ -326,8 +352,8 @@ class ResolvedAttributeBacking:
 
 
 @dataclass(frozen=True, slots=True)
-class ResolvedConstBacking:
-    """A fixed target with source rows needed only for reverse enumeration."""
+class ResolvedConstBacking(_SourceFilters):
+    """A fixed target with optional predicates on local source columns."""
 
     source_model: type[models.Model]
     relation: Relation
@@ -340,6 +366,74 @@ class ResolvedConstBacking:
 
     def source_values_path(self) -> str:
         return self.source_id_attr
+
+    def matches(self, resource_id: str, using: str | None = None) -> bool:
+        """Bare constants stay row-independent; filtered edges require a match."""
+        if not self.filters:
+            return True
+        return (
+            self.source_model._base_manager.db_manager(using)
+            .filter(
+                Q(**self.filters)
+                & model_identity_filter(self.source_model, self.source_id_attr, resource_id)
+            )
+            .exists()
+        )
+
+    def matches_candidate(self, instance: models.Model, *, using: str | None = None) -> bool | None:
+        """Evaluate local column values without reading a persisted source row."""
+        if not self.filters:
+            return True
+        query = Query(None)
+        for lookup in sorted(self.filters):
+            field = _const_filter_field(self.source_model, lookup)
+            value = getattr(instance, field.attname)
+            if _value_is_unresolved(field, value):
+                return None
+            root = lookup.split("__", 1)[0]
+            _query_field, scalar = model_identity_fields(self.source_model, root)
+            query.add_annotation(_candidate_literal(scalar, value), root, select=False)
+        query.add_annotation(
+            Coalesce(Q(**self.filters), False, output_field=models.BooleanField()),
+            "_rebac_const_matches",
+        )
+        result = query.get_compiler(using=using or DEFAULT_DB_ALIAS).execute_sql(SINGLE)
+        return bool(result and result[0])
+
+
+def _const_filter_field(model: type[models.Model], lookup: str) -> models.Field[Any, Any]:
+    """Resolve a constant predicate to a column on its own resource model."""
+    root = lookup.split("__", 1)[0]
+    field = model._meta.pk if root == "pk" else model._meta.get_field(root)
+    if (
+        not isinstance(field, models.Field)
+        or (root != "pk" and field not in model._meta.local_concrete_fields)
+        or (field.is_relation and root not in {"pk", field.attname})
+    ):
+        raise ValueError(
+            "constant filters must name local concrete fields on the resource model; "
+            "inherited MTI columns and related-row traversals require a join"
+        )
+    return field
+
+
+def _validate_const_filters(model: type[models.Model], backing: ConstBinding) -> None:
+    if not backing.filters:
+        return
+    query = Query(None)
+    for lookup, _value in backing.filters:
+        try:
+            _const_filter_field(model, lookup)
+        except FieldDoesNotExist as exc:
+            raise ValueError(str(exc)) from exc
+        _query_field, scalar = model_identity_fields(model, lookup.split("__", 1)[0])
+        query.add_annotation(Value(None, output_field=scalar), lookup.split("__", 1)[0])
+    try:
+        query.add_q(Q(**dict(backing.filters)))
+    except (FieldError, ValueError, TypeError, ValidationError) as exc:
+        raise ValueError(f"invalid constant filters on {model.__name__}: {exc}") from exc
+    # Check scalar lookups AND model paths: Django accepts parent_id__name as a traversal.
+    _validate_filters(model, backing.filters)
 
 
 def _relation_path(
@@ -372,38 +466,6 @@ def _validate_filters(model: type[models.Model], filters: tuple[tuple[str, Any],
         model._base_manager.filter(Q(**dict(filters)))
     except (FieldError, ValueError, TypeError, ValidationError) as exc:
         raise ValueError(f"invalid filters on {model.__name__}: {exc}") from exc
-
-
-def model_identity_fields(
-    model: type[models.Model], attr: str
-) -> tuple[models.Field[Any, Any], models.Field[Any, Any]]:
-    """Return the query field and scalar conversion owner for an identity.
-
-    Django exposes an MTI child primary key as its parent-link ``OneToOneField``.
-    Relation attnames likewise address the stored scalar, while relation names
-    materialize model instances and cannot be wire identities.
-    """
-
-    field = model._meta.pk if attr == "pk" else model._meta.get_field(attr)
-    if not isinstance(field, models.Field) or isinstance(field, models.CompositePrimaryKey):
-        raise ValueError(f"{model.__name__} identity {attr!r} must be a scalar field")
-    scalar_field = field
-    if field.is_relation:
-        if not isinstance(field, (models.ForeignKey, models.OneToOneField)) or (
-            attr != "pk" and attr != field.attname
-        ):
-            raise ValueError(f"{model.__name__} identity {attr!r} must be a scalar field")
-    seen: set[int] = set()
-    while scalar_field.is_relation:
-        if id(scalar_field) in seen or not isinstance(
-            scalar_field, (models.ForeignKey, models.OneToOneField)
-        ):
-            raise ValueError(f"{model.__name__} identity {attr!r} must be a scalar field")
-        seen.add(id(scalar_field))
-        scalar_field = scalar_field.target_field
-    if isinstance(scalar_field, models.CompositePrimaryKey):
-        raise ValueError(f"{model.__name__} identity {attr!r} must be a scalar field")
-    return field, scalar_field
 
 
 def _validate_model_identity(model: type[models.Model], attr: str) -> None:
@@ -534,8 +596,8 @@ def resolve_const_backing(
 ) -> ResolvedConstBacking | None:
     """Resolve a ``// rebac:const=...`` binding to concrete Django metadata.
 
-    Returns ``None`` when the binding is not a const backing or the declaring
-    type has no loaded Django model. The target type need not be a model (it is
+    Returns ``None`` for another backing kind, missing source model or invalid
+    local-column filters. The target type need not be a model (it is
     commonly a virtual role namespace such as ``platform/role``); only the source
     type must be one, because the reverse direction enumerates its rows.
     """
@@ -547,6 +609,10 @@ def resolve_const_backing(
     allowed = relation.allowed_subjects[0]
     source_model = model_for_resource_type(definition.resource_type)
     if source_model is None:
+        return None
+    try:
+        _validate_const_filters(source_model, backing)
+    except ValueError:
         return None
     return ResolvedConstBacking(
         source_model,
@@ -560,11 +626,16 @@ def const_backing_model_errors(definition: Definition, relation: Relation) -> li
     """Return Django-model validation errors for a const-backed relation."""
     if not isinstance(relation.backing, ConstBinding):
         return []
-    if model_for_resource_type(definition.resource_type) is None:
+    model = model_for_resource_type(definition.resource_type)
+    if model is None:
         return [
             f"{definition.resource_type}#{relation.name}: const-backed relation "
             "requires a Django model with matching Meta.rebac_resource_type"
         ]
+    try:
+        _validate_const_filters(model, relation.backing)
+    except ValueError as exc:
+        return [f"{definition.resource_type}#{relation.name}: const backing: {exc}"]
     return []
 
 

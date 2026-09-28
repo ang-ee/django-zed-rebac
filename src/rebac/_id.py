@@ -26,6 +26,10 @@ from __future__ import annotations
 
 from typing import Any
 
+from django.core.exceptions import ValidationError
+from django.db import models
+from django.db.models import Q
+
 from .conf import app_settings
 
 
@@ -70,6 +74,49 @@ def subject_relation(model_or_instance: Any) -> str:
 
     relation = getattr(model_or_instance._meta, "rebac_subject_relation", "")
     return str(relation or "")
+
+
+def model_identity_fields(
+    model: type[models.Model], attr: str
+) -> tuple[models.Field[Any, Any], models.Field[Any, Any]]:
+    """Return the query field and scalar conversion owner for an identity.
+
+    Django exposes an MTI child primary key as its parent-link ``OneToOneField``.
+    Relation attnames likewise address the stored scalar, while relation names
+    materialize model instances and cannot be wire identities.
+    """
+
+    field = model._meta.pk if attr == "pk" else model._meta.get_field(attr)
+    if not isinstance(field, models.Field) or isinstance(field, models.CompositePrimaryKey):
+        raise ValueError(f"{model.__name__} identity {attr!r} must be a scalar field")
+    scalar_field = field
+    if field.is_relation:
+        if not isinstance(field, (models.ForeignKey, models.OneToOneField)) or (
+            attr != "pk" and attr != field.attname
+        ):
+            raise ValueError(f"{model.__name__} identity {attr!r} must be a scalar field")
+    seen: set[int] = set()
+    while scalar_field.is_relation:
+        if id(scalar_field) in seen or not isinstance(
+            scalar_field, (models.ForeignKey, models.OneToOneField)
+        ):
+            raise ValueError(f"{model.__name__} identity {attr!r} must be a scalar field")
+        seen.add(id(scalar_field))
+        scalar_field = scalar_field.target_field
+    if isinstance(scalar_field, models.CompositePrimaryKey):
+        raise ValueError(f"{model.__name__} identity {attr!r} must be a scalar field")
+    return field, scalar_field
+
+
+def model_identity_filter(model: type[models.Model], attr: str, wire_id: str) -> Q:
+    """Convert a wire identity once; malformed scalar values select no row."""
+    _field, scalar = model_identity_fields(model, attr)
+    try:
+        value = scalar.to_python(wire_id)
+        scalar.get_prep_value(value)
+    except ValidationError, ValueError, TypeError:
+        return Q(pk__in=[])
+    return Q(**{attr: value})
 
 
 __all__ = ["resource_id_attr", "subject_id_attr", "subject_relation", "type_with_prefix"]

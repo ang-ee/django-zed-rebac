@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 from django.conf import settings
+from django.contrib.contenttypes.fields import GenericForeignKey, GenericRelation
+from django.contrib.contenttypes.models import ContentType
 from django.db import models
 
 from rebac import RebacMixin
@@ -261,3 +263,75 @@ class NativeParentLinkedRecord(RebacMixin, models.Model):
     class Meta:
         app_label = "testapp"
         rebac_resource_type = "test/nativeparentlinkedrecord"
+
+
+class BackingDocument(RebacMixin, models.Model):
+    owner = models.ForeignKey(settings.AUTH_USER_MODEL, on_delete=models.CASCADE)
+    bindings = GenericRelation("BackingBinding", related_query_name="document")
+
+    class Meta:
+        app_label = "testapp"
+        rebac_resource_type = "test/backingdocument"
+
+
+class BackingOtherDocument(RebacMixin, models.Model):
+    bindings = GenericRelation("BackingBinding", related_query_name="other_document")
+
+    class Meta:
+        app_label = "testapp"
+        rebac_resource_type = "test/backingotherdocument"
+
+
+class BackingBinding(RebacMixin, models.Model):
+    content_type = models.ForeignKey(ContentType, on_delete=models.CASCADE)
+    object_id = models.PositiveIntegerField()
+    content_object = GenericForeignKey()
+    reader = models.ForeignKey(settings.AUTH_USER_MODEL, on_delete=models.CASCADE)
+
+    class Meta:
+        app_label = "testapp"
+        rebac_resource_type = "test/backingbinding"
+
+
+class BackingQueue(RebacMixin, models.Model):
+    class Meta:
+        app_label = "testapp"
+        rebac_resource_type = "test/backingqueue"
+
+
+class BackingStage(models.Model):
+    hidden = models.BooleanField(null=True)
+
+
+class BackingTask(RebacMixin, models.Model):
+    queue = models.ForeignKey(BackingQueue, on_delete=models.CASCADE, related_name="tasks")
+    stage = models.ForeignKey(BackingStage, null=True, on_delete=models.SET_NULL)
+    visibility = models.CharField(max_length=16, default="inherited")
+    asker = models.ForeignKey(settings.AUTH_USER_MODEL, null=True, on_delete=models.SET_NULL)
+    surrendered = models.BooleanField(default=False)
+    shared_round = models.ForeignKey("BackingRound", null=True, on_delete=models.SET_NULL)
+
+    class Meta:
+        app_label = "testapp"
+        rebac_resource_type = "test/backingtask"
+
+
+class BackingProject(models.Model):
+    task = models.ForeignKey(BackingTask, on_delete=models.CASCADE, related_name="promoted")
+
+
+class BackingRound(RebacMixin, models.Model):
+    project = models.ForeignKey(
+        BackingProject, null=True, on_delete=models.SET_NULL, related_name="rounds"
+    )
+    listing = models.CharField(max_length=16, default="hidden")
+
+    class Meta:
+        app_label = "testapp"
+        rebac_resource_type = "test/backinground"
+
+
+class BackingEntry(models.Model):
+    round = models.ForeignKey(BackingRound, on_delete=models.CASCADE, related_name="entries")
+    responder = models.ForeignKey(settings.AUTH_USER_MODEL, on_delete=models.CASCADE)
+    retired_at = models.DateTimeField(null=True)
