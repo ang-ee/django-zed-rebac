@@ -7,6 +7,8 @@ pre-1.0; breaking changes within a minor version are explicitly called out.
 
 ## [0.21.0] — 2026-09-28
 
+0.20.0 was never published to PyPI; 0.21.0 supersedes it and includes its changes.
+
 ### Added
 
 - Local queryset scopes compile self-recursive role-inclusion and parent arrows
@@ -17,8 +19,8 @@ pre-1.0; breaking changes within a minor version are explicitly called out.
   deferred SQL boundary probe delegates potential overflow candidates to the
   check walker, preserving short-circuit behavior and `PermissionDepthExceeded`
   instead of silently truncating a long chain. Bounded graphs add one validation
-  query, independent of row count. SQL size is linear in the bound per self-arrow;
-  composing role and parent recursion can be quadratic. Multiple self-arrows in
+  query, independent of row count. Flat join paths grow in width with the bound;
+  composing role and parent recursion adds more paths. Multiple self-arrows in
   one permission are refused with `UnsupportedScope` before exponential SQL
   expansion. Non-recursive scopes retain byte-identical SQL. A recursive CTE
   seam is the eventual owner of structural sharing.
@@ -27,6 +29,13 @@ pre-1.0; breaking changes within a minor version are explicitly called out.
 
 ### Fixed
 
+- Recursive grant and boundary SQL use flat join paths, avoiding SQLite parser
+  stack and expression-depth overflow as `REBAC_DEPTH_LIMIT` increases. Registry
+  joins remain inside derived sources to avoid multiplying each hop's table count.
+  Acyclic scopes retain their existing SQL.
+- PyPI publishing verifies the installed `rebac.__version__` after `uv sync`,
+  preserving agreement with the release tag and `pyproject.toml` when the version
+  comes from package metadata.
 - Recursive field/attribute arrow checks retain per-resource traversal instead
   of the enumeration shortcut, so direct checks enforce the same dispatch bound.
   Subject-set-only cycles keep the exact enumeration optimization and its

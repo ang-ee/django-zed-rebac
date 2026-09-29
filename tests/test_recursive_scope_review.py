@@ -210,7 +210,10 @@ def test_composed_recursions_remain_supported_at_default_bound(active):
             Folder, "read", "blog/folder"
         )
         assert isinstance(predicate.children[0], DepthCheckedPredicate)
-        assert len(str(Folder._base_manager.filter(predicate).query)) < 100_000
+        # Flat paths repeat shared prefixes to keep parser depth constant.
+        # Composed recursion remains bounded; the guard above still refuses
+        # multiple self-arrows before exponential expansion.
+        assert len(str(Folder._base_manager.filter(predicate).query)) < 500_000
 
 
 def test_fresh_compiler_has_immutable_frames_and_captures_limit(active):

@@ -1427,7 +1427,17 @@ querysets; already evaluated Django result caches retain Django's normal behavio
 
 Self-recursive arrows (role inclusion and parent hierarchies) reuse the same
 field/path joins and stored-tuple subqueries, unrolled through
-`REBAC_DEPTH_LIMIT`. Depth follows the check walker: arrows and subject-set
+`REBAC_DEPTH_LIMIT`. The recursive compiler flattens positive existential
+dispatches into an OR of join paths. Each path has one existential SELECT;
+increasing the bound increases its width, not its SELECT nesting. The ordinary
+acyclic compiler is unchanged. Storage-owned joins and field/path predicates
+remain authoritative; multi-table joins (including registry storage) are
+isolated in flat `SELECT DISTINCT` derived relations so their internal tables
+do not multiply the outer path's join count. Deduplication cannot change
+existential membership and prevents SQLite from merging these joins back into
+the path. Leaf predicates and exclusions retain their scope. There is no runtime
+recursive-CTE seam or additional dependency.
+Depth follows the check walker: arrows and subject-set
 traversals consume one frame; aliases and boolean operators consume none. A
 terminal node at the bound is evaluated; an additional reachable hop is never
 silently truncated. Recursive predicates carry a deferred SQL boundary probe
@@ -1449,16 +1459,17 @@ exact enumeration optimization; that traversal already enforces the depth bound.
 
 SQL size is independent of data row count, but grows with the unroll bound:
 
-- One self-arrow, for example `read = reader + parent->read`, grows linearly
-  in the bound per self-arrow (the verification fixture adds about 812 bytes per level).
+- One self-arrow, for example `read = reader + parent->read`, emits a linear
+  number of paths, each with at most a linear number of joins. Flattening repeats
+  path prefixes, so SQL text grows quadratically in the bound while SELECT
+  nesting stays constant.
 - Composed recursions on one definition, for example
   `effective_member = member + includes->effective_member` and
-  `read = (reader + effective_member) + parent->read`, grow quadratically
-  because each parent level expands the member recursion. This remains supported
-  (about 44 KB at bound eight in the verification fixture).
+  `read = (reader + effective_member) + parent->read`, emit a quadratic number
+  of paths because each parent level expands the member recursion. Their flat
+  SQL text can grow cubically. This remains supported at the default bound.
 - More than one self-arrow in the same permission, for example
-  `read = (reader + parent->read) + includes->read`, grows exponentially
-  (about 600 KB at bound eight, for each of the grant and frontier predicates).
+  `read = (reader + parent->read) + includes->read`, grows exponentially.
   The compiler refuses this shape with `UnsupportedScope` before unrolling,
   selecting whole-expression evaluator fallback. Count occurrences after alias
   expansion, including repeated identical arrows, but count recursion into each

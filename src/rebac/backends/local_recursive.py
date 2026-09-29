@@ -32,6 +32,7 @@ from ..schema.ast import (
 from ..schema.introspection import dispatch_edges
 from ..schema.walker import find_relation
 from ..types import SubjectRef
+from .local_flat import FlatPredicate
 from .local_query import _ROOT_CONTEXT, LocalQueryScope, UnsupportedScope, _CompileContext, _truth
 
 if TYPE_CHECKING:
@@ -209,7 +210,11 @@ class RecursiveQueryScope(LocalQueryScope):
 
 
 class DepthCheckedPredicate(models.Expression):
-    """Validate the live frontier at SQL compilation, without enumerating grants."""
+    """Validate the live frontier at SQL compilation, without enumerating grants.
+
+    Both the grant and the frontier compile through ``FlatPredicate``, so the
+    unrolled bound widens the SQL instead of nesting it.
+    """
 
     def __init__(
         self,
@@ -239,7 +244,9 @@ class DepthCheckedPredicate(models.Expression):
         if query.external_aliases:
             # A correlated scope cannot execute outside its outer SQL query.
             # Validate conservatively over its type, with unrelabeled aliases.
-            candidates = self.model._base_manager.using(self.scope.using).filter(self.frontier)
+            candidates = self.model._base_manager.using(self.scope.using).filter(
+                FlatPredicate(self.frontier)
+            )
         else:
             query.where = self._frontier_where(query.where)
             query.clear_limits()
@@ -261,10 +268,10 @@ class DepthCheckedPredicate(models.Expression):
                 0,
                 using=self.scope.using,
             )
-        sql, params = compiler.compile(self.expressions[0])
+        sql, params = compiler.compile(FlatPredicate(self.expressions[0]))
         return str(sql), tuple(params)
 
     def _frontier_where(self, node: WhereNode) -> WhereNode:
         # Django wraps conditional expressions in Exact(expression, True).
         # replace_expressions traverses that wrapper as well as WhereNodes.
-        return node.replace_expressions({self: self.expressions[1]})
+        return node.replace_expressions({self: FlatPredicate(self.expressions[1])})

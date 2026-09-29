@@ -30,10 +30,11 @@ jobs:
 
       - name: Verify release version
         run: |
+          uv sync
+          export REBAC_INSTALLED_VERSION="$(uv run python -c 'import rebac; print(rebac.__version__)')"
           python - <<'PY'
           import os
           import pathlib
-          import re
           import sys
           import tomllib
 
@@ -42,16 +43,12 @@ jobs:
           with pathlib.Path("pyproject.toml").open("rb") as handle:
               project_version = tomllib.load(handle)["project"]["version"]
 
-          init_text = pathlib.Path("src/rebac/__init__.py").read_text(
-              encoding="utf-8"
-          )
-          match = re.search(r'^__version__ = "([^"]+)"$', init_text, re.M)
-          package_version = match.group(1) if match else None
+          package_version = os.environ["REBAC_INSTALLED_VERSION"]
 
           versions = {
               "tag": expected,
               "pyproject.toml": project_version,
-              "src/rebac/__init__.py": package_version,
+              "installed rebac.__version__": package_version,
           }
           if len(set(versions.values())) != 1:
               for name, version in versions.items():
@@ -63,7 +60,6 @@ jobs:
       - name: Build distributions
         # Release artifacts are built only after the same checks as branch CI.
         run: |
-          uv venv --python 3.14
           make install-dev
           make check
           uv build --out-dir dist
