@@ -44,8 +44,9 @@ class _ExecutionTime(models.Expression):
     def __init__(self) -> None:
         super().__init__(output_field=models.DateTimeField())
 
-    def as_sql(self, compiler: Any, connection: Any) -> tuple[str, list[Any]]:
-        return compiler.compile(Value(timezone.now(), output_field=self.output_field))  # type: ignore[no-any-return]
+    def as_sql(self, compiler: Any, connection: Any) -> tuple[str, tuple[Any, ...]]:
+        sql, params = compiler.compile(Value(timezone.now(), output_field=self.output_field))
+        return sql, tuple(params)
 
 
 @dataclass(frozen=True, slots=True)
