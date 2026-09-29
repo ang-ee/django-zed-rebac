@@ -328,6 +328,22 @@ def _rebac_schema_rows_changed(sender: type[Model], raw: bool = False, **_: Any)
     _mark_schema_caches_stale()
 
 
+@receiver(post_delete, sender="rebac.SchemaDefinition")
+@receiver(post_delete, sender="rebac.SchemaRelation")
+@receiver(post_delete, sender="rebac.SchemaPermission")
+@receiver(post_delete, sender="rebac.SchemaCaveat")
+@receiver(post_delete, sender="rebac.SchemaOverride")
+def _rebac_schema_cascade_revision(
+    sender: type[Model], *, origin: Any = None, using: str, **_: Any
+) -> None:
+    """Cover collector cascades whose origin does not own schema publication."""
+    from .models.generation import SchemaGeneration
+    from .models.schema_write import SchemaQuerySet, SchemaRow
+
+    if not isinstance(origin, (SchemaRow, SchemaQuerySet)):
+        SchemaGeneration.objects.advance(using=using)
+
+
 def _override_target_repr(instance: Any) -> str:
     """Best-effort string repr of the override target for audit rows."""
     from django.contrib.contenttypes.models import ContentType

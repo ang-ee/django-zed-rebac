@@ -17,7 +17,7 @@ Cache key:
   - check:      ``(backend_identity, schema_generation, subject, action, resource, context)``
   - accessible: ``(backend_identity, schema_generation, subject, action, resource_type, context)``
 
-Both share a single LRU bounded by ``REBAC_EVALUATOR_CACHE_SIZE``
+These and compiled SQL plans share a budget bounded by ``REBAC_EVALUATOR_CACHE_SIZE``
 (default 10_000). Conditional results are never cached — the missing
 caveat params are part of the answer and the next call may supply them.
 
@@ -35,6 +35,11 @@ from contextlib import contextmanager
 from contextvars import ContextVar
 from typing import TYPE_CHECKING, Any
 
+from django.db import connections, models
+
+from ._id import resource_id_attr
+from .conf import app_settings
+from .resources import model_resource_type
 from .schema.cache import SchemaScope, schema_operation
 from .types import CheckResult, Consistency, ObjectRef, PermissionResult, SubjectRef, Zookie
 
@@ -100,15 +105,75 @@ class PermissionEvaluator:
     supported for tests.
     """
 
-    __slots__ = ("_accessible_cache", "_check_cache", "_max_size", "_schema_scope")
+    __slots__ = ("_accessible_cache", "_check_cache", "_max_size", "_plan_cache", "_schema_scope")
 
     def __init__(self, *, max_size: int = 10_000) -> None:
         self._check_cache: OrderedDict[tuple[Any, ...], CheckResult] = OrderedDict()
         self._accessible_cache: OrderedDict[tuple[Any, ...], tuple[str, ...]] = OrderedDict()
+        self._plan_cache: OrderedDict[tuple[Any, ...], models.Q | None] = OrderedDict()
         self._max_size = max_size
         self._schema_scope = SchemaScope()
 
     # ----- public API -----
+
+    @schema_operation
+    def compiled_scope_plan(
+        self,
+        backend: Backend,
+        *,
+        model: type[models.Model],
+        subject: SubjectRef,
+        action: str,
+        using: str,
+    ) -> models.Q | None:
+        """Reuse an uncorrelated SQL plan, never a permission answer or ID set.
+
+        Backends opt in through their validated schema generation hook. Live
+        backing is safe: every execution reads the underlying tables again.
+        """
+        from .backends.scope_plan import compile_scope_plan
+        from .models import SchemaDefinition
+
+        if current_evaluator() is not self:
+            return backend.queryset_filter(model=model, subject=subject, action=action, using=using)
+        generation = getattr(backend, "_scope_plan_generation", None)
+        connection = connections[using]
+        schema_connection = connections[SchemaDefinition.objects.db]
+        boundaries = tuple(
+            self._schema_scope.generation(candidate)
+            for candidate in (connection, schema_connection)
+        )
+        manual = any(
+            not candidate.get_autocommit()
+            and not (candidate.in_atomic_block and candidate.commit_on_exit)
+            for candidate in (connection, schema_connection)
+        )
+        version = generation() if callable(generation) and not manual else None
+        if version is None:
+            return backend.queryset_filter(model=model, subject=subject, action=action, using=using)
+        key = (
+            _BackendKey(backend),
+            version,
+            boundaries,
+            connection,
+            using,
+            model._meta.concrete_model,
+            model_resource_type(model),
+            resource_id_attr(model),
+            subject,
+            action,
+            app_settings.REBAC_DEPTH_LIMIT,
+        )
+        if key in self._plan_cache:
+            self._plan_cache.move_to_end(key)
+            return self._plan_cache[key]
+        predicate = backend.queryset_filter(
+            model=model, subject=subject, action=action, using=using
+        )
+        plan = compile_scope_plan(model, predicate, using) if predicate is not None else None
+        self._plan_cache[key] = plan
+        self._evict_if_full()
+        return plan
 
     @schema_operation
     def check(
@@ -214,6 +279,7 @@ class PermissionEvaluator:
         """
         self._check_cache.clear()
         self._accessible_cache.clear()
+        self._plan_cache.clear()
         self._schema_scope.clear()
 
     # ----- introspection (for tests + debugging) -----
@@ -222,6 +288,7 @@ class PermissionEvaluator:
         return {
             "check_entries": len(self._check_cache),
             "accessible_entries": len(self._accessible_cache),
+            "plan_entries": len(self._plan_cache),
             "max_size": self._max_size,
         }
 
@@ -236,15 +303,16 @@ class PermissionEvaluator:
         self._evict_if_full()
 
     def _evict_if_full(self) -> None:
-        # Total across BOTH caches counts against the limit so adversarial
-        # callers can't blow memory by flipping between check and accessible.
-        total = len(self._check_cache) + len(self._accessible_cache)
+        # Total across all caches counts against the limit, including plans.
+        caches: tuple[OrderedDict[tuple[Any, ...], Any], ...] = (
+            self._check_cache,
+            self._accessible_cache,
+            self._plan_cache,
+        )
+        total = sum(map(len, caches))
         while total > self._max_size:
             # Evict from whichever cache is larger; deterministic tie-break.
-            if len(self._check_cache) >= len(self._accessible_cache):
-                self._check_cache.popitem(last=False)
-            else:
-                self._accessible_cache.popitem(last=False)
+            max(caches, key=len).popitem(last=False)
             total -= 1
 
 
@@ -292,6 +360,7 @@ def evaluator_scope(
         evaluator._schema_scope.users -= 1
         if evaluator._schema_scope.users == 0:
             evaluator._schema_scope.clear()
+            evaluator._plan_cache.clear()
         try:
             _current_evaluator.reset(token)
         except ValueError:

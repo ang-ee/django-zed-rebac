@@ -92,8 +92,11 @@ def _grant(row, relation, subject):
     return RelationshipTuple(to_object_ref(row), relation, subject)
 
 
-def _assert_post_visibility(active, queryset, actor, action, expected):
+def _assert_post_visibility(active, queryset, actor, action, expected, *, reuse=True):
     """Assert an explicit answer as well as parity with independent graph lookup."""
+    if reuse:
+        with evaluator_scope():
+            _assert_post_visibility(active, queryset.all(), actor, action, expected, reuse=False)
     expected_ids = {post.pk for post in expected}
     graph_ids = set(active.accessible(subject=actor, action=action, resource_type="blog/post"))
     assert graph_ids == {str(pk) for pk in expected_ids}

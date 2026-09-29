@@ -7,8 +7,10 @@ from django.contrib.contenttypes.fields import GenericForeignKey
 from django.contrib.contenttypes.models import ContentType
 from django.db import models
 
+from .schema_write import SchemaRow
 
-class SchemaOverride(models.Model):
+
+class SchemaOverride(SchemaRow):
     KIND_TIGHTEN = "tighten"
     KIND_LOOSEN = "loosen"
     KIND_DISABLE = "disable"
@@ -35,7 +37,7 @@ class SchemaOverride(models.Model):
     created_at = models.DateTimeField(auto_now_add=True)
     expires_at = models.DateTimeField(null=True, blank=True)
 
-    class Meta:
+    class Meta(SchemaRow.Meta):
         app_label = "rebac"
         indexes = [
             models.Index(fields=["target_ct", "target_pk"], name="rebac_ovr_target_idx"),

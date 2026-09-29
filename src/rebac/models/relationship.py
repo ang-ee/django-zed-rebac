@@ -49,8 +49,10 @@ class RelationshipQuerySet(models.QuerySet["Relationship"]):
     """Mode-agnostic queryset helpers for denormalized relationship rows."""
 
     def with_wire_ids(self) -> RelationshipQuerySet:
-        """Expose IDs for correlated expressions without storage-specific paths."""
-        return self.alias(_scope_subject_id=F("subject_id"))
+        """Expose wire IDs for scope expressions without storage-specific paths."""
+        return self.alias(_scope_subject_id=F("subject_id")).annotate(
+            _scope_resource_id=F("resource_id")
+        )
 
     def for_resource(self, resource_type: str, resource_id: str) -> RelationshipQuerySet:
         return self.filter(resource_type=resource_type, resource_id=resource_id)
@@ -324,8 +326,10 @@ class RelationshipRegistryQuerySet(models.QuerySet["RelationshipRegistry"]):
         return super().annotate(*args, **kwargs)
 
     def with_wire_ids(self) -> RelationshipRegistryQuerySet:
-        """Expose the same correlated identity as denormalized storage."""
-        return self.alias(_scope_subject_id=F(_REGISTRY_WIRE_FIELD_MAP["subject_id"]))
+        """Expose the same scope identities as denormalized storage."""
+        return self.alias(_scope_subject_id=F(_REGISTRY_WIRE_FIELD_MAP["subject_id"])).annotate(
+            _scope_resource_id=F(_REGISTRY_WIRE_FIELD_MAP["resource_id"])
+        )
 
     def for_resource(self, resource_type: str, resource_id: str) -> RelationshipRegistryQuerySet:
         return self.filter(**{"resource_type": resource_type, "resource_id": resource_id})

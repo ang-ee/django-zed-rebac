@@ -13,7 +13,7 @@ chaining via `_clone()` and propagates into instances via `from_db()`.
 from __future__ import annotations
 
 from collections.abc import AsyncIterator, Collection, Iterable
-from typing import Any, TypeVar, cast
+from typing import Any, Self, TypeVar, cast
 
 from asgiref.sync import sync_to_async
 from django.db import models
@@ -27,6 +27,7 @@ from .actors import current_sudo_reason, grant_subject_ref, to_subject_ref
 from .actors import is_sudo as _is_sudo_ambient
 from .conf import app_settings
 from .errors import MissingActorError, PermissionDenied
+from .evaluator import current_evaluator
 from .field_visibility import (
     accessible_ids,
     apply_field_visibility,
@@ -47,6 +48,36 @@ _M = TypeVar("_M", bound=models.Model)
 
 class _ScopeWhere(WhereNode):
     """A removable authorization restriction, separate from caller predicates."""
+
+
+class _RebacQuery(Query):
+    """Cover expressions which copy QuerySet.query without resolving the QS."""
+
+    _rebac_state: dict[str, Any]
+
+    def resolve_expression(self, *args: Any, **kwargs: Any) -> Self:
+        clone = cast(Self, self.clone())
+        state = getattr(self, "_rebac_state", {})
+        queryset: RebacQuerySet[Any] = RebacQuerySet(
+            model=self.model, query=clone, using=state.get("_db")
+        )
+        for name, value in state.items():
+            setattr(queryset, name, value)
+        queryset._apply_scope_in_place()
+
+        # A set combination has one actor policy, owned by its root queryset.
+        # _scope_query already applied it to each operand (or the root bypass
+        # lifted it). Django resolves each operand again below; prevent stale
+        # operand metadata from reapplying a different actor or rejecting an
+        # intentionally unscoped right-hand operand.
+        def resolved_parts(query: Query) -> None:
+            for part in query.combined_queries:
+                if isinstance(part, _RebacQuery):
+                    part._rebac_state = {**state, "_rebac_scope_applied": True}
+                resolved_parts(part)
+
+        resolved_parts(clone)
+        return cast(Self, Query.resolve_expression(clone, *args, **kwargs))
 
 
 def _without_scope(node: WhereNode) -> WhereNode:
@@ -111,6 +142,8 @@ class RebacQuerySet(models.QuerySet[_M]):
 
     def __init__(self, *args: Any, **kwargs: Any) -> None:
         super().__init__(*args, **kwargs)
+        if type(self._query) is Query:
+            self._query.__class__ = _RebacQuery
         self._rebac_actor = None
         self._rebac_action = None
         self._rebac_sudo_reason = None
@@ -118,6 +151,32 @@ class RebacQuerySet(models.QuerySet[_M]):
         self._rebac_select_related_guards = ()
         self._rebac_eager_scope = False
         self._rebac_aggregate_scope = False
+
+    @property
+    def query(self) -> Query:
+        query = super().query
+        if isinstance(query, _RebacQuery):
+            query._rebac_state = {
+                name: value
+                for name, value in self.__dict__.items()
+                if name.startswith("_rebac_") or name in ("_db", "_hints", "_for_write")
+            }
+        return query
+
+    @query.setter
+    def query(self, value: Query) -> None:  # pyright: ignore[reportIncompatibleVariableOverride]
+        # Match Django's public setter without forcing authorization on query
+        # construction, filters, or unused relation declarations.
+        from django.db.models.query import ValuesIterable
+
+        if value.values_select:
+            self._iterable_class = ValuesIterable
+        self._query = value
+
+    def resolve_expression(self, *args: Any, **kwargs: Any) -> Query:
+        clone = self._clone()
+        clone._apply_scope_in_place()
+        return cast(Query, super(RebacQuerySet, clone).resolve_expression(*args, **kwargs))
 
     # Note: a second `_clone` override below combines the actor + scope-flag
     # propagation; this stub kept for readability.
@@ -380,11 +439,15 @@ class RebacQuerySet(models.QuerySet[_M]):
             resource_type=rebac_type,
         ):
             return
-        predicate = active_backend.queryset_filter(
-            model=model,
-            subject=actor,
-            action=action,
-            using=self.db,
+        evaluator = current_evaluator()
+        predicate = (
+            evaluator.compiled_scope_plan(
+                active_backend, model=model, subject=actor, action=action, using=self.db
+            )
+            if evaluator is not None
+            else active_backend.queryset_filter(
+                model=model, subject=actor, action=action, using=self.db
+            )
         )
         if predicate is not None:
             restriction = query.build_where(predicate)

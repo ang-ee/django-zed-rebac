@@ -6,6 +6,8 @@ from io import StringIO
 
 import pytest
 from django.core.management import call_command
+from django.db import connection
+from django.db.migrations.executor import MigrationExecutor
 
 from rebac import SchemaError, backend
 from rebac.backends import reset_backend
@@ -15,9 +17,19 @@ from rebac.models import SchemaDefinition, SchemaRelation
 pytestmark = pytest.mark.django_db(transaction=True)
 
 
-def _old_backing() -> SchemaRelation:
-    definition = SchemaDefinition.objects.create(resource_type="blog/post")
-    return SchemaRelation.objects.create(
+def _old_backing(*, historical=False) -> SchemaRelation:
+    if historical:
+        state = (
+            MigrationExecutor(connection)
+            .loader.project_state([("rebac", "0003_schema_relation_backing")])
+            .apps
+        )
+        definition_model = state.get_model("rebac", "SchemaDefinition")
+        relation_model = state.get_model("rebac", "SchemaRelation")
+    else:
+        definition_model, relation_model = SchemaDefinition, SchemaRelation
+    definition = definition_model.objects.create(resource_type="blog/post")
+    return relation_model.objects.create(
         definition=definition,
         name="folder",
         allowed_subjects=[{"type": "blog/folder"}],
@@ -30,7 +42,7 @@ def test_migrate_can_upgrade_legacy_backing_with_system_checks_enabled(settings)
     output = StringIO()
     call_command("migrate", "rebac", "0003", skip_checks=True, verbosity=0, stdout=output)
     try:
-        row = _old_backing()
+        row = _old_backing(historical=True)
         reset_backend()
         assert check_field_backed_relations() == []
         assert check_universal_admin_in_roles() == []
@@ -39,9 +51,9 @@ def test_migrate_can_upgrade_legacy_backing_with_system_checks_enabled(settings)
         with pytest.raises(SchemaError, match="backing"):
             backend().schema()
 
-        call_command("migrate", "rebac", "0005", skip_checks=False, verbosity=0, stdout=output)
+        call_command("migrate", "rebac", "0006", skip_checks=False, verbosity=0, stdout=output)
 
-        row.refresh_from_db()
+        row = SchemaRelation.objects.get(pk=row.pk)
         assert row.backing == {"kind": "fk", "path": "folder"}
         reset_backend()
         assert backend().schema().get_definition("blog/post") is not None
@@ -50,7 +62,7 @@ def test_migrate_can_upgrade_legacy_backing_with_system_checks_enabled(settings)
         with pytest.raises(SchemaError, match="backing"):
             backend().schema()
     finally:
-        call_command("migrate", "rebac", "0005", skip_checks=True, verbosity=0, stdout=output)
+        call_command("migrate", "rebac", "0006", skip_checks=True, verbosity=0, stdout=output)
         reset_backend()
 
 

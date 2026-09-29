@@ -1,7 +1,7 @@
 """Compile bounded recursive predicates without SQL nesting that grows with the bound.
 
-The recursive compiler unrolls each dispatch hop as a correlated ``EXISTS`` or
-``IN`` subquery inside the previous hop, so the ORM keeps owning joins, identity
+The local compiler expresses each dispatch hop as an ``IN`` set (or a fixed
+``EXISTS`` test), so the ORM keeps owning joins, identity
 conversions and the relationship storage shapes. That nesting grows with
 ``REBAC_DEPTH_LIMIT``, and SQLite parses nested SELECTs on a fixed stack and
 bounds expression height, so builds differ in the bound they accept.
@@ -11,6 +11,9 @@ q))`` is ``EXISTS(A CROSS JOIN B WHERE p AND q)`` and ``x IN (SELECT y FROM B
 WHERE q)`` is ``EXISTS(B WHERE q AND x = y)``. Applying that identity to every
 nested existential and distributing over disjunctions yields one existential
 SELECT per dispatch path: the bound grows the width of the SQL, never its depth.
+The outermost IN keeps its comparison outside that SELECT, making the actor's
+reachable set uncorrelated. Equal paths, sources and common terms are shared
+before emission, while exclusions remain at their original scope.
 Subqueries without nested existentials, and every leaf condition, keep the SQL
 the ORM compiled for them; their aliases are renamed with Django's own
 relabeling so sibling paths never collide in one FROM clause.
@@ -44,6 +47,32 @@ class _Path:
 
     sources: tuple[_Fragment, ...] = ()
     conditions: tuple[_Fragment, ...] = ()
+
+
+def _group_paths(paths: list[_Path]) -> list[_Path]:
+    """Deduplicate DNF arms and share equal FROM clauses and common terms."""
+    groups: dict[tuple[_Fragment, ...], list[tuple[_Fragment, ...]]] = {}
+    for path in paths:
+        conditions = tuple(dict.fromkeys(path.conditions))
+        arms = groups.setdefault(path.sources, [])
+        if conditions not in arms:
+            arms.append(conditions)
+    result = []
+    for sources, arms in groups.items():
+        common = tuple(part for part in arms[0] if all(part in arm for arm in arms[1:]))
+        residual = [tuple(part for part in arm if part not in common) for arm in arms]
+        if all(residual):
+            disjunction = _Fragment(
+                "("
+                + " OR ".join(
+                    "(" + " AND ".join(f"({part.sql})" for part in arm) + ")" for arm in residual
+                )
+                + ")",
+                tuple(value for arm in residual for part in arm for value in part.params),
+            )
+            common = (*common, disjunction)
+        result.append(_Path(sources, common))
+    return result
 
 
 def _conjoin(left: list[_Path], right: list[_Path]) -> list[_Path]:
@@ -121,7 +150,7 @@ class FlatPredicate(models.Expression):
 
     def as_sql(self, compiler: Any, connection: Any) -> tuple[str, tuple[Any, ...]]:
         flattener = _Flattener(compiler, connection)
-        fragment = flattener.emit(flattener.paths(self.expressions[0]))
+        fragment = flattener.emit(flattener.paths(self.expressions[0], lift=False))
         return fragment.sql, fragment.params
 
 
@@ -132,16 +161,25 @@ class _Flattener:
         self.subqueries = 0
         self.aliases = set(compiler.query.alias_map) | set(compiler.query.external_aliases)
 
-    def paths(self, node: Any, negated: bool = False) -> list[_Path]:
+    def paths(self, node: Any, negated: bool = False, *, lift: bool = True) -> list[_Path]:
         """Disjunctive paths of ``node``, distributing only over nested existentials."""
 
-        if isinstance(node, WhereNode) and _nests(node):
+        if isinstance(node, WhereNode):
             negated ^= node.negated
             conjunction = (node.connector == WhereNode.default) != negated
             result = [_Path()] if conjunction else []
+            start_aliases, start_count = self.aliases.copy(), self.subqueries
+            used_aliases, max_count = self.aliases.copy(), self.subqueries
             for child in node.children:
-                branch = self.paths(child, negated)
+                if not conjunction:
+                    # OR branches have independent FROM scopes. Canonical
+                    # aliases make equivalent arms equal before emission.
+                    self.aliases, self.subqueries = start_aliases.copy(), start_count
+                branch = self.paths(child, negated, lift=lift)
                 result = _conjoin(result, branch) if conjunction else result + branch
+                used_aliases.update(self.aliases)
+                max_count = max(max_count, self.subqueries)
+            self.aliases, self.subqueries = used_aliases, max_count
             return result
         if isinstance(node, Exact) and node.rhs is True and isinstance(node.lhs, Value):
             node = node.lhs
@@ -149,7 +187,7 @@ class _Flattener:
             return [_Path()] if node.value != negated else []
         existential = _existential(node)
         if existential is not None and _nests(existential[0].where):
-            inner = self.subquery(*existential)
+            inner = self.subquery(*existential, membership=not lift and existential[1] is not None)
             if not negated:
                 return inner
             try:
@@ -169,7 +207,7 @@ class _Flattener:
             sql = f"NOT ({sql})"
         return [_Path(conditions=(_Fragment(sql, tuple(params)),))]
 
-    def subquery(self, original: Query, lhs: Any) -> list[_Path]:
+    def subquery(self, original: Query, lhs: Any, *, membership: bool = False) -> list[_Path]:
         """Lift a subquery's FROM clause beside its conditions."""
 
         query = original.clone()
@@ -218,14 +256,42 @@ class _Flattener:
             if selected is not None:
                 selected = _replace_columns(selected, replacements)
         paths = self.paths(query.where)
-        if lhs is not None:
+        if lhs is not None and not membership:
             left = self.compiler.compile(lhs)
             right = self.compiler.compile(selected)
             paths = _conjoin(
                 paths,
                 [_Path(conditions=(_Fragment(f"{left[0]} = {right[0]}", (*left[1], *right[1])),))],
             )
-        return [_Path((source, *path.sources), path.conditions) for path in paths]
+        paths = [_Path((source, *path.sources), path.conditions) for path in paths]
+        if membership:
+            # Keep the outer comparison outside the reachable-ID set. Inner
+            # hops flatten into joins, so depth widens the set query without
+            # turning it back into a per-row correlated EXISTS.
+            left_sql, left_params = self.compiler.compile(lhs)
+            selected_sql, selected_params = compiler.compile(selected)
+            arms: list[_Path] = []
+            for path in _group_paths(paths):
+                sources = " CROSS JOIN ".join(part.sql for part in path.sources)
+                conditions = " AND ".join(f"({part.sql})" for part in path.conditions)
+                where = f" WHERE {conditions}" if conditions else ""
+                params = (
+                    *left_params,
+                    *selected_params,
+                    *(value for part in (*path.sources, *path.conditions) for value in part.params),
+                )
+                arms.append(
+                    _Path(
+                        conditions=(
+                            _Fragment(
+                                f"{left_sql} IN (SELECT {selected_sql} FROM {sources}{where})",
+                                params,
+                            ),
+                        )
+                    )
+                )
+            return arms
+        return paths
 
     @staticmethod
     def emit(paths: list[_Path]) -> _Fragment:
@@ -235,7 +301,7 @@ class _Flattener:
             raise FullResultSet
         branches: list[str] = []
         params: list[Any] = []
-        for path in paths:
+        for path in _group_paths(paths):
             sources = " CROSS JOIN ".join(part.sql for part in path.sources)
             conditions = " AND ".join(f"({part.sql})" for part in path.conditions)
             params.extend(

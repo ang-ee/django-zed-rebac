@@ -5,6 +5,56 @@ pre-1.0; breaking changes within a minor version are explicitly called out.
 
 ## [Unreleased]
 
+## [0.22.0] — 2026-09-29
+
+### Added
+
+- Per-operation compiled SQL scope plans in `PermissionEvaluator`, shared by
+  repeated querysets, filters, aggregates and prefetches. Standalone ID queries
+  stay outside caller clone and alias-relabel traversal. The existing evaluator
+  and `SchemaScope` own their bounded lifetime and invalidation after writes,
+  transaction boundaries, rollback, schema expiry and subscription teardown.
+- Reproducible PostgreSQL SQL-size and `EXPLAIN (ANALYZE)` measurements with JIT
+  disabled in `python -m tests.probe_scope_plans`.
+
+### Changed
+
+- Local scopes use subject-first `IN` sets for stored relations, usersets and
+  live field/path membership. The flat compiler deduplicates disjunctive arms
+  and shares equal sources/common conditions. Both relationship stores retain
+  the same permission semantics; relationship storage and schema syntax are unchanged.
+- Compiled plans retain SQL only. Relationship expiration, converted resource
+  IDs and recursive frontier validation remain live at SQL compilation.
+  Calls outside an evaluator scope continue to compile directly.
+
+### Fixed
+
+- **RG-02:** bare actor-scoped querysets remain scoped in `Subquery`, `Exists`,
+  `__in` and explicit `Prefetch` querysets. Queryset and SQL Query expression
+  resolution fail closed without an actor; `.scoped()` is no longer required
+  at these embedding boundaries.
+- **RG-01:** recursive `accessible()` enumeration and bulk write guards use the
+  per-resource walker for candidate rows, including denied overflow candidates,
+  raising `PermissionDepthExceeded` at the same reachable bound as checks.
+
+### Removed
+
+- Database schema-revision triggers and their PostgreSQL function, and system
+  check `rebac.E012`. Business consistency now belongs to Django schema models
+  and querysets through one transactional revision owner, including bulk writes,
+  relation writes and cascades. Migration 0006 removes the installed database
+  objects and keeps the revision row. Raw SQL policy writes are unsupported;
+  conflict-handling bulk creates are refused. Missing witness rows still disable
+  caching, and `rebac sync` always publishes a new revision.
+
+### Known gaps
+
+- **RG-03:** correlated frontier validation conservatively covers the whole
+  resource type when outer references cannot be evaluated independently.
+- **RG-04:** frontier probes still run at each SQL compilation; their results
+  are deliberately not cached. Recursive SQL still grows with the depth bound;
+  reachability storage and structural sharing are deferred.
+
 ## [0.21.0] — 2026-09-28
 
 0.20.0 was never published to PyPI; 0.21.0 supersedes it and includes its changes.
@@ -48,11 +98,11 @@ pre-1.0; breaking changes within a minor version are explicitly called out.
 
 - **RG-01 — enumeration/bulk depth parity:** `accessible()` and the bulk
   `update()` authorization guard can silently truncate recursive arrows at the
-  bound where `check_access()` raises. Unresolved in 0.21.0.
+  bound where `check_access()` raises. Fixed in 0.22.0.
 - **RG-02 — implicit subquery scoping (highest priority, next release):** a bare
   `with_actor()` queryset consumed by `Subquery`, `Exists`, `__in`, or `Prefetch`
   is unscoped unless `.scoped()` is called. Use explicit `.scoped()` at these
-  boundaries until the integration is corrected.
+  boundaries on 0.21.0. Fixed in 0.22.0.
 - **RG-03 — correlated frontier scope:** correlated `Exists(scoped())` validates
   the whole resource type. One over-deep row anywhere can raise for every
   correlated use, even when the outer query would exclude that row.

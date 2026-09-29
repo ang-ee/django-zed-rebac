@@ -57,12 +57,8 @@ def _set_permission(permission, expression, writer):
     elif writer == "bulk_update":
         permission.expression = expression
         SchemaPermission.objects.bulk_update([permission], ["expression"])
-    elif writer == "raw":
-        with connection.cursor() as cursor:
-            cursor.execute(
-                'UPDATE "rebac_schemapermission" SET "expression" = %s WHERE "id" = %s',
-                [expression, permission.pk],
-            )
+    elif writer == "related":
+        permission.definition.permissions.filter(pk=permission.pk).update(expression=expression)
     else:
         raise AssertionError(f"Unknown test writer: {writer}")
 
@@ -128,7 +124,7 @@ def test_transaction_write_without_permission_read_invalidates_prior_snapshot(pe
         assert not _cached_allowed(evaluator, local)
 
 
-@pytest.mark.parametrize("writer", ["update", "bulk_update", "raw"])
+@pytest.mark.parametrize("writer", ["update", "bulk_update", "related"])
 def test_autocommit_bulk_write_invalidates_cached_grant(persisted_schema, writer):
     local, permission = persisted_schema
     _set_permission(permission, "viewer", "save")
@@ -138,7 +134,7 @@ def test_autocommit_bulk_write_invalidates_cached_grant(persisted_schema, writer
         assert not _cached_allowed(evaluator, local)
 
 
-@pytest.mark.parametrize("writer", ["save", "update", "bulk_update", "raw"])
+@pytest.mark.parametrize("writer", ["save", "update", "bulk_update", "related"])
 def test_manual_savepoint_rollback_discards_temporary_schema_grant(persisted_schema, writer):
     local, permission = persisted_schema
     with transaction.atomic(), evaluator_scope() as evaluator:
@@ -326,7 +322,7 @@ def test_interleaved_scope_exit_removes_only_its_own_observer(persisted_schema):
         assert tuple(connection.execute_wrappers) == (*original, *second_observers)
         with transaction.atomic():
             assert not second.run(_allowed, local)
-            second.run(_set_permission, permission, "viewer", "raw")
+            second.run(_set_permission, permission, "viewer", "related")
             assert second.run(_allowed, local)
     finally:
         if first_open:

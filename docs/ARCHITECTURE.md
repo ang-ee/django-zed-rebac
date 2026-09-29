@@ -885,36 +885,34 @@ A zero-read unscoped check cannot detect another process's commit without an
 external invalidation service.
 
 The internal `SchemaGeneration` singleton extends the existing generation to the
-database. Transactional triggers on the four baseline tables and
-`SchemaOverride` replace its token on INSERT/UPDATE/DELETE, including sync, admin,
-bulk ORM and raw DML writes. Package provenance hashes cannot witness admin edits
-or overrides. Tokens are fresh identities rather than rollback-reusable counters;
-an uncommitted token is visible only to its originating transaction. Database
-isolation determines which revision a connection can see. Runtime tokens never
-enter generated schema output or its deterministic hashes.
+database. The five policy models (definitions, relations, permissions, caveats
+and overrides) own their writes through a shared model and queryset.
+`SchemaGeneration.objects.advance(using=...)` is the single publisher: each
+successful save, queryset update, ordinary bulk create, bulk update or delete
+publishes a fresh token inside the same transaction as the policy change.
+The schema base manager uses that queryset too, including reverse-relation
+bulk writes. A deletion receiver covers cascades initiated by other models,
+which Django's collector performs without calling the policy owners' delete
+methods. Conflict-ignoring and upserting bulk creates are refused on policy
+models. Raw SQL writes to policy tables are unsupported.
 
-On the first witnessed load per alias/database in a process, the loader verifies
-the enabled triggers once, outside the process lock. A missing trigger, witness
-row or table is **never cacheable**: each operation loads the current schema and
-pins it only for that operation, never for an evaluator scope. Facts and permission
-decisions are not retained. A backend that detects a missing witness remains in
-this conservative mode until replaced (normally by a worker restart after repair),
-avoiding repeated witness probes and preserving the old per-operation query cost.
-Thus code running before migration degrades to uncached evaluation, preserving
-validation errors for malformed schemas. `manage.py check --database <schema-alias>`
-reports `rebac.E012` for an absent/empty witness or missing/disabled triggers.
-Only an absent table with migration `0005_schema_generation` still pending is
-deferred, allowing `migrate` to install it. Apply migrations before serving and
-run the database check after restoring databases or schema metadata. Runtime
-trigger verification is a one-time catalog query, not a per-permission query.
-Restart workers after repairing trigger metadata. Same-process schema
-signals also evict the backend's shared snapshots and facts, even when a broken
-trigger leaves the token unchanged. `TRUNCATE` fires none of these DML triggers;
-run `rebac sync` afterwards to restore the declared schema and advance its witness
-before serving requests again. Every explicit sync publishes a fresh token even
-when its declared schema is unchanged; `sync --check` remains read-only.
-Unsupported database vendors receive no witness and use uncached evaluation;
-the database check reports that schema caching is unsupported.
+Tokens are fresh identities rather than rollback-reusable counters; an
+uncommitted token is visible only to its originating transaction. Database
+isolation determines which revision a connection can see. Runtime tokens never
+enter generated schema output or its deterministic hashes. Existing same-process
+signals still evict shared snapshots and facts; bulk owners do so as well.
+
+A missing witness row or table is **never cacheable**: each operation loads the
+current schema and pins it only for that operation, never for an evaluator
+scope. Facts and permission decisions are not retained. A backend that detects
+a missing witness remains in this conservative mode until replaced (normally
+by a worker restart after repair), avoiding repeated witness probes. Code
+running before migration therefore degrades to uncached evaluation, preserving
+validation errors for malformed schemas. Apply migrations before serving.
+A supported schema write recreates a missing revision row. Every explicit
+`rebac sync` publishes a fresh token even when its declared schema is unchanged;
+`sync --check` remains read-only. Schema writes and revision publication share
+the schema write database alias and transaction.
 
 Evaluator invalidation clears its pins, including on subscription emissions;
 an unchanged database revision can reuse the shared parsed tree. The existing
@@ -999,7 +997,7 @@ All settings prefixed `REBAC_`. No nested dict. Read via the public `app_setting
 | `REBAC_TYPE_PREFIX` | `""` | `str` | Optional prefix for all generated resource types (multi-tenant SaaS). |
 | `REBAC_SUPERUSER_BYPASS` | `True` | `bool` | If `True`, active superusers short-circuit `has_perm` AND run inside an `ActorMiddleware`-opened `sudo("superuser-bypass")` bracket so QuerySet scoping lifts too. Each elevated request emits a `KIND_SUDO_BYPASS` audit row. Suppressed when `REBAC_ALLOW_SUDO = False`. Strict tenants set this to `False`. |
 | `REBAC_LINT_BARE_PREFETCH` | `True` | `bool` | Toggle for `rebac.W003` — the structural warning that an RBAC-bound model has an FK / O2O / M2M to another RBAC-bound model (a bare-string `select_related` / `prefetch_related` can load unguarded related rows). Enabled by default so the risky shape is visible; use `rebac_select_related()` / `rebac_prefetch_related()` or the Strawberry-Django optimizer for protected paths. |
-| `REBAC_EVALUATOR_CACHE_SIZE` | `10000` | `int` | Max entries across the per-scope evaluator's `check_access` and `accessible` LRU caches. |
+| `REBAC_EVALUATOR_CACHE_SIZE` | `10000` | `int` | Max entries across the per-scope evaluator's check, accessible and compiled-plan caches. |
 | `REBAC_ZOOKIE_TRANSPORT` | `"none"` | `"none"` \| `"header"` \| `"session"` | Optional cross-request transport for the current Zookie. |
 | `REBAC_ZOOKIE_HEADER_NAME` | `"X-Rebac-Zookie"` | `str` | Header name used when `REBAC_ZOOKIE_TRANSPORT = "header"`. |
 | `REBAC_ZOOKIE_SESSION_KEY` | `"_rebac_zookie"` | `str` | Session key used when `REBAC_ZOOKIE_TRANSPORT = "session"`. |
@@ -1049,7 +1047,6 @@ System checks (in `rebac/checks.py`):
 | `rebac.E009` | Error | A field-, attribute- or const-backed relation cannot be resolved: missing Django model, identity field, relation path, attribute or filter lookup; a path that ends on a different model than the declared subject type; or a const-backed relation whose target type has no schema definition. |
 | `rebac.E010` | Error | Const-backed arrows form an evaluation cycle that would recurse to the depth limit on every check. |
 | `rebac.E011` | Error | `Meta.rebac_subject_relation` names a relation the model's effective schema definition does not declare. |
-| `rebac.E012` | Error | Database checks find an incomplete schema revision witness on the routed schema alias; see [Effective schema loading and generation](#effective-schema-loading-and-generation). |
 | `rebac.W001` | Warning | `rebac.backends.RebacBackend` not in `AUTHENTICATION_BACKENDS`. |
 | `rebac.W002` | Warning | A model with `Meta.rebac_resource_type` is missing `RebacMixin`. |
 | `rebac.W003` | Warning | An RBAC-bound relation exists where bare `select_related("rel")` / `prefetch_related("rel")` can be unsafe outside the REBAC helpers or Strawberry-Django optimizer. |
@@ -1430,7 +1427,7 @@ field/path joins and stored-tuple subqueries, unrolled through
 `REBAC_DEPTH_LIMIT`. The recursive compiler flattens positive existential
 dispatches into an OR of join paths. Each path has one existential SELECT;
 increasing the bound increases its width, not its SELECT nesting. The ordinary
-acyclic compiler is unchanged. Storage-owned joins and field/path predicates
+acyclic compiler also uses subject-first membership sets. Storage-owned joins and field/path predicates
 remain authoritative; multi-table joins (including registry storage) are
 isolated in flat `SELECT DISTINCT` derived relations so their internal tables
 do not multiply the outer path's join count. Deduplication cannot change
@@ -1481,7 +1478,7 @@ alias expansion. Cycle classification, self-arrow reachability and the expansion
 guard share it. Compilation carries depth and frontier mode in a frozen context;
 each recursive compiler reads `REBAC_DEPTH_LIMIT` once during construction.
 A recursive CTE seam is the eventual owner of structural sharing for these
-growth classes; this release adds neither a CTE dependency nor a compilation cache.
+growth classes; this release adds no CTE dependency or storage change.
 Missing subject-set target definitions compile to a constant-false branch,
 matching the walker's missing-definition result without abandoning other arms.
 
@@ -1489,8 +1486,8 @@ Caveats, recursive subject-set schemas without a supported self-arrow, and
 unsupported expression shapes still fall back for the entire permission
 expression to the conservative evaluator. In particular, an unsupported
 exclusion arm must never be treated as false. The explicit `accessible()`
-enumeration API and write authorization are unchanged. Previously supported
-non-recursive scopes keep their SQL byte for byte.
+enumeration API and bulk authorization validate recursive-arrow candidates
+through the check walker and raise `PermissionDepthExceeded` instead of truncating.
 Field-backed arrows compare native foreign-key target columns, independently of
 public resource-ID encoding. If a stored relation targets a resource field whose
 Python/wire value differs from SQL storage (custom converters, virtual fields or
@@ -1508,6 +1505,35 @@ execution. Existing evaluated Django result caches are not refreshed implicitly.
 
 Same-definition permission-alias cycles deny the repeated branch in both
 queryset fallback and individual checks; they cannot cause Python recursion.
+
+Inside an existing `evaluator_scope`, `PermissionEvaluator.compiled_scope_plan`
+retains one standalone actor-scoped ID query per backend identity, validated
+schema snapshot generation and invalidation generation, database connection/alias,
+concrete model and resource identity field, resource type, subject, action and
+`REBAC_DEPTH_LIMIT`. The large query is opaque to caller cloning and alias
+relabeling; a small uncorrelated expression embeds it. The existing `SchemaScope`
+connection observer owns write, transaction and rollback invalidation; schema
+expiry and explicit evaluator invalidation also force reconstruction. Plan entries
+share the evaluator's bounded cache budget and disappear on scope teardown.
+Live field-backed SQL can reuse plans even when decision caching is disabled.
+No permission answers, IDs or frontier outcomes are cached by this entry point.
+Expiration binds the application clock at SQL compilation, and converted tuple
+IDs are resolved then too. Recursive frontier validation remains execution-time
+and preserves caller filters; RG-03 (correlated scopes validate the whole type)
+and RG-04 (repeated frontier probes) remain open. Outside an evaluator scope,
+querysets use the existing direct compiler path.
+
+Membership arms use `row.fk IN (<actor's reachable IDs>)`, with the actor side
+uncorrelated. Boolean paths are flattened to disjunctions and identical arms are
+deduplicated before SQL emission. This preserves cardinality and exclusions;
+different paths can still repeat shared sub-permissions. Structural sharing of
+those paths remains a future CTE/index concern.
+
+`RebacQuerySet.resolve_expression` applies authorization before delegating. The
+SQL Query expression seam does the same for Django's `Subquery` and `Exists`,
+which copy `.query` directly. Bare `with_actor()` querysets therefore remain
+scoped in `Subquery`, `Exists`, `__in` and explicit `Prefetch(queryset=...)`; missing
+actors fail closed. Explicit `.scoped()` remains available for eager composition.
 
 ### Schema introspection
 
@@ -1803,7 +1829,7 @@ with evaluator_scope() as evaluator:
 ```
 
 Bounded by `REBAC_EVALUATOR_CACHE_SIZE` (default `10_000`) using `OrderedDict`
-Bounded cache eviction across BOTH check and accessible caches. Conditional results
+Bounded cache eviction across check, accessible and compiled-plan caches. Conditional results
 (`CONDITIONAL_PERMISSION(missing=[...])`) are NOT cached — the missing caveat
 params are part of the answer and the next call may supply them. Per-call
 explicit `consistency` / `at_zookie` also bypass the cache.
@@ -1920,8 +1946,8 @@ class GraphQLConsumer(RebacChannelsConsumerMixin, GraphQLWSConsumer):
 Subscription invariants:
 - **Actor**: connection-scoped (resolved at handshake from `scope["user"]`).
 - **Evaluator**: per-emission. Revoked grants take effect at next tick.
-- **Zookie**: per-emission. Naturally aligns with the write-triggered nature
-  of subscriptions — the change that triggered the emission carries its
+- **Zookie**: per-emission. Naturally aligns with the write-driven nature
+  of subscriptions — the change that initiated the emission carries its
   Zookie within the emission's scope.
 
 For non-request contexts (Celery, cron, management commands), use `with sudo(reason=...)` or set the actor explicitly via `.with_actor(actor)` / `.as_user(user)` / `.as_agent(agent, on_behalf_of=user)`.
@@ -2296,7 +2322,7 @@ write alias. Projects must not infer cross-database authorization from these
 alias-free public calls.
 
 
-9. **Structural SQL sharing for shared sub-permissions.** The lazy compiler expands each referenced sub-permission/relation at *every* occurrence, so a permission DAG in which a sub-expression is reachable by N paths emits N copies of its predicate — Django's SQL compiler does not deduplicate structurally-identical, or even object-identical, subqueries (an `Exists` object OR'd with itself compiles twice). The blow-up is bounded by `REBAC_DEPTH_LIMIT`; realistic DAGs bloat by a small constant factor, but degenerate identical-sibling schemas can produce large queries and slow planning. Note: memoizing the schema *walk* would cut compile-time CPU but **not** the emitted SQL size, so it does not address the planner cost. Lean: real reduction needs CTE-based structural sharing (`WITH` clauses), tracked alongside the `select_related` SQL compiler (1.x); until then the depth limit caps the expansion.
+9. **Structural SQL sharing for shared sub-permissions.** Version 0.22 deduplicates identical disjunctive arms, shares equal sources/common conditions, and reuses plan construction within an operation. Different dispatch paths can still repeat a shared sub-permission. Their SQL size grows with `REBAC_DEPTH_LIMIT`; per-operation plan reuse alone cannot remove that planner cost. Further structural sharing through CTEs or a derived reachability index remains deferred.
 
 ---
 

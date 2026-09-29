@@ -10,6 +10,7 @@ from django.db import connections, models
 from django.db.models import Exists, F, OuterRef, Q, QuerySet, Subquery, Value
 from django.db.models.expressions import Combinable
 from django.db.models.functions import Cast
+from django.db.models.lookups import In
 from django.utils import timezone
 
 from .._id import model_identity_fields, resource_id_attr
@@ -35,6 +36,16 @@ if TYPE_CHECKING:
 
 class UnsupportedScope(Exception):
     """Use the existing evaluator for the entire permission expression."""
+
+
+class _ExecutionTime(models.Expression):
+    """The application clock, bound for each SQL execution, not plan creation."""
+
+    def __init__(self) -> None:
+        super().__init__(output_field=models.DateTimeField())
+
+    def as_sql(self, compiler: Any, connection: Any) -> tuple[str, list[Any]]:
+        return compiler.compile(Value(timezone.now(), output_field=self.output_field))  # type: ignore[no-any-return]
 
 
 @dataclass(frozen=True, slots=True)
@@ -152,10 +163,13 @@ class LocalQueryScope:
         self.relationships = rows.with_wire_ids()
 
     def predicate(self, model: type[models.Model], action: str, resource_type: str) -> Q:
+        from .local_flat import FlatPredicate
+
         try:
-            return self.permission(
+            condition = self.permission(
                 resource_type, action, model, resource_id_attr(model), frozenset()
             )
+            return Q(FlatPredicate(condition))
         except UnsupportedScope:
             from .local_recursive import RecursiveQueryScope, reaches_self_arrow
 
@@ -249,16 +263,21 @@ class LocalQueryScope:
             Cast(OuterRef(identity), models.TextField()) if isinstance(identity, str) else identity
         )
 
-    def _source_by_identity(
-        self, queryset: QuerySet[Any], id_attr: str, identity: str | Value
-    ) -> QuerySet[Any]:
-        """Correlate a backing source with a wire identity in the surrounding query."""
-        if not self.native_identity(queryset.model, id_attr):
+    @staticmethod
+    def membership(identity: str | Value, rows: QuerySet[Any], selected: str) -> Q:
+        """Compare canonical wire IDs to a standalone subject-first set."""
+        lhs = Cast(F(identity), models.TextField()) if isinstance(identity, str) else identity
+        predicate = Q(In(lhs, Subquery(rows.order_by().values(selected))))
+        # EXISTS was false for NULL; retain that two-valued behavior under NOT.
+        if isinstance(identity, str) and identity not in ("pk", "_scope_subject_id"):
+            predicate &= Q(**{f"{identity}__isnull": False})
+        return predicate
+
+    def source_membership(self, identity: str | Value, source: QuerySet[Any], id_attr: str) -> Q:
+        if not self.native_identity(source.model, id_attr):
             raise UnsupportedScope
-        source: QuerySet[Any] = queryset.alias(
-            _scope_resource_id=Cast(F(id_attr), models.TextField())
-        ).filter(_scope_resource_id=self.reference(identity))
-        return source
+        source = source.annotate(_scope_resource_id=Cast(F(id_attr), models.TextField()))
+        return self.membership(identity, source, "_scope_resource_id")
 
     def relation(
         self,
@@ -323,10 +342,8 @@ class LocalQueryScope:
                 target_ids = destination.order_by().values_list(backing.target_id_attr, flat=True)
                 source = backing.queryset(target_ids=target_ids, using=self.using)
             if model is backing.source_model and isinstance(identity, str):
-                source = source.filter(pk=OuterRef("pk"))
-            else:
-                source = self._source_by_identity(source, backing.source_id_attr, identity)
-            return Q(Exists(source))
+                return Q(pk__in=Subquery(source.order_by().values("pk")))
+            return self.source_membership(identity, source, backing.source_id_attr)
         attribute = self.backend._resolve_declared_attribute_backing(definition, relation)
         if attribute is not None:
             if (
@@ -366,9 +383,37 @@ class LocalQueryScope:
                     resource_match = Q(**{identity: resource_id})
             else:
                 raise UnsupportedScope
+            if target is None and not subject_allowed_by_relation(relation, self.subject):
+                return _truth(False)
+            if attribute.resource is None and isinstance(identity, str):
+                reachable = attribute.target_model._base_manager.using(self.using).filter(
+                    **attribute.filters
+                )
+                if target is None:
+                    if (
+                        self.subject.subject_type != attribute.target_resource_type
+                        or self.subject.optional_relation
+                    ):
+                        return _truth(False)
+                    reachable = reachable.filter(
+                        **{attribute.target_id_attr: self.subject.subject_id}
+                    )
+                else:
+                    reachable = reachable.filter(
+                        self.hop(
+                            attribute.target_resource_type,
+                            target,
+                            attribute.target_model,
+                            attribute.target_id_attr,
+                            seen,
+                            context,
+                        )
+                    )
+                reachable = reachable.filter(**{f"{attribute.field.name}__isnull": False})
+                if isinstance(attribute.field, (models.CharField, models.TextField)):
+                    reachable = reachable.exclude(**{attribute.field.name: ""})
+                return self.source_membership(identity, reachable, attribute.field.name)
             if target is None:
-                if not subject_allowed_by_relation(relation, self.subject):
-                    return _truth(False)
                 target_condition = attribute.target_filter(resource_id, self.subject)
             else:
                 target_condition = attribute.subjects_filter(resource_id) & self.hop(
@@ -412,12 +457,11 @@ class LocalQueryScope:
                 if model is const.source_model and isinstance(identity, str):
                     row_match = Q(**const.filters)
                 else:
-                    source = self._source_by_identity(
+                    row_match = self.source_membership(
+                        identity,
                         const.source_model._base_manager.using(self.using).filter(**const.filters),
                         const.source_id_attr,
-                        identity,
                     )
-                    row_match = Q(Exists(source))
                 return row_match & constant_match
             return constant_match
         if (
@@ -459,7 +503,6 @@ class LocalQueryScope:
         rows = self.relationships.filter(
             **{
                 "resource_type": definition.resource_type,
-                "resource_id": self.reference(identity),
                 "relation": relation.name,
                 "caveat_name": "",
             }
@@ -471,7 +514,7 @@ class LocalQueryScope:
             # using the DB clock here would let the two evaluation strategies
             # disagree inside the app/DB clock-skew window and break the
             # ``accessible() == queryset`` parity contract.
-            rows = rows.filter(Q(expires_at__isnull=True) | Q(expires_at__gt=timezone.now()))
+            rows = rows.filter(Q(expires_at__isnull=True) | Q(expires_at__gt=_ExecutionTime()))
         else:
             rows = rows.filter(expires_at__isnull=True)
         allowed_rows = _truth(False)
@@ -479,7 +522,7 @@ class LocalQueryScope:
             shape = self.subject_shape(allowed)
             member = self.subject_membership(allowed, target, seen, context)
             allowed_rows |= shape & member
-        return Q(Exists(rows.filter(allowed_rows)))
+        return self.membership(identity, rows.filter(allowed_rows), "_scope_resource_id")
 
     def hop(
         self,

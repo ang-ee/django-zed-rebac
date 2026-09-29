@@ -200,7 +200,6 @@ class LocalBackend(Backend):
 
         from ..evaluator import current_evaluator
         from ..models import SchemaDefinition
-        from ..schema.generation import schema_triggers_verified
 
         with self._schema_lock:
             if self._schema_is_manual and self._schema is not None:
@@ -238,7 +237,7 @@ class LocalBackend(Backend):
             with self._schema_lock:
                 degraded = connection.alias in self._uncacheable_aliases
             revision = None if degraded else self._read_schema_revision(connection)
-            if revision is None or not schema_triggers_verified(connection):
+            if revision is None:
                 with self._schema_lock:
                     self._uncacheable_aliases.add(connection.alias)
                     self._evict_schema_alias(connection.alias)
@@ -354,6 +353,18 @@ class LocalBackend(Backend):
             return None
         return snapshot.generation, _relationship_generation
 
+    def _scope_plan_generation(self) -> tuple[int, int, int, str] | None:
+        """Validated schema identity for SQL, including live-backed types."""
+        snapshot = self._schema_snapshot()
+        if snapshot.revision is None and not self._schema_is_manual:
+            return None
+        return (
+            snapshot.generation,
+            snapshot.invalidation_generation,
+            _relationship_generation,
+            app_settings.REBAC_LOCAL_BACKEND_STORAGE,
+        )
+
     def _schema_facts(self, snapshot: SchemaSnapshot) -> _SchemaFacts:
         """Whole-schema facts derived once per schema generation."""
         from ..schema.introspection import accessible_is_exact, live_backed_resource_types
@@ -417,6 +428,8 @@ class LocalBackend(Backend):
                 Prefetch(
                     "relations", queryset=SchemaRelation.objects.using(using).order_by("name")
                 ),
+            )
+            .prefetch_related(
                 Prefetch(
                     "permissions", queryset=SchemaPermission.objects.using(using).order_by("name")
                 ),
@@ -634,6 +647,26 @@ class LocalBackend(Backend):
         # Cycle-breaker for self-referential traversals (e.g. folder.parent->read).
         # Mapping `(resource_type, action)` -> currently-resolving sentinel or set.
         cache: dict[tuple[str, str], set[str] | None] = {}
+        from ..schema.introspection import _has_recursive_dispatch
+
+        if _has_recursive_dispatch(self.schema(), (resource_type, action)):
+            # A fixpoint drops both overflow candidates and branch ordering.
+            # Enumerate possible resources, then use the check walker so a
+            # denied/outsider path raises at the same reachable bound too.
+            return [
+                resource_id
+                for resource_id in sorted(self._enumeration_candidates(definition))
+                if self._eval_permission_on(
+                    permission_name=action,
+                    definition=definition,
+                    resource_id=resource_id,
+                    subject=subject,
+                    depth=0,
+                    context=context,
+                    missing=set(),
+                )
+                is True
+            ]
         if permission is None:
             if _find_relation(definition, action) is None:
                 return []
@@ -657,6 +690,32 @@ class LocalBackend(Backend):
                 context=context,
             )
         )
+
+    def _enumeration_candidates(self, definition: Definition) -> set[str]:
+        """Possible resources, including denied frontiers; never cached."""
+        from .._id import resource_id_attr
+        from ..models import active_relationship_model
+        from ..resources import model_for_resource_type
+
+        candidates = set(
+            active_relationship_model()
+            .objects.filter(resource_type=definition.resource_type)
+            .values_list("resource_id", flat=True)
+        )
+        model = model_for_resource_type(definition.resource_type)
+        if model is not None:
+            candidates.update(
+                str(value)
+                for value in model._base_manager.values_list(resource_id_attr(model), flat=True)
+            )
+        for relation in definition.relations:
+            attribute = self._resolve_declared_attribute_backing(definition, relation)
+            if attribute is not None:
+                targets = attribute.target_model._base_manager.values_list(
+                    attribute.target_id_attr, flat=True
+                )
+                candidates.update(attribute.resource_ids_for_targets(targets))
+        return candidates
 
     @_schema_operation
     def grants_all(

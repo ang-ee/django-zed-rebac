@@ -307,7 +307,7 @@ def accessible_is_exact(schema: Schema) -> bool:
     )
 
 
-def _has_recursive_dispatch(schema: Schema) -> bool:
+def _has_recursive_dispatch(schema: Schema, start: tuple[str, str] | None = None) -> bool:
     """An arrow participates in a cycle exactly when its target reaches its source.
 
     Subject-set-only cycles already enforce enumeration depth. Testing return
@@ -326,14 +326,25 @@ def _has_recursive_dispatch(schema: Schema) -> bool:
             for edge in dispatch_edges(schema, *key)
         )
 
+    if start is None:
+        nodes = {
+            (definition.resource_type, permission.name)
+            for definition in schema.definitions
+            for permission in definition.permissions
+        }
+    else:
+        nodes = set()
+        pending = [start]
+        while pending:
+            key = pending.pop()
+            if key in nodes:
+                continue
+            nodes.add(key)
+            pending.extend((e.resource_type, e.action) for e in dispatch_edges(schema, *key))
     return any(
-        edge.is_arrow
-        and reaches(
-            (edge.resource_type, edge.action), (definition.resource_type, permission.name), set()
-        )
-        for definition in schema.definitions
-        for permission in definition.permissions
-        for edge in dispatch_edges(schema, definition.resource_type, permission.name)
+        edge.is_arrow and reaches((edge.resource_type, edge.action), key, set())
+        for key in sorted(nodes)
+        for edge in dispatch_edges(schema, *key)
     )
 
 

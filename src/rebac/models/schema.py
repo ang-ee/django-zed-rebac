@@ -6,11 +6,13 @@ from typing import TYPE_CHECKING
 
 from django.db import models
 
+from .schema_write import SchemaRow
+
 if TYPE_CHECKING:
     from django.db.models.fields.related_descriptors import RelatedManager
 
 
-class SchemaDefinition(models.Model):
+class SchemaDefinition(SchemaRow):
     resource_type = models.CharField(max_length=64, unique=True)
 
     if TYPE_CHECKING:
@@ -19,14 +21,14 @@ class SchemaDefinition(models.Model):
         relations: RelatedManager[SchemaRelation]
         permissions: RelatedManager[SchemaPermission]
 
-    class Meta:
+    class Meta(SchemaRow.Meta):
         app_label = "rebac"
 
     def __str__(self) -> str:
         return self.resource_type
 
 
-class SchemaRelation(models.Model):
+class SchemaRelation(SchemaRow):
     definition = models.ForeignKey(
         SchemaDefinition, on_delete=models.CASCADE, related_name="relations"
     )
@@ -41,7 +43,7 @@ class SchemaRelation(models.Model):
     caveat = models.CharField(max_length=64, blank=True, default="")
     with_expiration = models.BooleanField(default=False)
 
-    class Meta:
+    class Meta(SchemaRow.Meta):
         app_label = "rebac"
         unique_together = [("definition", "name")]
 
@@ -49,14 +51,14 @@ class SchemaRelation(models.Model):
         return f"{self.definition.resource_type}#{self.name}"
 
 
-class SchemaPermission(models.Model):
+class SchemaPermission(SchemaRow):
     definition = models.ForeignKey(
         SchemaDefinition, on_delete=models.CASCADE, related_name="permissions"
     )
     name = models.CharField(max_length=64)
     expression = models.TextField()
 
-    class Meta:
+    class Meta(SchemaRow.Meta):
         app_label = "rebac"
         unique_together = [("definition", "name")]
 
@@ -64,13 +66,13 @@ class SchemaPermission(models.Model):
         return f"{self.definition.resource_type}#{self.name}"
 
 
-class SchemaCaveat(models.Model):
+class SchemaCaveat(SchemaRow):
     name = models.CharField(max_length=64, unique=True)
     # `[{"name": "ip", "type": "ipaddress"}, ...]`.
     params = models.JSONField(default=list)
     expression = models.TextField()
 
-    class Meta:
+    class Meta(SchemaRow.Meta):
         app_label = "rebac"
 
     def __str__(self) -> str:

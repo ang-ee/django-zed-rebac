@@ -1,6 +1,6 @@
 """Opt in with REBAC_TEST_SCHEMA_VENDORS=1 pytest -m schema_vendors.
 
-Exercise the migration's actual SQL on disposable PostgreSQL/MySQL containers;
+Exercise Django schema owners and upgrades on disposable PostgreSQL/MySQL containers;
 Docker storage is ephemeral and containers are removed even after failure.
 """
 
@@ -9,8 +9,6 @@ from __future__ import annotations
 import os
 import subprocess
 import time
-from importlib import import_module
-from types import SimpleNamespace
 
 import pytest
 
@@ -49,6 +47,8 @@ def vendor_database(request):
             "127.0.0.1::" + ("3306" if mysql else "5432"),
             "-e",
             secret,
+            "-e",
+            ("MYSQL_DATABASE" if mysql else "POSTGRES_DB") + "=rebac_schema",
             image,
         ]
     )
@@ -73,111 +73,24 @@ def vendor_database(request):
         _run(["docker", "rm", "-f", container])
 
 
-def test_vendor_schema_triggers(vendor_database):
-    vendor, container, _port = vendor_database
-    migration = import_module("rebac.migrations.0005_schema_generation")
-    mysql = vendor == "mysql"
-    statements = []
-    quote = "`" if mysql else '"'
-    editor = SimpleNamespace(
-        connection=SimpleNamespace(vendor=vendor),
-        quote_name=lambda name: f"{quote}{name}{quote}",
-        execute=statements.append,
-    )
-    # Model state with custom db_table values proves the migration doesn't
-    # assume the app's default table names.
-    state = SimpleNamespace(
-        get_model=lambda app, name: SimpleNamespace(
-            _meta=SimpleNamespace(db_table=f"probe_{name.lower()}")
-        )
-    )
-    witness = state.get_model("rebac", "SchemaGeneration")._meta.db_table
-    tables = migration.tables(state)
-    if mysql:
-        statements.extend(["CREATE DATABASE schema_probe", "USE schema_probe"])
-    statements.append(f"CREATE TABLE {witness} (id smallint PRIMARY KEY, revision varchar(32))")
-    statements.extend(
-        f"CREATE TABLE {table} (id bigint PRIMARY KEY, body varchar(100))" for table in tables
-    )
-    migration.install(state, editor)
-
-    def remember(name):
-        if mysql:
-            return f"SET @{name} = (SELECT revision FROM {witness} WHERE id=1)"
-        return f"SELECT revision AS {name} FROM {witness} WHERE id=1 \\gset"
-
-    before = "@before" if mysql else ":'before'"
-    temporary = "@temporary" if mysql else ":'temporary'"
-
-    def verify(predicate, label):
-        statements.append(
-            f"SELECT CASE WHEN {predicate} THEN '{label}:ok' ELSE 'FAIL' END "
-            f"FROM {witness} WHERE id=1"
-        )
-
-    for table in tables:
-        statements.extend([remember("before"), f"INSERT INTO {table} VALUES (1, 'original')"])
-        verify(f"revision<>{before}", "insert")
-        statements.extend(
-            [
-                remember("before"),
-                "START TRANSACTION",
-                f"UPDATE {table} SET body='temporary' WHERE id=1",
-                remember("temporary"),
-                "ROLLBACK",
-            ]
-        )
-        verify(f"revision={before}", "rollback")
-        statements.append(f"UPDATE {table} SET body='committed' WHERE id=1")
-        verify(f"revision<>{temporary} AND revision<>{before}", "new-revision")
-        statements.extend([remember("before"), f"DELETE FROM {table} WHERE id=1"])
-        verify(f"revision<>{before}", "delete")
-    migration.uninstall(state, editor)
-    migration.uninstall(state, editor)  # Idempotent reverse, including partial DDL.
-
-    if mysql:
-        sql = "DELIMITER //\n" + "\n".join(s + "//" for s in statements)
-        client = ["mysql", "-uroot", "-pschema-test", "--batch", "--skip-column-names"]
-    else:
-        sql = "\n".join(s if s.endswith("\\gset") else s + ";" for s in statements)
-        client = ["psql", "-U", "postgres", "-v", "ON_ERROR_STOP=1", "-tA"]
-    result = _run(["docker", "exec", "-i", container, *client], input=sql)
-    assert result.returncode == 0, result.stdout + result.stderr
-    assert "FAIL" not in result.stdout
-    assert result.stdout.count(":ok") == 20
-
-
-def test_vendor_django_schema_paths(vendor_database, django_db_blocker, monkeypatch):
+@pytest.mark.parametrize("storage", ["denormalized", "registry"])
+@pytest.mark.django_db(transaction=True)
+def test_vendor_django_schema_owners_and_upgrade(
+    vendor_database, django_db_blocker, settings, storage
+):
     vendor, _container, port = vendor_database
-    if vendor == "postgresql":
-        try:
-            import_module("psycopg")
-        except ImportError:
-            pytest.importorskip(
-                "psycopg2", reason="Django PostgreSQL paths need psycopg or psycopg2"
-            )
-    else:
-        pytest.importorskip("MySQLdb", reason="Django MySQL paths need the mysqlclient driver")
+    pytest.importorskip("MySQLdb" if vendor == "mysql" else "psycopg")
 
-    from django.apps import apps
-    from django.db import connections, transaction
+    from django.db import connections
     from django.db.utils import ConnectionHandler
-    from django.test.utils import CaptureQueriesContext
 
-    from rebac import LocalBackend
-    from rebac.models.generation import SchemaGeneration
-    from rebac.schema.generation import (
-        missing_schema_triggers,
-        refresh_schema_revision,
-        schema_triggers_verified,
-    )
-
-    alias = f"schema_driver_{vendor}"
+    settings.REBAC_LOCAL_BACKEND_STORAGE = storage
+    alias = f"schema_owner_{vendor}"
     handler = ConnectionHandler(
         {
             "default": {
                 "ENGINE": "django.db.backends." + vendor,
-                "NAME": "mysql" if vendor == "mysql" else "postgres",
+                "NAME": "rebac_schema",
                 "USER": "root" if vendor == "mysql" else "postgres",
                 "PASSWORD": "schema-test",
                 "HOST": "127.0.0.1",
@@ -188,45 +101,67 @@ def test_vendor_django_schema_paths(vendor_database, django_db_blocker, monkeypa
     db = handler["default"]
     db.alias = alias
     connections[alias] = db
-    local = LocalBackend()
-    migration = import_module("rebac.migrations.0005_schema_generation")
-    monkeypatch.setattr("rebac.schema.generation._trigger_checks", {})
     try:
         with django_db_blocker.unblock():
-            # Autocommit exercises the actual driver's missing-table exception
-            # (sqlstate for psycopg, pgcode for psycopg2, errno for mysqlclient).
-            assert local._read_schema_revision(db) is None
-            with transaction.atomic(using=alias), CaptureQueriesContext(db) as queries:
-                assert local._read_schema_revision(db) is None
-                with db.cursor() as cursor:
-                    cursor.execute("SELECT 1")  # Missing metadata did not abort the transaction.
-                    assert cursor.fetchone()[0] == 1
-            if vendor == "postgresql":
-                assert any("to_regclass" in q["sql"] for q in queries)
-            assert len(missing_schema_triggers(db)) == 15
-            with db.schema_editor() as editor:
-                editor.create_model(SchemaGeneration)
-                for table in migration.tables(apps):
-                    editor.execute(
-                        f"CREATE TABLE {editor.quote_name(table)} "
-                        "(id bigint PRIMARY KEY, body varchar(100))"
-                    )
-                migration.install(apps, editor)
-            assert missing_schema_triggers(db) == []
-            assert schema_triggers_verified(db)
-            before = local._read_schema_revision(db)
-            assert before is not None
-            table = db.ops.quote_name(migration.tables(apps)[0])
-            with db.cursor() as cursor:
-                cursor.execute(f"TRUNCATE TABLE {table}")
-            assert local._read_schema_revision(db) == before
-            refresh_schema_revision(db)
-            assert local._read_schema_revision(db) != before
-            with db.schema_editor() as editor:
-                migration.uninstall(apps, editor)
-                migration.uninstall(apps, editor)
-            assert len(missing_schema_triggers(db)) == 15
+            exercise_vendor_owners(db)
     finally:
         with django_db_blocker.unblock():
             db.close()
         del connections[alias]
+
+
+def exercise_vendor_owners(db):
+    """Also callable by a disposable runner with the vendor's native driver."""
+    from django.core.management import call_command
+    from django.db import transaction
+
+    from rebac import LocalBackend
+    from rebac.models.generation import SchemaGeneration
+
+    from .test_schema_write_owners import (
+        installed_database_objects,
+        policy_row,
+        upgrade_schema_owners,
+    )
+
+    local = LocalBackend()
+    assert local._read_schema_revision(db) is None
+    with transaction.atomic(using=db.alias):
+        assert local._read_schema_revision(db) is None
+        with db.cursor() as cursor:
+            cursor.execute("SELECT 1")
+            assert cursor.fetchone()[0] == 1
+    call_command("migrate", database=db.alias, verbosity=0)
+    upgrade_schema_owners(db)
+    for kind in ("definition", "relation", "permission", "caveat", "override"):
+        # Roll back fixtures too, keeping each model scenario independent.
+        with transaction.atomic(using=db.alias):
+            row, changes = policy_row(kind, using=db.alias)
+            manager = type(row).objects.using(db.alias)
+            revisions = [local._read_schema_revision(db)]
+            manager.bulk_create([row])
+            if row.pk is None:  # MySQL does not return IDs from bulk inserts.
+                row = manager.latest("pk")
+            revisions.append(local._read_schema_revision(db))
+            manager.filter(pk=row.pk).update(**changes)
+            revisions.append(local._read_schema_revision(db))
+            for field, value in changes.items():
+                setattr(row, field, value)
+            manager.bulk_update([row], list(changes))
+            revisions.append(local._read_schema_revision(db))
+            row.save(using=db.alias)
+            revisions.append(local._read_schema_revision(db))
+            with transaction.atomic(using=db.alias):
+                manager.filter(pk=row.pk).delete()
+                assert local._read_schema_revision(db) not in revisions
+                transaction.set_rollback(True, using=db.alias)
+            assert local._read_schema_revision(db) == revisions[-1]
+            row.delete(using=db.alias)
+            revisions.append(local._read_schema_revision(db))
+            assert len(set(revisions)) == len(revisions)
+            transaction.set_rollback(True, using=db.alias)
+    assert installed_database_objects(db) == set()
+    SchemaGeneration.objects.using(db.alias).all().delete()
+    assert local._read_schema_revision(db) is None
+    SchemaGeneration.objects.advance(using=db.alias)
+    assert local._read_schema_revision(db) is not None

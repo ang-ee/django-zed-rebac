@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import hashlib
 import json
-from contextlib import contextmanager
+from contextlib import contextmanager, nullcontext
 from itertools import pairwise
 from pathlib import Path
 from unittest.mock import patch
@@ -21,6 +21,7 @@ from rebac import (
     RelationshipTuple,
     SubjectRef,
     backend,
+    evaluator_scope,
     sudo,
     to_object_ref,
 )
@@ -129,13 +130,14 @@ def grant(active, row, member, actor=ACTOR):
 @pytest.mark.parametrize("shape", ["role", "folder"])
 @pytest.mark.parametrize("backing", ["tuple", "field"])
 @pytest.mark.parametrize("depth", [0, 1, 2, 8])
-def test_recursive_chain_parity(storage, shape, backing, depth):
+@pytest.mark.parametrize("reuse", [False, True])
+def test_recursive_chain_parity(storage, shape, backing, depth, reuse):
     with schema_context(storage, shape, backing) as (active, member, hop, action):
         rows = chain(active, hop, backing, depth)
         actors = [SubjectRef.of("auth/user", str(100 + i)) for i in range(len(rows))]
         for row, actor in zip(rows, actors, strict=True):
             grant(active, row, member, actor)
-        with no_enumeration(active):
+        with no_enumeration(active), evaluator_scope() if reuse else nullcontext():
             for level, actor in enumerate([*actors, OUTSIDER, ANONYMOUS]):
                 expected = {row.pk for row in rows[level:]} if level < len(rows) else set()
                 scoped = Folder.objects.with_actor(actor).with_action(action)
@@ -260,7 +262,7 @@ def test_early_grant_and_live_boundary(storage, backing):
 
 
 @pytest.mark.parametrize("storage", ["denormalized", "registry"])
-def test_nonrecursive_sql_is_byte_identical(storage):
+def test_nonrecursive_subject_first_sql_is_deterministic(storage):
     fingerprints = json.loads(
         (Path(__file__).parent / "fixtures/nonrecursive_scope_sql.json").read_text()
     )

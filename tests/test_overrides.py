@@ -151,7 +151,7 @@ def test_expired_override_cannot_grant_access(monkeypatch, warm_cache, surface):
 
 
 @pytest.mark.django_db(transaction=True)
-def test_next_scope_observes_schema_edits_without_local_signals():
+def test_next_scope_observes_schema_edits_without_local_signals(monkeypatch):
     sp = _seed_db_schema("blog/post", "read", "viewer")
     local = LocalBackend()
     viewer = SubjectRef.of("auth/user", "viewer")
@@ -161,18 +161,20 @@ def test_next_scope_observes_schema_edits_without_local_signals():
         assert evaluator.check(local, subject=viewer, action="read", resource=post).allowed
         # A different connection has neither this evaluator's SQL observer nor
         # local model signals, as with a write committed by another worker.
-        from django.db import connection
+        from django.db import connection, connections
         from django.db.backends.base.base import BaseDatabaseWrapper
 
         other = connection.copy(alias="schema_writer")
+        connections[other.alias] = other
         try:
-            with other.cursor() as cursor:
-                cursor.execute(
-                    'UPDATE "rebac_schemapermission" SET "expression" = %s WHERE "id" = %s',
-                    ["owner", sp.pk],
+            with monkeypatch.context() as external:
+                external.setattr("rebac.signals._mark_schema_caches_stale", lambda: None)
+                SchemaPermission.objects.using(other.alias).filter(pk=sp.pk).update(
+                    expression="owner"
                 )
         finally:
             BaseDatabaseWrapper.close(other)
+            del connections[other.alias]
         assert evaluator.check(local, subject=viewer, action="read", resource=post).allowed
     with evaluator_scope() as evaluator:
         assert not evaluator.check(local, subject=viewer, action="read", resource=post).allowed

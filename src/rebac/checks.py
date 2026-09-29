@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import logging
-from collections.abc import Sequence
 from typing import TYPE_CHECKING, Any
 
 from django.core import checks
@@ -16,55 +15,6 @@ from .roles import is_role_type
 
 if TYPE_CHECKING:
     from .schema.ast import Schema
-
-
-@checks.register("rebac", checks.Tags.database)
-def check_schema_generation(
-    app_configs: Any = None, *, databases: Sequence[str] | None = None, **kwargs: Any
-) -> list[checks.CheckMessage]:
-    """Validate the schema witness on its routed alias when DB checks are requested."""
-    from django.db import connections
-
-    from .models import SchemaDefinition
-    from .models.generation import SchemaGeneration
-    from .schema.generation import missing_schema_triggers
-
-    if databases is None or app_settings.REBAC_BACKEND != "local":
-        return []
-    alias = SchemaDefinition.objects.db
-    if alias not in databases:
-        return []
-    connection = connections[alias]
-    table = SchemaGeneration._meta.db_table
-    with connection.cursor() as cursor:
-        present = table in connection.introspection.table_names(cursor)
-    if not present:
-        from django.db.migrations.recorder import MigrationRecorder
-
-        # migrate runs database checks before applying operations. A pending
-        # witness migration must not prevent the command that installs it.
-        if ("rebac", "0005_schema_generation") not in MigrationRecorder(
-            connection
-        ).applied_migrations():
-            return []
-    healthy = present and bool(
-        SchemaGeneration.objects.using(alias)
-        .filter(pk=1)
-        .values_list("revision", flat=True)
-        .first()
-    )
-    missing = missing_schema_triggers(connection)
-    if healthy and not missing:
-        return []
-    return [
-        checks.Error(
-            f"Schema revision witness is incomplete on database {alias!r}: "
-            f"{'missing table or revision row; ' if not healthy else ''}"
-            f"missing or disabled triggers: {', '.join(missing) or 'none'}.",
-            hint="Apply rebac migrations before serving; restore missing schema triggers.",
-            id="rebac.E012",
-        )
-    ]
 
 
 def _schema_for_checks() -> Schema | None:

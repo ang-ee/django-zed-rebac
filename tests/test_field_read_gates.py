@@ -381,7 +381,8 @@ def test_no_read_gates_do_not_add_field_accessible_calls(alice, monkeypatch):
     post_table = connection.ops.quote_name(Post._meta.db_table)
     row_queries = [query["sql"] for query in queries if f"FROM {post_table}" in query["sql"]]
     assert len(row_queries) == 1
-    assert "EXISTS" in row_queries[0]
+    assert " IN (SELECT " in row_queries[0]
+    assert "EXISTS" not in row_queries[0]
 
 
 @override_settings(REBAC_FIELD_READ_MODE="redact")

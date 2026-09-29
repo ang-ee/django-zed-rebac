@@ -251,14 +251,10 @@ class Command(BaseCommand):
     # ---------- sync ----------
 
     def _handle_sync(self, options: dict[str, Any]) -> None:
-        from django.db import transaction
+        from django.db import router
 
-        from ...models import (
-            SchemaCaveat,
-            SchemaDefinition,
-            SchemaPermission,
-            SchemaRelation,
-        )
+        from ...models import SchemaDefinition
+        from ...models.generation import schema_write_atomic
 
         check_only = options["check"]
         force = options["force_overwrite"]
@@ -321,13 +317,23 @@ class Command(BaseCommand):
                 self.stderr.write(self.style.ERROR(f"  effective schema: {error}"))
             raise CommandError("Effective schema validation failed")
 
+        alias = router.db_for_write(SchemaDefinition)
+        with schema_write_atomic(alias):
+            self._apply_schema_sources(sources, check_only=check_only, force=force, using=alias)
+
+    def _apply_schema_sources(
+        self, sources: list[tuple[Any, Path, Any]], *, check_only: bool, force: bool, using: str
+    ) -> None:
+        from ...models import SchemaCaveat, SchemaDefinition, SchemaPermission, SchemaRelation
+        from ...models.generation import SchemaGeneration, schema_write_atomic
+
         any_drift = False
         for app_config, schema_path, schema in sources:
             package_name = app_config.name
 
             self.stdout.write(f"-> {package_name} ({schema_path})")
 
-            with transaction.atomic():
+            with schema_write_atomic(using):
                 expected_external_ids: set[str] = set()
                 # Caveats first (definitions reference them).
                 for caveat in schema.caveats:
@@ -345,6 +351,7 @@ class Command(BaseCommand):
                         external_id=external_id,
                         check_only=check_only,
                         force=force,
+                        using=using,
                     )
                     any_drift = any_drift or drift
 
@@ -360,11 +367,14 @@ class Command(BaseCommand):
                         external_id=external_id,
                         check_only=check_only,
                         force=force,
+                        using=using,
                     )
                     any_drift = any_drift or drift
-                    schema_def = SchemaDefinition.objects.filter(
-                        resource_type=d.resource_type
-                    ).first()
+                    schema_def = (
+                        SchemaDefinition.objects.using(using)
+                        .filter(resource_type=d.resource_type)
+                        .first()
+                    )
                     if schema_def is None:
                         continue
 
@@ -396,6 +406,7 @@ class Command(BaseCommand):
                             external_id=external_id,
                             check_only=check_only,
                             force=force,
+                            using=using,
                         )
                         any_drift = any_drift or drift
 
@@ -412,6 +423,7 @@ class Command(BaseCommand):
                             external_id=external_id,
                             check_only=check_only,
                             force=force,
+                            using=using,
                         )
                         any_drift = any_drift or drift
 
@@ -421,6 +433,7 @@ class Command(BaseCommand):
                         keep_names=relation_names,
                         check_only=check_only,
                         force=force,
+                        using=using,
                     )
                     any_drift = any_drift or drift
                     drift = self._prune_schema_children(
@@ -429,6 +442,7 @@ class Command(BaseCommand):
                         keep_names=permission_names,
                         check_only=check_only,
                         force=force,
+                        using=using,
                     )
                     any_drift = any_drift or drift
 
@@ -437,6 +451,7 @@ class Command(BaseCommand):
                     keep_external_ids=expected_external_ids,
                     check_only=check_only,
                     force=force,
+                    using=using,
                 )
                 any_drift = any_drift or drift
 
@@ -446,14 +461,10 @@ class Command(BaseCommand):
             self.stdout.write(self.style.SUCCESS("OK — no drift."))
             return
 
-        # Publish even an unchanged sync: TRUNCATE does not fire DML triggers.
-        from django.db import connections
-
+        # Publish even an unchanged sync inside the schema-write transaction.
         from ...backends import reset_backend
-        from ...models import SchemaDefinition
-        from ...schema.generation import refresh_schema_revision
 
-        refresh_schema_revision(connections[SchemaDefinition.objects.db])
+        SchemaGeneration.objects.advance(using=using)
         reset_backend()
         self.stdout.write(self.style.SUCCESS("Sync complete."))
 
@@ -466,6 +477,7 @@ class Command(BaseCommand):
         external_id: str,
         check_only: bool,
         force: bool,
+        using: str = "default",
     ) -> bool:
         """Sync one schema row, respecting `no_update`. Returns True if drifted."""
         from django.contrib.contenttypes.models import ContentType
@@ -473,19 +485,21 @@ class Command(BaseCommand):
         from ...models import PackageManagedRecord
 
         content_hash = self._hash_payload({**natural_key, **payload})
-        existing = model_cls.objects.filter(**natural_key).first()
-        ct = ContentType.objects.get_for_model(model_cls)
+        existing = model_cls.objects.using(using).filter(**natural_key).first()
+        ct = ContentType.objects.db_manager(using).get_for_model(model_cls)
 
-        record = PackageManagedRecord.objects.filter(
-            package=package, external_id=external_id
-        ).first()
+        record = (
+            PackageManagedRecord.objects.using(using)
+            .filter(package=package, external_id=external_id)
+            .first()
+        )
 
         if existing is None:
             # Fresh.
             if check_only:
                 return True
-            obj = model_cls.objects.create(**natural_key, **payload)
-            PackageManagedRecord.objects.update_or_create(
+            obj = model_cls.objects.using(using).create(**natural_key, **payload)
+            PackageManagedRecord.objects.using(using).update_or_create(
                 package=package,
                 external_id=external_id,
                 defaults={
@@ -508,8 +522,8 @@ class Command(BaseCommand):
                 return True
             for k, v in payload.items():
                 setattr(existing, k, v)
-            existing.save()
-            PackageManagedRecord.objects.create(
+            existing.save(using=using)
+            PackageManagedRecord.objects.using(using).create(
                 package=package,
                 external_id=external_id,
                 schema_revision=1,
@@ -527,7 +541,7 @@ class Command(BaseCommand):
             if record.content_hash != content_hash and not check_only:
                 record.content_hash = content_hash
                 record.last_synced_at = timezone.now()
-                record.save(update_fields=["content_hash", "last_synced_at"])
+                record.save(using=using, update_fields=["content_hash", "last_synced_at"])
             return False  # no-op
 
         if record.no_update and not force:
@@ -542,10 +556,10 @@ class Command(BaseCommand):
             return True
         for k, v in payload.items():
             setattr(existing, k, v)
-        existing.save()
+        existing.save(using=using)
         record.content_hash = content_hash
         record.last_synced_at = timezone.now()
-        record.save(update_fields=["content_hash", "last_synced_at"])
+        record.save(using=using, update_fields=["content_hash", "last_synced_at"])
         return False
 
     def _prune_schema_children(
@@ -556,9 +570,14 @@ class Command(BaseCommand):
         keep_names: set[str],
         check_only: bool,
         force: bool,
+        using: str = "default",
     ) -> bool:
         """Remove relation/permission rows no longer declared by the package schema."""
-        stale = list(model_cls.objects.filter(definition=definition).exclude(name__in=keep_names))
+        stale = list(
+            model_cls.objects.using(using)
+            .filter(definition=definition)
+            .exclude(name__in=keep_names)
+        )
         if not stale:
             return False
         if check_only or not force:
@@ -576,10 +595,12 @@ class Command(BaseCommand):
 
         from ...models import PackageManagedRecord
 
-        ct = ContentType.objects.get_for_model(model_cls)
+        ct = ContentType.objects.db_manager(using).get_for_model(model_cls)
         target_pks = [obj.pk for obj in stale]
-        PackageManagedRecord.objects.filter(target_ct=ct, target_pk__in=target_pks).delete()
-        model_cls.objects.filter(pk__in=target_pks).delete()
+        PackageManagedRecord.objects.using(using).filter(
+            target_ct=ct, target_pk__in=target_pks
+        ).delete()
+        model_cls.objects.using(using).filter(pk__in=target_pks).delete()
         return True
 
     def _prune_package_records(
@@ -589,13 +610,14 @@ class Command(BaseCommand):
         keep_external_ids: set[str],
         check_only: bool,
         force: bool,
+        using: str = "default",
     ) -> bool:
         from ...models import PackageManagedRecord
 
         schema_prefixes = ("caveat:", "definition:", "relation:", "permission:")
         stale = [
             record
-            for record in PackageManagedRecord.objects.filter(package=package)
+            for record in PackageManagedRecord.objects.using(using).filter(package=package)
             if record.external_id.startswith(schema_prefixes)
             and record.external_id not in keep_external_ids
         ]
@@ -616,8 +638,8 @@ class Command(BaseCommand):
         ):
             target = record.target
             if target is not None:
-                target.delete()
-            record.delete()
+                target.delete(using=using)
+            record.delete(using=using)
         return True
 
     @staticmethod

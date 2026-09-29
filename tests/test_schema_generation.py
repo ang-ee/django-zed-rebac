@@ -4,12 +4,10 @@ from __future__ import annotations
 
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import nullcontext
-from importlib import import_module
 from io import StringIO
 from threading import Barrier, Event
 
 import pytest
-from django.apps import apps
 from django.contrib.contenttypes.models import ContentType
 from django.core.management import call_command
 from django.db import connection, connections, transaction
@@ -27,7 +25,6 @@ from rebac import (
     sudo,
 )
 from rebac.backends import reset_backend
-from rebac.checks import check_schema_generation
 from rebac.models import (
     SchemaCaveat,
     SchemaDefinition,
@@ -41,12 +38,6 @@ from .testapp.models import Folder, Post
 
 pytestmark = pytest.mark.django_db(transaction=True)
 ACTOR = SubjectRef.of("auth/user", "reader")
-
-
-@pytest.fixture(autouse=True)
-def fresh_process_trigger_checks(monkeypatch):
-    # Each test can simulate process startup against intact or damaged metadata.
-    monkeypatch.setattr("rebac.schema.generation._trigger_checks", {})
 
 
 @pytest.fixture(params=["denormalized", "registry"])
@@ -84,12 +75,19 @@ def _permission():
     return SchemaPermission.objects.get(definition__resource_type="blog/post", name="write")
 
 
-def _raw_permission(expression, pk, *, using=connection):
-    with using.cursor() as cursor:
-        cursor.execute(
-            'UPDATE "rebac_schemapermission" SET "expression" = %s WHERE "id" = %s',
-            [expression, pk],
-        )
+def _write_permission(expression, pk, *, using=connection):
+    # Copied connections need registration for Django's transaction owner.
+    if using is connection:
+        using = connections["default"]
+    original = connections[using.alias] if using.alias in connections else None
+    connections[using.alias] = using
+    try:
+        SchemaPermission.objects.using(using.alias).filter(pk=pk).update(expression=expression)
+    finally:
+        if original is None:
+            del connections[using.alias]
+        else:
+            connections[using.alias] = original
 
 
 @pytest.mark.parametrize("atomic", [False, True])
@@ -185,15 +183,9 @@ def test_evaluator_revalidates_once_per_transaction_boundary(synced):
 def test_absent_witness_never_caches_a_revoked_grant(synced, scoped):
     local, resource = synced
     permission = _permission()
-    migration = import_module("rebac.migrations.0005_schema_generation")
-    with connection.schema_editor() as editor:
-        migration.uninstall(apps, editor)
     SchemaGeneration.objects.all().delete()
     other = connection.copy(alias="unwitnessed_writer")
     try:
-        errors = check_schema_generation(databases=["default"])
-        assert [error.id for error in errors] == ["rebac.E012"]
-        assert "missing table or revision row" in errors[0].msg
         with evaluator_scope() if scoped else nullcontext() as evaluator:
 
             def check():
@@ -204,48 +196,14 @@ def test_absent_witness_never_caches_a_revoked_grant(synced, scoped):
                 return _check(local, resource)
 
             assert check()
-            _raw_permission("nil", permission.pk, using=other)
+            _write_permission("nil", permission.pk, using=other)
             assert not check()
             assert not check()
             if evaluator is not None:
                 assert evaluator.stats()["check_entries"] == 0
     finally:
         BaseDatabaseWrapper.close(other)
-        with connection.schema_editor() as editor:
-            SchemaGeneration.objects.all().delete()
-            migration.install(apps, editor)
-
-
-def test_missing_triggers_are_reported_even_with_revision_row(synced):
-    migration = import_module("rebac.migrations.0005_schema_generation")
-    assert check_schema_generation(databases=["default"]) == []
-    with connection.schema_editor() as editor:
-        migration.uninstall(apps, editor)
-        migration.uninstall(apps, editor)  # Partial reversals are safe to retry.
-    try:
-        errors = check_schema_generation(databases=["default"])
-        assert [error.id for error in errors] == ["rebac.E012"]
-        assert "missing table or revision row" not in errors[0].msg
-        assert "rebac_schemapermission_update_generation" in errors[0].msg
-    finally:
-        SchemaGeneration.objects.all().delete()
-        with connection.schema_editor() as editor:
-            SchemaGeneration.objects.all().delete()
-            migration.install(apps, editor)
-
-
-def test_missing_witness_table_after_migration_is_reported(synced):
-    migration = import_module("rebac.migrations.0005_schema_generation")
-    with connection.schema_editor() as editor:
-        migration.uninstall(apps, editor)
-        editor.delete_model(SchemaGeneration)
-    try:
-        assert [e.id for e in check_schema_generation(databases=["default"])] == ["rebac.E012"]
-    finally:
-        with connection.schema_editor() as editor:
-            editor.create_model(SchemaGeneration)
-            SchemaGeneration.objects.all().delete()
-            migration.install(apps, editor)
+        SchemaGeneration.objects.advance(using="default")
 
 
 @pytest.mark.parametrize("atomic", [False, True])
@@ -254,17 +212,22 @@ def test_unmigrated_database_loads_uncached(synced, atomic):
     permission = _permission()
     try:
         call_command("migrate", "rebac", "0004", verbosity=0)
-        # The migration command's preflight must permit installing its witness.
-        assert check_schema_generation(databases=["default"]) == []
         with transaction.atomic() if atomic else nullcontext(), evaluator_scope() as evaluator:
             assert evaluator.check(local, subject=ACTOR, action="write", resource=resource).allowed
-            _raw_permission("nil", permission.pk)
+            from django.db.migrations.executor import MigrationExecutor
+
+            legacy = (
+                MigrationExecutor(connection)
+                .loader.project_state([("rebac", "0004_field_backing_path")])
+                .apps.get_model("rebac", "SchemaPermission")
+            )
+            legacy.objects.filter(pk=permission.pk).update(expression="nil")
             assert not evaluator.check(
                 local, subject=ACTOR, action="write", resource=resource
             ).allowed
         assert not _check(local, resource)
     finally:
-        call_command("migrate", "rebac", "0005", verbosity=0)
+        call_command("migrate", "rebac", "0006", verbosity=0)
 
 
 def test_revision_reads_can_run_concurrently(synced):
@@ -317,7 +280,7 @@ def test_revision_races_have_a_bounded_retry_budget(synced, monkeypatch):
     assert local._schema_loads == local._schema_snapshots == {}
     with evaluator_scope() as evaluator:
         assert evaluator.check(local, subject=ACTOR, action="write", resource=resource).allowed
-        _raw_permission("nil", _permission().pk)
+        _write_permission("nil", _permission().pk)
         assert not evaluator.check(local, subject=ACTOR, action="write", resource=resource).allowed
         assert evaluator.stats()["check_entries"] == 0
     assert local._schema_snapshots == local._schema_facts_memo == {}
@@ -334,7 +297,7 @@ def test_generation_model_is_private():
 def test_sync_invalidates_existing_backend_on_next_check(synced, monkeypatch, external):
     local, resource = synced
     permission = _permission()
-    _raw_permission("viewer", permission.pk)
+    _write_permission("viewer", permission.pk)
     assert not _check(local, resource)
     before = _revision()
     invalidation = local._schema_invalidation_generation
@@ -367,7 +330,7 @@ def test_sync_invalidates_existing_backend_on_next_check(synced, monkeypatch, ex
     assert len(warm) == 2
 
 
-def test_noop_sync_publishes_revision_for_trigger_free_maintenance(synced):
+def test_noop_sync_publishes_revision(synced):
     local, _ = synced
     before, schema = _revision(), local.schema()
     call_command("rebac", "sync", stdout=StringIO())
@@ -381,11 +344,11 @@ def test_noop_sync_publishes_revision_for_trigger_free_maintenance(synced):
 def test_rolled_back_revision_cannot_alias_a_later_schema(synced):
     local, resource = synced
     permission = _permission()
-    _raw_permission("viewer", permission.pk)
+    _write_permission("viewer", permission.pk)
     original = _revision()
     assert not _check(local, resource)
     with transaction.atomic():
-        _raw_permission("owner", permission.pk)
+        _write_permission("owner", permission.pk)
         temporary = _revision()
         assert _check(local, resource)
         transaction.set_rollback(True)
@@ -393,7 +356,7 @@ def test_rolled_back_revision_cannot_alias_a_later_schema(synced):
     # No intervening permission read after rollback: a counter could reuse the
     # temporary revision here and incorrectly grant from its cached AST.
     with transaction.atomic():
-        _raw_permission("viewer", permission.pk)
+        _write_permission("viewer", permission.pk)
         assert _revision() not in (original, temporary)
         assert not _check(local, resource)
     assert not _check(local, resource)
@@ -403,12 +366,12 @@ def test_rolled_back_revision_cannot_alias_a_later_schema(synced):
 def test_rollback_without_evaluator_discards_temporary_schema(synced, boundary):
     local, resource = synced
     permission = _permission()
-    _raw_permission("viewer", permission.pk)
+    _write_permission("viewer", permission.pk)
     assert not _check(local, resource)
     if boundary == "manual":
         transaction.set_autocommit(False)
         try:
-            _raw_permission("owner", permission.pk)
+            _write_permission("owner", permission.pk)
             assert _check(local, resource)
             transaction.rollback()
             assert not _check(local, resource)
@@ -418,7 +381,7 @@ def test_rollback_without_evaluator_discards_temporary_schema(synced, boundary):
     else:
         with transaction.atomic():
             savepoint = transaction.savepoint() if boundary == "savepoint" else None
-            _raw_permission("owner", permission.pk)
+            _write_permission("owner", permission.pk)
             assert _check(local, resource)
             if savepoint is not None:
                 transaction.savepoint_rollback(savepoint)
@@ -441,7 +404,7 @@ def test_load_retries_when_another_connection_changes_revision(synced, monkeypat
         result = load(using)
         calls.append(using)
         if len(calls) == 1:
-            _raw_permission("viewer", permission.pk, using=other)
+            _write_permission("viewer", permission.pk, using=other)
         return result
 
     monkeypatch.setattr(local, "_load_schema_from_db", racing_load)
@@ -570,10 +533,7 @@ def test_generation_tracks_bulk_insert_update_and_delete_on_every_schema_table(s
     revisions.append(_revision())
     model.objects.filter(pk=row.pk).update(**changes)
     revisions.append(_revision())
-    # Raw delete deliberately bypasses Django's signals and delete collector.
-    table = connection.ops.quote_name(model._meta.db_table)
-    with connection.cursor() as cursor:
-        cursor.execute(f"DELETE FROM {table} WHERE id = %s", [row.pk])
+    model.objects.filter(pk=row.pk).delete()
     revisions.append(_revision())
     assert len(set(revisions)) == 4
 
@@ -587,11 +547,11 @@ def test_generation_migration_reverses_without_changing_schema(synced):
         assert "rebac_schemageneration" not in connection.introspection.table_names()
         assert list(SchemaPermission.objects.order_by("pk").values()) == before
     finally:
-        call_command("migrate", "rebac", "0005", verbosity=0)
+        call_command("migrate", "rebac", "0006", verbosity=0)
     assert list(SchemaPermission.objects.order_by("pk").values()) == before
     assert _revision() != revision
     assert _check(local, resource)
-    _raw_permission("viewer", _permission().pk)
+    _write_permission("viewer", _permission().pk)
     assert not _check(local, resource)
 
 
@@ -672,11 +632,9 @@ def test_schema_and_override_cache_follow_routed_database(synced, tmp_path, djan
             )
             assert _check(local, resource)
             with override_settings(DATABASE_ROUTERS=[SchemaRouter()]):
-                assert check_schema_generation(databases=[alias]) == []
                 SchemaGeneration.objects.using(alias).all().delete()
-                assert [e.id for e in check_schema_generation(databases=[alias])] == ["rebac.E012"]
-                assert check_schema_generation(databases=["default"]) == []
-                # A schema write recreates the witness via the installed trigger.
+                assert local._read_schema_revision(target) is None
+                # A schema write recreates the witness through its Django owner.
                 permission.save(using=alias)
                 assert _check(local, resource)
                 # Both the override's target and all schema components must
@@ -693,84 +651,43 @@ def test_schema_and_override_cache_follow_routed_database(synced, tmp_path, djan
         del connections[alias]
 
 
-@pytest.mark.parametrize("scoped", [False, True])
-@pytest.mark.parametrize("all_triggers", [False, True])
-def test_missing_triggers_with_row_disable_runtime_cache(synced, monkeypatch, scoped, all_triggers):
-    _, resource = synced
-    permission = _permission()
-    migration = import_module("rebac.migrations.0005_schema_generation")
-    with connection.schema_editor() as editor:
-        if all_triggers:
-            migration.uninstall(apps, editor)
-        else:
-            editor.execute('DROP TRIGGER "rebac_schemapermission_update_generation"')
-    # Simulate the first witnessed load in a new worker, without a system check.
-    monkeypatch.setattr("rebac.schema.generation._trigger_checks", {})
-    local = LocalBackend()
-    other = connection.copy(alias="triggerless_writer")
+def test_sync_uses_one_schema_write_alias(synced, tmp_path, django_db_blocker):
+    from django.test import override_settings
+
+    alias = "schema_sync_target"
+    target = connection.copy(alias=alias)
+    target.settings_dict["NAME"] = str(tmp_path / "sync.sqlite3")
+    connections[alias] = target
+
+    class SchemaRouter:
+        def db_for_write(self, model, **hints):
+            return alias if model is SchemaDefinition else None
+
     try:
-        revision = _revision()
-        with evaluator_scope() if scoped else nullcontext() as evaluator:
-
-            def check():
-                if evaluator is not None:
-                    return evaluator.check(local, subject=ACTOR, action="write", resource=resource)
-                return local.check_access(subject=ACTOR, action="write", resource=resource)
-
-            assert check().allowed
-            _raw_permission("nil", permission.pk, using=other)
-            assert _revision() == revision
-            assert not check().allowed
-            assert not check().allowed
-            assert local._schema_snapshots == local._schema_facts_memo == {}
-            if evaluator is not None:
-                assert evaluator.stats()["check_entries"] == 0
-    finally:
-        BaseDatabaseWrapper.close(other)
-        with connection.schema_editor() as editor:
-            migration.uninstall(apps, editor)
-            SchemaGeneration.objects.all().delete()
-            migration.install(apps, editor)
-
-
-def test_schema_signal_evicts_shared_snapshot_even_when_trigger_breaks(synced):
-    local, resource = synced
-    assert _check(local, resource)
-    before = _revision()
-    migration = import_module("rebac.migrations.0005_schema_generation")
-    with connection.schema_editor() as editor:
-        migration.uninstall(apps, editor)
-    try:
-        with evaluator_scope() as evaluator:
-            assert evaluator.check(local, subject=ACTOR, action="write", resource=resource).allowed
-            assert local._schema_snapshots
-            assert local._schema_facts_memo
-            permission = _permission()
-            permission.expression = "nil"
-            permission.save(update_fields=["expression"])
+        with django_db_blocker.unblock():
+            call_command("migrate", database=alias, verbosity=0)
+            before = _revision()
+            target_before = SchemaGeneration.objects.using(alias).get(pk=1).revision
+            with override_settings(DATABASE_ROUTERS=[SchemaRouter()]):
+                call_command("rebac", "sync", stdout=StringIO())
+                call_command("rebac", "sync", "--check", stdout=StringIO())
+            assert SchemaPermission.objects.using(alias).filter(name="read").exists()
+            assert SchemaGeneration.objects.using(alias).get(pk=1).revision != target_before
             assert _revision() == before
-            assert local._schema_snapshots == local._schema_facts_memo == {}
-            assert not evaluator.check(
-                local, subject=ACTOR, action="write", resource=resource
-            ).allowed
     finally:
-        with connection.schema_editor() as editor:
-            SchemaGeneration.objects.all().delete()
-            migration.install(apps, editor)
+        target.close()
+        del connections[alias]
 
 
-@pytest.mark.parametrize("gap", ["row", "table", "triggers"])
+@pytest.mark.parametrize("gap", ["row", "table"])
 @pytest.mark.parametrize("scoped", [False, True])
 def test_degraded_mode_loads_once_per_operation(synced, monkeypatch, gap, scoped):
     _, resource = synced
-    migration = import_module("rebac.migrations.0005_schema_generation")
-    with connection.schema_editor() as editor:
-        migration.uninstall(apps, editor)
-        if gap == "table":
+    if gap == "table":
+        with connection.schema_editor() as editor:
             editor.delete_model(SchemaGeneration)
     if gap == "row":
         SchemaGeneration.objects.all().delete()
-    monkeypatch.setattr("rebac.schema.generation._trigger_checks", {})
     local = LocalBackend()
     monkeypatch.setattr("rebac.backends._backend", local)
     try:
@@ -812,8 +729,7 @@ def test_degraded_mode_loads_once_per_operation(synced, monkeypatch, gap, scoped
         with connection.schema_editor() as editor:
             if gap == "table":
                 editor.create_model(SchemaGeneration)
-            SchemaGeneration.objects.all().delete()
-            migration.install(apps, editor)
+        SchemaGeneration.objects.advance(using="default")
 
 
 def test_shared_snapshots_and_facts_retain_only_latest_revision(synced):
@@ -821,7 +737,7 @@ def test_shared_snapshots_and_facts_retain_only_latest_revision(synced):
     permission = _permission()
     old = local._schema_snapshot()
     for index in range(51):
-        _raw_permission("nil" if index % 2 else "owner", permission.pk)
+        _write_permission("nil" if index % 2 else "owner", permission.pk)
         with evaluator_scope() as evaluator:
             assert evaluator.check(
                 local, subject=ACTOR, action="write", resource=resource
@@ -831,32 +747,6 @@ def test_shared_snapshots_and_facts_retain_only_latest_revision(synced):
     assert latest.generation != old.generation
     local._schema_facts(old)  # An older in-flight pin cannot repopulate the memo.
     assert set(local._schema_facts_memo) == {latest.generation}
-
-
-def test_trigger_catalog_checked_once_across_backends_and_threads(synced, monkeypatch):
-    _, resource = synced
-    from rebac.schema import generation
-
-    monkeypatch.setattr(generation, "_trigger_checks", {})
-    inspect = generation.missing_schema_triggers
-    calls = []
-    barrier = Barrier(4)
-
-    def count(connection):
-        calls.append(connection.alias)
-        return inspect(connection)
-
-    def worker():
-        try:
-            barrier.wait(timeout=5)
-            return _check(LocalBackend(), resource)
-        finally:
-            BaseDatabaseWrapper.close(connections["default"])
-
-    monkeypatch.setattr(generation, "missing_schema_triggers", count)
-    with ThreadPoolExecutor(max_workers=4) as executor:
-        assert all(executor.map(lambda _: worker(), range(4)))
-    assert calls == ["default"]
 
 
 @pytest.mark.parametrize("attribute", ["sqlstate", "pgcode"])

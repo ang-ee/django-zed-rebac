@@ -100,5 +100,5 @@ class Migration(migrations.Migration):
             ],
             options={"default_permissions": ()},
         ),
-        migrations.RunPython(install, uninstall),
+        migrations.RunPython(install, uninstall, atomic=False),
     ]
