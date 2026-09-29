@@ -258,7 +258,9 @@ class DepthCheckedPredicate(models.Expression):
         # Stream potential overflows only. For a bounded graph this is a single
         # empty SQL result, regardless of how many resources receive a grant.
         for resource_id in (
-            candidates.order_by().values_list(resource_id_attr(self.model), flat=True).iterator()
+            candidates.order_by()
+            .values_list(resource_id_attr(self.model), flat=True)
+            .iterator(chunk_size=256)
         ):
             self.scope.backend._eval_permission(
                 expr,

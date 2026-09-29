@@ -29,7 +29,8 @@ def _run(args, **kwargs):
 def vendor_database(request):
     vendor = request.param
     mysql = vendor == "mysql"
-    container = f"rebac-schema-test-{os.getpid()}-{vendor}"
+    worker = os.environ.get("PYTEST_XDIST_WORKER", "master")
+    container = f"rebac-schema-test-{os.getpid()}-{worker}-{vendor}"
     image = "mysql:8.0" if mysql else "postgres:16"
     data = "/var/lib/mysql" if mysql else "/var/lib/postgresql/data"
     secret = "MYSQL_ROOT_PASSWORD=schema-test" if mysql else "POSTGRES_PASSWORD=schema-test"
@@ -43,6 +44,7 @@ def vendor_database(request):
             container,
             "--tmpfs",
             data,
+            *([] if mysql else ["--memory", "768m", "--memory-swap", "768m"]),
             "-p",
             "127.0.0.1::" + ("3306" if mysql else "5432"),
             "-e",
@@ -73,18 +75,14 @@ def vendor_database(request):
         _run(["docker", "rm", "-f", container])
 
 
-@pytest.mark.parametrize("storage", ["denormalized", "registry"])
-@pytest.mark.django_db(transaction=True)
-def test_vendor_django_schema_owners_and_upgrade(
-    vendor_database, django_db_blocker, settings, storage
-):
+@pytest.fixture
+def vendor_connection(vendor_database, django_db_blocker):
     vendor, _container, port = vendor_database
     pytest.importorskip("MySQLdb" if vendor == "mysql" else "psycopg")
 
     from django.db import connections
     from django.db.utils import ConnectionHandler
 
-    settings.REBAC_LOCAL_BACKEND_STORAGE = storage
     alias = f"schema_owner_{vendor}"
     handler = ConnectionHandler(
         {
@@ -103,11 +101,44 @@ def test_vendor_django_schema_owners_and_upgrade(
     connections[alias] = db
     try:
         with django_db_blocker.unblock():
-            exercise_vendor_owners(db)
+            yield db
     finally:
         with django_db_blocker.unblock():
             db.close()
         del connections[alias]
+
+
+@pytest.mark.parametrize("storage", ["denormalized", "registry"])
+@pytest.mark.django_db(transaction=True)
+def test_vendor_django_schema_owners_and_upgrade(vendor_connection, settings, storage):
+    settings.REBAC_LOCAL_BACKEND_STORAGE = storage
+    exercise_vendor_owners(vendor_connection)
+
+
+@pytest.mark.parametrize("vendor_database", ["postgresql"], indirect=True)
+@pytest.mark.parametrize("storage", ["denormalized", "registry"])
+@pytest.mark.django_db(transaction=True)
+def test_postgresql_additive_scope(vendor_connection, monkeypatch, storage):
+    from django.core.management import call_command
+    from django.test import override_settings
+
+    from .test_scope_additive import exercise_binding_scope
+
+    db = vendor_connection
+
+    class Router:
+        def db_for_read(self, model, **hints):
+            return db.alias
+
+        def db_for_write(self, model, **hints):
+            return db.alias
+
+    call_command("migrate", database=db.alias, verbosity=0)
+    with db.cursor() as cursor:
+        cursor.execute("SET jit = off")
+        cursor.execute("SET statement_timeout = '5s'")
+    with override_settings(DATABASE_ROUTERS=[Router()]):
+        exercise_binding_scope(db, monkeypatch, storage, measure_probe=True)
 
 
 def exercise_vendor_owners(db):

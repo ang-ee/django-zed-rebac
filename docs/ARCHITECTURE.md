@@ -1442,8 +1442,12 @@ on the queryset database. It selects only potential overflow candidates; the
 existing per-resource walker validates those candidates, preserving early
 returns and multi-target branch order and raising the same
 `PermissionDepthExceeded`. Valid bounded chains require one boundary query in
-addition to the scoped read, independent of row count. Validation runs again at
-SQL compilation, so pending scopes see relationship and live-field changes.
+addition to the scoped read, independent of row count. Validation runs at each
+SQL compilation over the additive candidate predicate, so pending scopes see
+relationship and live-field changes. Rendering `str(query)` also runs the probe
+and can raise `PermissionDepthExceeded`. Candidates stream in chunks of 256;
+no frontier result is cached. Django's compiler and operations classes are not
+modified.
 Caller filters constrain boundary candidates; SQL slicing does not conceal an
 invalid candidate. Correlated subqueries conservatively validate the resource
 type when outer references cannot be evaluated independently. As with existing
@@ -1453,6 +1457,12 @@ Field/attribute direct checks retain the walker for cycles containing an arrow
 instead of substituting fixpoint enumeration, which does not preserve depth
 errors. Subject-set-only cycles (such as nested `auth/group#member`) keep the
 exact enumeration optimization; that traversal already enforces the depth bound.
+
+Intersections and exclusions are set boundaries: each model operand compiles
+to its own primary-key membership set, joined with AND or NULL-safe negation.
+They never distribute over unions;
+their SQL size is additive. Identical disjuncts shared by intersection operands
+are factored out before emission. Flattening still applies inside each operand.
 
 SQL size is independent of data row count, but grows with the unroll bound:
 
@@ -1518,16 +1528,17 @@ share the evaluator's bounded cache budget and disappear on scope teardown.
 Live field-backed SQL can reuse plans even when decision caching is disabled.
 No permission answers, IDs or frontier outcomes are cached by this entry point.
 Expiration binds the application clock at SQL compilation, and converted tuple
-IDs are resolved then too. Recursive frontier validation remains execution-time
-and preserves caller filters; RG-03 (correlated scopes validate the whole type)
-and RG-04 (repeated frontier probes) remain open. Outside an evaluator scope,
-querysets use the existing direct compiler path.
+IDs are resolved then too. Recursive frontier validation runs at compilation
+over the additive form and preserves caller filters. RG-03 (correlated scopes
+validate the whole type) and RG-04 (repeated frontier probes) remain open.
+Outside an evaluator scope, querysets use the existing direct compiler path.
 
 Membership arms use `row.fk IN (<actor's reachable IDs>)`, with the actor side
-uncorrelated. Boolean paths are flattened to disjunctions and identical arms are
-deduplicated before SQL emission. This preserves cardinality and exclusions;
-different paths can still repeat shared sub-permissions. Structural sharing of
-those paths remains a future CTE/index concern.
+uncorrelated. Positive paths inside each set operand are flattened to disjunctions;
+identical arms are deduplicated before SQL emission, including common disjuncts
+on both sides of an intersection. This preserves cardinality and exclusions.
+Different join paths can still repeat shared sub-permissions. Structural sharing
+of those paths remains a future CTE/index concern.
 
 `RebacQuerySet.resolve_expression` applies authorization before delegating. The
 SQL Query expression seam does the same for Django's `Subquery` and `Exists`,
@@ -2251,6 +2262,11 @@ Three layers of tests define the project target:
 3. **Future cross-backend contract tests**: once `SpiceDBBackend` lands, run the same suite against `LocalBackend` and SpiceDB (for example via [`testcontainers-spicedb`](https://pypi.org/project/testcontainers-spicedb/)).
 
 GitHub CI gates Ruff lint and formatting, strict mypy, Pyright, and pytest.
+CI runs the SQLite suite with `-n auto --dist loadfile`, keeping each test module
+on one worker. Local `make test` and `make check` remain serial for debugging;
+`make test-parallel` uses the CI scheduling. Random ordering is opt-in with
+`-p randomly --randomly-seed=137`. Test databases and temporary files must be
+worker-local, and fixtures must restore process-local state between tests.
 The supported matrix is declared once, in `pyproject.toml` (`requires-python`,
 the Django pin) and `.github/workflows/ci.yml`; at the time of writing that is
 Python 3.14 × Django 6.0 × SQLite with the `local` backend. Broader matrices

@@ -5,6 +5,39 @@ pre-1.0; breaking changes within a minor version are explicitly called out.
 
 ## [Unreleased]
 
+## [0.22.1] — 2026-09-29
+
+### Fixed
+
+- Local scope intersections and exclusions compile independent primary-key
+  membership sets instead of multiplying their disjunctive paths. SQL grows
+  additively, shared intersection arms emit once, and exclusions retain NULL-safe
+  semantics. Recursive dispatch paths still flatten inside each operand so the
+  recursion bound widens those paths without deepening their SELECT nesting.
+  The depth-12 binding regression shrinks from 1.89/2.63 MB to 74/101 KB in
+  denormalized/registry storage, with check/scope parity on SQLite and PostgreSQL.
+- The recursive frontier probe retains its 0.22.0 placement in `as_sql`, now
+  over the additive candidate form. Candidates stream in batches of 256 through
+  the bounded walker; `PermissionDepthExceeded`, boolean early returns and
+  **RG-01** enumeration/bulk behavior are preserved. Django's compiler and
+  operations classes are not modified. **RG-03** (conservative correlated scope)
+  and **RG-04** (probes at each compilation, including SQL rendering) remain open.
+  Converted tuple IDs likewise retain their compile-time resolution and observe
+  pending-scope revocations.
+
+### Tests
+
+- Add pytest-xdist and opt-in pytest-randomly to the development extra, with
+  `make test-parallel` and CI using `-n auto --dist loadfile`. Serial `make test`
+  and `make check` retain their ordering; random ordering uses
+  `-p randomly --randomly-seed=137`.
+- Isolate registrations, backend/schema caches, process memos and actor contexts
+  between tests. Pytest-django owns per-worker databases, temporary files remain
+  worker-local, and disposable vendor containers use worker/PID names and dynamic
+  host ports. Add additive-SQL, exclusion, shared-arm and permission-parity
+  regressions in both relationship stores, including PostgreSQL frontier-probe
+  size and timing measurements.
+
 ## [0.22.0] — 2026-09-29
 
 ### Added

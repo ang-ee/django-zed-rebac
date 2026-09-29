@@ -24,4 +24,4 @@ jobs:
           uv venv --python "${{ matrix.python-version }}"
           uv pip install -e '.[dev,caveats,drf,strawberry]' "django==${{ matrix.django-version }}.*"
       - name: Lint, format, types, and tests
-        run: make check
+        run: make lint format-check typecheck test-parallel

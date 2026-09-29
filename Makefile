@@ -1,10 +1,13 @@
-.PHONY: install-dev test lint format-check typecheck check ci
+.PHONY: install-dev test test-parallel lint format-check typecheck check ci
 
 install-dev:
 	uv pip install -e '.[dev,caveats,drf,strawberry]'
 
 test:
 	uv run --no-sync pytest -q
+
+test-parallel:
+	uv run --no-sync pytest -q -n auto --dist loadfile --durations=25
 
 lint:
 	uv run --no-sync ruff check src/ tests/
@@ -18,4 +21,4 @@ typecheck:
 
 check: lint format-check typecheck test
 
-ci: install-dev check
+ci: install-dev lint format-check typecheck test-parallel

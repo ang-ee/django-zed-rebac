@@ -227,10 +227,23 @@ class LocalQueryScope:
             right = self.branch(expr.right, definition, model, identity, seen, context)
             if expr.op == "+":
                 return left | right
+            if expr.op in ("&", "-") and model is not None:
+                # Boolean operands are independent resource sets. PK membership
+                # also keeps nullable field arrows inside the operand, so a
+                # NULL FK cannot poison an exclusion's NOT IN comparison.
+                def operand(condition: Q) -> Q:
+                    rows = model._base_manager.using(self.using).filter(condition)
+                    return Q(pk__in=Subquery(rows.order_by().values("pk")))
+
+                left, right = operand(left), operand(right)
             if expr.op == "&":
-                return left & right
+                from .local_flat import SetPredicate
+
+                return Q(SetPredicate(left, right))
             if expr.op == "-":
-                return left & ~right
+                from .local_flat import SetPredicate
+
+                return Q(SetPredicate(left, ~right))
             raise UnsupportedScope
         if isinstance(expr, PermArrow):
             relation = find_relation(definition, expr.via)

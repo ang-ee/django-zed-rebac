@@ -9,11 +9,12 @@ bounds expression height, so builds differ in the bound they accept.
 Positive existentials commute with joins: ``EXISTS(A WHERE p AND EXISTS(B WHERE
 q))`` is ``EXISTS(A CROSS JOIN B WHERE p AND q)`` and ``x IN (SELECT y FROM B
 WHERE q)`` is ``EXISTS(B WHERE q AND x = y)``. Applying that identity to every
-nested existential and distributing over disjunctions yields one existential
+nested existential inside a set operand and distributing its joins over disjunctions yields one existential
 SELECT per dispatch path: the bound grows the width of the SQL, never its depth.
 The outermost IN keeps its comparison outside that SELECT, making the actor's
 reachable set uncorrelated. Equal paths, sources and common terms are shared
-before emission, while exclusions remain at their original scope.
+before emission. Intersections and exclusions are opaque set boundaries: their
+independent operands never form a Cartesian product.
 Subqueries without nested existentials, and every leaf condition, keep the SQL
 the ORM compiled for them; their aliases are renamed with Django's own
 relabeling so sibling paths never collide in one FROM clause.
@@ -23,7 +24,6 @@ from __future__ import annotations
 
 from collections.abc import Sequence
 from dataclasses import dataclass
-from itertools import product
 from typing import Any
 
 from django.core.exceptions import EmptyResultSet, FullResultSet
@@ -76,9 +76,10 @@ def _group_paths(paths: list[_Path]) -> list[_Path]:
 
 
 def _conjoin(left: list[_Path], right: list[_Path]) -> list[_Path]:
-    return [
-        _Path(a.sources + b.sources, a.conditions + b.conditions) for a, b in product(left, right)
-    ]
+    if len(left) > 1 and len(right) > 1:
+        # Independent branching factors must never become a Cartesian product.
+        return [_Path(conditions=(_Flattener.emit(left), _Flattener.emit(right)))]
+    return [_Path(a.sources + b.sources, a.conditions + b.conditions) for a in left for b in right]
 
 
 def _existential(node: Any) -> tuple[Query, Any] | None:
@@ -151,6 +152,39 @@ class FlatPredicate(models.Expression):
     def as_sql(self, compiler: Any, connection: Any) -> tuple[str, tuple[Any, ...]]:
         flattener = _Flattener(compiler, connection)
         fragment = flattener.emit(flattener.paths(self.expressions[0], lift=False))
+        return fragment.sql, fragment.params
+
+
+class SetPredicate(FlatPredicate):
+    """An additive intersection boundary, including Django's NULL-safe negation.
+
+    Each side keeps outer membership comparisons outside its independent flat
+    paths. Equal disjuncts are factored: (a OR c) AND (b OR c) = c OR (a AND b).
+    No path product is constructed, even when this node sits inside an arrow.
+    """
+
+    def __init__(self, left: Any, right: Any) -> None:
+        super().__init__(left)
+        self.expressions.append(right)
+
+    def as_sql(self, compiler: Any, connection: Any) -> tuple[str, tuple[Any, ...]]:
+        left, right = [
+            _Flattener(compiler, connection).paths(expr, lift=False) for expr in self.expressions
+        ]
+        if not left or not right:
+            raise EmptyResultSet
+        if _Path() in left:
+            fragment = _Flattener.emit(right)
+            return fragment.sql, fragment.params
+        if _Path() in right:
+            fragment = _Flattener.emit(left)
+            return fragment.sql, fragment.params
+        common = [path for path in left if path in right]
+        left = [path for path in left if path not in common]
+        right = [path for path in right if path not in common]
+        if left and right:
+            common.append(_Path(conditions=(_Flattener.emit(left), _Flattener.emit(right))))
+        fragment = _Flattener.emit(common)
         return fragment.sql, fragment.params
 
 
