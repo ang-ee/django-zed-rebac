@@ -50,3 +50,6 @@ jobs:
           uv pip install -e '.[dev,caveats,drf,strawberry]' 'django==6.0.*' 'psycopg[binary]>=3.2,<4'
       - name: PostgreSQL suite
         run: make test-postgres
+      # Budgets and query plans, measured with nothing else running.
+      - name: Scale budgets on PostgreSQL
+        run: make test-scale-postgres

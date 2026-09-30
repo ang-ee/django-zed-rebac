@@ -1,4 +1,9 @@
-"""A consumer-shaped rebuild with intersecting, multi-hop usersets."""
+"""A consumer-shaped rebuild with intersecting, multi-hop usersets.
+
+These cases measure time, statement counts and query plans. Other work on the
+same machine distorts all three, so the suite is deselected by default and
+runs alone: ``make test-scale`` (SQLite) or ``make test-scale-postgres``.
+"""
 
 from __future__ import annotations
 
@@ -21,6 +26,8 @@ from rebac.models.relationship import Relationship
 from rebac.schema import parse_zed
 from tests.index_harness import assert_index_matches, assert_no_drift
 from tests.testapp.models import BackingQueue, BackingTask
+
+pytestmark = pytest.mark.scale
 
 SCHEMA = """
 definition auth/user {}

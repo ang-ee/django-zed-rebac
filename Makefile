@@ -28,6 +28,13 @@ test-index-reference:
 test-postgres:
 	uv run --no-sync pytest -q --ds=tests.settings_postgres -n auto --dist loadfile --durations=25
 
+# Time, statement and plan budgets: alone, one test at a time.
+test-scale:
+	uv run --no-sync pytest -q -p no:xdist -m scale --durations=10
+
+test-scale-postgres:
+	uv run --no-sync pytest -q -p no:xdist -m scale --ds=tests.settings_postgres --durations=10
+
 test-index-postgres:
 	uv run --no-sync pytest -q --ds=tests.settings_postgres -n auto --dist loadfile --durations=25 $(INDEX_TESTS)
 

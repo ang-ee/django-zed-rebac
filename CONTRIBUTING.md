@@ -31,8 +31,10 @@ make check
   under reproducible random ordering, run
   `uv run --no-sync pytest -q -n auto --dist loadfile -p randomly --randomly-seed=137`.
   Random ordering is disabled by default; use `-n 0` or `-p no:xdist` to debug serially.
-- Default pytest configuration deselects `index_exhaustive`, `slow` and
-  `schema_vendors`. `index_exhaustive` selects the complete reference sweep;
+- Default pytest configuration deselects `index_exhaustive`, `slow`,
+  `schema_vendors` and `scale`. `scale` holds time, statement and query-plan
+  budgets, which run alone (`make test-scale`, `make test-scale-postgres`)
+  because parallel workers distort them. `index_exhaustive` selects the complete reference sweep;
   `index_shard` labels independently schedulable cases within it. Default runs
   retain every named regression, all one/two-leaf expressions and deterministic
   samples of larger trees. A default pass alone does not satisfy the full gate.
@@ -114,10 +116,10 @@ maintenance fan-out and streamed Python rows and formula work. Written assertion
 Python 3.14 and Django 6.0. Three workflows, chained so that a slow suite
 never blocks a fast result:
 
-- **CI** runs on every push and pull request: lint, format, types and the
-  parallel SQLite suite. It is the gate.
+- **CI** runs on every push and pull request: lint, format, types, the
+  parallel SQLite suite, then the scale budgets alone. It is the gate.
 - **PostgreSQL** runs the default suite on PostgreSQL 16 after CI succeeds on a
-  commit, or on demand. It uses a service container, `psycopg`,
+  commit, or on demand, then the scale budgets and query plans alone. It uses a service container, `psycopg`,
   `tests.settings_postgres` and `REBAC_TEST_POSTGRES_URL`.
 - **Publish to PyPI** runs after CI succeeds on a `v*` tag. It does not run the
   tests again: it verifies that the tag, `pyproject.toml` and the installed

@@ -32,3 +32,6 @@ jobs:
         run: make lint format-check typecheck
       - name: SQLite suite
         run: make test-parallel
+      # Budgets measured with nothing else running, after the parallel suite.
+      - name: Scale budgets
+        run: make test-scale

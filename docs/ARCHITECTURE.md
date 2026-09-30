@@ -2405,7 +2405,9 @@ The coverage matrix is the completion criterion; merely having a generator
 does not cover it.
 
 Default `pytest`, `make test` and `make test-parallel` deselect
-`index_exhaustive`, `slow` and `schema_vendors`. The full reference sweep uses
+`index_exhaustive`, `slow`, `schema_vendors` and `scale`. The scale suite runs
+alone, never beside parallel workers: `make test-scale` in CI after the SQLite
+suite, `make test-scale-postgres` after the PostgreSQL suite. The full reference sweep uses
 `index_exhaustive` and its schedulable cases also carry `index_shard`.
 `make test-index` runs all default index suites;
 `make test-index-reference` overrides the marker filter and runs every reference

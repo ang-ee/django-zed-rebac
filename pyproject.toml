@@ -73,13 +73,14 @@ rebac = ["py.typed"]
 DJANGO_SETTINGS_MODULE = "tests.settings"
 python_files = ["test_*.py"]
 testpaths = ["tests"]
-addopts = "-p no:randomly -m 'not index_exhaustive and not slow and not schema_vendors'"
+addopts = "-p no:randomly -m 'not index_exhaustive and not slow and not schema_vendors and not scale'"
 markers = [
     "slow: opt-in expensive tests, excluded from the default suite",
     "index_exhaustive: opt-in complete permission-index reference expression and tuple-presence sweep",
     "index_shard: independently schedulable shard of the exhaustive permission-index reference sweep",
     "postgresql: permission-index transaction and concurrency cases requiring PostgreSQL",
     "schema_vendors: opt-in Docker PostgreSQL/MySQL storage, schema owner and upgrade contracts",
+    "scale: time, statement and query-plan budgets; run alone, never beside parallel workers",
 ]
 pythonpath = ["."]
 # A hung test (e.g. a lock-ordering deadlock) must fail loudly, not stall the run:
