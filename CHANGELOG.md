@@ -5,6 +5,12 @@ pre-1.0; breaking changes within a minor version are explicitly called out.
 
 ## [Unreleased]
 
+### Fixed
+
+- When the index build cannot resolve a backed relation, its error carries the
+  reason that `rebac.E009` reports (for example, which resource or subject type
+  has no concrete Django model) instead of only the relation's name.
+
 ### Documentation
 
 - The scope-plan cache's exception to the ORM-only rule is permanent, with the

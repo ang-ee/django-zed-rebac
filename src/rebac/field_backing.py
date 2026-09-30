@@ -508,7 +508,17 @@ def _resolve_field_backing(definition: Definition, relation: Relation) -> Resolv
     source_model = model_for_resource_type(definition.resource_type)
     target = model_for_subject_type(allowed.type)
     if source_model is None or target is None:
-        raise ValueError("field-backed relation requires matching source and target Django models")
+        missing = [
+            side
+            for side, found in (
+                (f"resource type {definition.resource_type}", source_model),
+                (f"subject type {allowed.type}", target),
+            )
+            if found is None
+        ]
+        raise ValueError(
+            "field-backed relation requires a concrete Django model for " + " and ".join(missing)
+        )
     target_model, target_id_attr = target
     try:
         _validate_model_identity(source_model, resource_id_attr(source_model))
@@ -549,7 +559,10 @@ def _resolve_attribute_backing(
     allowed = relation.allowed_subjects[0]
     target = model_for_subject_type(allowed.type)
     if target is None:
-        raise ValueError("attribute-backed relation requires a matching subject Django model")
+        raise ValueError(
+            f"attribute-backed relation requires a concrete Django model for subject type "
+            f"{allowed.type}"
+        )
     target_model, target_id_attr = target
     try:
         _validate_model_identity(target_model, target_id_attr)

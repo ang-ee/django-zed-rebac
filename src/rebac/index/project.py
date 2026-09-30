@@ -26,9 +26,10 @@ from django.db.models.functions import Coalesce
 
 from rebac.errors import SchemaError
 from rebac.field_backing import (
-    resolve_attribute_backing,
+    _resolve_attribute_backing,
+    _resolve_field_backing,
+    const_backing_model_errors,
     resolve_const_backing,
-    resolve_field_backing,
 )
 from rebac.models import active_relationship_model
 from rebac.models.index import IndexCover, IndexEdge, IndexTerm, IndexWork
@@ -429,10 +430,13 @@ def _backed(
         return
     allowed = relation.allowed_subjects[0]
     rr = ""
+    label = f"{definition.resource_type}#{relation.name}"
     if isinstance(backing, FieldBinding):
-        resolved = resolve_field_backing(definition, relation)
-        if resolved is None:
-            raise SchemaError(f"Cannot resolve {definition.resource_type}#{relation.name}")
+        # The raising resolver keeps the reason, which rebac.E009 also reports.
+        try:
+            resolved = _resolve_field_backing(definition, relation)
+        except ValueError as exc:
+            raise SchemaError(f"Cannot resolve {label}: {exc} (rebac.E009)") from exc
         rows = resolved.queryset(using=using)
         rid = identity_codec(resolved.source_model, resolved.source_id_attr).to_wire(
             resolved.source_values_path()
@@ -442,9 +446,10 @@ def _backed(
         )
         source = "field"
     elif isinstance(backing, AttributeBinding):
-        attribute = resolve_attribute_backing(definition, relation)
-        if attribute is None:
-            raise SchemaError(f"Cannot resolve {definition.resource_type}#{relation.name}")
+        try:
+            attribute = _resolve_attribute_backing(definition, relation)
+        except ValueError as exc:
+            raise SchemaError(f"Cannot resolve {label}: {exc} (rebac.E009)") from exc
         rows = attribute.target_model._base_manager.using(using).filter(**attribute.filters)
         if attribute.resource is not None:
             rows = attribute.target_model._base_manager.using(using).filter(
@@ -464,7 +469,8 @@ def _backed(
         if backing.filters:
             const = resolve_const_backing(definition, relation)
             if const is None:
-                raise SchemaError(f"Cannot resolve {definition.resource_type}#{relation.name}")
+                reasons = "; ".join(const_backing_model_errors(definition, relation))
+                raise SchemaError(f"Cannot resolve {label}: {reasons or 'unresolved'} (rebac.E009)")
             rows = const.source_model._base_manager.using(using).filter(**const.filters)
             rid = identity_codec(const.source_model, const.source_id_attr).to_wire(
                 const.source_values_path()

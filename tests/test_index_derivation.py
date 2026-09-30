@@ -1951,3 +1951,20 @@ def test_resource_type_whose_model_has_no_table(install):
     )
     assert not _allowed(doc("one"), "read", user("alice")).allowed
     assert_no_drift()
+
+
+def test_unresolvable_backing_names_the_missing_model(install):
+    # No Django model declares test/unmodelled, so its field backing cannot
+    # resolve; the index build says why, as rebac.E009 does.
+    with pytest.raises(
+        SchemaError,
+        match=r"test/unmodelled#owner: field-backed relation requires a concrete Django model "
+        r"for resource type test/unmodelled \(rebac\.E009\)",
+    ):
+        install("""
+            definition auth/user {}
+            definition test/unmodelled {
+                relation owner: auth/user // rebac:field=author
+                permission read = owner
+            }
+        """)
