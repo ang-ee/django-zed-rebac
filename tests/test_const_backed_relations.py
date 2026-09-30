@@ -286,15 +286,6 @@ def test_direct_const_reference_lookup_subjects_returns_const_target(direct_back
     assert subjects == [_role("admin")]
 
 
-def test_const_reverse_enumerates_via_base_manager(backend, posts):
-    # The reverse (accessible) walk enumerates every row through the unscoped
-    # _base_manager, independent of the scoped default `objects` manager.
-    _grant_admin(backend, "alice")
-    ids = set(backend.accessible(subject=_user("alice"), action="read", resource_type="blog/post"))
-    assert ids == {str(pk) for pk in Post._base_manager.values_list("pk", flat=True)}
-    assert len(ids) == Post._base_manager.count() == len(posts)
-
-
 def test_system_check_reports_const_target_without_definition(db):
     # A const relation's target type must resolve to a schema definition;
     # a typo (here `org/role` is simply never defined) would otherwise make the

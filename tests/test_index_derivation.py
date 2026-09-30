@@ -17,6 +17,7 @@ from rebac.index.rebuild import rebuild
 from rebac.models.index import IndexCover, IndexEdge, IndexMember
 from rebac.schema import parse_zed
 from rebac.types import RelationshipFilter
+from tests.backend_setup import STORAGE_TIERS
 from tests.index_harness import assert_index_matches, assert_no_drift, assert_scope_matches, seed
 
 pytestmark = pytest.mark.django_db
@@ -70,6 +71,7 @@ definition test/doc {
 """
 
 
+@pytest.mark.parametrize("install", STORAGE_TIERS, indirect=True)
 def test_all_setop_lanes_and_finite_exclusion(install):
     install(BASE)
     seed(
@@ -625,6 +627,7 @@ definition test/doc {
 """
 
 
+@pytest.mark.parametrize("install", STORAGE_TIERS, indirect=True)
 def test_conditions_in_all_positions_and_membership_alternatives(install):
     active = install(CAVEATED)
     seed(["test/doc:root#b@test/group:g#member"])
@@ -909,6 +912,8 @@ def test_region_repair_preserves_unrelated_bans_on_type_level_cover(install):
     assert_no_drift()
 
 
+@pytest.mark.pg_delta
+@pytest.mark.parametrize("install", STORAGE_TIERS, indirect=True)
 def test_batched_expiry_growth_for_recursive_covers_and_memberships(install, monkeypatch):
     from django.db import connection
     from django.test.utils import CaptureQueriesContext

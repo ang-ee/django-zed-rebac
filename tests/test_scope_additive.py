@@ -11,7 +11,7 @@ from rebac import RebacMixin, RelationshipTuple, SubjectRef, backend, sudo, to_o
 from rebac.backends import reset_backend
 from rebac.index.program import program_for
 from rebac.schema import parse_zed
-from tests.backend_setup import install_schema
+from tests.backend_setup import STORAGE_TIERS, install_schema
 from tests.index_harness import assert_no_drift
 
 pytestmark = pytest.mark.django_db(transaction=True)
@@ -209,18 +209,21 @@ def exercise_binding_scope(db, monkeypatch, storage):
         assert_no_drift(using=db.alias)
 
 
+# Intrinsically slow: 27 maintained writes over an eight-model production-shaped graph.
+@pytest.mark.slow
 @pytest.mark.parametrize("storage", ["denormalized", "registry"])
 def test_recursive_intersection_is_additive(monkeypatch, storage):
     exercise_binding_scope(connection, monkeypatch, storage)
 
 
-@pytest.mark.parametrize("storage", ["denormalized", "registry"])
-def test_scope_sql_is_independent_of_recursive_depth(monkeypatch, storage):
+@pytest.mark.parametrize("storage", STORAGE_TIERS)
+@pytest.mark.parametrize("deep", [3, pytest.param(12, marks=pytest.mark.slow)])
+def test_scope_sql_is_independent_of_recursive_depth(monkeypatch, storage, deep):
     with binding_graph(connection, monkeypatch, storage) as (_active, types, binding):
         actor = SubjectRef.of("auth/user", "both")
         shapes = []
         parent = None
-        for depth in (1, 12):
+        for depth in (1, deep):
             with sudo(reason="scope depth fixture"):
                 for _ in range(depth):
                     parent = types["scope/page"].objects.create(parent=parent)

@@ -109,6 +109,7 @@ def _managed(row: SchemaRelation, payload: dict, *, external_id: str) -> Package
     )
 
 
+@pytest.mark.pg_delta
 @pytest.mark.django_db
 def test_migrated_rows_sync_without_drift_while_admin_edits_stay_drift() -> None:
     historical_apps = _historical_apps()

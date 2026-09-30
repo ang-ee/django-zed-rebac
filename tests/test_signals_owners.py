@@ -32,6 +32,7 @@ from rebac.models import (
 from rebac.models.generation import SchemaGeneration
 from rebac.schema import parse_zed
 from tests import test_index_maintenance as maintenance_cases
+from tests.backend_setup import STORAGE_TIERS
 from tests.index_harness import assert_no_drift
 from tests.test_index_maintenance import ALICE, grant_folder
 from tests.testapp.models import (
@@ -173,6 +174,7 @@ def test_queryset_roots_are_not_point_checked_again(indexed):
     assert_no_drift()
 
 
+@pytest.mark.parametrize("indexed", STORAGE_TIERS, indirect=True)
 def test_delete_owner_batches_identity_cleanup_once(indexed):
     from rebac import signals
 
@@ -187,9 +189,11 @@ def test_delete_owner_batches_identity_cleanup_once(indexed):
     assert_no_drift()
 
 
+@pytest.mark.pg_delta
 @pytest.mark.parametrize(
     "operation", ["update", "bulk_create", "bulk_update", "reverse_add", "set_null", "delete"]
 )
+@pytest.mark.parametrize("indexed", STORAGE_TIERS, indirect=True)
 def test_owning_base_manager_maintains_without_actor_scope(indexed, operation):
     folder = Folder.objects.create(name="folder")
     post = Post.objects.create(title="post", folder=folder)
@@ -232,6 +236,7 @@ def test_owning_base_manager_maintains_without_actor_scope(indexed, operation):
 @pytest.mark.parametrize(
     "operation", ["save_base", "update", "bulk_create", "bulk_update", "delete", "queryset_delete"]
 )
+@pytest.mark.parametrize("indexed", STORAGE_TIERS, indirect=True)
 def test_tracked_mixin_owners_maintain_nonresource_paths(indexed, operation):
     assert issubclass(BackingProject, RebacTrackedMixin)
     one, two = BackingQueue.objects.create(), BackingQueue.objects.create()

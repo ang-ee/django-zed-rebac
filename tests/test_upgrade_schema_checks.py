@@ -37,6 +37,7 @@ def _old_backing(*, historical=False) -> SchemaRelation:
     )
 
 
+@pytest.mark.pg_delta
 def test_migrate_can_upgrade_legacy_backing_with_system_checks_enabled(settings):
     settings.REBAC_UNIVERSAL_ADMIN_ROLE = "platform/role:admin"
     output = StringIO()

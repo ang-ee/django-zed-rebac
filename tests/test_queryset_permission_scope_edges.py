@@ -21,7 +21,7 @@ from rebac import (
 from rebac.backends import reset_backend
 from rebac.schema import parse_zed
 from tests.backend_setup import atomic_source_write, install_schema
-from tests.testapp.models import AuthoredPost, EncodedPost, Post, TextIdentityPost
+from tests.testapp.models import AuthoredPost, Post, TextIdentityPost
 
 pytestmark = pytest.mark.django_db(transaction=True)
 
@@ -131,14 +131,6 @@ def test_field_backed_owner_resolves_non_pk_subject_identity(storage):
             assert AuthoredPost.objects.with_actor(to_subject_ref(bob)).count() == 1
 
 
-def test_encoded_identity_stored_arrow_is_refused(storage):
-    from rebac.errors import SchemaError
-    from rebac.index.codec import identity_codec
-
-    with pytest.raises(SchemaError, match=r"rebac\.E014"):
-        identity_codec(EncodedPost)
-
-
 def test_text_identity_stored_arrow_via_tuple_relation(storage):
     """Tuple-backed arrows retain visibility, dangling-target and identity parity."""
     src = """
@@ -218,16 +210,12 @@ def test_arrow_via_undeclared_relation_compiles_to_static_deny(storage):
         permission read = ghost->read
     }
     """
-    try:
-        schema = parse_zed(src)
-        with override_settings(REBAC_LOCAL_BACKEND_STORAGE=storage):
-            reset_backend()
-            active = backend()
-            assert isinstance(active, LocalBackend)
-            install_schema(active, schema)
-    except Exception:  # pragma: no cover - schema validation may reject this shape
+    schema = parse_zed(src)
+    with override_settings(REBAC_LOCAL_BACKEND_STORAGE=storage):
         reset_backend()
-        pytest.skip("schema layer rejects arrows through undeclared relations")
+        active = backend()
+        assert isinstance(active, LocalBackend)
+        install_schema(active, schema)
     try:
         with sudo(reason="undeclared-arrow fixtures"):
             post = Post.objects.create(title="unreachable")

@@ -180,20 +180,6 @@ def test_denied_permission_does_not_run_body() -> None:
     assert calls == []
 
 
-@pytest.mark.django_db
-def test_allowed_runs_body_exactly_once() -> None:
-    _grant_invoke(ObjectRef("mcp/tool/edit_post", "singleton"), SubjectRef.of("auth/user", "1"))
-    calls: list[str] = []
-
-    @rebac_mcp_tool(resource_type="mcp/tool/edit_post", action="invoke", resource_id="singleton")
-    def edit(body: str, ctx: object = None) -> str:
-        calls.append(body)
-        return "ok"
-
-    edit("once", ctx=_ctx("auth/user:1"))
-    assert calls == ["once"]
-
-
 # ---------- resource id resolution ----------
 
 

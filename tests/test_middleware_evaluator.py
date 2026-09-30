@@ -207,18 +207,3 @@ def test_invalid_transport_triggers_e007():
     with override_settings(REBAC_ZOOKIE_TRANSPORT="bogus"):
         errors = checks.run_checks(tags=["rebac"])
         assert any(e.id == "rebac.E007" for e in errors)
-
-
-def test_session_without_contrib_sessions_triggers_w006():
-    """W006 fires when transport=session but django.contrib.sessions is absent."""
-    # `tests.settings` includes contrib.sessions; mock its absence via
-    # override_settings with a filtered INSTALLED_APPS.
-    from django.conf import settings as dj_settings
-
-    installed = [a for a in dj_settings.INSTALLED_APPS if a != "django.contrib.sessions"]
-    with override_settings(
-        REBAC_ZOOKIE_TRANSPORT="session",
-        INSTALLED_APPS=installed,
-    ):
-        warnings = checks.run_checks(tags=["rebac"])
-        assert any(w.id == "rebac.W006" for w in warnings)

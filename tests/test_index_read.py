@@ -288,6 +288,7 @@ def test_type_level_cover_concrete_exception_and_empty_resource(active):
     assert check(actor, "").allowed
 
 
+@pytest.mark.pg_delta
 def test_intervals_are_half_open(active, monkeypatch):
     now = index_now()
     actor = SubjectRef.of("auth/user", "alice")
@@ -457,6 +458,7 @@ def test_generation_manager_publishes_current_revision_in_one_statement(active):
     assert not SchemaGeneration.objects.filter(SchemaGeneration.objects.ready_q()).exists()
 
 
+@pytest.mark.pg_delta
 def test_identity_filter_rejects_noncanonical_integer_spelling(active):
     from rebac._id import model_identity_filter
 
@@ -584,6 +586,7 @@ def test_enumeration_query_count_does_not_scale_with_candidates(active):
     assert counts[0] == counts[1]
 
 
+@pytest.mark.pg_delta
 @pytest.mark.parametrize("width", [1, 30])
 def test_scope_sql_length_and_statement_count_independent_of_depth(active, width):
     actor = SubjectRef.of("auth/user", "alice")
@@ -634,6 +637,7 @@ def test_scope_width_does_not_change_sql(active):
     assert measured[0] == measured[1]
 
 
+@pytest.mark.pg_delta
 def test_embedded_querysets_remain_scoped(active):
     Folder._base_manager.bulk_create([Folder(pk=1, name="folder")])
     Post._base_manager.bulk_create(
@@ -790,6 +794,7 @@ def test_empty_id_check_uses_sql_existence_not_python_resource_expansion(active,
     assert check(actor, resource="", context={"a": True}).allowed
 
 
+@pytest.mark.pg_delta
 def test_context_accessible_uses_subqueries_for_more_than_sqlite_parameter_limit(active):
     actor = SubjectRef.of("auth/user", "alice")
     Post._base_manager.bulk_create([Post(pk=i, title=str(i)) for i in range(1, 1201)])
@@ -1072,7 +1077,10 @@ def test_each_site_compiles_once_so_read_sql_is_linear_in_the_read_plan(settings
         assert size <= fixed + per_lookup * (lookups - 1), (lookups, size)
 
 
-def test_context_enumeration_sql_does_not_grow_with_the_number_of_caveat_instances(settings):
+@pytest.mark.parametrize("instances", [20, pytest.param(200, marks=pytest.mark.slow)])
+def test_context_enumeration_sql_does_not_grow_with_the_number_of_caveat_instances(
+    settings, instances
+):
     from rebac.backends import reset_backend
     from rebac.index.rebuild import rebuild
 
@@ -1092,7 +1100,7 @@ def test_context_enumeration_sql_does_not_grow_with_the_number_of_caveat_instanc
     rebuild(using="default")
     actor = SubjectRef.of("auth/user", "alice")
     measured = []
-    for size in (1, 200):
+    for size in (1, instances):
         active.write_relationships(
             [
                 RelationshipTuple(ObjectRef("test/doc", str(b)), "r1", actor, "above", {"b": b})
@@ -1119,6 +1127,7 @@ def test_context_enumeration_sql_does_not_grow_with_the_number_of_caveat_instanc
     assert measured[0] == measured[1]
 
 
+@pytest.mark.pg_delta
 def test_scope_plan_parameters_are_prepared_for_the_vendor(active, monkeypatch):
     from datetime import UTC, datetime
 

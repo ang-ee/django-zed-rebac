@@ -38,6 +38,7 @@ from rebac.models.index import (
 from rebac.models.schema_write import schema_index_write
 from rebac.schema import parse_zed
 from rebac.types import ObjectRef, RelationshipFilter, RelationshipTuple, SubjectRef
+from tests.backend_setup import STORAGE_TIERS
 from tests.index_harness import assert_index_matches, assert_no_drift, seed
 from tests.testapp.models import (
     BackingProject,
@@ -196,6 +197,7 @@ def test_new_constant_userset_reference_is_in_maintenance_region(indexed):
     ).exists()
 
 
+@pytest.mark.parametrize("indexed", STORAGE_TIERS, indirect=True)
 def test_mixin_reparent_preserves_old_and_new_frontiers(indexed):
     left, right = Folder.objects.create(name="left"), Folder.objects.create(name="right")
     child = Folder.objects.create(name="child", parent=left)
@@ -212,7 +214,9 @@ def test_mixin_reparent_preserves_old_and_new_frontiers(indexed):
     assert indexed.check_access(subject=BOB, resource=to_object_ref(post), action="read").allowed
 
 
+@pytest.mark.pg_delta
 @pytest.mark.parametrize("owner", ["instance", "queryset"])
+@pytest.mark.parametrize("indexed", STORAGE_TIERS, indirect=True)
 def test_subtree_delete_and_collector_set_null(indexed, owner):
     root = Folder.objects.create(name="root")
     child = Folder.objects.create(name="child", parent=root)
@@ -229,6 +233,7 @@ def test_subtree_delete_and_collector_set_null(indexed, owner):
     check_rows(*old, post)
 
 
+@pytest.mark.parametrize("indexed", STORAGE_TIERS, indirect=True)
 def test_bulk_update_captures_changing_predicate_before_statement(indexed):
     left, right = Folder.objects.create(name="left"), Folder.objects.create(name="right")
     posts = Post.objects.bulk_create([Post(title=str(i), folder=left) for i in range(4)])
@@ -242,6 +247,7 @@ def test_bulk_update_captures_changing_predicate_before_statement(indexed):
     )
 
 
+@pytest.mark.parametrize("indexed", STORAGE_TIERS, indirect=True)
 def test_bulk_update_many_batches_has_one_maintenance_pass(indexed):
     left, right = Folder.objects.create(name="left"), Folder.objects.create(name="right")
     posts = Post.objects.bulk_create([Post(title=str(i), folder=left) for i in range(3)])
@@ -275,7 +281,9 @@ def test_unwatched_update_does_not_reproject(indexed, owner):
     check_rows(post)
 
 
+@pytest.mark.pg_delta
 @pytest.mark.parametrize("operation", ["add", "remove", "clear", "set", "reverse_clear"])
+@pytest.mark.parametrize("indexed", STORAGE_TIERS, indirect=True)
 def test_m2m_all_owner_actions(indexed, operation):
     first, second = Folder.objects.create(name="first"), Folder.objects.create(name="second")
     post = Post.objects.create(title="post")
@@ -296,6 +304,7 @@ def test_m2m_all_owner_actions(indexed, operation):
     check_rows(post)
 
 
+@pytest.mark.slow  # Intrinsically slow: five full drift and oracle checks over a four-model path.
 def test_plain_reparent_and_filter_transition(indexed):
     first, second = BackingQueue.objects.create(), BackingQueue.objects.create()
     stage = BackingStage.objects.create(hidden=False)
@@ -422,6 +431,7 @@ def test_concrete_ban_rederives_type_level_cover_and_retains_other_scopes(indexe
 
 
 @pytest.mark.parametrize("payload", ["expires_at", "condition", "site", "membership"])
+@pytest.mark.parametrize("indexed", STORAGE_TIERS, indirect=True)
 def test_verify_detects_complete_payload_drift_and_never_commits(indexed, payload):
     resource = ObjectRef("test/document", "one")
     seed(["auth/group:g#member@auth/user:alice", "test/document:one#blocked@auth/group:g#member"])
@@ -451,6 +461,7 @@ def test_verify_detects_complete_payload_drift_and_never_commits(indexed, payloa
         "through_bulk_create",
     ],
 )
+@pytest.mark.parametrize("indexed", STORAGE_TIERS, indirect=True)
 def test_unsupported_paths_drift_and_rebuild_repairs(indexed, unsupported):
     from rebac.models import active_relationship_model
 
@@ -529,6 +540,7 @@ def test_capture_values_keeps_nonnull_sibling_on_reverse_relation(indexed):
         ) == [str(stage.pk)]
 
 
+@pytest.mark.parametrize("indexed", STORAGE_TIERS, indirect=True)
 def test_nested_pass_reuses_lock_and_materializes_old_queryset(indexed):
     first, second = Folder.objects.create(name="a"), Folder.objects.create(name="b")
     post = Post.objects.create(title="post", folder=first)
@@ -549,6 +561,7 @@ def test_nested_pass_reuses_lock_and_materializes_old_queryset(indexed):
 @pytest.mark.parametrize("rollback", ["outer", "savepoint", "maintenance_failure"])
 @pytest.mark.postgresql
 @pytest.mark.django_db(transaction=True)
+@pytest.mark.parametrize("indexed", STORAGE_TIERS, indirect=True)
 def test_source_and_index_roll_back_together(indexed, rollback):
     first, second = Folder.objects.create(name="a"), Folder.objects.create(name="b")
     post = Post.objects.create(title="post", folder=first)
@@ -582,6 +595,8 @@ def test_source_and_index_roll_back_together(indexed, rollback):
     check_rows(post)
 
 
+@pytest.mark.pg_delta
+@pytest.mark.parametrize("indexed", STORAGE_TIERS, indirect=True)
 def test_conflict_bulk_create_preserves_refusal_and_maintains_sudo_writes(indexed):
     from rebac.errors import PermissionDenied
 
@@ -609,15 +624,13 @@ def test_conflict_bulk_create_preserves_refusal_and_maintains_sudo_writes(indexe
     check_rows(post)
 
 
-@pytest.mark.django_db(databases="__all__")
-def test_tuple_maintenance_and_rebuild_use_write_alias(indexed):
-    aliases = sorted(alias for alias in connections if alias != "default")
-    if not aliases:
-        pytest.skip("requires a second configured test database")
-    alias = aliases[0]
-    IndexState.objects.using(alias).get_or_create(key="global")
-    rebuild(using=alias)
-    baseline = list(IndexCover.objects.using("default").order_by("pk").values())
+@pytest.mark.parametrize("indexed", STORAGE_TIERS, indirect=True)
+def test_tuple_maintenance_and_rebuild_use_write_alias(indexed, tmp_path, django_db_blocker):
+    from tests.backend_setup import sqlite_alias
+
+    alias = "index_write_target"
+    target = sqlite_alias(alias, tmp_path / "index.sqlite3")
+    connections[alias] = target
 
     class AliasRouter:
         def db_for_read(self, model, **hints):
@@ -626,15 +639,28 @@ def test_tuple_maintenance_and_rebuild_use_write_alias(indexed):
         def db_for_write(self, model, **hints):
             return alias
 
-    resource = ObjectRef("test/document", "alias")
-    with patch.object(router, "routers", [AliasRouter()]):
-        indexed.write_relationships([RelationshipTuple(resource, "viewer", ALICE)])
-        check_rows(resource, actions=("direct",), using=alias)
-        indexed.delete_relationships(RelationshipFilter(resource_type="test/document"))
-        check_rows(resource, actions=("direct",), using=alias)
-    assert list(IndexCover.objects.using("default").order_by("pk").values()) == baseline
+    try:
+        with django_db_blocker.unblock():
+            call_command("migrate", database=alias, verbosity=0)
+            IndexState.objects.using(alias).get_or_create(key="global")
+            rebuild(using=alias)
+            baseline = list(IndexCover.objects.using("default").order_by("pk").values())
+            resource = ObjectRef("test/document", "alias")
+            with patch.object(router, "routers", [AliasRouter()]):
+                indexed.write_relationships([RelationshipTuple(resource, "viewer", ALICE)])
+                check_rows(resource, actions=("direct",), using=alias)
+                assert indexed.check_access(subject=ALICE, action="direct", resource=resource)
+                assert IndexCover.objects.using(alias).filter(scope__object_id="alias").exists()
+                indexed.delete_relationships(RelationshipFilter(resource_type="test/document"))
+                check_rows(resource, actions=("direct",), using=alias)
+                assert not IndexCover.objects.using(alias).filter(scope__object_id="alias").exists()
+            assert list(IndexCover.objects.using("default").order_by("pk").values()) == baseline
+    finally:
+        target.close()
+        del connections[alias]
 
 
+@pytest.mark.parametrize("indexed", STORAGE_TIERS, indirect=True)
 def test_rebuild_is_idempotent_and_vacuums_unreferenced_terms(indexed):
     seed(["test/document:one#viewer@auth/user:alice"])
     IndexTerm.objects.create(type="unused/object", object_id="orphan", relation="")
@@ -679,6 +705,7 @@ def test_type_rebuild_keeps_unaffected_cover_ids(indexed):
     check_rows(ObjectRef("test/document", "one"), actions=("direct",))
 
 
+@pytest.mark.parametrize("indexed", STORAGE_TIERS, indirect=True)
 def test_ordinary_write_keeps_unrelated_rows_and_logs_cost(indexed, caplog):
     left, right = Folder.objects.create(name="left"), Folder.objects.create(name="right")
     left_post = Post.objects.create(title="left", folder=left)
@@ -711,6 +738,7 @@ def test_ordinary_write_keeps_unrelated_rows_and_logs_cost(indexed, caplog):
     check_rows(left_post, right_post)
 
 
+@pytest.mark.parametrize("indexed", STORAGE_TIERS, indirect=True)
 def test_index_commands_exit_nonzero_on_drift(indexed):
     seed(["test/document:one#viewer@auth/user:alice"])
     call_command("rebac", "index", "verify", stdout=StringIO())
@@ -954,6 +982,7 @@ def test_unwatched_m2m_does_not_open_index_owner(indexed, django_user_model):
     assert_no_drift()
 
 
+@pytest.mark.pg_delta
 @pytest.mark.django_db(transaction=True)
 def test_flush_then_tuple_write_recreates_lock(indexed):
     indexed.set_schema(
@@ -1066,6 +1095,7 @@ def test_universal_subtraction_replacement_preserves_other_bans(indexed):
     assert_no_drift()
 
 
+@pytest.mark.pg_delta
 @pytest.mark.django_db(transaction=True)
 @pytest.mark.parametrize("atomic", [False, True])
 def test_failed_deferred_save_cleans_orphan_work(indexed, atomic):
@@ -1117,6 +1147,7 @@ def test_failed_later_pre_save_receiver_cleans_work_on_commit(indexed):
 
 
 @pytest.mark.parametrize("fail", [False, True])
+@pytest.mark.parametrize("indexed", STORAGE_TIERS, indirect=True)
 def test_queryset_snapshot_terms_are_cleaned(indexed, fail):
     folder = Folder.objects.create(name="snapshot")
     post = Post.objects.create(title="snapshot", folder=folder)
@@ -1207,6 +1238,7 @@ def test_caught_nested_schema_failure_restores_outer_pass_state(persisted):
     )
 
 
+@pytest.mark.pg_delta
 def test_unchanged_sync_after_migration_rebuilds_everything(db):
     output = StringIO()
     call_command("rebac", "sync", stdout=output)
@@ -1223,6 +1255,7 @@ def test_unchanged_sync_after_migration_rebuilds_everything(db):
     check_rows(ObjectRef("blog/post", "missing"))
 
 
+@pytest.mark.pg_delta
 @pytest.mark.django_db(transaction=True)
 def test_plain_autocommit_warns_but_maintains(caplog):
     IndexState.objects.get_or_create(key="global")
@@ -1241,6 +1274,7 @@ def test_plain_autocommit_warns_but_maintains(caplog):
     check_rows(ObjectRef("test/backingtask", "missing"))
 
 
+@pytest.mark.pg_delta
 @pytest.mark.django_db(transaction=True)
 def test_plain_autocommit_warning_error_is_raised_after_maintenance():
     IndexState.objects.get_or_create(key="global")
@@ -1499,6 +1533,7 @@ def test_writes_before_the_first_sync_proceed_and_reads_stay_closed(db, django_u
         backend().check_access(subject=ALICE, action="read", resource=to_object_ref(post))
 
 
+@pytest.mark.pg_delta
 @pytest.mark.django_db(transaction=True)
 def test_writes_proceed_while_the_library_tables_are_not_migrated(django_user_model):
     reset_backend()
@@ -1514,7 +1549,9 @@ def test_writes_proceed_while_the_library_tables_are_not_migrated(django_user_mo
     assert not SchemaGeneration.objects.exists()
 
 
-def test_a_write_does_not_rederive_resources_that_share_its_target(indexed):
+@pytest.mark.parametrize("many", [5, pytest.param(30, marks=pytest.mark.slow)])
+@pytest.mark.parametrize("indexed", STORAGE_TIERS, indirect=True)
+def test_a_write_does_not_rederive_resources_that_share_its_target(indexed, many):
     """An edge belongs to its source: objects pointing at the same target are untouched."""
     import logging
 
@@ -1534,16 +1571,16 @@ def test_a_write_does_not_rederive_resources_that_share_its_target(indexed):
     logger.setLevel(logging.INFO)
     try:
         cost = {}
-        for siblings in (2, 30):
+        for siblings in (2, many):
             folder = Folder.objects.create(name=f"shared-{siblings}")
             for number in range(siblings):
                 Post.objects.create(title=f"sibling-{number}", folder=folder)
             passes.rows.clear()
             post = Post.objects.create(title="one more", folder=folder)
             cost[siblings] = passes.rows
-        assert cost[30], "the write ran no maintenance pass"
-        assert cost[2] == cost[30]
-        assert all(types == ["blog/post"] for _deleted, _inserted, types in cost[30])
+        assert cost[many], "the write ran no maintenance pass"
+        assert cost[2] == cost[many]
+        assert all(types == ["blog/post"] for _deleted, _inserted, types in cost[many])
     finally:
         logger.removeHandler(passes)
         logger.setLevel(level)

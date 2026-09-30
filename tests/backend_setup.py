@@ -1,11 +1,16 @@
 """Explicit setup for legacy behavioural tests using an in-memory schema."""
 
+import pytest
 from django.db import router, transaction
 
 from rebac.index.read import using_backend
 from rebac.index.rebuild import rebuild
 from rebac.models import active_relationship_model
 from rebac.models.index import IndexState
+
+# A heavy case keeps the default relationship storage in tier 1; the same case on the
+# registry storage runs with ``slow`` (docs/ARCHITECTURE.md § Test tiers).
+STORAGE_TIERS = ("denormalized", pytest.param("registry", marks=pytest.mark.slow))
 
 
 def rebuild_backend(local, *, using=None):

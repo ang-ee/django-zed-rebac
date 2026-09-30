@@ -138,6 +138,7 @@ def test_every_policy_write_and_revision_are_atomic(kind, path, failure, monkeyp
     assert list(model.objects.order_by("pk").values()) == before
 
 
+@pytest.mark.pg_delta
 @pytest.mark.parametrize("kind", ["definition", "relation", "permission", "caveat", "override"])
 @pytest.mark.parametrize("option", ["ignore_conflicts", "update_conflicts"])
 def test_conflict_bulk_paths_are_refused_without_writes(kind, option):
@@ -252,10 +253,12 @@ def upgrade_schema_owners(db):
         MigrationExecutor(db).migrate(current)
 
 
+@pytest.mark.pg_delta
 def test_upgrade_removes_installed_database_objects_and_preserves_revision():
     upgrade_schema_owners(connection)
 
 
+@pytest.mark.pg_delta
 def test_sync_failure_rolls_back_all_policy_rows_and_revision(monkeypatch):
     from rebac.management.commands.rebac import Command
 
@@ -276,6 +279,7 @@ def test_sync_failure_rolls_back_all_policy_rows_and_revision(monkeypatch):
     assert SchemaGeneration.objects.get(pk=1).revision == before
 
 
+@pytest.mark.pg_delta
 def test_bulk_update_late_batch_failure_rolls_back_earlier_batches(monkeypatch):
     definition = SchemaDefinition.objects.create(resource_type="batch/object")
     rows = SchemaPermission.objects.bulk_create(

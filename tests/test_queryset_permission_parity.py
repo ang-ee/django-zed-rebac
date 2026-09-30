@@ -29,7 +29,7 @@ from rebac import (
 from rebac.backends import reset_backend
 from rebac.models import active_relationship_model
 from rebac.schema import parse_zed
-from tests.backend_setup import atomic_source_write, install_schema, rebuild_backend
+from tests.backend_setup import STORAGE_TIERS, atomic_source_write, install_schema, rebuild_backend
 from tests.testapp.models import AuthoredPost, Folder, Post
 
 pytestmark = pytest.mark.django_db(transaction=True)
@@ -146,6 +146,7 @@ def shared_posts(active):
         ("read", ("owned", "shared", "both")),
     ],
 )
+@pytest.mark.parametrize("active", STORAGE_TIERS, indirect=True)
 def test_shared_paths_and_boolean_permissions_preserve_rows_and_counts(
     active, shared_posts, action, visible
 ):
@@ -236,6 +237,7 @@ def test_field_backed_arrow_obeys_group_grants_and_exclusions(active):
     assert not queryset.filter(pk=private.pk).exists()
 
 
+@pytest.mark.parametrize("active", STORAGE_TIERS, indirect=True)
 def test_rebinding_composed_permission_replaces_actor_and_action(active, shared_posts):
     original = Post.objects.with_actor(ALICE).exclude(title="hidden").scoped_for_aggregate()
     _assert_post_visibility(
@@ -263,6 +265,7 @@ def test_rebinding_composed_permission_replaces_actor_and_action(active, shared_
     ("operation", "visible"),
     [("union", {"shared", "other"}), ("intersection", {"shared"}), ("difference", set())],
 )
+@pytest.mark.parametrize("active", STORAGE_TIERS, indirect=True)
 def test_rebinding_sql_set_operands_preserves_caller_filters(
     active, shared_posts, operation, visible
 ):
@@ -426,7 +429,9 @@ def test_unevaluated_eager_scope_observes_revoked_group_membership(active, scope
         _assert_post_visibility(active, eager, ALICE, "read", [])
 
 
-def test_field_owner_sql_cost_is_independent_of_visible_row_count(active):
+@pytest.mark.parametrize("corpus", [50, pytest.param(2000, marks=pytest.mark.slow)])
+@pytest.mark.parametrize("active", STORAGE_TIERS, indirect=True)
+def test_field_owner_sql_cost_is_independent_of_visible_row_count(active, corpus):
     alice = atomic_source_write(get_user_model().objects.create_user, username="bulk-owner")
     bob = atomic_source_write(get_user_model().objects.create_user, username="other-owner")
 
@@ -449,14 +454,14 @@ def test_field_owner_sql_cost_is_independent_of_visible_row_count(active):
         small_cost = measure(1)
         with sudo(reason="grow bounded permission SQL fixtures"):
             AuthoredPost.objects.bulk_create(
-                [AuthoredPost(title=f"owned-{index}", author=alice) for index in range(2000)]
-                + [AuthoredPost(title=f"hidden-{index}", author=bob) for index in range(2000)]
+                [AuthoredPost(title=f"owned-{index}", author=alice) for index in range(corpus)]
+                + [AuthoredPost(title=f"hidden-{index}", author=bob) for index in range(corpus)]
             )
-        large_cost = measure(2001)
+        large_cost = measure(1 + corpus)
     assert large_cost == small_cost
     assert large_cost[0] == 2  # One aggregate and one bounded page.
-    # A fixed plan of three lookups, independent of the 2,001 visible IDs. The
-    # count changes only with the compiler.
+    # A fixed plan of three lookups, independent of the number of visible IDs.
+    # The count changes only with the compiler.
     assert large_cost[1] == 109
 
 
