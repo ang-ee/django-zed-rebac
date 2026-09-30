@@ -180,7 +180,7 @@ make pg-up                            # prints: export REBAC_TEST_POSTGRES_URL=.
 make test-pg                          # tier 2, under three minutes
 make pg-down
 
-make test-release                     # tier 3, about an hour; nightly in CI
+make test-release                     # tier 3, about 12 minutes on 18 cores; nightly in CI
 gh workflow run release.yml           # the same, on GitHub
 gh run list --workflow release.yml --limit 1
 ```
@@ -194,6 +194,19 @@ Acceptance:
   cases as before the change minus the churn removed: nothing is lost to a tier.
 - `pytest --durations=20` on the default selection shows no test over 2 s.
 - Every new `xfail` is strict and names its defect.
+
+Measured on the branch (18-core laptop, PostgreSQL 16 in Docker):
+
+| Command | Result | Time |
+|---|---|---|
+| `make check` | 2,909 passed, 4 skipped, 63 expected failures | 66 s |
+| `make test-pg` | 92 passed, 2 skipped | 13 s |
+| `make test-slow` | 140 passed | 45 s |
+| `make test-postgres` | 3,051 passed, 2 skipped, 63 expected failures | 227 s |
+| `make test-scale` / `test-scale-postgres` | 4 passed, 1 skipped / 5 passed | 12 s / 21 s |
+| `make test-index-reference` | 10,575 passed | 352 s |
+| `make test-random` | 2,909 passed, 4 skipped, 63 expected failures | 73 s |
+| `make test-schema-vendors` | not run: `mysqlclient` needs the MySQL client libraries | — |
 
 ## Not in scope
 

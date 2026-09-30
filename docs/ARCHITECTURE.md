@@ -2428,7 +2428,7 @@ blocker like any other.
 |---|---|---|---|
 | **1. Fast** — `make check` | Every change, every push and pull request. The only gate for merging and for publishing a tag. | Ruff lint and format, strict mypy, Pyright, then the SQLite suite without `slow`, in parallel with work stealing, stopping at the first failure. | 1 minute on a developer machine, 5 minutes in CI. |
 | **2. PostgreSQL delta** — `make test-pg` | Every push and pull request, as a job beside tier 1. Locally when a change touches SQL generation, transactions, locking or migrations. | Only the tests marked `postgresql` or `pg_delta`, on PostgreSQL 16. | 3 minutes. |
-| **3. Release** — `make test-release` | Nightly on `main` and on demand before a release. Never inside a fix loop. | `slow` on SQLite; the whole suite including `slow` on PostgreSQL; `scale` alone on both; the full `index_exhaustive` sweep; the `schema_vendors` PostgreSQL/MySQL contracts; a randomized parallel run with seed 137; the SpiceDB conformance suite once it lands. | About an hour, as independent parallel jobs. |
+| **3. Release** — `make test-release` | Nightly on `main` and on demand before a release. Never inside a fix loop. | `slow` on SQLite; the whole suite including `slow` on PostgreSQL; `scale` alone on both; the full `index_exhaustive` sweep; the `schema_vendors` PostgreSQL/MySQL contracts; a randomized parallel run with seed 137; the SpiceDB conformance suite once it lands. | About 12 minutes on an 18-core machine; independent parallel jobs in CI, where the sweep is the longest. |
 
 Rules that keep the tiers honest:
 
