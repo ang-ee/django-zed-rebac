@@ -431,14 +431,6 @@ def test_build_zed_emits_use_typechecking_exactly_once(
     assert text.splitlines().count("use typechecking") == 1
 
 
-@pytest.mark.xfail(
-    strict=True,
-    reason=(
-        "_handle_build_zed (src/rebac/management/commands/rebac.py:799-811) renders only "
-        "definitions and caveats under a hard-coded `use typechecking`, so a schema with "
-        "`with expiration` loses `use expiration` and SpiceDB WriteSchema rejects it."
-    ),
-)
 def test_build_zed_emits_use_expiration(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     text = _call_build(
         tmp_path,

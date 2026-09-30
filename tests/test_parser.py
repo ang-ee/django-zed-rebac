@@ -337,14 +337,6 @@ def test_caveat_body_keeps_braces_inside_strings():
     assert caveat.expression == 'x == "}"'
 
 
-@pytest.mark.xfail(
-    strict=True,
-    raises=ParseError,
-    reason=(
-        "_tokenize (src/rebac/schema/parser.py:62,146) sweeps caveat CEL bodies with a "
-        "punctuation set lacking '/', '%' and \"'\", so valid CEL using them fails to parse."
-    ),
-)
 @pytest.mark.parametrize("body", ["10 / x > 1", "x % 2 == 0", "string(x) == 'a'"])
 def test_caveat_body_accepts_cel_operators(body: str):
     schema = parse_zed(f"caveat c(x int) {{\n    {body}\n}}\n")
@@ -386,13 +378,6 @@ def test_validate_schema_rejects_relation_permission_name_collision():
     assert any("name collision" in error for error in validate_schema(schema))
 
 
-@pytest.mark.xfail(
-    strict=True,
-    reason=(
-        "validate_schema (src/rebac/schema/parser.py:564-626) collects names into sets, so "
-        "a relation declared twice in one definition is accepted; SpiceDB rejects it."
-    ),
-)
 def test_validate_schema_rejects_duplicate_relation():
     schema = parse_zed(
         """
@@ -405,13 +390,6 @@ def test_validate_schema_rejects_duplicate_relation():
     assert any("x/y" in error for error in validate_schema(schema))
 
 
-@pytest.mark.xfail(
-    strict=True,
-    reason=(
-        "validate_schema (src/rebac/schema/parser.py:564-626) collects names into sets, so "
-        "a permission declared twice in one definition is accepted; SpiceDB rejects it."
-    ),
-)
 def test_validate_schema_rejects_duplicate_permission():
     schema = parse_zed(
         """

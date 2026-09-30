@@ -11,6 +11,7 @@ ARCHITECTURE.md § Three actor-resolution paths.
 from __future__ import annotations
 
 import builtins
+from base64 import urlsafe_b64encode
 from collections.abc import AsyncIterator, Callable, Iterator
 from contextlib import asynccontextmanager, contextmanager
 from contextvars import ContextVar
@@ -276,7 +277,7 @@ def grant_subject_ref(agent: Any, on_behalf_of: Any | None) -> SubjectRef:
     """Build a Grant subject for `agent` acting on behalf of `on_behalf_of`.
 
     Resolve the agent and user through ``to_subject_ref`` and construct a
-    deterministic ``agents/grant:<user-id>.<agent-id>#valid`` subject. The
+    deterministic ``agents/grant:v2.<encoded-components>#valid`` subject. The
     application owns the compatible ``valid`` relation and grant relationships;
     this helper neither registers a grant type nor creates its permissions.
 
@@ -288,7 +289,15 @@ def grant_subject_ref(agent: Any, on_behalf_of: Any | None) -> SubjectRef:
         # Standalone agent run — no user-grant intersection.
         return agent_ref
     user_ref = to_subject_ref(on_behalf_of)
-    grant_id = f"{user_ref.subject_id}.{agent_ref.subject_id}"
+    parts = (
+        user_ref.subject_type,
+        user_ref.subject_id,
+        agent_ref.subject_type,
+        agent_ref.subject_id,
+    )
+    grant_id = "v2." + ".".join(
+        urlsafe_b64encode(part.encode("utf-8")).decode("ascii").rstrip("=") for part in parts
+    )
     return SubjectRef(
         object=ObjectRef(type_with_prefix("agents/grant"), grant_id),
         optional_relation="valid",

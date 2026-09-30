@@ -25,11 +25,6 @@ from rebac.models import SchemaDefinition, SchemaOverride, SchemaPermission, Sch
 from rebac.schema import parse_zed
 from tests.backend_setup import install_schema
 
-GRANT_ID_COLLIDES = (
-    "grant_subject_ref joins the bare subject ids with '.' and drops both subject types "
-    "(src/rebac/actors.py:291)"
-)
-
 
 @rebac_subject(type="agents/agent", id_attr="slug")
 class _Agent:
@@ -43,14 +38,12 @@ class _Bot:
         self.slug = slug
 
 
-@pytest.mark.xfail(strict=True, reason=GRANT_ID_COLLIDES)
 def test_grant_subject_ref_distinguishes_agent_types():
     user = SubjectRef.of("auth/user", "1")
 
     assert grant_subject_ref(_Agent("7"), user) != grant_subject_ref(_Bot("7"), user)
 
 
-@pytest.mark.xfail(strict=True, reason=GRANT_ID_COLLIDES)
 def test_grant_subject_ref_distinguishes_principal_types():
     agent = SubjectRef.of("agents/agent", "7")
 
@@ -59,7 +52,6 @@ def test_grant_subject_ref_distinguishes_principal_types():
     )
 
 
-@pytest.mark.xfail(strict=True, reason=GRANT_ID_COLLIDES)
 def test_grant_subject_ref_distinguishes_dot_split():
     left = grant_subject_ref(SubjectRef.of("agents/agent", "c"), SubjectRef.of("auth/user", "a.b"))
     right = grant_subject_ref(SubjectRef.of("agents/agent", "b.c"), SubjectRef.of("auth/user", "a"))
@@ -100,14 +92,6 @@ def test_override_on_defined_relation_takes_effect():
 
 
 @pytest.mark.django_db
-@pytest.mark.xfail(
-    strict=True,
-    reason=(
-        "compose() never validates override references and _enforced_schema_errors drops "
-        "validate_schema's 'undefined reference' error, so the override silently contributes "
-        "nothing (src/rebac/composition.py:239, src/rebac/backends/local.py:94)"
-    ),
-)
 def test_override_naming_undefined_relation_is_refused():
     permission = _seed_read_permission()
 

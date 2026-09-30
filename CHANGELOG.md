@@ -5,6 +5,50 @@ pre-1.0; breaking changes within a minor version are explicitly called out.
 
 ## [Unreleased]
 
+### Fixed
+
+- Middleware grants the superuser request bypass only when the resolved actor
+  is the active session superuser's own subject.
+- DRF denies unresolved identities on REBAC objects; unrelated objects retain
+  the adapter's pass-through behavior after actor and action admission.
+- MCP and create preflight refuse caller-supplied empty resource or overlay
+  subject IDs, keeping the backend's internal model-level sentinel private.
+- MCP validates model-backed `id_arg` values with the resource identity codec
+  before checking access, closing noncanonical ID privilege confusion.
+- A declared caveat parameter supplied as `None` remains conditional, whether
+  it came from stored or request context.
+- Pickled querysets shed actor and sudo authority, evaluated rows, and applied
+  query scope; deserialization needs a fresh actor or explicit bypass.
+- M2M add, remove, set, and clear check write permission on each affected
+  resource row through the explicit-sender through-model receiver.
+- `RebacManager.raw()` requires sudo or system context; `explain()` describes
+  an actor-scoped query.
+- Relationship queryset deletes maintain the permission index through the
+  tuple owner; queryset updates are refused with API guidance.
+- Refreshing a redacted model instance leaves previously denied fields hidden.
+- Bulk updates and instance saves check read gates on source columns used by
+  `F()` and other ORM write expressions.
+- Bulk write denial messages no longer include resource IDs outside the
+  actor's read scope.
+- Override composition rejects undefined relation and permission references,
+  including arrow sources.
+- **Breaking:** `grant_subject_ref` now uses an injective `v2.` grant ID made
+  from encoded principal and agent types and IDs. Migrate stored grant objects
+  and their relationship tuples together; old dot-joined IDs no longer match.
+- Django async permission checks reach `RebacBackend` through `ahas_perm` and
+  `ahas_module_perms`.
+- The schema tokenizer accepts CEL division, modulo, and single-quoted string
+  literals in caveat bodies.
+- Schema validation rejects duplicate relation and permission declarations.
+- CEL runtime lookup and unsupported-function failures raise
+  `CaveatUnsupportedError` instead of a false conditional result.
+- Backend configuration checks report invalid selection, missing SpiceDB
+  settings or client, and authenticate backend identity without crashing.
+- Admin autodiscovery imports `rebac.admin` without a runtime generic shim.
+- `build-zed` emits `use expiration` when required and includes it in the
+  deterministic content hash.
+- `rebac explain` prints the composed effective permission expression.
+
 ### Tests
 
 - The test commands follow the three tiers of ARCHITECTURE.md § Test tiers.

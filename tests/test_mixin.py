@@ -11,6 +11,7 @@ from rebac import (
     RelationshipTuple,
     SubjectRef,
     backend,
+    grant_subject_ref,
     rebac_subject,
     sudo,
     write_relationships,
@@ -194,7 +195,7 @@ def test_as_agent_scopes_agent_grant_on_behalf_of_user(alice, bob, post):
 
     agent = FakeAgent("assistant")
     _grant_owner_subject(
-        SubjectRef.of("agents/grant", f"{alice.pk}.assistant", "valid"),
+        grant_subject_ref(agent, alice),
         post,
     )
 
@@ -533,14 +534,14 @@ def test_instance_as_agent_shorthand_scopes_agent_grant(alice, bob, post):
 
     agent = FakeAgent("assistant")
     _grant_owner_subject(
-        SubjectRef.of("agents/grant", f"{alice.pk}.assistant", "valid"),
+        grant_subject_ref(agent, alice),
         post,
     )
     with sudo(reason="test.load"):
         instance = Post.objects.get(pk=post.pk)
 
     instance.as_agent(agent, on_behalf_of=alice)
-    assert instance.actor() == SubjectRef.of("agents/grant", f"{alice.pk}.assistant", "valid")
+    assert instance.actor() == grant_subject_ref(agent, alice)
     assert instance.has_access("read") is True
 
     instance.as_agent(agent, on_behalf_of=bob)

@@ -456,21 +456,16 @@ def test_verify_detects_complete_payload_drift_and_never_commits(indexed, payloa
     "unsupported",
     [
         "plain_update",
-        "tuple_queryset",
         "raw_save",
         "through_bulk_create",
     ],
 )
 @pytest.mark.parametrize("indexed", STORAGE_TIERS, indirect=True)
 def test_unsupported_paths_drift_and_rebuild_repairs(indexed, unsupported):
-    from rebac.models import active_relationship_model
-
     folder = Folder.objects.create(name="folder")
     post = Post.objects.create(title="post", folder=folder)
     grant_folder(folder)
-    if unsupported == "tuple_queryset":
-        active_relationship_model().objects.filter(resource_type="blog/folder").delete()
-    elif unsupported == "raw_save":
+    if unsupported == "raw_save":
         post.folder = None
         post.save_base(raw=True)
     elif unsupported == "through_bulk_create":
@@ -489,6 +484,26 @@ def test_unsupported_paths_drift_and_rebuild_repairs(indexed, unsupported):
     assert verify(using="default")
     rebuild(using="default")
     check_rows(post)
+
+
+@pytest.mark.pg_delta
+@pytest.mark.parametrize("indexed", STORAGE_TIERS, indirect=True)
+def test_tuple_queryset_delete_maintains_index(indexed):
+    from rebac.models import active_relationship_model
+
+    folder = Folder.objects.create(name="folder")
+    post = Post.objects.create(title="post", folder=folder)
+    grant_folder(folder)
+    assert indexed.check_access(subject=ALICE, action="read", resource=to_object_ref(post)).allowed
+
+    active_relationship_model().objects.filter(
+        resource_type="blog/folder", resource_id=str(folder.pk)
+    ).delete()
+
+    assert not indexed.check_access(
+        subject=ALICE, action="read", resource=to_object_ref(post)
+    ).allowed
+    assert_no_drift()
 
 
 def test_independent_owner_restores_enclosing_owner(indexed):

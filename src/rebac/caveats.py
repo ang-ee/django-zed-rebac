@@ -179,7 +179,7 @@ def evaluate(
 
     missing: list[str] = []
     for name in declared:
-        if name not in static and name not in dynamic:
+        if (static[name] if name in static else dynamic.get(name)) is None:
             missing.append(name)
 
     if missing:
@@ -210,13 +210,6 @@ def evaluate(
     try:
         result = program.evaluate(activation)
     except cel.CELEvalError as exc:
-        # Most commonly: a downstream sub-expression references an undeclared
-        # variable. Treat as CONDITIONAL when the underlying error is a
-        # KeyError (missing var); otherwise propagate as a CaveatUnsupportedError.
-        cause = exc.args[1] if len(exc.args) > 1 else None
-        names = exc.args[2] if len(exc.args) > 2 else None
-        if cause is KeyError and isinstance(names, tuple):
-            return None, tuple(sorted(str(n) for n in names))
         raise CaveatUnsupportedError(
             f"Caveat {caveat.name!r} failed to evaluate: {exc.args[0] if exc.args else exc}"
         ) from exc

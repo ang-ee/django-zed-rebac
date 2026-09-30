@@ -204,17 +204,7 @@ def test_reverse_fk_write_without_actor_raises_missing_actor(world, op):
 # ---------- many-to-many ----------
 
 
-_M2M_UNGATED = pytest.mark.xfail(
-    strict=True,
-    reason=(
-        "M2M add/remove/set/clear write the auto-created through model through its plain "
-        "manager, which no REBAC owner gates; src/rebac/signals.py:124 only maintains "
-        "the index via m2m_changed."
-    ),
-)
-
-
-@pytest.mark.parametrize("op", [pytest.param(op, marks=_M2M_UNGATED) for op in M2M_OPS])
+@pytest.mark.parametrize("op", M2M_OPS)
 def test_m2m_write_by_read_only_actor_is_denied(world, op):
     folders, posts = _load(world, actor=READER)
     before = _stored_collections(world)
@@ -225,9 +215,7 @@ def test_m2m_write_by_read_only_actor_is_denied(world, op):
     assert _stored_collections(world) == before
 
 
-@pytest.mark.parametrize(
-    "op", [op if op == "set" else pytest.param(op, marks=_M2M_UNGATED) for op in M2M_OPS]
-)
+@pytest.mark.parametrize("op", M2M_OPS)
 def test_m2m_write_without_actor_raises_missing_actor(world, op):
     folders, posts = _load(world, actor=None)
     before = _stored_collections(world)
@@ -241,13 +229,6 @@ def test_m2m_write_without_actor_raises_missing_actor(world, op):
 # ---------- relationship rows ----------
 
 
-@pytest.mark.xfail(
-    strict=True,
-    reason=(
-        "Relationship.objects queryset deletes have no tuple owner or signal "
-        "(src/rebac/models/relationship.py:60), so the derived index keeps the grant."
-    ),
-)
 def test_relationship_queryset_delete_revokes_index_grant(world):
     _, posts = world
     resource = ObjectRef("blog/post", str(posts[0].pk))
@@ -264,13 +245,6 @@ def test_relationship_queryset_delete_revokes_index_grant(world):
 # ---------- gated columns ----------
 
 
-@pytest.mark.xfail(
-    strict=True,
-    reason=(
-        "RebacQuerySet._rebac_update (src/rebac/managers.py:928) checks write gates only "
-        "and never inspects F() values for read__<field> gates, so update() copies them."
-    ),
-)
 @override_settings(REBAC_FIELD_READ_MODE="redact")
 def test_bulk_update_cannot_copy_read_gated_column_into_readable_one():
     with sudo(reason="test.fixture"):
@@ -286,13 +260,21 @@ def test_bulk_update_cannot_copy_read_gated_column_into_readable_one():
     assert Post.objects.with_actor(EDITOR).get(pk=post.pk).title != "secret body"
 
 
-@pytest.mark.xfail(
-    strict=True,
-    reason=(
-        "RebacMixin does not override refresh_from_db, so Django reloads every column "
-        "through the unscoped _rebac_base manager (src/rebac/mixins.py:149)."
-    ),
-)
+@override_settings(REBAC_FIELD_READ_MODE="redact")
+def test_instance_save_cannot_copy_read_gated_column_into_readable_one():
+    with sudo(reason="test.fixture"):
+        post = Post.objects.create(title="public", body="secret body")
+    _grant("blog/post", post.pk, "editor", EDITOR)
+    row = Post.objects.with_actor(EDITOR).get(pk=post.pk)
+    row.title = F("body")
+
+    with pytest.raises(PermissionDenied, match="read__body"):
+        row.save(update_fields=["title"])
+
+    with sudo(reason="test.verify"):
+        assert Post.objects.get(pk=post.pk).title == "public"
+
+
 @override_settings(REBAC_FIELD_READ_MODE="redact")
 @pytest.mark.parametrize("fields", [None, ["body"]], ids=["all", "body"])
 def test_refresh_from_db_keeps_redacted_field_hidden(fields):
@@ -311,13 +293,6 @@ def test_refresh_from_db_keeps_redacted_field_hidden(fields):
 # ---------- bulk guard ----------
 
 
-@pytest.mark.xfail(
-    strict=True,
-    reason=(
-        "_guard_bulk_action (src/rebac/managers.py:970) samples denied ids from an "
-        "unscoped scan (managers.py:1048), naming rows outside the actor's read scope."
-    ),
-)
 def test_bulk_guard_denial_names_no_row_the_actor_cannot_read():
     with sudo(reason="test.fixture"):
         SluggedPost.objects.create(slug="visible-row", title="old")

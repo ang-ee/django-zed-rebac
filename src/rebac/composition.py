@@ -40,7 +40,7 @@ from .schema.ast import (
     PermRef,
     Schema,
 )
-from .schema.parser import parse_permission_expression
+from .schema.parser import parse_permission_expression, validate_schema
 
 if TYPE_CHECKING:
     from .models import SchemaOverride
@@ -141,6 +141,13 @@ def compose_tagged(baseline: Schema, overrides: Iterable[SchemaOverride]) -> Tag
     # Reject any composition that introduces a permission cycle that wasn't
     # present in the baseline.
     _detect_cycles(baseline, composed)
+    reference_errors = [
+        error
+        for error in validate_schema(composed)
+        if "undefined reference" in error or "arrow walks via undefined relation" in error
+    ]
+    if reference_errors:
+        raise SchemaError("; ".join(reference_errors))
 
     return TaggedComposition(composed, arms, sites)
 

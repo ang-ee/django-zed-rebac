@@ -462,13 +462,6 @@ def test_cel_compile_error_raises_caveat_unsupported():
         evaluate(caveat, {}, {"x": 1})
 
 
-_LOOKUP_FAILURE_REASON = (
-    "caveats.evaluate (src/rebac/caveats.py:216-219) reports a CEL runtime "
-    "lookup failure as CONDITIONAL with the failed name as a missing parameter "
-    "instead of raising CaveatUnsupportedError."
-)
-
-
 @pytest.mark.parametrize(
     ("type_name", "expression", "value"),
     [
@@ -481,21 +474,12 @@ _LOOKUP_FAILURE_REASON = (
             '{"a": 1}[x] > 0',
             "b",
             id="missing-map-key",
-            marks=pytest.mark.xfail(strict=True, reason=_LOOKUP_FAILURE_REASON),
         ),
         pytest.param(
             "ipaddress",
             'x.in_cidr("10.0.0.0/8")',
             "10.0.0.1",
             id="ipaddress",
-            marks=pytest.mark.xfail(
-                strict=True,
-                reason=(
-                    "ZED.md § Conditional access says LocalBackend raises "
-                    "CaveatUnsupportedError for ipaddress; caveats.evaluate "
-                    "(src/rebac/caveats.py:216-219) returns CONDITIONAL(missing=('in_cidr',))."
-                ),
-            ),
         ),
     ],
 )

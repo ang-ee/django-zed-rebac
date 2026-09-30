@@ -59,7 +59,7 @@ _KEYWORDS = {"definition", "relation", "permission", "caveat", "use", "with", "n
 # Punct includes characters that legally appear inside caveat CEL bodies so
 # the tokenizer can sweep past them; the caveat parser re-reads the body
 # from raw source via offset scanning.
-_PUNCT = set("{}|+&-=:>,()*#.<[];!?")
+_PUNCT = set("{}|+&-=:>,()*#.<[];!?/%")
 
 
 def _tokenize(text: str) -> list[Token]:
@@ -130,9 +130,10 @@ def _tokenize(text: str) -> list[Token]:
             col += 1
             continue
         # String literals (used in caveat expressions if they appear inline — uncommon)
-        if c == '"':
+        if c in ('"', "'"):
+            quote = c
             j = i + 1
-            while j < n and text[j] != '"':
+            while j < n and text[j] != quote:
                 if text[j] == "\\":
                     j += 2
                 else:
@@ -493,10 +494,11 @@ class _Parser:
         n = len(self.text)
         while i < n:
             c = self.text[i]
-            if c == '"':
+            if c in ('"', "'"):
+                quote = c
                 # consume string
                 i += 1
-                while i < n and self.text[i] != '"':
+                while i < n and self.text[i] != quote:
                     if self.text[i] == "\\":
                         i += 2
                     else:
@@ -563,6 +565,10 @@ def validate_schema(schema: Schema) -> list[str]:
             )
         relation_names = {r.name for r in definition.relations}
         permission_names = {p.name for p in definition.permissions}
+        if len(relation_names) != len(definition.relations):
+            errors.append(f"{definition.resource_type}: duplicate relation name")
+        if len(permission_names) != len(definition.permissions):
+            errors.append(f"{definition.resource_type}: duplicate permission name")
 
         for relation in definition.relations:
             if relation.name in BUILTIN_ACTOR_TYPES:

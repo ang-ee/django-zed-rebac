@@ -27,6 +27,7 @@ from rebac import (
     backend,
     delete_relationship,
     delete_relationships,
+    grant_subject_ref,
     rebac_subject,
     sudo,
     write_relationships,
@@ -488,7 +489,7 @@ def test_as_agent_shorthands_scope_querysets_and_instances_through_local_backend
 
     post = _create_post(title="agent readable")
     agent = FakeAgent("assistant")
-    grant_subject = SubjectRef.of("agents/grant", f"{fake_users.alice.pk}.assistant", "valid")
+    grant_subject = grant_subject_ref(agent, fake_users.alice)
     write_relationships([_grant(grant_subject, ObjectRef("blog/post", str(post.pk)), "owner")])
 
     assert list(

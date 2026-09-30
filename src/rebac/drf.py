@@ -95,7 +95,7 @@ class RebacPermission(BasePermission):  # type: ignore[misc]  # untyped third-pa
         try:
             resource = to_object_ref(obj)
         except TypeError:
-            return True
+            return model_resource_type(obj) is None
         return backend().has_access(subject=subject, action=rebac_action, resource=resource)
 
 

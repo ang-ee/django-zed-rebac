@@ -687,6 +687,8 @@ result = backend().check_access(
 ```
 
 If you check WITHOUT supplying `ip`, the result is `CONDITIONAL_PERMISSION(missing=["ip"])`. The application can re-check with the missing field — useful for two-pass evaluation (cheap relationship check + expensive context resolution).
+A supplied `None` is also missing, including when stored relationship context
+pins the parameter to `None`; stored context still takes precedence.
 
 **`LocalBackend` caveat support.** Backed by [`cel-python`](https://pypi.org/project/cel-python/). Most CEL types work out of the box (`int`, `string`, `bool`, `list`, `map`, `timestamp`, `duration`). The `ipaddress` type is **not** in `cel-python`'s built-ins — `LocalBackend` raises `CaveatUnsupportedError`. Rewrite the caveat to take strings and do CIDR matching server-side, or move to the future `SpiceDBBackend` once it lands.
 
@@ -902,6 +904,10 @@ authorize this subject shape explicitly; constructing it neither impersonates
 the requester nor copies the requester's grants. The user-subject examples
 above illustrate permission arrows, not an automatic mapping from this grant
 subject back to a user.
+The helper's grant ID is `v2.` plus four dot-separated, unpadded URL-safe
+base64 UTF-8 components: principal type, principal ID, agent type, agent ID.
+This replaces the old `<user-id>.<agent-id>` form. Migrate stored grant
+objects and relationship tuples together before using the new helper.
 
 ```python
 # Common case: HTTP request from a Django user
@@ -1342,7 +1348,12 @@ The plugin parses the SpiceDB-canonical subset relevant to Django projects:
 - `relation` declarations with type unions, subject sets, wildcards, `with <caveat>`, `with expiration`
 - `permission` expressions: `+`, `&`, `-`, arrows (`->`)
 - `caveat` blocks with parameters and CEL expressions
+- CEL caveat bodies retain their operators and string literals, including
+  division (`/`), modulo (`%`), and single-quoted strings
 - Directives: `use typechecking` (auto-emitted), `use expiration`
+
+Each relation and permission name may be declared only once within a
+definition; duplicate declarations fail schema validation.
 
 NOT yet supported by the parser (raw `.zed` import + `WriteSchema` only when running against SpiceDB):
 

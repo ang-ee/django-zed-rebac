@@ -152,6 +152,25 @@ class RebacQuerySet(models.QuerySet[_M]):
         self._rebac_aggregate_scope = False
         self._rebac_visibility_applied = False
 
+    def __getstate__(self) -> dict[str, Any]:
+        """Do not transport actor or sudo authority through a pickle."""
+        state = super().__getstate__()
+        state["_rebac_actor"] = None
+        state["_rebac_sudo_reason"] = None
+        state["_rebac_scope_applied"] = False
+        state["_rebac_eager_scope"] = False
+        state["_result_cache"] = None
+        query = state.get("_query")
+        if isinstance(query, _RebacQuery):
+            query = cast(_RebacQuery, _without_query_scope(query))
+            query._rebac_state = {
+                name: value
+                for name, value in getattr(query, "_rebac_state", {}).items()
+                if name not in {"_rebac_actor", "_rebac_sudo_reason"}
+            }
+            state["_query"] = query
+        return state
+
     @property
     def query(self) -> Query:
         query = super().query
@@ -177,6 +196,11 @@ class RebacQuerySet(models.QuerySet[_M]):
         clone = self._clone()
         clone._apply_scope_in_place()
         return cast(Query, super(RebacQuerySet, clone).resolve_expression(*args, **kwargs))
+
+    def explain(self, *, format: str | None = None, **options: Any) -> str:
+        scoped = self._clone()
+        scoped._apply_scope_in_place()
+        return super(RebacQuerySet, scoped).explain(format=format, **options)
 
     # Note: a second `_clone` override below combines the actor + scope-flag
     # propagation; this stub kept for readability.
@@ -937,6 +961,7 @@ class RebacQuerySet(models.QuerySet[_M]):
             # has a ``write__<f>`` permission declared, every affected row
             # must also pass that check.
             self._guard_bulk_field_writes(actor, kwargs)  # type: ignore[arg-type]
+            self._guard_bulk_expression_reads(actor, kwargs)  # type: ignore[arg-type]
         return super().update(**kwargs)
 
     def delete(self) -> tuple[int, dict[str, int]]:
@@ -967,9 +992,8 @@ class RebacQuerySet(models.QuerySet[_M]):
         allowed = set(backend().accessible(subject=actor, action=action, resource_type=rebac_type))
         denied = affected - allowed
         if denied:
-            sample = ", ".join(sorted(denied)[:5])
             raise PermissionDenied(
-                f"Bulk {action}: {len(denied)} row(s) outside actor scope (e.g. {sample}). "
+                f"Bulk {action}: {len(denied)} row(s) outside actor scope. "
                 f"Bulk operations are all-or-nothing."
             )
 
@@ -1036,10 +1060,48 @@ class RebacQuerySet(models.QuerySet[_M]):
             )
             denied = affected - allowed
             if denied:
-                sample = ", ".join(sorted(denied)[:5])
                 raise PermissionDenied(
                     f"Bulk {action}: {len(denied)} row(s) outside actor scope "
-                    f"(e.g. {sample}). Bulk operations are all-or-nothing."
+                    "Bulk operations are all-or-nothing."
+                )
+
+    def _guard_bulk_expression_reads(self, actor: SubjectRef, kwargs: dict[str, Any]) -> None:
+        if runtime_field_deny_mode(self._effective_field_mode()) == "allow":
+            return
+        gated = gated_read_fields(self.model)
+        if not gated:
+            return
+        from .backends import backend
+
+        query = self.query.clone()
+        required: set[str] = set()
+        for value in kwargs.values():
+            resolver = getattr(value, "resolve_expression", None)
+            if not callable(resolver):
+                continue
+            resolved = resolver(query)
+            required.update(
+                column.target.name
+                for column in _expression_columns(resolved)
+                if column.alias == query.base_table and column.target.name in gated
+            )
+        if not required:
+            return
+        affected = self._affected_resource_ids_for_guard()
+        rebac_type = model_resource_type(self.model)
+        assert rebac_type is not None
+        for field_name in sorted(required):
+            allowed = set(
+                accessible_ids(
+                    backend(),
+                    subject=actor,
+                    action=f"read__{field_name}",
+                    resource_type=rebac_type,
+                )
+            )
+            if affected - allowed:
+                raise PermissionDenied(
+                    f"Bulk write expression reads denied field read__{field_name}."
                 )
 
     def _affected_resource_ids_for_guard(self) -> set[str]:
@@ -1072,6 +1134,15 @@ class RebacManager(models.Manager.from_queryset(RebacQuerySet)):  # type: ignore
             hints=self._hints,  # pyright: ignore[reportAttributeAccessIssue]
         )
         return qs
+
+    def raw(
+        self, raw_query: str, params: Any = (), translations: Any = None, using: Any = None
+    ) -> Any:
+        _, bypass = self.get_queryset().effective_actor(strict=True)
+        if not bypass:
+            raise PermissionDenied("raw() cannot be actor-scoped; use sudo or system_context")
+        raw_method = super().raw
+        return raw_method(raw_query, params=params, translations=translations, using=using)
 
     def with_actor(self, actor: Any) -> RebacQuerySet[Any]:
         return self.get_queryset().with_actor(actor)

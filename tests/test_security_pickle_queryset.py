@@ -31,12 +31,6 @@ definition blog/post {
 }
 """
 
-NO_GETSTATE = (
-    "RebacQuerySet defines no __getstate__, so Django's QuerySet.__getstate__ pickles "
-    "_rebac_sudo_reason with the queryset and the bypass survives unpickling "
-    "(src/rebac/managers.py:124)."
-)
-
 
 @pytest.fixture(autouse=True)
 def _setup_backend(db):
@@ -70,7 +64,6 @@ def posts(db, alice):
     return owned, hidden
 
 
-@pytest.mark.xfail(strict=True, reason=NO_GETSTATE)
 def test_unpickled_sudo_queryset_has_no_bypass(posts):
     restored = pickle.loads(pickle.dumps(Post.objects.sudo(reason="pickle.sudo")))
 
@@ -79,7 +72,6 @@ def test_unpickled_sudo_queryset_has_no_bypass(posts):
         list(restored.filter(title__isnull=False))
 
 
-@pytest.mark.xfail(strict=True, reason=NO_GETSTATE)
 def test_unpickled_system_context_queryset_has_no_bypass(posts):
     restored = pickle.loads(pickle.dumps(Post.objects.system_context(reason="pickle.system")))
 

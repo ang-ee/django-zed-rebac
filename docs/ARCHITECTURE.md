@@ -819,6 +819,9 @@ The schema rows themselves stay clean. Provenance, hash-checking, and noupdate a
 
 ### `SchemaOverride` — Tier 2, runtime tweaks
 
+`rebac.admin` registers the override and read-only REBAC models through
+Django admin autodiscovery without a runtime generic-class shim.
+
 ```python
 class SchemaOverride(models.Model):
     KIND_TIGHTEN  = "tighten"
@@ -848,6 +851,10 @@ effective_expr = (baseline_expr + extends) AND tightens
                                  minus disables
                                  with caveats merged from recaveats
 ```
+
+Every relation or permission named by an override expression must already
+exist in the target definition. Composition and override writes reject
+undefined names with `SchemaError`, including undefined arrow sources.
 
 #### Effective schema loading and generation
 
@@ -977,7 +984,7 @@ All settings prefixed `REBAC_`. No nested dict. Read via the public `app_setting
 | `REBAC_ACTOR_RESOLVER` | `"rebac.actors.default_resolver"` | `str` | Dotted-path callable that resolves `request → SubjectRef`. Override for custom identity layers (e.g., agent grants). |
 | `REBAC_MCP_ACTOR_RESOLVER` | `"rebac.mcp.default_actor_resolver"` | `str` | Dotted-path callable resolving an MCP request `Context → SubjectRef`, consulted before ambient `current_actor()`. The default reads a canonical `SubjectRef` string from trusted server-populated `ctx.request_context.meta["actor_subject"]`. Invalid explicit identity fails closed. |
 | `REBAC_TYPE_PREFIX` | `""` | `str` | Optional prefix for all generated resource types (multi-tenant SaaS). |
-| `REBAC_SUPERUSER_BYPASS` | `True` | `bool` | If `True`, active superusers short-circuit `has_perm` AND run inside an `ActorMiddleware`-opened `sudo("superuser-bypass")` bracket so QuerySet scoping lifts too. Each elevated request emits a `KIND_SUDO_BYPASS` audit row. Suppressed when `REBAC_ALLOW_SUDO = False`. Strict tenants set this to `False`. |
+| `REBAC_SUPERUSER_BYPASS` | `True` | `bool` | If `True`, active superusers short-circuit `has_perm`; `ActorMiddleware` opens `sudo("superuser-bypass")` only when the resolver returns that user's own subject. Each elevated request emits a `KIND_SUDO_BYPASS` audit row. Suppressed when `REBAC_ALLOW_SUDO = False`. Strict tenants set this to `False`. |
 | `REBAC_LINT_BARE_PREFETCH` | `True` | `bool` | Toggle for `rebac.W003` — the structural warning that an RBAC-bound model has an FK / O2O / M2M to another RBAC-bound model (a bare-string `select_related` / `prefetch_related` can load unguarded related rows). Enabled by default so the risky shape is visible; use `rebac_select_related()` / `rebac_prefetch_related()` or the Strawberry-Django optimizer for protected paths. |
 | `REBAC_EVALUATOR_CACHE_SIZE` | `10000` | `int` | Max entries across the per-scope evaluator's check and accessible caches. |
 | `REBAC_ZOOKIE_TRANSPORT` | `"none"` | `"none"` \| `"header"` \| `"session"` | Optional cross-request transport for the current Zookie. |
@@ -988,6 +995,11 @@ All settings prefixed `REBAC_`. No nested dict. Read via the public `app_setting
 
 Validation runs in Django's system-checks framework. `rebac.E001` validates the
 backend selection, `rebac.E002` checks required SpiceDB settings, and
+the optional SpiceDB client installation. Schema-dependent checks skip
+backend resolution when a non-local backend is selected, so invalid backend
+configuration is reported as checks rather than crashing `manage.py check`.
+`rebac.W001` recognizes the shipped auth backend and its subclasses by class
+identity, including the two public import paths.
 `rebac.E017` requires a positive integer condition limit (booleans are invalid).
 Production-only checks (`--deploy`) include `rebac.W101` for
 `REBAC_SPICEDB_TLS = False`.
@@ -1065,6 +1077,10 @@ any accessible row or a row-independent grant. `has_module_perms` applies the
 same model-level semantics across the module's registered resources.
 Proposed-row create authorization still uses `check_new`, because model-level
 admission does not authorize a particular candidate's relationships.
+Django's async permission walk calls `ahas_perm` and
+`ahas_module_perms` on each backend. `RebacBackend` supplies those methods
+through the same sync permission logic, executed in a thread-sensitive
+worker so ORM access is safe from async views.
 
 **Codename mapping.** Default mappings (`{view_, change_, delete_, add_}_<model>` → `{read, write, delete, create}`) ship in `rebac.codenames`. Per-package overrides via:
 
@@ -1080,7 +1096,7 @@ class YourAppConfig(AppConfig):
 **Superuser bypass.** Preserved by default for operational ergonomics. When `REBAC_SUPERUSER_BYPASS = True` (default) and the user is an *active* superuser, two surfaces short-circuit:
 
 1. `RebacBackend.has_perm(user, perm[, obj])` returns `True` immediately (this section's existing behaviour). Used by Django admin's "can the user see this row / use this app" probes.
-2. `ActorMiddleware` opens a `sudo(reason="superuser-bypass")` bracket for the request lifetime, so `Model.objects.with_actor(superuser).filter(...)` returns every row instead of being narrowed by `accessible()`. This matches the legacy contrib.auth contract that admin sees everything *at the QuerySet layer*, not just at the `has_perm` layer — without it, admin changelist queries would silently filter to "rows the superuser has an explicit relationship to", which is almost never what's wanted.
+2. `ActorMiddleware` opens a `sudo(reason="superuser-bypass")` bracket for the request lifetime only when its resolver returns the active superuser's own subject, so `Model.objects.with_actor(superuser).filter(...)` returns every row instead of being narrowed by `accessible()`. This matches the legacy contrib.auth contract that admin sees everything *at the QuerySet layer*, not just at the `has_perm` layer — without it, admin changelist queries would silently filter to "rows the superuser has an explicit relationship to", which is almost never what's wanted.
 
 The middleware path routes through the public `sudo()` API, so each elevated request emits a `KIND_SUDO_BYPASS` audit row (consistent with the strict-mode invariant that bypasses are auditable) and obeys `REBAC_ALLOW_SUDO` — when sudo is globally disabled, the middleware short-circuit is suppressed too (fail-closed: a tenant that turned sudo off shouldn't get an implicit superuser elevation). Strict tenants disable both surfaces by setting `REBAC_SUPERUSER_BYPASS = False`.
 
@@ -1167,6 +1183,9 @@ class Backend(ABC):
 `CheckResult` carries the three-state result, missing caveat parameters and an
 optional `reason`. Unknown resource types and actions preserve their diagnostic
 reason. Callers may retry conditional results with additional context.
+For caveats, a declared parameter with a `None` value is missing even when
+its key exists. A CEL lookup or function failure after all declared parameters
+are supplied raises `CaveatUnsupportedError`; it is not a missing parameter.
 
 ### `check_new` — preflight against not-yet-persisted resources
 
@@ -1212,6 +1231,10 @@ rebac:const=admin`, `check_new()` behaves as if the proposed object carried
 `#admin @ platform/role:admin`, then evaluates `admin->member` through the real
 backend store. Non-empty or unknown caller entries for these bare-ID constants
 raise `SchemaError`.
+
+Caller-supplied overlay subjects with empty IDs do not constitute a tuple and
+cannot authorize direct membership or arrow hops. The empty virtual resource
+ID used internally by the walker is not an overlay subject.
 
 `check_new` retains its existing virtual-relationship-only signature. Django
 create paths construct the candidate first, including Python defaults, then
@@ -1624,6 +1647,11 @@ their normal behavior.
 
 Tuple owners, resource/tracked mixin owners, and queryset write owners wrap
 the source write and maintenance in one transaction on its write alias.
+`Relationship` and `RelationshipRegistry` queryset deletes are tuple-owned:
+they capture each matching tuple before deletion and update the index in the
+same transaction. Queryset `update()` on relationship rows is refused because
+it can change a tuple's wire identity or policy without a matching tuple
+write owner; use `delete_relationships()` and `write_relationships()`.
 Plain third-party tracked models use explicit-sender signals; their callers
 must use `atomic()` or `ATOMIC_REQUESTS`. In autocommit, the receiver
 logs and warns under decision D2. `rebac.E018` rejects unowned,
@@ -1790,6 +1818,11 @@ The three actor verbs are sugar over the same primitive:
 | `rebac_prefetch_related(*lookups)` | Applies Django `prefetch_related`, rewriting bare protected lookups to `Prefetch(queryset=Related.objects.with_actor(actor))`. | Reverse, M2M, and to-many loading where protected children should be scoped rather than loaded via `_base_manager`. |
 
 `as_agent(agent)` without `on_behalf_of` uses `to_subject_ref(agent)` unchanged. Its resource type and grants come from the consumer's identity and schema declarations. Passing `on_behalf_of=user` constructs a deterministic grant subject; it does not create a grant, intersect permissions or impersonate the user. Applications that use a different grant identity pass their own subject through `with_actor`.
+The constructed grant ID is `v2.` followed by four dot-separated, unpadded
+URL-safe base64 encodings of the UTF-8 principal type, principal ID, agent
+type, and agent ID, in that order. This framing is injective even when IDs
+contain dots. Existing `agents/grant:<user-id>.<agent-id>` IDs must be
+recreated along with their relationship tuples before using the new helper.
 
 `rebac_select_related()` preserves Django's to-one join optimization, then
 checks every selected REBAC-bound related object in batches. If the actor cannot
@@ -1803,6 +1836,9 @@ model's default manager, never `_base_manager`.
 Every requested path is retained after its protected prefixes, including
 unprotected terminal relations and their explicit `Prefetch` queryset/`to_attr`.
 Loading an unprotected tail does not bypass any protected intermediate relation.
+Pickling a queryset strips its pinned actor and sudo reason, as instance
+pickling does. The receiving process must establish its own trusted actor or
+bypass context before materializing or mutating it.
 
 ### `with_actor` vs `sudo` — distinct verbs
 
@@ -1866,7 +1902,26 @@ A pinned actor (path 2) **always wins** over ambient state (paths 3-4) — there
 | `Model.objects.update(**kwargs)` | `write` on each affected row | Manager intersects the queryset PK set with the actor's `write` scope; raises if any in-scope row is excluded. When the update touches watched fields, the permission index is maintained set-based in the same transaction. |
 | `Model.objects.delete()` | `delete` on each row | Same pattern. |
 
+For an automatically created M2M through table owned by a REBAC resource,
+`add` / `remove` / `set` / `clear` check `write` on each affected row of the
+model that declared the M2M field, including reverse-manager calls. The
+through-model's explicit-sender `m2m_changed` receiver checks before mutation
+and still maintains the index after mutation. The carrying actor wins over
+ambient context; instance sudo does not propagate to the related manager.
+Without an actor, strict mode raises `MissingActorError`.
+
+`QuerySet.explain()` applies the same actor scope as the query it describes.
+`RebacManager.raw()` cannot attach a REBAC scope to arbitrary SQL and therefore
+requires ambient sudo or `system_context`; it raises in ordinary actor scope
+and raises `MissingActorError` without an actor in strict mode.
+
 **Failure mode for writes:** *all-or-nothing*. Any denied row in a bulk write raises and rolls back. **Failure mode for reads:** denied rows are absent from the queryset; no raise. List endpoints return `[]` rather than 403 when the user has no rows.
+Write expressions, including `F()` on an instance or in `update()` and
+`bulk_update()`, may read columns before writing their result. If a source
+column has a `read__<field>` gate under the active field-read mode, every
+affected row must grant that read; otherwise the write is denied. Bulk denial
+messages report counts and actions without identifying rows outside the
+actor's read scope.
 
 Actor-scoped `bulk_create(update_conflicts=True)` raises `PermissionDenied`
 before writing: a proposed-row create check cannot authorize updates to existing
@@ -1925,6 +1980,9 @@ redacted field via `save(update_fields=[...])`, the save_base owner raises
 `PermissionDenied`. A full `save()` on a redacted instance rewrites
 `update_fields` to exclude redacted fields, preventing a display-time `None`
 from overwriting the stored value.
+`refresh_from_db()` preserves fields already redacted on that instance, even
+when the refresh explicitly names one of them; refresh never reveals a hidden
+database value through Django's unscoped base manager.
 
 When the goal is to load a row *in order to mutate it* (resolve an
 update/delete target, then write a different column), redaction would hide
@@ -1960,6 +2018,11 @@ MIDDLEWARE = [
 ```
 
 The contextvar is exposed as `current_actor()` — works in async views, sync views, ASGI consumers, and DRF viewsets identically.
+
+The superuser request bypass applies only when the configured actor resolver
+returns that active superuser's own subject. A resolver returning an agent,
+grant, API key, or no actor keeps normal permission scoping even when
+`request.user` is a superuser.
 
 ## Per-request evaluator + Zookie freshness
 
@@ -2158,6 +2221,10 @@ Read admission requires a resolved actor, but does not require any accessible
 row at the model level. `RebacFilterBackend` applies row scoping and
 `has_object_permission` gates a concrete detail object: a list with no
 accessible rows returns `[]`, as required by the CRUD enforcement matrix.
+An object declaring a REBAC resource type is denied if its concrete identity
+cannot be resolved (including unsaved and redacted identifiers). An object
+without a REBAC resource type remains outside this permission class's object
+gate and is allowed after actor and action admission.
 
 drf-spectacular OpenAPI emission: optional `rebac.drf.spectacular` integration adds a security requirement to operations that include `RebacPermission`. Activated automatically if `drf_spectacular` is installed.
 
@@ -2209,6 +2276,11 @@ client-provided `_meta.actor_subject` unchanged. The server must overwrite it
 with the verified identity, or configure a resolver that reads trusted
 server-side authentication state. Implemented
 per [proposal 0004](./proposals/0004-mcp-tool-integration.md).
+
+Caller-supplied empty resource IDs and relationship target IDs are denied;
+the backend's empty ID has a separate, internal model-level meaning. For a
+model-backed resource, an `id_arg` must be canonical under that model's
+identity codec before the permission check.
 
 ### GraphQL (graphene / strawberry)
 
@@ -2282,6 +2354,9 @@ python manage.py rebac index rebuild [--type T ...]   # derive the permission in
 python manage.py rebac index verify  [--type T ...]   # CI / periodic: diff against a rolled-back rebuild; non-zero on drift
 ```
 
+`rebac explain` renders the effective permission expression after active
+`SchemaOverride` rows have been composed with the baseline.
+
 `index rebuild` and `index verify` are specified under
 [Index commands](#commands). Run `rebuild` after any write that
 bypasses the index owners: raw SQL, data migrations over historical models,
@@ -2340,6 +2415,9 @@ Build output (`effective.zed`) is **byte-identical** across runs, machines, Pyth
 3. **No timestamps in generated files.** A content hash is computed from the *sorted, canonical inputs* and emitted as a comment header.
 4. **All set / dict iteration: `sorted(...)`.** Filesystem walks: `sorted(os.listdir(...))`.
 5. **Generator-version stamp**: `// Generated by django-zed-rebac 1.0.0` — pinned to the installed version.
+6. **Feature directives**: emit `use typechecking` exactly once and emit
+   `use expiration` when any source uses the directive or declares a relation
+   with expiration.
 
 CI determinism test: run `rebac build-zed` twice in a tmpdir, byte-diff. Failure on any difference. Mirrors `manage.py makemigrations --check`.
 

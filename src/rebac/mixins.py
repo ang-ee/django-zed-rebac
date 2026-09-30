@@ -391,6 +391,22 @@ class RebacMixin(RebacTrackedMixin):
             pass
         return instance
 
+    def refresh_from_db(
+        self,
+        using: str | None = None,
+        fields: Iterable[str] | None = None,
+        from_queryset: models.QuerySet[Any] | None = None,
+    ) -> None:
+        redacted = frozenset(getattr(self, "_rebac_redacted_fields", frozenset()) or frozenset())
+        super().refresh_from_db(using=using, fields=fields, from_queryset=from_queryset)
+        if redacted:
+            from .field_visibility import mark_denied_fields
+
+            mode: FieldDenyMode = (
+                "omit" if getattr(self, "_rebac_omitted_fields", frozenset()) else "redact"
+            )
+            mark_denied_fields(self, redacted, mode=mode)
+
     def __getstate__(self) -> dict[str, Any]:
         """Strip per-instance REBAC binding before pickling.
 
@@ -852,6 +868,13 @@ def _gate_save(
     # trivially "dirty"; gating create on per-field permissions makes no
     # sense (use ``permission create = ...`` for that).
     if not is_create:
+        _enforce_expression_reads(
+            sender=sender,
+            instance=instance,
+            actor=actor,
+            resource=resource,
+            update_fields=update_fields,
+        )
         _enforce_redacted_field_writes(
             sender=sender,
             instance=instance,
@@ -896,6 +919,60 @@ def _gate_delete(
 
 
 # ---------- Per-field write helpers ----------
+
+
+def _enforce_expression_reads(
+    *,
+    sender: type[models.Model],
+    instance: Any,
+    actor: SubjectRef,
+    resource: ObjectRef,
+    update_fields: Iterable[str] | None,
+) -> None:
+    from django.db.models.sql import Query
+
+    from .backends import backend
+    from .field_visibility import (
+        check_field_access,
+        effective_field_deny_mode,
+        gated_read_fields,
+        runtime_field_deny_mode,
+    )
+    from .managers import _expression_columns
+
+    if runtime_field_deny_mode(effective_field_deny_mode(instance._rebac_field_deny)) == "allow":
+        return
+    gated = gated_read_fields(sender)
+    if not gated:
+        return
+    selected = (
+        set(_normalise_update_field_names(sender=sender, update_fields=update_fields))
+        if update_fields is not None
+        else {field.name for field in sender._meta.concrete_fields if not field.primary_key}
+    )
+    query = Query(sender)
+    required: set[str] = set()
+    for field in sender._meta.concrete_fields:
+        if field.name not in selected:
+            continue
+        value = getattr(instance, field.attname)
+        resolver = getattr(value, "resolve_expression", None)
+        if not callable(resolver):
+            continue
+        resolved = resolver(query)
+        required.update(
+            column.target.name
+            for column in _expression_columns(resolved)
+            if column.alias == query.base_table and column.target.name in gated
+        )
+    for field_name in sorted(required):
+        if not check_field_access(
+            backend(),
+            subject=actor,
+            action=f"read__{field_name}",
+            resource=resource,
+        ).allowed:
+            raise PermissionDenied(f"Write expression reads denied field read__{field_name}.")
 
 
 def _enforce_redacted_field_writes(

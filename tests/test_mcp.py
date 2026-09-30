@@ -185,7 +185,15 @@ def test_denied_permission_does_not_run_body() -> None:
 
 @pytest.mark.django_db
 def test_id_arg_targets_the_named_row() -> None:
-    _grant_owner(ObjectRef("blog/post", "p1"), SubjectRef.of("auth/user", "5"))
+    from rebac import sudo
+    from tests.testapp.models import Post
+
+    with sudo(reason="test.fixture"):
+        owned = Post.objects.create(title="owned")
+        other = Post.objects.create(title="not owned")
+    owned_id = str(owned.pk)
+    other_id = str(other.pk)
+    _grant_owner(ObjectRef("blog/post", owned_id), SubjectRef.of("auth/user", "5"))
     calls: list[str] = []
 
     @rebac_mcp_tool(resource_type="blog/post", action="write", id_arg="post_id")
@@ -193,11 +201,11 @@ def test_id_arg_targets_the_named_row() -> None:
         calls.append(post_id)
         return "ok"
 
-    # Authorised on p1, denied on p2 — same actor, different id_arg value.
-    assert edit_post("p1", "x", ctx=_ctx("auth/user:5")) == "ok"
+    # Authorised on the owned row, denied on another row under the same actor.
+    assert edit_post(owned_id, "x", ctx=_ctx("auth/user:5")) == "ok"
     with pytest.raises(PermissionDenied):
-        edit_post("p2", "x", ctx=_ctx("auth/user:5"))
-    assert calls == ["p1"]
+        edit_post(other_id, "x", ctx=_ctx("auth/user:5"))
+    assert calls == [owned_id]
 
 
 @pytest.mark.django_db

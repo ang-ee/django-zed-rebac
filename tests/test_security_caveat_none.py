@@ -20,11 +20,6 @@ definition blog/post {
 
 ALICE = SubjectRef.of("auth/user", "alice")
 
-NONE_IS_SUPPLIED = (
-    "caveats.evaluate counts a declared parameter present with value None as supplied and "
-    "evaluates the CEL body with null, so a deny-list caveat allows (src/rebac/caveats.py:182)"
-)
-
 
 @pytest.fixture(autouse=True)
 def _schema(db):
@@ -44,7 +39,6 @@ def _viewer(post_id: str, caveat_context: dict | None = None) -> RelationshipTup
     )
 
 
-@pytest.mark.xfail(strict=True, reason=NONE_IS_SUPPLIED)
 def test_check_access_with_none_parameter_is_conditional():
     backend().write_relationships([_viewer("p1")])
     post = ObjectRef("blog/post", "p1")
@@ -61,7 +55,6 @@ def test_check_access_with_none_parameter_is_conditional():
     assert result.conditional_on == ("flagged",)
 
 
-@pytest.mark.xfail(strict=True, reason=NONE_IS_SUPPLIED)
 def test_accessible_with_none_parameter_excludes_row():
     backend().write_relationships([_viewer("p1")])
 
@@ -78,7 +71,6 @@ def test_accessible_with_none_parameter_excludes_row():
     assert ids({"flagged": None}) == set()
 
 
-@pytest.mark.xfail(strict=True, reason=NONE_IS_SUPPLIED)
 def test_scoped_queryset_with_pinned_none_parameter_excludes_row():
     from tests.testapp.models import Post
 

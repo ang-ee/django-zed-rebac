@@ -31,12 +31,6 @@ definition blog/post {
 
 AGENT = SubjectRef.of("agents/agent", "helper")
 
-BYPASS_FROM_SESSION_USER = (
-    "ActorMiddleware._should_sudo reads request.user, not the actor REBAC_ACTOR_RESOLVER "
-    "returned, so a non-superuser actor on a superuser session runs under sudo "
-    "(src/rebac/middleware.py:195)."
-)
-
 
 class _Request:
     def __init__(self, user):
@@ -82,7 +76,6 @@ def _sync_view(captured):
     return view
 
 
-@pytest.mark.xfail(strict=True, reason=BYPASS_FROM_SESSION_USER)
 @override_settings(
     REBAC_SUPERUSER_BYPASS=True,
     REBAC_ACTOR_RESOLVER=f"{__name__}.agent_resolver",
@@ -99,7 +92,6 @@ def test_sync_resolved_agent_on_superuser_session_is_not_sudo(root, post):
     assert not PermissionAuditEvent.objects.filter(reason="superuser-bypass").exists()
 
 
-@pytest.mark.xfail(strict=True, reason=BYPASS_FROM_SESSION_USER)
 @pytest.mark.django_db(transaction=True)
 @override_settings(
     REBAC_SUPERUSER_BYPASS=True,

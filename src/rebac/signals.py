@@ -429,12 +429,74 @@ def _index_m2m(
     using: str,
     **kwargs: Any,
 ) -> None:
-    if sender not in _throughs or not _current_watch(sender, using):
+    if sender not in _throughs:
+        return
+    if action in {"pre_add", "pre_remove", "pre_clear"}:
+        _gate_m2m(sender, instance, reverse, pk_set, using)
+    if not _current_watch(sender, using):
         return
     if action in {"pre_add", "pre_remove", "pre_clear"}:
         _capture_signal_old(type(instance), instance, using)
     elif action in {"post_add", "post_remove", "post_clear"}:
         _finish_signal(type(instance), instance, using)
+
+
+def _gate_m2m(
+    sender: type[Model],
+    instance: Any,
+    reverse: bool,
+    pk_set: set[Any] | None,
+    using: str,
+) -> None:
+    """Gate the resource rows whose declared M2M edge is being changed."""
+    from .actors import current_actor, is_sudo
+    from .backends import backend
+    from .errors import MissingActorError, PermissionDenied
+
+    owner_model = sender._meta.auto_created
+    if not isinstance(owner_model, type) or not model_resource_type(owner_model):
+        return
+    actor = getattr(instance, "_rebac_actor", None)
+    if actor is None:
+        if is_sudo():
+            return
+        actor = current_actor()
+    if actor is None:
+        if app_settings.REBAC_STRICT_MODE:
+            raise MissingActorError("M2M write on a REBAC resource requires an actor.")
+        return
+
+    if reverse:
+        owner_field = next(
+            field
+            for field in sender._meta.fields
+            if isinstance(field, models.ForeignKey) and field.remote_field.model is owner_model
+        )
+        if pk_set is None:
+            other_field = next(
+                field
+                for field in sender._meta.fields
+                if isinstance(field, models.ForeignKey) and field is not owner_field
+            )
+            owner_ids = (
+                sender._base_manager.using(using)
+                .filter(**{other_field.attname: instance.pk})
+                .values(owner_field.attname)
+            )
+        else:
+            owner_ids = pk_set
+        rows = (
+            owner_model._base_manager.using(using)
+            .filter(pk__in=owner_ids)
+            .iterator(chunk_size=1000)
+        )
+    else:
+        rows = (instance,)
+    active = backend()
+    for row in rows:
+        resource = to_object_ref(row)
+        if not active.has_access(subject=actor, action="write", resource=resource):
+            raise PermissionDenied(f"Denied: {actor} cannot write {resource}")
 
 
 def _mark_schema_caches_stale() -> None:

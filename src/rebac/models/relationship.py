@@ -17,14 +17,14 @@ returns the one selected by the setting. The wire shape (``RelationshipTuple``
 
 from __future__ import annotations
 
-from collections.abc import Iterable, Mapping
+from collections.abc import Callable, Iterable, Mapping
 from typing import Any, cast
 
 from django.db import models
 from django.db.models import F, Q
 
 from ..conf import app_settings
-from ..errors import RelationshipReadError
+from ..errors import PermissionDenied, RelationshipReadError
 from ..types import ObjectRef, RelationshipTuple, SubjectRef
 
 WIRE_VALUE_FIELDS = (
@@ -59,6 +59,15 @@ _REGISTRY_WIRE_FIELD_MAP = {
 
 class RelationshipQuerySet(models.QuerySet["Relationship"]):
     """Mode-agnostic queryset helpers for denormalized relationship rows."""
+
+    def delete(self) -> tuple[int, dict[str, int]]:
+        return _owned_tuple_delete(self, super().delete)
+
+    def update(self, **kwargs: Any) -> int:
+        raise PermissionDenied(
+            "Relationship queryset update() is unsupported; use delete_relationships() "
+            "and write_relationships() to change tuples."
+        )
 
     def index_projection(self) -> models.QuerySet[Any]:
         return cast(
@@ -297,6 +306,15 @@ class RelationshipRegistryQuerySet(models.QuerySet["RelationshipRegistry"]):
     returns this class so the rewrite is in scope for the whole chain.
     """
 
+    def delete(self) -> tuple[int, dict[str, int]]:
+        return _owned_tuple_delete(self, super().delete)
+
+    def update(self, **kwargs: Any) -> int:
+        raise PermissionDenied(
+            "Relationship queryset update() is unsupported; use delete_relationships() "
+            "and write_relationships() to change tuples."
+        )
+
     def index_projection(self) -> models.QuerySet[Any]:
         # Every F expression uses a real FK path. The internal projection is a
         # plain queryset: its wire aliases are now real annotations, and later
@@ -412,6 +430,37 @@ class RelationshipRegistryQuerySet(models.QuerySet["RelationshipRegistry"]):
                 "caveat_name",
             )
         ]
+
+
+def _owned_tuple_delete(
+    rows: RelationshipQuerySet | RelationshipRegistryQuerySet,
+    delete: Callable[[], tuple[int, dict[str, int]]],
+) -> tuple[int, dict[str, int]]:
+    """Capture arbitrary queryset matches before their tuple rows disappear."""
+    from ..backends.local import mark_relationships_changed
+    from ..index.maintain import tuple_owner
+
+    with tuple_owner(rows.db) as maintenance:
+        if maintenance is not None:
+            projection = rows.index_projection()
+            maintenance.capture_old(
+                tuples=(
+                    RelationshipTuple(
+                        resource=ObjectRef(row["resource_type"], row["resource_id"]),
+                        relation=row["relation"],
+                        subject=SubjectRef.of(
+                            row["subject_type"], row["subject_id"], row["subject_relation"]
+                        ),
+                    )
+                    for row in projection.iterator(chunk_size=1000)
+                )
+            )
+        result = delete()
+        if maintenance is not None:
+            maintenance.changed()
+    if result[0]:
+        mark_relationships_changed()
+    return result
 
 
 class RelationshipRegistryManager(models.Manager.from_queryset(RelationshipRegistryQuerySet)):  # type: ignore[misc]

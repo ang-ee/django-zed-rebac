@@ -28,6 +28,9 @@ def _schema_for_checks() -> Schema | None:
 
     from .backends import backend
 
+    if app_settings.REBAC_BACKEND != "local":
+        return None
+
     try:
         try:
             return backend().schema()
@@ -102,6 +105,15 @@ def check_backend_setting(app_configs: Any = None, **kwargs: Any) -> list[checks
             )
         )
     if backend == "spicedb":
+        from importlib.util import find_spec
+
+        if find_spec("authzed") is None:
+            issues.append(
+                checks.Error(
+                    "REBAC_BACKEND='spicedb' requires the authzed client package",
+                    id="rebac.E002",
+                )
+            )
         if not app_settings.REBAC_SPICEDB_ENDPOINT:
             issues.append(
                 checks.Error(
@@ -426,9 +438,21 @@ def check_auth_backend_installed(
 ) -> list[checks.CheckMessage]:
     """Warn if `rebac.backends.auth.RebacBackend` is not in AUTHENTICATION_BACKENDS."""
     from django.conf import settings
+    from django.utils.module_loading import import_string
+
+    from .backends.auth import RebacBackend
 
     backends = getattr(settings, "AUTHENTICATION_BACKENDS", [])
-    if not any(b.endswith(".RebacBackend") or b.endswith(".auth.RebacBackend") for b in backends):
+    found = False
+    for path in backends:
+        try:
+            cls = import_string(path)
+        except ImportError, AttributeError, TypeError:
+            continue
+        if isinstance(cls, type) and issubclass(cls, RebacBackend):
+            found = True
+            break
+    if not found:
         return [
             checks.Warning(
                 "rebac.backends.auth.RebacBackend not in AUTHENTICATION_BACKENDS. "

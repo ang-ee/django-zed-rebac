@@ -300,7 +300,8 @@ def _build_ctx(
         candidates = [
             candidate
             for candidate in proposed
-            if subject_allowed_by_relation(relation_def, candidate, caveat_name="")
+            if candidate.subject_id
+            and subject_allowed_by_relation(relation_def, candidate, caveat_name="")
         ]
         return _virtual_membership(
             ctx=ctx,
@@ -327,7 +328,8 @@ def _build_ctx(
         candidates = [
             candidate
             for candidate in proposed
-            if subject_allowed_by_relation(via_relation, candidate, caveat_name="")
+            if candidate.subject_id
+            and subject_allowed_by_relation(via_relation, candidate, caveat_name="")
         ]
         if not candidates:
             return False

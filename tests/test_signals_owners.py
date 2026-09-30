@@ -461,7 +461,8 @@ def test_db_only_m2m_watch_added_by_another_worker_needs_no_reconnection(monkeyp
     assert backend() is stale_worker
     # First local operation is a revoke, before any scope/check warms its plan.
     with patch("rebac.signals.connect_tracked_signals", side_effect=AssertionError("reconnect")):
-        post.collections.remove(folder)
+        with sudo(reason="index maintenance fixture"):
+            post.collections.remove(folder)
     assert_no_drift()
     assert (
         not backend()

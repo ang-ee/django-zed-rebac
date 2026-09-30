@@ -88,27 +88,8 @@ QUERYSET_TERMINALS = {
     "contains": lambda post: Post.objects.contains(post),
     "dates": lambda post: list(AuthoredPost.objects.dates("author__date_joined", "day")),
     "datetimes": lambda post: list(AuthoredPost.objects.datetimes("author__date_joined", "day")),
-    "explain": pytest.param(
-        lambda post: Post.objects.all().explain(),
-        marks=pytest.mark.xfail(
-            strict=True,
-            reason=(
-                "RebacQuerySet does not override QuerySet.explain, which runs the unscoped "
-                "query without resolving an actor; it returns a plan, not rows "
-                "(src/rebac/managers.py:124)."
-            ),
-        ),
-    ),
-    "raw": pytest.param(
-        lambda post: list(Post.objects.raw(f"SELECT * FROM {Post._meta.db_table}")),
-        marks=pytest.mark.xfail(
-            strict=True,
-            reason=(
-                "RebacManager inherits Manager.raw, whose RawQuerySet applies no actor scope "
-                "and returns every row in strict mode (src/rebac/managers.py:1052)."
-            ),
-        ),
-    ),
+    "explain": lambda post: Post.objects.all().explain(),
+    "raw": lambda post: list(Post.objects.raw(f"SELECT * FROM {Post._meta.db_table}")),
 }
 
 INSTANCE_TERMINALS = {

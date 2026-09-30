@@ -6,8 +6,7 @@ audit, provenance and Tier-1 schema admins are read-only, even for superusers.
 ``tests.settings`` does not install ``django.contrib.admin``. The ModelAdmin
 classes are exercised on a private ``AdminSite`` with ``RequestFactory``
 requests: changelists, permissions, forms and ``save_model`` need neither the
-admin app nor a URLconf. Importing ``rebac.admin`` currently needs a runtime
-generic shim; see ``test_admin_module_loads_in_a_project_with_the_admin_app``.
+admin app nor a URLconf.
 """
 
 from __future__ import annotations
@@ -21,7 +20,6 @@ from typing import Any
 
 import pytest
 from django.contrib.admin import AdminSite
-from django.contrib.admin.options import BaseModelAdmin
 from django.contrib.admin.utils import lookup_field
 from django.contrib.auth import get_user_model
 from django.contrib.contenttypes.models import ContentType
@@ -56,21 +54,14 @@ def site(monkeypatch: pytest.MonkeyPatch) -> AdminSite:
     """Load ``rebac.admin`` against a private site, leaving no process state behind.
 
     ``@admin.register`` resolves ``django.contrib.admin.sites.site`` when it runs,
-    so the registrations land on ``private``. The module subscripts ModelAdmin
-    classes, which Django does not support at runtime; the shim exists only
-    while the module body executes.
+    so the registrations land on ``private``.
     """
     private = AdminSite(name="rebac_test_admin")
     monkeypatch.setattr("django.contrib.admin.sites.site", private)
     monkeypatch.delitem(sys.modules, "rebac.admin", raising=False)
-    shimmed = "__class_getitem__" not in BaseModelAdmin.__dict__
-    if shimmed:
-        BaseModelAdmin.__class_getitem__ = classmethod(lambda cls, *args: cls)  # type: ignore[attr-defined]
     try:
         importlib.import_module("rebac.admin")
     finally:
-        if shimmed:
-            del BaseModelAdmin.__class_getitem__  # type: ignore[attr-defined]
         sys.modules.pop("rebac.admin", None)
     return private
 
@@ -130,14 +121,6 @@ def test_admin_module_registers_the_documented_models(site: AdminSite) -> None:
     assert set(site._registry) == {SchemaOverride, *READ_ONLY_MODELS}
 
 
-@pytest.mark.xfail(
-    strict=True,
-    reason=(
-        "src/rebac/admin.py:42,53,72 subscript admin.ModelAdmin/TabularInline at runtime; "
-        "Django 6.0 classes are not generic without django_stubs_ext.monkeypatch(), so "
-        "admin autodiscovery raises TypeError in any project that installs the admin."
-    ),
-)
 def test_admin_module_loads_in_a_project_with_the_admin_app() -> None:
     script = """
 import django

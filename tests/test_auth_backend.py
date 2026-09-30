@@ -294,13 +294,6 @@ def _run(coroutine_function, *args):
     return async_to_sync(coroutine_function)(*args)
 
 
-@pytest.mark.xfail(
-    strict=True,
-    reason=(
-        "RebacBackend (src/rebac/backends/auth.py:48) defines no ahas_perm/ahas_module_perms, "
-        "so Django's async permission walk skips it and async checks never reach REBAC."
-    ),
-)
 @override_settings(AUTHENTICATION_BACKENDS=["rebac.backends.auth.RebacBackend"])
 @pytest.mark.parametrize(
     ("method", "args"),

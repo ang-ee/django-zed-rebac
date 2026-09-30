@@ -124,14 +124,6 @@ def test_explain_misses_fail(synced, target: str, message: str) -> None:
         _run("explain", target)
 
 
-@pytest.mark.xfail(
-    strict=True,
-    reason=(
-        "_handle_explain (src/rebac/management/commands/rebac.py:1000-1015) prints the "
-        "stored baseline SchemaPermission.expression, ignoring active SchemaOverride rows, "
-        "so it does not print the compiled expression."
-    ),
-)
 def test_explain_includes_an_active_override(synced) -> None:
     target = SchemaPermission.objects.get(definition__resource_type="blog/post", name="read")
     SchemaOverride.objects.create(

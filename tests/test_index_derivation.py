@@ -1237,7 +1237,7 @@ def test_projection_keeps_maximum_expiry_across_conflicts(install):
 
 def test_pinned_declared_context_does_not_drop_missing_runtime_global(install):
     active = install("""
-        caveat runtime(ok bool) { ok && runtime_flag }
+        caveat runtime(ok bool, runtime_flag bool) { ok && runtime_flag }
         definition auth/user {}
         definition test/doc {
             relation blocked: auth/user with runtime

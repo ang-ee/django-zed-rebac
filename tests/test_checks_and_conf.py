@@ -397,15 +397,6 @@ def test_e001_silent_for_supported_backends(value):
         assert "rebac.E001" not in _ids(check_backend_setting())
 
 
-@pytest.mark.xfail(
-    strict=True,
-    raises=ValueError,
-    reason=(
-        "_schema_for_checks (src/rebac/checks.py:29-47) lets backend()'s ValueError for an "
-        "unknown REBAC_BACKEND escape, so `manage.py check` crashes instead of reporting "
-        "rebac.E001."
-    ),
-)
 def test_e001_is_reported_by_the_check_framework():
     with override_settings(REBAC_BACKEND="bogus"):
         issues = checks.run_checks(tags=["rebac"])
@@ -417,8 +408,7 @@ def test_e002_requires_spicedb_endpoint():
         REBAC_BACKEND="spicedb", REBAC_SPICEDB_ENDPOINT=None, REBAC_SPICEDB_TOKEN="t"
     ):
         issues = [i for i in check_backend_setting() if i.id == "rebac.E002"]
-    assert len(issues) == 1
-    assert "REBAC_SPICEDB_ENDPOINT" in issues[0].msg
+    assert sum("REBAC_SPICEDB_ENDPOINT" in issue.msg for issue in issues) == 1
 
 
 def test_e002_requires_spicedb_token():
@@ -426,28 +416,22 @@ def test_e002_requires_spicedb_token():
         REBAC_BACKEND="spicedb", REBAC_SPICEDB_ENDPOINT="localhost:50051", REBAC_SPICEDB_TOKEN=""
     ):
         issues = [i for i in check_backend_setting() if i.id == "rebac.E002"]
-    assert len(issues) == 1
-    assert "REBAC_SPICEDB_TOKEN" in issues[0].msg
+    assert sum("REBAC_SPICEDB_TOKEN" in issue.msg for issue in issues) == 1
 
 
-def test_e002_silent_when_spicedb_is_configured_or_not_selected():
+def test_e002_requires_client_even_when_spicedb_settings_are_configured():
+    from importlib.util import find_spec
+
     with override_settings(
         REBAC_BACKEND="spicedb", REBAC_SPICEDB_ENDPOINT="localhost:50051", REBAC_SPICEDB_TOKEN="t"
     ):
-        assert "rebac.E002" not in _ids(check_backend_setting())
+        issues = [issue for issue in check_backend_setting() if issue.id == "rebac.E002"]
+        assert bool(issues) is (find_spec("authzed") is None)
+        assert all("authzed" in issue.msg for issue in issues)
     with override_settings(REBAC_BACKEND="local", REBAC_SPICEDB_ENDPOINT=None):
         assert "rebac.E002" not in _ids(check_backend_setting())
 
 
-@pytest.mark.xfail(
-    strict=True,
-    raises=ImportError,
-    reason=(
-        "_schema_for_checks (src/rebac/checks.py:29-47) lets SpiceDBBackend's ImportError "
-        "escape when authzed is absent, so `manage.py check` crashes instead of reporting "
-        "rebac.E002."
-    ),
-)
 def test_e002_is_reported_by_the_check_framework():
     with override_settings(REBAC_BACKEND="spicedb", REBAC_SPICEDB_ENDPOINT=None):
         issues = checks.run_checks(tags=["rebac"])
@@ -504,13 +488,6 @@ def test_w001_silent_with_rebac_auth_backend(path):
         assert check_auth_backend_installed() == []
 
 
-@pytest.mark.xfail(
-    strict=True,
-    reason=(
-        "check_auth_backend_installed (src/rebac/checks.py:431) accepts any dotted path "
-        "ending in '.RebacBackend', so a foreign class of that name silences rebac.W001."
-    ),
-)
 def test_w001_not_silenced_by_a_foreign_class_named_rebac_backend():
     with override_settings(AUTHENTICATION_BACKENDS=["example.auth.RebacBackend"]):
         assert _ids(check_auth_backend_installed()) == ["rebac.W001"]

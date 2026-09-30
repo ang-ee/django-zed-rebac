@@ -121,7 +121,8 @@ design that prevents the worst data-leakage bug class.
   two surfaces short-circuit for active superusers: (a)
   `RebacBackend.has_perm` returns `True` immediately, and (b)
   `ActorMiddleware` opens a `sudo(reason="superuser-bypass")` bracket for
-  the request lifetime so QuerySet `accessible()` scoping also lifts —
+  the request lifetime only when its resolver returned that superuser's own
+  subject, so QuerySet `accessible()` scoping also lifts —
   matching the contrib.auth contract that admin sees every row. The
   middleware path routes through the public `sudo()`, so each elevated
   request emits a `KIND_SUDO_BYPASS` audit row and obeys

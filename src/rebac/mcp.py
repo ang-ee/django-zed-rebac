@@ -56,7 +56,9 @@ from .actors import actor_context, current_actor
 from .backends import backend
 from .conf import app_settings
 from .errors import PermissionDenied
+from .index.codec import identity_codec
 from .preflight import check_new
+from .resources import model_for_resource_type
 from .types import CheckResult, ObjectRef, PermissionResult, SubjectRef
 
 _F = TypeVar("_F", bound=Callable[..., Any])
@@ -197,8 +199,16 @@ def _object_ref(
     if id_arg is not None:
         value = bound.arguments.get(id_arg)
         if value is not None:
-            return ObjectRef(resource_type, str(value))
+            wire = str(value)
+            if not wire:
+                raise PermissionDenied(f"Empty resource ID for {resource_type}")
+            model = model_for_resource_type(resource_type)
+            if model is not None and not identity_codec(model).is_canonical(wire):
+                raise PermissionDenied(f"Non-canonical resource ID for {resource_type}: {wire!r}")
+            return ObjectRef(resource_type, wire)
     if resource_id is not None:
+        if not resource_id:
+            raise PermissionDenied(f"Empty resource ID for {resource_type}")
         return ObjectRef(resource_type, resource_id)
     return ObjectRef(resource_type, _SINGLETON_ID)
 
@@ -222,9 +232,12 @@ def _create_overlay(
         if value is None:
             continue
         try:
-            overlay[relation] = [SubjectRef.parse(str(value))]
+            subject = SubjectRef.parse(str(value))
         except ValueError:
             continue
+        if not subject.subject_id:
+            raise PermissionDenied(f"Empty subject ID for create relation {relation}")
+        overlay[relation] = [subject]
     return overlay
 
 

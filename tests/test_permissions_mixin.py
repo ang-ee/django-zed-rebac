@@ -400,12 +400,6 @@ def test_async_active_superuser_is_answered_by_backends():
     assert _run(user.ahas_perm, "blog.delete_post") is False
 
 
-_REBAC_BACKEND_ASYNC_REASON = (
-    "RebacBackend (src/rebac/backends/auth.py:48) defines no ahas_perm/ahas_module_perms, "
-    "so the mixin's async walk skips it and async checks never reach REBAC."
-)
-
-
 @pytest.fixture
 def owned_post(db):
     from django.contrib.auth import get_user_model
@@ -443,7 +437,6 @@ def owned_post(db):
     return user, post
 
 
-@pytest.mark.xfail(strict=True, reason=_REBAC_BACKEND_ASYNC_REASON)
 @override_settings(AUTHENTICATION_BACKENDS=["rebac.backends.auth.RebacBackend"])
 @pytest.mark.parametrize(
     ("method", "args"),

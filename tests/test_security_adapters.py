@@ -90,13 +90,6 @@ def _banned_post():
 # ---------- DRF ----------
 
 
-@pytest.mark.xfail(
-    strict=True,
-    reason=(
-        "RebacPermission.has_object_permission returns True when to_object_ref raises "
-        "TypeError for an unsaved REBAC instance (src/rebac/drf.py:98)"
-    ),
-)
 def test_drf_object_permission_denies_unsaved_instance() -> None:
     from tests.testapp.models import Post
 
@@ -106,13 +99,6 @@ def test_drf_object_permission_denies_unsaved_instance() -> None:
     assert not RebacPermission().has_object_permission(request, view, Post(title="unsaved"))
 
 
-@pytest.mark.xfail(
-    strict=True,
-    reason=(
-        "RebacPermission.has_object_permission returns True when the id attribute is "
-        "redacted to None and to_object_ref raises TypeError (src/rebac/drf.py:98)"
-    ),
-)
 @override_settings(REBAC_FIELD_READ_MODE="redact")
 def test_drf_object_permission_denies_instance_with_redacted_id() -> None:
     from tests.testapp.models import SluggedPost
@@ -136,15 +122,13 @@ def test_drf_object_permission_denies_instance_with_redacted_id() -> None:
 # ---------- MCP ----------
 
 
-@pytest.mark.xfail(
-    strict=True,
-    reason=(
-        'rebac_mcp_tool turns id_arg "" into ObjectRef(type, ""), the model-level '
-        '"any accessible row" check, so owning any row admits the call (src/rebac/mcp.py:200)'
-    ),
-)
 def test_mcp_empty_id_arg_is_not_a_model_level_check() -> None:
-    _grant(ObjectRef("blog/post", "p1"), "owner", ALICE)
+    from tests.testapp.models import Post
+
+    with sudo(reason="test.fixture"):
+        post = Post.objects.create(title="owned")
+    post_id = str(post.pk)
+    _grant(ObjectRef("blog/post", post_id), "owner", ALICE)
     calls: list[str] = []
 
     @rebac_mcp_tool(resource_type="blog/post", action="write", id_arg="post_id")
@@ -152,20 +136,12 @@ def test_mcp_empty_id_arg_is_not_a_model_level_check() -> None:
         calls.append(post_id)
         return "ok"
 
-    assert edit_post("p1", ctx=_ctx("auth/user:alice")) == "ok"
+    assert edit_post(post_id, ctx=_ctx("auth/user:alice")) == "ok"
     with pytest.raises(PermissionDenied):
         edit_post("", ctx=_ctx("auth/user:alice"))
-    assert calls == ["p1"]
+    assert calls == [post_id]
 
 
-@pytest.mark.xfail(
-    strict=True,
-    reason=(
-        'create_relations parses "blog/post:" to an empty-id subject and check_new\'s arrow '
-        'hop checks ObjectRef(type, ""), the any-row sentinel (src/rebac/mcp.py:225, '
-        "src/rebac/preflight.py:344)"
-    ),
-)
 def test_mcp_create_relations_with_empty_id_denies() -> None:
     _grant(ObjectRef("blog/post", "p0"), "owner", ALICE)
     calls: list[str] = []
@@ -183,14 +159,6 @@ def test_mcp_create_relations_with_empty_id_denies() -> None:
     assert calls == ["blog/post:p0"]
 
 
-@pytest.mark.xfail(
-    strict=True,
-    reason=(
-        "rebac_mcp_tool passes a non-canonical integer spelling through unchanged; it has no "
-        "term, reads at the type-level scope and skips the row's concrete ban, while Django "
-        "resolves the same string to that row (src/rebac/mcp.py:200)"
-    ),
-)
 @pytest.mark.parametrize("spelling", NONCANONICAL)
 def test_mcp_noncanonical_id_arg_does_not_skip_concrete_ban(spelling) -> None:
     from tests.testapp.models import Post
@@ -215,13 +183,6 @@ def test_mcp_noncanonical_id_arg_does_not_skip_concrete_ban(spelling) -> None:
 # ---------- check_new ----------
 
 
-@pytest.mark.xfail(
-    strict=True,
-    reason=(
-        'check_new\'s arrow hop over an empty-id overlay subject checks ObjectRef(type, ""), '
-        "the model-level any-row sentinel (src/rebac/preflight.py:344)"
-    ),
-)
 def test_check_new_empty_id_overlay_subject_denies() -> None:
     _grant(ObjectRef("blog/post", "p0"), "owner", ALICE)
 

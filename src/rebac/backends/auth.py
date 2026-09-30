@@ -35,6 +35,7 @@ from __future__ import annotations
 
 from typing import Any
 
+from asgiref.sync import sync_to_async
 from django.apps import apps as django_apps
 from django.contrib.auth.base_user import AbstractBaseUser
 
@@ -109,6 +110,9 @@ class RebacBackend:
         except PermissionDepthExceeded:
             return False
 
+    async def ahas_perm(self, user_obj: Any, perm: str, obj: Any = None) -> bool:
+        return await sync_to_async(self.has_perm, thread_sensitive=True)(user_obj, perm, obj)
+
     def has_module_perms(self, user_obj: Any, app_label: str) -> bool:
         if not getattr(user_obj, "is_active", False):
             return False
@@ -152,6 +156,11 @@ class RebacBackend:
                 resource_type__in=rebac_types,
             )
             .exists()
+        )
+
+    async def ahas_module_perms(self, user_obj: Any, app_label: str) -> bool:
+        return await sync_to_async(self.has_module_perms, thread_sensitive=True)(
+            user_obj, app_label
         )
 
 

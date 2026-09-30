@@ -64,6 +64,7 @@ def _baseline_with_perm(resource_type: str, perm_name: str, expr_text: str) -> S
         Relation("owner", (AllowedSubject("auth/user"),)),
         Relation("viewer", (AllowedSubject("auth/user"),)),
         Relation("auditor", (AllowedSubject("auth/user"),)),
+        Relation("is_active", (AllowedSubject("auth/user"),)),
     )
     perm = Permission(perm_name, expr, expr_text)
     return Schema(definitions=[Definition(resource_type, relations, (perm,))])
@@ -87,6 +88,11 @@ def _seed_db_schema(resource_type: str, perm_name: str, expr_text: str) -> Schem
     SchemaRelation.objects.create(
         definition=sd,
         name="auditor",
+        allowed_subjects=[{"type": "auth/user"}],
+    )
+    SchemaRelation.objects.create(
+        definition=sd,
+        name="is_active",
         allowed_subjects=[{"type": "auth/user"}],
     )
     sp = SchemaPermission.objects.create(definition=sd, name=perm_name, expression=expr_text)
@@ -539,6 +545,9 @@ def test_override_create_emits_audit_event() -> None:
     SchemaRelation.objects.create(
         definition=sd, name="owner", allowed_subjects=[{"type": "auth/user"}]
     )
+    SchemaRelation.objects.create(
+        definition=sd, name="is_active", allowed_subjects=[{"type": "auth/user"}]
+    )
     sp = SchemaPermission.objects.create(definition=sd, name="read", expression="owner")
 
     PermissionAuditEvent.objects.all().delete()
@@ -566,6 +575,9 @@ def test_override_delete_emits_audit_event() -> None:
     sd = SchemaDefinition.objects.create(resource_type="blog/post")
     SchemaRelation.objects.create(
         definition=sd, name="owner", allowed_subjects=[{"type": "auth/user"}]
+    )
+    SchemaRelation.objects.create(
+        definition=sd, name="auditor", allowed_subjects=[{"type": "auth/user"}]
     )
     sp = SchemaPermission.objects.create(definition=sd, name="read", expression="owner")
 
