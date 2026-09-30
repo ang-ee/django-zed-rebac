@@ -111,16 +111,22 @@ maintenance fan-out and streamed Python rows and formula work. Written assertion
 
 ## CI matrix
 
-CI validates:
+Python 3.14 and Django 6.0. Three workflows, chained so that a slow suite
+never blocks a fast result:
 
-- Python 3.14
-- Django 6.0
-- Parallel SQLite and PostgreSQL 16 default suites, including the index and
-  ported behavioral suites. PostgreSQL uses a service container, `psycopg`,
-  `tests.settings_postgres`, and `REBAC_TEST_POSTGRES_URL`.
-- The full reference sweep and Docker PostgreSQL/MySQL vendor contracts are
-  explicit local release gates. A SpiceDB conformance job (`-m spicedb` against a pinned
-  `serve-testing` container) is planned after 0.23.0.
+- **CI** runs on every push and pull request: lint, format, types and the
+  parallel SQLite suite. It is the gate.
+- **PostgreSQL** runs the default suite on PostgreSQL 16 after CI succeeds on a
+  commit, or on demand. It uses a service container, `psycopg`,
+  `tests.settings_postgres` and `REBAC_TEST_POSTGRES_URL`.
+- **Publish to PyPI** runs after CI succeeds on a `v*` tag. It does not run the
+  tests again: it verifies that the tag, `pyproject.toml` and the installed
+  package agree, builds, checks and uploads. Run it by hand with a tag to
+  publish again.
+
+The full reference sweep and the Docker PostgreSQL/MySQL vendor contracts are
+local release gates. A SpiceDB conformance job (`-m spicedb` against a pinned
+`serve-testing` container) is planned after 0.23.0.
 
 ## Commit hygiene
 

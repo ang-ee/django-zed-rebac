@@ -1,24 +1,43 @@
 name: Publish to PyPI
 
+# Publishes a version tag once CI has passed on it. The tests already ran in
+# CI on the same commit, so this workflow only verifies the version, builds
+# and uploads. A manual run publishes a given tag.
+
 on:
-  push:
-    tags:
-      - "v*"
+  workflow_run:
+    workflows: [CI]
+    types: [completed]
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Version tag to publish, for example v0.23.1"
+        required: true
 
 permissions:
   contents: read
 
 concurrency:
-  group: publish-pypi-${{ github.ref }}
+  group: publish-pypi
   cancel-in-progress: false
 
 jobs:
   publish:
     name: Build and publish
+    if: >-
+      github.event_name == 'workflow_dispatch' ||
+      (github.event.workflow_run.conclusion == 'success' &&
+       github.event.workflow_run.event == 'push' &&
+       startsWith(github.event.workflow_run.head_branch, 'v'))
     runs-on: ubuntu-latest
+    timeout-minutes: 15
+    env:
+      RELEASE_TAG: ${{ github.event.inputs.tag || github.event.workflow_run.head_branch }}
     steps:
-      - name: Checkout repository
+      - name: Checkout the tag
         uses: actions/checkout@v5
+        with:
+          ref: refs/tags/${{ env.RELEASE_TAG }}
 
       - name: Set up Python
         uses: actions/setup-python@v6
@@ -38,7 +57,7 @@ jobs:
           import sys
           import tomllib
 
-          expected = os.environ["GITHUB_REF_NAME"].removeprefix("v")
+          expected = os.environ["RELEASE_TAG"].removeprefix("v")
 
           with pathlib.Path("pyproject.toml").open("rb") as handle:
               project_version = tomllib.load(handle)["project"]["version"]
@@ -58,11 +77,7 @@ jobs:
           PY
 
       - name: Build distributions
-        # Release artifacts are built only after the same checks as branch CI.
-        run: |
-          make install-dev
-          make check
-          uv build --out-dir dist
+        run: uv build --out-dir dist
 
       - name: Validate distributions
         run: uvx --from twine twine check --strict dist/*

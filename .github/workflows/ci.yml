@@ -1,59 +1,34 @@
 name: CI
 
+# The fast gate for every push and pull request. Longer suites run in their
+# own workflows after this one succeeds, so a slow suite never holds up the
+# lint, type and SQLite results, and publishing waits only on this gate.
+
 on:
   push:
   pull_request:
 
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
 jobs:
   test:
-    strategy:
-      fail-fast: false
-      matrix:
-        python-version: ["3.14"]
-        django-version: ["6.0"]
+    name: Lint, types and SQLite suite
     runs-on: ubuntu-latest
+    timeout-minutes: 30
     steps:
       - uses: actions/checkout@v5
-      - uses: actions/setup-python@v6
-        with:
-          python-version: ${{ matrix.python-version }}
+      # uv's managed Python bundles a current SQLite. The runner's system
+      # SQLite has a fixed parser stack that deep read plans overflow.
       - name: Install uv
         uses: astral-sh/setup-uv@v7
       - name: Install dependencies
         run: |
-          uv venv --python "${{ matrix.python-version }}"
-          uv pip install -e '.[dev,caveats,drf,strawberry]' "django==${{ matrix.django-version }}.*"
-      - name: Lint, format, types, and tests
-        run: make lint format-check typecheck test-parallel
-
-  postgres:
-    runs-on: ubuntu-latest
-    services:
-      postgres:
-        image: postgres:16
-        env:
-          POSTGRES_USER: postgres
-          POSTGRES_PASSWORD: rebac-test
-          POSTGRES_DB: rebac_test
-        ports:
-          - 5432:5432
-        options: >-
-          --health-cmd "pg_isready -U postgres -d rebac_test"
-          --health-interval 10s
-          --health-timeout 5s
-          --health-retries 5
-    env:
-      REBAC_TEST_POSTGRES_URL: postgresql://postgres:rebac-test@127.0.0.1:5432/rebac_test
-    steps:
-      - uses: actions/checkout@v5
-      - uses: actions/setup-python@v6
-        with:
-          python-version: "3.14"
-      - name: Install uv
-        uses: astral-sh/setup-uv@v7
-      - name: Install dependencies and PostgreSQL driver
-        run: |
-          uv venv --python 3.14
-          uv pip install -e '.[dev,caveats,drf,strawberry]' 'django==6.0.*' 'psycopg[binary]>=3.2,<4'
-      - name: Index and behavioural suites on PostgreSQL
-        run: make test-postgres
+          uv venv --python 3.14 --python-preference only-managed
+          uv run --no-sync python -c 'import sqlite3; print("SQLite", sqlite3.sqlite_version)'
+          uv pip install -e '.[dev,caveats,drf,strawberry]' 'django==6.0.*'
+      - name: Lint, format and types
+        run: make lint format-check typecheck
+      - name: SQLite suite
+        run: make test-parallel

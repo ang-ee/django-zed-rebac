@@ -127,24 +127,20 @@ def test_unauthenticated_user_instance_raises():
     (covered by ``test_anonymous_user_resolves_to_anonymous_subject``);
     arbitrary user instances with ``is_authenticated=False`` must fail loudly.
     """
+    from unittest.mock import patch
+
     from django.contrib.auth import get_user_model
 
     User = get_user_model()
 
-    # Build a minimally-faked user with is_authenticated=False; the field is
-    # property-derived on the default User model so constructing an unsaved
-    # instance with no pk gives is_authenticated=True. Subclass + override.
-    class _UnauthUser(User):  # type: ignore[misc, valid-type]
-        class Meta:
-            proxy = True
-            app_label = "auth"
-
-        @property
-        def is_authenticated(self) -> bool:
-            return False
-
-    with pytest.raises(NoActorResolvedError, match="is_authenticated=False"):
-        to_subject_ref(_UnauthUser(username="ghost"))
+    # is_authenticated is a property on the default User model, and an unsaved
+    # instance reports True. Override it for this test only: a model class
+    # declared here would stay in the global app registry for later tests.
+    with (
+        patch.object(User, "is_authenticated", new=property(lambda self: False)),
+        pytest.raises(NoActorResolvedError, match="is_authenticated=False"),
+    ):
+        to_subject_ref(User(username="ghost"))
 
 
 def test_unsaved_user_instance_raises():

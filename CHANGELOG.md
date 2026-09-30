@@ -5,6 +5,17 @@ pre-1.0; breaking changes within a minor version are explicitly called out.
 
 ## [Unreleased]
 
+### Tests
+
+- CI is three workflows. **CI** runs lint, types and the parallel SQLite suite
+  on every push. **PostgreSQL** runs after CI succeeds. **Publish to PyPI**
+  runs after CI succeeds on a `v*` tag and no longer runs the suite again.
+- CI uses uv's managed Python, whose bundled SQLite accepts deep read plans.
+  SQLite 3.45 (Ubuntu 24.04's system library) refuses a nine-lookup plan with
+  `parser stack overflow`; see Known limits in ARCHITECTURE.md.
+- A test no longer leaves a proxy of the user model in the global app
+  registry, where later system checks failed on it.
+
 ## [0.23.0] — 2026-09-30
 
 ### Added

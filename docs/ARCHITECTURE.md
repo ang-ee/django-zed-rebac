@@ -1650,7 +1650,10 @@ refused when written. An arrow into a node with type-level rows materializes
 one row per edge for each type-level row. The index has no depth limit: where
 the walker raises `PermissionDepthExceeded`, the index terminates and
 answers. Broad graph fan-out may still make maintenance expensive, and the
-0.23.0 lock is global per alias.
+0.23.0 lock is global per alias. SQLite, supported for tests, must allow a
+deeply nested statement: SQLite 3.45, the system library of Ubuntu 24.04, has
+a fixed parser stack and refuses a read plan of nine lookups with `parser
+stack overflow`; SQLite 3.46.1 accepts it.
 
 ### Schema introspection
 
