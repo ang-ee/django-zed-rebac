@@ -283,6 +283,34 @@ def _build_ctx(
     doesn't have to know about either.
     """
 
+    from .index.codec import identity_codec
+    from .resources import model_for_subject_type, model_resource_type
+
+    canonical: dict[str, tuple[SubjectRef, ...] | None] = {}
+    for name, candidates in relationships.items():
+        if candidates is None:
+            canonical[name] = None
+            continue
+        kept: list[SubjectRef] = []
+        for candidate in candidates:
+            if candidate.subject_id == "*" and not candidate.optional_relation:
+                # Wildcards are a schema-declared subject class, not a model ID.
+                kept.append(candidate)
+                continue
+            mapped = model_for_subject_type(candidate.subject_type)
+            if mapped is not None:
+                model, attr = mapped
+                # A REBAC model's object identity is also its subject identity.
+                if model_resource_type(model):
+                    from ._id import resource_id_attr
+
+                    attr = resource_id_attr(model)
+                if not identity_codec(model, attr).is_canonical(candidate.subject_id):
+                    continue
+            kept.append(candidate)
+        canonical[name] = tuple(kept)
+    relationships = canonical
+
     def resolve_relation(
         ctx: WalkContext,
         definition: Definition,

@@ -419,14 +419,20 @@ def test_e002_requires_spicedb_token():
     assert sum("REBAC_SPICEDB_TOKEN" in issue.msg for issue in issues) == 1
 
 
-def test_e002_requires_client_even_when_spicedb_settings_are_configured():
-    from importlib.util import find_spec
+@pytest.mark.parametrize("installed", [False, True])
+def test_e002_requires_client_even_when_spicedb_settings_are_configured(monkeypatch, installed):
+    import importlib.util
 
+    monkeypatch.setattr(
+        importlib.util,
+        "find_spec",
+        lambda name: object() if installed else None,
+    )
     with override_settings(
         REBAC_BACKEND="spicedb", REBAC_SPICEDB_ENDPOINT="localhost:50051", REBAC_SPICEDB_TOKEN="t"
     ):
         issues = [issue for issue in check_backend_setting() if issue.id == "rebac.E002"]
-        assert bool(issues) is (find_spec("authzed") is None)
+        assert bool(issues) is not installed
         assert all("authzed" in issue.msg for issue in issues)
     with override_settings(REBAC_BACKEND="local", REBAC_SPICEDB_ENDPOINT=None):
         assert "rebac.E002" not in _ids(check_backend_setting())

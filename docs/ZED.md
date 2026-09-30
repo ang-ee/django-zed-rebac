@@ -791,6 +791,14 @@ or automatically inherit the owner's permissions.
 application you ship. Declare any User/Group definitions your schema uses too;
 automatic base-schema emission is not implemented.
 
+`grant_subject_ref(agent, on_behalf_of=user)` constructs a conventional
+`agents/grant:v2_<digest>#valid` subject. The ID is `v2_` plus unpadded
+base64url of SHA-256 over the UTF-8 principal type, principal ID, agent type,
+and agent ID, each prefixed by its unsigned 4-byte big-endian length. The
+`#valid` subject relation is carried separately and is not part of the digest.
+The ID is 46 characters and uses SpiceDB-legal object-ID characters. Existing
+grant rows and their relationship tuples must be recreated when adopting it.
+
 A typical `agents/permissions.zed`:
 
 ```zed
@@ -904,10 +912,9 @@ authorize this subject shape explicitly; constructing it neither impersonates
 the requester nor copies the requester's grants. The user-subject examples
 above illustrate permission arrows, not an automatic mapping from this grant
 subject back to a user.
-The helper's grant ID is `v2.` plus four dot-separated, unpadded URL-safe
-base64 UTF-8 components: principal type, principal ID, agent type, agent ID.
-This replaces the old `<user-id>.<agent-id>` form. Migrate stored grant
-objects and relationship tuples together before using the new helper.
+The helper uses the fixed-length `v2_` digest recipe above. It replaces both
+the old `<user-id>.<agent-id>` form and the interim dot-separated `v2.` form.
+Migrate stored grant objects and relationship tuples together before using it.
 
 ```python
 # Common case: HTTP request from a Django user

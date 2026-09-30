@@ -100,3 +100,8 @@ def test_pickled_query_attribute_does_not_carry_bypass(posts):
 
     with pytest.raises(MissingActorError):
         list(queryset)
+
+
+def test_pickle_does_not_evaluate_queryset(posts, django_assert_num_queries):
+    with django_assert_num_queries(0):
+        pickle.dumps(Post.objects.all())

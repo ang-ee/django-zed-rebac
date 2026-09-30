@@ -7,7 +7,7 @@ import asyncio
 import pytest
 from django.db.models import Count
 
-from rebac import MissingActorError, backend, sudo
+from rebac import MissingActorError, PermissionDenied, backend, sudo
 from rebac.backends import reset_backend
 from rebac.schema import parse_zed
 from tests.backend_setup import install_schema
@@ -121,3 +121,15 @@ def test_rows_are_unchanged_after_refused_writes(post):
 
     with sudo(reason="test.verify"):
         assert list(Post.objects.values_list("title", "body")) == [("hidden", "")]
+
+
+def test_queryset_raw_requires_a_bypass_with_or_without_actor(post):
+    from rebac.types import SubjectRef
+
+    query = f"SELECT * FROM {Post._meta.db_table}"
+    actor = SubjectRef.of("auth/user", "alice")
+    with pytest.raises(PermissionDenied):
+        list(Post.objects.with_actor(actor).raw(query))
+    with pytest.raises(MissingActorError):
+        list(Post.objects.all().raw(query))
+    assert len(list(Post.objects.sudo(reason="raw.test").raw(query))) == 1

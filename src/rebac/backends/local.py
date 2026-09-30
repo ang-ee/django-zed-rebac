@@ -148,6 +148,7 @@ class LocalBackend(Backend):
         # Counter used as a stable monotonic xid on backends (e.g. SQLite test
         # mode) without `txid_current()`.
         self._xid_counter = 0
+        self._last_xid = 0
         with _backend_registry_lock:
             _db_loaded_backends.add(self)
 
@@ -671,6 +672,7 @@ class LocalBackend(Backend):
 
         from ..index.maintain import maintain_tuples
         from ..models import active_relationship_model
+        from ..models.relationship import engine_tuple_write
 
         RelationshipModel = active_relationship_model()
 
@@ -680,6 +682,7 @@ class LocalBackend(Backend):
         with (
             transaction.atomic(using=using),
             maintain_tuples(written=rows, using=using, backend=self),
+            engine_tuple_write(),
         ):
             schema = self._write_schema(using)
             for tup in rows:
@@ -709,7 +712,7 @@ class LocalBackend(Backend):
         if max_xid == 0:
             return self._zookie()
         mark_relationships_changed()
-        return Zookie(self.kind, str(max_xid))
+        return Zookie(self.kind, str(max(max_xid, self._last_xid)))
 
     @_schema_operation
     def delete_relationships(self, filter_: RelationshipFilter) -> Zookie:
@@ -717,12 +720,14 @@ class LocalBackend(Backend):
 
         from ..index.maintain import maintain_tuples
         from ..models import active_relationship_model
+        from ..models.relationship import engine_tuple_write
 
         RelationshipModel = active_relationship_model()
         using = router.db_for_write(RelationshipModel)
         with (
             transaction.atomic(using=using),
             maintain_tuples(deleted_filter=filter_, using=using, backend=self),
+            engine_tuple_write(),
         ):
             schema = self._write_schema(using)
             backed = self._backed_relation_for_filter(
@@ -748,12 +753,14 @@ class LocalBackend(Backend):
 
         from ..index.maintain import maintain_tuples
         from ..models import active_relationship_model
+        from ..models.relationship import engine_tuple_write
 
         RelationshipModel = active_relationship_model()
         using = router.db_for_write(RelationshipModel)
         with (
             transaction.atomic(using=using),
             maintain_tuples(deleted=[tuple_], using=using, backend=self),
+            engine_tuple_write(),
         ):
             schema = self._write_schema(using)
             definition = schema.get_definition(tuple_.resource.resource_type)
@@ -779,7 +786,8 @@ class LocalBackend(Backend):
 
     def _next_xid(self) -> int:
         self._xid_counter += 1
-        return int(time.time_ns()) + self._xid_counter
+        self._last_xid = max(int(time.time_ns()) + self._xid_counter, self._last_xid + 1)
+        return self._last_xid
 
     def _zookie(self) -> Zookie:
         return Zookie(self.kind, str(self._next_xid()))

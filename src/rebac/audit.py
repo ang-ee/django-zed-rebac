@@ -8,8 +8,8 @@ call them; downstream consumers can call them too — re-exported as
 `defer_to_commit=True` (default) routes the write through
 `transaction.on_commit`, so audit rows for grant / revoke flows persist
 exactly when the surrounding business transaction does. `defer_to_commit=False`
-writes immediately — correct for events that must persist regardless of
-outer transaction state (sudo enter, permission denial about to roll back).
+writes immediately on the current connection; the row remains subject to any
+enclosing transaction's commit or rollback.
 
 Sync vs async paths
 -------------------

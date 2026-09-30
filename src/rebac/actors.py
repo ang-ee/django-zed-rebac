@@ -11,6 +11,8 @@ ARCHITECTURE.md § Three actor-resolution paths.
 from __future__ import annotations
 
 import builtins
+import hashlib
+import re
 from base64 import urlsafe_b64encode
 from collections.abc import AsyncIterator, Callable, Iterator
 from contextlib import asynccontextmanager, contextmanager
@@ -277,7 +279,7 @@ def grant_subject_ref(agent: Any, on_behalf_of: Any | None) -> SubjectRef:
     """Build a Grant subject for `agent` acting on behalf of `on_behalf_of`.
 
     Resolve the agent and user through ``to_subject_ref`` and construct a
-    deterministic ``agents/grant:v2.<encoded-components>#valid`` subject. The
+    deterministic ``agents/grant:v2_<digest>#valid`` subject. The
     application owns the compatible ``valid`` relation and grant relationships;
     this helper neither registers a grant type nor creates its permissions.
 
@@ -295,9 +297,14 @@ def grant_subject_ref(agent: Any, on_behalf_of: Any | None) -> SubjectRef:
         agent_ref.subject_type,
         agent_ref.subject_id,
     )
-    grant_id = "v2." + ".".join(
-        urlsafe_b64encode(part.encode("utf-8")).decode("ascii").rstrip("=") for part in parts
+    encoded = b"".join(
+        len(raw).to_bytes(4, "big") + raw for raw in (part.encode("utf-8") for part in parts)
     )
+    grant_id = "v2_" + urlsafe_b64encode(hashlib.sha256(encoded).digest()).decode("ascii").rstrip(
+        "="
+    )
+    if len(grant_id) > 64 or re.fullmatch(r"[A-Za-z0-9/_|=+\-]+", grant_id) is None:
+        raise ValueError("Generated grant ID exceeds the storage or SpiceDB object-ID contract")
     return SubjectRef(
         object=ObjectRef(type_with_prefix("agents/grant"), grant_id),
         optional_relation="valid",
@@ -348,9 +355,8 @@ def _sudo_state_context(*, reason: str | None = None) -> Iterator[None]:
         from .audit import emit as _emit_audit
         from .models import PermissionAuditEvent
 
-        # `defer_to_commit=False` — sudo blocks may run outside a transaction,
-        # and the bypass must always be auditable even if a wrapping transaction
-        # later rolls back.
+        # Write now so callers inside the block can inspect the audit row.
+        # Durability still follows the enclosing transaction.
         _emit_audit(
             PermissionAuditEvent.KIND_SUDO_BYPASS,
             actor=bypass_actor,

@@ -114,7 +114,10 @@ design that prevents the worst data-leakage bug class.
 
 - `REBAC_STRICT_MODE = True` is the production default.
 - Bypass requires explicit `.sudo(reason="...")` or `with sudo(reason="..."):`.
-  Both write a structured audit-log event.
+  Every public bypass writes one structured audit event when it takes effect:
+  block context at entry, queryset at first evaluation/update/delete, instance
+  at first check/save/delete. Engine-internal captures use a private non-audited
+  path. Rows are durable only if the enclosing transaction commits.
 - Empty `sudo()` calls without `reason` raise when
   `REBAC_REQUIRE_SUDO_REASON = True` (default).
 - **Superuser carve-out.** When `REBAC_SUPERUSER_BYPASS = True` (default),
@@ -214,6 +217,13 @@ evaluation does not exclude them.
 - **Don't** introduce an `active_test`-style toggle (Odoo's per-call
   footgun) that flips visibility from inside the permission layer. It's a
   top-level policy.
+
+### 5d. Backed edge writes follow the declaring resource
+
+Changing a column or through row watched by a field-backed relation requires
+`write` on every affected resource row of the relation's declaring type.
+Reverse FK and M2M accessors, tracked backing sources, and symmetrical M2M
+mirror edges follow the same rule. Deny before mutation and audit denials.
 
 ### 6. Determinism is load-bearing
 

@@ -236,6 +236,16 @@ subject sets, wildcards, specific ids, caveats, or expiration. `rebac.E009`
 validates every Django path, lookup, and target model. Index derivation and
 maintenance share these resolved owners.
 
+An edge change requires `write` on every affected resource row whose declared
+backing watches the changed column or through table. This includes reverse FK
+and M2M accessors, scalar predicate columns, nested field paths whose source
+is another model, and both mirror rows of a symmetrical self-M2M. The gate
+finds source rows through the unchanged prefix of each affected path, before
+mutation and under the effective actor of the write. Denial is audited.
+Tracked models can be backing sources even when their own saves have no
+resource write gate. Attribute-backed changes check both the old and proposed
+virtual container IDs when the container key changes.
+
 Dynamic attribute containers are named by the canonical Python spelling of the
 column value (`ResolvedAttributeBacking.container_id_of`); a non-canonical id
 such as `"01"` for integer `1` names no container. Derivation reads attribute
@@ -852,9 +862,11 @@ effective_expr = (baseline_expr + extends) AND tightens
                                  with caveats merged from recaveats
 ```
 
-Every relation or permission named by an override expression must already
-exist in the target definition. Composition and override writes reject
-undefined names with `SchemaError`, including undefined arrow sources.
+Every relation or permission newly named by an override expression must already
+exist in the target definition. Composition and override writes reject newly
+introduced undefined names with `SchemaError`, including undefined arrow
+sources. A pre-existing undefined reference in the baseline remains a baseline
+error; composition does not add a second failure for it.
 
 #### Effective schema loading and generation
 
@@ -950,7 +962,11 @@ class PermissionAuditEvent(models.Model):
     occurred_at        = models.DateTimeField(auto_now_add=True, db_index=True)
 ```
 
-Written by every Tier 2 / Tier 3 mutation and every `sudo(reason=...)` invocation. Append-only.
+Written by every Tier 2 / Tier 3 mutation and every effective public bypass.
+Queryset bypasses are audited at first evaluation or write, instance bypasses
+at the first check or write, and block bypasses at entry, once per bypass.
+Engine-internal captures use a private non-audited path. An audit row is durable
+only when its enclosing transaction commits. Append-only.
 
 ---
 
@@ -1074,7 +1090,9 @@ REBAC. Inactive users deny. For a concrete object, `has_perm(user, perm, obj)`
 maps the codename to an action and checks that object. Without an object,
 mapped model permissions use an empty resource ID to ask whether the actor has
 any accessible row or a row-independent grant. `has_module_perms` applies the
-same model-level semantics across the module's registered resources.
+same model-level semantics for each registered resource's
+`Meta.rebac_default_action` (or `read`) and returns true on the first
+effective grant, including group, wildcard, and field-backed paths.
 Proposed-row create authorization still uses `check_new`, because model-level
 admission does not authorize a particular candidate's relationships.
 Django's async permission walk calls `ahas_perm` and
@@ -1186,6 +1204,9 @@ reason. Callers may retry conditional results with additional context.
 For caveats, a declared parameter with a `None` value is missing even when
 its key exists. A CEL lookup or function failure after all declared parameters
 are supplied raises `CaveatUnsupportedError`; it is not a missing parameter.
+Schema validation rejects CEL identifier roots absent from the caveat's
+declared parameter list. Runtime evaluation errors name the caveat and
+parameter names, never caller context values.
 
 ### `check_new` — preflight against not-yet-persisted resources
 
@@ -1345,6 +1366,10 @@ Limitations (0.4):
 * Subject-set candidates (``auth/group:eng#member``) inside a virtual
   relation list are resolved through the backend on the real group row
   — that subject-set walk costs one dispatch level.
+* A virtual subject of a model-backed type must use that model's canonical
+  identity spelling, including subjects supplied by MCP create relations and
+  subject-set candidates. Schema-declared `type:*` wildcards remain subject
+  classes rather than concrete model IDs.
 
 ---
 
@@ -1652,6 +1677,13 @@ they capture each matching tuple before deletion and update the index in the
 same transaction. Queryset `update()` on relationship rows is refused because
 it can change a tuple's wire identity or policy without a matching tuple
 write owner; use `delete_relationships()` and `write_relationships()`.
+It raises `NotImplementedError` for an unsupported write operation, not an
+authorization denial.
+Instance saves and deletes follow the same tuple owner, capturing the old
+tuple before mutation and deriving the new state after mutation. A nested
+tuple write derives its effects before returning its Zookie, even inside an
+open model owner; the outer pass may repeat work at exit. This extra pass is
+the cost of read-your-writes correctness within a transaction.
 Plain third-party tracked models use explicit-sender signals; their callers
 must use `atomic()` or `ATOMIC_REQUESTS`. In autocommit, the receiver
 logs and warns under decision D2. `rebac.E018` rejects unowned,
@@ -1818,11 +1850,14 @@ The three actor verbs are sugar over the same primitive:
 | `rebac_prefetch_related(*lookups)` | Applies Django `prefetch_related`, rewriting bare protected lookups to `Prefetch(queryset=Related.objects.with_actor(actor))`. | Reverse, M2M, and to-many loading where protected children should be scoped rather than loaded via `_base_manager`. |
 
 `as_agent(agent)` without `on_behalf_of` uses `to_subject_ref(agent)` unchanged. Its resource type and grants come from the consumer's identity and schema declarations. Passing `on_behalf_of=user` constructs a deterministic grant subject; it does not create a grant, intersect permissions or impersonate the user. Applications that use a different grant identity pass their own subject through `with_actor`.
-The constructed grant ID is `v2.` followed by four dot-separated, unpadded
-URL-safe base64 encodings of the UTF-8 principal type, principal ID, agent
-type, and agent ID, in that order. This framing is injective even when IDs
-contain dots. Existing `agents/grant:<user-id>.<agent-id>` IDs must be
-recreated along with their relationship tuples before using the new helper.
+The constructed grant ID is `v2_` followed by unpadded base64url of SHA-256
+over four UTF-8 components in order: principal type, principal ID, agent type,
+agent ID. Each component is framed by its unsigned 4-byte big-endian byte
+length. The result is 46 ASCII characters, within the 64-character storage
+limit and SpiceDB's object-ID character set. Subject relations (including
+`#valid`) are carried separately on `SubjectRef` and are not hashed. Existing
+grant IDs must be recreated along with their relationship tuples before using
+the new helper.
 
 `rebac_select_related()` preserves Django's to-one join optimization, then
 checks every selected REBAC-bound related object in batches. If the actor cannot
@@ -1837,7 +1872,7 @@ Every requested path is retained after its protected prefixes, including
 unprotected terminal relations and their explicit `Prefetch` queryset/`to_attr`.
 Loading an unprotected tail does not bypass any protected intermediate relation.
 Pickling a queryset strips its pinned actor and sudo reason, as instance
-pickling does. The receiving process must establish its own trusted actor or
+pickling does, without evaluating the queryset. The receiving process must establish its own trusted actor or
 bypass context before materializing or mutating it.
 
 ### `with_actor` vs `sudo` — distinct verbs
@@ -1845,7 +1880,7 @@ bypass context before materializing or mutating it.
 [Borrowed from Odoo's `with_user` / `sudo` distinction. Adapted with mandatory `reason` and a generic actor type.]
 
 - `with_actor(actor)` — re-evaluate all checks **as** `actor`. The originating actor (`current_actor()`) is unchanged — `with_actor()` does NOT mutate the ContextVar; the new scope lives on the queryset clone. Audit events record both the originating actor and the queryset's pinned actor. Mirrors Odoo's `with_user(u)`, generalised to any subject type.
-- `sudo(reason=...)` — request-path bypass of all REBAC checks. `current_actor()` still returns the originating subject; only `is_sudo()` flips. Mirrors Odoo's `env.su` / `env.user` independence. Mandatory `reason`. The block-scoped context manager writes a `PermissionAuditEvent` with kind `sudo.bypass`. **Gated by `REBAC_ALLOW_SUDO`** — strict tenants disable it.
+- `sudo(reason=...)` — request-path bypass of all REBAC checks. `current_actor()` still returns the originating subject; only `is_sudo()` flips. Mirrors Odoo's `env.su` / `env.user` independence. Mandatory `reason`. Every public bypass is audited at first use: block at entry, queryset at evaluation or write, instance at check or write. Rows follow the enclosing transaction's commit or rollback. **Gated by `REBAC_ALLOW_SUDO`** — strict tenants disable it.
 - `instance.unsudo()` — clears only a per-instance sudo pin and returns the instance. It does not bind an actor; use `with_actor(actor)` when the intent is to leave sudo under a concrete subject.
 - `system_context(reason=...)` — same bypass semantics as `sudo()` (same block-scoped audit kind, same reason requirement, same non-propagation through traversal), but intended for framework-owned jobs running outside a request: migrations, fixture seeders, asset loaders, scheduled maintenance. **Not gated by `REBAC_ALLOW_SUDO`** — a tenant who has disabled request-path sudo still needs to run migrations. Choose `sudo()` for request-path elevation (admin views, override layer); choose `system_context()` for framework jobs.
 
@@ -1899,19 +1934,28 @@ A pinned actor (path 2) **always wins** over ambient state (paths 3-4) — there
 | `instance.save()` (loaded/non-adding instance) | `write` on the row | `RebacMixin.save_base`, before consumer `pre_save`. |
 | `instance.save()` (new instance) | `create` on the proposed row's forward relations | `save_base` projects the constructed candidate into `check_new`. |
 | `instance.delete()` | `delete` on the row | `RebacMixin.delete`; explicit-sender `pre_delete` checks collector children. |
-| `Model.objects.update(**kwargs)` | `write` on each affected row | Manager intersects the queryset PK set with the actor's `write` scope; raises if any in-scope row is excluded. When the update touches watched fields, the permission index is maintained set-based in the same transaction. |
+| `Model.objects.update(**kwargs)` | `write` on each affected row and every resource row whose backed FK edge changes | Manager intersects the queryset PK set with the actor's `write` scope; raises if any in-scope row is excluded. A backed FK update checks old and proposed source rows before SQL; expressions whose proposed FK cannot be resolved are refused. When the update touches watched fields, the permission index is maintained set-based in the same transaction. |
 | `Model.objects.delete()` | `delete` on each row | Same pattern. |
 
-For an automatically created M2M through table owned by a REBAC resource,
-`add` / `remove` / `set` / `clear` check `write` on each affected row of the
-model that declared the M2M field, including reverse-manager calls. The
+For an automatically created M2M through table watched by a REBAC backing,
+`add` / `remove` / `set` / `clear` check `write` on each affected row of every
+resource type that owns an affected backed edge, including reverse-manager and
+symmetrical self-M2M calls. The
 through-model's explicit-sender `m2m_changed` receiver checks before mutation
 and still maintains the index after mutation. The carrying actor wins over
 ambient context; instance sudo does not propagate to the related manager.
-Without an actor, strict mode raises `MissingActorError`.
+Without an actor, strict mode raises `MissingActorError`. Signal-free
+`bulk_create`, `update`, and `bulk_update` paths apply the same backed-column
+gate; ORM expressions for a proposed watched value are refused unless
+explicitly bypassed.
+Tracked-model `bulk_create(update_conflicts=True)` refuses updates to watched
+backing columns because the insert candidate cannot identify the old edge of a conflicting
+row; checked saves or explicit sudo are required.
+`RebacMixin._base_manager` remains an unscoped infrastructure write path and
+maintains the index without applying actor gates.
 
 `QuerySet.explain()` applies the same actor scope as the query it describes.
-`RebacManager.raw()` cannot attach a REBAC scope to arbitrary SQL and therefore
+`RebacManager.raw()` and `RebacQuerySet.raw()` cannot attach a REBAC scope to arbitrary SQL and therefore
 requires ambient sudo or `system_context`; it raises in ordinary actor scope
 and raises `MissingActorError` without an actor in strict mode.
 
@@ -1920,7 +1964,7 @@ Write expressions, including `F()` on an instance or in `update()` and
 `bulk_update()`, may read columns before writing their result. If a source
 column has a `read__<field>` gate under the active field-read mode, every
 affected row must grant that read; otherwise the write is denied. Bulk denial
-messages report counts and actions without identifying rows outside the
+messages report the action without identifying or counting rows outside the
 actor's read scope.
 
 Actor-scoped `bulk_create(update_conflicts=True)` raises `PermissionDenied`
@@ -1980,6 +2024,11 @@ redacted field via `save(update_fields=[...])`, the save_base owner raises
 `PermissionDenied`. A full `save()` on a redacted instance rewrites
 `update_fields` to exclude redacted fields, preventing a display-time `None`
 from overwriting the stored value.
+Write expressions may use a gated source column only after its `read__<field>`
+check succeeds. A subquery whose base model or a joined model declares gated
+fields is refused in both instance saves and bulk updates: SQL can read rows
+and aliases beyond the destination row, so a destination-row check cannot
+establish source access.
 `refresh_from_db()` preserves fields already redacted on that instance, even
 when the refresh explicitly names one of them; refresh never reveals a hidden
 database value through Django's unscoped base manager.
@@ -2096,6 +2145,11 @@ edge. LocalBackend has no historical relationship versions and rejects
 `Consistency.AT_EXACT_SNAPSHOT`; applications requiring historical snapshots
 need a backend that implements them. Database routing and transaction isolation
 must make the required writes visible on the reading connection.
+The returned token is at least the highest xid allocated by any tuple write
+nested in the call. Inside an open model owner, a nested tuple write derives
+its index effects before returning, so a read in the same transaction at that
+token sees them. An ambient LocalBackend token only advances; a later outer
+helper cannot replace a nested helper's higher token with a lower one.
 Backends validate `Zookie.backend` matches their
 own `kind` and raise on mismatch — a SpiceDB token handed to LocalBackend
 would be interpreted as a numeric xid with garbage semantics.
@@ -2221,8 +2275,9 @@ Read admission requires a resolved actor, but does not require any accessible
 row at the model level. `RebacFilterBackend` applies row scoping and
 `has_object_permission` gates a concrete detail object: a list with no
 accessible rows returns `[]`, as required by the CRUD enforcement matrix.
-An object declaring a REBAC resource type is denied if its concrete identity
-cannot be resolved (including unsaved and redacted identifiers). An object
+An object declaring a REBAC resource type through model metadata,
+`@rebac_resource`, or `RebacObjectMeta` is denied if its concrete identity
+cannot be resolved (including missing, empty, unsaved, and redacted IDs). An object
 without a REBAC resource type remains outside this permission class's object
 gate and is allowed after actor and action admission.
 

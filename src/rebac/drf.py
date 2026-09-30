@@ -18,7 +18,7 @@ from rest_framework.permissions import BasePermission
 from .actors import current_actor, to_subject_ref
 from .backends import backend
 from .errors import NoActorResolvedError
-from .resources import model_resource_type, to_object_ref
+from .resources import _resource_registry, model_resource_type, to_object_ref
 from .types import ObjectRef, SubjectRef
 
 _DEFAULT_ACTION_MAP = {
@@ -95,7 +95,12 @@ class RebacPermission(BasePermission):  # type: ignore[misc]  # untyped third-pa
         try:
             resource = to_object_ref(obj)
         except TypeError:
-            return model_resource_type(obj) is None
+            declared = (
+                model_resource_type(obj) is not None
+                or bool(getattr(type(obj), "_rebac_resource_type", None))
+                or any(isinstance(obj, cls) for cls in _resource_registry)
+            )
+            return not declared
         return backend().has_access(subject=subject, action=rebac_action, resource=resource)
 
 

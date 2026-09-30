@@ -201,8 +201,17 @@ class ActorMiddleware:
             and user is not None
             and getattr(user, "is_active", False)
             and getattr(user, "is_superuser", False)
-            and actor_ref == to_subject_ref(user)
+            and self._is_own_superuser_actor(actor_ref, user)
         )
+
+    @staticmethod
+    def _is_own_superuser_actor(actor_ref: Any, user: Any) -> bool:
+        from .errors import NoActorResolvedError
+
+        try:
+            return bool(actor_ref == to_subject_ref(user))
+        except NoActorResolvedError, TypeError:
+            return False
 
     # ---------- Zookie transport plumbing (opt-in) ----------
 

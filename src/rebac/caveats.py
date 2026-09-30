@@ -211,7 +211,8 @@ def evaluate(
         result = program.evaluate(activation)
     except cel.CELEvalError as exc:
         raise CaveatUnsupportedError(
-            f"Caveat {caveat.name!r} failed to evaluate: {exc.args[0] if exc.args else exc}"
+            f"Caveat {caveat.name!r} failed to evaluate with parameters "
+            f"{', '.join(sorted(activation))}; context values redacted"
         ) from exc
 
     if not isinstance(result, (bool, cel.celtypes.BoolType)):

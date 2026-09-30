@@ -76,7 +76,7 @@ def be(db):
 
 
 def _user(id_: str) -> SubjectRef:
-    return SubjectRef.of("auth/user", id_)
+    return SubjectRef.of("auth/user", {"allowed": "1", "denied": "2", "other": "3"}.get(id_, id_))
 
 
 def _new_post() -> ObjectRef:

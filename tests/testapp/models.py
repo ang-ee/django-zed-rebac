@@ -59,6 +59,17 @@ class Post(RebacMixin, models.Model):
         rebac_resource_type = "blog/post"
 
 
+class LinkedPost(RebacMixin, models.Model):
+    """Symmetrical M2M fixture: one mutation creates two backed edges."""
+
+    title = models.CharField(max_length=100)
+    peers = models.ManyToManyField("self", blank=True)
+
+    class Meta:
+        app_label = "testapp"
+        rebac_resource_type = "blog/linkedpost"
+
+
 class SluggedPost(RebacMixin, models.Model):
     """Exercises ``Meta.rebac_id_attr`` — REBAC keys on ``slug``, not ``pk``.
 

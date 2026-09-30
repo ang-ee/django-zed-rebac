@@ -38,7 +38,7 @@ from .backend_setup import STORAGE_TIERS
 from .testapp.models import Folder, Post
 
 pytestmark = pytest.mark.django_db(transaction=True)
-ACTOR = SubjectRef.of("auth/user", "reader")
+ACTOR = SubjectRef.of("auth/user", "1")
 
 
 @pytest.fixture(params=["denormalized", "registry"])

@@ -17,14 +17,16 @@ returns the one selected by the setting. The wire shape (``RelationshipTuple``
 
 from __future__ import annotations
 
-from collections.abc import Callable, Iterable, Mapping
+from collections.abc import Callable, Iterable, Iterator, Mapping
+from contextlib import contextmanager
+from contextvars import ContextVar
 from typing import Any, cast
 
-from django.db import models
+from django.db import models, router
 from django.db.models import F, Q
 
 from ..conf import app_settings
-from ..errors import PermissionDenied, RelationshipReadError
+from ..errors import RelationshipReadError
 from ..types import ObjectRef, RelationshipTuple, SubjectRef
 
 WIRE_VALUE_FIELDS = (
@@ -56,6 +58,82 @@ _REGISTRY_WIRE_FIELD_MAP = {
     "subject_id": "subject_fk__resource_id",
 }
 
+_engine_tuple_owner: ContextVar[bool] = ContextVar("rebac_engine_tuple_owner", default=False)
+
+
+@contextmanager
+def engine_tuple_write() -> Iterator[None]:
+    """The backend's enclosing tuple owner already captures this ORM write."""
+    token = _engine_tuple_owner.set(True)
+    try:
+        yield
+    finally:
+        _engine_tuple_owner.reset(token)
+
+
+def _tuple_of(row: Relationship | RelationshipRegistry) -> RelationshipTuple:
+    return RelationshipTuple(
+        resource=ObjectRef(row.resource_type, row.resource_id),
+        relation=row.relation,
+        subject=SubjectRef.of(row.subject_type, row.subject_id, row.optional_subject_relation),
+        caveat_name=row.caveat_name,
+        caveat_context=row.caveat_context or {},
+        expires_at=row.expires_at,
+    )
+
+
+def projected_tuples(rows: models.QuerySet[Any]) -> Iterable[RelationshipTuple]:
+    """Stream the wire identity from either storage shape for old-state capture."""
+    for row in rows.iterator(chunk_size=1000):
+        yield RelationshipTuple(
+            resource=ObjectRef(row["resource_type"], row["resource_id"]),
+            relation=row["relation"],
+            subject=SubjectRef.of(row["subject_type"], row["subject_id"], row["subject_relation"]),
+        )
+
+
+def _owned_instance_save(
+    row: Relationship | RelationshipRegistry, save: Callable[[], None], using: str | None
+) -> None:
+    if _engine_tuple_owner.get():
+        save()
+        return
+    from ..backends.local import mark_relationships_changed
+    from ..index.maintain import tuple_owner
+
+    using = using or router.db_for_write(type(row), instance=row)
+    with tuple_owner(using) as maintenance:
+        if maintenance is not None and not row._state.adding and row.pk is not None:
+            old = type(row)._base_manager.using(using).filter(pk=row.pk).first()
+            if old is not None:
+                maintenance.capture_old(tuples=[_tuple_of(old)])
+        save()
+        if maintenance is not None:
+            maintenance.changed(tuples=[_tuple_of(row)])
+    mark_relationships_changed()
+
+
+def _owned_instance_delete(
+    row: Relationship | RelationshipRegistry,
+    delete: Callable[[], tuple[int, dict[str, int]]],
+    using: str | None,
+) -> tuple[int, dict[str, int]]:
+    if _engine_tuple_owner.get():
+        return delete()
+    from ..backends.local import mark_relationships_changed
+    from ..index.maintain import tuple_owner
+
+    using = using or router.db_for_write(type(row), instance=row)
+    with tuple_owner(using) as maintenance:
+        if maintenance is not None:
+            maintenance.capture_old(tuples=[_tuple_of(row)])
+        result = delete()
+        if maintenance is not None:
+            maintenance.changed()
+    if result[0]:
+        mark_relationships_changed()
+    return result
+
 
 class RelationshipQuerySet(models.QuerySet["Relationship"]):
     """Mode-agnostic queryset helpers for denormalized relationship rows."""
@@ -64,7 +142,7 @@ class RelationshipQuerySet(models.QuerySet["Relationship"]):
         return _owned_tuple_delete(self, super().delete)
 
     def update(self, **kwargs: Any) -> int:
-        raise PermissionDenied(
+        raise NotImplementedError(
             "Relationship queryset update() is unsupported; use delete_relationships() "
             "and write_relationships() to change tuples."
         )
@@ -136,6 +214,16 @@ class Relationship(models.Model):
     written_at_xid = models.BigIntegerField(default=0, db_index=True)
 
     objects = RelationshipManager()
+
+    def save(self, *args: Any, **kwargs: Any) -> None:
+        _owned_instance_save(
+            self, lambda: super(Relationship, self).save(*args, **kwargs), kwargs.get("using")
+        )
+
+    def delete(self, *args: Any, **kwargs: Any) -> tuple[int, dict[str, int]]:
+        return _owned_instance_delete(
+            self, lambda: super(Relationship, self).delete(*args, **kwargs), kwargs.get("using")
+        )
 
     class Meta:
         app_label = "rebac"
@@ -310,7 +398,7 @@ class RelationshipRegistryQuerySet(models.QuerySet["RelationshipRegistry"]):
         return _owned_tuple_delete(self, super().delete)
 
     def update(self, **kwargs: Any) -> int:
-        raise PermissionDenied(
+        raise NotImplementedError(
             "Relationship queryset update() is unsupported; use delete_relationships() "
             "and write_relationships() to change tuples."
         )
@@ -440,21 +528,13 @@ def _owned_tuple_delete(
     from ..backends.local import mark_relationships_changed
     from ..index.maintain import tuple_owner
 
+    cast(Any, rows)._for_write = True
+    if _engine_tuple_owner.get():
+        return delete()
     with tuple_owner(rows.db) as maintenance:
         if maintenance is not None:
             projection = rows.index_projection()
-            maintenance.capture_old(
-                tuples=(
-                    RelationshipTuple(
-                        resource=ObjectRef(row["resource_type"], row["resource_id"]),
-                        relation=row["relation"],
-                        subject=SubjectRef.of(
-                            row["subject_type"], row["subject_id"], row["subject_relation"]
-                        ),
-                    )
-                    for row in projection.iterator(chunk_size=1000)
-                )
-            )
+            maintenance.capture_old(tuples=projected_tuples(projection))
         result = delete()
         if maintenance is not None:
             maintenance.changed()
@@ -578,6 +658,20 @@ class RelationshipRegistry(models.Model):
     written_at_xid = models.BigIntegerField(default=0, db_index=True)
 
     objects = RelationshipRegistryManager()
+
+    def save(self, *args: Any, **kwargs: Any) -> None:
+        _owned_instance_save(
+            self,
+            lambda: super(RelationshipRegistry, self).save(*args, **kwargs),
+            kwargs.get("using"),
+        )
+
+    def delete(self, *args: Any, **kwargs: Any) -> tuple[int, dict[str, int]]:
+        return _owned_instance_delete(
+            self,
+            lambda: super(RelationshipRegistry, self).delete(*args, **kwargs),
+            kwargs.get("using"),
+        )
 
     class Meta:
         app_label = "rebac"

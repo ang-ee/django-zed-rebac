@@ -309,6 +309,16 @@ def test_fully_pinned_params_do_not_erase_missing_declared_runtime_condition():
     assert result == CheckResult.conditional(("runtime_flag",))
 
 
+def test_reference_schema_rejects_undeclared_runtime_identifier():
+    from rebac.schema.parser import validate_schema
+
+    schema = schema_for("r1")
+    schema.caveats = [
+        replace(c, expression="a && runtime_flag") if c.name == "ca" else c for c in schema.caveats
+    ]
+    assert any("undeclared identifier 'runtime_flag'" in error for error in validate_schema(schema))
+
+
 def test_alternative_membership_paths_keep_all_missing_sets_and_last_expiry():
     schema = schema_for("r1")
     tuples = [

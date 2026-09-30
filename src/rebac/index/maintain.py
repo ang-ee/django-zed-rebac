@@ -734,9 +734,13 @@ def maintain_tuples(
     backend: LocalBackend | None = None,
 ) -> Iterator[None]:
     from rebac.models import active_relationship_model
-    from rebac.models.relationship import RelationshipQuerySet, RelationshipRegistryQuerySet
-    from rebac.types import ObjectRef, SubjectRef
+    from rebac.models.relationship import (
+        RelationshipQuerySet,
+        RelationshipRegistryQuerySet,
+        projected_tuples,
+    )
 
+    nested = current_pass(using) is not None
     with IndexMaintenance(using=using, backend=backend) as maintenance:
         maintenance.capture_old(tuples=(*written, *deleted))
         if deleted_filter is not None:
@@ -747,20 +751,14 @@ def maintain_tuples(
             ).index_projection()
             # Streaming input is immediately materialized in IndexWork; there is
             # no queryset retained across the owner's DELETE.
-            maintenance.capture_old(
-                tuples=(
-                    RelationshipTuple(
-                        resource=ObjectRef(row["resource_type"], row["resource_id"]),
-                        relation=row["relation"],
-                        subject=SubjectRef.of(
-                            row["subject_type"], row["subject_id"], row["subject_relation"]
-                        ),
-                    )
-                    for row in rows.iterator(chunk_size=1000)
-                )
-            )
+            maintenance.capture_old(tuples=projected_tuples(rows))
         yield
         maintenance.changed(tuples=written)
+        if nested:
+            # A caller may check at the Zookie returned by this nested write
+            # before its enclosing model owner exits. Derive now; the outer
+            # owner can repeat the pass after its own final capture.
+            maintenance.finish()
 
 
 @contextmanager

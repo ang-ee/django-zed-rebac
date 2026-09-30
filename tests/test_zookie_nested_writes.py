@@ -81,37 +81,6 @@ CAROL = SubjectRef.of("auth/user", "carol")
 SEEN = (True, True, True)
 UNSEEN = (False, False, False)
 
-IN_OPEN_OWNER = pytest.mark.xfail(
-    strict=True,
-    raises=AssertionError,
-    reason=(
-        "A write nested in an open index owner returns its Zookie before its tuples are "
-        "derived: IndexMaintenance.__enter__ hands it the enclosing pass "
-        "(src/rebac/index/maintain.py:188-204), only the outermost owner calls finish() "
-        "(maintain.py:708), yet write_relationships/delete_relationships return the token "
-        "at src/rebac/backends/local.py:712/736, and reads only validate the token "
-        "(local.py:112), so they read the index as it was before the enclosing save."
-    ),
-)
-NESTED_ROWS_ABOVE_TOKEN = (
-    "LocalBackend.write_relationships takes its token from its own batch only (max_xid, "
-    "src/rebac/backends/local.py:679-712); a write nested in a Relationship post_save "
-    "fired by update_or_create (local.py:691) draws later xids from _next_xid "
-    "(local.py:780-782), so the returned token is lower than the nested rows"
-)
-TOKEN_BELOW_NESTED_ROWS = pytest.mark.xfail(
-    strict=True, raises=AssertionError, reason=NESTED_ROWS_ABOVE_TOKEN + "."
-)
-AMBIENT_REGRESSES = pytest.mark.xfail(
-    strict=True,
-    raises=AssertionError,
-    reason=(
-        NESTED_ROWS_ABOVE_TOKEN + "; the outer public helper then records that lower token "
-        "over the nested helper's (src/rebac/relationships.py:36, "
-        "src/rebac/consistency.py:79 overwrites unconditionally)."
-    ),
-)
-
 
 @pytest.fixture
 def local(db: None) -> LocalBackend:
@@ -188,7 +157,6 @@ def test_post_save_writes_are_read_at_their_zookies_after_the_save(local):
     assert int(tokens[-1].token) >= high_watermark()
 
 
-@IN_OPEN_OWNER
 def test_post_save_write_is_read_at_its_zookie_inside_the_save(local):
     observed: dict[str, Any] = {}
 
@@ -223,7 +191,6 @@ def test_write_nested_in_write_relationships_is_read_at_the_outer_zookie(local):
     assert seen(local, token, BOB, ref) == SEEN
 
 
-@TOKEN_BELOW_NESTED_ROWS
 def test_outer_zookie_witnesses_writes_nested_in_write_relationships(local):
     post = create_post()
     ref = to_object_ref(post)
@@ -243,9 +210,7 @@ def test_outer_zookie_witnesses_writes_nested_in_write_relationships(local):
 
 
 @pytest.mark.parametrize("change", ["create", "reparent"])
-@pytest.mark.parametrize(
-    "where", [pytest.param("in_handler", marks=IN_OPEN_OWNER), "after_save", "after_atomic"]
-)
+@pytest.mark.parametrize("where", ["in_handler", "after_save", "after_atomic"])
 def test_field_backed_save_and_signal_tuple_are_read_at_the_zookie(local, change, where):
     with sudo(reason="zookie nested writes fixture"):
         granting = Folder.objects.create(name="granting")
@@ -338,7 +303,7 @@ def test_delete_in_one_atomic_is_read_at_its_zookie(local):
         assert seen(local, token, BOB, ref) == SEEN
 
 
-@pytest.mark.parametrize("where", [pytest.param("in_handler", marks=IN_OPEN_OWNER), "after_save"])
+@pytest.mark.parametrize("where", ["in_handler", "after_save"])
 def test_post_save_delete_is_read_at_its_zookie(local, where):
     post = create_post()
     ref = to_object_ref(post)
@@ -384,7 +349,6 @@ def test_ambient_zookie_after_a_save_with_nested_public_writes(local):
         assert seen(local, token, BOB, ref) == SEEN
 
 
-@AMBIENT_REGRESSES
 def test_ambient_zookie_does_not_regress_below_a_nested_write(local):
     post = create_post()
     ref = to_object_ref(post)
@@ -406,9 +370,7 @@ def test_ambient_zookie_does_not_regress_below_a_nested_write(local):
         assert int(token.token) >= high_watermark()
 
 
-@pytest.mark.parametrize(
-    "nesting", ["post_save", pytest.param("relationship_post_save", marks=AMBIENT_REGRESSES)]
-)
+@pytest.mark.parametrize("nesting", ["post_save", "relationship_post_save"])
 @override_settings(REBAC_ZOOKIE_TRANSPORT="header")
 def test_middleware_header_zookie_witnesses_nested_writes(local, nesting):
     post = create_post()

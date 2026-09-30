@@ -1156,8 +1156,9 @@ def test_dynamic_and_fixed_attributes_preserve_tuple_precedence(install):
             permission read = member
         }
     """)
-    staff = get_user_model().objects.create(username="alice", is_staff=True)
-    other = get_user_model().objects.create(username="bob", is_staff=False)
+    with sudo(reason="test.attribute-fixture"):
+        staff = get_user_model().objects.create(username="alice", is_staff=True)
+        other = get_user_model().objects.create(username="bob", is_staff=False)
     # Simulate persisted tuples predating the backing declaration. Projection
     # must suppress only the fixed anchor, and every dynamic container.
     model = active_relationship_model()
@@ -1255,6 +1256,13 @@ def test_pinned_declared_context_does_not_drop_missing_runtime_global(install):
         actions=["read"],
         contexts=[None, {"runtime_flag": True}, {"runtime_flag": False}],
     )
+
+
+def test_undeclared_caveat_runtime_identifier_is_rejected():
+    from rebac.schema.parser import validate_schema
+
+    schema = parse_zed("caveat runtime(ok bool) { ok && runtime_flag }")
+    assert any("undeclared identifier 'runtime_flag'" in error for error in validate_schema(schema))
 
 
 @pytest.mark.parametrize("storage", ["denormalized", "registry"])

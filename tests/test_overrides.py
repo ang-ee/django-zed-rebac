@@ -637,6 +637,22 @@ def test_baseline_cycle_is_not_attributed_to_override() -> None:
     assert result.get_definition("blog/post") is not None
 
 
+@pytest.mark.django_db
+def test_baseline_undefined_reference_is_not_attributed_to_override() -> None:
+    sp = _seed_db_schema("blog/post", "read", "owner")
+    override = _make_ovr(sp, SchemaOverride.KIND_LOOSEN, "owner")
+    baseline = Schema(
+        definitions=[
+            Definition(
+                "blog/post",
+                relations=(Relation("owner", (AllowedSubject("auth/user"),)),),
+                permissions=(Permission("read", PermRef("missing"), "missing"),),
+            )
+        ]
+    )
+    assert compose(baseline, [override]).get_permission("blog/post", "read") is not None
+
+
 # ---------------------------------------------------------------------------
 # RECAVEAT.
 # ---------------------------------------------------------------------------

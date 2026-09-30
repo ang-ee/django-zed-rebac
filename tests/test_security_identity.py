@@ -44,6 +44,15 @@ def test_grant_subject_ref_distinguishes_agent_types():
     assert grant_subject_ref(_Agent("7"), user) != grant_subject_ref(_Bot("7"), user)
 
 
+def test_grant_subject_ref_wire_id_is_fixed_and_bounded():
+    ref = grant_subject_ref(_Agent("7"), SubjectRef.of("auth/user", "1"))
+    assert ref.subject_id == "v2_W69a_dKLXdo1XsDJfYhI-_lTs4sswu0zDcuWVCUHBTc"
+    assert ref.optional_relation == "valid"
+    long_ref = grant_subject_ref(_Agent("7"), SubjectRef.of("auth/user", "a" * 100))
+    assert len(long_ref.subject_id) == 46
+    assert "." not in long_ref.subject_id
+
+
 def test_grant_subject_ref_distinguishes_principal_types():
     agent = SubjectRef.of("agents/agent", "7")
 
@@ -109,8 +118,11 @@ MODULE_SCHEMA = """
 use expiration
 caveat enabled(value bool) { value }
 definition auth/user {}
+definition auth/group {
+    relation member: auth/user
+}
 definition blog/post {
-    relation viewer: auth/user | auth/user with enabled | auth/user with expiration
+    relation viewer: auth/user | auth/group#member | auth/user with enabled | auth/user with expiration
     relation banned: auth/user
     permission read = viewer - banned
     permission write = viewer - banned
@@ -144,13 +156,6 @@ def test_has_module_perms_with_a_live_grant(module_user):
     assert RebacBackend().has_module_perms(module_user, "testapp")
 
 
-@pytest.mark.xfail(
-    strict=True,
-    reason=(
-        "has_module_perms admits on any relationship row naming the user, without evaluating "
-        "expiry, caveats or exclusions (src/rebac/backends/auth.py:147)"
-    ),
-)
 @pytest.mark.parametrize(
     "kwargs",
     [
@@ -171,3 +176,15 @@ def test_has_module_perms_without_an_effective_grant(module_user, kwargs):
     assert not list(backend().accessible(subject=subject, action="read", resource_type="blog/post"))
 
     assert not RebacBackend().has_module_perms(module_user, "testapp")
+
+
+def test_has_module_perms_follows_group_membership(module_user):
+    user = SubjectRef.of("auth/user", str(module_user.pk))
+    group = ObjectRef("auth/group", "editors")
+    backend().write_relationships(
+        [
+            RelationshipTuple(group, "member", user),
+            RelationshipTuple(ObjectRef("blog/post", "p1"), "viewer", SubjectRef(group, "member")),
+        ]
+    )
+    assert RebacBackend().has_module_perms(module_user, "testapp")

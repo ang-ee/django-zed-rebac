@@ -201,7 +201,7 @@ def deletion_owner(
     scope = DeleteScope(origin, using, actor, unscoped)
     if isinstance(origin, models.QuerySet):
         roots = (
-            origin.system_context(reason="rebac.delete.roots")
+            origin._system_capture(reason="rebac.delete.roots")
             if isinstance(origin, RebacQuerySet)
             else origin
         )
@@ -245,6 +245,9 @@ class RebacTrackedMixin(models.Model, metaclass=RebacModelBase):
         if raw:
             return super().save_base(raw, force_insert, force_update, alias, update_fields)
         with model_write(model=type(self), using=alias, names=update_fields) as maintenance:
+            from .signals import _gate_backed_field_change
+
+            _gate_backed_field_change(type(self), self, alias, update_fields)
             if maintenance is not None and self.pk is not None:
                 maintenance.capture_old(model=type(self), pks=(self.pk,))
             super().save_base(raw, force_insert, force_update, alias, update_fields)
@@ -324,6 +327,7 @@ class RebacMixin(RebacTrackedMixin):
     # forcing the consumer to re-attach via middleware / Celery hook.
     _rebac_actor: SubjectRef | None = None
     _rebac_sudo_reason: str | None = None
+    _rebac_sudo_audited: bool = False
     _rebac_field_deny: FieldDenyMode | None = None
     _rebac_resource_id: str | None = None
 
@@ -421,6 +425,7 @@ class RebacMixin(RebacTrackedMixin):
         if isinstance(state, dict):
             state.pop("_rebac_actor", None)
             state.pop("_rebac_sudo_reason", None)
+            state.pop("_rebac_sudo_audited", None)
             state.pop("_rebac_loaded_values", None)
             state.pop("_rebac_field_deny", None)
         return state
@@ -442,6 +447,7 @@ class RebacMixin(RebacTrackedMixin):
 
         self._rebac_actor = actor if isinstance(actor, SubjectRef) else to_subject_ref(actor)
         self._rebac_sudo_reason = None
+        self._rebac_sudo_audited = False
         return self
 
     def as_user(self, user: Any) -> Self:
@@ -481,6 +487,7 @@ class RebacMixin(RebacTrackedMixin):
                 "sudo() requires reason= when REBAC_REQUIRE_SUDO_REASON=True"
             )
         self._rebac_sudo_reason = reason
+        self._rebac_sudo_audited = False
         return self
 
     def unsudo(self) -> Self:
@@ -491,7 +498,25 @@ class RebacMixin(RebacTrackedMixin):
         ``sudo(reason=...)`` for actorless paths.
         """
         self._rebac_sudo_reason = None
+        self._rebac_sudo_audited = False
         return self
+
+    def _audit_bypass_once(self) -> None:
+        if self._rebac_sudo_reason is None or self._rebac_sudo_audited:
+            return
+        from .actors import current_actor
+        from .audit import emit
+        from .models import PermissionAuditEvent
+
+        actor = current_actor()
+        emit(
+            PermissionAuditEvent.KIND_SUDO_BYPASS,
+            actor=actor,
+            origin=actor,
+            reason=self._rebac_sudo_reason,
+            defer_to_commit=False,
+        )
+        self._rebac_sudo_audited = True
 
     def is_sudo(self) -> bool:
         return self._rebac_sudo_reason is not None
@@ -518,6 +543,8 @@ class RebacMixin(RebacTrackedMixin):
         if insert is not None and insert[0] is self:
             return insert[1], insert[2]
         if self._rebac_sudo_reason is not None:
+            if strict:
+                self._audit_bypass_once()
             return (None, True)
         if self._rebac_actor is not None:
             return (self._rebac_actor, False)
@@ -938,13 +965,11 @@ def _enforce_expression_reads(
         gated_read_fields,
         runtime_field_deny_mode,
     )
-    from .managers import _expression_columns
+    from .managers import _expression_columns, _has_gated_subquery
 
     if runtime_field_deny_mode(effective_field_deny_mode(instance._rebac_field_deny)) == "allow":
         return
     gated = gated_read_fields(sender)
-    if not gated:
-        return
     selected = (
         set(_normalise_update_field_names(sender=sender, update_fields=update_fields))
         if update_fields is not None
@@ -960,6 +985,8 @@ def _enforce_expression_reads(
         if not callable(resolver):
             continue
         resolved = resolver(query)
+        if _has_gated_subquery(resolved):
+            raise PermissionDenied("Write expression reads a subquery over gated fields.")
         required.update(
             column.target.name
             for column in _expression_columns(resolved)

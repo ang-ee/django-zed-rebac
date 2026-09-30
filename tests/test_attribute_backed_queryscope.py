@@ -35,12 +35,13 @@ definition blog/post {
 def test_fixed_attribute_anchor_is_lazy_and_honours_filters(django_user_model):
     reset_backend()
     install_schema(backend(), parse_zed(SCHEMA))
-    actor = atomic_source_write(
-        django_user_model.objects.create,
-        username="admin",
-        is_active=True,
-        is_superuser=True,
-    )
+    with sudo(reason="test.attribute-fixture"):
+        actor = atomic_source_write(
+            django_user_model.objects.create,
+            username="admin",
+            is_active=True,
+            is_superuser=True,
+        )
     with sudo(reason="test.fixture"):
         first = Post.objects.create(title="First")
         second = Post.objects.create(title="Second")
@@ -50,7 +51,8 @@ def test_fixed_attribute_anchor_is_lazy_and_honours_filters(django_user_model):
 
     pending = Post.objects.with_actor(actor)
     actor.is_active = False
-    atomic_source_write(actor.save, update_fields=["is_active"])
+    with sudo(reason="test.attribute-fixture"):
+        atomic_source_write(actor.save, update_fields=["is_active"])
     assert list(pending) == []
 
 
@@ -58,12 +60,13 @@ def test_fixed_attribute_anchor_is_lazy_and_honours_filters(django_user_model):
 def test_attribute_anchor_preserves_unmatched_resource_tuple(django_user_model):
     reset_backend()
     install_schema(backend(), parse_zed(SCHEMA.replace("rebac:const=admin", "rebac:const=editor")))
-    actor = atomic_source_write(
-        django_user_model.objects.create,
-        username="admin",
-        is_active=True,
-        is_superuser=True,
-    )
+    with sudo(reason="test.attribute-fixture"):
+        actor = atomic_source_write(
+            django_user_model.objects.create,
+            username="admin",
+            is_active=True,
+            is_superuser=True,
+        )
     with sudo(reason="test.fixture"):
         post = Post.objects.create(title="Tuple-backed editor")
         write_relationships(
@@ -248,9 +251,10 @@ def test_direct_live_checks_use_witness_and_one_index_query(
             """
         ),
     )
-    alice = atomic_source_write(
-        django_user_model.objects.create, username="alice", is_active=True, is_staff=True
-    )
+    with sudo(reason="test.attribute-fixture"):
+        alice = atomic_source_write(
+            django_user_model.objects.create, username="alice", is_active=True, is_staff=True
+        )
     with sudo(reason="test.fixture"):
         folder = Folder.objects.create(name="Shared")
         AuthoredPost.objects.create(title="allowed", folder=folder, author=alice)
@@ -289,12 +293,16 @@ def test_attribute_arrow_preserves_caveats_in_one_index_query(
     reader = atomic_source_write(
         django_user_model.objects.create, username="reader", is_active=True
     )
-    staff = [
-        atomic_source_write(
-            django_user_model.objects.create, username=f"staff{i}", is_active=True, is_staff=True
-        )
-        for i in range(2)
-    ]
+    with sudo(reason="test.attribute-fixture"):
+        staff = [
+            atomic_source_write(
+                django_user_model.objects.create,
+                username=f"staff{i}",
+                is_active=True,
+                is_staff=True,
+            )
+            for i in range(2)
+        ]
     with sudo(reason="test.fixture"):
         folder = Folder.objects.create(name="Shared")
         for member in staff:

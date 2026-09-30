@@ -99,6 +99,31 @@ def test_drf_object_permission_denies_unsaved_instance() -> None:
     assert not RebacPermission().has_object_permission(request, view, Post(title="unsaved"))
 
 
+def test_drf_denies_non_model_rebac_object_with_missing_id() -> None:
+    from rebac.mixins import RebacObjectMeta
+
+    class Page(metaclass=RebacObjectMeta):
+        class Meta:
+            rebac_resource_type = "site/page"
+            rebac_id_attr = "id"
+
+    request = SimpleNamespace(method="GET", user=_user("drf-page"))
+    view = SimpleNamespace(action="retrieve")
+    assert not RebacPermission().has_object_permission(request, view, Page())
+
+
+def test_declared_non_model_empty_id_is_not_a_model_level_sentinel() -> None:
+    from rebac import rebac_resource
+    from rebac.resources import to_object_ref
+
+    @rebac_resource(type="site/page", id_attr="id")
+    class Page:
+        id = ""
+
+    with pytest.raises(TypeError):
+        to_object_ref(Page())
+
+
 @override_settings(REBAC_FIELD_READ_MODE="redact")
 def test_drf_object_permission_denies_instance_with_redacted_id() -> None:
     from tests.testapp.models import SluggedPost
@@ -143,7 +168,11 @@ def test_mcp_empty_id_arg_is_not_a_model_level_check() -> None:
 
 
 def test_mcp_create_relations_with_empty_id_denies() -> None:
-    _grant(ObjectRef("blog/post", "p0"), "owner", ALICE)
+    from tests.testapp.models import Post
+
+    with sudo(reason="test.fixture"):
+        parent = Post.objects.create(title="parent")
+    _grant(ObjectRef("blog/post", str(parent.pk)), "owner", ALICE)
     calls: list[str] = []
 
     @rebac_mcp_tool(
@@ -153,10 +182,11 @@ def test_mcp_create_relations_with_empty_id_denies() -> None:
         calls.append(parent_ref)
         return "ok"
 
-    assert create_post("blog/post:p0", ctx=_ctx("auth/user:alice")) == "ok"
+    parent_ref = f"blog/post:{parent.pk}"
+    assert create_post(parent_ref, ctx=_ctx("auth/user:alice")) == "ok"
     with pytest.raises(PermissionDenied):
         create_post("blog/post:", ctx=_ctx("auth/user:alice"))
-    assert calls == ["blog/post:p0"]
+    assert calls == [parent_ref]
 
 
 @pytest.mark.parametrize("spelling", NONCANONICAL)
@@ -184,13 +214,17 @@ def test_mcp_noncanonical_id_arg_does_not_skip_concrete_ban(spelling) -> None:
 
 
 def test_check_new_empty_id_overlay_subject_denies() -> None:
-    _grant(ObjectRef("blog/post", "p0"), "owner", ALICE)
+    from tests.testapp.models import Post
+
+    with sudo(reason="test.fixture"):
+        parent = Post.objects.create(title="parent")
+    _grant(ObjectRef("blog/post", str(parent.pk)), "owner", ALICE)
 
     assert check_new(
         subject=ALICE,
         action="create",
         resource_type="blog/post",
-        relationships={"parent": [SubjectRef.of("blog/post", "p0")]},
+        relationships={"parent": [SubjectRef.of("blog/post", str(parent.pk))]},
     ).allowed
     assert not check_new(
         subject=ALICE,
@@ -206,6 +240,41 @@ def test_check_new_empty_id_actor_is_not_authenticated() -> None:
         subject=SubjectRef.of("auth/user", ""), action="create", resource_type="site/page"
     )
     assert result.result is PermissionResult.NO_PERMISSION
+
+
+@pytest.mark.parametrize("spelling", ["0{}", " {}"])
+def test_noncanonical_create_overlay_cannot_escape_concrete_ban(spelling):
+    schema = SCHEMA_TEXT.replace(
+        "permission read = authenticated - banned\n    permission write = owner\n    permission create = parent->write",
+        "permission read = authenticated - banned\n"
+        "    permission comment = authenticated - banned\n"
+        "    permission write = owner\n"
+        "    permission create = parent->comment",
+    )
+    install_schema(backend(), parse_zed(schema))
+    post = _banned_post()
+    canonical = f"blog/post:{post.pk}"
+    invalid = f"blog/post:{spelling.format(post.pk)}"
+    for wire in (canonical, invalid):
+        assert not check_new(
+            subject=ALICE,
+            action="create",
+            resource_type="blog/post",
+            relationships={"parent": [SubjectRef.parse(wire)]},
+        ).allowed
+
+    calls: list[str] = []
+
+    @rebac_mcp_tool(
+        resource_type="blog/post", action="create", create_relations={"parent": "parent_ref"}
+    )
+    def create_post(parent_ref: str, ctx: object = None) -> str:
+        calls.append(parent_ref)
+        return "ok"
+
+    with pytest.raises(PermissionDenied):
+        create_post(invalid, ctx=_ctx("auth/user:alice"))
+    assert calls == []
 
 
 # ---------- backend.check_access identity ----------

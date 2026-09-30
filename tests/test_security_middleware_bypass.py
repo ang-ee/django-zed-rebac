@@ -127,3 +127,21 @@ def test_resolved_superuser_keeps_documented_bypass(root, post):
     assert captured["actor"] == to_subject_ref(root)
     assert captured["sudo"] is True
     assert captured["rows"] == [post.pk]
+
+
+@override_settings(
+    REBAC_SUPERUSER_BYPASS=True,
+    REBAC_ACTOR_RESOLVER=f"{__name__}.session_user_resolver",
+)
+def test_superuser_resolution_error_suppresses_bypass(root, post, monkeypatch):
+    from rebac import middleware
+    from rebac.errors import NoActorResolvedError
+
+    def fail(user):
+        raise NoActorResolvedError("identity unavailable")
+
+    monkeypatch.setattr(middleware, "to_subject_ref", fail)
+    captured = {}
+    ActorMiddleware(_sync_view(captured))(_Request(root))
+    assert captured["sudo"] is False
+    assert captured["rows"] == []

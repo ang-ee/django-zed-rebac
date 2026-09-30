@@ -23,6 +23,7 @@ happens at row evaluation time (LocalBackend), not here.
 
 from __future__ import annotations
 
+from collections import Counter
 from collections.abc import Iterable
 from dataclasses import dataclass
 from datetime import datetime
@@ -40,7 +41,7 @@ from .schema.ast import (
     PermRef,
     Schema,
 )
-from .schema.parser import parse_permission_expression, validate_schema
+from .schema.parser import parse_permission_expression, reference_issues
 
 if TYPE_CHECKING:
     from .models import SchemaOverride
@@ -141,10 +142,10 @@ def compose_tagged(baseline: Schema, overrides: Iterable[SchemaOverride]) -> Tag
     # Reject any composition that introduces a permission cycle that wasn't
     # present in the baseline.
     _detect_cycles(baseline, composed)
+    baseline_errors = Counter(reference_issues(baseline))
     reference_errors = [
-        error
-        for error in validate_schema(composed)
-        if "undefined reference" in error or "arrow walks via undefined relation" in error
+        issue.message()
+        for issue in (Counter(reference_issues(composed)) - baseline_errors).elements()
     ]
     if reference_errors:
         raise SchemaError("; ".join(reference_errors))

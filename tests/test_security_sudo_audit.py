@@ -48,39 +48,26 @@ def _bypass_rows(reason):
     )
 
 
-@pytest.mark.xfail(
-    strict=True,
-    reason=(
-        "RebacQuerySet._bypass installs the queryset bypass without emitting an audit row "
-        "(src/rebac/managers.py:279)."
-    ),
-)
 def test_queryset_sudo_writes_bypass_row(post):
     assert list(Post.objects.sudo(reason="audit.queryset-sudo")) == [post]
 
-    assert _bypass_rows("audit.queryset-sudo").exists()
+    assert _bypass_rows("audit.queryset-sudo").count() == 1
 
 
-@pytest.mark.xfail(
-    strict=True,
-    reason=(
-        "RebacQuerySet.system_context goes through _bypass, which emits no audit row "
-        "(src/rebac/managers.py:279)."
-    ),
-)
+def test_queryset_sudo_audits_only_when_used_once(post):
+    rows = Post.objects.sudo(reason="audit.lazy")
+    assert not _bypass_rows("audit.lazy").exists()
+    assert rows.count() == 1
+    assert list(rows) == [post]
+    assert _bypass_rows("audit.lazy").count() == 1
+
+
 def test_queryset_system_context_writes_bypass_row(post):
     assert list(Post.objects.system_context(reason="audit.queryset-system")) == [post]
 
-    assert _bypass_rows("audit.queryset-system").exists()
+    assert _bypass_rows("audit.queryset-system").count() == 1
 
 
-@pytest.mark.xfail(
-    strict=True,
-    reason=(
-        "RebacMixin.sudo only sets _rebac_sudo_reason and emits no audit row "
-        "(src/rebac/mixins.py:450)."
-    ),
-)
 def test_instance_sudo_writes_bypass_row(post):
     with sudo(reason="test.load"):
         instance = Post.objects.get(pk=post.pk)
@@ -88,7 +75,7 @@ def test_instance_sudo_writes_bypass_row(post):
 
     instance.sudo(reason="audit.instance-sudo").save()
 
-    assert _bypass_rows("audit.instance-sudo").exists()
+    assert _bypass_rows("audit.instance-sudo").count() == 1
 
 
 def test_block_sudo_writes_bypass_row_inside_block(post):
@@ -96,19 +83,16 @@ def test_block_sudo_writes_bypass_row_inside_block(post):
         assert _bypass_rows("audit.block-sudo").count() == 1
 
 
-@pytest.mark.xfail(
-    strict=True,
-    reason=(
-        "sudo() writes its audit row on the caller's connection inside the caller's "
-        "transaction, so an outer rollback removes it (src/rebac/actors.py:342)."
-    ),
-)
 @pytest.mark.django_db(transaction=True)
-def test_block_sudo_row_survives_outer_rollback():
+def test_block_sudo_row_follows_outer_transaction():
     with pytest.raises(_Rollback):
         with transaction.atomic():
             with sudo(reason="audit.rolled-back"):
                 assert _bypass_rows("audit.rolled-back").count() == 1
             raise _Rollback
 
-    assert _bypass_rows("audit.rolled-back").count() == 1
+    assert _bypass_rows("audit.rolled-back").count() == 0
+    with transaction.atomic():
+        with sudo(reason="audit.committed"):
+            assert _bypass_rows("audit.committed").count() == 1
+    assert _bypass_rows("audit.committed").count() == 1

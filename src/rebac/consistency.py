@@ -76,6 +76,14 @@ def record_zookie(zookie: Zookie | None) -> None:
         return
     if _current_zookie.get() is _NO_SCOPE:
         return
+    previous = current_zookie()
+    if previous is not None and previous.backend == zookie.backend:
+        try:
+            if int(previous.token) > int(zookie.token):
+                return
+        except ValueError:
+            # Opaque remote tokens have no local ordering contract.
+            pass
     _current_zookie.set(zookie)
 
 

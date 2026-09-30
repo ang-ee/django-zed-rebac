@@ -289,10 +289,10 @@ def test_create_action_uses_preflight() -> None:
 
 @pytest.mark.django_db
 def test_create_with_relations_overlay_allows() -> None:
-    # create = parent->write. The new row would carry parent -> blog/post:p0,
-    # and user 5 owns p0 (so has write on it). The overlay lets check_new walk
+    # create = parent->write. The new row would carry parent -> blog/post:1,
+    # and user 5 owns that parent (so has write on it). The overlay lets check_new walk
     # the arrow into the real parent and authorise the create.
-    _grant_owner(ObjectRef("blog/post", "p0"), SubjectRef.of("auth/user", "5"))
+    _grant_owner(ObjectRef("blog/post", "1"), SubjectRef.of("auth/user", "5"))
     calls: list[str] = []
 
     @rebac_mcp_tool(
@@ -304,7 +304,7 @@ def test_create_with_relations_overlay_allows() -> None:
         calls.append(body)
         return "ok"
 
-    assert create_post("blog/post:p0", "x", ctx=_ctx("auth/user:5")) == "ok"
+    assert create_post("blog/post:1", "x", ctx=_ctx("auth/user:5")) == "ok"
     assert calls == ["x"]
 
 
@@ -323,7 +323,7 @@ def test_create_with_relations_overlay_denies_without_parent_write() -> None:
         return "ok"
 
     with pytest.raises(PermissionDenied):
-        create_post("blog/post:p0", "x", ctx=_ctx("auth/user:5"))
+        create_post("blog/post:1", "x", ctx=_ctx("auth/user:5"))
     assert calls == []
 
 

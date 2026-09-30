@@ -16,7 +16,7 @@ Actor resolution order (first hit wins):
    ``REBAC_MCP_ACTOR_RESOLVER`` (default :func:`default_actor_resolver`, which
    reads ``ctx.request_context.meta["actor_subject"]`` as a canonical
    :class:`~rebac.SubjectRef` string such as ``auth/user:42`` or
-   ``agents/grant:42.assistant#valid``).
+   ``agents/grant:v2_<digest>#valid``).
 2. The ambient :func:`rebac.current_actor` — a transport middleware may have
    populated it at the request boundary.
 
@@ -108,7 +108,7 @@ def default_actor_resolver(ctx: Any) -> SubjectRef | None:
     """Resolve the actor from ``ctx.request_context.meta["actor_subject"]``.
 
     ``actor_subject`` is a canonical :class:`~rebac.SubjectRef` string —
-    ``auth/user:42``, ``agents/grant:42.assistant#valid``, ``auth/apikey:k_1``.
+    ``auth/user:42``, ``agents/grant:v2_<digest>#valid``, ``auth/apikey:k_1``.
     Returns ``None`` when no such key is present *or* when the value is not a
     parseable ref, so the decorator falls through to its fail-closed deny — a
     missing or malformed actor is a clean deny, never a 500.

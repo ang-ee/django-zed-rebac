@@ -492,6 +492,17 @@ def test_cel_runtime_error_raises_caveat_unsupported(type_name, expression, valu
         evaluate(caveat, {}, {"x": value})
 
 
+def test_cel_runtime_error_redacts_context_values():
+    from rebac.caveats import evaluate
+    from rebac.schema.ast import Caveat, CaveatParam
+
+    caveat = Caveat("redacted", (CaveatParam("secret", "string"),), "secret > 1")
+    with pytest.raises(CaveatUnsupportedError) as captured:
+        evaluate(caveat, {}, {"secret": "sensitive-token"})
+    assert "secret" in str(captured.value)
+    assert "sensitive-token" not in str(captured.value)
+
+
 def test_cel_runtime_error_surfaces_from_check_access(db):
     local = LocalBackend()
     install_schema(

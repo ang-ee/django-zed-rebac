@@ -149,7 +149,15 @@ def to_object_ref(obj: Any) -> ObjectRef:
     # 2. @rebac_resource registry
     for cls, (type_, id_attr) in _resource_registry.items():
         if isinstance(obj, cls):
-            value = getattr(obj, id_attr)
+            try:
+                value = _resolve_dotted(obj, id_attr)
+            except AttributeError as exc:
+                raise TypeError(
+                    f"Cannot resolve {obj.__class__.__name__} to ObjectRef: "
+                    f"rebac_id_attr={id_attr!r} not found on instance ({exc})."
+                ) from exc
+            if value is None or value == "":
+                raise TypeError(f"Cannot resolve {obj.__class__.__name__} to ObjectRef: empty ID.")
             return ObjectRef(type_with_prefix(type_), str(value))
 
     # 3. RebacObjectMeta — class-level _rebac_resource_type (views, menus, etc.)
@@ -164,6 +172,8 @@ def to_object_ref(obj: Any) -> ObjectRef:
                 f"Cannot resolve {cls_obj.__name__} to ObjectRef: "
                 f"rebac_id_attr={id_attr!r} not found on instance ({exc})."
             ) from exc
+        if resource_id is None or resource_id == "":
+            raise TypeError(f"Cannot resolve {cls_obj.__name__} to ObjectRef: empty ID.")
         return ObjectRef(type_with_prefix(resource_type), str(resource_id))
 
     raise TypeError(

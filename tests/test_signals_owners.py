@@ -16,6 +16,7 @@ from rebac import (
     RebacTrackedMixin,
     backend,
     rebac_subject,
+    sudo,
     to_object_ref,
 )
 from rebac.actors import _current_actor, _sudo_state
@@ -244,7 +245,7 @@ def test_tracked_mixin_owners_maintain_nonresource_paths(indexed, operation):
     other_task = BackingTask.objects.create(queue=two)
     project = BackingProject.objects.create(task=task)
     round_ = BackingRound.objects.create(project=project)
-    with no_ambient_scope():
+    with no_ambient_scope(), sudo(reason="test.maintenance-owner"):
         if operation == "save_base":
             project.task = other_task
             project.save_base(update_fields=["task"])
@@ -326,7 +327,8 @@ def test_fresh_worker_user_revoke_loads_current_program(settings, explicit):
             },
         )
         SchemaPermission.objects.create(definition=definition, name="read", expression="member")
-    user = get_user_model().objects.create_user(username="fresh", is_active=True)
+    with sudo(reason="test.tracked-user-maintenance"):
+        user = get_user_model().objects.create_user(username="fresh", is_active=True)
     from rebac import ObjectRef, to_subject_ref
 
     resource = ObjectRef("test/active", "active")
@@ -339,7 +341,8 @@ def test_fresh_worker_user_revoke_loads_current_program(settings, explicit):
     # remain static; no rebuild or permission read may warm the write path.
     reset_backend()
     user.is_active = False
-    user.save(update_fields=["is_active"])
+    with sudo(reason="test.tracked-user-maintenance"):
+        user.save(update_fields=["is_active"])
     assert_no_drift()
     assert (
         not backend()
@@ -606,18 +609,18 @@ def test_tracked_through_bulk_owners_grant_and_revoke_existing_resource(indexed)
     actor = to_subject_ref(user)
     resource = to_object_ref(round_)
     assert not indexed.check_access(subject=actor, action="read", resource=resource).allowed
-    with no_ambient_scope():
+    with no_ambient_scope(), sudo(reason="test.tracked-backing-maintenance"):
         entry = BackingEntry.objects.bulk_create(
             [BackingEntry(round=round_, responder=user, retired_at=None)]
         )[0]
     assert indexed.check_access(subject=actor, action="read", resource=resource).allowed
     assert_no_drift()
-    with no_ambient_scope():
+    with no_ambient_scope(), sudo(reason="test.tracked-backing-maintenance"):
         BackingEntry._base_manager.filter(pk=entry.pk).update(retired_at=timezone.now())
     assert not indexed.check_access(subject=actor, action="read", resource=resource).allowed
     assert_no_drift()
     entry.retired_at = None
-    with no_ambient_scope():
+    with no_ambient_scope(), sudo(reason="test.tracked-backing-maintenance"):
         BackingEntry.objects.bulk_update([entry], ["retired_at"])
     assert indexed.check_access(subject=actor, action="read", resource=resource).allowed
     assert_no_drift()

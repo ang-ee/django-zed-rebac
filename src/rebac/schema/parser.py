@@ -44,6 +44,19 @@ class ParseError(Exception):
     pass
 
 
+@dataclass(frozen=True)
+class ReferenceIssue:
+    resource_type: str
+    permission: str
+    kind: str
+    name: str
+
+    def message(self) -> str:
+        if self.kind == "arrow":
+            return f"{self.resource_type}: arrow walks via undefined relation {self.name!r}"
+        return f"{self.resource_type}: undefined reference {self.name!r} in expression"
+
+
 # ---------- Tokenizer ----------
 
 
@@ -556,6 +569,25 @@ def validate_schema(schema: Schema) -> list[str]:
     """
     errors = subject_relation_errors(schema)
     caveat_names = {c.name for c in schema.caveats}
+    for caveat in schema.caveats:
+        declared = {param.name for param in caveat.params}
+        # CEL bodies are stored opaquely by the schema parser. Check free
+        # identifier roots without treating string contents, member names, or
+        # function names as caveat parameters.
+        body = re.sub(r"""(?:\bb)?(?:"(?:\\.|[^"\\])*"|'(?:\\.|[^'\\])*')""", "", caveat.expression)
+        for match in re.finditer(r"[A-Za-z_][A-Za-z0-9_]*", body):
+            name = match.group()
+            prefix = body[: match.start()].rstrip()
+            suffix = body[match.end() :].lstrip()
+            if (
+                name in {"true", "false", "null", "in"}
+                or prefix.endswith(".")
+                or suffix.startswith("(")
+                or (name == "u" and prefix and prefix[-1].isdigit())
+            ):
+                continue
+            if name not in declared:
+                errors.append(f"caveat {caveat.name}: undeclared identifier {name!r}")
 
     for definition in schema.definitions:
         if definition.resource_type in BUILTIN_ACTOR_TYPES:
@@ -622,7 +654,10 @@ def validate_schema(schema: Schema) -> list[str]:
 
         for perm in definition.permissions:
             errors.extend(
-                _validate_expr(perm.expression, definition, relation_names, permission_names)
+                issue.message()
+                for issue in _validate_expr(
+                    perm.expression, definition, perm.name, relation_names, permission_names
+                )
             )
         # Detect duplicate names within a definition.
         all_names = list(relation_names) + list(permission_names)
@@ -670,10 +705,11 @@ def subject_relation_errors(schema: Schema) -> list[str]:
 def _validate_expr(
     expr: PermExpr,
     definition: Definition,
+    permission: str,
     relation_names: set[str],
     permission_names: set[str],
-) -> list[str]:
-    errors: list[str] = []
+) -> list[ReferenceIssue]:
+    errors: list[ReferenceIssue] = []
     if isinstance(expr, PermNil):
         return errors
     if isinstance(expr, PermRef):
@@ -681,16 +717,34 @@ def _validate_expr(
             return errors
         if expr.name not in relation_names and expr.name not in permission_names:
             errors.append(
-                f"{definition.resource_type}: undefined reference {expr.name!r} in expression"
+                ReferenceIssue(definition.resource_type, permission, "reference", expr.name)
             )
         return errors
     if isinstance(expr, PermArrow):
         if expr.via not in relation_names:
-            errors.append(
-                f"{definition.resource_type}: arrow walks via undefined relation {expr.via!r}"
-            )
+            errors.append(ReferenceIssue(definition.resource_type, permission, "arrow", expr.via))
         return errors
     if isinstance(expr, PermBinOp):
-        errors.extend(_validate_expr(expr.left, definition, relation_names, permission_names))
-        errors.extend(_validate_expr(expr.right, definition, relation_names, permission_names))
+        errors.extend(
+            _validate_expr(expr.left, definition, permission, relation_names, permission_names)
+        )
+        errors.extend(
+            _validate_expr(expr.right, definition, permission, relation_names, permission_names)
+        )
     return errors
+
+
+def reference_issues(schema: Schema) -> list[ReferenceIssue]:
+    """Structured reference diagnostics for baseline/composition comparison."""
+    return [
+        issue
+        for definition in schema.definitions
+        for permission in definition.permissions
+        for issue in _validate_expr(
+            permission.expression,
+            definition,
+            permission.name,
+            {relation.name for relation in definition.relations},
+            {item.name for item in definition.permissions},
+        )
+    ]
