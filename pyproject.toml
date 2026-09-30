@@ -79,15 +79,20 @@ markers = [
     "index_exhaustive: opt-in complete permission-index reference expression and tuple-presence sweep",
     "index_shard: independently schedulable shard of the exhaustive permission-index reference sweep",
     "postgresql: permission-index transaction and concurrency cases requiring PostgreSQL",
+    "pg_delta: runs on every vendor, and PostgreSQL may disagree; selected by make test-pg",
     "schema_vendors: opt-in Docker PostgreSQL/MySQL storage, schema owner and upgrade contracts",
     "scale: time, statement and query-plan budgets; run alone, never beside parallel workers",
 ]
 pythonpath = ["."]
-# A hung test (e.g. a lock-ordering deadlock) must fail loudly, not stall the run:
-# faulthandler dumps every thread's stack after 120 s; pytest-timeout fails the
-# test after 300 s. Opt-in sweeps override with `--timeout=0` if they need more.
+# A hung test (e.g. a lock-ordering deadlock) must fail loudly, not stall the run.
+# pytest-timeout fails a test after 10 s, fixtures included, and prints every
+# thread's stack. Tier 1 budgets 2 s per test, so a test that reaches 10 s is
+# marked `slow`. The Makefile targets that select `slow`, `scale`,
+# `index_exhaustive` or `schema_vendors` pass `--timeout=300`. faulthandler dumps
+# every thread's stack after 120 s: an early warning in those 300 s runs, and the
+# only report from a test blocked in C code that the timeout signal cannot stop.
 faulthandler_timeout = 120
-timeout = 300
+timeout = 10
 filterwarnings = [
     "error",
     "ignore::DeprecationWarning:django.*",

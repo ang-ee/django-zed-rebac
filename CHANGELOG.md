@@ -5,6 +5,32 @@ pre-1.0; breaking changes within a minor version are explicitly called out.
 
 ## [Unreleased]
 
+### Tests
+
+- The test commands follow the three tiers of ARCHITECTURE.md § Test tiers.
+  `make check` (tier 1) runs lint, format, mypy and pyright, then the SQLite
+  suite in parallel with work stealing, stopping at the first failure.
+  `make test-pg` (tier 2) runs the tests marked `postgresql` or `pg_delta` on
+  PostgreSQL. `make test-release` (tier 3) runs `slow` on SQLite, the whole
+  suite on PostgreSQL, the scale budgets on both vendors, the reference sweep,
+  the vendor contracts and a random-order run in sequence; it continues past a
+  failing part and reports each one. `make test-parallel` is removed.
+- The default per-test timeout is 10 s instead of 300 s. The targets that
+  select `slow`, `scale`, `index_exhaustive` or `schema_vendors` pass
+  `--timeout=300`.
+- `make pg-up` starts a disposable `postgres:16` container on a
+  Docker-assigned port and prints the `REBAC_TEST_POSTGRES_URL` to export;
+  `make pg-down` removes it. The PostgreSQL and vendor targets fail naming a
+  missing URL, driver or Docker instead of skipping.
+- CI runs tier 1 (`test (3.14, 6.0)`) and tier 2 (`postgres-delta`) as two
+  parallel jobs; the scale budgets moved out of CI. The PostgreSQL workflow is
+  replaced by Release, which runs tier 3 nightly on `main` and on demand, one
+  job per part, with the reference sweep split across six jobs by expression
+  shape.
+- Publish to PyPI reads the result of the `test (3.14, 6.0)` job instead of
+  the conclusion of the whole CI run, so a tag publishes on tier 1 alone and a
+  `postgres-delta` failure does not hold it back.
+
 ## [0.23.2] — 2026-09-30
 
 ### Fixed

@@ -1,0 +1,215 @@
+name: Release
+
+# Tier 3 (docs/ARCHITECTURE.md § Test tiers): nightly on main and on demand.
+# Each part is an independent job, so one part's failure never hides another's
+# result. Publishing does not wait for this workflow; its nightly result on
+# main is the release evidence. `make test-release` runs the same parts
+# locally, in sequence.
+
+on:
+  schedule:
+    - cron: "17 3 * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+# A manual run while the nightly one is in progress waits for it.
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  slow:
+    name: slow (SQLite)
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v5
+      # uv's managed Python bundles a current SQLite. The runner's system
+      # SQLite has a fixed parser stack that deep read plans overflow.
+      - name: Install uv
+        uses: astral-sh/setup-uv@v7
+      - name: Install dependencies
+        run: |
+          uv venv --python 3.14 --python-preference only-managed
+          uv run --no-sync python -c 'import sqlite3; print("SQLite", sqlite3.sqlite_version)'
+          uv pip install -e '.[dev,caveats,drf,strawberry]' 'django==6.0.*'
+      - name: Slow tests
+        run: make test-slow
+
+  postgres:
+    name: whole suite (PostgreSQL 16)
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    services:
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_USER: postgres
+          POSTGRES_PASSWORD: rebac-test
+          POSTGRES_DB: rebac_test
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U postgres -d rebac_test"
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+    env:
+      REBAC_TEST_POSTGRES_URL: postgresql://postgres:rebac-test@127.0.0.1:5432/rebac_test
+    steps:
+      - uses: actions/checkout@v5
+      # uv's managed Python bundles a current SQLite. The runner's system
+      # SQLite has a fixed parser stack that deep read plans overflow.
+      - name: Install uv
+        uses: astral-sh/setup-uv@v7
+      - name: Install dependencies and PostgreSQL driver
+        run: |
+          uv venv --python 3.14 --python-preference only-managed
+          uv run --no-sync python -c 'import sqlite3; print("SQLite", sqlite3.sqlite_version)'
+          uv pip install -e '.[dev,caveats,drf,strawberry]' 'django==6.0.*' 'psycopg[binary]>=3.2,<4'
+      - name: Whole suite including slow
+        run: make test-postgres
+
+  # Budgets and query plans, measured alone in their own jobs.
+  scale:
+    name: scale (SQLite)
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v5
+      # uv's managed Python bundles a current SQLite. The runner's system
+      # SQLite has a fixed parser stack that deep read plans overflow.
+      - name: Install uv
+        uses: astral-sh/setup-uv@v7
+      - name: Install dependencies
+        run: |
+          uv venv --python 3.14 --python-preference only-managed
+          uv run --no-sync python -c 'import sqlite3; print("SQLite", sqlite3.sqlite_version)'
+          uv pip install -e '.[dev,caveats,drf,strawberry]' 'django==6.0.*'
+      - name: Scale budgets
+        run: make test-scale
+
+  scale-postgres:
+    name: scale (PostgreSQL 16)
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    services:
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_USER: postgres
+          POSTGRES_PASSWORD: rebac-test
+          POSTGRES_DB: rebac_test
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U postgres -d rebac_test"
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+    env:
+      REBAC_TEST_POSTGRES_URL: postgresql://postgres:rebac-test@127.0.0.1:5432/rebac_test
+    steps:
+      - uses: actions/checkout@v5
+      # uv's managed Python bundles a current SQLite. The runner's system
+      # SQLite has a fixed parser stack that deep read plans overflow.
+      - name: Install uv
+        uses: astral-sh/setup-uv@v7
+      - name: Install dependencies and PostgreSQL driver
+        run: |
+          uv venv --python 3.14 --python-preference only-managed
+          uv run --no-sync python -c 'import sqlite3; print("SQLite", sqlite3.sqlite_version)'
+          uv pip install -e '.[dev,caveats,drf,strawberry]' 'django==6.0.*' 'psycopg[binary]>=3.2,<4'
+      - name: Scale budgets on PostgreSQL
+        run: make test-scale-postgres
+
+  # The sweep's target is 60 minutes on 16 workers, about four hours on one
+  # four-core runner, so it is split by expression shape: the five four-leaf
+  # shapes carry nearly all of the cost and take one job each; everything else
+  # in the module takes the sixth. The six selections partition the module's
+  # cases. If the test ids change, a shape job selects nothing and fails; no
+  # case drops out silently.
+  reference:
+    name: reference sweep (${{ matrix.part }})
+    runs-on: ubuntu-latest
+    timeout-minutes: 180
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - part: up to three leaves, tuple presence
+            select: not leaves-4
+          - part: four leaves, shape 0
+            select: leaves-4-shape-0
+          - part: four leaves, shape 1
+            select: leaves-4-shape-1
+          - part: four leaves, shape 2
+            select: leaves-4-shape-2
+          - part: four leaves, shape 3
+            select: leaves-4-shape-3
+          - part: four leaves, shape 4
+            select: leaves-4-shape-4
+    steps:
+      - uses: actions/checkout@v5
+      # uv's managed Python bundles a current SQLite. The runner's system
+      # SQLite has a fixed parser stack that deep read plans overflow.
+      - name: Install uv
+        uses: astral-sh/setup-uv@v7
+      - name: Install dependencies
+        run: |
+          uv venv --python 3.14 --python-preference only-managed
+          uv run --no-sync python -c 'import sqlite3; print("SQLite", sqlite3.sqlite_version)'
+          uv pip install -e '.[dev,caveats,drf,strawberry]' 'django==6.0.*'
+      - name: Reference sweep
+        env:
+          SELECT: ${{ matrix.select }}
+        run: make test-index-reference ARGS="-k '$SELECT'"
+
+  vendors:
+    name: vendor contracts (PostgreSQL 16, MySQL 8)
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v5
+      # uv's managed Python bundles a current SQLite. The runner's system
+      # SQLite has a fixed parser stack that deep read plans overflow.
+      - name: Install uv
+        uses: astral-sh/setup-uv@v7
+      # mysqlclient builds from source against the MySQL client library.
+      - name: Install the MySQL client library
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends libmysqlclient-dev pkg-config
+      - name: Install dependencies and both drivers
+        run: |
+          uv venv --python 3.14 --python-preference only-managed
+          uv run --no-sync python -c 'import sqlite3; print("SQLite", sqlite3.sqlite_version)'
+          uv pip install -e '.[dev,caveats,drf,strawberry]' 'django==6.0.*' 'psycopg[binary]>=3.2,<4' mysqlclient
+      # The fixtures start their own containers; pulling first keeps the
+      # download out of each test's timeout.
+      - name: Pull the database images
+        run: |
+          docker pull postgres:16
+          docker pull mysql:8.0
+      - name: Vendor contracts
+        run: make test-schema-vendors
+
+  random:
+    name: random order (seed 137)
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v5
+      # uv's managed Python bundles a current SQLite. The runner's system
+      # SQLite has a fixed parser stack that deep read plans overflow.
+      - name: Install uv
+        uses: astral-sh/setup-uv@v7
+      - name: Install dependencies
+        run: |
+          uv venv --python 3.14 --python-preference only-managed
+          uv run --no-sync python -c 'import sqlite3; print("SQLite", sqlite3.sqlite_version)'
+          uv pip install -e '.[dev,caveats,drf,strawberry]' 'django==6.0.*'
+      - name: Tier 1 selection in random order
+        run: make test-random

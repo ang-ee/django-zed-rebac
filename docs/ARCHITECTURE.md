@@ -2410,36 +2410,88 @@ Three layers of tests define the project target:
 2. **Integration tests** (`pytest-django`, `@pytest.mark.django_db`): SQLite and PostgreSQL. `RebacMixin` end-to-end, manager scoping, index semantics and maintenance, signal handlers.
 3. **SpiceDB conformance tests** (`-m spicedb`, planned right after 0.23.0): generated schemas and data evaluated by a real SpiceDB and by `LocalBackend`, answers compared. See [SpiceDB conformance suite](#spicedb-conformance-suite-planned). They do not need `SpiceDBBackend`. They drive SpiceDB directly and become the cross-backend contract tests once that backend lands.
 
-GitHub CI gates Ruff lint and formatting, strict mypy, Pyright, and pytest.
-CI runs the SQLite suite with `-n auto --dist loadfile`, keeping each test module
-on one worker. Local `make test` and `make check` remain serial for debugging;
-`make test-parallel` uses the CI scheduling. Random ordering is opt-in with
-`-p randomly --randomly-seed=137`. Test databases and temporary files must be
-worker-local, and fixtures must restore process-local state between tests.
 The supported matrix is declared once, in `pyproject.toml` (`requires-python`,
 the Django pin) and `.github/workflows/ci.yml`; at the time of writing that is
-Python 3.14 × Django 6.0, with SQLite and PostgreSQL 16 jobs for the `local`
-backend. PostgreSQL runs the same default suite, including ported behavioral
-tests and PostgreSQL-marked concurrency cases, through
-`tests.settings_postgres` and `REBAC_TEST_POSTGRES_URL`. MySQL 8 uses the
-opt-in vendor suite and must pass before release.
+Python 3.14 × Django 6.0, with SQLite and PostgreSQL 16 for the `local`
+backend. Test databases and temporary files must be worker-local, and fixtures
+must restore process-local state between tests, so any test can run on any
+worker in any order. Random ordering is opt-in with
+`-p randomly --randomly-seed=137` (`make test-random`).
+
+### Test tiers
+
+Every test belongs to exactly one of three tiers. The tiers differ in when
+they run, not in how much they are trusted: a tier 3 failure is a release
+blocker like any other.
+
+| Tier | Runs | Contents | Budget |
+|---|---|---|---|
+| **1. Fast** — `make check` | Every change, every push and pull request. The only gate for merging and for publishing a tag. | Ruff lint and format, strict mypy, Pyright, then the SQLite suite without `slow`, in parallel with work stealing, stopping at the first failure. | 1 minute on a developer machine, 5 minutes in CI. |
+| **2. PostgreSQL delta** — `make test-pg` | Every push and pull request, as a job beside tier 1. Locally when a change touches SQL generation, transactions, locking or migrations. | Only the tests marked `postgresql` or `pg_delta`, on PostgreSQL 16. | 3 minutes. |
+| **3. Release** — `make test-release` | Nightly on `main` and on demand before a release. Never inside a fix loop. | `slow` on SQLite; the whole suite including `slow` on PostgreSQL; `scale` alone on both; the full `index_exhaustive` sweep; the `schema_vendors` PostgreSQL/MySQL contracts; a randomized parallel run with seed 137; the SpiceDB conformance suite once it lands. | About an hour, as independent parallel jobs. |
+
+Rules that keep the tiers honest:
+
+- **Tier 1 has a per-test budget.** A test that takes more than 2 seconds on
+  a developer machine is marked `slow`. A 10-second per-test timeout in tier
+  1 turns a test that outgrew the budget into a failure, not a slower loop.
+  The targets that select `slow`, `scale`, `index_exhaustive` or
+  `schema_vendors` raise the timeout to 300 seconds.
+- **A `slow` matrix leaves a representative behind.** When a parametrized
+  test is heavy because of depth, corpus size or the number of combinations,
+  one small parameter set stays in tier 1 and the full matrix is `slow`. Moving
+  a test to `slow` never reduces its universe or weakens its assertions.
+- **`postgresql` means "requires PostgreSQL"; `pg_delta` means "runs
+  everywhere, and PostgreSQL may disagree".** `pg_delta` holds tests that
+  branch on the vendor, at least one test for each area that emits SQL
+  (recursive scopes, index reads, maintenance, schema write owners,
+  migrations), and every test that has ever failed on PostgreSQL while passing
+  on SQLite. A PostgreSQL-only failure found in tier 3 adds that test to
+  `pg_delta` in the same change that fixes it.
+- **A vendor-specific test skips, it does not return.** A test that cannot run
+  on the current vendor calls `pytest.skip`; an early `return` reports a pass
+  for something that did not run.
+- **Parallel scheduling is by test, not by file** (`--dist worksteal`). No
+  test may rely on sharing a worker with its module.
+- **Budgets are measured alone.** `scale` holds time, statement and query-plan
+  budgets and never runs beside parallel workers.
+- **Publishing does not wait for tier 3.** A tag publishes once tier 1 is
+  green on it. Tier 3 is consulted before tagging; its nightly result on
+  `main` is the release evidence.
+
+Default `pytest` deselects `slow`, `index_exhaustive`, `schema_vendors` and
+`scale`. `make test` runs the tier 1 selection serially, for debugging only.
+
+Tiers 1 and 2 are the two parallel jobs of `.github/workflows/ci.yml`, on
+every push to `main`, every version tag and every pull request:
+`test (3.14, 6.0)` runs `make check` and `postgres-delta` runs `make test-pg`
+against a PostgreSQL 16 service container. Publish to PyPI reads the result of
+the `test (3.14, 6.0)` job, not of the whole CI run, so a tag publishes on tier
+1 alone. Tier 3 is `.github/workflows/release.yml`, nightly on `main` and on
+demand, with one job per part; the reference sweep is split across six jobs by
+expression shape. `make test-release` runs the same parts locally in sequence,
+continues past a failing part and reports each one. `make pg-up` starts a
+disposable PostgreSQL 16 container for tier 2 and the PostgreSQL parts of tier
+3 and prints the `REBAC_TEST_POSTGRES_URL` to export; `make pg-down` removes
+it. The commands are listed in
+[CONTRIBUTING.md § Commands](../CONTRIBUTING.md#commands).
 
 ### Permission index suites
 
 The coverage matrix is the completion criterion; merely having a generator
 does not cover it.
 
-Default `pytest`, `make test` and `make test-parallel` deselect
-`index_exhaustive`, `slow`, `schema_vendors` and `scale`. The scale suite runs
-alone, never beside parallel workers: `make test-scale` in CI after the SQLite
-suite, `make test-scale-postgres` after the PostgreSQL suite. The full reference sweep uses
+The scale suite runs alone: `make test-scale` and `make test-scale-postgres`.
+The full reference sweep uses
 `index_exhaustive` and its schedulable cases also carry `index_shard`.
-`make test-index` runs all default index suites;
 `make test-index-reference` overrides the marker filter and runs every reference
-shard, distributed by test rather than by file. Run `make test-postgres` for
-the full default PostgreSQL suite or `make test-index-postgres` for its index
-subset. `make test-schema-vendors` opts into disposable PostgreSQL/MySQL
-contracts. Drivers, environment and release gates are in
+shard, distributed by test rather than by file. `make test-postgres` runs
+the whole suite, `slow` included, on PostgreSQL. `make test-schema-vendors`
+opts into disposable PostgreSQL/MySQL contracts; MySQL 8 is covered only
+there. All of these are tier 3. `make test-index` and
+`make test-index-postgres` run the index modules with the default selection on
+SQLite and on PostgreSQL; they are focused runs, not tiers. Drivers,
+environment and release gates are in
 [CONTRIBUTING.md](../CONTRIBUTING.md).
 
 | Suite | Required cases and assertions |
