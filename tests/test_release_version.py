@@ -17,7 +17,9 @@ def test_publish_version_agreement(monkeypatch, tmp_path, different):
     versions = dict.fromkeys(("tag", "project", "installed"), rebac.__version__)
     if different is not None:
         versions[different] = "0.0.0"
-    monkeypatch.setenv("GITHUB_REF_NAME", f"v{versions['tag']}")
+    # The workflow names the tag it publishes in RELEASE_TAG: the CI run's
+    # tag, or the one given to a manual run.
+    monkeypatch.setenv("RELEASE_TAG", f"v{versions['tag']}")
     monkeypatch.setenv("REBAC_INSTALLED_VERSION", versions["installed"])
     (tmp_path / "pyproject.toml").write_text(f'[project]\nversion = "{versions["project"]}"\n')
     monkeypatch.chdir(tmp_path)
