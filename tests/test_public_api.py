@@ -142,17 +142,10 @@ def test_claude_md_public_surface_is_importable(module: str, name: str) -> None:
         assert name in rebac.__all__
 
 
-@pytest.mark.xfail(
-    strict=True,
-    raises=ModuleNotFoundError,
-    reason=(
-        "CLAUDE.md § Public API surface lists `from rebac.celery import propagate_actor` "
-        "(0.3+), but src/rebac/celery.py does not exist; ARCHITECTURE.md § Celery says "
-        "rebac.celery is not shipped."
-    ),
-)
-def test_claude_md_celery_adapter_is_importable() -> None:
-    assert importlib.import_module("rebac.celery").propagate_actor is not None
+def test_celery_adapter_is_not_shipped() -> None:
+    """ARCHITECTURE.md § Celery: automatic propagation is planned, not shipped."""
+    with pytest.raises(ModuleNotFoundError):
+        importlib.import_module("rebac.celery")
 
 
 @pytest.mark.parametrize("name", PUBLIC_ERRORS)

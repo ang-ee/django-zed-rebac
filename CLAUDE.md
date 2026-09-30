@@ -428,9 +428,11 @@ from rebac import (
     app_settings,
 )
 from rebac.drf import RebacPermission, RebacFilterBackend
-from rebac.celery import propagate_actor          # 0.3+
 from rebac.mcp import rebac_mcp_tool                # 0.6+
 ```
+
+`rebac.celery` is not shipped: automatic Celery propagation is planned
+(ARCHITECTURE.md § Celery); tasks use `actor_context()` / `.with_actor()`.
 
 `with_actor` itself is a method on `RebacManager` / `RebacQuerySet`, not
 a top-level import. The top-level `actor_context(actor)` is the
