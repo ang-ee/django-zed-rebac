@@ -4,8 +4,12 @@ name: CI
 # own workflows after this one succeeds, so a slow suite never holds up the
 # lint, type and SQLite results, and publishing waits only on this gate.
 
+# Pushes to lane branches don't run CI; their commits run it on main or in a
+# pull request, so one commit is tested once.
 on:
   push:
+    branches: [main]
+    tags: ["v*"]
   pull_request:
 
 concurrency:

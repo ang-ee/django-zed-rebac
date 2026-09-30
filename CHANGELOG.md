@@ -5,11 +5,29 @@ pre-1.0; breaking changes within a minor version are explicitly called out.
 
 ## [Unreleased]
 
+## [0.23.2] — 2026-09-30
+
 ### Fixed
 
+- A model write re-derived every resource that shared its target: creating a
+  post re-derived every post in its folder, so a seed that writes through the
+  owners slowed down quadratically. The written row's field-backed targets no
+  longer enter the maintenance region; an edge belongs to its source.
+- The arrow rule's type-level lane joined type-level rows through a synthetic
+  `$type` edge per object; on fresh PostgreSQL tables the planner could pick
+  nested loops over that join and a rebuild ran for minutes. Each type-level
+  row is now applied with one indexed query over the arrow's edges, and the
+  `$type` edges are gone. The vacuum keeps the object terms of defined types,
+  which those edges used to keep.
 - When the index build cannot resolve a backed relation, its error carries the
   reason that `rebac.E009` reports (for example, which resource or subject type
   has no concrete Django model) instead of only the relation's name.
+
+### Tests
+
+- CI runs on `main`, version tags and pull requests, not on every branch push,
+  so a commit pushed to a lane and to `main` is tested once. The PostgreSQL
+  workflow runs the suite and the scale budgets as two independent jobs.
 
 ### Documentation
 

@@ -116,10 +116,12 @@ maintenance fan-out and streamed Python rows and formula work. Written assertion
 Python 3.14 and Django 6.0. Three workflows, chained so that a slow suite
 never blocks a fast result:
 
-- **CI** runs on every push and pull request: lint, format, types, the
-  parallel SQLite suite, then the scale budgets alone. It is the gate.
-- **PostgreSQL** runs the default suite on PostgreSQL 16 after CI succeeds on a
-  commit, or on demand, then the scale budgets and query plans alone. It uses a service container, `psycopg`,
+- **CI** runs on pushes to `main`, on version tags and on pull requests:
+  lint, format, types, the parallel SQLite suite, then the scale budgets
+  alone. It is the gate.
+- **PostgreSQL** runs after CI succeeds on a commit, or on demand, as two
+  independent jobs: the default suite on PostgreSQL 16, and the scale budgets
+  and query plans alone. It uses a service container, `psycopg`,
   `tests.settings_postgres` and `REBAC_TEST_POSTGRES_URL`.
 - **Publish to PyPI** runs after CI succeeds on a `v*` tag. It does not run the
   tests again: it verifies that the tag, `pyproject.toml` and the installed
