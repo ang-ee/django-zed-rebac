@@ -330,17 +330,21 @@ def test_read_lookup_plans_use_indexed_scope_and_member_keys():
     # PostgreSQL cannot auto-analyze this fixture before the plain EXPLAIN.
     _fixture(users=120, groups=16, resources=120)
     rebuild(using="default")
-    scope = (
-        IndexCover.objects.filter(resource_type="test/backingtask")
-        .values_list("scope_id", flat=True)
-        .first()
-    )
-    assert scope is not None
     from rebac.index.program import program_for
 
     program = program_for(backend(), using="default")
     (site,) = program.held_sites(("test/backingtask", "manage"))
     operand = program.nodes[site].operands[0]
+    # A concrete task that holds the site's left operand.
+    scope = (
+        IndexCover.objects.filter(
+            resource_type="test/backingtask", node=operand, scope__relation=""
+        )
+        .order_by("scope_id")
+        .values_list("scope_id", flat=True)
+        .first()
+    )
+    assert scope is not None
     covers = IndexCover.objects.filter(scope_id=scope, node=operand).select_related("holder")
     holder_ids = list(covers.values_list("holder_id", flat=True))
     assert holder_ids

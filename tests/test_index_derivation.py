@@ -1,5 +1,6 @@
 """Derivation regressions against source facts, the reference model, and the walker."""
 
+import re
 from datetime import timedelta
 
 import pytest
@@ -973,7 +974,9 @@ def test_batched_expiry_growth_for_recursive_covers_and_memberships(install, mon
         and any(table in query["sql"] for table in ("rebac_grant", "rebac_membership"))
     ]
     assert updates
-    assert all("SELECT" not in sql.upper() for sql in updates)
+    # Batched upserts read no index table. (Django's PostgreSQL bulk_create
+    # spells its rows as ``SELECT * FROM UNNEST(...)``; that is not a read.)
+    assert all(not re.search(r'FROM\s+"rebac_', sql) for sql in updates)
     for instant in (now, short, long):
         assert_index_matches(
             subjects=subjects,

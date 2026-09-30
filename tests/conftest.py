@@ -80,3 +80,31 @@ def initial_index(request):
     # Build the initial empty persisted policy explicitly, without a manual AST.
     if not SchemaGeneration.objects.filter(pk=1).exists():
         rebuild_backend(backend())
+
+
+@pytest.fixture(autouse=True)
+def close_worker_thread_connections(request):
+    """Close the connections that threads opened for a test that awaits the ORM.
+
+    Django runs a coroutine's sync parts on asgiref's single worker thread
+    and iterates results on short-lived executor threads; a sync ``sudo()``
+    reached from a coroutine writes its audit row on the library's fallback
+    thread. Their connections outlive the test, and PostgreSQL cannot drop a
+    test database while such a session exists. Those tests need
+    ``transaction=True``, so only such tests pay for the extra loop.
+    """
+    yield
+    marker = request.node.get_closest_marker("django_db")
+    if marker is None or not marker.kwargs.get("transaction"):
+        return
+    import asyncio
+    import gc
+
+    from asgiref.sync import sync_to_async
+    from django.db import connections
+
+    from rebac import audit
+
+    asyncio.run(sync_to_async(connections.close_all)())
+    audit._shutdown_fallback_executor()
+    gc.collect()
