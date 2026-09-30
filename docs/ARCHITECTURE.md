@@ -1514,7 +1514,12 @@ that carry formulas. The normalized logical contribution is bounded by
 `REBAC_INDEX_CONDITION_LIMIT`; exceeding it raises `SchemaError` and
 rolls the write back. Index writes use Django `bulk_create` and run inside
 the owner's `atomic(savepoint=False)`, without a savepoint per batch.
-No raw SQL, trigger, database function or undocumented ORM API is used.
+No raw SQL, trigger, database function or undocumented ORM API is used,
+with one exception, kept until a Django-native design replaces it: the
+queryset-scope plan cache (0.23.1) keeps the SQL that Django compiles for a
+plan, through `Query.get_compiler()`, and embeds it in the outer statement
+from a custom expression. Django has no public way to reuse a compiled
+subquery. The SQL is Django's own; no statement is written by hand.
 
 #### Reads
 
@@ -1538,7 +1543,16 @@ sat(s,y) = member(left(s),y) AND member(right(s),y)      for &
 ```
 
 Each site compiles once, so SQL size is bounded by the plan: at most
-`a + b·k` for `k` lookups. The queries nest, and an object is a column of one
+`a + b·k` for `k` lookups.
+
+A queryset scope tests each row's term against one uncorrelated subquery: the
+terms of the type that the actor holds the node on. The SQL of that subquery
+depends only on the program, the node and the shape of the actor (its type and
+relation, whether its id is empty, whether it is the anonymous singleton), so
+the library compiles it once per process for each of those keys, in a bounded
+cache of 128 plans. The actor's id, the clock and the manual-schema revision
+are parameters, prepared when the statement that embeds the plan compiles; the
+readiness fence runs when it executes. The queries nest, and an object is a column of one
 enclosing query; the compiler numbers the queries from the outside in and
 renders an object for the level that references it.
 

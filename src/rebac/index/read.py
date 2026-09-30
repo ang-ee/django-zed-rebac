@@ -2,13 +2,14 @@
 
 from __future__ import annotations
 
-from collections import defaultdict
+from collections import OrderedDict, defaultdict
 from collections.abc import Iterable, Iterator, Mapping
 from contextlib import contextmanager
 from contextvars import ContextVar
 from dataclasses import dataclass
 from datetime import datetime
 from itertools import count
+from threading import RLock
 from typing import TYPE_CHECKING, Any, cast
 
 from django.db import models
@@ -25,10 +26,11 @@ from django.db.models import (
     Value,
     When,
 )
-from django.db.models.lookups import Contains, Exact, GreaterThanOrEqual, LessThan
+from django.db.models.functions import Coalesce
+from django.db.models.lookups import Contains, Exact, GreaterThanOrEqual, In, LessThan
 
 from .._id import resource_id_attr
-from ..actors import anonymous_actor
+from ..actors import anonymous_actor, is_anonymous_actor
 from ..errors import SchemaError
 from ..resources import model_for_resource_type, model_resource_type, stores_rows
 from ..schema.cache import SchemaSnapshot, schema_operation
@@ -52,6 +54,13 @@ class _ReadOperation:
 
 
 _operation: ContextVar[_ReadOperation | None] = ContextVar("rebac_index_read", default=None)
+_compiling_scope: ContextVar[bool] = ContextVar("rebac_scope_compilation", default=False)
+_SCOPE_TIME = object()
+_SCOPE_REVISION = object()
+_SCOPE_ACTOR_ID = object()
+_SCOPE_CACHE_LIMIT = 128
+_scope_cache: OrderedDict[tuple[Any, ...], tuple[str, tuple[Any, ...]]] = OrderedDict()
+_scope_cache_lock = RLock()
 
 
 @contextmanager
@@ -126,6 +135,8 @@ class _ExecutionTime(Expression):
         super().__init__(output_field=models.DateTimeField())
 
     def as_sql(self, compiler: Any, connection: Any) -> tuple[str, Any]:
+        if _compiling_scope.get():
+            return "%s", [_SCOPE_TIME]
         return cast(
             tuple[str, Any],
             compiler.compile(Value(index_time.index_now(), output_field=models.DateTimeField())),
@@ -138,9 +149,19 @@ class _ManualRevision(Expression):
         self.backend = backend
 
     def as_sql(self, compiler: Any, connection: Any) -> tuple[str, Any]:
+        if _compiling_scope.get():
+            return "%s", [_SCOPE_REVISION]
         return cast(
             tuple[str, Any], compiler.compile(Value(self.backend._manual_schema_revision()))
         )
+
+
+class _ScopeActorId(Expression):
+    def __init__(self) -> None:
+        super().__init__(output_field=models.CharField())
+
+    def as_sql(self, compiler: Any, connection: Any) -> tuple[str, Any]:
+        return "%s", [_SCOPE_ACTOR_ID]
 
 
 def _ready_rows(*, using: str, program: IndexProgram, pinned: bool = False) -> QuerySet[Any]:
@@ -180,6 +201,14 @@ def _triple_q(triple: Triple, prefix: str = "") -> Q:
 
 
 def _actor_q(actor: SubjectRef, prefix: str = "") -> Q:
+    if _compiling_scope.get():
+        return Q(
+            **{
+                prefix + "type": actor.subject_type,
+                prefix + "object_id": _ScopeActorId(),
+                prefix + "relation": actor.optional_relation,
+            }
+        )
     return _triple_q((actor.subject_type, actor.subject_id, actor.optional_relation), prefix)
 
 
@@ -552,6 +581,97 @@ def named(node: Key, x: int, *, program: IndexProgram, using: str, now: Expressi
     )
 
 
+class _ScopeIds(Expression):
+    """A non-correlated, actor-specific read plan compiled once per program.
+
+    The one exception to the library's ORM-only rule (ARCHITECTURE.md): the SQL
+    Django compiles for the plan is kept and embedded as text, because Django
+    has no public way to reuse a compiled subquery. To be replaced by a
+    Django-native design.
+    """
+
+    def __init__(
+        self,
+        *,
+        backend: LocalBackend,
+        program: IndexProgram,
+        key: Key,
+        actor: SubjectRef,
+        using: str,
+    ) -> None:
+        super().__init__(output_field=models.CharField())
+        self.backend = backend
+        self.program = program
+        self.key = key
+        self.actor = actor
+        self.using = using
+
+    def as_sql(self, compiler: Any, connection: Any) -> tuple[str, Any]:
+        cache_key = (
+            self.program.revision,
+            self.program.digest,
+            self.key,
+            self.actor.subject_type,
+            self.actor.optional_relation,
+            bool(self.actor.subject_id),
+            is_anonymous_actor(self.actor),
+            self.using,
+            connection.vendor,
+            self.backend._schema_is_manual,
+        )
+        with _scope_cache_lock:
+            cached = _scope_cache.get(cache_key)
+            if cached is None:
+                from ..models.index import IndexTerm
+
+                terms = IndexTerm.objects.using(self.using).order_by()
+                candidates = Q(relation="") & ~Q(object_id="*")
+                if self.key in self.program.type_level_nodes:
+                    candidates |= Q(relation="$type", object_id="*")
+                with using_backend(self.backend):
+                    token = _compiling_scope.set(True)
+                    try:
+                        query = (
+                            terms.filter(
+                                candidates,
+                                Exists(_ready_rows(using=self.using, program=self.program)),
+                                member(
+                                    self.key,
+                                    "pk",
+                                    self.actor,
+                                    True,
+                                    program=self.program,
+                                    using=self.using,
+                                    now=_ExecutionTime(),
+                                ),
+                                type=self.key[0],
+                            )
+                            .values("object_id")
+                            .query
+                        )
+                        sql, params = query.get_compiler(
+                            using=self.using, connection=connection
+                        ).as_sql()
+                    finally:
+                        _compiling_scope.reset(token)
+                cached = sql, tuple(params)
+                _scope_cache[cache_key] = cached
+                if len(_scope_cache) > _SCOPE_CACHE_LIMIT:
+                    _scope_cache.popitem(last=False)
+            else:
+                _scope_cache.move_to_end(cache_key)
+        sql, params = cached
+        # Each placeholder is prepared the way Django prepares the value it
+        # stands for, so a vendor stores and compares it in its own format.
+        values = {
+            id(_SCOPE_TIME): Value(index_time.index_now(), output_field=models.DateTimeField()),
+            id(_SCOPE_REVISION): Value(self.backend._manual_schema_revision()),
+            id(_SCOPE_ACTOR_ID): Value(self.actor.subject_id, output_field=models.CharField()),
+        }
+        prepared = {name: compiler.compile(value)[1][0] for name, value in values.items()}
+        return f"({sql})", [prepared.get(id(param), param) for param in params]
+
+
 @schema_operation
 def scope_q(model: type[models.Model], *, action: str, actor: SubjectRef, using: str) -> Q:
     active = _backend()
@@ -566,28 +686,22 @@ def scope_q(model: type[models.Model], *, action: str, actor: SubjectRef, using:
         from ..models.index import IndexTerm
 
         key = resource_type, action
+        if key not in program.nodes:
+            return Q(pk__in=[])
         terms = IndexTerm.objects.using(using)
-
-        def identity(row: OuterRef) -> Q:
-            """The term of a model row; ``row`` refers to it from the query that asks."""
-            return Q(
-                type=resource_type, relation="", object_id=codec.to_wire(cast(Expression, row))
-            )
-
-        tested = identity(OuterRef(attr))
-        if key in program.type_level_nodes:
-            # A row without a term of its own is read at the type-level scope.
-            interned = terms.filter(identity(OuterRef(OuterRef(attr))))
-            tested |= Q(type=resource_type, object_id="*", relation="$type") & ~Q(Exists(interned))
+        wire = codec.to_wire(cast(Expression, OuterRef(attr)))
+        concrete = (
+            terms.filter(type=resource_type, relation="", object_id=wire)
+            .order_by()
+            .values("object_id")[:1]
+        )
+        # A missing concrete term is tested at the type-level scope. A
+        # concrete term that exists but grants nothing must not fall back.
+        tested = Coalesce(Subquery(concrete), Value("*"), output_field=models.CharField())
         return Q(
-            Exists(
-                terms.filter(
-                    tested,
-                    Exists(_ready_rows(using=using, program=program)),
-                    member(
-                        key, "pk", actor, True, program=program, using=using, now=_ExecutionTime()
-                    ),
-                )
+            In(
+                tested,
+                _ScopeIds(backend=active, program=program, key=key, actor=actor, using=using),
             )
         )
 

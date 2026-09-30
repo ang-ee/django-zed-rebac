@@ -235,7 +235,7 @@ def test_encoded_owner_corpus_is_not_enumerated_for_sparse_tuple_grants(active, 
     assert large_cost[0] <= 16
     # The plan has five lookups (the item's site, and the folder's site behind
     # the arrow); each compiles once. The count changes only with the compiler.
-    assert large_cost[1] == 150
+    assert large_cost[1] == 153
 
 
 def test_encoded_exclusion_with_caveated_group_membership_falls_back_wholly(

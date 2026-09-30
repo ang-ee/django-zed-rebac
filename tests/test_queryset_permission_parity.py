@@ -457,7 +457,7 @@ def test_field_owner_sql_cost_is_independent_of_visible_row_count(active):
     assert large_cost[0] == 2  # One aggregate and one bounded page.
     # A fixed plan of three lookups, independent of the 2,001 visible IDs. The
     # count changes only with the compiler.
-    assert large_cost[1] == 106
+    assert large_cost[1] == 109
 
 
 def test_stored_arrow_resolves_virtual_targets_without_row_multiplication(active):

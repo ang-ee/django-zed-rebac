@@ -5,6 +5,7 @@ source-to-index contract against the frozen walker and reference model.
 """
 
 from datetime import timedelta
+from unittest.mock import patch
 
 import pytest
 from django.db import connection
@@ -733,6 +734,49 @@ def test_manual_schema_change_refuses_every_read_until_rebuilt(active):
     assert not check(actor).allowed
 
 
+def test_scope_plan_reuses_only_the_same_actor_and_program(active):
+    from tests.backend_setup import rebuild_backend
+
+    read._scope_cache.clear()
+    Post._base_manager.bulk_create([Post(pk=1, title="one")])
+    alice = SubjectRef.of("auth/user", "alice")
+    bob = SubjectRef.of("auth/user", "bob")
+    cover(term("auth/user", "alice"))
+
+    def scoped(actor):
+        queryset = Post._base_manager.filter(
+            read.scope_q(Post, action="read", actor=actor, using="default")
+        )
+        queryset.query.sql_with_params()
+        return queryset
+
+    with patch.object(read, "member", wraps=read.member) as build:
+        old = scoped(alice)
+        _, alice_params = old.query.sql_with_params()
+        assert list(old.values_list("pk", flat=True)) == [1]
+        assert list(scoped(alice).values_list("pk", flat=True)) == [1]
+        assert build.call_count == 1
+
+        bob_scope = scoped(bob)
+        _, bob_params = bob_scope.query.sql_with_params()
+        assert "alice" in alice_params and "alice" not in bob_params
+        assert "bob" in bob_params
+        assert list(bob_scope) == []
+        assert build.call_count == 1
+
+        assert list(scoped(SubjectRef.of("auth/group", "staff", "member"))) == []
+        assert build.call_count == 2
+
+        active.set_schema(
+            parse_zed(SCHEMA.replace("permission read = walk - blocked", "permission read = nil"))
+        )
+        # The already-compiled scope refreshes its readiness witness at use.
+        assert list(old) == []
+        rebuild_backend(active)
+        assert list(scoped(alice)) == []
+        assert build.call_count == 3
+
+
 def test_empty_id_check_uses_sql_existence_not_python_resource_expansion(active, monkeypatch):
     actor = SubjectRef.of("auth/user", "alice")
     Post._base_manager.bulk_create([Post(pk=i, title=str(i)) for i in range(1, 1201)])
@@ -1073,3 +1117,19 @@ def test_context_enumeration_sql_does_not_grow_with_the_number_of_caveat_instanc
         ).allowed
         measured.append((len(sql), len(params)))
     assert measured[0] == measured[1]
+
+
+def test_scope_plan_parameters_are_prepared_for_the_vendor(active, monkeypatch):
+    from datetime import UTC, datetime
+
+    read._scope_cache.clear()
+    instant = datetime(2031, 5, 6, 7, 8, 9, 123456, tzinfo=UTC)
+    monkeypatch.setattr(index_time, "index_now", lambda: instant)
+    actor = SubjectRef.of("auth/user", "alice")
+    for _ in range(2):  # a cold plan, then the cached one
+        queryset = Post._base_manager.filter(
+            read.scope_q(Post, action="read", actor=actor, using="default")
+        )
+        _sql, params = queryset.query.sql_with_params()
+        assert connection.ops.adapt_datetimefield_value(instant) in params
+        assert instant not in params or connection.vendor == "postgresql"

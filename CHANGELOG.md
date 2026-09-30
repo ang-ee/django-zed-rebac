@@ -5,6 +5,21 @@ pre-1.0; breaking changes within a minor version are explicitly called out.
 
 ## [Unreleased]
 
+## [0.23.1] — 2026-09-30
+
+### Changed
+
+- A queryset scope compiles its permission plan once per process for each
+  program, node and shape of actor, instead of once per queryset. Building and
+  compiling a scoped queryset went from about 35 ms to about 1 ms for a
+  five-site plan on the library's benchmark; the first use of a new key still
+  compiles the plan (about 27 ms). The plan is an uncorrelated subquery; the
+  actor's id, the clock and the manual-schema revision are parameters, and the
+  readiness fence still runs when the statement executes.
+- **Exception to the ORM-only rule, until a Django-native design replaces it:**
+  the cache keeps the SQL Django compiles for the plan (`Query.get_compiler()`)
+  and embeds it from a custom expression.
+
 ### Tests
 
 - CI is three workflows. **CI** runs lint, types and the parallel SQLite suite
