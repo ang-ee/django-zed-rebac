@@ -2,7 +2,7 @@
 
 ## Problem
 
-Field-backed relations currently support one forward foreign key. Django also
+The original field-backed relation supported one forward foreign key. Django also
 stores authorization structure in set-valued relations and ordinary target
 attributes. Mirroring those facts into relationship rows creates two writers
 and drift.
@@ -58,12 +58,11 @@ expiration. Field paths must terminate at that subject model. Attribute fields
 and filters must resolve on that model. Invalid JSON, options, paths, fields,
 lookups, or value shapes fail schema validation and Django system checks.
 
-Model identities are queryable scalar Django fields, including virtual fields
-whose public value encodes an existing primary key. The identity need not own
-a database column. Django owns lookup preparation and projected-value
-conversion; REBAC never substitutes a raw primary key for a public graph ID.
-Native model-to-model SQL correlations use the underlying columns. Hops that
-require a wire-ID conversion unavailable in SQL retain evaluator fallback.
+In 0.23.0, model identities require canonical SQL wire/column codecs for
+integer/auto, char/text/slug or UUID fields. REBAC never substitutes a raw
+primary key for a public graph ID. Custom encoded field conversions that the
+SQL codec cannot reproduce are refused with `rebac.E014`. There is no
+per-candidate identity fallback.
 
 An identity attribute must return a scalar value on the model instance. Django's
 `pk` remains valid when multi-table inheritance makes its field a parent-link
@@ -72,14 +71,17 @@ as well. The relation descriptor (`parent_ptr`) returns a model object and is
 not an identity. Django's underlying target field owns scalar conversion for
 relational columns, including primary keys.
 
-All direct checks, arrows, resource and subject lookup, eager enumeration, and
-lazy local queryset scope read the same resolved backing. Reads honor the
-queryset database alias. Tuple writes and deletes targeting the live container
+All persisted checks, resource/subject lookup and queryset scopes read the
+permission index. Derivation shares the resolved backing, and supported source
+writes maintain it in the same transaction. Reads honor the queryset database
+alias; source models and index tables must be co-located (`rebac.E015`). Plain
+backing-path models require caller-owned transactions; their signal-free bulk
+writes require rebuild (`rebac.W010`). Tuple writes/deletes targeting the live container
 raise `SchemaError`; the Django relation or attribute is the only writer.
 
 ## Backend limits
 
-This proposal implements live resolution for `LocalBackend`. The directive is
+This proposal supplies source backings for `LocalBackend` index projection. The directive is
 preserved in local schema serialization and omitted from SpiceDB schema text.
 Remote SpiceDB projection remains a separate future capability, and its burden
 is larger than the forward-FK case: a filtered or set-valued path projects one

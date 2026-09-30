@@ -61,7 +61,10 @@ async def search_documents(
   support should read `ctx.request_context.meta["actor_subject"]` as a canonical
   string such as `auth/user:42` or `agents/grant:42.assistant#valid`.
 - The decorator constructs `ObjectRef(resource_type, resource_id)` where
-  `resource_id` comes from `id_arg`, `resource_id`, or `"*"` for singleton tools.
+  `resource_id` comes from `id_arg` or an explicit `resource_id`. In 0.23.0,
+  use a concrete `resource_id="singleton"` for singleton tools; resource-side
+  `"*"` tuple IDs are refused, so applications must not rely on that legacy
+  decorator default when authoring grants.
 - The permission check runs before the tool body. Deny raises
   `rebac.PermissionDenied`.
 - The decorator must support sync and async tool functions.
@@ -119,7 +122,7 @@ different asynchronous tasks.
 - Missing actor fails closed.
 - Denied permission prevents the tool body from running.
 - Allowed permission calls the tool body exactly once.
-- `id_arg` resource ids and singleton `"*"` tools both work.
+- `id_arg` resource IDs and explicitly named singleton tools both work.
 - Capability-style hidden args do not appear in the exported MCP schema when
   the selected SDK exposes a hook for schema filtering.
 - Sync and async tools are both supported.

@@ -2,6 +2,33 @@
 
 ## Product roadmap
 
+- [x] 0.23.0 permission index.
+  - Shipped surface: seven internal derived tables; fixed-shape LocalBackend
+    reads; synchronous Django write maintenance under one global lock per alias;
+    complete subject expansion; rebuild/verify commands; E013–E017 and W010;
+    reference/differential suites and PostgreSQL CI.
+  - Release gates: the full opt-in reference sweep, SQLite/PostgreSQL behavioral
+    suites, and MySQL 8 vendor contracts. See CONTRIBUTING.md for commands;
+    implementation status does not assert a gate has passed.
+  - Follow-ups: measure lock contention and write/storage amplification before
+    considering per-type locks or fan-out budgets. Monotone set operations on
+    recursive cycles remain deferred; negative cycles stay unsupported.
+
+- [ ] SpiceDB conformance suite (right after 0.23.0).
+  - Why: 0.23.0's differential oracle compares the permission index with the
+    library's own walker, which proves parity with current behaviour, not
+    correctness. SpiceDB is the contract (CLAUDE.md invariant 1).
+  - Outcome: `pytest -m spicedb` checks generated schemas and data against a
+    pinned `spicedb serve-testing` container in dev and in a CI job, comparing
+    `CheckPermission` (including caveat `missing_required_context`),
+    `LookupResources` and `LookupSubjects`. Deliberate divergences (data
+    cycles, E016 recursive set-operation refusals, expiring overrides,
+    `check_new`) are listed in ARCHITECTURE and pinned by
+    tests. The in-process oracle then shrinks to a spec-written reference
+    model. ARCHITECTURE.md § SpiceDB conformance suite has the design.
+  - Include: the test-side projector of field, attribute and constant
+    backings into tuples; it seeds the `SpiceDBBackend` projector below.
+
 - [ ] Implement `SpiceDBBackend`.
   - Why: the public backend boundary is in place, but
     `src/rebac/backends/spicedb.py` is still an explicit stub.
@@ -16,10 +43,8 @@
     fields. ARCHITECTURE.md § Field-backed structural relations lists the
     projection burden per kind.
 
-- [ ] Implement MCP tool integration.
-  - Why: schema authors can already model MCP tools as resources, but the
-    advertised `rebac_mcp_tool` decorator does not exist yet.
-  - Outcome: proposal 0004 lands as `rebac.mcp.rebac_mcp_tool` with
+- [x] Implement MCP tool integration (0.11.0).
+  - Outcome: proposal 0004 ships as `rebac.mcp.rebac_mcp_tool` with
     fail-closed actor resolution and sync/async tool support.
 
 - [ ] Decide the LocalBackend registry-storage default.

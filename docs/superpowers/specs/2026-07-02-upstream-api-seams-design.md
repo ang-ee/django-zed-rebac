@@ -2,14 +2,14 @@
 
 ## Purpose
 
-Expose four library-owned REBAC contracts as public APIs so downstream Angee code can delete private probes and local reimplementations:
+Expose four library-owned REBAC contracts as public APIs so downstream applications can delete private probes and local reimplementations:
 
-- effective actor resolution probes in `angee/base/mixins.py`
-- relationship storage shape sniffing in `angee/base/rebac.py`
-- permission AST walking in `iam/roles.py`
-- the `AngeeManager.check_create` type-level fallback branch
+- effective actor resolution probes in application mixins
+- relationship storage shape sniffing in application adapters
+- permission AST walking in role tooling
+- application managers' type-level create fallback branches
 
-Item 5 from the original request, aggregate-safe scoping and `rebac_select_related` ownership, stays out of this pass unless a test exposes a regression. `RebacQuerySet.aggregate()`, `count()`, and `exists()` are already actor-scoped in the current codebase; after the pin bump, Angee's `scoped_for_aggregate` wrapper may be thinnable too.
+Item 5 from the original request, aggregate-safe scoping and `rebac_select_related` ownership, stays out of this pass unless a test exposes a regression. `RebacQuerySet.aggregate()`, `count()`, and `exists()` are already actor-scoped; downstream aggregate wrappers can delegate to those APIs.
 
 ## Scope
 
@@ -65,7 +65,7 @@ Unified precedence:
 5. Strict-mode handling.
 
 This preserves the current queryset behavior, changes instance `check_access()`
-in the fail-closed direction, and supports Angee's elevated-block pattern where
+in the fail-closed direction, and supports an elevated-block pattern where
 code pins an actor to compute a user's view inside a broader
 `system_context()` or `sudo()` scope. If code truly wants bypass, it must use
 per-object or per-queryset `.sudo(reason=...)`.
@@ -129,7 +129,8 @@ It should use the existing resource registry (`model_resource_type()`, `model_fo
 
 ### Downstream Deletion Check
 
-This deletes `angee/base/rebac.py` and replaces filter/order plumbing in `iam/roles.py` and `integrate/models.py` with public relationship helpers.
+Application adapters and role tooling can replace storage-specific filter/order
+plumbing with public relationship helpers.
 
 ## Schema Introspection
 
@@ -195,11 +196,11 @@ def roles_reaching(
 ) -> frozenset[ObjectRef]: ...
 ```
 
-The role convention is library-owned, but the namespace is not. Callers pass `role_resource_type` such as `"angee/role"` or `"storage/role"`.
+The role convention is library-owned, but the namespace is not. Callers pass `role_resource_type` such as `"platform/role"` or `"storage/role"`.
 
 ### Downstream Deletion Check
 
-This shrinks `iam/roles.py` by deleting its direct AST walk over `PermBinOp`, `PermRef`, and `PermArrow`.
+Role tooling can delete its direct AST walk over `PermBinOp`, `PermRef`, and `PermArrow`.
 
 ## `check_new` Const Overlay
 
@@ -211,7 +212,7 @@ For:
 
 ```zed
 definition blog/post {
-    relation admin: angee/role // rebac:const=admin
+    relation admin: platform/role // rebac:const=admin
     permission create = parent->create + admin->member
 }
 ```
@@ -219,16 +220,16 @@ definition blog/post {
 the preflight overlay behaves as if the new object carried:
 
 ```text
-blog/post:<virtual>#admin @ angee/role:admin
+blog/post:<virtual>#admin @ platform/role:admin
 ```
 
-The tuple is virtual only. The subsequent reachability check remains real: `admin->member` dispatches into the active backend for `angee/role:admin#member`, including caveats and subject-set traversal.
+The tuple is virtual only. The subsequent reachability check remains real: `admin->member` dispatches into the active backend for `platform/role:admin#member`, including caveats and subject-set membership. LocalBackend 0.23.0 answers that persisted check from the index.
 
 ### Merge Rules
 
 - Caller-supplied relationships remain authoritative for ordinary relations.
 - Const-backed relations are appended when the schema declares them.
-- Caller-supplied entries for const-backed relations are rejected with `SchemaError`. Silently merging them would let a caller add `admin @ angee/role:editor` beside the schema-derived `admin @ angee/role:admin`, and the relation type union would allow the wrong role id to grant create.
+- Caller-supplied entries for const-backed relations are rejected with `SchemaError`. Silently merging them would let a caller add `admin @ platform/role:editor` beside the schema-derived `admin @ platform/role:admin`, and the relation type union would allow the wrong role id to grant create.
 
 ### Security Regression
 
@@ -247,16 +248,17 @@ Also add the const-backed positive/negative create tests:
 
 ### Downstream Deletion Check
 
-This removes the fallback branch from `AngeeManager.check_create` in the same downstream pin bump. If the fallback survives, the over-grant survives.
+Remove application managers' type-level create fallback branches in the same
+downstream upgrade. If a fallback survives, the over-grant survives.
 
 ## Documentation And PR Notes
 
-The PR description must name the Angee deletions explicitly:
+Downstream upgrade notes should identify the removed local implementations:
 
-- `angee/base/mixins.py` effective actor probe
-- `angee/base/rebac.py`
-- AST walk in `iam/roles.py`
-- `AngeeManager.check_create` fallback branch
+- effective actor probes
+- storage-specific relationship adapters
+- role-tooling AST walks
+- type-level create fallback branches
 
 `docs/ARCHITECTURE.md` should document:
 

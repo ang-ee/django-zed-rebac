@@ -2,7 +2,7 @@
 
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
-**Goal:** Publish upstream REBAC APIs that let Angee delete private actor probes, relationship storage sniffing, schema AST walking, and the create fallback over-grant.
+**Goal:** Publish upstream REBAC APIs that let downstream applications delete private actor probes, relationship storage sniffing, schema AST walking, and the create fallback over-grant.
 
 **Architecture:** Add public observer APIs while keeping enforcement fail-closed, expose relationship helpers at the active model manager/queryset boundary, centralize schema introspection in `rebac.schema.introspection`, and make `check_new()` inject schema-owned const tuples while rejecting caller-supplied tuples for synthetic relations. All behavior is covered with failing tests before production edits.
 

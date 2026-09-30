@@ -14,7 +14,7 @@
 
 The backend interface is designed around one Python API:
 
-- **`LocalBackend`** — pure Django, evaluates permissions against local relationship rows. Zero external infrastructure. Suitable up to moderate graph sizes and depth <= 8.
+- **`LocalBackend`** — pure Django, with a derived permission index. It stores monotone sets and evaluates named intersections and subtractions at read time; SQL size is bounded by a static schema plan. Supported writes maintain the index synchronously in the source transaction, including watched fields written through proxies or inherited models. One global lock per database alias serializes index-affecting writes. Context-aware enumeration matches candidates in SQL and evaluates distinct caveat formulas in Python. See [the index design and limits](./docs/ARCHITECTURE.md#permission-index--the-localbackend-read-path).
 - **`SpiceDBBackend`** — planned adapter for the official [`authzed`](https://pypi.org/project/authzed/) Python client. The class exists today as a clear stub, but `REBAC_BACKEND = "spicedb"` is not a supported runtime path yet.
 
 Add the mixin to your model and `Post.objects.all()` returns only what the user can read. Add `Model.objects.with_actor(actor)` for explicit actor scoping in Celery tasks, GraphQL resolvers, management commands, and other non-HTTP entrypoints — `actor` can be a Django `User`, a registered `Agent`, an `agents/grant` (agent-acting-on-behalf-of-user, shipped by your `agents` app), or anything `@rebac_subject`-registered. Typed shorthands `as_user(user)` and `as_agent(agent, on_behalf_of=user)` cover the common cases. The default Django actor labels are `auth/user` and `auth/group`; include their definitions in your application schema (automatic base-schema emission is planned). `agents/agent`, `agents/grant`, `auth/apikey`, and other subject types live in your own apps.
@@ -79,9 +79,15 @@ class Post(RebacMixin, models.Model):
 ```
 
 ```bash
-python manage.py migrate                  # creates Relationship + Schema* tables
-python manage.py rebac sync           # loads permissions.zed into Schema* tables
+python manage.py migrate              # creates source and permission-index tables
+python manage.py rebac sync           # loads permissions.zed and builds the index
 ```
+
+An unbuilt index reports an E013 setup warning and permission reads fail closed
+until sync/rebuild completes. Write aliases for backing models and relationships
+must match; separate read replicas are allowed. After a database flush the next
+maintenance owner recreates the lock row, but schema/fixture data still needs
+sync/rebuild before serving. See the [upgrade notes](./CHANGELOG.md#0230--2026-09-29).
 
 ```python
 # blog/views.py
@@ -104,7 +110,7 @@ That's the end-to-end flow. The same `Post.objects.with_actor(...)` pattern work
 | Problem | Existing options | What `django-zed-rebac` does |
 |---|---|---|
 | Per-object permissions in Django | `django-guardian` (per-object ACL via GenericFK; no JOIN propagation; no graph traversal) | True REBAC graph; SpiceDB-compatible; manager-level queryset scoping; cross-relation propagation. |
-| Run SpiceDB-style permissions locally without infrastructure | None — SpiceDB itself is a Go binary that needs Postgres + a sidecar | `LocalBackend`: pure-Django graph evaluation over relationship rows. Same API surface the planned `SpiceDBBackend` will use. |
+| Run SpiceDB-style permissions locally without infrastructure | None — SpiceDB itself is a Go binary that needs Postgres + a sidecar | `LocalBackend`: pure-Django permission index derived from relationships and declared backings. Same API surface the planned `SpiceDBBackend` will use. |
 | AI-agent authorization | Cedar (no graph traversal); Casbin (in-memory post-filter); Polar/Oso (deprecated 2023) | Consumer-defined grant objects and permission expressions can combine delegation and capability conditions. The engine evaluates those explicit relationships; resolving an agent or grant subject does not confer the user's permissions. |
 | Permission scoping outside HTTP | Manual `if user.has_perm(...)` everywhere | `Model.objects.with_actor(actor)` works in Celery tasks, cron, management commands, plain Python, and MCP servers. The actor is generic: Django `User`, `Agent`, `agents/grant`, `auth/apikey`, or any registered subject. |
 | Strict-by-default (no silent leaks) | `django-guardian` returns all rows when nothing scopes; easy to forget | Querysets without an actor raise `MissingActorError` rather than returning everything. Bypass requires an explicit `reason`; block-scoped `sudo()` is logged. |
@@ -143,7 +149,7 @@ verification of its ORM integration.
 
 Versioning follows SemVer while the project is below 1.0: minor releases may add public API and tighten alpha contracts; patch releases are reserved for compatible fixes.
 
-Database support: PostgreSQL 13+ (production target), MySQL 8+ (supported), SQLite (test/dev only — local graph-walk performance is not production-grade). The `Relationship` table ships with all required indexes in `0001_initial.py`.
+Database support: PostgreSQL 13+ (production target), MySQL 8+ (opt-in vendor suite), SQLite (test/dev only). CI runs SQLite and PostgreSQL; the MySQL suite is a release gate. The `Relationship` indexes ship in `0001_initial.py`, and the permission-index tables in `0007_permission_index.py`. After upgrading, run `rebac sync` or `rebac index rebuild` before serving; reads fail closed until the index is ready. See [upgrade notes](./CHANGELOG.md#0230--2026-09-29) for backing-model transactions and unsupported write paths.
 
 ## Comparison
 
@@ -175,7 +181,7 @@ Database support: PostgreSQL 13+ (production target), MySQL 8+ (supported), SQLi
 │              │                          │                        │
 │   ┌──────────▼──────────┐   ┌───────────▼───────────┐           │
 │   │  LocalBackend       │   │  SpiceDBBackend        │           │
-│   │  local graph walk + │   │  planned authzed       │           │
+│   │  permission index +│   │  planned authzed       │           │
 │   │  cel-python caveats │   │  adapter               │           │
 │   └─────────────────────┘   └────────────────────────┘           │
 └──────────────────────────────────────────────────────────────────┘
@@ -200,6 +206,7 @@ This is an **alpha** package. The architecture is settled (see [docs/ARCHITECTUR
 - **0.2** — Alpha hardening: schema-level built-in actors, action-scoped queryset reads, split `sudo()` / `system_context()`, and efficient schema cache invalidation.
 - **0.3-0.9** — shipped middleware, registry storage mode, evaluator/Zookie scopes, Strawberry adapter, field-level read gates, REBAC-safe relation loading, Strawberry-Django optimizer, field-backed structural relations, and LocalBackend hardening.
 - **0.11** — FastMCP `rebac_mcp_tool` adapter ([proposal 0004](./docs/proposals/0004-mcp-tool-integration.md)).
+- **0.23** — permission index, synchronous maintenance, rebuild/verify commands, full subject expansion, and PostgreSQL CI.
 - **Next** — `SpiceDBBackend` adapter.
 - **1.0** — Stable release with full docs and CI matrix green.
 

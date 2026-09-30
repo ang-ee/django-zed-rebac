@@ -11,7 +11,7 @@ Guidance for Claude Code working in the `django-zed-rebac` repository.
 
 `django-zed-rebac` is a **standalone, drop-in REBAC plugin for any Django 6.0
 project** (the supported matrix is pinned in `pyproject.toml`; see § Tooling). SpiceDB-compatible schema language, two interchangeable
-backends (`LocalBackend` recursive-CTE in pure Django; `SpiceDBBackend` over
+backends (`LocalBackend` permission index in pure Django; planned `SpiceDBBackend` over
 `authzed-py`), strict-by-default queryset scoping, AI-agent Grant pattern,
 MCP / Celery / DRF / GraphQL adapters.
 
@@ -207,8 +207,8 @@ Archived/inactive rows are visible to permission evaluation by default.
 Soft-delete is orthogonal to permission scope — an admin with `delete` on an
 archived resource needs to be able to un-archive it. If callers want to hide
 archived rows, they filter at the queryset level
-(`Post.objects.with_actor(u).filter(archived=False)`); the permission walk
-over `Relationship` does not exclude them.
+(`Post.objects.with_actor(u).filter(archived=False)`); permission-index
+evaluation does not exclude them.
 
 - **Don't** introduce an `active_test`-style toggle (Odoo's per-call
   footgun) that flips visibility from inside the permission layer. It's a
@@ -311,6 +311,19 @@ package, not here"**.
 
 ## Implementation guidelines
 
+### Fix-loop test discipline
+
+Long agent sessions burn most of their time re-running whole test modules.
+In a fix loop:
+
+- run only the tests you touched or that just failed, by node id or via
+  `make test-fast` (`-n auto --dist worksteal --lf --ff -x`);
+- never run a whole module that takes over 30 s inside the loop; the
+  reference sweep and scale modules are reached by node id only;
+- run `make test-index` once when the loop is green, then `make test-parallel`
+  once; re-run a full gate only after source changes it actually covers;
+- static checks (ruff, mypy, pyright) once at the end.
+
 ### Tooling
 
 Per `docs/ARCHITECTURE.md § Testing`:
@@ -322,9 +335,11 @@ Per `docs/ARCHITECTURE.md § Testing`:
 - **Type-check:** `mypy --strict` AND `pyright` — both must pass on CI. Ship
   `py.typed`.
 - **Test:** `pytest` + `pytest-django` for integration; pure-Python `pytest`
-  for unit. Cross-backend contract tests via `testcontainers-spicedb`,
-  opt-in marker.
-- **CI matrix:** Python 3.14 × Django 6.0 × SQLite, as declared in
+  for unit. SpiceDB conformance tests (`-m spicedb`, planned after 0.23.0)
+  run generated cases against a pinned `spicedb serve-testing` container in
+  dev and CI; see ARCHITECTURE.md § SpiceDB conformance suite. SpiceDB is the
+  oracle; a `LocalBackend` difference not listed there as deliberate is a bug.
+- **CI matrix:** Python 3.14 × Django 6.0, with SQLite and PostgreSQL jobs, as declared in
   `.github/workflows/ci.yml` and `pyproject.toml`. Broader matrices are a
   release decision, not the current contract. `ruff` targets 3.14, so
   3.14-only syntax is in play and `ruff format` emits it: an unparenthesised
@@ -349,10 +364,11 @@ class RebacConfig(AppConfig):
 
     def ready(self):
         from . import checks   # noqa: F401  — register system checks
-        from . import signals  # noqa: F401  — connect pre/post-save handlers
+        from . import signals
+        signals.connect_tracked_signals()  # explicit senders, static configuration
 ```
 
-**Two lines in `ready()`.** No queries. No model instantiation. No backend
+**Static sender registration in `ready()`.** No queries. No model instantiation. No backend
 resolution at import time. Backend singleton is constructed lazily on first
 access via `rebac.backend()`.
 
@@ -364,8 +380,12 @@ access via `rebac.backend()`.
 - Use `swapper` if `REBAC_RELATIONSHIP_MODEL` is genuinely swappable;
   otherwise mark `class Meta: managed = True` (default) and ship the
   standard migration.
-- Migrations must run on PostgreSQL 13+, MySQL 8+, SQLite (test only). The
-  recursive-CTE syntax differs slightly across these — test all three in CI.
+- Migrations must run on PostgreSQL 13+, MySQL 8+, SQLite (test only).
+  Index writes use Django ORM and streamed `bulk_create`; rows pass through
+  Python in bounded batches. No raw SQL, triggers or database functions;
+  migration `0005`'s existing legacy uninstall routine is the only raw-SQL
+  exception. CI runs SQLite and PostgreSQL; the opt-in MySQL 8 vendor suite
+  is a release gate.
 
 ### Settings
 
@@ -385,7 +405,7 @@ update; removing from it is a breaking change requiring a major bump.
 ```python
 # What's PUBLIC and semver-stable:
 from rebac import (
-    RebacMixin,
+    RebacMixin, RebacTrackedMixin,
     require_permission, rebac_resource, rebac_subject,
     Backend, LocalBackend, SpiceDBBackend, backend,
     CheckResult, Consistency, Zookie, PermissionResult,
@@ -414,6 +434,20 @@ release.
 
 ## Common pitfalls
 
+### Receiver ownership
+
+No sender-free receivers; signals only where no owner exists (collector cascades,
+third-party models, ContentType→SchemaOverride), always with explicit senders.
+Create/write gates run in save_base before consumer pre_save. Preparation needed
+by a create check belongs in save() or proposed_relationships.
+
+### Multi-valued joins and existing APIs
+
+Multi-valued joins: one `.filter(Q(...) & Q(...))` per join,
+`Exists`/`OuterRef` for correlation; never chain `.filter()`/`.exclude()`
+on the same multi-valued path. Use existing Django/stdlib/library APIs before
+writing helpers; no raw SQL, triggers or database functions.
+
 ### Don't import models in `apps.py` at module level
 `AppRegistryNotReady`. Import inside `ready()` or inside the function that
 uses them.
@@ -430,7 +464,10 @@ system checks.
 ### Don't replace `_base_manager` with the scoped manager
 Django uses `_base_manager` for FK reverse caching, M2M intermediate
 handling, etc. — these break if filtering applies. Install the scoped
-manager as `objects` (`_default_manager`); leave `_base_manager` unfiltered.
+manager as `objects` (`_default_manager`). RebacMixin and RebacTrackedMixin inject
+an owning, unscoped base manager through `base_manager_name`: it maintains writes
+but never filters reads or applies actor scope. This preserves the unfiltered
+base-manager rule and covers reverse-FK bulk add and collector SET_NULL.
 This is why bare-string `prefetch_related("rel")` doesn't auto-scope and the
 spec requires the explicit `Prefetch(queryset=...)` form.
 
@@ -497,8 +534,12 @@ When implementing or modifying the plugin:
    - `ruff format --check src/ tests/`
    - `mypy --strict src/`
    - `pyright src/`
-   - `pytest` (all tests)
-   - `pytest -m spicedb` (when Docker available)
+   - `pytest` (default suite; excludes opt-in slow/vendor cases)
+   - `make test-index-reference` (complete reference sweep)
+   - `make test-postgres` (`REBAC_TEST_POSTGRES_URL` required)
+   - `make test-schema-vendors` (Docker PostgreSQL/MySQL contracts)
+   - `pytest -m spicedb` (Docker or `REBAC_TEST_SPICEDB_ENDPOINT`; once the
+     conformance suite lands)
    - `python manage.py rebac sync --check` (in the integration test
      project)
 5. **Determinism test on every emitter touch.** See
