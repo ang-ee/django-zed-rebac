@@ -597,54 +597,6 @@ def project_edges(program: IndexProgram, *, using: str, region: int | None = Non
             stats.python_rows - before_python,
             perf_counter() - rule_started,
         )
-    # A reserved type edge supplies an ORM join from a type-level target
-    # grant to every concrete target of that type. It is never a schema edge.
-    # Every object of a defined type has one. A pass adds it for the objects
-    # of its region and for the targets its edges name, which may be new.
-    defined = (
-        IndexTerm.objects.using(using)
-        .filter(
-            type__in=[definition.resource_type for definition in program.baseline.definitions],
-            relation="",
-        )
-        .exclude(object_id="*")
-    )
-    if region is None:
-        bridged = [defined]
-    else:
-        scopes = region_terms(using, region)
-        named = (
-            IndexEdge.objects.using(using)
-            .filter(resource_id__in=scopes)
-            .exclude(relation="$type")
-            .values("target_id")
-        )
-        bridged = [defined.filter(pk__in=scopes), defined.filter(pk__in=named)]
-    type_id = _term_id(OuterRef("type"), Value("*"), Value("$type"), using)
-    for objects in bridged:
-        if region is not None:
-            # A target can be of a type the pass has not met: its type-level
-            # term may not exist yet.
-            met = objects.order_by().values_list("type", flat=True).distinct()
-            stats.python_rows += len(intern(sorted(map(type_level, met)), using=using))
-        upsert(
-            select(
-                objects,
-                resource_id=F("pk"),
-                resource_type=F("type"),
-                relation=text("$type"),
-                subject_id=type_id,
-                target_id=type_id,
-                source=text("const"),
-                expires_at=Value(index_time.TIME_MAX),
-                condition=formula_value(None),
-                condition_key=text(""),
-            ),
-            IndexEdge,
-            ("resource_id", "relation", "subject_id", "source", "condition_key"),
-            using=using,
-            stats=stats,
-        )
     # Concrete usersets referenced by another relation need a set term even
     # when their own relation is supplied entirely by an unfiltered constant.
     for resource_type, relation_name in sorted(program.userset_relations):

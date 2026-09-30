@@ -491,13 +491,9 @@ class IndexMaintenance:
                 ):
                     # Deliberately omit backing filters: transitions into and
                     # out of a filter must capture the same source identity.
+                    # The edge belongs to its source. Its target's rows do not
+                    # read incoming edges, so the target is not in the region.
                     self.capture_values(sources, type_, backing.source_id_attr, phase=phase)
-                    self.capture_values(
-                        sources,
-                        backing.target_resource_type,
-                        backing.target_values_path(),
-                        phase=phase,
-                    )
 
     def reverse_sources(
         self,
@@ -567,11 +563,7 @@ class IndexMaintenance:
             sets = work.filter(kind="set").values("term_id")
             # The sets of a changed object: intern the ones its edges name,
             # then take every set of the object.
-            edges = (
-                IndexEdge.objects.using(self.using)
-                .filter(resource_id__in=Subquery(scopes))
-                .exclude(relation="$type")
-            )
+            edges = IndexEdge.objects.using(self.using).filter(resource_id__in=Subquery(scopes))
             self.python_rows += intern_from(
                 edges.order_by()
                 .values("relation", type=F("resource__type"), object_id=F("resource__object_id"))
@@ -686,7 +678,10 @@ class IndexMaintenance:
         self.work().delete()
         from rebac.index.rebuild import _vacuum_terms
 
-        _vacuum_terms(using=self.using)
+        _vacuum_terms(
+            using=self.using,
+            defined=[d.resource_type for d in self.load_program().baseline.definitions],
+        )
         logger.info(
             "Permission index maintained",
             extra={

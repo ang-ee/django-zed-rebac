@@ -1425,7 +1425,8 @@ naive datetimes according to `USE_TZ`. Relationship expirations must lie
 strictly between them. No graph re-derivation is needed when time passes.
 
 The index gives every row of a resource model a term, so that enumeration
-lists a row that holds a permission only through a type-level grant. It reads
+lists a row that holds a permission only through a type-level grant; the
+vacuum keeps the object terms of every defined type for the same reason. It reads
 those rows only when Django manages the model's table. An unmanaged model may
 be the anchor of a type whose objects exist only in relationships, such as a
 role, and have no table at all: the objects of its type are the ones that
@@ -1487,7 +1488,7 @@ Each rule is a set-based queryset streamed through `stream_create`:
 |---|---|
 | Relation r | Each edge `(R,r,subject)` yields `(R,N,subject,"")`. |
 | Reference M | Copy M at the same scope, retaining holder and site. |
-| Arrow `via->p` | For each edge `(R,via,t)`, copy p's rows at t, taking the earlier edge/row expiry and conjunction of conditions. Follow t's object even when the edge subject has a userset suffix. Type-level target rows apply to each edge of the target type; instantiate a type-level site holder at t. |
+| Arrow `via->p` | For each edge `(R,via,t)`, copy p's rows at t, taking the earlier edge/row expiry and conjunction of conditions. Follow t's object even when the edge subject has a userset suffix. Type-level target rows apply to each edge of the target type: each type-level row, and there are few, is applied with one indexed query over the arrow's edges to targets of its type. Instantiate a type-level site holder at t. |
 | Builtin and unfiltered constant | Produce one type-level row with a reserved holder, or target rows at type level. |
 | Site s as an arm | For each scope with any left-operand row, emit `(R,N,R,s)` with the latest expiry of those rows and no condition. A type-level left row emits `(T*,N,T*,s)`. |
 
@@ -1641,12 +1642,14 @@ reads no whole source table, model table or index table, so its cost does not
 depend on the size of the index or of the schema. A full rebuild does.
 
 Each pass locks `IndexState("global")` before source reads, captures old
-identities and path targets durably in `IndexWork`, applies the source
-write, projects new edges, materializes the affected region and deletes
-and re-derives it in dependency order. Region closure follows same-resource
-dependencies, incoming arrows, membership ancestors and old/new backing
-paths. It does not follow holders: a grant that holds a set by reference
-does not change when the set's members do. A write to a relation no node
+identities durably in `IndexWork`, applies the source write, projects new
+edges, materializes the affected region and deletes and re-derives it in
+dependency order. Region closure follows same-resource dependencies,
+incoming arrows, membership ancestors and old/new backing paths. It does not
+follow holders: a grant that holds a set by reference does not change when
+the set's members do. Nor does it take in an edge's target: an edge belongs
+to its source, and no rule reads the edges that point at an object, so
+writing a row does not re-derive the other rows that share its target. A write to a relation no node
 references repairs only memberships. Schema owners rebuild
 affected definitions and dependents and publish `index_revision` only
 after success. A missing lock row after flush is repaired in the owner.

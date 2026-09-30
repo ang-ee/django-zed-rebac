@@ -258,7 +258,11 @@ def test_rebuild_scale_and_statement_budget():
         assert sum(after["rows"].values()) <= 2.3 * sum(before["rows"].values())
     base = measurements[0]
     assert base["savepoints"] <= 2 * 4
-    assert base["statements"] / sum(base["rows"].values()) <= 0.03
+    # 0.031, not 0.03: from 0.23.2 the index no longer stores a synthetic
+    # `$type` edge per object (361 rows at scale 1), and each type-level row
+    # of an arrow is applied with its own indexed query. Statements still do
+    # not grow with the data; the growth checks above hold them per doubling.
+    assert base["statements"] / sum(base["rows"].values()) <= 0.031
     assert not any(re.search(r"\bOR\b[^()]*\bIN \(SELECT", sql) for sql in base["sql"])
 
 

@@ -1512,3 +1512,39 @@ def test_writes_proceed_while_the_library_tables_are_not_migrated(django_user_mo
         with connection.schema_editor() as editor:
             editor.create_model(SchemaGeneration)
     assert not SchemaGeneration.objects.exists()
+
+
+def test_a_write_does_not_rederive_resources_that_share_its_target(indexed):
+    """An edge belongs to its source: objects pointing at the same target are untouched."""
+    import logging
+
+    class Passes(logging.Handler):
+        def __init__(self):
+            super().__init__()
+            self.rows = []
+
+        def emit(self, record):
+            if record.getMessage() == "Permission index maintained":
+                self.rows.append((record.deleted, record.inserted, sorted(record.types)))
+
+    passes = Passes()
+    logger = logging.getLogger("rebac.index")
+    level = logger.level
+    logger.addHandler(passes)
+    logger.setLevel(logging.INFO)
+    try:
+        cost = {}
+        for siblings in (2, 30):
+            folder = Folder.objects.create(name=f"shared-{siblings}")
+            for number in range(siblings):
+                Post.objects.create(title=f"sibling-{number}", folder=folder)
+            passes.rows.clear()
+            post = Post.objects.create(title="one more", folder=folder)
+            cost[siblings] = passes.rows
+        assert cost[30], "the write ran no maintenance pass"
+        assert cost[2] == cost[30]
+        assert all(types == ["blog/post"] for _deleted, _inserted, types in cost[30])
+    finally:
+        logger.removeHandler(passes)
+        logger.setLevel(level)
+    check_rows(post)

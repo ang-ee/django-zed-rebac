@@ -4,14 +4,14 @@ from __future__ import annotations
 
 import heapq
 import logging
-from collections.abc import Iterator, Sequence
+from collections.abc import Iterable, Iterator, Sequence
 from contextlib import contextmanager
 from tempfile import TemporaryFile
 from time import monotonic
 from typing import TYPE_CHECKING, TextIO, cast
 
 from django.db import transaction
-from django.db.models import Subquery
+from django.db.models import Q, Subquery
 
 from rebac.index.maintain import IndexMaintenance, dependent_types
 from rebac.schema.serialization import canonical_json
@@ -114,8 +114,13 @@ def _rebuild_locked(maintenance: IndexMaintenance, *, types: Sequence[str] | Non
     return stats
 
 
-def _vacuum_terms(*, using: str) -> None:
-    """Vacuum after clearing this pass's work, while its global lock is held."""
+def _vacuum_terms(*, using: str, defined: Iterable[str] = ()) -> None:
+    """Vacuum after clearing this pass's work, while its global lock is held.
+
+    The term of an object of a ``defined`` type stays: enumeration lists an
+    object that holds a permission only through a type-level grant, with no
+    row of its own.
+    """
     from rebac.models.index import (
         IndexCover,
         IndexEdge,
@@ -138,7 +143,10 @@ def _vacuum_terms(*, using: str) -> None:
         .order_by()
         .values_list("term_id", flat=True)
     )
-    IndexTerm.objects.using(using).exclude(pk__in=references[0].union(*references[1:])).delete()
+    objects = Q(type__in=sorted(defined), relation="") & ~Q(object_id="*")
+    IndexTerm.objects.using(using).exclude(objects).exclude(
+        pk__in=references[0].union(*references[1:])
+    ).delete()
 
 
 def _seed_sources(maintenance: IndexMaintenance, selected: set[str]) -> None:

@@ -8,7 +8,7 @@ from contextlib import contextmanager, nullcontext
 from time import perf_counter
 from typing import Any
 
-from django.db.models import F, FilteredRelation, Max, OuterRef, Q, QuerySet, Value
+from django.db.models import DateTimeField, F, FilteredRelation, Max, OuterRef, Q, QuerySet, Value
 from django.db.models.functions import Least
 
 from rebac.models.index import IndexCover, IndexEdge, IndexMember, IndexTerm, IndexWork
@@ -394,22 +394,13 @@ def _arrow_lanes(
     stats: Stats,
     pass_id: int,
     round_: int,
-    type_level_target: bool,
     target_conditional: bool,
     edge_conditional: bool,
 ) -> int:
-    holder: Any = F("_type__resource_id") if type_level_target else F("holder_id")
-    if type_level_target:
-        from django.db.models import Case, When
-
-        holder = Case(
-            When(site__gt="", holder_id=F("scope_id"), then=F("_type__resource_id")),
-            default=F("holder_id"),
-        )
     columns = dict(
         **_columns(node, pass_id, round_),
         scope_id=F("_edge__resource_id"),
-        holder_id=holder,
+        holder_id=F("holder_id"),
         site=F("site"),
         expires_at=Least("expires_at", "_edge__expires_at"),
     )
@@ -519,46 +510,115 @@ def _arrow(
         stats=stats,
         pass_id=pass_id,
         round_=round_,
-        type_level_target=False,
         target_conditional=target_conditional,
         edge_conditional=edge_conditional,
     )
-    universal = (
-        IndexCover.objects.using(using)
-        .filter(node=expr.target, scope__relation="$type")
-        .alias(
-            _type=FilteredRelation(
-                "scope__edges_in",
-                condition=Q(scope__edges_in__relation="$type"),
-            ),
-            _edge=FilteredRelation(
-                "_type__resource__edges_in",
-                condition=Q(
-                    _type__resource__edges_in__resource_type=node.type,
-                    _type__resource__edges_in__relation=expr.via,
-                ),
-            ),
-        )
-    )
-    if round_:
-        universal = universal.filter(
-            resource_type__in=[t for t, n in recursive if n == expr.target],
-            pass_id=pass_id,
-            round=round_ - 1,
-        )
-    if any(key[1] == expr.target for key in program.type_level_nodes):
-        changed += _arrow_lanes(
-            universal,
+    # Only the types the arrow's relation allows as subjects can be its targets.
+    subject_types = sorted(type_ for type_, name in node.deps if name == expr.target)
+    if any((type_, expr.target) in program.type_level_nodes for type_ in subject_types):
+        changed += _type_level_arrow(
+            expr,
             node,
+            subject_types=subject_types,
+            edge_conditional=edge_conditional,
             using=using,
             region=region,
             stats=stats,
             pass_id=pass_id,
             round_=round_,
-            type_level_target=True,
-            target_conditional=target_conditional,
-            edge_conditional=edge_conditional,
+            recursive=recursive,
         )
+    return changed
+
+
+def _type_level_arrow(
+    expr: PermArrow,
+    node: NodeSpec,
+    *,
+    subject_types: list[str],
+    edge_conditional: bool,
+    using: str,
+    region: int | None,
+    stats: Stats,
+    pass_id: int,
+    round_: int,
+    recursive: frozenset[Key],
+) -> int:
+    """A type-level row of the target applies at every edge whose target has its type.
+
+    Type-level rows are few, one per distinct holder, so each is applied with
+    one indexed query over the arrow's edges. A site held at the type-level
+    scope is instantiated at the edge's target.
+    """
+    rows = IndexCover.objects.using(using).filter(
+        node=expr.target, resource_type__in=subject_types, scope__relation="$type"
+    )
+    if round_:
+        rows = rows.filter(
+            resource_type__in=[t for t, n in recursive if n == expr.target],
+            pass_id=pass_id,
+            round=round_ - 1,
+        )
+    edges = (
+        IndexEdge.objects.using(using)
+        .filter(resource_type=node.type, relation=expr.via)
+        .exclude(target__object_id="*")
+    )
+    if region is not None:
+        from .project import region_terms
+
+        edges = edges.filter(resource_id__in=region_terms(using, region))
+    changed = 0
+    for row in (
+        rows.order_by()
+        .values("resource_type", "scope_id", "holder_id", "site", "expires_at", "condition")
+        .iterator(chunk_size=BATCH_SIZE)
+    ):
+        stats.python_rows += 1
+        at_target = row["site"] and row["holder_id"] == row["scope_id"]
+        columns = dict(
+            **_columns(node, pass_id, round_),
+            scope_id=F("resource_id"),
+            holder_id=F("target_id") if at_target else Value(row["holder_id"]),
+            site=text(row["site"]),
+            expires_at=Least(Value(row["expires_at"], output_field=DateTimeField()), "expires_at"),
+        )
+        targets = edges.filter(target__type=row["resource_type"])
+        formula = row["condition"]
+        changed += _covers(
+            select(
+                targets.filter(condition_key=""),
+                **columns,
+                condition=formula_value(formula),
+                condition_key=text(conditions.key(formula)),
+            ),
+            using=using,
+            region=region,
+            stats=stats,
+            pass_id=pass_id,
+            round_=round_,
+        )
+        if not edge_conditional:
+            continue
+        pairs = targets.exclude(condition_key="").order_by().values("condition").distinct()
+        for pair in pairs.iterator(chunk_size=BATCH_SIZE):
+            stats.python_rows += 1
+            combined = conditions.and_(formula, pair["condition"])
+            if combined is False:
+                continue
+            changed += _covers(
+                select(
+                    targets.filter(formula_filter(pair)),
+                    **columns,
+                    condition=formula_value(combined),
+                    condition_key=text(conditions.key(combined)),
+                ),
+                using=using,
+                region=region,
+                stats=stats,
+                pass_id=pass_id,
+                round_=round_,
+            )
     return changed
 
 
