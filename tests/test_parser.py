@@ -241,6 +241,191 @@ def test_permission_expression_precedence():
     assert expr.right.name == "c"
 
 
+def _expr(text: str) -> object:
+    schema = parse_zed(
+        f"""
+        definition x/y {{
+            relation a: auth/user
+            relation b: auth/user
+            relation c: auth/user
+            permission p = {text}
+        }}
+        """
+    )
+    perm = schema.get_permission("x/y", "p")
+    assert perm is not None
+    return perm.expression
+
+
+def test_exclusion_is_left_associative():
+    # a - b - c  ==  (a - b) - c
+    assert _expr("a - b - c") == PermBinOp(
+        "-", PermBinOp("-", PermRef("a"), PermRef("b")), PermRef("c")
+    )
+
+
+def test_intersection_binds_tighter_than_exclusion_on_the_right():
+    # a - b & c  ==  a - (b & c)
+    assert _expr("a - b & c") == PermBinOp(
+        "-", PermRef("a"), PermBinOp("&", PermRef("b"), PermRef("c"))
+    )
+
+
+def test_intersection_binds_tighter_than_exclusion_on_the_left():
+    # a & b - c  ==  (a & b) - c
+    assert _expr("a & b - c") == PermBinOp(
+        "-", PermBinOp("&", PermRef("a"), PermRef("b")), PermRef("c")
+    )
+
+
+def test_union_binds_tighter_than_exclusion():
+    # a - b + c  ==  a - (b + c)
+    assert _expr("a - b + c") == PermBinOp(
+        "-", PermRef("a"), PermBinOp("+", PermRef("b"), PermRef("c"))
+    )
+
+
+def test_block_comments_are_ignored_and_keep_line_numbers():
+    schema = parse_zed(
+        """
+        /* A block comment
+           spanning lines, with // and { } inside. */
+        definition x/y {
+            relation a: auth/user /* trailing */
+            permission p = a /* inline */ + a
+        }
+        """
+    )
+    assert _relations(schema, "x/y")[0].name == "a"
+    assert schema.get_permission("x/y", "p") is not None
+
+    with pytest.raises(ParseError, match=r"line 5"):
+        parse_zed(
+            """/* one
+two
+three */
+definition x/y {
+    bogus
+}
+"""
+        )
+
+
+@pytest.mark.parametrize(
+    ("text", "message"),
+    [
+        ('definition x/y {}\n"never closed', "Unterminated string"),
+        ("definition x/y {}\n/* never closed", "Unterminated block comment"),
+        ("caveat c(x int) {\n    x > 0\n", "Unterminated caveat body"),
+        ('caveat c(x string) {\n    x == "}"\n', "Unterminated caveat body"),
+    ],
+)
+def test_unterminated_lexemes_raise(text: str, message: str):
+    with pytest.raises(ParseError, match=message):
+        parse_zed(text)
+
+
+def test_caveat_body_requires_an_opening_brace():
+    with pytest.raises(ParseError, match=r"Expected '\{' to open caveat body"):
+        parse_zed("caveat c(x int) x > 0\n")
+
+
+def test_caveat_body_keeps_braces_inside_strings():
+    schema = parse_zed('caveat c(x string) {\n    x == "}"\n}\n')
+    caveat = schema.get_caveat("c")
+    assert caveat is not None
+    assert caveat.expression == 'x == "}"'
+
+
+@pytest.mark.xfail(
+    strict=True,
+    raises=ParseError,
+    reason=(
+        "_tokenize (src/rebac/schema/parser.py:62,146) sweeps caveat CEL bodies with a "
+        "punctuation set lacking '/', '%' and \"'\", so valid CEL using them fails to parse."
+    ),
+)
+@pytest.mark.parametrize("body", ["10 / x > 1", "x % 2 == 0", "string(x) == 'a'"])
+def test_caveat_body_accepts_cel_operators(body: str):
+    schema = parse_zed(f"caveat c(x int) {{\n    {body}\n}}\n")
+    caveat = schema.get_caveat("c")
+    assert caveat is not None
+    assert caveat.expression == body
+
+
+def test_caveat_generic_parameter_types():
+    from rebac.schema import render_zed
+
+    schema = parse_zed(
+        """
+        caveat c(names list<string>, limits map<int>, now timestamp) {
+            now > timestamp("2000-01-01T00:00:00Z") && "a" in names
+        }
+        """
+    )
+    caveat = schema.get_caveat("c")
+    assert caveat is not None
+    assert [(p.name, p.type.replace(" ", "")) for p in caveat.params] == [
+        ("names", "list<string>"),
+        ("limits", "map<int>"),
+        ("now", "timestamp"),
+    ]
+    reparsed = parse_zed(render_zed(schema)).get_caveat("c")
+    assert reparsed == caveat
+
+
+def test_validate_schema_rejects_relation_permission_name_collision():
+    schema = parse_zed(
+        """
+        definition x/y {
+            relation a: auth/user
+            permission a = a
+        }
+        """
+    )
+    assert any("name collision" in error for error in validate_schema(schema))
+
+
+@pytest.mark.xfail(
+    strict=True,
+    reason=(
+        "validate_schema (src/rebac/schema/parser.py:564-626) collects names into sets, so "
+        "a relation declared twice in one definition is accepted; SpiceDB rejects it."
+    ),
+)
+def test_validate_schema_rejects_duplicate_relation():
+    schema = parse_zed(
+        """
+        definition x/y {
+            relation a: auth/user
+            relation a: auth/group
+        }
+        """
+    )
+    assert any("x/y" in error for error in validate_schema(schema))
+
+
+@pytest.mark.xfail(
+    strict=True,
+    reason=(
+        "validate_schema (src/rebac/schema/parser.py:564-626) collects names into sets, so "
+        "a permission declared twice in one definition is accepted; SpiceDB rejects it."
+    ),
+)
+def test_validate_schema_rejects_duplicate_permission():
+    schema = parse_zed(
+        """
+        definition x/y {
+            relation a: auth/user
+            relation b: auth/user
+            permission p = a
+            permission p = b
+        }
+        """
+    )
+    assert any("x/y" in error for error in validate_schema(schema))
+
+
 def test_permission_with_arrow():
     schema = parse_zed(
         """

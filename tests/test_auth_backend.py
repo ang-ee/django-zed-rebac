@@ -260,3 +260,88 @@ def test_authenticate_returns_none():
 
 def test_get_user_returns_none():
     assert RebacBackend().get_user(1) is None
+
+
+# ---------- Permission codename enumeration ----------
+
+
+def test_rebac_grants_do_not_enumerate_as_codenames(user, post):
+    """REBAC grants are per-row; the codename listings stay ModelBackend's."""
+    from django.contrib.auth.backends import ModelBackend
+    from django.contrib.auth.models import Group, Permission
+
+    view_user = Permission.objects.get(codename="view_user")
+    change_group = Permission.objects.get(codename="change_group")
+    group = atomic_source_write(Group.objects.create, name="editors")
+    atomic_source_write(group.permissions.add, change_group)
+    atomic_source_write(user.groups.add, group)
+    atomic_source_write(user.user_permissions.add, view_user)
+    user = get_user_model().objects.get(pk=user.pk)  # drop cached permission sets
+
+    assert user.has_perm("testapp.change_post", post) is True
+    assert user.get_user_permissions() == {"auth.view_user"}
+    assert user.get_group_permissions() == {"auth.change_group"}
+    assert user.get_all_permissions() == ModelBackend().get_all_permissions(user)
+    assert user.get_all_permissions(post) == set()
+
+
+# ---------- Async permission checks ----------
+
+
+def _run(coroutine_function, *args):
+    from asgiref.sync import async_to_sync
+
+    return async_to_sync(coroutine_function)(*args)
+
+
+@pytest.mark.xfail(
+    strict=True,
+    reason=(
+        "RebacBackend (src/rebac/backends/auth.py:48) defines no ahas_perm/ahas_module_perms, "
+        "so Django's async permission walk skips it and async checks never reach REBAC."
+    ),
+)
+@override_settings(AUTHENTICATION_BACKENDS=["rebac.backends.auth.RebacBackend"])
+@pytest.mark.parametrize(
+    ("method", "args"),
+    [
+        ("has_perm", ("testapp.change_post", "post")),
+        ("has_perm", ("testapp.view_post",)),
+        ("has_perms", (["testapp.view_post", "testapp.change_post"], "post")),
+        ("has_module_perms", ("testapp",)),
+    ],
+)
+def test_async_checks_route_through_rebac_backend(user, post, method, args):
+    args = tuple(post if arg == "post" else arg for arg in args)
+    assert getattr(user, method)(*args) is True
+    assert _run(getattr(user, f"a{method}"), *args) is True
+
+
+@override_settings(AUTHENTICATION_BACKENDS=["rebac.backends.auth.RebacBackend"])
+def test_async_checks_deny_unrelated_users(other_user, post):
+    assert _run(other_user.ahas_perm, "testapp.change_post", post) is False
+    assert _run(other_user.ahas_module_perms, "testapp") is False
+
+
+# ---------- Unresolvable actors and engine errors ----------
+
+
+class _UnresolvableActor:
+    is_active = True
+    is_superuser = False
+
+
+def test_unresolvable_actor_is_denied(post):
+    backend_ = RebacBackend()
+    assert backend_.has_perm(_UnresolvableActor(), "testapp.change_post", obj=post) is False
+    assert backend_.has_module_perms(_UnresolvableActor(), "testapp") is False
+
+
+def test_depth_exceeded_is_a_deny(user, post, monkeypatch):
+    from rebac.errors import PermissionDepthExceeded
+
+    def exceeded(**kwargs):
+        raise PermissionDepthExceeded("cycle")
+
+    monkeypatch.setattr(backend(), "has_access", exceeded)
+    assert RebacBackend().has_perm(user, "testapp.change_post", obj=post) is False
