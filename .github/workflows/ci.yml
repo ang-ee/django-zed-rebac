@@ -14,7 +14,8 @@ concurrency:
 
 jobs:
   test:
-    name: Lint, types and SQLite suite
+    # Branch protection requires this check name.
+    name: test (3.14, 6.0)
     runs-on: ubuntu-latest
     timeout-minutes: 30
     steps:
