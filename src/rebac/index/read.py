@@ -585,9 +585,9 @@ class _ScopeIds(Expression):
     """A non-correlated, actor-specific read plan compiled once per program.
 
     The one exception to the library's ORM-only rule (ARCHITECTURE.md): the SQL
-    Django compiles for the plan is kept and embedded as text, because Django
-    has no public way to reuse a compiled subquery. To be replaced by a
-    Django-native design.
+    Django compiles for the plan is kept and embedded as text. Embedding the
+    plan as a queryset makes Django re-resolve its whole expression tree on
+    every statement, about 18 ms for an eleven-lookup plan against about 1 ms.
     """
 
     def __init__(

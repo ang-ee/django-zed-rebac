@@ -1515,11 +1515,19 @@ that carry formulas. The normalized logical contribution is bounded by
 rolls the write back. Index writes use Django `bulk_create` and run inside
 the owner's `atomic(savepoint=False)`, without a savepoint per batch.
 No raw SQL, trigger, database function or undocumented ORM API is used,
-with one exception, kept until a Django-native design replaces it: the
-queryset-scope plan cache (0.23.1) keeps the SQL that Django compiles for a
-plan, through `Query.get_compiler()`, and embeds it in the outer statement
-from a custom expression. Django has no public way to reuse a compiled
-subquery. The SQL is Django's own; no statement is written by hand.
+with one deliberate exception: the queryset-scope plan cache (0.23.1) keeps the
+SQL that Django compiles for a plan, through `Query.get_compiler()`, and embeds
+it in the outer statement from a custom expression. The SQL is Django's own; no
+statement is written by hand.
+
+The exception stays because no public-API design comes close. Embedding a
+queryset makes Django clone and re-resolve every expression node of it
+(`Query.resolve_expression`), and for a plan that is about 70% of compile time.
+Measured on an eleven-lookup plan: reusing the built plan and compiling it
+each time takes 18.5 ms; a compact actor set stored in the index, 17.4 ms;
+matching the actor with a join instead of subqueries, 18.8 ms. Even a
+placeholder actor set, which is incorrect, only reaches 10.9 ms. The cached
+SQL takes about 1 ms.
 
 #### Reads
 

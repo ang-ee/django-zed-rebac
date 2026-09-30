@@ -5,6 +5,13 @@ pre-1.0; breaking changes within a minor version are explicitly called out.
 
 ## [Unreleased]
 
+### Documentation
+
+- The scope-plan cache's exception to the ORM-only rule is permanent, with the
+  measurements in ARCHITECTURE.md: every public-API alternative costs 17–19 ms
+  per scope for an eleven-lookup plan against about 1 ms, because Django
+  re-resolves an embedded queryset's whole expression tree on every statement.
+
 ## [0.23.1] — 2026-09-30
 
 ### Changed
