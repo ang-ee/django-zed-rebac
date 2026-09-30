@@ -50,6 +50,22 @@ def _schema_for_checks() -> Schema | None:
 @checks.register("rebac")
 def check_backend_setting(app_configs: Any = None, **kwargs: Any) -> list[checks.CheckMessage]:
     issues: list[checks.CheckMessage] = []
+    condition_limit = app_settings.REBAC_INDEX_CONDITION_LIMIT
+    if type(condition_limit) is not int or condition_limit < 1:
+        issues.append(
+            checks.Error(
+                f"REBAC_INDEX_CONDITION_LIMIT={condition_limit!r} (expected a positive integer)",
+                id="rebac.E017",
+            )
+        )
+    lookup_limit = app_settings.REBAC_INDEX_LOOKUP_LIMIT
+    if type(lookup_limit) is not int or lookup_limit < 1:
+        issues.append(
+            checks.Error(
+                f"REBAC_INDEX_LOOKUP_LIMIT={lookup_limit!r} (expected a positive integer)",
+                id="rebac.E019",
+            )
+        )
     backend = app_settings.REBAC_BACKEND
     if backend not in ("local", "spicedb"):
         issues.append(
@@ -101,6 +117,157 @@ def check_backend_setting(app_configs: Any = None, **kwargs: Any) -> list[checks
                 )
             )
     return issues
+
+
+def _index_schema_for_checks(using: str) -> Schema | None:
+    """Alias-specific loading, deferring checks until the schema is readable."""
+    from django.db import connections
+    from django.db.migrations.executor import MigrationExecutor
+
+    from .backends import backend
+    from .backends.local import LocalBackend
+
+    active = backend()
+    if not isinstance(active, LocalBackend):
+        return None
+    try:
+        try:
+            if active._schema_is_manual:
+                return active.schema()
+            schema, _deadline = active._load_schema_from_db(using)
+            return schema
+        except SchemaError:
+            executor = MigrationExecutor(connections[using])
+            targets = executor.loader.graph.leaf_nodes("rebac")
+            if not executor.migration_plan(targets):
+                raise
+            logging.getLogger("rebac.checks").debug(
+                "Index schema checks deferred on %s until REBAC migrations are applied", using
+            )
+    except (DatabaseError, RuntimeError) as exc:
+        logging.getLogger("rebac.checks").debug(
+            "Index schema checks skipped on %s: schema unavailable (%s)", using, exc
+        )
+    return None
+
+
+@checks.register("rebac", checks.Tags.database)
+def check_index_ready(app_configs: Any = None, **kwargs: Any) -> list[checks.CheckMessage]:
+    """E013: never access the database unless Django explicitly requests it."""
+    if app_settings.REBAC_BACKEND != "local" or not kwargs.get("databases"):
+        return []
+    from django.db import router
+
+    from .models import active_relationship_model
+    from .models.generation import SchemaGeneration
+
+    issues: list[checks.CheckMessage] = []
+    for using in sorted(set(kwargs["databases"])):
+        if not router.allow_migrate_model(using, active_relationship_model()):
+            continue
+        try:
+            row = SchemaGeneration.objects.witness(using)
+        except (DatabaseError, RuntimeError) as exc:
+            logging.getLogger("rebac.checks").debug(
+                "Index readiness check deferred on %s: %s", using, exc
+            )
+            continue
+        if row is None or not row.revision or row.revision != row.index_revision:
+            issues.append(
+                checks.Warning(
+                    f"Permission index on database {using!r} is not built for the current schema revision.",
+                    hint=f"Run `python manage.py rebac sync` or `python manage.py rebac index rebuild --database {using}`.",
+                    id="rebac.E013",
+                )
+            )
+    return issues
+
+
+@checks.register("rebac", checks.Tags.database)
+def check_index_schema(app_configs: Any = None, **kwargs: Any) -> list[checks.CheckMessage]:
+    """E014-E018; all schema I/O is opt-in via database checks."""
+    if app_settings.REBAC_BACKEND != "local" or not kwargs.get("databases"):
+        return []
+    from django.apps import apps
+    from django.db import router
+
+    from ._id import resource_id_attr
+    from .index.codec import identity_codec
+    from .index.program import codec_fields, program_errors, watched_for
+    from .models import active_relationship_model
+    from .resources import model_for_resource_type
+
+    issues: list[checks.CheckMessage] = []
+    relationship_model = active_relationship_model()
+    relationship_alias = router.db_for_write(relationship_model)
+    for using in sorted(set(kwargs["databases"])):
+        if not router.allow_migrate_model(using, relationship_model):
+            continue
+        schema = _index_schema_for_checks(using)
+        if schema is None:
+            continue
+        watched = watched_for(schema)
+        fields = {
+            (model._meta.label_lower, attr): (model, attr) for model, attr in codec_fields(schema)
+        }
+        scoped = {
+            model._meta.label_lower: model for model in apps.get_models() if _is_rebac_bound(model)
+        }
+        for model in scoped.values():
+            attr = resource_id_attr(model)
+            fields[model._meta.label_lower, attr] = (model, attr)
+        for key in sorted(fields):
+            model, attr = fields[key]
+            try:
+                identity_codec(model, attr)
+            except SchemaError as exc:
+                issues.append(
+                    checks.Error(
+                        f"{model._meta.label}.{attr}: no permission-index codec: {exc}",
+                        obj=model,
+                        id="rebac.E014",
+                    )
+                )
+        models_to_check = dict(scoped)
+        for label, watch in sorted(watched.items()):
+            models_to_check[label] = watch.model
+        for definition in schema.definitions:
+            resource_model = model_for_resource_type(definition.resource_type)
+            if resource_model is not None:
+                models_to_check[resource_model._meta.label_lower] = resource_model
+        for _label, model in sorted(models_to_check.items()):
+            write_alias = router.db_for_write(model)
+            if write_alias != relationship_alias:
+                issues.append(
+                    checks.Error(
+                        f"{model._meta.label} routes writes to {write_alias!r}; "
+                        f"relationships use {relationship_alias!r}. "
+                        "Permission-index sources must share the relationship database alias.",
+                        obj=model,
+                        id="rebac.E015",
+                    )
+                )
+        from .signals import tracked_model, tracked_through
+
+        for label, watch in sorted(watched.items()):
+            if not tracked_model(watch.model) and not tracked_through(watch.model):
+                issues.append(
+                    checks.Error(
+                        f"{label} is on a permission backing path but has no write owner or tracking.",
+                        hint="Use RebacMixin/RebacTrackedMixin, or list the third-party model in "
+                        "REBAC_TRACKED_MODELS and save inside transaction.atomic()/ATOMIC_REQUESTS. "
+                        "Third-party signal-free bulk writes require rebuild.",
+                        obj=label,
+                        id="rebac.E018",
+                    )
+                )
+        issues.extend(program_errors(schema))
+    # Model/schema diagnostics may be identical on multiple explicitly checked aliases.
+    unique: list[checks.CheckMessage] = []
+    for issue in issues:
+        if issue not in unique:
+            unique.append(issue)
+    return unique
 
 
 @checks.register("rebac")
@@ -160,8 +327,9 @@ def check_field_backed_relations(
             for error in const_backing_model_errors(definition, relation):
                 issues.append(checks.Error(error, id="rebac.E009"))
     # Schema-level const checks (no Django model needed): a const arrow's target
-    # type must resolve to a definition, and const arrows must not form an
-    # evaluation cycle that would recurse to the depth limit on every check.
+    # type must resolve to a definition. Keep the public E010 const-arrow
+    # restriction unchanged for compatibility and bounded proposed-object
+    # preflight, even though indexed positive data cycles terminate.
     for error in const_target_definition_errors(schema):
         issues.append(checks.Error(error, id="rebac.E009"))
     for error in const_arrow_cycle_errors(schema):
@@ -491,5 +659,32 @@ def check_cross_rbac_relations(app_configs: Any = None, **kwargs: Any) -> list[c
                     obj=model,
                     id="rebac.W003",
                 )
+            )
+    return issues
+
+
+@checks.register("rebac")
+def check_tracked_models_setting(
+    app_configs: Any = None, **kwargs: Any
+) -> list[checks.CheckMessage]:
+    from django.apps import apps
+
+    labels = app_settings.REBAC_TRACKED_MODELS
+    if not isinstance(labels, list) or any(not isinstance(label, str) for label in labels):
+        return [
+            checks.Error(
+                "REBAC_TRACKED_MODELS must be a list of app_label.ModelName strings.",
+                id="rebac.E018",
+            )
+        ]
+    issues: list[checks.CheckMessage] = []
+    for label in sorted(set(labels)):
+        try:
+            model = apps.get_model(label)
+        except LookupError, ValueError:
+            model = None
+        if model is None or model._meta.abstract:
+            issues.append(
+                checks.Error(f"REBAC_TRACKED_MODELS: unknown model {label!r}.", id="rebac.E018")
             )
     return issues

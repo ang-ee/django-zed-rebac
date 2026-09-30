@@ -1,7 +1,5 @@
 """Canonical Zed rendering of the native schema AST."""
 
-import json
-
 from .ast import (
     AllowedSubject,
     AttributeBinding,
@@ -18,6 +16,7 @@ from .ast import (
     Schema,
     backing_to_dict,
 )
+from .serialization import canonical_json
 
 
 def render_zed(schema: Schema, *, include_backing: bool = True) -> str:
@@ -80,7 +79,7 @@ def _render_relation(relation: Relation, *, include_backing: bool) -> str:
         assert data is not None
         kind = data.pop("kind")
         directive = "field" if kind == "fk" else kind
-        body = json.dumps(data, sort_keys=True, separators=(",", ":"), ensure_ascii=False)
+        body = canonical_json(data)
         return f"{line} // rebac:{directive}={body}"
     raise TypeError(f"{relation.name}: unsupported relation backing {type(backing).__name__}")
 

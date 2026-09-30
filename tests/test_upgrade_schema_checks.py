@@ -46,30 +46,40 @@ def test_migrate_can_upgrade_legacy_backing_with_system_checks_enabled(settings)
         reset_backend()
         assert check_field_backed_relations() == []
         assert check_universal_admin_in_roles() == []
-        # Missing revision metadata degrades to uncached loading; malformed
-        # backing still fails closed before and after the upgrade.
-        with pytest.raises(SchemaError, match="backing"):
+        # Runtime schema reads require the index witness columns after upgrade.
+        from django.db import OperationalError, ProgrammingError
+
+        with pytest.raises((OperationalError, ProgrammingError)):
             backend().schema()
 
-        call_command("migrate", "rebac", "0006", skip_checks=False, verbosity=0, stdout=output)
+        call_command("migrate", "rebac", "0007", skip_checks=False, verbosity=0, stdout=output)
 
         row = SchemaRelation.objects.get(pk=row.pk)
         assert row.backing == {"kind": "fk", "path": "folder"}
         reset_backend()
         assert backend().schema().get_definition("blog/post") is not None
         row.backing = {"kind": "fk", "attname": "folder"}
-        row.save(update_fields=["backing"])
         with pytest.raises(SchemaError, match="backing"):
-            backend().schema()
+            row.save(update_fields=["backing"])
     finally:
-        call_command("migrate", "rebac", "0006", skip_checks=True, verbosity=0, stdout=output)
+        call_command("migrate", "rebac", "0007", skip_checks=True, verbosity=0, stdout=output)
         reset_backend()
 
 
 @pytest.mark.parametrize("check", [check_field_backed_relations, check_universal_admin_in_roles])
 def test_invalid_backing_is_not_suppressed_after_migrations(check, settings):
     settings.REBAC_UNIVERSAL_ADMIN_ROLE = "platform/role:admin"
-    _old_backing()
+    # Historical ORM rows deliberately bypass schema-write validation.
+    state = MigrationExecutor(connection).loader.project_state().apps
+    definition = state.get_model("rebac", "SchemaDefinition").objects.create(
+        resource_type="blog/post"
+    )
+    state.get_model("rebac", "SchemaRelation").objects.create(
+        definition=definition,
+        name="folder",
+        allowed_subjects=[{"type": "blog/folder"}],
+        backing={"kind": "fk", "attname": "folder"},
+    )
     reset_backend()
     try:
         with pytest.raises(SchemaError, match="backing"):

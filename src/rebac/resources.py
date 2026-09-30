@@ -49,6 +49,17 @@ def model_for_resource_type(resource_type: str) -> Any | None:
     return None
 
 
+def stores_rows(model: Any) -> bool:
+    """Whether the library may read the model's table without being asked to.
+
+    Django manages the table of a managed model, so it exists. An unmanaged
+    model may be the anchor of a resource type whose objects exist only in
+    relationships, and have no table.
+    """
+    concrete = model._meta.concrete_model
+    return concrete is not None and bool(concrete._meta.managed)
+
+
 def model_for_subject_type(subject_type: str) -> tuple[Any, str] | None:
     """Return ``(model, id_attr)`` for a subject type that maps onto a Django model.
 

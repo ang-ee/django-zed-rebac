@@ -33,3 +33,6 @@ REBAC_STRICT_MODE = True
 REBAC_REQUIRE_SUDO_REASON = True
 REBAC_ALLOW_SUDO = True
 REBAC_SUPERUSER_BYPASS = False
+
+# Exercise third-party-style tracking separately from first-party owners.
+REBAC_TRACKED_MODELS = ["testapp.BackingStage"]

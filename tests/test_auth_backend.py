@@ -31,6 +31,7 @@ from rebac import (
 from rebac.backends import reset_backend
 from rebac.backends.auth import RebacBackend
 from rebac.schema import parse_zed
+from tests.backend_setup import atomic_source_write, install_schema
 
 SCHEMA = """
 definition auth/user {}
@@ -54,7 +55,7 @@ definition blog/post {
 @pytest.fixture(autouse=True)
 def _setup_schema(db):
     reset_backend()
-    backend().set_schema(parse_zed(SCHEMA))
+    install_schema(backend(), parse_zed(SCHEMA))
     yield
     reset_backend()
 
@@ -104,7 +105,7 @@ def test_has_perm_object_level_non_owner_denied(other_user, post):
 
 def test_has_perm_inactive_user_always_denied(user, post):
     user.is_active = False
-    user.save(update_fields=["is_active"])
+    atomic_source_write(user.save, update_fields=["is_active"])
     backend_ = RebacBackend()
     assert backend_.has_perm(user, "testapp.change_post", obj=post) is False
 
@@ -185,7 +186,7 @@ def test_has_module_perms_app_without_rebac_models_returns_false(user):
 @override_settings(REBAC_SUPERUSER_BYPASS=True)
 def test_superuser_bypass_grants_module_and_perm(user, post):
     user.is_superuser = True
-    user.save(update_fields=["is_superuser"])
+    atomic_source_write(user.save, update_fields=["is_superuser"])
     backend_ = RebacBackend()
     assert backend_.has_perm(user, "testapp.change_post") is True
     assert backend_.has_perm(user, "testapp.change_post", obj=post) is True
@@ -196,7 +197,7 @@ def test_superuser_bypass_disabled_still_routes_through_engine(user, post):
     """REBAC_SUPERUSER_BYPASS is False in the test settings — even
     superusers must have explicit grants."""
     user.is_superuser = True
-    user.save(update_fields=["is_superuser"])
+    atomic_source_write(user.save, update_fields=["is_superuser"])
     backend_ = RebacBackend()
     # Owner relation already exists from the fixture, so True. The
     # point is the answer comes from the engine, not the bypass.
@@ -205,7 +206,7 @@ def test_superuser_bypass_disabled_still_routes_through_engine(user, post):
 
 def test_inactive_user_denied_module_perms(user, post):
     user.is_active = False
-    user.save(update_fields=["is_active"])
+    atomic_source_write(user.save, update_fields=["is_active"])
     backend_ = RebacBackend()
     assert backend_.has_module_perms(user, "testapp") is False
 

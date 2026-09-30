@@ -21,6 +21,7 @@ from rebac import (
 )
 from rebac.backends import reset_backend
 from rebac.schema import parse_zed
+from tests.backend_setup import atomic_source_write, install_schema
 
 # ``write`` opens up to owners + editors; ``write__title`` narrows it back
 # to owners only. ``body`` has no per-field gate, so it inherits ``write``.
@@ -52,7 +53,7 @@ definition blog/post {
 @pytest.fixture(autouse=True)
 def _setup_backend(db):
     reset_backend()
-    backend().set_schema(parse_zed(SCHEMA_TEXT))
+    install_schema(backend(), parse_zed(SCHEMA_TEXT))
     yield
     reset_backend()
 
@@ -62,7 +63,7 @@ def alice(db):
     """Owner of the post."""
     from django.contrib.auth import get_user_model
 
-    return get_user_model().objects.create(username="alice", is_active=True)
+    return atomic_source_write(get_user_model().objects.create, username="alice", is_active=True)
 
 
 @pytest.fixture
@@ -70,7 +71,7 @@ def bob(db):
     """Editor of the post (not owner)."""
     from django.contrib.auth import get_user_model
 
-    return get_user_model().objects.create(username="bob", is_active=True)
+    return atomic_source_write(get_user_model().objects.create, username="bob", is_active=True)
 
 
 @pytest.fixture
@@ -205,10 +206,11 @@ def test_handbuilt_instance_with_pinned_actor(alice):
     """
     from tests.testapp.models import Post
 
-    backend().set_schema(
+    install_schema(
+        backend(),
         parse_zed(
             SCHEMA_TEXT.replace("permission create = owner", "permission create = authenticated")
-        )
+        ),
     )
     instance = Post(title="from-thin-air", body="b")
     instance._rebac_actor = SubjectRef.of("auth/user", str(alice.pk))

@@ -16,6 +16,7 @@ from rebac import (
 )
 from rebac.backends import reset_backend
 from rebac.schema import parse_zed
+from tests.backend_setup import atomic_source_write, install_schema
 
 pytest.importorskip(
     "strawberry_django",
@@ -48,7 +49,7 @@ definition blog/post {
 @pytest.fixture(autouse=True)
 def _setup_backend(db):
     reset_backend()
-    backend().set_schema(parse_zed(SCHEMA_TEXT))
+    install_schema(backend(), parse_zed(SCHEMA_TEXT))
     yield
     reset_backend()
 
@@ -57,7 +58,7 @@ def _setup_backend(db):
 def alice(db):
     from django.contrib.auth import get_user_model
 
-    return get_user_model().objects.create(username="alice", is_active=True)
+    return atomic_source_write(get_user_model().objects.create, username="alice", is_active=True)
 
 
 def _grant(resource_type: str, resource_id: object, relation: str, user: Any) -> None:

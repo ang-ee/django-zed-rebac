@@ -2,7 +2,7 @@
 
 Covers actor resolution from ``ctx.request_context.meta``, the ambient
 ``current_actor()`` path, fail-closed on a missing actor, deny short-circuiting
-the body, allow running the body exactly once, ``id_arg`` / singleton ``"*"``
+the body, allow running the body exactly once, ``id_arg`` / singleton ``"singleton"``
 resource ids, sync + async tools, and grant-backed actors.
 
 A fake ``Context`` (a nested ``SimpleNamespace``) stands in for the FastMCP
@@ -28,6 +28,7 @@ from rebac import (
 from rebac.backends import reset_backend
 from rebac.mcp import default_actor_resolver, rebac_mcp_tool
 from rebac.schema import parse_zed
+from tests.backend_setup import install_schema
 
 SCHEMA_TEXT = """
 definition auth/user {}
@@ -53,7 +54,7 @@ definition blog/post {
 @pytest.fixture(autouse=True)
 def _setup_backend(db):
     reset_backend()
-    backend().set_schema(parse_zed(SCHEMA_TEXT))
+    install_schema(backend(), parse_zed(SCHEMA_TEXT))
     yield
     reset_backend()
 
@@ -101,10 +102,10 @@ def test_default_resolver_returns_none_without_actor_subject() -> None:
 
 @pytest.mark.django_db
 def test_actor_from_request_context_meta_allows() -> None:
-    _grant_invoke(ObjectRef("mcp/tool/edit_post", "*"), SubjectRef.of("auth/user", "7"))
+    _grant_invoke(ObjectRef("mcp/tool/edit_post", "singleton"), SubjectRef.of("auth/user", "7"))
     calls: list[str] = []
 
-    @rebac_mcp_tool(resource_type="mcp/tool/edit_post", action="invoke")
+    @rebac_mcp_tool(resource_type="mcp/tool/edit_post", action="invoke", resource_id="singleton")
     def edit(body: str, ctx: object = None) -> str:
         calls.append(body)
         return "ok"
@@ -118,10 +119,10 @@ def test_ctx_actor_takes_priority_over_ambient() -> None:
     # Ctx names user 7 (granted); ambient names user 9 (no grant). The per-call
     # ctx actor must win — the body runs because user 7 is authorised, and the
     # ambient ContextVar does NOT override the explicit per-request identity.
-    _grant_invoke(ObjectRef("mcp/tool/edit_post", "*"), SubjectRef.of("auth/user", "7"))
+    _grant_invoke(ObjectRef("mcp/tool/edit_post", "singleton"), SubjectRef.of("auth/user", "7"))
     calls: list[str] = []
 
-    @rebac_mcp_tool(resource_type="mcp/tool/edit_post", action="invoke")
+    @rebac_mcp_tool(resource_type="mcp/tool/edit_post", action="invoke", resource_id="singleton")
     def edit(body: str, ctx: object = None) -> str:
         calls.append(body)
         return "ok"
@@ -135,10 +136,10 @@ def test_ctx_actor_takes_priority_over_ambient() -> None:
 def test_ambient_actor_used_as_fallback_when_ctx_has_no_actor() -> None:
     # Ctx carries no actor_subject; ambient names a granted user. With no per-call
     # identity stamped, the ambient actor is the fallback and the body runs.
-    _grant_invoke(ObjectRef("mcp/tool/edit_post", "*"), SubjectRef.of("auth/user", "9"))
+    _grant_invoke(ObjectRef("mcp/tool/edit_post", "singleton"), SubjectRef.of("auth/user", "9"))
     calls: list[str] = []
 
-    @rebac_mcp_tool(resource_type="mcp/tool/edit_post", action="invoke")
+    @rebac_mcp_tool(resource_type="mcp/tool/edit_post", action="invoke", resource_id="singleton")
     def edit(body: str, ctx: object = None) -> str:
         calls.append(body)
         return "ok"
@@ -152,7 +153,7 @@ def test_ambient_actor_used_as_fallback_when_ctx_has_no_actor() -> None:
 def test_missing_actor_fails_closed() -> None:
     calls: list[str] = []
 
-    @rebac_mcp_tool(resource_type="mcp/tool/edit_post", action="invoke")
+    @rebac_mcp_tool(resource_type="mcp/tool/edit_post", action="invoke", resource_id="singleton")
     def edit(body: str, ctx: object = None) -> str:
         calls.append(body)
         return "ok"
@@ -169,7 +170,7 @@ def test_missing_actor_fails_closed() -> None:
 def test_denied_permission_does_not_run_body() -> None:
     calls: list[str] = []
 
-    @rebac_mcp_tool(resource_type="mcp/tool/edit_post", action="invoke")
+    @rebac_mcp_tool(resource_type="mcp/tool/edit_post", action="invoke", resource_id="singleton")
     def edit(body: str, ctx: object = None) -> str:
         calls.append(body)
         return "ok"
@@ -181,10 +182,10 @@ def test_denied_permission_does_not_run_body() -> None:
 
 @pytest.mark.django_db
 def test_allowed_runs_body_exactly_once() -> None:
-    _grant_invoke(ObjectRef("mcp/tool/edit_post", "*"), SubjectRef.of("auth/user", "1"))
+    _grant_invoke(ObjectRef("mcp/tool/edit_post", "singleton"), SubjectRef.of("auth/user", "1"))
     calls: list[str] = []
 
-    @rebac_mcp_tool(resource_type="mcp/tool/edit_post", action="invoke")
+    @rebac_mcp_tool(resource_type="mcp/tool/edit_post", action="invoke", resource_id="singleton")
     def edit(body: str, ctx: object = None) -> str:
         calls.append(body)
         return "ok"
@@ -225,8 +226,8 @@ def test_resource_id_decorator_arg_used_when_no_id_arg() -> None:
 
 
 @pytest.mark.django_db
-def test_singleton_star_when_no_id_supplied(monkeypatch: pytest.MonkeyPatch) -> None:
-    _grant_invoke(ObjectRef("mcp/tool/edit_post", "*"), SubjectRef.of("auth/user", "5"))
+def test_explicit_singleton_identity(monkeypatch: pytest.MonkeyPatch) -> None:
+    _grant_invoke(ObjectRef("mcp/tool/edit_post", "singleton"), SubjectRef.of("auth/user", "5"))
     seen: list[ObjectRef] = []
 
     real_check_access = backend().check_access
@@ -238,19 +239,19 @@ def test_singleton_star_when_no_id_supplied(monkeypatch: pytest.MonkeyPatch) -> 
     # monkeypatch auto-restores the bound method after the test.
     monkeypatch.setattr(backend(), "check_access", spy)
 
-    @rebac_mcp_tool(resource_type="mcp/tool/edit_post", action="invoke")
+    @rebac_mcp_tool(resource_type="mcp/tool/edit_post", action="invoke", resource_id="singleton")
     def tool(ctx: object = None) -> str:
         return "ok"
 
     assert tool(ctx=_ctx("auth/user:5")) == "ok"
-    assert seen == [ObjectRef("mcp/tool/edit_post", "*")]
+    assert seen == [ObjectRef("mcp/tool/edit_post", "singleton")]
 
 
 @pytest.mark.django_db
 def test_id_arg_default_none_falls_back_to_singleton(monkeypatch: pytest.MonkeyPatch) -> None:
     # A tool whose id_arg parameter has a default the caller omits must not check
-    # a bogus "<type>:None" row — it falls back to the singleton "*".
-    _grant_invoke(ObjectRef("mcp/tool/edit_post", "*"), SubjectRef.of("auth/user", "5"))
+    # a bogus "<type>:None" row — it falls back to the explicit singleton "singleton".
+    _grant_invoke(ObjectRef("mcp/tool/edit_post", "singleton"), SubjectRef.of("auth/user", "5"))
     seen: list[ObjectRef] = []
 
     real_check_access = backend().check_access
@@ -261,12 +262,14 @@ def test_id_arg_default_none_falls_back_to_singleton(monkeypatch: pytest.MonkeyP
 
     monkeypatch.setattr(backend(), "check_access", spy)
 
-    @rebac_mcp_tool(resource_type="mcp/tool/edit_post", action="invoke", id_arg="thing")
+    @rebac_mcp_tool(
+        resource_type="mcp/tool/edit_post", action="invoke", resource_id="singleton", id_arg="thing"
+    )
     def tool(thing: str | None = None, ctx: object = None) -> str:
         return "ok"
 
     assert tool(ctx=_ctx("auth/user:5")) == "ok"
-    assert seen == [ObjectRef("mcp/tool/edit_post", "*")]
+    assert seen == [ObjectRef("mcp/tool/edit_post", "singleton")]
 
 
 # ---------- create-style action routes through check_new ----------
@@ -338,10 +341,10 @@ def test_create_with_relations_overlay_denies_without_parent_write() -> None:
 # rollback-wrapped transaction would deadlock that thread on sqlite.
 @pytest.mark.django_db(transaction=True)
 def test_async_tool_allowed_runs_body() -> None:
-    _grant_invoke(ObjectRef("mcp/tool/edit_post", "*"), SubjectRef.of("auth/user", "1"))
+    _grant_invoke(ObjectRef("mcp/tool/edit_post", "singleton"), SubjectRef.of("auth/user", "1"))
     calls: list[str] = []
 
-    @rebac_mcp_tool(resource_type="mcp/tool/edit_post", action="invoke")
+    @rebac_mcp_tool(resource_type="mcp/tool/edit_post", action="invoke", resource_id="singleton")
     async def edit(body: str, ctx: object = None) -> str:
         calls.append(body)
         return "ok"
@@ -354,7 +357,7 @@ def test_async_tool_allowed_runs_body() -> None:
 def test_async_tool_denied_does_not_run_body() -> None:
     calls: list[str] = []
 
-    @rebac_mcp_tool(resource_type="mcp/tool/edit_post", action="invoke")
+    @rebac_mcp_tool(resource_type="mcp/tool/edit_post", action="invoke", resource_id="singleton")
     async def edit(body: str, ctx: object = None) -> str:
         calls.append(body)
         return "ok"
@@ -370,10 +373,10 @@ def test_async_tool_denied_does_not_run_body() -> None:
 @pytest.mark.django_db
 def test_grant_backed_actor_is_accepted() -> None:
     grant = SubjectRef.of("agents/grant", "42.assistant", "valid")
-    _grant_invoke(ObjectRef("mcp/tool/edit_post", "*"), grant)
+    _grant_invoke(ObjectRef("mcp/tool/edit_post", "singleton"), grant)
     calls: list[str] = []
 
-    @rebac_mcp_tool(resource_type="mcp/tool/edit_post", action="invoke")
+    @rebac_mcp_tool(resource_type="mcp/tool/edit_post", action="invoke", resource_id="singleton")
     def edit(body: str, ctx: object = None) -> str:
         calls.append(body)
         return "ok"
@@ -404,10 +407,10 @@ def test_wrapped_signature_is_unchanged() -> None:
 def test_body_runs_inside_actor_context() -> None:
     from rebac import current_actor
 
-    _grant_invoke(ObjectRef("mcp/tool/edit_post", "*"), SubjectRef.of("auth/user", "1"))
+    _grant_invoke(ObjectRef("mcp/tool/edit_post", "singleton"), SubjectRef.of("auth/user", "1"))
     seen: list[SubjectRef | None] = []
 
-    @rebac_mcp_tool(resource_type="mcp/tool/edit_post", action="invoke")
+    @rebac_mcp_tool(resource_type="mcp/tool/edit_post", action="invoke", resource_id="singleton")
     def edit(ctx: object = None) -> str:
         seen.append(current_actor())
         return "ok"
@@ -427,10 +430,10 @@ async def _drain(agen: object) -> list[str]:
 def test_async_generator_tool_runs_inside_actor_context() -> None:
     from rebac import current_actor
 
-    _grant_invoke(ObjectRef("mcp/tool/edit_post", "*"), SubjectRef.of("auth/user", "1"))
+    _grant_invoke(ObjectRef("mcp/tool/edit_post", "singleton"), SubjectRef.of("auth/user", "1"))
     seen: list[SubjectRef | None] = []
 
-    @rebac_mcp_tool(resource_type="mcp/tool/edit_post", action="invoke")
+    @rebac_mcp_tool(resource_type="mcp/tool/edit_post", action="invoke", resource_id="singleton")
     async def stream(ctx: object = None):  # type: ignore[no-untyped-def]
         seen.append(current_actor())
         yield "a"
@@ -444,7 +447,7 @@ def test_async_generator_tool_runs_inside_actor_context() -> None:
 def test_async_generator_tool_denied_does_not_run_body() -> None:
     produced: list[str] = []
 
-    @rebac_mcp_tool(resource_type="mcp/tool/edit_post", action="invoke")
+    @rebac_mcp_tool(resource_type="mcp/tool/edit_post", action="invoke", resource_id="singleton")
     async def stream(ctx: object = None):  # type: ignore[no-untyped-def]
         produced.append("a")
         yield "a"
@@ -460,10 +463,10 @@ def test_stream_actor_is_scoped_to_production_and_cleanup() -> None:
 
     caller = SubjectRef.of("auth/user", "caller")
     tool_actor = SubjectRef.of("auth/user", "1")
-    _grant_invoke(ObjectRef("mcp/tool/edit_post", "*"), tool_actor)
+    _grant_invoke(ObjectRef("mcp/tool/edit_post", "singleton"), tool_actor)
     seen: list[SubjectRef | None] = []
 
-    @rebac_mcp_tool(resource_type="mcp/tool/edit_post", action="invoke")
+    @rebac_mcp_tool(resource_type="mcp/tool/edit_post", action="invoke", resource_id="singleton")
     async def stream(ctx: object = None):
         try:
             seen.append(current_actor())
@@ -502,7 +505,7 @@ def test_default_resolver_returns_none_on_malformed_actor_subject() -> None:
 def test_malformed_actor_subject_raises_permission_denied_not_value_error() -> None:
     calls: list[str] = []
 
-    @rebac_mcp_tool(resource_type="mcp/tool/edit_post", action="invoke")
+    @rebac_mcp_tool(resource_type="mcp/tool/edit_post", action="invoke", resource_id="singleton")
     def edit(ctx: object = None) -> str:
         calls.append("ran")
         return "ok"
@@ -515,10 +518,10 @@ def test_malformed_actor_subject_raises_permission_denied_not_value_error() -> N
 @pytest.mark.django_db
 @pytest.mark.parametrize("raw", ["garbage-no-colon", "", None, 123, {"actor": "auth/user:1"}])
 def test_explicit_invalid_actor_cannot_fall_back_to_privileged_ambient(raw) -> None:
-    _grant_invoke(ObjectRef("mcp/tool/edit_post", "*"), SubjectRef.of("auth/user", "1"))
+    _grant_invoke(ObjectRef("mcp/tool/edit_post", "singleton"), SubjectRef.of("auth/user", "1"))
     calls = []
 
-    @rebac_mcp_tool(resource_type="mcp/tool/edit_post", action="invoke")
+    @rebac_mcp_tool(resource_type="mcp/tool/edit_post", action="invoke", resource_id="singleton")
     def edit(ctx: object = None) -> str:
         calls.append("ran")
         return "ok"
@@ -544,7 +547,7 @@ def test_conditional_permission_surfaces_missing_caveat_params(
 
     monkeypatch.setattr(backend(), "check_access", conditional)
 
-    @rebac_mcp_tool(resource_type="mcp/tool/edit_post", action="invoke")
+    @rebac_mcp_tool(resource_type="mcp/tool/edit_post", action="invoke", resource_id="singleton")
     def edit(ctx: object = None) -> str:
         return "ok"
 
@@ -562,12 +565,12 @@ def test_conditional_permission_surfaces_missing_caveat_params(
 def test_find_context_accepts_context_named_arg_with_request_context() -> None:
     # A non-ctx/context parameter whose value's class is named 'Context' and
     # carries request_context is recognised as the MCP context.
-    _grant_invoke(ObjectRef("mcp/tool/edit_post", "*"), SubjectRef.of("auth/user", "5"))
+    _grant_invoke(ObjectRef("mcp/tool/edit_post", "singleton"), SubjectRef.of("auth/user", "5"))
 
     class Context(SimpleNamespace):
         pass
 
-    @rebac_mcp_tool(resource_type="mcp/tool/edit_post", action="invoke")
+    @rebac_mcp_tool(resource_type="mcp/tool/edit_post", action="invoke", resource_id="singleton")
     def edit(c: object) -> str:
         return "ok"
 
@@ -582,7 +585,7 @@ def test_find_context_ignores_context_named_arg_without_request_context() -> Non
     class Context:  # a test double, not the MCP context shape
         pass
 
-    @rebac_mcp_tool(resource_type="mcp/tool/edit_post", action="invoke")
+    @rebac_mcp_tool(resource_type="mcp/tool/edit_post", action="invoke", resource_id="singleton")
     def edit(payload: object) -> str:
         return "ok"
 
@@ -623,3 +626,23 @@ def test_hide_id_arg_emits_warning() -> None:
         )
         def search(ctx: object = None, *, _capability: str = "docs.search") -> str:
             return "ok"
+
+
+@pytest.mark.parametrize("id_arg", [None, "thing"])
+def test_legacy_default_resource_resolution_is_unchanged(id_arg):
+    """The adapter fallback stays public; tuple grants must use a concrete ID."""
+    import inspect
+
+    from rebac.mcp import _object_ref
+
+    def tool(thing=None):
+        pass
+
+    bound = inspect.signature(tool).bind()
+    bound.apply_defaults()
+    assert _object_ref(
+        resource_type="mcp/tool/edit_post",
+        id_arg=id_arg,
+        resource_id=None,
+        bound=bound,
+    ) == ObjectRef("mcp/tool/edit_post", "*")

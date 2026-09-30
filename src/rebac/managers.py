@@ -27,7 +27,6 @@ from .actors import current_sudo_reason, grant_subject_ref, to_subject_ref
 from .actors import is_sudo as _is_sudo_ambient
 from .conf import app_settings
 from .errors import MissingActorError, PermissionDenied
-from .evaluator import current_evaluator
 from .field_visibility import (
     accessible_ids,
     apply_field_visibility,
@@ -151,6 +150,7 @@ class RebacQuerySet(models.QuerySet[_M]):
         self._rebac_select_related_guards = ()
         self._rebac_eager_scope = False
         self._rebac_aggregate_scope = False
+        self._rebac_visibility_applied = False
 
     @property
     def query(self) -> Query:
@@ -432,26 +432,19 @@ class RebacQuerySet(models.QuerySet[_M]):
 
         action = str(self._rebac_action or getattr(model._meta, "rebac_default_action", "read"))
         active_backend = backend()
+        predicate = active_backend.queryset_filter(
+            model=model, subject=actor, action=action, using=self.db
+        )
+        if predicate is not None:
+            restriction = query.build_where(predicate)
+            query.where = WhereNode([query.where, _ScopeWhere(children=[restriction])])
+            return
         if backend_grants_all(
             active_backend,
             subject=actor,
             action=action,
             resource_type=rebac_type,
         ):
-            return
-        evaluator = current_evaluator()
-        predicate = (
-            evaluator.compiled_scope_plan(
-                active_backend, model=model, subject=actor, action=action, using=self.db
-            )
-            if evaluator is not None
-            else active_backend.queryset_filter(
-                model=model, subject=actor, action=action, using=self.db
-            )
-        )
-        if predicate is not None:
-            restriction = query.build_where(predicate)
-            query.where = WhereNode([query.where, _ScopeWhere(children=[restriction])])
             return
         ids: list[Any] = list(
             accessible_ids(
@@ -620,7 +613,7 @@ class RebacQuerySet(models.QuerySet[_M]):
         actor, sudo = self._resolve_effective_actor()
         self._guard_projected_field_reads(actor, sudo)
         super()._fetch_all()
-        if self._result_cache is not None:
+        if self._result_cache is not None and not self._rebac_visibility_applied:
             if actor is not None and not sudo:
                 for inst in self._result_cache:
                     if isinstance(inst, models.Model):
@@ -633,6 +626,7 @@ class RebacQuerySet(models.QuerySet[_M]):
                     mode=self._effective_field_mode(),
                 )
             self._guard_selected_related_reads()
+            self._rebac_visibility_applied = True
 
     def iterator(self, *args: Any, **kwargs: Any) -> Any:
         if self._result_cache is None:
@@ -775,7 +769,7 @@ class RebacQuerySet(models.QuerySet[_M]):
         such as GraphQL mutation resolvers and forms. Domain factories that
         must run for every insert override this queryset method, not ``create``
         on the manager, so kwargs and prepared-instance creation converge here.
-        The pre-save signal remains the sole create authorization gate.
+        The save_base owner remains the sole create authorization gate.
 
         Queryset scope owns the write: any actor or sudo pinned on ``obj``
         itself is replaced by this queryset's actor and sudo reason. A prepared
@@ -796,19 +790,58 @@ class RebacQuerySet(models.QuerySet[_M]):
                 f"{self.model.__name__}.insert() cannot insert an instance bound to "
                 f"database {obj._state.db!r} on database {self.db!r}."
             )
-        actor, _unscoped = self._resolve_effective_actor()
+        from .mixins import insertion_scope
+
+        actor, unscoped = self._resolve_effective_actor()
         obj._rebac_actor = actor  # type: ignore[attr-defined]
-        # The signal layer needs the explicit queryset bypass for this insert.
-        # Clear it afterwards, just as reading through a sudo queryset does not
-        # leave its returned instances permanently elevated.
-        obj._rebac_sudo_reason = self._rebac_sudo_reason  # type: ignore[attr-defined]
-        try:
+        obj._rebac_sudo_reason = None  # type: ignore[attr-defined]
+        with insertion_scope(obj, actor, unscoped):
             obj.save(force_insert=True, using=self.db)
-        finally:
-            obj._rebac_sudo_reason = None  # type: ignore[attr-defined]
         return obj
 
     def bulk_create(
+        self,
+        objs: Iterable[_M],
+        batch_size: int | None = None,
+        ignore_conflicts: bool = False,
+        update_conflicts: bool = False,
+        update_fields: Collection[str] | None = None,
+        unique_fields: Collection[str] | None = None,
+    ) -> list[_M]:
+        from .index.maintain import model_write
+
+        self._for_write = True
+        candidates = list(objs)
+        with model_write(model=self.model, using=self.db) as maintenance:
+            if maintenance is not None:
+                if ignore_conflicts or update_conflicts:
+                    maintenance.capture_old(queryset=self.model._base_manager.using(self.db).all())
+                else:
+                    maintenance.capture_old(
+                        model=self.model, pks=[row.pk for row in candidates if row.pk is not None]
+                    )
+            rows = self._rebac_bulk_create(
+                candidates,
+                batch_size,
+                ignore_conflicts,
+                update_conflicts,
+                update_fields,
+                unique_fields,
+            )
+            if maintenance is not None:
+                if ignore_conflicts or update_conflicts or any(row.pk is None for row in rows):
+                    maintenance._capture(
+                        model=self.model,
+                        pks=(),
+                        tuples=(),
+                        phase="new",
+                        queryset=self.model._base_manager.using(self.db).all(),
+                    )
+                else:
+                    maintenance.changed(model=self.model, pks=[row.pk for row in rows])
+            return rows
+
+    def _rebac_bulk_create(
         self,
         objs: Iterable[_M],
         batch_size: int | None = None,
@@ -861,6 +894,38 @@ class RebacQuerySet(models.QuerySet[_M]):
         return rows
 
     def update(self, **kwargs: Any) -> int:
+        from .index.maintain import model_write
+
+        self._for_write = True
+        with model_write(model=self.model, using=self.db, names=kwargs) as maintenance:
+            frozen = None
+            if maintenance is not None:
+                frozen = maintenance.snapshot_queryset(
+                    self.system_context(reason="rebac.index.capture")
+                )
+                maintenance.capture_old(queryset=frozen)
+            count = self._rebac_update(**kwargs)
+            if maintenance is not None and frozen is not None:
+                if {"pk", self.model._meta.pk.name, self.model._meta.pk.attname} & kwargs.keys():
+                    frozen = self.model._base_manager.using(self.db).all()
+                maintenance._capture(
+                    model=self.model, pks=(), tuples=(), queryset=frozen, phase="new"
+                )
+            return count
+
+    def bulk_update(
+        self, objs: Iterable[_M], fields: Iterable[str], batch_size: int | None = None
+    ) -> int:
+        from .index.maintain import model_write
+
+        self._for_write = True
+        # Django dispatches batches through update(); this outer owner merely
+        # keeps all batches in one pass and never captures or derives twice.
+        field_names = tuple(fields)
+        with model_write(model=self.model, using=self.db, names=field_names):
+            return super().bulk_update(objs, field_names, batch_size=batch_size)
+
+    def _rebac_update(self, **kwargs: Any) -> int:
         actor, sudo = self._resolve_effective_actor()
         if sudo:
             return super().update(**kwargs)
@@ -875,13 +940,19 @@ class RebacQuerySet(models.QuerySet[_M]):
         return super().update(**kwargs)
 
     def delete(self) -> tuple[int, dict[str, int]]:
-        actor, sudo = self._resolve_effective_actor()
-        if sudo:
-            return super().delete()
-        rebac_type = model_resource_type(self.model)
-        if rebac_type:
-            self._guard_bulk_action(actor, "delete")  # type: ignore[arg-type]
-        return super().delete()
+        from .index.maintain import model_write
+
+        self._for_write = True
+        with model_write(model=self.model, using=self.db) as maintenance:
+            if maintenance is not None:
+                maintenance.capture_old(queryset=self.system_context(reason="rebac.index.capture"))
+            from .mixins import deletion_owner
+
+            actor, unscoped = self._resolve_effective_actor()
+            if not unscoped and model_resource_type(self.model):
+                self._guard_bulk_action(actor, "delete")  # type: ignore[arg-type]
+            with deletion_owner(self, self.db, actor, unscoped):
+                return super().delete()
 
     def _guard_bulk_action(self, actor: SubjectRef, action: str) -> None:
         from .backends import backend
@@ -905,7 +976,7 @@ class RebacQuerySet(models.QuerySet[_M]):
     def _guard_bulk_field_writes(self, actor: SubjectRef, kwargs: dict[str, Any]) -> None:
         """Per-field write enforcement for bulk ``QuerySet.update()``.
 
-        Mirrors the per-field gate run in ``signals.pre_save``: for each
+        Mirrors the per-field gate run in ``RebacMixin.save_base``: for each
         ``f`` in ``kwargs`` whose resource type declares a permission
         named ``write__<f>``, every row in the current scope must pass
         that check too — same all-or-nothing semantics as the
@@ -1031,3 +1102,100 @@ class RebacManager(models.Manager.from_queryset(RebacQuerySet)):  # type: ignore
 
     def system_context(self, *, reason: str) -> RebacQuerySet[Any]:
         return self.get_queryset().system_context(reason=reason)
+
+
+class TrackedQuerySet[T: models.Model](models.QuerySet[T]):
+    """Owning queryset without actor scoping, also used by both base managers."""
+
+    def update(self, **kwargs: Any) -> int:
+        from .index.maintain import model_write
+
+        self._for_write = True
+        with model_write(model=self.model, using=self.db, names=kwargs) as maintenance:
+            frozen = maintenance.snapshot_queryset(self) if maintenance is not None else None
+            if maintenance is not None:
+                maintenance.capture_old(queryset=frozen)
+            count = super().update(**kwargs)
+            if maintenance is not None and frozen is not None:
+                if {"pk", self.model._meta.pk.name, self.model._meta.pk.attname} & kwargs.keys():
+                    frozen = self.model._base_manager.using(self.db).all()
+                maintenance._capture(
+                    model=self.model, pks=(), tuples=(), queryset=frozen, phase="new"
+                )
+            return count
+
+    def delete(self) -> tuple[int, dict[str, int]]:
+        from .actors import current_actor, is_sudo
+        from .conf import app_settings
+        from .index.maintain import model_write
+        from .mixins import deletion_owner
+
+        self._for_write = True
+        actor = current_actor()
+        # Resource base-manager writes are intentionally unscoped infrastructure
+        # operations. Plain tracked roots retain ambient scope for resource cascades.
+        from .mixins import RebacMixin
+
+        unscoped = (
+            issubclass(self.model, RebacMixin)
+            or is_sudo()
+            or (actor is None and not app_settings.REBAC_STRICT_MODE)
+        )
+        with model_write(model=self.model, using=self.db) as maintenance:
+            if maintenance is not None:
+                maintenance.capture_old(queryset=self)
+            with deletion_owner(self, self.db, actor, unscoped):
+                return super().delete()
+
+    def bulk_create(
+        self,
+        objs: Iterable[T],
+        batch_size: int | None = None,
+        ignore_conflicts: bool = False,
+        update_conflicts: bool = False,
+        update_fields: Collection[str] | None = None,
+        unique_fields: Collection[str] | None = None,
+    ) -> list[T]:
+        from .index.maintain import model_write
+
+        self._for_write = True
+        candidates = list(objs)
+        with model_write(model=self.model, using=self.db) as maintenance:
+            all_rows = self.model._base_manager.using(self.db).all()
+            if maintenance is not None:
+                if ignore_conflicts or update_conflicts:
+                    maintenance.capture_old(queryset=all_rows)
+                else:
+                    maintenance.capture_old(
+                        model=self.model, pks=[row.pk for row in candidates if row.pk is not None]
+                    )
+            rows = super().bulk_create(
+                candidates,
+                batch_size,
+                ignore_conflicts,
+                update_conflicts,
+                update_fields,
+                unique_fields,
+            )
+            if maintenance is not None:
+                if ignore_conflicts or update_conflicts or any(row.pk is None for row in rows):
+                    maintenance._capture(
+                        model=self.model, pks=(), tuples=(), queryset=all_rows, phase="new"
+                    )
+                else:
+                    maintenance.changed(model=self.model, pks=[row.pk for row in rows])
+            return rows
+
+    def bulk_update(
+        self, objs: Iterable[T], fields: Iterable[str], batch_size: int | None = None
+    ) -> int:
+        from .index.maintain import model_write
+
+        self._for_write = True
+        field_names = tuple(fields)
+        with model_write(model=self.model, using=self.db, names=field_names):
+            return super().bulk_update(objs, field_names, batch_size=batch_size)
+
+
+class TrackedManager(models.Manager.from_queryset(TrackedQuerySet)):  # type: ignore[misc]
+    """Unfiltered manager whose writes maintain the permission index."""

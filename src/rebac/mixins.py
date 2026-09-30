@@ -14,15 +14,24 @@ overrides where the captured values land.
 
 from __future__ import annotations
 
-from collections.abc import Iterable, Mapping
-from typing import TYPE_CHECKING, Any, Self, cast
+from collections.abc import Iterable, Iterator, Mapping
+from contextlib import contextmanager
+from contextvars import ContextVar
+from dataclasses import dataclass
+from dataclasses import field as dataclass_field
+from typing import TYPE_CHECKING, Any, ClassVar, Self, cast
 
-from django.db import models
+from django.db import models, router
 from django.db.models.base import ModelBase
 
 from ._id import resource_id_attr
-from .managers import RebacManager
+from .conf import app_settings
+from .errors import PermissionDenied
+from .field_visibility import backend_schema
+from .managers import RebacManager, TrackedManager
+from .preflight import _check_new_model
 from .resources import model_resource_type
+from .schema.walker import field_gated_actions
 from .types import CheckResult, Consistency, FieldDenyMode, ObjectRef, SubjectRef
 
 REBAC_META_OPTIONS = (
@@ -129,26 +138,152 @@ class RebacModelBase(RebacObjectMeta, ModelBase):
     ``ModelBase.__new__()`` correctly.
     """
 
+    def __new__(
+        mcs, name: str, bases: tuple[type, ...], attrs: dict[str, Any], **kwargs: Any
+    ) -> type:
+        meta = attrs.get("Meta")
+        attrs["Meta"] = type(
+            "Meta",
+            (meta,) if meta is not None else (),
+            {
+                "base_manager_name": "_rebac_base",
+                "default_manager_name": getattr(meta, "default_manager_name", "objects"),
+            },
+        )
+        attrs["_rebac_base"] = TrackedManager()
+        new_cls = cast(type[models.Model], super().__new__(mcs, name, bases, attrs, **kwargs))
+        if not new_cls._meta.abstract:
+            from .signals import connect_owned_model
+
+            connect_owned_model(new_cls)
+        return new_cls
+
     @staticmethod
     def _store_rebac_meta(target_cls: type[models.Model], captured: dict[str, Any]) -> None:
         for key, value in captured.items():
             setattr(target_cls._meta, key, value)
 
 
-class RebacMixin(models.Model, metaclass=RebacModelBase):
+@dataclass
+class DeleteScope:
+    origin: Any
+    using: str
+    actor: SubjectRef | None
+    unscoped: bool
+    identities: set[ObjectRef] = dataclass_field(default_factory=set)
+    root_pks: frozenset[Any] = frozenset()
+
+
+_delete_scopes: ContextVar[tuple[DeleteScope, ...]] = ContextVar("rebac_delete_scopes", default=())
+_insert_scope: ContextVar[tuple[Any, SubjectRef | None, bool] | None] = ContextVar(
+    "rebac_insert_scope", default=None
+)
+
+
+def delete_scope(origin: Any, using: str) -> DeleteScope | None:
+    return next(
+        (
+            scope
+            for scope in reversed(_delete_scopes.get())
+            if scope.origin is origin and scope.using == using
+        ),
+        None,
+    )
+
+
+@contextmanager
+def deletion_owner(
+    origin: Any, using: str, actor: SubjectRef | None, unscoped: bool
+) -> Iterator[None]:
+    from .managers import RebacQuerySet
+    from .signals import cleanup_identities
+
+    scope = DeleteScope(origin, using, actor, unscoped)
+    if isinstance(origin, models.QuerySet):
+        roots = (
+            origin.system_context(reason="rebac.delete.roots")
+            if isinstance(origin, RebacQuerySet)
+            else origin
+        )
+        scope.root_pks = frozenset(roots.values_list("pk", flat=True))
+    token = _delete_scopes.set((*_delete_scopes.get(), scope))
+    try:
+        yield
+        cleanup_identities(scope.identities, using=using)
+    finally:
+        _delete_scopes.reset(token)
+
+
+@contextmanager
+def insertion_scope(instance: Any, actor: SubjectRef | None, unscoped: bool) -> Iterator[None]:
+    token = _insert_scope.set((instance, actor, unscoped))
+    try:
+        yield
+    finally:
+        _insert_scope.reset(token)
+
+
+class RebacTrackedMixin(models.Model, metaclass=RebacModelBase):
+    """Unscoped write ownership for first-party non-resource backing models."""
+
+    objects: ClassVar[models.Manager[Any]] = TrackedManager()
+
+    class Meta:
+        abstract = True
+
+    def save_base(
+        self,
+        raw: bool = False,
+        force_insert: bool | tuple[ModelBase, ...] = False,
+        force_update: bool = False,
+        using: str | None = None,
+        update_fields: Iterable[str] | None = None,
+    ) -> None:
+        from .index.maintain import model_write
+
+        alias = using or router.db_for_write(type(self), instance=self)
+        if raw:
+            return super().save_base(raw, force_insert, force_update, alias, update_fields)
+        with model_write(model=type(self), using=alias, names=update_fields) as maintenance:
+            if maintenance is not None and self.pk is not None:
+                maintenance.capture_old(model=type(self), pks=(self.pk,))
+            super().save_base(raw, force_insert, force_update, alias, update_fields)
+            if maintenance is not None:
+                maintenance.changed(model=type(self), pks=(self.pk,))
+
+    def delete(
+        self, using: str | None = None, keep_parents: bool = False
+    ) -> tuple[int, dict[str, int]]:
+        from .actors import current_actor, is_sudo
+        from .conf import app_settings
+        from .index.maintain import model_write
+
+        alias = using or router.db_for_write(type(self), instance=self)
+        if delete_scope(self, alias) is not None:
+            return super().delete(using=alias, keep_parents=keep_parents)
+        actor = current_actor()
+        unscoped = is_sudo() or (actor is None and not app_settings.REBAC_STRICT_MODE)
+        with model_write(model=type(self), using=alias) as maintenance:
+            if maintenance is not None:
+                maintenance.capture_old(model=type(self), pks=(self.pk,))
+            with deletion_owner(self, alias, actor, unscoped):
+                return super().delete(using=alias, keep_parents=keep_parents)
+
+
+class RebacMixin(RebacTrackedMixin):
     """Mix into a model to gate every read / write / delete on REBAC.
 
     Required: declare `Meta.rebac_resource_type = "<app>/<resource>"`.
 
     What this installs:
       - `objects = RebacManager()` — replaces the default manager.
-      - `_default_manager` points at it; `_base_manager` left unfiltered (Django
-        uses base manager for FK reverse caching / M2M intermediates).
-      - Pre-save / pre-delete signal handlers gate writes (wired in `signals.py`).
+      - `_default_manager` points at it; `_base_manager` owns index maintenance
+        and remains unfiltered for Django's relationship infrastructure.
+      - save_base/delete owners gate writes; explicit-sender signals cover cascades.
       - ``from_db()`` propagates the queryset's actor onto loaded instances
         and snapshots loaded field values into ``_rebac_loaded_values`` for
         later dirty-field computation (per-field ``write__<f>`` enforcement;
-        see ``signals.py``).
+        see ``mixins.py``).
 
     Instance-level surface (Odoo PR #179148 triple, plus actor / sudo binding):
 
@@ -178,7 +313,9 @@ class RebacMixin(models.Model, metaclass=RebacModelBase):
       blob.
     """
 
-    objects = RebacManager()
+    # Django's model metaclass replaces the abstract parent's manager; the
+    # class-level slot is intentionally more specific on resource models.
+    objects: ClassVar[RebacManager] = RebacManager()  # pyright: ignore[reportIncompatibleVariableOverride]
 
     # Carried through from_db (via the queryset's `_fetch_all`) so
     # `instance.save()` re-checks against the same actor. Both this and
@@ -195,10 +332,10 @@ class RebacMixin(models.Model, metaclass=RebacModelBase):
         # class default would survive pickling and defeat the
         # actor-stripping contract in ``__getstate__``). Snapshot of the
         # row's loaded field values, used for per-field dirty detection
-        # in pre_save.
+        # in save_base.
         _rebac_loaded_values: dict[str, Any]
 
-    class Meta:
+    class Meta(RebacTrackedMixin.Meta):
         abstract = True
 
     def proposed_relationships(
@@ -230,7 +367,7 @@ class RebacMixin(models.Model, metaclass=RebacModelBase):
         """Instantiate from a row + snapshot loaded field values.
 
         The snapshot lives on ``instance._rebac_loaded_values`` and powers
-        per-field write gates: ``signals.py`` compares it against the
+        per-field write gates: the save_base owner compares it against the
         current values to detect dirty fields, then re-checks each one
         against ``write__<field>`` if such a permission is declared.
 
@@ -361,6 +498,9 @@ class RebacMixin(models.Model, metaclass=RebacModelBase):
         from .conf import app_settings
         from .errors import MissingActorError
 
+        insert = _insert_scope.get()
+        if insert is not None and insert[0] is self:
+            return insert[1], insert[2]
         if self._rebac_sudo_reason is not None:
             return (None, True)
         if self._rebac_actor is not None:
@@ -412,8 +552,8 @@ class RebacMixin(models.Model, metaclass=RebacModelBase):
             return CheckResult.has(reason="unscoped")
         assert actor is not None
 
-        # Empty resource_id on adding — same sentinel the pre-save signal
-        # uses so the backend treats it as a model-level "any row?" check.
+        # Empty resource_id on adding is the backend's model-level "any row?"
+        # sentinel. Persistence itself uses check_new's candidate overlay.
         if self._state.adding:
             resource_id = ""
         else:
@@ -494,10 +634,81 @@ class RebacMixin(models.Model, metaclass=RebacModelBase):
         return self
 
     def save(self, *args: Any, **kwargs: Any) -> None:
+        self._rebac_save(*args, **kwargs)
+
+    def save_base(
+        self,
+        raw: bool = False,
+        force_insert: bool | tuple[ModelBase, ...] = False,
+        force_update: bool = False,
+        using: str | None = None,
+        update_fields: Iterable[str] | None = None,
+    ) -> None:
+        from .errors import PermissionDenied
+        from .index.maintain import model_write
+
+        alias = using or router.db_for_write(type(self), instance=self)
+        if raw:
+            return super().save_base(raw, force_insert, force_update, alias, update_fields)
+        try:
+            with model_write(model=type(self), using=alias, names=update_fields) as maintenance:
+                if maintenance is not None and self.pk is not None:
+                    maintenance.capture_old(model=type(self), pks=(self.pk,))
+                _gate_save(type(self), self, using=alias, update_fields=update_fields)
+                super().save_base(raw, force_insert, force_update, alias, update_fields)
+                if maintenance is not None:
+                    maintenance.changed(model=type(self), pks=(self.pk,))
+        except PermissionDenied as exc:
+            # The gate's audit write was inside the rolled-back owner block
+            # (model_write always opens one). Re-emit it after the rollback,
+            # preserving any caller transaction and the exact field action.
+            self._audit_denial_after_rollback(exc, default_action="write")
+            raise
+
+    def delete(
+        self, using: str | None = None, keep_parents: bool = False
+    ) -> tuple[int, dict[str, int]]:
+        from .errors import PermissionDenied
+        from .index.maintain import model_write
+
+        alias = using or router.db_for_write(type(self), instance=self)
+        scope = self.effective_actor(strict=bool(model_resource_type(self)))
+        try:
+            with model_write(model=type(self), using=alias) as maintenance:
+                _gate_delete(type(self), self, scope=scope)
+                if maintenance is not None:
+                    maintenance.capture_old(model=type(self), pks=(self.pk,))
+                with deletion_owner(self, alias, *scope):
+                    # The tracked base reuses this scope, preserving consumer MRO.
+                    return super().delete(using=alias, keep_parents=keep_parents)
+        except PermissionDenied as exc:
+            self._audit_denial_after_rollback(exc, default_action="delete")
+            raise
+
+    def _audit_denial_after_rollback(self, exc: Exception, *, default_action: str) -> None:
+        from .conf import app_settings
+
+        if not app_settings.REBAC_AUDIT_DENIALS or " cannot " not in str(exc):
+            return
+        resource_type = model_resource_type(type(self))
+        if resource_type is None:
+            return
+        actor, unscoped = self.effective_actor(strict=False)
+        if unscoped:
+            return
+        action = str(exc).split(" cannot ", 1)[1].split(" ", 1)[0] or default_action
+        resource_id = "" if self._state.adding else str(getattr(self, resource_id_attr(type(self))))
+        _maybe_audit_denial(
+            actor=actor,
+            action=action,
+            resource=ObjectRef(resource_type, resource_id),
+        )
+
+    def _rebac_save(self, *args: Any, **kwargs: Any) -> None:
         """Keep new resource instances insert-only and exclude redacted update fields.
 
-        Explicit ``save(update_fields=[...])`` remains visible to the signal
-        layer, which fails closed if a redacted field is named.
+        Explicit ``save(update_fields=[...])`` remains visible to the save_base
+        owner, which fails closed if a redacted field is named.
         """
         if self._state.adding and model_resource_type(self):
             if kwargs.get("force_update") or kwargs.get("update_fields") is not None:
@@ -560,3 +771,283 @@ class RebacMixin(models.Model, metaclass=RebacModelBase):
             if stored is not None:
                 return str(stored)
         return str(getattr(self, attr))
+
+
+def _maybe_audit_denial(*, actor: SubjectRef | None, action: str, resource: ObjectRef) -> None:
+    """Emit a denial audit row when REBAC_AUDIT_DENIALS is enabled.
+
+    Uses ``defer_to_commit=False`` so the row persists even though the
+    raising save / delete is about to roll back the surrounding transaction.
+
+    Audit kind reuses the relevant grant / revoke kind (a denied write is a
+    grant that didn't happen; a denied delete is a revoke that didn't
+    happen). The reason text carries the ``denied:`` prefix so consumers
+    can distinguish denial from successful writes when querying the trail.
+    """
+    if not app_settings.REBAC_AUDIT_DENIALS:
+        return
+    from .audit import emit as emit_audit
+    from .models import PermissionAuditEvent
+
+    if action == "delete":
+        kind = PermissionAuditEvent.KIND_RELATIONSHIP_REVOKE
+    else:
+        kind = PermissionAuditEvent.KIND_RELATIONSHIP_GRANT
+    emit_audit(
+        kind,
+        actor=actor,
+        origin=actor,
+        target_repr=f"{resource}#{action}",
+        reason=f"denied: {actor} cannot {action} {resource}",
+        defer_to_commit=False,
+    )
+
+
+def _gate_save(
+    sender: type[models.Model],
+    instance: Any,
+    raw: bool = False,
+    using: Any = None,
+    update_fields: Iterable[str] | None = None,
+    **_: Any,
+) -> None:
+    if raw:
+        return
+    if not isinstance(instance, RebacMixin):
+        return
+    rebac_type = model_resource_type(sender)
+    if not rebac_type:
+        return
+    # Share the observer/check API's precedence: a pinned actor outranks
+    # ambient sudo, while an explicit instance bypass still wins locally.
+    actor, unscoped = instance.effective_actor(strict=True)
+    if unscoped:
+        return
+    assert actor is not None
+
+    is_create = instance._state.adding
+    action = "create" if is_create else "write"
+
+    from .backends import backend
+
+    if is_create:
+        active_backend = backend()
+        result = _check_new_model(
+            instance,
+            subject=actor,
+            using=using,
+            backend=active_backend,
+        )
+        resource = ObjectRef(rebac_type, "")
+    else:
+        resource_id = _resource_id_for_existing_instance(sender=sender, instance=instance)
+        resource = ObjectRef(rebac_type, resource_id)
+        result = backend().check_access(subject=actor, action=action, resource=resource)
+    if not result.allowed:
+        _maybe_audit_denial(actor=actor, action=action, resource=resource)
+        raise PermissionDenied(f"Denied: {actor} cannot {action} {resource}")
+
+    # Per-field ``write__<f>`` enforcement — only on UPDATE. On INSERT the
+    # row didn't exist, so "loaded values" is empty and every field is
+    # trivially "dirty"; gating create on per-field permissions makes no
+    # sense (use ``permission create = ...`` for that).
+    if not is_create:
+        _enforce_redacted_field_writes(
+            sender=sender,
+            instance=instance,
+            resource=resource,
+            update_fields=update_fields,
+        )
+        _enforce_per_field_writes(
+            sender=sender,
+            instance=instance,
+            actor=actor,
+            resource=resource,
+            update_fields=update_fields,
+        )
+
+
+def _gate_delete(
+    sender: type[models.Model],
+    instance: Any,
+    scope: tuple[SubjectRef | None, bool] | None = None,
+) -> None:
+    if not isinstance(instance, RebacMixin):
+        return
+    rebac_type = model_resource_type(sender)
+    if not rebac_type:
+        return
+    actor, unscoped = scope if scope is not None else instance.effective_actor(strict=True)
+    if unscoped:
+        return
+    if actor is None:
+        from .errors import MissingActorError
+
+        raise MissingActorError("Cascaded delete has no actor.")
+
+    from .backends import backend
+
+    resource_id = str(getattr(instance, resource_id_attr(sender)))
+    resource = ObjectRef(rebac_type, resource_id)
+    result = backend().check_access(subject=actor, action="delete", resource=resource)
+    if not result.allowed:
+        _maybe_audit_denial(actor=actor, action="delete", resource=resource)
+        raise PermissionDenied(f"Denied: {actor} cannot delete {resource}")
+
+
+# ---------- Per-field write helpers ----------
+
+
+def _enforce_redacted_field_writes(
+    *,
+    sender: type[models.Model],
+    instance: Any,
+    resource: ObjectRef,
+    update_fields: Iterable[str] | None,
+) -> None:
+    redacted = frozenset(getattr(instance, "_rebac_redacted_fields", frozenset()) or frozenset())
+    if not redacted or update_fields is None:
+        return
+    requested = set(_normalise_update_field_names(sender=sender, update_fields=update_fields))
+    bad = redacted & requested
+    if bad:
+        names = ", ".join(sorted(bad))
+        raise PermissionDenied(
+            f"Cannot write redacted field(s) {names} on {resource}: "
+            "read__<field> denied on the loaded instance."
+        )
+
+
+def _resource_id_for_existing_instance(*, sender: type[models.Model], instance: Any) -> str:
+    attr = resource_id_attr(sender)
+    redacted = frozenset(getattr(instance, "_rebac_redacted_fields", frozenset()) or frozenset())
+    field_names = {attr}
+    try:
+        field = sender._meta.get_field(attr)
+    except Exception:
+        field = None
+    if field is not None:
+        field_names.add(field.name)
+        field_names.add(getattr(field, "attname", field.name))
+    if redacted & field_names:
+        stored = getattr(instance, "_rebac_resource_id", None)
+        if stored is not None:
+            return str(stored)
+    return str(getattr(instance, attr))
+
+
+def _enforce_per_field_writes(
+    *,
+    sender: type[models.Model],
+    instance: Any,
+    actor: SubjectRef,
+    resource: ObjectRef,
+    update_fields: Iterable[str] | None,
+) -> None:
+    """Re-run ``check_access`` for any dirty field that has a ``write__<f>``
+    permission declared on its resource type.
+
+    Called after the resource-level ``write`` check has already passed.
+    Honours ``save(update_fields=...)`` when supplied (the caller knows
+    what's actually dirty); otherwise falls back to comparing current
+    values against the snapshot ``from_db`` stashed on the instance. If
+    no snapshot is present (instance hand-built and re-saved as an
+    UPDATE — unusual), every non-pk concrete field is treated as dirty
+    (conservative; fail-closed).
+
+    Schema lookup goes via ``backend().schema()`` when the backend
+    exposes one (LocalBackend always does; SpiceDBBackend will route
+    through its own server-side schema once 0.5 lands). Backends without
+    an in-process schema accessor skip per-field enforcement — the
+    resource-level ``write`` check already gated the operation.
+
+    Pure in-memory comparison; never queries the DB to refresh state.
+    """
+    schema = backend_schema()
+    if schema is None:
+        return
+    definition = schema.get_definition(resource.resource_type)
+    if definition is None:
+        return
+    declared = field_gated_actions(definition, "write")
+    if not declared:
+        return  # No per-field gates declared — common case, cheap exit.
+
+    dirty = _dirty_field_names(sender=sender, instance=instance, update_fields=update_fields)
+    if not dirty:
+        return
+
+    from .backends import backend
+
+    for field_name in dirty:
+        action = f"write__{field_name}"
+        if action not in declared:
+            continue  # Field inherits the resource-level write (already passed).
+        result = backend().check_access(subject=actor, action=action, resource=resource)
+        if not result.allowed:
+            _maybe_audit_denial(actor=actor, action=action, resource=resource)
+            raise PermissionDenied(
+                f"Denied: {actor} cannot {action} {resource} "
+                f"(field {field_name!r} requires {action})"
+            )
+
+
+def _dirty_field_names(
+    *,
+    sender: type[models.Model],
+    instance: Any,
+    update_fields: Iterable[str] | None,
+) -> list[str]:
+    """Return the list of (field.name) values that have changed.
+
+    Trust order:
+
+    1. If the caller passed ``save(update_fields=[...])``, trust it
+       (Django itself only writes those columns). Normalise tokens to
+       ``field.name`` so that both ``"folder"`` and ``"folder_id"`` look
+       up ``write__folder`` correctly.
+    2. Otherwise compare ``_rebac_loaded_values`` (snapshotted in
+       ``RebacMixin.from_db``) against the current attribute values for
+       every non-pk concrete field. Fields that were deferred at load
+       time (absent from the snapshot) are treated as dirty.
+    3. If no snapshot exists at all (e.g. hand-built instance being
+       re-saved as an UPDATE — rare), conservatively treat every non-pk
+       concrete field as dirty.
+    """
+    meta = sender._meta
+    if update_fields is not None:
+        return _normalise_update_field_names(sender=sender, update_fields=update_fields)
+
+    concrete = [f for f in meta.concrete_fields if not f.primary_key]
+    loaded: dict[str, Any] | None = getattr(instance, "_rebac_loaded_values", None)
+    if loaded is None:
+        return [f.name for f in concrete]
+
+    dirty: list[str] = []
+    for field in concrete:
+        attname = field.attname
+        current = getattr(instance, attname, None)
+        if attname not in loaded:
+            # Was deferred at load time — can't compare cheaply.
+            dirty.append(field.name)
+        elif loaded[attname] != current:
+            dirty.append(field.name)
+    return dirty
+
+
+def _normalise_update_field_names(
+    *,
+    sender: type[models.Model],
+    update_fields: Iterable[str],
+) -> list[str]:
+    meta = sender._meta
+    names: list[str] = []
+    for tok in update_fields:
+        try:
+            field = meta.get_field(tok)
+        except Exception:
+            # Unknown field tag — leave it; Django will reject the save.
+            names.append(tok)
+            continue
+        names.append(field.name)
+    return names

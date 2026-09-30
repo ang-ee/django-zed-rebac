@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "django-zed-rebac"
-version = "0.22.1"
+version = "0.23.0"
 description = "Drop-in REBAC engine for Django, SpiceDB-compatible, with a pure-Django LocalBackend."
 readme = "README.md"
 license = "Apache-2.0"
@@ -48,6 +48,7 @@ dev = [
     "pytest-django>=4.8",
     "pytest-randomly>=3.16",
     "pytest-xdist>=3.6",
+    "pytest-timeout>=2.3",
     "ruff>=0.5",
     "mypy>=1.10",
     "pyright>=1.1.350",
@@ -72,9 +73,20 @@ rebac = ["py.typed"]
 DJANGO_SETTINGS_MODULE = "tests.settings"
 python_files = ["test_*.py"]
 testpaths = ["tests"]
-addopts = "-p no:randomly"
-markers = ["schema_vendors: opt-in Docker PostgreSQL/MySQL Django schema owner and upgrade contract"]
+addopts = "-p no:randomly -m 'not index_exhaustive and not slow and not schema_vendors'"
+markers = [
+    "slow: opt-in expensive tests, excluded from the default suite",
+    "index_exhaustive: opt-in complete permission-index reference expression and tuple-presence sweep",
+    "index_shard: independently schedulable shard of the exhaustive permission-index reference sweep",
+    "postgresql: permission-index transaction and concurrency cases requiring PostgreSQL",
+    "schema_vendors: opt-in Docker PostgreSQL/MySQL storage, schema owner and upgrade contracts",
+]
 pythonpath = ["."]
+# A hung test (e.g. a lock-ordering deadlock) must fail loudly, not stall the run:
+# faulthandler dumps every thread's stack after 120 s; pytest-timeout fails the
+# test after 300 s. Opt-in sweeps override with `--timeout=0` if they need more.
+faulthandler_timeout = 120
+timeout = 300
 filterwarnings = [
     "error",
     "ignore::DeprecationWarning:django.*",

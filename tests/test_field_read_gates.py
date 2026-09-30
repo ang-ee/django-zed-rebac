@@ -27,6 +27,7 @@ from rebac import (
 )
 from rebac.backends import reset_backend
 from rebac.schema import parse_zed
+from tests.backend_setup import atomic_source_write, install_schema
 from tests.testapp.models import Post
 
 SCHEMA_TEXT = """
@@ -120,7 +121,7 @@ FUTURE = "2099-01-01T00:00:00Z"
 @pytest.fixture(autouse=True)
 def _setup_backend(db):
     reset_backend()
-    backend().set_schema(parse_zed(SCHEMA_TEXT))
+    install_schema(backend(), parse_zed(SCHEMA_TEXT))
     yield
     reset_backend()
 
@@ -129,14 +130,14 @@ def _setup_backend(db):
 def alice(db):
     from django.contrib.auth import get_user_model
 
-    return get_user_model().objects.create(username="alice", is_active=True)
+    return atomic_source_write(get_user_model().objects.create, username="alice", is_active=True)
 
 
 @pytest.fixture
 def bob(db):
     from django.contrib.auth import get_user_model
 
-    return get_user_model().objects.create(username="bob", is_active=True)
+    return atomic_source_write(get_user_model().objects.create, username="bob", is_active=True)
 
 
 def _post(*, title: str, body: str = ""):
@@ -357,7 +358,7 @@ def test_aggregate_cannot_return_a_gated_field(alice):
 
 
 def test_no_read_gates_do_not_add_field_accessible_calls(alice, monkeypatch):
-    backend().set_schema(parse_zed(NO_READ_GATE_SCHEMA_TEXT))
+    install_schema(backend(), parse_zed(NO_READ_GATE_SCHEMA_TEXT))
     post = _post(title="plain")
     _post(title="hidden")
     _grant(post.pk, alice, "owner")
@@ -381,8 +382,6 @@ def test_no_read_gates_do_not_add_field_accessible_calls(alice, monkeypatch):
     post_table = connection.ops.quote_name(Post._meta.db_table)
     row_queries = [query["sql"] for query in queries if f"FROM {post_table}" in query["sql"]]
     assert len(row_queries) == 1
-    assert " IN (SELECT " in row_queries[0]
-    assert "EXISTS" not in row_queries[0]
 
 
 @override_settings(REBAC_FIELD_READ_MODE="redact")
@@ -423,7 +422,7 @@ def test_full_save_excludes_redacted_fields_from_the_update(alice, bob):
 def test_full_save_uses_dirty_fields_minus_redacted_fields(alice, bob):
     from tests.testapp.models import Post
 
-    backend().set_schema(parse_zed(WRITE_GATE_WITH_REDACTED_BODY_SCHEMA_TEXT))
+    install_schema(backend(), parse_zed(WRITE_GATE_WITH_REDACTED_BODY_SCHEMA_TEXT))
     post = _post(title="visible title", body="stored secret")
     folder = _folder(name="new folder")
     _grant(post.pk, bob, "owner")
@@ -464,7 +463,7 @@ def test_bulk_update_still_works_when_read_gates_are_enabled(alice, bob):
 def test_full_save_skips_deferred_fields_when_redaction_narrows_update_fields(alice, bob):
     from tests.testapp.models import Post
 
-    backend().set_schema(parse_zed(WRITE_GATE_WITH_REDACTED_BODY_SCHEMA_TEXT))
+    install_schema(backend(), parse_zed(WRITE_GATE_WITH_REDACTED_BODY_SCHEMA_TEXT))
     post = _post(title="deferred title", body="stored secret")
     _grant(post.pk, bob, "owner")
     _grant(post.pk, alice, "viewer")
@@ -528,7 +527,7 @@ def test_pickled_redacted_instance_preserves_write_safety_metadata(alice, bob):
 def test_redacted_resource_id_attr_still_authorizes_writes_against_loaded_id(alice, bob):
     from tests.testapp.models import SluggedPost
 
-    backend().set_schema(parse_zed(SLUGGED_SCHEMA_TEXT))
+    install_schema(backend(), parse_zed(SLUGGED_SCHEMA_TEXT))
     post = _slugged_post(slug="visible-id", title="old title")
     _grant_ref("blog/sluggedpost", "visible-id", bob, "owner")
     _grant_ref("blog/sluggedpost", "visible-id", alice, "viewer")
@@ -565,7 +564,7 @@ def test_explicit_save_of_redacted_field_fails_closed(alice, bob):
 
 
 def test_instance_denied_read_fields_honours_caveat_context(alice):
-    backend().set_schema(parse_zed(CAVEAT_SCHEMA_TEXT))
+    install_schema(backend(), parse_zed(CAVEAT_SCHEMA_TEXT))
     post = _post(title="conditional title")
     _grant(post.pk, alice, "viewer")
     _grant(
@@ -586,7 +585,7 @@ def test_instance_denied_read_fields_honours_caveat_context(alice):
 def test_bulk_conditional_field_reads_fail_closed_by_default_and_can_flip(alice):
     from tests.testapp.models import Post
 
-    backend().set_schema(parse_zed(CAVEAT_SCHEMA_TEXT))
+    install_schema(backend(), parse_zed(CAVEAT_SCHEMA_TEXT))
     post = _post(title="conditional title")
     _grant(post.pk, alice, "viewer")
     _grant(

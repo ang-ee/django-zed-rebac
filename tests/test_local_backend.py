@@ -19,6 +19,7 @@ from rebac.models import (
     SchemaRelation,
 )
 from rebac.schema import parse_zed
+from tests.backend_setup import install_schema
 
 SCHEMA_TEXT = """
 caveat during_business_hours(hour int) { hour >= 0 }
@@ -51,7 +52,7 @@ definition blog/folder {
 @pytest.fixture
 def backend(db):
     b = LocalBackend()
-    b.set_schema(parse_zed(SCHEMA_TEXT))
+    install_schema(b, parse_zed(SCHEMA_TEXT))
     return b
 
 
@@ -228,7 +229,8 @@ def test_wildcard_grants_read_to_anyone(backend):
 
 def test_schema_level_builtin_actor_grants(db):
     backend = LocalBackend()
-    backend.set_schema(
+    install_schema(
+        backend,
         parse_zed(
             """
             definition auth/user {}
@@ -239,7 +241,7 @@ def test_schema_level_builtin_actor_grants(db):
                 permission signed_in = authenticated
             }
             """
-        )
+        ),
     )
     provider = ObjectRef("auth_oidc/provider", "google")
     # ``anonymous`` schema keyword matches the canonical anonymous
@@ -340,7 +342,20 @@ def test_cached_db_schema_does_not_query_schema_tables_on_hot_path() -> None:
         with CaptureQueriesContext(connection) as queries:
             assert backend.has_access(subject=alice, action="read", resource=post)
 
-    schema_queries = [query["sql"] for query in queries if '"rebac_schema' in query["sql"].lower()]
+    schema_queries = [
+        query["sql"]
+        for query in queries
+        if any(
+            f'"rebac_{name}"' in query["sql"].lower()
+            for name in (
+                "schemadefinition",
+                "schemarelation",
+                "schemapermission",
+                "schemacaveat",
+                "schemaoverride",
+            )
+        )
+    ]
     assert schema_queries == []
 
 

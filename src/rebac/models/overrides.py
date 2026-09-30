@@ -11,6 +11,8 @@ from .schema_write import SchemaRow
 
 
 class SchemaOverride(SchemaRow):
+    _audit_target: str | None = None
+
     KIND_TIGHTEN = "tighten"
     KIND_LOOSEN = "loosen"
     KIND_DISABLE = "disable"
@@ -45,3 +47,43 @@ class SchemaOverride(SchemaRow):
 
     def __str__(self) -> str:
         return f"{self.kind}:{self.target_ct}/{self.target_pk}"
+
+    def _audit_target_repr(self) -> str:
+        cached = getattr(self, "_audit_target", None)
+        if cached is not None:
+            return str(cached)
+        try:
+            ct = self.target_ct
+            return f"{self.kind}:{ct.app_label}.{ct.model}/{self.target_pk}"
+        except ContentType.DoesNotExist:
+            return f"{self.kind}:?/{self.target_pk}"
+
+    def _audit_change(self, *, created: bool) -> None:
+        from ..actors import current_actor
+        from ..audit import emit
+        from ..backends import reset_backend
+        from .audit import PermissionAuditEvent
+
+        reset_backend()
+        payload = {"kind": self.kind, "expression": self.expression, "reason": self.reason}
+        actor = current_actor()
+        emit(
+            PermissionAuditEvent.KIND_OVERRIDE_CREATE
+            if created
+            else PermissionAuditEvent.KIND_OVERRIDE_DELETE,
+            actor=actor,
+            origin=actor,
+            target_repr=self._audit_target_repr(),
+            before=None if created else payload,
+            after=payload if created else None,
+            reason=self.reason or "",
+            defer_to_commit=True,
+        )
+
+    def _write_effects(self, *, created: bool = False, deleted: bool = False) -> None:
+        from ..backends import reset_backend
+
+        if created or deleted:
+            self._audit_change(created=created)
+        else:
+            reset_backend()

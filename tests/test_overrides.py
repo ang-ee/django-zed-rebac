@@ -599,11 +599,8 @@ def test_override_introducing_self_cycle_is_rejected() -> None:
     sp = _seed_db_schema("blog/post", "read", "owner")
     # Introduce `read = read` via a tighten override — `(owner & read)`
     # closes the loop on `read`.
-    ovr = _make_ovr(sp, SchemaOverride.KIND_TIGHTEN, "read")
-
-    baseline = _baseline_with_perm("blog/post", "read", "owner")
     with pytest.raises(SchemaError) as exc_info:
-        compose(baseline, [ovr])
+        _make_ovr(sp, SchemaOverride.KIND_TIGHTEN, "read")
     assert "cycle" in str(exc_info.value).lower()
 
 

@@ -51,6 +51,7 @@ def synced(request, settings):
     local = backend()
     resource = ObjectRef("blog/post", str(post.pk))
     local.write_relationships([RelationshipTuple(resource, "owner", ACTOR)])
+    local.schema()  # Warm the per-revision snapshot before measuring scoped reads.
     yield local, resource
     reset_backend()
 
@@ -68,7 +69,9 @@ def _loads(queries):
 
 
 def _generation_reads(queries):
-    return sum('FROM "rebac_schemageneration"' in query["sql"] for query in queries)
+    # Count standalone witness round trips, not the execution fence embedded
+    # in the permission statement (which adds no database round trip).
+    return sum(query["sql"].startswith('SELECT "rebac_schemageneration".') for query in queries)
 
 
 def _permission():
@@ -159,7 +162,10 @@ def test_evaluator_scope_query_budget(synced, atomic, surface):
                     evaluate()
             expected = 0 if surface == "new" or (surface == "decision" and not atomic) else n
             assert len(repeated) == expected
-            assert _generation_reads(repeated) == _loads(repeated) == 0
+            assert _loads(repeated) == 0
+            assert _generation_reads(repeated) == 0
+            if expected:
+                assert all("rebac_schemageneration" in query["sql"] for query in repeated)
 
 
 def test_evaluator_revalidates_once_per_transaction_boundary(synced):
@@ -180,54 +186,23 @@ def test_evaluator_revalidates_once_per_transaction_boundary(synced):
 
 
 @pytest.mark.parametrize("scoped", [False, True])
-def test_absent_witness_never_caches_a_revoked_grant(synced, scoped):
+def test_absent_witness_fails_closed_until_rebuilt(synced, scoped):
+    from rebac import SchemaError
+    from tests.backend_setup import rebuild_backend
+
     local, resource = synced
-    permission = _permission()
     SchemaGeneration.objects.all().delete()
-    other = connection.copy(alias="unwitnessed_writer")
-    try:
-        with evaluator_scope() if scoped else nullcontext() as evaluator:
-
-            def check():
-                if evaluator is not None:
-                    return evaluator.check(
-                        local, subject=ACTOR, action="write", resource=resource
-                    ).allowed
-                return _check(local, resource)
-
-            assert check()
-            _write_permission("nil", permission.pk, using=other)
-            assert not check()
-            assert not check()
-            if evaluator is not None:
-                assert evaluator.stats()["check_entries"] == 0
-    finally:
-        BaseDatabaseWrapper.close(other)
-        SchemaGeneration.objects.advance(using="default")
-
-
-@pytest.mark.parametrize("atomic", [False, True])
-def test_unmigrated_database_loads_uncached(synced, atomic):
-    local, resource = synced
-    permission = _permission()
-    try:
-        call_command("migrate", "rebac", "0004", verbosity=0)
-        with transaction.atomic() if atomic else nullcontext(), evaluator_scope() as evaluator:
-            assert evaluator.check(local, subject=ACTOR, action="write", resource=resource).allowed
-            from django.db.migrations.executor import MigrationExecutor
-
-            legacy = (
-                MigrationExecutor(connection)
-                .loader.project_state([("rebac", "0004_field_backing_path")])
-                .apps.get_model("rebac", "SchemaPermission")
-            )
-            legacy.objects.filter(pk=permission.pk).update(expression="nil")
-            assert not evaluator.check(
-                local, subject=ACTOR, action="write", resource=resource
-            ).allowed
-        assert not _check(local, resource)
-    finally:
-        call_command("migrate", "rebac", "0006", verbosity=0)
+    local.mark_schema_stale()
+    with evaluator_scope() if scoped else nullcontext() as evaluator:
+        with pytest.raises(SchemaError, match="E013"):
+            if evaluator is None:
+                _check(local, resource)
+            else:
+                evaluator.check(local, subject=ACTOR, action="write", resource=resource)
+        if evaluator is not None:
+            assert evaluator.stats()["check_entries"] == 0
+    rebuild_backend(local)
+    assert _check(local, resource)
 
 
 def test_revision_reads_can_run_concurrently(synced):
@@ -235,7 +210,7 @@ def test_revision_reads_can_run_concurrently(synced):
     barrier = Barrier(4)
 
     def instrument(execute, sql, params, many, context):
-        if 'FROM "rebac_schemageneration"' in sql:
+        if sql.startswith('SELECT "rebac_schemageneration".'):
             # Deterministic regression for a lock held during network I/O:
             # all four queries must enter before any one can finish.
             barrier.wait(timeout=5)
@@ -259,23 +234,42 @@ def test_revision_races_have_a_bounded_retry_budget(synced, monkeypatch):
     local = LocalBackend()
     reads = []
 
-    def changing_revision(connection):
-        reads.append(connection.alias)
-        return str(len(reads))
+    witness = SchemaGeneration.objects.witness
 
-    monkeypatch.setattr(local, "_read_schema_revision", changing_revision)
+    def changing_revision(using):
+        reads.append(using)
+        current = witness(using)
+        # Three racing before/after pairs, then a stable paired fallback.
+        if (len(reads) - 1) % 8 < 6:
+            return current._replace(revision=str(len(reads)))
+        return current
+
+    load_snapshot = local._load_schema_snapshot
+
+    def racing_snapshot():
+        # Interleave this reader's witness observations only. Writes and other
+        # backends must continue to use their real publication witnesses.
+        with monkeypatch.context() as reader_patch:
+            reader_patch.setattr(SchemaGeneration.objects, "witness", changing_revision)
+            return load_snapshot()
+
+    monkeypatch.setattr(local, "_load_schema_snapshot", racing_snapshot)
     load = local._load_schema_from_db
     loads = []
 
-    def count_load(using):
+    def count_load(using, **kwargs):
+        if kwargs.get("overrides") is not None:
+            return load(using, **kwargs)
         loads.append(using)
         return load(using)
 
     monkeypatch.setattr(local, "_load_schema_from_db", count_load)
     snapshot = local._schema_snapshot()
-    assert snapshot.revision is None
+    assert (snapshot.revision, snapshot.index_revision, snapshot.index_program) == witness(
+        "default"
+    )
     assert snapshot.generation == -1
-    assert len(reads) == 6
+    assert len(reads) == 8  # Six racing reads plus the two fallback witnesses.
     assert len(loads) == 4  # Three attempts, then one uncached fallback.
     assert local._schema_loads == local._schema_snapshots == {}
     with evaluator_scope() as evaluator:
@@ -291,6 +285,30 @@ def test_generation_model_is_private():
 
     assert not hasattr(rebac.models, "SchemaGeneration")
     assert SchemaGeneration._meta.default_permissions == ()
+
+
+def test_uncached_fallback_retains_mismatched_index_witness(synced, monkeypatch):
+    from unittest.mock import Mock
+
+    from rebac.errors import SchemaError
+    from rebac.index import read
+
+    local = LocalBackend()
+    current = SchemaGeneration.objects.witness("default")
+    revision, stale = current.revision, "stale-index"
+    pairs = Mock(
+        side_effect=[current._replace(revision=str(n), index_revision=stale) for n in range(6)]
+        + [current._replace(index_revision=stale)] * 2
+    )
+    monkeypatch.setattr(SchemaGeneration.objects, "witness", pairs)
+    with read.using_backend(local):
+        snapshot = local._schema_snapshot()
+        assert snapshot.generation == -1
+        assert (snapshot.revision, snapshot.index_revision) == (revision, stale)
+        with pytest.raises(SchemaError, match=r"rebac\.E013"):
+            read.ensure_ready(using="default")
+    assert pairs.call_count == 8  # Readiness consumes the pinned pair, with no ninth SELECT.
+    assert local._schema_snapshots == local._schema_facts_memo == {}
 
 
 @pytest.mark.parametrize("external", [False, True])
@@ -400,7 +418,9 @@ def test_load_retries_when_another_connection_changes_revision(synced, monkeypat
     other = connection.copy(alias="schema_writer")
     calls = []
 
-    def racing_load(using):
+    def racing_load(using, **kwargs):
+        if kwargs.get("overrides") is not None:
+            return load(using, **kwargs)
         result = load(using)
         calls.append(using)
         if len(calls) == 1:
@@ -417,27 +437,20 @@ def test_load_retries_when_another_connection_changes_revision(synced, monkeypat
         BaseDatabaseWrapper.close(other)
 
 
-def test_shared_backend_threads_parse_and_compute_facts_once(synced, monkeypatch):
+def test_shared_backend_threads_parse_once(synced, monkeypatch):
     _, resource = synced
     local = LocalBackend()
     barrier = Barrier(8)
     loads = []
-    facts = []
     load = local._load_schema_from_db
-    from rebac.schema import introspection
 
-    live_types = introspection.live_backed_resource_types
-
-    def count_load(using):
+    def count_load(using, **kwargs):
+        if kwargs.get("overrides") is not None:
+            return load(using, **kwargs)
         loads.append(using)
         return load(using)
 
-    def count_facts(schema):
-        facts.append(schema)
-        return live_types(schema)
-
     monkeypatch.setattr(local, "_load_schema_from_db", count_load)
-    monkeypatch.setattr(introspection, "live_backed_resource_types", count_facts)
 
     def worker():
         db = connections["default"]
@@ -462,7 +475,7 @@ def test_shared_backend_threads_parse_and_compute_facts_once(synced, monkeypatch
         assert warm == 0
         assert cost == 8
         assert schema is parent_schema
-    assert len(loads) == len(facts) == local._schema_generation == 1
+    assert len(loads) == local._schema_generation == 1
 
 
 def test_signal_invalidation_does_not_wait_on_database_loader(synced, monkeypatch):
@@ -472,7 +485,9 @@ def test_signal_invalidation_does_not_wait_on_database_loader(synced, monkeypatc
     load = local._load_schema_from_db
     calls = []
 
-    def slow_load(using):
+    def slow_load(using, **kwargs):
+        if kwargs.get("overrides") is not None:
+            return load(using, **kwargs)
         schema = load(using)
         calls.append(using)
         if len(calls) == 1:
@@ -547,8 +562,11 @@ def test_generation_migration_reverses_without_changing_schema(synced):
         assert "rebac_schemageneration" not in connection.introspection.table_names()
         assert list(SchemaPermission.objects.order_by("pk").values()) == before
     finally:
-        call_command("migrate", "rebac", "0006", verbosity=0)
+        call_command("migrate", "rebac", "0007", verbosity=0)
     assert list(SchemaPermission.objects.order_by("pk").values()) == before
+    from tests.backend_setup import rebuild_backend
+
+    rebuild_backend(local)
     assert _revision() != revision
     assert _check(local, resource)
     _write_permission("viewer", _permission().pk)
@@ -582,7 +600,9 @@ def test_cached_schema_keeps_filtered_constants_and_fields_live(synced):
     with evaluator_scope() as evaluator:
         assert evaluator.check(local, subject=ACTOR, action="read", resource=resource).allowed
         revision = _revision()
-        Folder._base_manager.filter(pk=row.pk).update(is_active=False)
+        Folder.objects.sudo(reason="backing fixture update").filter(pk=row.pk).update(
+            is_active=False
+        )
         with CaptureQueriesContext(connection) as queries:
             assert not evaluator.check(
                 local, subject=ACTOR, action="read", resource=resource
@@ -590,24 +610,28 @@ def test_cached_schema_keeps_filtered_constants_and_fields_live(synced):
             assert not Post.objects.with_actor(ACTOR).filter(pk=post.pk).exists()
         assert _loads(queries) == 0
         assert _revision() == revision
-        Folder._base_manager.filter(pk=row.pk).update(is_active=True)
+        Folder.objects.sudo(reason="backing fixture update").filter(pk=row.pk).update(
+            is_active=True
+        )
         assert evaluator.check(local, subject=ACTOR, action="read", resource=resource).allowed
-        Post._base_manager.filter(pk=post.pk).update(folder=None)
+        Post.objects.sudo(reason="backing fixture update").filter(pk=post.pk).update(folder=None)
         assert not evaluator.check(local, subject=ACTOR, action="read", resource=resource).allowed
 
 
 def test_schema_and_override_cache_follow_routed_database(synced, tmp_path, django_db_blocker):
     local, resource = synced
     alias = "schema_target"
-    target = connection.copy(alias=alias)
-    target.settings_dict["NAME"] = str(tmp_path / "schema.sqlite3")
+    from tests.backend_setup import sqlite_alias
+
+    target = sqlite_alias(alias, tmp_path / "schema.sqlite3")
     connections[alias] = target
 
     class SchemaRouter:
         def db_for_read(self, model, **hints):
-            if model is SchemaDefinition:
-                return alias
-            return None
+            return alias if model._meta.app_label == "rebac" else None
+
+        def db_for_write(self, model, **hints):
+            return alias if model._meta.app_label == "rebac" else None
 
     from django.test import override_settings
 
@@ -632,19 +656,18 @@ def test_schema_and_override_cache_follow_routed_database(synced, tmp_path, djan
             )
             assert _check(local, resource)
             with override_settings(DATABASE_ROUTERS=[SchemaRouter()]):
-                SchemaGeneration.objects.using(alias).all().delete()
-                assert local._read_schema_revision(target) is None
-                # A schema write recreates the witness through its Django owner.
-                permission.save(using=alias)
+                local.write_relationships([RelationshipTuple(resource, "owner", ACTOR)])
                 assert _check(local, resource)
                 # Both the override's target and all schema components must
-                # come from this alias even though only the owner is routed.
+                # come from the same routed alias as the index and source tuples.
                 override.expression = "nil"
                 override.save(using=alias)
                 assert not _check(local, resource)
                 with CaptureQueriesContext(target) as queries:
                     assert not _check(local, resource)
-                assert len(queries) == 1
+                assert len(queries) == 2
+                SchemaGeneration.objects.using(alias).all().delete()
+                assert local._read_schema_revision(target) is None
             assert _check(local, resource)
     finally:
         target.close()
@@ -655,8 +678,9 @@ def test_sync_uses_one_schema_write_alias(synced, tmp_path, django_db_blocker):
     from django.test import override_settings
 
     alias = "schema_sync_target"
-    target = connection.copy(alias=alias)
-    target.settings_dict["NAME"] = str(tmp_path / "sync.sqlite3")
+    from tests.backend_setup import sqlite_alias
+
+    target = sqlite_alias(alias, tmp_path / "sync.sqlite3")
     connections[alias] = target
 
     class SchemaRouter:
@@ -667,7 +691,12 @@ def test_sync_uses_one_schema_write_alias(synced, tmp_path, django_db_blocker):
         with django_db_blocker.unblock():
             call_command("migrate", database=alias, verbosity=0)
             before = _revision()
-            target_before = SchemaGeneration.objects.using(alias).get(pk=1).revision
+            target_before = (
+                SchemaGeneration.objects.using(alias)
+                .filter(pk=1)
+                .values_list("revision", flat=True)
+                .first()
+            )
             with override_settings(DATABASE_ROUTERS=[SchemaRouter()]):
                 call_command("rebac", "sync", stdout=StringIO())
                 call_command("rebac", "sync", "--check", stdout=StringIO())
@@ -679,60 +708,7 @@ def test_sync_uses_one_schema_write_alias(synced, tmp_path, django_db_blocker):
         del connections[alias]
 
 
-@pytest.mark.parametrize("gap", ["row", "table"])
-@pytest.mark.parametrize("scoped", [False, True])
-def test_degraded_mode_loads_once_per_operation(synced, monkeypatch, gap, scoped):
-    _, resource = synced
-    if gap == "table":
-        with connection.schema_editor() as editor:
-            editor.delete_model(SchemaGeneration)
-    if gap == "row":
-        SchemaGeneration.objects.all().delete()
-    local = LocalBackend()
-    monkeypatch.setattr("rebac.backends._backend", local)
-    try:
-        _check(local, resource)  # Detect the gap once, before measuring steady state.
-        with evaluator_scope() if scoped else nullcontext() as evaluator:
-            surfaces = [
-                (lambda: _check(local, resource), 6),
-                (lambda: list(Post.objects.with_actor(ACTOR).with_action("write")), 6),
-                (
-                    lambda: check_new(
-                        subject=ACTOR,
-                        action="write",
-                        resource_type="blog/post",
-                        relationships={"owner": [ACTOR]},
-                        backend=local,
-                    ),
-                    5,
-                ),
-            ]
-            if evaluator is not None:
-                surfaces.append(
-                    (
-                        lambda: evaluator.check(
-                            local, subject=ACTOR, action="write", resource=resource
-                        ),
-                        6,
-                    )
-                )
-            for operation, cost in surfaces:
-                for n in (1, 10):
-                    with CaptureQueriesContext(connection) as queries:
-                        for _ in range(n):
-                            operation()
-                    assert len(queries) == cost * n
-                    assert _loads(queries) == n
-                    assert _generation_reads(queries) == 0
-        assert local._schema_snapshots == local._schema_facts_memo == {}
-    finally:
-        with connection.schema_editor() as editor:
-            if gap == "table":
-                editor.create_model(SchemaGeneration)
-        SchemaGeneration.objects.advance(using="default")
-
-
-def test_shared_snapshots_and_facts_retain_only_latest_revision(synced):
+def test_shared_snapshots_retain_only_latest_revision(synced):
     local, resource = synced
     permission = _permission()
     old = local._schema_snapshot()
@@ -742,23 +718,6 @@ def test_shared_snapshots_and_facts_retain_only_latest_revision(synced):
             assert evaluator.check(
                 local, subject=ACTOR, action="write", resource=resource
             ).allowed == (index % 2 == 0)
-        assert len(local._schema_snapshots) == len(local._schema_facts_memo) == 1
+        assert len(local._schema_snapshots) == 1
     latest = next(iter(local._schema_snapshots.values()))
     assert latest.generation != old.generation
-    local._schema_facts(old)  # An older in-flight pin cannot repopulate the memo.
-    assert set(local._schema_facts_memo) == {latest.generation}
-
-
-@pytest.mark.parametrize("attribute", ["sqlstate", "pgcode"])
-def test_missing_table_detection_supports_both_postgresql_drivers(monkeypatch, attribute):
-    from django.db import ProgrammingError
-    from django.db.models import QuerySet
-
-    cause = Exception("undefined table")
-    setattr(cause, attribute, "42P01")
-
-    def missing(self):
-        raise ProgrammingError("undefined table") from cause
-
-    monkeypatch.setattr(QuerySet, "first", missing)
-    assert LocalBackend()._read_schema_revision(connection) is None

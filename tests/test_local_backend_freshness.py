@@ -17,6 +17,7 @@ from rebac import (
     Zookie,
 )
 from rebac.schema import parse_zed
+from tests.backend_setup import install_schema
 
 SCHEMA = """
 definition auth/user {}
@@ -30,7 +31,7 @@ definition blog/post {
 @pytest.fixture
 def backend(db):
     b = LocalBackend()
-    b.set_schema(parse_zed(SCHEMA))
+    install_schema(b, parse_zed(SCHEMA))
     return b
 
 

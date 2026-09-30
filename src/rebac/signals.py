@@ -1,483 +1,443 @@
-"""Pre-save / pre-delete signal handlers gating writes through REBAC."""
+"""Explicit-sender lifecycle hooks for writes that bypass model/queryset owners."""
 
 from __future__ import annotations
 
 from collections.abc import Iterable
-from typing import Any
+from itertools import batched
+from typing import Any, cast
+from weakref import WeakSet
 
+from django.apps import apps
+from django.db import models, router
 from django.db.models import Model, Q
-from django.db.models.signals import post_delete, post_save, pre_delete, pre_save
+from django.db.models.signals import (
+    class_prepared,
+    m2m_changed,
+    post_delete,
+    post_save,
+    pre_delete,
+    pre_save,
+)
 from django.dispatch import receiver
 
-from ._id import resource_id_attr
-from .actors import current_actor as _current_actor
 from .actors import model_can_resolve_subject, to_subject_ref
 from .conf import app_settings
-from .errors import NoActorResolvedError, PermissionDenied
-from .field_visibility import backend_schema
-from .mixins import RebacMixin
-from .preflight import _check_new_model
+from .errors import NoActorResolvedError
 from .resources import model_resource_type, to_object_ref
-from .schema.walker import field_gated_actions
-from .types import ObjectRef, SubjectRef
+from .types import ObjectRef, RelationshipTuple, SubjectRef
+
+# Weak sets retain no isolated app registry after its classes disappear.
+_owned: WeakSet[type[Model]] = WeakSet()
+_subjects: WeakSet[type[Model]] = WeakSet()
+_tracked: WeakSet[type[Model]] = WeakSet()
+_throughs: WeakSet[type[Model]] = WeakSet()
+_through_candidates: WeakSet[type[Model]] = WeakSet()
 
 
-def _maybe_audit_denial(*, actor: SubjectRef | None, action: str, resource: ObjectRef) -> None:
-    """Emit a denial audit row when REBAC_AUDIT_DENIALS is enabled.
+def tracked_model(model: type[Model]) -> bool:
+    """Static tracking eligibility; no schema/backend/database access."""
+    from django.conf import settings
 
-    Uses ``defer_to_commit=False`` so the row persists even though the
-    raising save / delete is about to roll back the surrounding transaction.
+    from .mixins import RebacTrackedMixin
 
-    Audit kind reuses the relevant grant / revoke kind (a denied write is a
-    grant that didn't happen; a denied delete is a revoke that didn't
-    happen). The reason text carries the ``denied:`` prefix so consumers
-    can distinguish denial from successful writes when querying the trail.
-    """
-    if not app_settings.REBAC_AUDIT_DENIALS:
-        return
-    from .audit import emit as emit_audit
-    from .models import PermissionAuditEvent
-
-    if action == "delete":
-        kind = PermissionAuditEvent.KIND_RELATIONSHIP_REVOKE
-    else:
-        kind = PermissionAuditEvent.KIND_RELATIONSHIP_GRANT
-    emit_audit(
-        kind,
-        actor=actor,
-        origin=actor,
-        target_repr=f"{resource}#{action}",
-        reason=f"denied: {actor} cannot {action} {resource}",
-        defer_to_commit=False,
+    if issubclass(model, RebacTrackedMixin):
+        return True
+    labels = {settings.AUTH_USER_MODEL.lower(), "auth.group"}
+    configured = app_settings.REBAC_TRACKED_MODELS
+    if isinstance(configured, (list, tuple)):
+        labels.update(label.lower() for label in configured if isinstance(label, str))
+    return any(
+        hasattr(base, "_meta") and base._meta.label_lower in labels for base in model.__mro__
     )
 
 
-@receiver(pre_save)
-def _rebac_pre_save(
-    sender: type[Model],
-    instance: Any,
-    raw: bool = False,
-    using: Any = None,
-    update_fields: Iterable[str] | None = None,
-    **_: Any,
-) -> None:
-    if raw:
+def tracked_through(model: type[Model]) -> bool:
+    return bool(model._meta.auto_created) and any(
+        isinstance(field.remote_field.model, type) and tracked_model(field.remote_field.model)
+        for field in model._meta.fields
+        if isinstance(field, models.ForeignKey)
+    )
+
+
+def _connect(signal: Any, handler: Any, model: type[Model]) -> None:
+    # Only callers that just changed membership connect. Repeated connect()
+    # would clear Django's project-wide per-sender cache even with a stable UID.
+    signal.connect(handler, sender=model, weak=False, dispatch_uid=handler.__name__)
+
+
+def connect_owned_model(model: type[Model]) -> None:
+    if model._meta.abstract or model in _owned:
         return
-    if not isinstance(instance, RebacMixin):
+    _owned.add(model)
+    _connect(pre_delete, _rebac_pre_delete, model)
+    connect_subject_model(model)
+
+
+def connect_subject_model(model: type[Model]) -> None:
+    if model._meta.abstract or model in _subjects:
         return
-    rebac_type = model_resource_type(sender)
-    if not rebac_type:
+    _subjects.add(model)
+    _connect(post_delete, _rebac_cascade_resource, model)
+    # Decorators run after class_prepared. Cover any subclasses already present.
+    for child in model.__subclasses__():
+        if hasattr(child, "_meta"):
+            connect_subject_model(child)
+
+
+def _register_model(model: type[Model]) -> None:
+    from .actors import _subject_registry
+    from .mixins import RebacTrackedMixin
+
+    if model._meta.abstract:
         return
-    # Share the observer/check API's precedence: a pinned actor outranks
-    # ambient sudo, while an explicit instance bypass still wins locally.
-    actor, unscoped = instance.effective_actor(strict=True)
-    if unscoped:
-        return
-    assert actor is not None
-
-    is_create = instance._state.adding
-    action = "create" if is_create else "write"
-
-    from .backends import backend
-
-    if is_create:
-        active_backend = backend()
-        result = _check_new_model(
-            instance,
-            subject=actor,
-            using=using,
-            backend=active_backend,
-        )
-        resource = ObjectRef(rebac_type, "")
-    else:
-        resource_id = _resource_id_for_existing_instance(sender=sender, instance=instance)
-        resource = ObjectRef(rebac_type, resource_id)
-        result = backend().check_access(subject=actor, action=action, resource=resource)
-    if not result.allowed:
-        _maybe_audit_denial(actor=actor, action=action, resource=resource)
-        raise PermissionDenied(f"Denied: {actor} cannot {action} {resource}")
-
-    # Per-field ``write__<f>`` enforcement — only on UPDATE. On INSERT the
-    # row didn't exist, so "loaded values" is empty and every field is
-    # trivially "dirty"; gating create on per-field permissions makes no
-    # sense (use ``permission create = ...`` for that).
-    if not is_create:
-        _enforce_redacted_field_writes(
-            sender=sender,
-            instance=instance,
-            resource=resource,
-            update_fields=update_fields,
-        )
-        _enforce_per_field_writes(
-            sender=sender,
-            instance=instance,
-            actor=actor,
-            resource=resource,
-            update_fields=update_fields,
-        )
-
-
-@receiver(pre_delete)
-def _rebac_pre_delete(sender: type[Model], instance: Any, using: Any = None, **_: Any) -> None:
-    if not isinstance(instance, RebacMixin):
-        return
-    rebac_type = model_resource_type(sender)
-    if not rebac_type:
-        return
-    actor, unscoped = instance.effective_actor(strict=True)
-    if unscoped:
-        return
-    assert actor is not None
-
-    from .backends import backend
-
-    resource_id = str(getattr(instance, resource_id_attr(sender)))
-    resource = ObjectRef(rebac_type, resource_id)
-    result = backend().check_access(subject=actor, action="delete", resource=resource)
-    if not result.allowed:
-        _maybe_audit_denial(actor=actor, action="delete", resource=resource)
-        raise PermissionDenied(f"Denied: {actor} cannot delete {resource}")
-
-
-# ---------- Per-field write helpers ----------
-
-
-def _enforce_redacted_field_writes(
-    *,
-    sender: type[Model],
-    instance: Any,
-    resource: ObjectRef,
-    update_fields: Iterable[str] | None,
-) -> None:
-    redacted = frozenset(getattr(instance, "_rebac_redacted_fields", frozenset()) or frozenset())
-    if not redacted or update_fields is None:
-        return
-    requested = set(_normalise_update_field_names(sender=sender, update_fields=update_fields))
-    bad = redacted & requested
-    if bad:
-        names = ", ".join(sorted(bad))
-        raise PermissionDenied(
-            f"Cannot write redacted field(s) {names} on {resource}: "
-            "read__<field> denied on the loaded instance."
-        )
-
-
-def _resource_id_for_existing_instance(*, sender: type[Model], instance: Any) -> str:
-    attr = resource_id_attr(sender)
-    redacted = frozenset(getattr(instance, "_rebac_redacted_fields", frozenset()) or frozenset())
-    field_names = {attr}
-    try:
-        field = sender._meta.get_field(attr)
-    except Exception:
-        field = None
-    if field is not None:
-        field_names.add(field.name)
-        field_names.add(getattr(field, "attname", field.name))
-    if redacted & field_names:
-        stored = getattr(instance, "_rebac_resource_id", None)
-        if stored is not None:
-            return str(stored)
-    return str(getattr(instance, attr))
-
-
-def _enforce_per_field_writes(
-    *,
-    sender: type[Model],
-    instance: Any,
-    actor: SubjectRef,
-    resource: ObjectRef,
-    update_fields: Iterable[str] | None,
-) -> None:
-    """Re-run ``check_access`` for any dirty field that has a ``write__<f>``
-    permission declared on its resource type.
-
-    Called after the resource-level ``write`` check has already passed.
-    Honours ``save(update_fields=...)`` when supplied (the caller knows
-    what's actually dirty); otherwise falls back to comparing current
-    values against the snapshot ``from_db`` stashed on the instance. If
-    no snapshot is present (instance hand-built and re-saved as an
-    UPDATE — unusual), every non-pk concrete field is treated as dirty
-    (conservative; fail-closed).
-
-    Schema lookup goes via ``backend().schema()`` when the backend
-    exposes one (LocalBackend always does; SpiceDBBackend will route
-    through its own server-side schema once 0.5 lands). Backends without
-    an in-process schema accessor skip per-field enforcement — the
-    resource-level ``write`` check already gated the operation.
-
-    Pure in-memory comparison; never queries the DB to refresh state.
-    """
-    schema = backend_schema()
-    if schema is None:
-        return
-    definition = schema.get_definition(resource.resource_type)
-    if definition is None:
-        return
-    declared = field_gated_actions(definition, "write")
-    if not declared:
-        return  # No per-field gates declared — common case, cheap exit.
-
-    dirty = _dirty_field_names(sender=sender, instance=instance, update_fields=update_fields)
-    if not dirty:
-        return
-
-    from .backends import backend
-
-    for field_name in dirty:
-        action = f"write__{field_name}"
-        if action not in declared:
-            continue  # Field inherits the resource-level write (already passed).
-        result = backend().check_access(subject=actor, action=action, resource=resource)
-        if not result.allowed:
-            _maybe_audit_denial(actor=actor, action=action, resource=resource)
-            raise PermissionDenied(
-                f"Denied: {actor} cannot {action} {resource} "
-                f"(field {field_name!r} requires {action})"
+    # Owned classes connect in RebacModelBase after metadata is installed.
+    if not issubclass(model, RebacTrackedMixin) and tracked_model(model):
+        if model not in _tracked:
+            _tracked.add(model)
+            _connect(pre_save, _index_pre_save, model)
+            _connect(post_save, _index_post_save, model)
+            _connect(pre_delete, _rebac_pre_delete, model)
+            connect_subject_model(model)  # also finishes non-identity tracked deletes
+    # Avoid get_user_model() during class preparation; labels/lineage suffice.
+    if any(base in _subject_registry for base in model.__mro__):
+        connect_subject_model(model)
+    if model._meta.auto_created:
+        _through_candidates.add(model)
+    for through in tuple(_through_candidates):
+        eligible = tracked_through(through)
+        if not eligible and through._meta.apps is model._meta.apps and tracked_model(model):
+            # class_prepared runs just before registry insertion and lazy FK
+            # resolution. Match a pending string endpoint to this known class.
+            eligible = any(
+                isinstance(field.remote_field.model, str)
+                and (
+                    field.remote_field.model
+                    if "." in field.remote_field.model
+                    else f"{through._meta.app_label}.{field.remote_field.model}"
+                ).lower()
+                == model._meta.label_lower
+                for field in through._meta.fields
+                if isinstance(field, models.ForeignKey)
             )
+        if eligible and through not in _throughs:
+            _throughs.add(through)
+            _connect(m2m_changed, _index_m2m, through)
 
 
-def _dirty_field_names(
-    *,
+def connect_tracked_signals() -> None:
+    """Install the static sender superset from the registry only."""
+    # Setting overrides may remove tracked classes; update only changed senders.
+    for model in tuple(_tracked):
+        if not tracked_model(model):
+            for signal, handler in (
+                (pre_save, _index_pre_save),
+                (post_save, _index_post_save),
+                (pre_delete, _rebac_pre_delete),
+            ):
+                signal.disconnect(sender=model, dispatch_uid=handler.__name__)
+            _tracked.discard(model)
+            if not model_can_resolve_subject(model):
+                post_delete.disconnect(sender=model, dispatch_uid="_rebac_cascade_resource")
+                _subjects.discard(model)
+    for model in tuple(_throughs):
+        if not tracked_through(model):
+            m2m_changed.disconnect(sender=model, dispatch_uid="_index_m2m")
+            _throughs.discard(model)
+    for model in apps.get_models(include_auto_created=True):
+        _register_model(model)
+
+
+@receiver(class_prepared, dispatch_uid="rebac.model_prepared")
+def _model_prepared(sender: type[Model], **kwargs: Any) -> None:
+    _register_model(sender)
+    # A through model can be prepared before its endpoint finishes resolving.
+    # Revisit local M2M fields once the endpoint is prepared (no registry query).
+    for field in sender._meta.local_many_to_many:
+        through = field.remote_field.through
+        if isinstance(through, type):
+            _register_model(through)
+
+
+def _current_watch(
     sender: type[Model],
-    instance: Any,
-    update_fields: Iterable[str] | None,
-) -> list[str]:
-    """Return the list of (field.name) values that have changed.
+    using: str,
+    names: Iterable[str] | None = None,
+) -> bool:
+    from .backends import backend
+    from .backends.local import LocalBackend
+    from .index.maintain import current_pass, get_program, installed, model_is_watched
+    from .models import active_relationship_model
 
-    Trust order:
-
-    1. If the caller passed ``save(update_fields=[...])``, trust it
-       (Django itself only writes those columns). Normalise tokens to
-       ``field.name`` so that both ``"folder"`` and ``"folder_id"`` look
-       up ``write__folder`` correctly.
-    2. Otherwise compare ``_rebac_loaded_values`` (snapshotted in
-       ``RebacMixin.from_db``) against the current attribute values for
-       every non-pk concrete field. Fields that were deferred at load
-       time (absent from the snapshot) are treated as dirty.
-    3. If no snapshot exists at all (e.g. hand-built instance being
-       re-saved as an UPDATE — rare), conservatively treat every non-pk
-       concrete field as dirty.
-    """
-    meta = sender._meta
-    if update_fields is not None:
-        return _normalise_update_field_names(sender=sender, update_fields=update_fields)
-
-    concrete = [f for f in meta.concrete_fields if not f.primary_key]
-    loaded: dict[str, Any] | None = getattr(instance, "_rebac_loaded_values", None)
-    if loaded is None:
-        return [f.name for f in concrete]
-
-    dirty: list[str] = []
-    for field in concrete:
-        attname = field.attname
-        current = getattr(instance, attname, None)
-        if attname not in loaded:
-            # Was deferred at load time — can't compare cheaply.
-            dirty.append(field.name)
-        elif loaded[attname] != current:
-            dirty.append(field.name)
-    return dirty
+    if not router.allow_migrate_model(using, active_relationship_model()):
+        return False
+    active = backend()
+    if not isinstance(active, LocalBackend):
+        return False
+    outer = current_pass(using)
+    if outer is not None:
+        return outer.watches(sender, names)
+    if not installed(using, active):
+        return False
+    return model_is_watched(get_program(using, active).watched, sender, names)
 
 
-def _normalise_update_field_names(
-    *,
-    sender: type[Model],
-    update_fields: Iterable[str],
-) -> list[str]:
-    meta = sender._meta
-    names: list[str] = []
-    for tok in update_fields:
-        try:
-            field = meta.get_field(tok)
-        except Exception:
-            # Unknown field tag — leave it; Django will reject the save.
-            names.append(tok)
-            continue
-        names.append(field.name)
-    return names
-
-
-# ---------------------------------------------------------------------------
-# Schema cache invalidation + SchemaOverride audit
-# ---------------------------------------------------------------------------
-#
-# Schema* CRUD invalidates DB-loaded LocalBackend schemas within the current
-# process and operation. The persisted generation validates snapshots across
-# processes; see docs/ARCHITECTURE.md "Effective schema loading and generation".
-# Tier-2 override CRUD also resets the cached global backend and emits a
-# PermissionAuditEvent via the single audit-emission helper.
-
-
-def _mark_schema_caches_stale() -> None:
-    from .backends.local import mark_db_loaded_schemas_stale
-
-    mark_db_loaded_schemas_stale()
-
-
-@receiver(post_save, sender="rebac.SchemaDefinition")
-@receiver(post_delete, sender="rebac.SchemaDefinition")
-@receiver(post_save, sender="rebac.SchemaRelation")
-@receiver(post_delete, sender="rebac.SchemaRelation")
-@receiver(post_save, sender="rebac.SchemaPermission")
-@receiver(post_delete, sender="rebac.SchemaPermission")
-@receiver(post_save, sender="rebac.SchemaCaveat")
-@receiver(post_delete, sender="rebac.SchemaCaveat")
-def _rebac_schema_rows_changed(sender: type[Model], raw: bool = False, **_: Any) -> None:
-    if raw:
-        return
-    _mark_schema_caches_stale()
-
-
-@receiver(post_delete, sender="rebac.SchemaDefinition")
-@receiver(post_delete, sender="rebac.SchemaRelation")
-@receiver(post_delete, sender="rebac.SchemaPermission")
-@receiver(post_delete, sender="rebac.SchemaCaveat")
-@receiver(post_delete, sender="rebac.SchemaOverride")
-def _rebac_schema_cascade_revision(
-    sender: type[Model], *, origin: Any = None, using: str, **_: Any
-) -> None:
-    """Cover collector cascades whose origin does not own schema publication."""
-    from .models.generation import SchemaGeneration
-    from .models.schema_write import SchemaQuerySet, SchemaRow
-
-    if not isinstance(origin, (SchemaRow, SchemaQuerySet)):
-        SchemaGeneration.objects.advance(using=using)
-
-
-def _override_target_repr(instance: Any) -> str:
-    """Best-effort string repr of the override target for audit rows."""
-    from django.contrib.contenttypes.models import ContentType
-
-    try:
-        ct = instance.target_ct
-        return f"{instance.kind}:{ct.app_label}.{ct.model}/{instance.target_pk}"
-    except ContentType.DoesNotExist:
-        return f"{getattr(instance, 'kind', '?')}:?/{getattr(instance, 'target_pk', '?')}"
-
-
-def _override_payload(instance: Any) -> dict[str, Any]:
-    return {
-        "kind": getattr(instance, "kind", ""),
-        "expression": getattr(instance, "expression", ""),
-        "reason": getattr(instance, "reason", ""),
-    }
-
-
-def _emit_override_audit(
-    *, kind: str, instance: Any, before: dict[str, Any] | None, after: dict[str, Any] | None
-) -> None:
-    """Emit an override.* PermissionAuditEvent via the single emission point."""
-    from .audit import emit as emit_audit
-
-    actor = _current_actor()
-    emit_audit(
-        kind,
-        actor=actor,
-        origin=actor,
-        target_repr=_override_target_repr(instance),
-        before=before,
-        after=after,
-        reason=getattr(instance, "reason", "") or "",
-        defer_to_commit=True,
-    )
-
-
-@receiver(post_save, sender="rebac.SchemaOverride")
-def _rebac_override_post_save(
-    sender: type[Model], instance: Any, created: bool, raw: bool = False, **_: Any
-) -> None:
-    if raw:
-        return
-    from .backends import reset_backend
-    from .models import PermissionAuditEvent
-
-    _mark_schema_caches_stale()
-    reset_backend()
-    if created:
-        _emit_override_audit(
-            kind=PermissionAuditEvent.KIND_OVERRIDE_CREATE,
-            instance=instance,
-            before=None,
-            after=_override_payload(instance),
-        )
-    # Updates to existing overrides aren't separately audited in v1; treat
-    # them as configuration drift and rely on the underlying admin log.
-
-
-@receiver(post_delete, sender="rebac.SchemaOverride")
-def _rebac_override_post_delete(sender: type[Model], instance: Any, **_: Any) -> None:
-    from .backends import reset_backend
-    from .models import PermissionAuditEvent
-
-    _mark_schema_caches_stale()
-    reset_backend()
-    _emit_override_audit(
-        kind=PermissionAuditEvent.KIND_OVERRIDE_DELETE,
-        instance=instance,
-        before=_override_payload(instance),
-        after=None,
-    )
-
-
-# ---------- RebacResource cascade ----------
-#
-# When a Django row with a resource or subject identity is deleted, every
-# relationship occurrence of that identity must disappear with it. Registry
-# storage does so by deleting its ``RebacResource`` row and relying on both FK
-# cascades.
-#
-# Denormalized storage has no foreign keys, so this handler deletes both
-# resource-side and subject-side occurrences explicitly. Both paths run on the
-# deleting instance's database alias inside Django's own delete transaction.
-
-
-@receiver(post_delete)
-def _rebac_cascade_resource(
-    sender: type[Model], instance: Any, using: str = "default", **_: Any
-) -> None:
-    """Remove every relationship occurrence of a deleted model identity.
-
-    Listens on every model's ``post_delete`` and uses class metadata to skip
-    rows for which neither the resource nor actor resolver owns an identity.
-    This includes configured Django User/Group subjects as well as RebacMixin
-    resources and model-owned or explicitly registered subjects.
-    """
+def _identities(sender: type[Model], instance: Any) -> set[ObjectRef]:
     identities: set[ObjectRef] = set()
-    if isinstance(instance, RebacMixin) and model_resource_type(sender):
+    if model_resource_type(sender):
         identities.add(to_object_ref(instance))
     if model_can_resolve_subject(sender):
         try:
             identities.add(to_subject_ref(instance).object)
         except NoActorResolvedError:
             pass
-    if not identities:
-        return
+    return identities
+
+
+def cleanup_identities(identities: Iterable[ObjectRef], *, using: str) -> None:
+    """Batch both sides of every identity inside the deletion owner's pass."""
     from .backends.local import mark_relationships_changed
+    from .index.maintain import tuple_owner
+    from .models import RebacResource, active_relationship_model
 
-    # ``post_delete`` fires inside the deleting Collector's atomic block on
-    # ``using``; the queryset deletes below join that transaction.
-    if app_settings.REBAC_LOCAL_BACKEND_STORAGE == "registry":
-        from .models import RebacResource
+    identities = sorted(set(identities), key=str)
+    if not identities or not router.allow_migrate_model(using, active_relationship_model()):
+        return
+    with tuple_owner(using) as maintenance:
+        for batch in batched(identities, 200, strict=False):
+            references = Q()
+            registry = Q()
+            for identity in batch:
+                pair = Q(resource_type=identity.resource_type, resource_id=identity.resource_id)
+                registry |= pair
+                references |= pair | Q(
+                    subject_type=identity.resource_type, subject_id=identity.resource_id
+                )
+            rows = active_relationship_model().objects.using(using).filter(references)
+            if maintenance is not None:
+                maintenance.capture_old(
+                    tuples=(
+                        RelationshipTuple(
+                            ObjectRef(row["resource_type"], row["resource_id"]),
+                            row["relation"],
+                            SubjectRef.of(
+                                row["subject_type"], row["subject_id"], row["subject_relation"]
+                            ),
+                        )
+                        # Django's stubs erase the custom queryset on the
+                        # selected relationship model's union manager.
+                        for row in cast(Any, rows).index_projection().iterator(chunk_size=1000)
+                    )
+                )
+            if app_settings.REBAC_LOCAL_BACKEND_STORAGE == "registry":
+                RebacResource.objects.using(using).filter(registry).delete()
+            else:
+                rows.delete()
+        mark_relationships_changed()
 
-        identity_filter = Q()
-        for identity in sorted(identities, key=lambda ref: (ref.resource_type, ref.resource_id)):
-            identity_filter |= Q(
-                resource_type=identity.resource_type,
-                resource_id=identity.resource_id,
-            )
-        RebacResource.objects.using(using).filter(identity_filter).delete()
+
+def _rebac_pre_delete(
+    sender: type[Model],
+    instance: Any,
+    using: str,
+    origin: Any = None,
+    **kwargs: Any,
+) -> None:
+    from .managers import RebacQuerySet, TrackedQuerySet
+    from .mixins import RebacMixin, _gate_delete, delete_scope
+
+    scope = delete_scope(origin, using)
+    # Scoped roots were gated by their owner; base-manager roots are explicitly
+    # unscoped. Only rows actually covered by that root operation can skip.
+    covered = scope is not None and (
+        origin is instance
+        or (
+            isinstance(origin, (RebacQuerySet, TrackedQuerySet))
+            and origin.model is sender
+            and instance.pk in scope.root_pks
+        )
+    )
+    if isinstance(instance, RebacMixin) and not covered:
+        _gate_delete(
+            sender,
+            instance,
+            scope=(scope.actor, scope.unscoped) if scope is not None else None,
+        )
+    if not covered:
+        _capture_signal_old(sender, instance, using)
+
+
+def _rebac_cascade_resource(
+    sender: type[Model],
+    instance: Any,
+    using: str = "default",
+    origin: Any = None,
+    **kwargs: Any,
+) -> None:
+    from .mixins import delete_scope
+
+    scope = delete_scope(origin, using)
+    identities = _identities(sender, instance)
+    if scope is not None:
+        scope.identities.update(identities)
+        return  # the owner holds the old captures and finishes once for the collection
     else:
-        from .models import active_relationship_model
+        cleanup_identities(identities, using=using)
+    if sender in _owned or sender in _tracked:
+        _finish_signal(sender, instance, using)
 
-        relationship_filter = Q()
-        for identity in sorted(identities, key=lambda ref: (ref.resource_type, ref.resource_id)):
-            relationship_filter |= Q(
-                resource_type=identity.resource_type,
-                resource_id=identity.resource_id,
-            ) | Q(
-                subject_type=identity.resource_type,
-                subject_id=identity.resource_id,
+
+@receiver(post_delete, sender="rebac.SchemaOverride")
+def _rebac_schema_cascade_revision(
+    sender: type[Model], *, instance: Any, origin: Any = None, using: str, **_: Any
+) -> None:
+    """Cover collector cascades whose origin does not own schema publication."""
+    from .models.generation import SchemaGeneration
+    from .models.schema_write import SchemaQuerySet, SchemaRow, _publish, schema_index_write
+
+    if not isinstance(origin, (SchemaRow, SchemaQuerySet)):
+        from .index.maintain import forget_signal_pass
+        from .models.index import IndexWork
+
+        with schema_index_write(using) as maintenance:
+            old_pass = instance.__dict__.pop("_rebac_index_schema_pass", None)
+            if old_pass is not None:
+                IndexWork.objects.using(using).filter(pass_id=old_pass).delete()
+                forget_signal_pass(using, old_pass)
+            SchemaGeneration.objects.advance(using=using)
+            _publish(maintenance, None)
+            instance._audit_change(created=False)
+
+
+@receiver(pre_delete, sender="rebac.SchemaOverride")
+def _rebac_schema_cascade_begin(
+    sender: type[Model], *, instance: Any, using: str, origin: Any = None, **_: Any
+) -> None:
+    from django.db import connections
+
+    from .index.maintain import IndexMaintenance, current_pass, defer_signal_pass
+    from .models.schema_write import SchemaQuerySet, SchemaRow, _old_program
+
+    if isinstance(origin, (SchemaRow, SchemaQuerySet)) or current_pass(using) is not None:
+        return
+    instance._audit_target = instance._audit_target_repr()
+    caller_atomic = (
+        connections[using].atomic_blocks[-1] if connections[using].in_atomic_block else None
+    )
+    with IndexMaintenance(using=using) as maintenance:
+        _old_program(maintenance)
+        maintenance.deferred = True
+        instance.__dict__["_rebac_index_schema_pass"] = maintenance.pass_id
+        defer_signal_pass(maintenance, caller_atomic)
+
+
+def _plain_write_warning(sender: type[Model], using: str, *, in_atomic: bool) -> None:
+    import warnings
+
+    from .index.maintain import logger
+
+    if not in_atomic:
+        message = f"{sender._meta.label} changes permission backing fields outside atomic(using={using!r}); source and index cannot roll back together (D2)."
+        logger.error(message)
+        warnings.warn(message, RuntimeWarning, stacklevel=4)
+
+
+def _capture_signal_old(
+    sender: type[Model],
+    instance: Any,
+    using: str,
+    *,
+    names: Iterable[str] | None = None,
+    warn: bool = False,
+) -> None:
+    from django.db import connections
+
+    from .index.maintain import IndexMaintenance, current_pass, defer_signal_pass
+
+    if not _current_watch(sender, using, names):
+        return
+    was_atomic = connections[using].in_atomic_block
+    caller_atomic = connections[using].atomic_blocks[-1] if was_atomic else None
+    outer = current_pass(using)
+    with IndexMaintenance(using=using) as maintenance:
+        if not maintenance.watches(sender, names):
+            return
+        if warn:
+            instance.__dict__["_rebac_index_plain_atomic"] = was_atomic
+        maintenance.capture_old(model=sender, pks=(instance.pk,))
+        if outer is None:
+            # Do not hold an unmanaged context manager across Django's signal
+            # dispatch: a failed save never sends post_save. The enclosing
+            # caller transaction retains the row lock and rolls this work back.
+            maintenance.deferred = True
+            instance.__dict__["_rebac_index_old_pass"] = maintenance.pass_id
+            defer_signal_pass(maintenance, caller_atomic)
+
+
+def _finish_signal(
+    sender: type[Model], instance: Any, using: str, *, names: Iterable[str] | None = None
+) -> None:
+    from .index.maintain import IndexMaintenance, forget_signal_pass
+    from .models.index import IndexWork
+
+    old_pass = instance.__dict__.pop("_rebac_index_old_pass", None)
+    if old_pass is None and not _current_watch(sender, using, names):
+        return
+    with IndexMaintenance(using=using, resume_pass=old_pass) as maintenance:
+        if old_pass is not None:
+            IndexWork.objects.using(using).filter(pass_id=old_pass).exclude(kind="pass").update(
+                pass_id=maintenance.pass_id
             )
-        active_relationship_model().objects.using(using).filter(relationship_filter).delete()
-    # The rows changed outside the backend's own write path; drop decisions.
-    mark_relationships_changed()
+            IndexWork.objects.using(using).filter(pass_id=old_pass).delete()
+            forget_signal_pass(using, old_pass)
+        if maintenance.watches(sender, names):
+            maintenance.changed(model=sender, pks=(instance.pk,))
+
+
+def _index_pre_save(
+    sender: type[Model],
+    instance: Any,
+    using: str,
+    raw: bool = False,
+    update_fields: Iterable[str] | None = None,
+    **kwargs: Any,
+) -> None:
+    if not raw:
+        _capture_signal_old(sender, instance, using, names=update_fields, warn=True)
+
+
+def _index_post_save(
+    sender: type[Model],
+    instance: Any,
+    using: str,
+    raw: bool = False,
+    update_fields: Iterable[str] | None = None,
+    **kwargs: Any,
+) -> None:
+    if not raw:
+        _finish_signal(sender, instance, using, names=update_fields)
+        was_atomic = instance.__dict__.pop("_rebac_index_plain_atomic", True)
+        _plain_write_warning(sender, using, in_atomic=was_atomic)
+
+
+def _index_m2m(
+    sender: type[Model],
+    instance: Any,
+    action: str,
+    reverse: bool,
+    model: type[Model],
+    pk_set: set[Any] | None,
+    using: str,
+    **kwargs: Any,
+) -> None:
+    if sender not in _throughs or not _current_watch(sender, using):
+        return
+    if action in {"pre_add", "pre_remove", "pre_clear"}:
+        _capture_signal_old(type(instance), instance, using)
+    elif action in {"post_add", "post_remove", "post_clear"}:
+        _finish_signal(type(instance), instance, using)
+
+
+def _mark_schema_caches_stale() -> None:
+    from .backends.local import mark_db_loaded_schemas_stale
+
+    mark_db_loaded_schemas_stale()

@@ -172,6 +172,12 @@ def rebac_subject(*, type: str, id_attr: str = "pk") -> Callable[[type], type]:
 
     def _decorator(cls: builtins.type) -> builtins.type:
         _subject_registry[cls] = (rebac_type, rebac_id_attr)
+        from django.db.models import Model
+
+        if issubclass(cls, Model):
+            from .signals import connect_subject_model
+
+            connect_subject_model(cls)
         return cls
 
     return _decorator

@@ -8,6 +8,7 @@ from rebac import ObjectRef, RelationshipTuple, SubjectRef, actor_context, backe
 from rebac.backends import reset_backend
 from rebac.drf import RebacFilterBackend, RebacPermission
 from rebac.schema import parse_zed
+from tests.backend_setup import atomic_source_write, install_schema
 
 SCHEMA_TEXT = """
 definition auth/user {}
@@ -28,7 +29,7 @@ definition blog/post {
 @pytest.fixture(autouse=True)
 def _setup_backend(db):
     reset_backend()
-    backend().set_schema(parse_zed(SCHEMA_TEXT))
+    install_schema(backend(), parse_zed(SCHEMA_TEXT))
     yield
     reset_backend()
 
@@ -39,7 +40,7 @@ def test_drf_prefers_current_actor_over_request_user_for_permissions_and_filteri
 
     from tests.testapp.models import Post
 
-    alice = get_user_model().objects.create(username="alice", is_active=True)
+    alice = atomic_source_write(get_user_model().objects.create, username="alice", is_active=True)
     with sudo(reason="test.fixture"):
         post = Post.objects.create(title="Visible to Alice")
     backend().write_relationships(
@@ -70,7 +71,7 @@ def test_drf_honors_view_permission_map_for_custom_actions() -> None:
 
     from tests.testapp.models import Post
 
-    user = get_user_model().objects.create_user(username="custom-action")
+    user = atomic_source_write(get_user_model().objects.create_user, username="custom-action")
     with sudo(reason="test.fixture"):
         post = Post.objects.create(title="Protected action")
     request = SimpleNamespace(method="POST", user=user)
@@ -104,7 +105,10 @@ def test_drf_partial_view_permission_map_retains_default_actions() -> None:
     from tests.testapp.models import Post
 
     request = SimpleNamespace(
-        method="DELETE", user=get_user_model().objects.create_user(username="partial-action-map")
+        method="DELETE",
+        user=atomic_source_write(
+            get_user_model().objects.create_user, username="partial-action-map"
+        ),
     )
     view = SimpleNamespace(
         action="destroy", queryset=Post.objects.all(), rebac_action_map={"publish": "write"}
@@ -119,7 +123,7 @@ def test_drf_http_methods_enforce_object_permissions(method) -> None:
 
     from tests.testapp.models import Post
 
-    user = get_user_model().objects.create_user(username=f"method-{method}")
+    user = atomic_source_write(get_user_model().objects.create_user, username=f"method-{method}")
     with sudo(reason="test.fixture"):
         post = Post.objects.create(title="Protected")
     request = SimpleNamespace(method=method, user=user)
@@ -134,7 +138,8 @@ def test_drf_unmapped_actions_fail_closed() -> None:
     from tests.testapp.models import Post
 
     request = SimpleNamespace(
-        method="POST", user=get_user_model().objects.create_user(username="unmapped")
+        method="POST",
+        user=atomic_source_write(get_user_model().objects.create_user, username="unmapped"),
     )
     view = SimpleNamespace(action="publish", queryset=Post.objects.all())
     permission = RebacPermission()
@@ -153,7 +158,8 @@ def test_drf_empty_http_list_is_admitted_and_scoped() -> None:
     from tests.testapp.models import Post
 
     request = SimpleNamespace(
-        method="GET", user=get_user_model().objects.create_user(username="empty-list")
+        method="GET",
+        user=atomic_source_write(get_user_model().objects.create_user, username="empty-list"),
     )
     view = SimpleNamespace(queryset=Post.objects.all())
     assert RebacPermission().has_permission(request, view)

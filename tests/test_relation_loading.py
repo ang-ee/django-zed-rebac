@@ -23,6 +23,7 @@ from rebac import (
 from rebac.backends import reset_backend
 from rebac.evaluator import evaluator_scope
 from rebac.schema import parse_zed
+from tests.backend_setup import atomic_source_write, install_schema
 
 SCHEMA_TEXT = """
 definition auth/user {}
@@ -48,7 +49,7 @@ definition blog/authoredpost {
 @pytest.fixture(autouse=True)
 def _setup_backend(db):
     reset_backend()
-    backend().set_schema(parse_zed(SCHEMA_TEXT))
+    install_schema(backend(), parse_zed(SCHEMA_TEXT))
     yield
     reset_backend()
 
@@ -57,7 +58,7 @@ def _setup_backend(db):
 def alice(db):
     from django.contrib.auth import get_user_model
 
-    return get_user_model().objects.create(username="alice", is_active=True)
+    return atomic_source_write(get_user_model().objects.create, username="alice", is_active=True)
 
 
 def _grant(resource_type: str, resource_id: object, relation: str, user: Any) -> None:
@@ -125,7 +126,8 @@ def test_rebac_select_related_tags_readable_related_without_extra_query(
 def test_rebac_select_related_redacts_and_tags_every_copy_of_shared_related_row(alice):
     from tests.testapp.models import Post
 
-    backend().set_schema(
+    install_schema(
+        backend(),
         parse_zed(
             SCHEMA_TEXT.replace(
                 "permission read = owner + viewer",
@@ -135,7 +137,7 @@ def test_rebac_select_related_redacts_and_tags_every_copy_of_shared_related_row(
         """,
                 1,
             )
-        )
+        ),
     )
     folder = _folder("private name")
     posts = [_post("first", folder=folder), _post("second", folder=folder)]
@@ -192,7 +194,8 @@ def test_sudo_does_not_bypass_selected_related_projection_guard(alice):
 def test_rebac_select_related_skips_guard_when_target_grants_all(alice):
     from tests.testapp.models import Post
 
-    backend().set_schema(
+    install_schema(
+        backend(),
         parse_zed(
             """
             definition auth/user {}
@@ -204,7 +207,7 @@ def test_rebac_select_related_skips_guard_when_target_grants_all(alice):
                 permission read = viewer
             }
             """
-        )
+        ),
     )
     folder = _folder("globally readable")
     post = _post("visible", folder=folder)
@@ -304,7 +307,7 @@ def authored_folder(alice):
     _grant("blog/folder", folder.pk, "viewer", alice)
     posts = []
     for index in range(3):
-        author = get_user_model().objects.create(username=f"author-{index}")
+        author = atomic_source_write(get_user_model().objects.create, username=f"author-{index}")
         author.groups.add(Group.objects.create(name=f"group-{index}"))
         with sudo(reason="test.fixture"):
             post = AuthoredPost.objects.create(title=f"post-{index}", folder=folder, author=author)

@@ -12,6 +12,7 @@ from rebac import LocalBackend, ObjectRef, RelationshipTuple, SubjectRef, evalua
 from rebac.models import SchemaDefinition, SchemaPermission, SchemaRelation
 from rebac.schema import parse_zed
 from rebac.types import RelationshipFilter
+from tests.backend_setup import install_schema
 
 ACTOR = SubjectRef.of("auth/user", "alice")
 RESOURCE = ObjectRef("blog/post", "1")
@@ -38,12 +39,13 @@ def _backend(*, persisted=False, expiration=False):
         SchemaPermission.objects.create(definition=definition, name="read", expression="viewer")
     else:
         modifier = " with expiration" if expiration else ""
-        local.set_schema(
+        install_schema(
+            local,
             parse_zed(
                 "use expiration\ndefinition auth/user {}\n"
                 f"definition blog/post {{ relation viewer: auth/user{modifier} "
                 "permission read = viewer }"
-            )
+            ),
         )
     return local
 

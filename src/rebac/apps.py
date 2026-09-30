@@ -1,4 +1,4 @@
-"""App configuration. Two lines in ready() per spec — no queries, no I/O."""
+"""App configuration. Static sender registration in ready() — no queries, no I/O."""
 
 from __future__ import annotations
 
@@ -16,5 +16,7 @@ class RebacConfig(AppConfig):
         # Connect signal handlers + register system checks. No DB queries here.
         from . import (
             checks,  # noqa: F401  — side-effect: register checks
-            signals,  # noqa: F401  — side-effect: connect handlers
+            signals,
         )
+
+        signals.connect_tracked_signals()

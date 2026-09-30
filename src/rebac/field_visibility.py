@@ -208,7 +208,13 @@ def apply_field_visibility(
     runtime_mode = runtime_field_deny_mode(validate_field_deny_mode(mode))
     if runtime_mode == "allow":
         return
-    batch = [inst for inst in instances if isinstance(inst, models.Model)]
+    marker = (actor, runtime_mode)
+    batch = [
+        inst
+        for inst in instances
+        if isinstance(inst, models.Model)
+        and getattr(inst, "_rebac_visibility_marker", None) != marker
+    ]
     if not batch:
         return
     fields = gated_read_fields(model)
@@ -244,6 +250,7 @@ def apply_field_visibility(
                 continue
             denied.add(field_name)
         mark_denied_fields(inst, denied, mode=runtime_mode)
+        cast(Any, inst)._rebac_visibility_marker = marker
 
 
 def mark_denied_fields(

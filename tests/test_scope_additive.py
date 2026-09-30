@@ -1,8 +1,6 @@
-"""Production-shaped additive intersections and compile-time frontier probes."""
+"""Production-shaped intersections have SQL bounded by their read plans."""
 
-import re
 from contextlib import contextmanager
-from time import perf_counter
 
 import pytest
 from django.db import connection, models
@@ -11,7 +9,10 @@ from django.test.utils import isolate_apps
 
 from rebac import RebacMixin, RelationshipTuple, SubjectRef, backend, sudo, to_object_ref
 from rebac.backends import reset_backend
+from rebac.index.program import program_for
 from rebac.schema import parse_zed
+from tests.backend_setup import install_schema
+from tests.index_harness import assert_no_drift
 
 pytestmark = pytest.mark.django_db(transaction=True)
 
@@ -20,10 +21,13 @@ pytestmark = pytest.mark.django_db(transaction=True)
 def binding_graph(db, monkeypatch, storage):
     """The same graph can run on SQLite and the opt-in vendor connections."""
     import rebac.field_backing
+    import rebac.index.program
+    import rebac.index.read
+    import rebac.resources
 
     with (
         isolate_apps("tests.testapp"),
-        override_settings(REBAC_LOCAL_BACKEND_STORAGE=storage, REBAC_DEPTH_LIMIT=12),
+        override_settings(REBAC_LOCAL_BACKEND_STORAGE=storage),
     ):
         types = {}
 
@@ -63,11 +67,20 @@ def binding_graph(db, monkeypatch, storage):
             "model_for_resource_type",
             lambda name: types.get(name) or original(name),
         )
+        for module in (rebac.resources, rebac.index.program, rebac.index.read):
+            monkeypatch.setattr(
+                module, "model_for_resource_type", lambda name: types.get(name) or original(name)
+            )
         original_subject = rebac.field_backing.model_for_subject_type
         monkeypatch.setattr(
             rebac.field_backing,
             "model_for_subject_type",
             lambda name: (types[name], "pk") if name in types else original_subject(name),
+        )
+        monkeypatch.setattr(
+            rebac.index.program,
+            "model_for_subject_type",
+            rebac.field_backing.model_for_subject_type,
         )
         schema = """
         definition auth/user {}
@@ -106,7 +119,13 @@ def binding_graph(db, monkeypatch, storage):
                 editor.create_model(cls)
         reset_backend()
         active = backend()
-        active.set_schema(parse_zed(schema))
+        install_schema(active, parse_zed(schema))
+        # Watch publication must retain these isolated classes, which cannot
+        # be resolved by the process-global Django app registry.
+        from rebac.index.program import program_for
+
+        watched = program_for(active, using=db.alias).watched
+        assert watched[binding._meta.label_lower].model is binding
         try:
             yield active, types, binding
         finally:
@@ -116,7 +135,7 @@ def binding_graph(db, monkeypatch, storage):
                     editor.delete_model(cls)
 
 
-def exercise_binding_scope(db, monkeypatch, storage, *, measure_probe=False):
+def exercise_binding_scope(db, monkeypatch, storage):
     with binding_graph(db, monkeypatch, storage) as (active, types, binding):
         actors = [SubjectRef.of("auth/user", name) for name in ("both", "left", "right", "neither")]
 
@@ -125,7 +144,9 @@ def exercise_binding_scope(db, monkeypatch, storage, *, measure_probe=False):
                 return types[f"scope/{name}"]._base_manager.using(db.alias).create(**fields)
 
         root = create("page")
-        page = create("page", parent=create("page", parent=root))
+        page = root
+        for _ in range(12):
+            page = create("page", parent=page)
         vault = create("vault")
         target = create("stage5")
         leaf = target
@@ -166,34 +187,10 @@ def exercise_binding_scope(db, monkeypatch, storage, *, measure_probe=False):
                     probes.append((sql, params))
                     return execute(sql, params, many, context)
 
-                started = perf_counter()
                 with db.execute_wrapper(record):
-                    sql, _params = qs.query.get_compiler(using=db.alias).as_sql()
-                compile_seconds = perf_counter() - started
-                if action == "read":
-                    assert len(probes) == 1  # Bounded graph: one empty frontier probe.
-                    probe_sql, probe_params = probes[0]
-                    assert len(probe_sql) < 120_000
-                    if measure_probe:
-                        # Include fetch time: PostgreSQL's iterator uses a server
-                        # cursor, so timing execute_wrapper alone misses FETCH.
-                        started = perf_counter()
-                        with db.cursor() as cursor:
-                            cursor.execute(probe_sql, probe_params)
-                            frontier = cursor.fetchall()
-                        probe_seconds = perf_counter() - started
-                        assert frontier == []
-                        assert probe_seconds < 2
-                        print(
-                            f"frontier {db.vendor}/{storage} actor={actor.subject_id} "
-                            f"bytes={len(probe_sql)} execute_fetch_seconds={probe_seconds:.6f} "
-                            f"compile_seconds={compile_seconds:.6f} rows={len(frontier)}"
-                        )
-                sizes[action] = len(sql)
-                # Measured standalone operands total 70/97 KB at limit 12.
-                # 120 KB gives modest alias/vendor headroom, and rejects the
-                # former 1.9/2.6 MB intersection and 2.0/2.8 MB exclusion.
-                assert len(sql) < 120_000
+                    sql, params = qs.query.get_compiler(using=db.alias).as_sql()
+                assert probes == []  # SQL compilation must perform no graph reads.
+                sizes[action] = (len(sql), len(params))
                 expected = {
                     row.pk
                     for row in rows
@@ -204,12 +201,12 @@ def exercise_binding_scope(db, monkeypatch, storage, *, measure_probe=False):
                 assert set(qs.values_list("pk", flat=True)) == expected
                 if action == "read":
                     assert expected == ({rows[0].pk, rows[1].pk} if actor == actors[0] else set())
-        # Each operand gains a PK membership boundary (under 4 KB total at
-        # this bound); the remaining SQL is the sum of the standalone arms.
-        assert sizes["read"] <= sizes["left"] + sizes["right"] + 5_000
-        # The shared project disjunct must occur once, not on both sides.
-        assert sizes["shared"] <= sizes["read"] + 64
-        print(f"additive scope {db.vendor}/{storage}: {sizes}")
+        plan = program_for(active, using=db.alias)
+        for action, (length, parameters) in sizes.items():
+            lookups = plan.lookups(("scope/binding", action))
+            assert length <= 1024 + 4096 * lookups
+            assert parameters <= 128 * lookups
+        assert_no_drift(using=db.alias)
 
 
 @pytest.mark.parametrize("storage", ["denormalized", "registry"])
@@ -218,21 +215,17 @@ def test_recursive_intersection_is_additive(monkeypatch, storage):
 
 
 @pytest.mark.parametrize("storage", ["denormalized", "registry"])
-def test_operand_select_nesting_is_independent_of_depth_limit(monkeypatch, storage):
-    with binding_graph(connection, monkeypatch, storage) as (_, _, binding):
-        depths = []
-        for limit in (12, 24):
-            with override_settings(REBAC_DEPTH_LIMIT=limit):
-                qs = binding.objects.with_actor(SubjectRef.of("auth/user", "both")).scoped()
-                sql, _params = qs.query.sql_with_params()
-                nesting = maximum = 0
-                for token in re.findall(r"[()]|\bSELECT\b", sql):
-                    if token == "(":
-                        nesting += 1
-                    elif token == ")":
-                        nesting -= 1
-                    else:
-                        maximum = max(maximum, nesting)
-                depths.append(maximum)
-                assert qs.count() == 0  # SQLite must parse and execute both bounds.
-        assert depths[0] == depths[1]
+def test_scope_sql_is_independent_of_recursive_depth(monkeypatch, storage):
+    with binding_graph(connection, monkeypatch, storage) as (_active, types, binding):
+        actor = SubjectRef.of("auth/user", "both")
+        shapes = []
+        parent = None
+        for depth in (1, 12):
+            with sudo(reason="scope depth fixture"):
+                for _ in range(depth):
+                    parent = types["scope/page"].objects.create(parent=parent)
+            qs = binding.objects.with_actor(actor).scoped()
+            sql, params = qs.query.sql_with_params()
+            shapes.append((sql, len(params)))
+            assert qs.count() == 0
+        assert shapes[0] == shapes[1]

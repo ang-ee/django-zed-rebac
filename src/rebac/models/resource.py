@@ -18,10 +18,9 @@ callers writing string kwargs see no shape change.
 
 from __future__ import annotations
 
-from typing import TYPE_CHECKING, Self, cast
+from typing import TYPE_CHECKING
 
-from django.db import models, transaction
-from django.db.models import Q
+from django.db import models, router, transaction
 
 if TYPE_CHECKING:
     from django.contrib.contenttypes.models import ContentType
@@ -120,29 +119,12 @@ class RebacResource(models.Model):
         """Batched variant of :meth:`upsert_ref` returning a ``(type, id) → pk`` map.
 
         ``bulk_create`` with ``ignore_conflicts=True`` so re-runs are
-        idempotent and a single round-trip suffices for the insert; a
-        follow-up SELECT resolves all primary keys (including any that
-        existed before the bulk insert). Returns an empty dict on empty
+        idempotent. Each batch contains at most 200 identities; a follow-up
+        SELECT resolves and validates all primary keys, including existing rows. Returns an empty dict on empty
         input — the caller can branch on emptiness without a query.
         """
-        if not pairs:
-            return {}
-        unique_pairs = list({pair for pair in pairs})
-        # ``cls(...)`` is typed as the concrete model rather than ``Self``
-        # by django-stubs, so cast for the ``bulk_create(Iterable[Self])``
-        # signature. ``RebacResource`` is a concrete (non-abstract) model
-        # that is never subclassed, so the cast is sound.
-        objs = cast(
-            "list[Self]", [cls(resource_type=rt, resource_id=rid) for rt, rid in unique_pairs]
+        from rebac.index.write import bulk_intern
+
+        return bulk_intern(
+            cls, ("resource_type", "resource_id"), pairs, using=router.db_for_write(cls)
         )
-        cls.objects.bulk_create(objs, ignore_conflicts=True)
-        # Build the OR-of-AND lookup directly — a naive
-        # ``resource_type__in / resource_id__in`` would scan the Cartesian
-        # product of the two sets and then post-filter in Python, which
-        # blows up to N² for N input pairs. The Q chain is exact and the
-        # SQL planner usually executes it as an index range scan per pair.
-        lookup = Q()
-        for rt, rid in unique_pairs:
-            lookup |= Q(resource_type=rt, resource_id=rid)
-        existing = cls.objects.filter(lookup).values_list("resource_type", "resource_id", "id")
-        return {(rt, rid): pk for rt, rid, pk in existing}

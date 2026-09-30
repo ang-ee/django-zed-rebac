@@ -27,7 +27,7 @@ from __future__ import annotations
 from typing import Any
 
 from django.core.exceptions import ValidationError
-from django.db import models
+from django.db import DEFAULT_DB_ALIAS, models
 from django.db.models import Q
 
 from .conf import app_settings
@@ -108,8 +108,14 @@ def model_identity_fields(
     return field, scalar_field
 
 
-def model_identity_filter(model: type[models.Model], attr: str, wire_id: str) -> Q:
+def model_identity_filter(
+    model: type[models.Model], attr: str, wire_id: str, *, using: str = DEFAULT_DB_ALIAS
+) -> Q:
     """Convert a wire identity once; malformed scalar values select no row."""
+    from .index.codec import identity_codec
+
+    if not identity_codec(model, attr).is_canonical(wire_id, using=using):
+        return Q(pk__in=[])
     _field, scalar = model_identity_fields(model, attr)
     try:
         value = scalar.to_python(wire_id)

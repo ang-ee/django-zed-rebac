@@ -14,6 +14,7 @@ from rebac.models import PermissionAuditEvent, active_relationship_model
 from rebac.relationships import write_relationships
 from rebac.schema import parse_zed
 from rebac.types import ObjectRef, RelationshipTuple, SubjectRef
+from tests.backend_setup import install_schema
 
 pytestmark = pytest.mark.django_db
 
@@ -43,7 +44,7 @@ definition storage/role {
 def _command_schema(request, settings):
     settings.REBAC_LOCAL_BACKEND_STORAGE = request.param
     reset_backend()
-    backend().set_schema(parse_zed(SCHEMA_TEXT))
+    install_schema(backend(), parse_zed(SCHEMA_TEXT))
     yield
     reset_backend()
 
@@ -203,7 +204,7 @@ def test_relationships_lists_orphans_without_loading_schema(
     monkeypatch, relationship_rows, flags: list[str], indices: list[int]
 ) -> None:
     engine = backend()
-    engine.set_schema(parse_zed("definition replacement/type {}"))
+    install_schema(engine, parse_zed("definition replacement/type {}"))
     schema = Mock(side_effect=AssertionError("Tuple listing must not load the schema"))
     monkeypatch.setattr(engine, "schema", schema)
     output = io.StringIO()

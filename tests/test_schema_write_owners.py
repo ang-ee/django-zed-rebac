@@ -225,13 +225,24 @@ def installed_database_objects(db):
 def upgrade_schema_owners(db):
     """Exercise actual 0.21.0 -> 0.22.0 migration states on each vendor."""
     previous = [("rebac", "0005_schema_generation")]
-    current = [("rebac", "0006_schema_write_owners")]
+    current = [("rebac", "0007_permission_index")]
     # Start below 0005, since reversing removal deliberately never reinstalls.
     MigrationExecutor(db).migrate([("rebac", "0004_field_backing_path")])
     try:
-        MigrationExecutor(db).migrate(previous)
+        executor = MigrationExecutor(db)
+        executor.migrate(previous)
+        from tests.fixtures.legacy_schema_triggers import install
+
+        historical = executor.loader.project_state(previous).apps
+        with db.schema_editor() as editor:
+            install(historical, editor)
         assert len(installed_database_objects(db)) == (16 if db.vendor == "postgresql" else 15)
-        revision = SchemaGeneration.objects.using(db.alias).get(pk=1).revision
+        revision = (
+            historical.get_model("rebac", "SchemaGeneration")
+            .objects.using(db.alias)
+            .get(pk=1)
+            .revision
+        )
         MigrationExecutor(db).migrate(current)
         assert installed_database_objects(db) == set()
         assert SchemaGeneration.objects.using(db.alias).get(pk=1).revision == revision

@@ -6,6 +6,7 @@ from types import SimpleNamespace
 from typing import Any
 from unittest.mock import patch
 
+import pytest
 from django.core import checks
 from django.test import override_settings
 
@@ -15,6 +16,70 @@ from rebac.checks import (
     check_universal_admin_in_roles,
 )
 from rebac.conf import app_settings
+
+
+def test_unbuilt_index_warns_without_blocking_database_setup(db):
+    """A fresh/flush-created database must reach sync; permission reads still fail."""
+    from rebac.checks import check_index_ready
+    from rebac.errors import SchemaError
+    from rebac.index.read import ensure_ready
+    from rebac.models.generation import SchemaGeneration
+
+    SchemaGeneration.objects.all().delete()
+    for _ in range(2):  # Repeated migrate/check before the first schema sync.
+        issues = check_index_ready(databases=["default"])
+        assert len(issues) == 1
+        assert issues[0].id == "rebac.E013"
+        assert issues[0].level == checks.WARNING
+        assert not issues[0].is_serious()
+        with pytest.raises(SchemaError, match=r"rebac\.E013"):
+            ensure_ready(using="default")
+
+
+def test_index_alias_check_accepts_read_replica_but_rejects_split_writes(monkeypatch):
+    from django.apps import apps
+    from django.db import router
+
+    from rebac import checks as rebac_checks
+    from rebac.schema.ast import Schema
+    from tests.testapp.models import Post
+
+    monkeypatch.setattr(rebac_checks, "_index_schema_for_checks", lambda using: Schema())
+    monkeypatch.setattr(apps, "get_models", lambda **kwargs: [Post])
+    monkeypatch.setattr(router, "db_for_read", lambda model, **kwargs: "replica")
+    monkeypatch.setattr(router, "db_for_write", lambda model, **kwargs: "default")
+    assert not any(
+        issue.id == "rebac.E015" for issue in rebac_checks.check_index_schema(databases=["default"])
+    )
+    monkeypatch.setattr(
+        router, "db_for_write", lambda model, **kwargs: "other" if model is Post else "default"
+    )
+    assert any(
+        issue.id == "rebac.E015" for issue in rebac_checks.check_index_schema(databases=["default"])
+    )
+
+
+@pytest.mark.parametrize("kind", ["BooleanField", "DateField", "DecimalField"])
+def test_dynamic_container_unsupported_scalar_codecs_are_explicit(kind):
+    from django.db import models
+    from django.test.utils import isolate_apps
+
+    from rebac.errors import SchemaError
+    from rebac.index.codec import identity_codec
+
+    with isolate_apps("tests.testapp"):
+        field = getattr(models, kind)(
+            **({"max_digits": 10, "decimal_places": 2} if kind == "DecimalField" else {})
+        )
+
+        class ContainerSubject(models.Model):
+            container = field
+
+            class Meta:
+                app_label = "testapp"
+
+        with pytest.raises(SchemaError, match=rf"rebac.E014.*container.*{kind}"):
+            identity_codec(ContainerSubject, "container")
 
 
 def test_app_settings_cache_invalidation_on_override_settings():

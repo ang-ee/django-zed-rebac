@@ -9,10 +9,11 @@ from __future__ import annotations
 from typing import Any
 
 from django.conf import settings
-from django.test.signals import setting_changed
+from django.core.signals import setting_changed
 
 _DEFAULTS: dict[str, Any] = {
     "REBAC_BACKEND": "local",
+    "REBAC_TRACKED_MODELS": [],
     "REBAC_RELATIONSHIP_MODEL": "rebac.Relationship",
     "REBAC_SPICEDB_ENDPOINT": None,
     "REBAC_SPICEDB_TOKEN": None,
@@ -20,6 +21,10 @@ _DEFAULTS: dict[str, Any] = {
     "REBAC_SPICEDB_AUTO_WRITE_SCHEMA": True,
     "REBAC_SCHEMA_DIR": None,  # resolves to <cwd>/rebac at use site
     "REBAC_DEPTH_LIMIT": 8,
+    # Maximum normalized logical contribution, rather than a per-row limit.
+    # Type/range validation belongs to the E017 system check, never import time.
+    "REBAC_INDEX_CONDITION_LIMIT": 256,
+    "REBAC_INDEX_LOOKUP_LIMIT": 64,
     "REBAC_DEFAULT_CONSISTENCY": "minimize_latency",
     "REBAC_CACHE_ALIAS": "default",
     "REBAC_LOOKUP_CACHE_TTL": 60,
@@ -66,7 +71,7 @@ _DEFAULTS: dict[str, Any] = {
     # actor is a Django ``User`` / ``Group`` instance. Per-model
     # ``Meta.rebac_id_attr`` still wins when set.
     "REBAC_USER_ID_ATTR": "pk",
-    # When True, the pre-save / pre-delete signal handlers also write a
+    # When True, the save/delete gates also write a
     # PermissionAuditEvent row before raising PermissionDenied. Defaults to
     # False because every denied write doubles as a failed-attempt log row,
     # which can dominate the audit table on heavy denial traffic (e.g. an
@@ -142,6 +147,13 @@ class _AppSettings:
     def _on_changed(self, sender: Any, setting: str, value: Any, **kwargs: Any) -> None:
         if setting in _DEFAULTS:
             self._cache.pop(setting, None)
+        if setting in {"REBAC_TRACKED_MODELS", "AUTH_USER_MODEL"}:
+            from django.apps import apps
+
+            if apps.ready:
+                from .signals import connect_tracked_signals
+
+                connect_tracked_signals()
 
     def __getattr__(self, name: str) -> Any:
         if name not in _DEFAULTS:

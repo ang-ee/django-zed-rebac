@@ -11,6 +11,7 @@ from rebac import Consistency, LocalBackend, ObjectRef, RelationshipTuple, Subje
 from rebac.models import active_relationship_model
 from rebac.schema import parse_zed
 from rebac.types import PermissionResult
+from tests.backend_setup import install_schema, rebuild_backend
 
 SCHEMA = """
 use expiration
@@ -39,7 +40,7 @@ POST = ObjectRef("blog/post", "p1")
 def backend(request, settings, db):
     settings.REBAC_LOCAL_BACKEND_STORAGE = request.param
     result = LocalBackend()
-    result.set_schema(parse_zed(SCHEMA))
+    install_schema(result, parse_zed(SCHEMA))
     return result
 
 
@@ -163,6 +164,7 @@ def test_expired_arrow_hop_does_not_authorize(backend):
             ),
         ]
     )
+    rebuild_backend(backend)
     assert not backend.has_access(subject=ALICE, action="read", resource=POST)
     assert not list(
         backend.accessible(
@@ -201,6 +203,7 @@ def test_stale_relationship_missing_required_caveat_cannot_authorize(backend, ca
         caveat_name=caveat_name,
         caveat_context={"value": True},
     )
+    rebuild_backend(backend)
     assert not backend.has_access(subject=ALICE, action="read", resource=POST)
     assert not list(
         backend.accessible(
@@ -230,7 +233,8 @@ def test_expiration_modifier_is_not_parsed_as_a_caveat():
 @pytest.mark.parametrize("context", [None, {"value": False}, {"value": True}])
 @pytest.mark.parametrize("via_arrow", [False, True])
 def test_preflight_virtual_tuples_cannot_omit_required_caveats(backend, context, via_arrow):
-    backend.set_schema(
+    install_schema(
+        backend,
         parse_zed("""
         caveat enabled(value bool) { value }
         definition auth/user {}
@@ -244,7 +248,7 @@ def test_preflight_virtual_tuples_cannot_omit_required_caveats(backend, context,
             permission direct = viewer
             permission inherited = folder->read
         }
-    """)
+    """),
     )
     backend.write_relationships(
         [

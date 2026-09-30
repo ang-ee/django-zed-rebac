@@ -19,6 +19,7 @@ from rebac import (
 from rebac.models import Relationship, SchemaDefinition, SchemaPermission, SchemaRelation
 from rebac.schema import parse_zed
 from rebac.types import RelationshipFilter
+from tests.backend_setup import atomic_source_write, install_schema
 
 from .testapp.models import AuthoredPost, Folder, Post
 
@@ -42,7 +43,7 @@ definition blog/post {
 @pytest.fixture
 def backend(db):
     b = LocalBackend()
-    b.set_schema(parse_zed(SCHEMA_TEXT))
+    install_schema(b, parse_zed(SCHEMA_TEXT))
     return b
 
 
@@ -210,35 +211,19 @@ def test_unresolved_field_backing_does_not_fall_back_to_stale_tuples(db, rows):
         subject_id="alice",
     )
 
-    expected = "blog/post#folder: field-backed relation could not be resolved"
-    with pytest.raises(SchemaError, match=expected):
-        backend.has_access(
-            subject=_user("alice"),
-            action="folder",
-            resource=_post_ref(visible_post),
-        )
-    with pytest.raises(SchemaError, match=expected):
-        backend.has_access(
-            subject=_user("alice"),
-            action="read",
-            resource=_post_ref(visible_post),
-        )
-    with pytest.raises(SchemaError, match=expected):
-        list(backend.accessible(subject=_user("alice"), action="read", resource_type="blog/post"))
-    with pytest.raises(SchemaError, match=expected):
-        list(
-            backend.lookup_subjects(
-                resource=_post_ref(visible_post),
-                action="folder",
-                subject_type="auth/user",
-            )
-        )
+    from tests.backend_setup import rebuild_backend
+
+    # Unresolvable backing now fails at the index publication boundary. No
+    # stale stored tuple may be published as a substitute for that backing.
+    with pytest.raises(SchemaError, match="blog/post#folder"):
+        rebuild_backend(backend)
 
 
 @override_settings(REBAC_USER_ID_ATTR="username")
 def test_field_backed_relation_to_auth_user_honors_subject_id_attr(db):
     backend = LocalBackend()
-    backend.set_schema(
+    install_schema(
+        backend,
         parse_zed(
             """
             definition auth/user {}
@@ -248,9 +233,9 @@ def test_field_backed_relation_to_auth_user_honors_subject_id_attr(db):
                 permission read = author
             }
             """
-        )
+        ),
     )
-    user = get_user_model().objects.create(username="alice", is_active=True)
+    user = atomic_source_write(get_user_model().objects.create, username="alice", is_active=True)
     with sudo(reason="field-backed-relations.auth-user"):
         post = AuthoredPost.objects.create(title="authored", author=user)
 
@@ -349,7 +334,8 @@ def test_reverse_one_to_one_read_scope_and_exclusion(django_user_model):
 
     reset_backend()
     backend = active_backend()
-    backend.set_schema(
+    install_schema(
+        backend,
         parse_zed("""
         definition auth/user {}
         definition test/nativeparentlinkedchild {
@@ -361,10 +347,10 @@ def test_reverse_one_to_one_read_scope_and_exclusion(django_user_model):
             permission read = child->read
             permission excluded = authenticated - child->read
         }
-    """)
+    """),
     )
-    alice = django_user_model.objects.create_user(username="reverse-alice")
-    bob = django_user_model.objects.create_user(username="reverse-bob")
+    alice = atomic_source_write(django_user_model.objects.create_user, username="reverse-alice")
+    bob = atomic_source_write(django_user_model.objects.create_user, username="reverse-bob")
     with sudo(reason="reverse one-to-one fixtures"):
         visible = NativeParentLinkedChild.objects.create(name="visible", owner=alice)
         hidden = NativeParentLinkedChild.objects.create(name="hidden", owner=bob)

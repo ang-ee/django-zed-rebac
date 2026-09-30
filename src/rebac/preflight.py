@@ -332,7 +332,7 @@ def _build_ctx(
         if not candidates:
             return False
         # Each arrow hop is a dispatch into another (real) resource, so
-        # increments depth — mirrors LocalBackend's `_walk_resolve_arrow`.
+        # increments the proposed-object walk depth before its persisted lookup.
         new_depth = depth + 1
         if new_depth > ctx.depth_limit:
             raise PermissionDepthExceeded(f"Depth limit {ctx.depth_limit} exceeded")

@@ -5,10 +5,10 @@ from unittest.mock import patch
 import pytest
 
 from rebac import LocalBackend, ObjectRef, RelationshipTuple, SchemaError, SubjectRef
-from rebac.backends.local_query import LocalQueryScope, UnsupportedScope
 from rebac.models import active_relationship_model
 from rebac.preflight import check_new
 from rebac.schema import parse_zed, validate_schema
+from tests.backend_setup import install_schema
 from tests.testapp.models import Post
 
 
@@ -34,7 +34,7 @@ def test_subject_set_rejects_permission_name_when_target_is_present() -> None:
         "tuples together with the schema"
     ]
     with pytest.raises(SchemaError, match="migrate existing tuples together with the schema"):
-        LocalBackend().set_schema(schema)
+        install_schema(LocalBackend(), schema)
 
 
 def test_subject_set_accepts_declared_relation() -> None:
@@ -91,9 +91,10 @@ def test_unresolved_cross_package_subject_type_is_deferred() -> None:
 @pytest.mark.django_db
 @pytest.mark.parametrize("storage", ["denormalized", "registry"])
 def test_invalid_ast_cannot_write_or_authorize_permission_subject_tuple(
-    settings, storage: str
+    settings, monkeypatch, storage: str
 ) -> None:
     settings.REBAC_LOCAL_BACKEND_STORAGE = storage
+    monkeypatch.setattr(Post._meta, "rebac_resource_type", "docs/document")
     schema = parse_zed(
         """
         definition auth/user {
@@ -110,11 +111,15 @@ def test_invalid_ast_cannot_write_or_authorize_permission_subject_tuple(
     # Exercise the defensive write/read boundary independently of the schema
     # validator, as if malformed persisted AST data reached the backend.
     with patch("rebac.backends.local._enforced_schema_errors", return_value=[]):
-        local.set_schema(schema)
+        install_schema(local, schema)
+    from rebac import sudo
+
+    with sudo(reason="invalid subject-set fixture"):
+        post = Post.objects.create(title="protected")
     user = SubjectRef.of("auth/user", "alice")
     local.write_relationships([RelationshipTuple(ObjectRef("auth/user", "set"), "member", user)])
     invalid = RelationshipTuple(
-        ObjectRef("docs/document", "one"),
+        ObjectRef("docs/document", str(post.pk)),
         "viewer",
         SubjectRef.of("auth/user", "set", "effective_member"),
     )
@@ -122,9 +127,12 @@ def test_invalid_ast_cannot_write_or_authorize_permission_subject_tuple(
     with pytest.raises(ValueError, match="cannot reference permissions"):
         local.write_relationships([invalid])
 
-    scope = LocalQueryScope(local, user, "default")
-    with pytest.raises(UnsupportedScope):
-        scope.predicate(Post, "read", "docs/document")
+    from rebac.index.read import scope_q, using_backend
+
+    with using_backend(local):
+        assert not Post._base_manager.filter(
+            scope_q(Post, action="read", actor=user, using="default")
+        ).exists()
 
     preflight = check_new(
         subject=user,
@@ -137,14 +145,17 @@ def test_invalid_ast_cannot_write_or_authorize_permission_subject_tuple(
 
     active_relationship_model().objects.create(
         resource_type="docs/document",
-        resource_id="one",
+        resource_id=str(post.pk),
         relation="viewer",
         subject_type="auth/user",
         subject_id="set",
         optional_subject_relation="effective_member",
     )
+    from tests.backend_setup import rebuild_backend
+
+    rebuild_backend(local)
     assert not local.has_access(
         subject=user,
         action="read",
-        resource=ObjectRef("docs/document", "one"),
+        resource=ObjectRef("docs/document", str(post.pk)),
     )

@@ -8,6 +8,7 @@ from rebac.memberships import containers_of, grant, members_of, revoke
 from rebac.models import Relationship
 from rebac.schema import parse_zed
 from rebac.types import ObjectRef, SubjectRef
+from tests.backend_setup import install_schema
 
 SCHEMA_TEXT = """
 caveat during_hours(timezone string) {
@@ -40,7 +41,7 @@ def _membership_schema(request):
         yield
         return
     reset_backend()
-    backend().set_schema(parse_zed(SCHEMA_TEXT))
+    install_schema(backend(), parse_zed(SCHEMA_TEXT))
     yield
     reset_backend()
 

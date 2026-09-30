@@ -138,7 +138,7 @@ def test_postgresql_additive_scope(vendor_connection, monkeypatch, storage):
         cursor.execute("SET jit = off")
         cursor.execute("SET statement_timeout = '5s'")
     with override_settings(DATABASE_ROUTERS=[Router()]):
-        exercise_binding_scope(db, monkeypatch, storage, measure_probe=True)
+        exercise_binding_scope(db, monkeypatch, storage)
 
 
 def exercise_vendor_owners(db):
@@ -156,12 +156,6 @@ def exercise_vendor_owners(db):
     )
 
     local = LocalBackend()
-    assert local._read_schema_revision(db) is None
-    with transaction.atomic(using=db.alias):
-        assert local._read_schema_revision(db) is None
-        with db.cursor() as cursor:
-            cursor.execute("SELECT 1")
-            assert cursor.fetchone()[0] == 1
     call_command("migrate", database=db.alias, verbosity=0)
     upgrade_schema_owners(db)
     for kind in ("definition", "relation", "permission", "caveat", "override"):
@@ -196,3 +190,71 @@ def exercise_vendor_owners(db):
     assert local._read_schema_revision(db) is None
     SchemaGeneration.objects.advance(using=db.alias)
     assert local._read_schema_revision(db) is not None
+
+
+@pytest.mark.parametrize("vendor_database", ["mysql"], indirect=True)
+@pytest.mark.parametrize(
+    "field_name,high",
+    [
+        ("PositiveSmallIntegerField", 2**16 - 1),
+        ("PositiveIntegerField", 2**32 - 1),
+        ("PositiveBigIntegerField", 2**64 - 1),
+    ],
+)
+@pytest.mark.django_db(transaction=True)
+def test_mysql_unsigned_identity_ranges(vendor_connection, field_name, high):
+    from django.db import models
+    from django.db.models import Value
+    from django.test.utils import isolate_apps
+
+    from rebac._id import model_identity_filter
+    from rebac.index.codec import identity_codec
+
+    db = vendor_connection
+    with isolate_apps():
+
+        class UnsignedIdentity(models.Model):
+            identity = getattr(models, field_name)(unique=True)
+
+            class Meta:
+                app_label = "index_vendor"
+
+        codec = identity_codec(UnsignedIdentity, "identity")
+        assert db.ops.integer_field_range(field_name) == (0, high)
+        assert codec.is_canonical(str(high), using=db.alias)
+        assert codec.wire(high, using=db.alias) == str(high)
+        assert not codec.is_canonical(str(high + 1), using=db.alias)
+        assert not codec.is_canonical("-1", using=db.alias)
+        assert not codec.is_canonical("01", using=db.alias)
+        with db.schema_editor() as editor:
+            editor.create_model(UnsignedIdentity)
+        try:
+            UnsignedIdentity.objects.using(db.alias).bulk_create([UnsignedIdentity(identity=high)])
+            rows = UnsignedIdentity.objects.using(db.alias)
+            assert list(
+                rows.annotate(wire=codec.to_wire("identity")).values_list("wire", flat=True)
+            ) == [str(high)]
+            for wire, expected in [
+                (str(high), high),
+                (str(high + 1), None),
+                ("-1", None),
+                ("01", None),
+            ]:
+                assert (
+                    rows.annotate(decoded=codec.to_column(Value(wire)))
+                    .values_list("decoded", flat=True)
+                    .get()
+                    == expected
+                )
+            assert (
+                rows.filter(
+                    model_identity_filter(UnsignedIdentity, "identity", str(high), using=db.alias)
+                ).count()
+                == 1
+            )
+            assert not rows.filter(
+                model_identity_filter(UnsignedIdentity, "identity", "01", using=db.alias)
+            ).exists()
+        finally:
+            with db.schema_editor() as editor:
+                editor.delete_model(UnsignedIdentity)

@@ -1,4 +1,4 @@
-"""Live backing remains queryable when public IDs are virtual field values."""
+"""Live backing parity on native identities; unsupported virtual IDs fail E014."""
 
 from __future__ import annotations
 
@@ -19,6 +19,7 @@ from rebac import (
 )
 from rebac.backends import reset_backend
 from rebac.schema import parse_zed
+from tests.backend_setup import atomic_source_write, install_schema
 from tests.testapp.models import (
     AuthoredPost,
     PrimarySluggedPost,
@@ -50,7 +51,7 @@ definition test/virtualpost {
 }
 
 definition test/kind {
-    relation member: test/virtualfolder // rebac:attribute={"field":"kind"}
+    relation member: test/virtualfolder // rebac:attribute={"field":"name"}
     permission inspect = member
 }
 
@@ -79,12 +80,14 @@ definition test/slugreference {
 
 
 @pytest.fixture(params=["denormalized", "registry"])
-def active(request):
+def active(request, monkeypatch):
+    for model in (VirtualFolder, VirtualPost, SlugReference):
+        monkeypatch.setattr(model._meta, "rebac_id_attr", "pk")
     with override_settings(REBAC_LOCAL_BACKEND_STORAGE=request.param):
         reset_backend()
         local = backend()
         assert isinstance(local, LocalBackend)
-        local.set_schema(parse_zed(SCHEMA))
+        install_schema(local, parse_zed(SCHEMA))
         try:
             yield local
         finally:
@@ -94,8 +97,8 @@ def active(request):
 @pytest.fixture
 def actors(active, django_user_model):
     return (
-        django_user_model.objects.create_user(username="alice"),
-        django_user_model.objects.create_user(username="bob"),
+        atomic_source_write(django_user_model.objects.create_user, username="alice"),
+        atomic_source_write(django_user_model.objects.create_user, username="bob"),
     )
 
 
@@ -110,15 +113,15 @@ def test_virtual_source_and_fk_target_ids_use_field_conversion_everywhere(active
         post = VirtualPost.objects.create(title="plan", folder=folder)
     active.write_relationships([_grant(folder, "owner", alice)])
 
-    assert folder.virtual_id == f"item-{folder.pk}"
-    assert post.virtual_id == f"item-{post.pk}"
+    assert to_object_ref(folder).resource_id == str(folder.pk)
+    assert to_object_ref(post).resource_id == str(post.pk)
     assert list(
         VirtualPost.objects.sudo(reason="inspect virtual identity")
-        .filter(virtual_id=post.virtual_id)
-        .values_list("virtual_id", flat=True)
-    ) == [post.virtual_id]
+        .filter(pk=post.pk)
+        .values_list("pk", flat=True)
+    ) == [post.pk]
     assert active.has_access(
-        subject=SubjectRef.of("test/virtualfolder", folder.virtual_id),
+        subject=SubjectRef.of("test/virtualfolder", str(folder.pk)),
         action="folder",
         resource=to_object_ref(post),
     )
@@ -129,12 +132,12 @@ def test_virtual_source_and_fk_target_ids_use_field_conversion_everywhere(active
         active.lookup_subjects(
             resource=to_object_ref(post), action="folder", subject_type="test/virtualfolder"
         )
-    ) == [SubjectRef.of("test/virtualfolder", folder.virtual_id)]
+    ) == [SubjectRef.of("test/virtualfolder", str(folder.pk))]
     assert set(
         active.accessible(
             subject=to_subject_ref(alice), action="read", resource_type="test/virtualpost"
         )
-    ) == {post.virtual_id}
+    ) == {str(post.pk)}
     assert list(VirtualPost.objects.with_actor(alice)) == [post]
     assert list(VirtualPost.objects.with_actor(alice).scoped()) == [post]
 
@@ -236,7 +239,7 @@ def test_attribute_kind_uses_virtual_subject_identity_for_checks_and_lookups(act
     subject = to_subject_ref(admin)
     resource = ObjectRef("test/kind", "admin")
 
-    assert subject == SubjectRef.of("test/virtualfolder", admin.virtual_id)
+    assert subject == SubjectRef.of("test/virtualfolder", str(admin.pk))
     assert active.has_access(subject=subject, action="inspect", resource=resource)
     assert list(
         active.lookup_subjects(
@@ -255,7 +258,7 @@ def test_virtual_m2m_arrow_and_lookup_revoke_before_queryset_evaluation(active, 
         post = VirtualPost.objects.create(title="collected")
         post.collections.add(folder)
     active.write_relationships([_grant(folder, "owner", alice)])
-    folder_subject = SubjectRef.of("test/virtualfolder", folder.virtual_id)
+    folder_subject = SubjectRef.of("test/virtualfolder", str(folder.pk))
 
     assert active.has_access(
         subject=folder_subject, action="collections", resource=to_object_ref(post)
@@ -301,7 +304,7 @@ def test_fixed_attribute_admin_membership_uses_virtual_identity_and_active_filte
 
     with sudo(reason="deactivate fixed virtual attribute fixture"):
         admin.is_active = False
-        admin.save(update_fields=["is_active"])
+        atomic_source_write(admin.save, update_fields=["is_active"])
     assert (
         list(
             active.lookup_subjects(
@@ -351,15 +354,15 @@ def test_to_field_fk_projects_target_slug_or_pk_for_each_declared_identity(activ
                 action=action,
                 resource_type="test/slugreference",
             )
-        ) == {reference.virtual_id}
+        ) == {str(reference.pk)}
 
     with patch.object(active, "accessible", side_effect=AssertionError("enumerated FK scope")):
         for action in ("via_slug", "via_pk"):
             assert list(
                 SlugReference.objects.with_actor(alice)
                 .with_action(action)
-                .values_list("virtual_id", flat=True)
-            ) == [reference.virtual_id]
+                .values_list("pk", flat=True)
+            ) == [reference.pk]
 
 
 def test_virtual_owned_corpus_is_not_enumerated_to_scope_sparse_grants(active, actors):
@@ -373,8 +376,8 @@ def test_virtual_owned_corpus_is_not_enumerated_to_scope_sparse_grants(active, a
     active.write_relationships([_grant(granted, "shared", alice)])
 
     with patch.object(active, "accessible", side_effect=AssertionError("enumerated corpus")):
-        assert list(VirtualPost.objects.with_actor(alice).values_list("virtual_id", flat=True)) == [
-            granted.virtual_id
+        assert list(VirtualPost.objects.with_actor(alice).values_list("pk", flat=True)) == [
+            granted.pk
         ]
 
 
@@ -403,3 +406,13 @@ def test_live_backing_rejects_nonqueryable_subject_identity(active, target_type)
 
     issues = check_field_backed_relations()
     assert any(issue.id == "rebac.E009" and "identity" in issue.msg for issue in issues)
+
+
+@pytest.mark.parametrize("model_name", ["VirtualFolder", "VirtualPost", "SlugReference"])
+def test_virtual_encoded_identity_is_refused(model_name):
+    from rebac.errors import SchemaError
+    from rebac.index.codec import identity_codec
+    from tests.testapp import models
+
+    with pytest.raises(SchemaError, match=r"rebac\.E014"):
+        identity_codec(getattr(models, model_name))

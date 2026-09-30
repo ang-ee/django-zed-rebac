@@ -31,6 +31,7 @@ from rebac.backends import reset_backend
 from rebac.models import PermissionAuditEvent
 from rebac.schema import parse_zed
 from rebac.types import RelationshipFilter
+from tests.backend_setup import install_schema
 
 SCHEMA_TEXT = """
 caveat during_business_hours(hour int) { hour >= 0 }
@@ -52,7 +53,7 @@ definition blog/post {
 @pytest.fixture(autouse=True)
 def _setup_backend(db):
     reset_backend()
-    backend().set_schema(parse_zed(SCHEMA_TEXT))
+    install_schema(backend(), parse_zed(SCHEMA_TEXT))
     yield
     reset_backend()
 

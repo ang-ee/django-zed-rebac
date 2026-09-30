@@ -15,6 +15,7 @@ from rebac import (
 from rebac.backends import LocalBackend, reset_backend
 from rebac.managers import RebacManager, RebacQuerySet
 from rebac.schema import parse_zed
+from tests.backend_setup import install_schema
 from tests.testapp.models import Post, SluggedPost
 
 ALICE = SubjectRef.of("auth/user", "alice")
@@ -40,7 +41,7 @@ def rows(db, request):
         reset_backend()
         active = backend()
         assert isinstance(active, LocalBackend)
-        active.set_schema(parse_zed(SCHEMA))
+        install_schema(active, parse_zed(SCHEMA))
         with sudo(reason="projection fixtures"):
             first = Post.objects.create(title="first")
             second = Post.objects.create(title="second")
@@ -124,7 +125,7 @@ def test_anonymous_actor_is_not_missing_actor(rows):
     reset_backend()
     active = backend()
     assert isinstance(active, LocalBackend)
-    active.set_schema(parse_zed("definition blog/post { permission read = anonymous }"))
+    install_schema(active, parse_zed("definition blog/post { permission read = anonymous }"))
     assert Post.objects.with_actor(anonymous_actor()).scoped_for_aggregate().count() == 3
 
 

@@ -13,6 +13,7 @@ from rebac import (
 )
 from rebac.schema import parse_zed
 from rebac.types import RelationshipFilter
+from tests.backend_setup import atomic_source_write, install_schema
 
 SCHEMA = """
 definition auth/user {
@@ -33,12 +34,14 @@ definition test/doc {
 @pytest.fixture
 def live_backend(db):
     backend = LocalBackend()
-    backend.set_schema(parse_zed(SCHEMA))
+    install_schema(backend, parse_zed(SCHEMA))
     return backend
 
 
 def test_fixed_attribute_owns_only_its_anchor(live_backend):
-    user = get_user_model().objects.create_user(username="staff", is_staff=True, is_active=True)
+    user = atomic_source_write(
+        get_user_model().objects.create_user, username="staff", is_staff=True, is_active=True
+    )
     subject = SubjectRef.of("auth/user", str(user.pk))
     assert live_backend.has_access(
         subject=subject, action="access", resource=ObjectRef("test/role", "admin")
@@ -83,16 +86,17 @@ def test_fixed_attribute_owns_only_its_anchor(live_backend):
 @pytest.mark.django_db(transaction=True)
 def test_live_backings_disable_evaluator_result_caching():
     backend = LocalBackend()
-    backend.set_schema(parse_zed(SCHEMA))
-    user = get_user_model().objects.create_user(
-        username="cache-staff", is_staff=True, is_active=True
+    install_schema(backend, parse_zed(SCHEMA))
+    user = atomic_source_write(
+        get_user_model().objects.create_user, username="cache-staff", is_staff=True, is_active=True
     )
     subject = SubjectRef.of("auth/user", str(user.pk))
     resource = ObjectRef("test/role", "admin")
 
     with evaluator_scope() as evaluator:
         assert evaluator.check(backend, subject=subject, action="access", resource=resource).allowed
-        get_user_model().objects.filter(pk=user.pk).update(is_staff=False)
+        user.is_staff = False
+        atomic_source_write(user.save, update_fields=["is_staff"])
         assert not evaluator.check(
             backend, subject=subject, action="access", resource=resource
         ).allowed
@@ -116,8 +120,8 @@ definition blog/post {
 @pytest.mark.django_db(transaction=True)
 def test_types_unreachable_from_live_backing_keep_caching_decisions():
     backend = LocalBackend()
-    backend.set_schema(parse_zed(CACHE_SCHEMA))
-    user = get_user_model().objects.create_user(username="cache-static")
+    install_schema(backend, parse_zed(CACHE_SCHEMA))
+    user = atomic_source_write(get_user_model().objects.create_user, username="cache-static")
     subject = SubjectRef.of("auth/user", str(user.pk))
     resource = ObjectRef("test/static", "one")
     backend.write_relationships([RelationshipTuple(resource, "viewer", subject)])
@@ -134,9 +138,9 @@ def test_types_unreachable_from_live_backing_keep_caching_decisions():
 @pytest.mark.django_db(transaction=True)
 def test_types_reaching_live_backing_through_const_targets_bypass_caching():
     backend = LocalBackend()
-    backend.set_schema(parse_zed(CACHE_SCHEMA))
-    user = get_user_model().objects.create_user(
-        username="cache-banner", is_staff=True, is_active=True
+    install_schema(backend, parse_zed(CACHE_SCHEMA))
+    user = atomic_source_write(
+        get_user_model().objects.create_user, username="cache-banner", is_staff=True, is_active=True
     )
     subject = SubjectRef.of("auth/user", str(user.pk))
     resource = ObjectRef("blog/post", "top")
@@ -146,7 +150,8 @@ def test_types_reaching_live_backing_through_const_targets_bypass_caching():
         assert evaluator.accessible(
             backend, subject=subject, action="access", resource_type="test/role"
         ) == ("admin",)
-        get_user_model().objects.filter(pk=user.pk).update(is_staff=False)
+        user.is_staff = False
+        atomic_source_write(user.save, update_fields=["is_staff"])
         assert not evaluator.check(
             backend, subject=subject, action="read", resource=resource
         ).allowed
@@ -163,11 +168,12 @@ def test_types_reaching_live_backing_through_const_targets_bypass_caching():
 @pytest.mark.django_db(transaction=True)
 def test_live_type_set_follows_schema_replacement():
     backend = LocalBackend()
-    backend.set_schema(parse_zed(CACHE_SCHEMA))
+    install_schema(backend, parse_zed(CACHE_SCHEMA))
     assert backend._cache_generation("test/static") is not None
     assert backend._cache_generation("test/role") is None
 
-    backend.set_schema(
+    install_schema(
+        backend,
         parse_zed(
             """
             definition auth/user {}
@@ -176,7 +182,7 @@ def test_live_type_set_follows_schema_replacement():
                 permission access = member
             }
             """
-        )
+        ),
     )
 
     assert backend._cache_generation("test/role") is not None

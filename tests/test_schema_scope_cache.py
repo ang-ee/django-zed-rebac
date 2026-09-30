@@ -33,6 +33,7 @@ def persisted_schema():
     )
     local = LocalBackend()
     local.write_relationships([RelationshipTuple(RESOURCE, "viewer", ACTOR)])
+    local.schema()  # Warm the per-revision snapshot before measuring scoped reads.
     return local, permission
 
 
@@ -79,7 +80,7 @@ def test_readonly_atomic_reuses_one_persisted_schema(persisted_schema):
         with CaptureQueriesContext(connection) as queries:
             for _ in range(4):
                 assert not _allowed(local)
-        # The relationship-write validation already loaded this revision.
+        # Fixture setup already loaded this revision.
         assert _schema_loads(queries) == 0
 
 

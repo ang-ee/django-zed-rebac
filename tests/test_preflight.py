@@ -15,6 +15,7 @@ from rebac import (
     check_new,
 )
 from rebac.schema import parse_zed
+from tests.backend_setup import install_schema
 
 SCHEMA_TEXT = """
 caveat link_not_expired(expires_at timestamp, now timestamp) {
@@ -73,7 +74,7 @@ definition project/note {
 @pytest.fixture
 def backend(db):
     b = LocalBackend()
-    b.set_schema(parse_zed(SCHEMA_TEXT))
+    install_schema(b, parse_zed(SCHEMA_TEXT))
     return b
 
 
@@ -114,7 +115,7 @@ definition blog/post {
 
 def _const_backend() -> LocalBackend:
     b = LocalBackend()
-    b.set_schema(parse_zed(CONST_CREATE_SCHEMA_TEXT))
+    install_schema(b, parse_zed(CONST_CREATE_SCHEMA_TEXT))
     return b
 
 
@@ -662,7 +663,8 @@ def test_create_via_parent_arrow_denies_when_actor_can_create_elsewhere(db):
     ],
 )
 def test_unknown_candidate_relation_denies_dependent_arm(backend, expression):
-    backend.set_schema(
+    install_schema(
+        backend,
         parse_zed(
             f"""
             definition auth/user {{}}
@@ -677,7 +679,7 @@ def test_unknown_candidate_relation_denies_dependent_arm(backend, expression):
                 permission create = {expression}
             }}
             """
-        )
+        ),
     )
 
     result = check_new(
@@ -705,7 +707,8 @@ def test_unknown_candidate_relation_denies_dependent_arm(backend, expression):
     ],
 )
 def test_unknown_candidate_relation_allows_independent_union_arm(backend, expression):
-    backend.set_schema(
+    install_schema(
+        backend,
         parse_zed(
             f"""
             definition auth/user {{}}
@@ -714,7 +717,7 @@ def test_unknown_candidate_relation_allows_independent_union_arm(backend, expres
                 permission create = {expression}
             }}
             """
-        )
+        ),
     )
 
     result = check_new(
@@ -748,7 +751,8 @@ def test_unknown_candidate_relation_preserves_independent_caveat_checks(backend,
     # An unreferenced unknown must not turn a real caveat condition into a
     # structural denial. A referenced one requires an independent definite
     # grant, so a conditional union arm alone cannot bypass it.
-    backend.set_schema(
+    install_schema(
+        backend,
         parse_zed(
             SCHEMA_TEXT
             + f"""
@@ -758,7 +762,7 @@ def test_unknown_candidate_relation_preserves_independent_caveat_checks(backend,
                 permission create = {expression}
             }}
             """
-        )
+        ),
     )
     backend.write_relationships(
         [
@@ -815,7 +819,8 @@ def test_create_rejects_unknown_const_relation_overlay(db):
 def test_unreferenced_unknown_candidate_relation_preserves_short_circuit(
     backend, monkeypatch, expression
 ):
-    backend.set_schema(
+    install_schema(
+        backend,
         parse_zed(
             SCHEMA_TEXT
             + f"""
@@ -825,7 +830,7 @@ def test_unreferenced_unknown_candidate_relation_preserves_short_circuit(
                 permission create = {expression}
             }}
             """
-        )
+        ),
     )
 
     def unexpected_target_check(**kwargs):

@@ -7,7 +7,7 @@ from django.contrib.contenttypes.fields import GenericForeignKey, GenericRelatio
 from django.contrib.contenttypes.models import ContentType
 from django.db import models
 
-from rebac import RebacMixin
+from rebac import RebacMixin, RebacTrackedMixin
 
 from .fields import (
     ColumnlessIdentityField,
@@ -34,6 +34,15 @@ class Folder(RebacMixin, models.Model):
     class Meta:
         app_label = "testapp"
         rebac_resource_type = "blog/folder"
+
+
+class RoleAnchor(RebacMixin, models.Model):
+    """A resource type whose objects exist only in relationships: it has no table."""
+
+    class Meta:
+        app_label = "testapp"
+        managed = False
+        rebac_resource_type = "test/roleanchor"
 
 
 class Post(RebacMixin, models.Model):
@@ -316,7 +325,7 @@ class BackingTask(RebacMixin, models.Model):
         rebac_resource_type = "test/backingtask"
 
 
-class BackingProject(models.Model):
+class BackingProject(RebacTrackedMixin):
     task = models.ForeignKey(BackingTask, on_delete=models.CASCADE, related_name="promoted")
 
 
@@ -331,7 +340,41 @@ class BackingRound(RebacMixin, models.Model):
         rebac_resource_type = "test/backinground"
 
 
-class BackingEntry(models.Model):
+class BackingEntry(RebacTrackedMixin):
     round = models.ForeignKey(BackingRound, on_delete=models.CASCADE, related_name="entries")
     responder = models.ForeignKey(settings.AUTH_USER_MODEL, on_delete=models.CASCADE)
     retired_at = models.DateTimeField(null=True)
+
+
+class TextIdentityFolder(RebacMixin, models.Model):
+    public_id = models.CharField(max_length=64, unique=True)
+    name = models.CharField(max_length=100)
+    author = models.ForeignKey(settings.AUTH_USER_MODEL, on_delete=models.CASCADE)
+
+    class Meta:
+        app_label = "testapp"
+        rebac_resource_type = "blog/textidentityfolder"
+        rebac_id_attr = "public_id"
+
+
+class TextIdentityPost(RebacMixin, models.Model):
+    public_id = models.CharField(max_length=64, unique=True)
+    title = models.CharField(max_length=200)
+    author = models.ForeignKey(settings.AUTH_USER_MODEL, on_delete=models.CASCADE)
+    folder = models.ForeignKey(TextIdentityFolder, null=True, on_delete=models.SET_NULL)
+
+    class Meta:
+        app_label = "testapp"
+        rebac_resource_type = "blog/textidentitypost"
+        rebac_id_attr = "public_id"
+
+
+class TextIdentityPrimaryPost(RebacMixin, models.Model):
+    id = models.CharField(max_length=64, primary_key=True)
+    title = models.CharField(max_length=200)
+    author = models.ForeignKey(settings.AUTH_USER_MODEL, on_delete=models.CASCADE)
+    folder = models.ForeignKey(TextIdentityFolder, null=True, on_delete=models.SET_NULL)
+
+    class Meta:
+        app_label = "testapp"
+        rebac_resource_type = "blog/textidentityprimarypost"

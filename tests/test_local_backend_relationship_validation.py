@@ -5,6 +5,7 @@ import pytest
 from rebac import LocalBackend, ObjectRef, RelationshipTuple, SubjectRef
 from rebac.models import Relationship
 from rebac.schema import parse_zed
+from tests.backend_setup import install_schema, rebuild_backend
 
 SCHEMA_TEXT = """
 definition auth/user {}
@@ -28,7 +29,7 @@ definition blog/post {
 @pytest.fixture
 def backend(db):
     backend = LocalBackend()
-    backend.set_schema(parse_zed(SCHEMA_TEXT))
+    install_schema(backend, parse_zed(SCHEMA_TEXT))
     return backend
 
 
@@ -53,6 +54,7 @@ def test_stale_undeclared_action_row_does_not_authorize_check_or_accessible(back
         subject_id="alice",
     )
 
+    rebuild_backend(backend)
     assert not backend.has_access(
         subject=_user("alice"),
         action="delete",
@@ -87,6 +89,7 @@ def test_stale_subject_set_row_not_allowed_by_relation_does_not_authorize(backen
         optional_subject_relation="member",
     )
 
+    rebuild_backend(backend)
     assert not backend.has_access(
         subject=_user("alice"),
         action="read",
@@ -110,6 +113,7 @@ def test_stale_wildcard_row_not_allowed_by_relation_does_not_authorize(backend) 
         subject_id="*",
     )
 
+    rebuild_backend(backend)
     assert not backend.has_access(
         subject=_user("anyone"),
         action="read",

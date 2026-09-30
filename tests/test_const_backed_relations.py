@@ -24,6 +24,7 @@ from rebac import (
 from rebac.models import Relationship, SchemaDefinition, SchemaPermission, SchemaRelation
 from rebac.schema import ConstBinding, parse_zed
 from rebac.types import RelationshipFilter
+from tests.backend_setup import install_schema
 
 from .testapp.models import Post
 
@@ -46,7 +47,7 @@ definition blog/post {
 @pytest.fixture
 def backend(db):
     b = LocalBackend()
-    b.set_schema(parse_zed(SCHEMA_TEXT))
+    install_schema(b, parse_zed(SCHEMA_TEXT))
     return b
 
 
@@ -196,7 +197,8 @@ def test_system_check_reports_const_relation_without_model(db):
     from rebac.checks import check_field_backed_relations
 
     reset_backend()
-    active_backend().set_schema(
+    install_schema(
+        active_backend(),
         parse_zed(
             """
             definition org/role { relation member: auth/user }
@@ -204,7 +206,7 @@ def test_system_check_reports_const_relation_without_model(db):
                 relation admin: org/role // rebac:const=admin
             }
             """
-        )
+        ),
     )
 
     issues = check_field_backed_relations()
@@ -238,7 +240,7 @@ definition blog/post {
 @pytest.fixture
 def direct_backend(db):
     b = LocalBackend()
-    b.set_schema(parse_zed(DIRECT_SCHEMA_TEXT))
+    install_schema(b, parse_zed(DIRECT_SCHEMA_TEXT))
     return b
 
 
@@ -303,7 +305,8 @@ def test_system_check_reports_const_target_without_definition(db):
     from rebac.checks import check_field_backed_relations
 
     reset_backend()
-    active_backend().set_schema(
+    install_schema(
+        active_backend(),
         parse_zed(
             """
             definition blog/post {
@@ -311,7 +314,7 @@ def test_system_check_reports_const_target_without_definition(db):
                 permission read = admin->member
             }
             """
-        )
+        ),
     )
 
     issues = check_field_backed_relations()
@@ -332,7 +335,8 @@ def test_system_check_reports_const_arrow_cycle(db):
     from rebac.checks import check_field_backed_relations
 
     reset_backend()
-    active_backend().set_schema(
+    install_schema(
+        active_backend(),
         parse_zed(
             """
             definition blog/post {
@@ -344,7 +348,7 @@ def test_system_check_reports_const_arrow_cycle(db):
                 permission p = peer->p
             }
             """
-        )
+        ),
     )
 
     issues = check_field_backed_relations()
@@ -361,7 +365,7 @@ def test_system_check_passes_for_acyclic_const_arrow(db):
     from rebac.checks import check_field_backed_relations
 
     reset_backend()
-    active_backend().set_schema(parse_zed(SCHEMA_TEXT))
+    install_schema(active_backend(), parse_zed(SCHEMA_TEXT))
 
     issues = check_field_backed_relations()
 

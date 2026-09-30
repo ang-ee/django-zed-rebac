@@ -15,6 +15,7 @@ from rebac.field_backing import _proposed_forward_relationships
 from rebac.preflight import _check_new_model
 from rebac.schema import Permission, PermRef, parse_zed, validate_schema
 from rebac.schema.introspection import relation_dependencies
+from tests.backend_setup import atomic_source_write, install_schema
 
 from .testapp.models import (
     BackingBinding,
@@ -91,7 +92,7 @@ def backend(db):
     )
     schema.definitions[schema.definitions.index(base)] = merged
     validate_schema(schema)
-    result.set_schema(schema)
+    install_schema(result, schema)
     assert not [issue for issue in check_field_backed_relations() if issue.id == "rebac.E009"]
     yield result
     reset_backend()
@@ -99,7 +100,10 @@ def backend(db):
 
 @pytest.fixture
 def actors(django_user_model):
-    return [django_user_model.objects.create_user(username=name) for name in ("alice", "bob")]
+    return [
+        atomic_source_write(django_user_model.objects.create_user, username=name)
+        for name in ("alice", "bob")
+    ]
 
 
 def assert_read(backend, model, actor, rows, *, action="read"):
@@ -179,9 +183,11 @@ def test_four_hop_filtered_path_and_nil_fragment_exclusion_use_same_entry(backen
     assert_read(backend, BackingQueue, bob, [queue], action="withheld")
     # Revocation changes an already constructed SQL scope, with no tuple writes.
     pending = BackingQueue.objects.with_actor(bob)
-    BackingEntry.objects.filter(pk=active.pk).update(retired_at=timezone.now())
+    active.retired_at = timezone.now()
+    atomic_source_write(active.save, update_fields=["retired_at"])
     assert set(pending.values_list("pk", flat=True)) == {queue.pk, empty.pk}
-    BackingEntry.objects.filter(pk=retired.pk).update(retired_at=None)
+    retired.retired_at = None
+    atomic_source_write(retired.save, update_fields=["retired_at"])
     assert_read(backend, BackingQueue, alice, [empty])
     candidate = BackingQueue()
     projected = _proposed_forward_relationships(
@@ -265,7 +271,7 @@ def test_donor_column_paths_use_root_row_filters_including_preflight(backend, ac
             for permission in definition.permissions
         ),
     )
-    backend.set_schema(schema)
+    install_schema(backend, schema)
     for allowed in (True, False):
         candidate = BackingTask(
             queue=queue,

@@ -17,6 +17,7 @@ from rebac import (
 )
 from rebac.backends import reset_backend
 from rebac.schema import parse_zed
+from tests.backend_setup import atomic_source_write, install_schema
 
 
 @pytest.fixture(autouse=True)
@@ -43,7 +44,8 @@ def test_model_refs_managers_and_signals_share_prefixed_type_policy() -> None:
 
     from tests.testapp.models import SluggedPost
 
-    backend().set_schema(
+    install_schema(
+        backend(),
         parse_zed(
             """
             definition tenantA/auth/user {}
@@ -55,9 +57,9 @@ def test_model_refs_managers_and_signals_share_prefixed_type_policy() -> None:
                 permission delete = owner
             }
             """
-        )
+        ),
     )
-    user = get_user_model().objects.create(username="alice", is_active=True)
+    user = atomic_source_write(get_user_model().objects.create, username="alice", is_active=True)
     # Configured User/Group types follow the prefix like every generated identity.
     subject = SubjectRef.of("tenantA/auth/user", str(user.pk))
     assert to_subject_ref(user) == subject

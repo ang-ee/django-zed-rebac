@@ -23,10 +23,12 @@ def isolated_process_state():
     """
     from django.contrib.contenttypes.models import ContentType
 
-    from rebac import actors, consistency, evaluator, resources
+    from rebac import actors, consistency, evaluator, resources, signals
     from rebac.backends import reset_backend
     from rebac.caveats import reset_cache
     from rebac.conf import app_settings
+    from rebac.index.maintain import _deferred
+    from rebac.mixins import _delete_scopes, _insert_scope
 
     registries = (actors._subject_registry, resources._resource_registry)
     snapshots = [registry.copy() for registry in registries]
@@ -35,12 +37,16 @@ def isolated_process_state():
         (actors._sudo_state, None),
         (consistency._current_zookie, consistency._NO_SCOPE),
         (evaluator._current_evaluator, None),
+        (_deferred, ()),
+        (_delete_scopes, ()),
+        (_insert_scope, None),
     )
     tokens = [(slot, slot.set(default)) for slot, default in slots]
     reset_backend()
     reset_cache()
     app_settings.reset()
     ContentType.objects.clear_cache()
+    signals.connect_tracked_signals()
     try:
         yield
     finally:
@@ -48,8 +54,29 @@ def isolated_process_state():
         reset_cache()
         app_settings.reset()
         ContentType.objects.clear_cache()
+        signals.connect_tracked_signals()
         for registry, snapshot in zip(registries, snapshots, strict=True):
             registry.clear()
             registry.update(snapshot)
         for slot, token in reversed(tokens):
             slot.reset(token)
+
+
+@pytest.fixture(autouse=True)
+def initial_index(request):
+    """Build an initial empty policy for legacy identity/sudo-only fixtures."""
+    if request.node.path.name.startswith("test_index_"):
+        return
+    if request.node.get_closest_marker("django_db") is None and not any(
+        name in request.fixturenames for name in ("db", "transactional_db")
+    ):
+        return
+    request.getfixturevalue("_django_db_helper")
+    from rebac import backend
+    from rebac.models.generation import SchemaGeneration
+    from tests.backend_setup import rebuild_backend
+
+    # Identity/sudo-only fixtures may write models before declaring a schema.
+    # Build the initial empty persisted policy explicitly, without a manual AST.
+    if not SchemaGeneration.objects.filter(pk=1).exists():
+        rebuild_backend(backend())

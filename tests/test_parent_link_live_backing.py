@@ -18,28 +18,16 @@ from rebac import (
 )
 from rebac.backends import reset_backend
 from rebac.schema import parse_zed
+from tests.backend_setup import atomic_source_write, install_schema
 from tests.testapp.models import (
     NativeParentLinkedChild,
     NativeParentLinkedRecord,
-    ParentLinkedChild,
-    ParentLinkedRecord,
 )
 
 pytestmark = pytest.mark.django_db(transaction=True)
 
 SCHEMA = """
 definition auth/user {}
-
-definition test/parentlinkedchild {
-    relation owner: auth/user // rebac:field=owner
-    relation viewer: auth/user
-    permission read = owner + viewer
-}
-
-definition test/parentlinkedrecord {
-    relation child: test/parentlinkedchild // rebac:field=child
-    permission read = child->read
-}
 
 definition test/nativeparentlinkedchild {
     relation owner: auth/user // rebac:field=owner
@@ -60,7 +48,7 @@ def active(request):
         reset_backend()
         local = backend()
         assert isinstance(local, LocalBackend)
-        local.set_schema(parse_zed(SCHEMA))
+        install_schema(local, parse_zed(SCHEMA))
         try:
             yield local
         finally:
@@ -68,15 +56,15 @@ def active(request):
 
 
 def test_parent_link_child_is_live_source_with_encoded_pk(active, django_user_model):
-    alice = django_user_model.objects.create_user(username="alice")
-    bob = django_user_model.objects.create_user(username="bob")
+    alice = atomic_source_write(django_user_model.objects.create_user, username="alice")
+    bob = atomic_source_write(django_user_model.objects.create_user, username="bob")
     with sudo(reason="parent-link source fixtures"):
-        child = ParentLinkedChild.objects.create(id="item-41", name="child", owner=alice)
-        other = ParentLinkedChild.objects.create(id="item-42", name="other", owner=bob)
+        child = NativeParentLinkedChild.objects.create(id=41, name="child", owner=alice)
+        other = NativeParentLinkedChild.objects.create(id=42, name="other", owner=bob)
     alice_ref = to_subject_ref(alice)
 
-    assert child.pk == "item-41"
-    assert to_object_ref(child).resource_id == "item-41"
+    assert child.pk == 41
+    assert to_object_ref(child).resource_id == "41"
     assert active.has_access(subject=alice_ref, action="owner", resource=to_object_ref(child))
     assert not active.has_access(
         subject=to_subject_ref(bob), action="owner", resource=to_object_ref(child)
@@ -87,23 +75,25 @@ def test_parent_link_child_is_live_source_with_encoded_pk(active, django_user_mo
         )
     ) == [alice_ref]
     assert set(
-        active.accessible(subject=alice_ref, action="read", resource_type="test/parentlinkedchild")
-    ) == {"item-41"}
+        active.accessible(
+            subject=alice_ref, action="read", resource_type="test/nativeparentlinkedchild"
+        )
+    ) == {"41"}
 
     with patch.object(active, "accessible", side_effect=AssertionError("enumerated direct FK")):
-        assert list(ParentLinkedChild.objects.with_actor(alice)) == [child]
-    assert list(ParentLinkedChild.objects.with_actor(bob)) == [other]
+        assert list(NativeParentLinkedChild.objects.with_actor(alice)) == [child]
+    assert list(NativeParentLinkedChild.objects.with_actor(bob)) == [other]
 
 
 def test_parent_link_child_is_live_target_for_direct_arrow_and_lazy_scope(
     active, django_user_model
 ):
-    alice = django_user_model.objects.create_user(username="alice")
-    bob = django_user_model.objects.create_user(username="bob")
+    alice = atomic_source_write(django_user_model.objects.create_user, username="alice")
+    bob = atomic_source_write(django_user_model.objects.create_user, username="bob")
     with sudo(reason="parent-link target fixtures"):
-        child = ParentLinkedChild.objects.create(id="item-51", name="child", owner=alice)
-        record = ParentLinkedRecord.objects.create(child=child)
-    child_subject = SubjectRef.of("test/parentlinkedchild", "item-51")
+        child = NativeParentLinkedChild.objects.create(id=51, name="child", owner=alice)
+        record = NativeParentLinkedRecord.objects.create(child=child)
+    child_subject = SubjectRef.of("test/nativeparentlinkedchild", "51")
 
     assert active.has_access(subject=child_subject, action="child", resource=to_object_ref(record))
     assert active.has_access(
@@ -116,33 +106,33 @@ def test_parent_link_child_is_live_target_for_direct_arrow_and_lazy_scope(
         active.lookup_subjects(
             resource=to_object_ref(record),
             action="child",
-            subject_type="test/parentlinkedchild",
+            subject_type="test/nativeparentlinkedchild",
         )
     ) == [child_subject]
     assert set(
         active.accessible(
             subject=to_subject_ref(alice),
             action="read",
-            resource_type="test/parentlinkedrecord",
+            resource_type="test/nativeparentlinkedrecord",
         )
     ) == {str(record.pk)}
 
     with patch.object(active, "accessible", side_effect=AssertionError("enumerated MTI arrow")):
-        assert list(ParentLinkedRecord.objects.with_actor(alice)) == [record]
+        assert list(NativeParentLinkedRecord.objects.with_actor(alice)) == [record]
 
-    pending = ParentLinkedRecord.objects.with_actor(alice)
+    pending = NativeParentLinkedRecord.objects.with_actor(alice)
     with sudo(reason="transfer parent-link owner fixture"):
         child.owner = bob
         child.save(update_fields=["owner"])
     assert list(pending) == []
-    assert list(ParentLinkedRecord.objects.with_actor(bob)) == [record]
+    assert list(NativeParentLinkedRecord.objects.with_actor(bob)) == [record]
 
 
 def test_native_parent_link_child_and_arrow_scopes_compile_without_enumeration(
     active, django_user_model
 ):
-    alice = django_user_model.objects.create_user(username="alice")
-    bob = django_user_model.objects.create_user(username="bob")
+    alice = atomic_source_write(django_user_model.objects.create_user, username="alice")
+    bob = atomic_source_write(django_user_model.objects.create_user, username="bob")
     with sudo(reason="native parent-link fixtures"):
         child = NativeParentLinkedChild.objects.create(name="child", owner=alice)
         record = NativeParentLinkedRecord.objects.create(child=child)
@@ -170,15 +160,21 @@ def test_native_parent_link_child_and_arrow_scopes_compile_without_enumeration(
 
 @pytest.mark.parametrize(
     ("model", "identity"),
-    [(NativeParentLinkedChild, None), (ParentLinkedChild, "item-61")],
-    ids=["native-parent-link", "encoded-parent-link"],
+    [(NativeParentLinkedChild, None), (NativeParentLinkedChild, 61)],
+    ids=["automatic-parent-id", "explicit-parent-id"],
 )
 def test_parent_link_stored_viewer_union_stays_lazy_through_revocation(
     active, django_user_model, model, identity
 ):
-    alice = django_user_model.objects.create_user(username=f"alice-{model.__name__}")
-    bob = django_user_model.objects.create_user(username=f"bob-{model.__name__}")
-    charlie = django_user_model.objects.create_user(username=f"charlie-{model.__name__}")
+    alice = atomic_source_write(
+        django_user_model.objects.create_user, username=f"alice-{model.__name__}"
+    )
+    bob = atomic_source_write(
+        django_user_model.objects.create_user, username=f"bob-{model.__name__}"
+    )
+    charlie = atomic_source_write(
+        django_user_model.objects.create_user, username=f"charlie-{model.__name__}"
+    )
     fields = {"name": "shared", "owner": alice}
     if identity is not None:
         fields["id"] = identity
@@ -194,3 +190,13 @@ def test_parent_link_stored_viewer_union_stays_lazy_through_revocation(
         pending = model.objects.with_actor(charlie)
         active.delete_relationship(viewer)
         assert list(pending) == []
+
+
+@pytest.mark.parametrize("model_name", ["ParentLinkedChild", "ParentLinkedResource"])
+def test_encoded_parent_link_identity_is_refused(model_name):
+    from rebac.errors import SchemaError
+    from rebac.index.codec import identity_codec
+    from tests.testapp import models
+
+    with pytest.raises(SchemaError, match=r"rebac\.E014"):
+        identity_codec(getattr(models, model_name))

@@ -289,7 +289,7 @@ def imply(*, parent: str | ObjectRef, child: str | ObjectRef) -> RelationshipRow
         # Now any member of storage/role:object_admin is also an
         # effective member of storage/role:object_editor.
     """
-    from django.db import transaction
+    from django.db import router, transaction
 
     from .models import active_relationship_model
     from .relationships import write_relationships
@@ -304,9 +304,10 @@ def imply(*, parent: str | ObjectRef, child: str | ObjectRef) -> RelationshipRow
         subject=SubjectRef(child_ref),
     )
     # Wrap write + read-back: same DoesNotExist race as ``grant``.
-    with transaction.atomic():
+    alias = router.db_for_write(Relationship)
+    with transaction.atomic(using=alias):
         write_relationships([tuple_])
-        row = Relationship.objects.get(
+        row = Relationship.objects.using(alias).get(
             resource_type=parent_ref.resource_type,
             resource_id=parent_ref.resource_id,
             relation=ROLE_INCLUDES_RELATION,
@@ -323,8 +324,9 @@ def unimply(*, parent: str | ObjectRef, child: str | ObjectRef) -> int:
 
     Returns the number of rows deleted (0 or 1).
     """
-    from django.db import transaction
+    from django.db import router
 
+    from .index.maintain import tuple_owner
     from .models import active_relationship_model
     from .relationships import delete_relationship
 
@@ -338,16 +340,21 @@ def unimply(*, parent: str | ObjectRef, child: str | ObjectRef) -> int:
         subject=SubjectRef(child_ref),
     )
     # Wrap presence-check + delete: same TOCTOU as ``revoke``.
-    with transaction.atomic():
-        exists = Relationship.objects.filter(
-            resource_type=parent_ref.resource_type,
-            resource_id=parent_ref.resource_id,
-            relation=ROLE_INCLUDES_RELATION,
-            subject_type=child_ref.resource_type,
-            subject_id=child_ref.resource_id,
-            optional_subject_relation="",
-            caveat_name="",
-        ).exists()
+    alias = router.db_for_write(Relationship)
+    with tuple_owner(alias, tuples=(tuple_,)):
+        exists = (
+            Relationship.objects.using(alias)
+            .filter(
+                resource_type=parent_ref.resource_type,
+                resource_id=parent_ref.resource_id,
+                relation=ROLE_INCLUDES_RELATION,
+                subject_type=child_ref.resource_type,
+                subject_id=child_ref.resource_id,
+                optional_subject_relation="",
+                caveat_name="",
+            )
+            .exists()
+        )
         delete_relationship(tuple_)
     return 1 if exists else 0
 

@@ -13,6 +13,7 @@ from rebac import (
 )
 from rebac.backends import reset_backend
 from rebac.schema import parse_zed
+from tests.backend_setup import atomic_source_write, install_schema
 from tests.testapp.models import AuthoredPost, Folder, Post
 
 SCHEMA = """
@@ -33,8 +34,9 @@ definition blog/post {
 @pytest.mark.django_db
 def test_fixed_attribute_anchor_is_lazy_and_honours_filters(django_user_model):
     reset_backend()
-    backend().set_schema(parse_zed(SCHEMA))
-    actor = django_user_model.objects.create(
+    install_schema(backend(), parse_zed(SCHEMA))
+    actor = atomic_source_write(
+        django_user_model.objects.create,
         username="admin",
         is_active=True,
         is_superuser=True,
@@ -48,15 +50,16 @@ def test_fixed_attribute_anchor_is_lazy_and_honours_filters(django_user_model):
 
     pending = Post.objects.with_actor(actor)
     actor.is_active = False
-    actor.save(update_fields=["is_active"])
+    atomic_source_write(actor.save, update_fields=["is_active"])
     assert list(pending) == []
 
 
 @pytest.mark.django_db
 def test_attribute_anchor_preserves_unmatched_resource_tuple(django_user_model):
     reset_backend()
-    backend().set_schema(parse_zed(SCHEMA.replace("rebac:const=admin", "rebac:const=editor")))
-    actor = django_user_model.objects.create(
+    install_schema(backend(), parse_zed(SCHEMA.replace("rebac:const=admin", "rebac:const=editor")))
+    actor = atomic_source_write(
+        django_user_model.objects.create,
         username="admin",
         is_active=True,
         is_superuser=True,
@@ -81,7 +84,8 @@ def test_attribute_anchor_preserves_unmatched_resource_tuple(django_user_model):
 def test_filtered_reverse_path_uses_one_join_and_stays_lazy(django_user_model, settings, storage):
     settings.REBAC_LOCAL_BACKEND_STORAGE = storage
     reset_backend()
-    backend().set_schema(
+    install_schema(
+        backend(),
         parse_zed(
             """
             definition auth/user {}
@@ -90,10 +94,10 @@ def test_filtered_reverse_path_uses_one_join_and_stays_lazy(django_user_model, s
                 permission read = member
             }
             """
-        )
+        ),
     )
-    alice = django_user_model.objects.create(username="alice", is_active=True)
-    bob = django_user_model.objects.create(username="bob", is_active=True)
+    alice = atomic_source_write(django_user_model.objects.create, username="alice", is_active=True)
+    bob = atomic_source_write(django_user_model.objects.create, username="bob", is_active=True)
     with sudo(reason="test.fixture"):
         folder = Folder.objects.create(name="Shared")
         AuthoredPost.objects.create(title="denied", folder=folder, author=alice)
@@ -160,23 +164,28 @@ definition blog/sluggedpost {
 @pytest.mark.parametrize(
     ("field", "expect_sql"),
     [("name", True), ("kind", False)],
-    ids=["stock-charfield-compiles", "transforming-field-falls-back"],
+    ids=["stock-charfield", "transforming-field-refused"],
 )
 def test_dynamic_container_parity_holds_for_noncanonical_stored_values(field, expect_sql):
     """Direct check, ``accessible()`` and the scoped queryset agree on membership.
 
-    A stock ``CharField`` compiles into a correlated SQL comparison; a field
-    with its own Python conversion (``LowercaseCharField``) must not, so all
-    three read paths keep the evaluator's canonical-spelling rule.
+    Stock string fields retain case-sensitive membership. A custom Python
+    conversion that SQL cannot reproduce is explicitly refused by E014.
     """
     from django.db import connection
     from django.test.utils import CaptureQueriesContext
 
-    from rebac.backends.local_query import LocalQueryScope, UnsupportedScope
     from tests.testapp.models import SluggedPost
 
     reset_backend()
-    backend().set_schema(parse_zed(CONTAINER_SCHEMA % field))
+    if not expect_sql:
+        from rebac.errors import SchemaError
+        from rebac.index.codec import identity_codec
+
+        with pytest.raises(SchemaError, match=r"rebac\.E014"):
+            identity_codec(Folder, field)
+        return
+    install_schema(backend(), parse_zed(CONTAINER_SCHEMA % field))
     with sudo(reason="test.fixture"):
         actor = Folder.objects.create(name="Premium", kind="Premium")
         canonical = SluggedPost.objects.create(slug="premium", title="lower")
@@ -196,13 +205,7 @@ def test_dynamic_container_parity_holds_for_noncanonical_stored_values(field, ex
         ).allowed is (slug in expected)
     assert {post.slug for post in SluggedPost.objects.with_actor(actor)} == expected
 
-    scope = LocalQueryScope(backend(), subject, "default")
-    if expect_sql:
-        scope.predicate(SluggedPost, "read", "blog/sluggedpost")
-    else:
-        with pytest.raises(UnsupportedScope):
-            scope.predicate(SluggedPost, "read", "blog/sluggedpost")
-    # Whether compiled or enumerated, the row set is the same as above.
+    # A repeated lazy scope retains the same membership.
     with CaptureQueriesContext(connection):
         assert {post.slug for post in SluggedPost.objects.with_actor(actor)} == expected
     del canonical
@@ -227,9 +230,12 @@ definition blog/post {
 
 
 @pytest.mark.django_db
-def test_direct_live_checks_cost_one_query(django_user_model, django_assert_num_queries):
+def test_direct_live_checks_use_witness_and_one_index_query(
+    django_user_model, django_assert_num_queries
+):
     reset_backend()
-    backend().set_schema(
+    install_schema(
+        backend(),
         parse_zed(
             """
             definition auth/user {}
@@ -240,21 +246,23 @@ def test_direct_live_checks_cost_one_query(django_user_model, django_assert_num_
                 permission manage = staff
             }
             """
-        )
+        ),
     )
-    alice = django_user_model.objects.create(username="alice", is_active=True, is_staff=True)
+    alice = atomic_source_write(
+        django_user_model.objects.create, username="alice", is_active=True, is_staff=True
+    )
     with sudo(reason="test.fixture"):
         folder = Folder.objects.create(name="Shared")
         AuthoredPost.objects.create(title="allowed", folder=folder, author=alice)
     subject = to_subject_ref(alice)
 
-    with django_assert_num_queries(1):
+    with django_assert_num_queries(2):
         assert (
             backend()
             .check_access(subject=subject, action="read", resource=to_object_ref(folder))
             .allowed
         )
-    with django_assert_num_queries(1):
+    with django_assert_num_queries(2):
         assert (
             backend()
             .check_access(
@@ -272,67 +280,19 @@ CAVEATED_ARROW_SCHEMA = ARROW_SCHEMA.replace(
 
 
 @pytest.mark.django_db
-@pytest.mark.parametrize("members", [1, 3])
-def test_attribute_arrow_check_is_bounded_when_enumeration_is_exact(
-    django_user_model, django_assert_num_queries, members
-):
-    """Without caveats or built-in actor terms the arrow costs a fixed number of queries.
-
-    Resolving the targets the subject holds ``reach`` on costs one query when
-    the set is empty (the check then denies without touching the container)
-    and two when it is not (the enumeration's fix-point confirms the set is
-    closed); one EXISTS then intersects it with the live container. Neither
-    depends on how wide the container is or on filters joining duplicate rows.
-    """
-    reset_backend()
-    backend().set_schema(parse_zed(ARROW_SCHEMA))
-    reader = django_user_model.objects.create(username="reader", is_active=True)
-    staff = [
-        django_user_model.objects.create(username=f"staff{i}", is_active=True, is_staff=True)
-        for i in range(members)
-    ]
-    with sudo(reason="test.fixture"):
-        folder = Folder.objects.create(name="Shared")
-        for member in staff:
-            AuthoredPost.objects.create(title="k-one", folder=folder, author=member)
-            AuthoredPost.objects.create(title="k-two", folder=folder, author=member)
-    subject = to_subject_ref(reader)
-
-    with django_assert_num_queries(1):
-        assert (
-            not backend()
-            .check_access(subject=subject, action="read", resource=ObjectRef("blog/post", "one"))
-            .allowed
-        )
-
-    write_relationships(
-        [RelationshipTuple(ObjectRef("auth/user", str(staff[0].pk)), "self", subject)]
-    )
-    with django_assert_num_queries(3):
-        assert (
-            backend()
-            .check_access(subject=subject, action="read", resource=ObjectRef("blog/post", "one"))
-            .allowed
-        )
-
-
-@pytest.mark.django_db
-def test_attribute_arrow_walk_keeps_tri_state_per_target_under_caveats(
+def test_attribute_arrow_preserves_caveats_in_one_index_query(
     django_user_model, django_assert_num_queries
 ):
-    """With a caveated subject in the schema the arrow evaluates each distinct target.
-
-    Enumeration drops conditional rows, so the walk must stay per target to
-    preserve CONDITIONAL. Cost model: one query for the distinct container
-    subjects, then the target permission per subject; ``reach = self`` is a
-    stored relation the tri-state evaluator denies with three queries.
-    Duplicate-producing filters must not multiply that.
-    """
+    """Caveated arrows preserve tri-state results without per-target reads."""
     reset_backend()
-    backend().set_schema(parse_zed(CAVEATED_ARROW_SCHEMA))
-    reader = django_user_model.objects.create(username="reader", is_active=True)
+    install_schema(backend(), parse_zed(CAVEATED_ARROW_SCHEMA))
+    reader = atomic_source_write(
+        django_user_model.objects.create, username="reader", is_active=True
+    )
     staff = [
-        django_user_model.objects.create(username=f"staff{i}", is_active=True, is_staff=True)
+        atomic_source_write(
+            django_user_model.objects.create, username=f"staff{i}", is_active=True, is_staff=True
+        )
         for i in range(2)
     ]
     with sudo(reason="test.fixture"):
@@ -342,9 +302,45 @@ def test_attribute_arrow_walk_keeps_tri_state_per_target_under_caveats(
             AuthoredPost.objects.create(title="k-two", folder=folder, author=member)
     subject = to_subject_ref(reader)
 
-    with django_assert_num_queries(1 + 3 * len(staff)):
+    with django_assert_num_queries(2):
         assert (
             not backend()
             .check_access(subject=subject, action="read", resource=ObjectRef("blog/post", "one"))
             .allowed
         )
+
+    from rebac import PermissionResult
+
+    write_relationships(
+        [
+            RelationshipTuple(
+                ObjectRef("auth/user", str(staff[0].pk)), "self", subject, caveat_name="present"
+            ),
+        ]
+    )
+    with django_assert_num_queries(2):
+        conditional = backend().check_access(
+            subject=subject, action="read", resource=ObjectRef("blog/post", "one")
+        )
+    assert conditional.result == PermissionResult.CONDITIONAL_PERMISSION
+    assert conditional.conditional_on == ("token",)
+    assert (
+        backend()
+        .check_access(
+            subject=subject,
+            action="read",
+            resource=ObjectRef("blog/post", "one"),
+            context={"token": "x"},
+        )
+        .allowed
+    )
+    assert (
+        not backend()
+        .check_access(
+            subject=subject,
+            action="read",
+            resource=ObjectRef("blog/post", "one"),
+            context={"token": "wrong"},
+        )
+        .allowed
+    )

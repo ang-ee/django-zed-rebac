@@ -24,6 +24,8 @@ happens at row evaluation time (LocalBackend), not here.
 from __future__ import annotations
 
 from collections.abc import Iterable
+from dataclasses import dataclass
+from datetime import datetime
 from typing import TYPE_CHECKING
 
 from .errors import SchemaError
@@ -46,10 +48,27 @@ if TYPE_CHECKING:
 __all__ = ["compose"]
 
 
+@dataclass(frozen=True)
+class ArmTag:
+    deadline: datetime | None
+    override: str
+
+
+@dataclass(frozen=True)
+class TaggedComposition:
+    schema: Schema
+    arms: dict[int, ArmTag]
+    sites: dict[int, ArmTag]
+
+
 # ---------- Public entry point ----------
 
 
 def compose(baseline: Schema, overrides: Iterable[SchemaOverride]) -> Schema:
+    return compose_tagged(baseline, overrides).schema
+
+
+def compose_tagged(baseline: Schema, overrides: Iterable[SchemaOverride]) -> TaggedComposition:
     """Apply override rows to a baseline schema, returning a new Schema.
 
     Pure: does NOT mutate ``baseline``. The returned Schema has fresh
@@ -60,15 +79,21 @@ def compose(baseline: Schema, overrides: Iterable[SchemaOverride]) -> Schema:
     not present in the baseline.
     """
     rows = list(overrides)
+    arms: dict[int, ArmTag] = {}
+    sites: dict[int, ArmTag] = {}
     if not rows:
         # Identity: return a fresh Schema wrapping the baseline's tuples by
         # reference. Definitions / caveats are frozen dataclasses so sharing
         # them is safe.
-        return Schema(
-            definitions=list(baseline.definitions),
-            caveats=list(baseline.caveats),
-            directives=list(baseline.directives),
-            headers=dict(baseline.headers),
+        return TaggedComposition(
+            Schema(
+                definitions=list(baseline.definitions),
+                caveats=list(baseline.caveats),
+                directives=list(baseline.directives),
+                headers=dict(baseline.headers),
+            ),
+            arms,
+            sites,
         )
 
     perm_groups, caveat_groups = _group_overrides(rows)
@@ -83,7 +108,7 @@ def compose(baseline: Schema, overrides: Iterable[SchemaOverride]) -> Schema:
             if not ovs:
                 new_perms.append(perm)
                 continue
-            new_perm = _compose_permission(perm, ovs)
+            new_perm = _compose_permission(perm, ovs, arms=arms, sites=sites)
             new_perms.append(new_perm)
             changed = True
         if changed:
@@ -117,7 +142,13 @@ def compose(baseline: Schema, overrides: Iterable[SchemaOverride]) -> Schema:
     # present in the baseline.
     _detect_cycles(baseline, composed)
 
-    return composed
+    return TaggedComposition(composed, arms, sites)
+
+
+def recaveat_targets(overrides: Iterable[SchemaOverride]) -> frozenset[str]:
+    """The names of the caveats that recaveat overrides redefine."""
+    rows = list(overrides)
+    return frozenset(_group_overrides(rows)[1]) if rows else frozenset()
 
 
 # ---------- Grouping ----------
@@ -205,7 +236,13 @@ def _group_overrides(
 # ---------- Permission composition ----------
 
 
-def _compose_permission(baseline_perm: Permission, overrides: list[SchemaOverride]) -> Permission:
+def _compose_permission(
+    baseline_perm: Permission,
+    overrides: list[SchemaOverride],
+    *,
+    arms: dict[int, ArmTag],
+    sites: dict[int, ArmTag],
+) -> Permission:
     """Compose a single permission row.
 
     Order: (((baseline U extends) - disables) & tightens)
@@ -239,15 +276,19 @@ def _compose_permission(baseline_perm: Permission, overrides: list[SchemaOverrid
     # 1. baseline U extends (associative + commutative -- order doesn't change
     # the AST shape's truth value but we sort for byte-deterministic output).
     for r in extend_rows:
-        expr = PermBinOp("+", expr, _parse_expr(r.expression, baseline_perm.name))
+        arm = _parse_expr(r.expression, baseline_perm.name)
+        arms[id(arm)] = ArmTag(r.expires_at, f"{r.kind}:{r.pk}")
+        expr = PermBinOp("+", expr, arm)
 
     # 2. - disables (NON-commutative).
     for r in disable_rows:
         expr = PermBinOp("-", expr, _parse_expr(r.expression, baseline_perm.name))
+        sites[id(expr)] = ArmTag(r.expires_at, f"{r.kind}:{r.pk}")
 
     # 3. & tightens.
     for r in tighten_rows:
         expr = PermBinOp("&", expr, _parse_expr(r.expression, baseline_perm.name))
+        sites[id(expr)] = ArmTag(r.expires_at, f"{r.kind}:{r.pk}")
 
     return Permission(
         name=baseline_perm.name,
@@ -332,35 +373,14 @@ def _cycles_in_definition(definition: Definition) -> set[str]:
     for perm in definition.permissions:
         edges[perm.name] = _refs_in_expr(perm.expression) & perm_names
 
-    cyclic: set[str] = set()
-    WHITE, GRAY, BLACK = 0, 1, 2
-    color: dict[str, int] = dict.fromkeys(edges, WHITE)
+    from .schema.graph import strongly_connected_components
 
-    def visit(node: str, stack: list[str]) -> None:
-        if color[node] == GRAY:
-            # Found a back-edge -- every node on the stack from `node` onward
-            # is part of the cycle.
-            try:
-                idx = stack.index(node)
-            except ValueError:
-                cyclic.add(node)
-                return
-            cyclic.update(stack[idx:])
-            return
-        if color[node] == BLACK:
-            return
-        color[node] = GRAY
-        stack.append(node)
-        for nbr in sorted(edges.get(node, ())):
-            visit(nbr, stack)
-        stack.pop()
-        color[node] = BLACK
-
-    for name in sorted(edges):
-        if color[name] == WHITE:
-            visit(name, [])
-
-    return cyclic
+    return {
+        name
+        for component in strongly_connected_components(edges)
+        if len(component) > 1 or any(name in edges[name] for name in component)
+        for name in component
+    }
 
 
 def _refs_in_expr(expr: PermExpr) -> set[str]:

@@ -28,6 +28,7 @@ from rebac import (
 )
 from rebac.backends import reset_backend
 from rebac.schema import parse_zed
+from tests.backend_setup import atomic_source_write, install_schema
 
 SCHEMA_TEXT = """
 definition auth/user {}
@@ -49,7 +50,7 @@ definition blog/sluggedpost {
 @pytest.fixture(autouse=True)
 def _setup_backend(db):
     reset_backend()
-    backend().set_schema(parse_zed(SCHEMA_TEXT))
+    install_schema(backend(), parse_zed(SCHEMA_TEXT))
     yield
     reset_backend()
 
@@ -243,7 +244,7 @@ def test_manager_filters_by_meta_attr_when_set():
 def _make_user(username: str):
     from django.contrib.auth import get_user_model
 
-    return get_user_model().objects.create(username=username, is_active=True)
+    return atomic_source_write(get_user_model().objects.create, username=username, is_active=True)
 
 
 def _grant_owner_pk(user, instance, resource_type: str) -> None:

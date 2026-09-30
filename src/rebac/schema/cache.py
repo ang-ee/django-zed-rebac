@@ -20,6 +20,11 @@ class SchemaSnapshot(NamedTuple):
     generation: int
     invalidation_generation: int
     revision: str | None = None
+    index_revision: str | None = None
+    using: str | None = None
+    baseline: Schema | None = None
+    overrides: tuple[Any, ...] = ()
+    index_program: str = ""
 
 
 class _ConnectionSchemas:
@@ -27,7 +32,6 @@ class _ConnectionSchemas:
         self.snapshots: WeakKeyDictionary[Any, SchemaSnapshot] = WeakKeyDictionary()
         self.marker: Callable[[], None] | None = None
         self.atomic = False
-        self.generation = 0
         self.observer = self._observe
         # Django exposes this list to execute_wrapper(). Remove by identity on
         # teardown: independently exiting evaluator contexts need not be LIFO.
@@ -44,12 +48,8 @@ class _ConnectionSchemas:
         # raw driver writes require explicit evaluator.invalidate(); see the
         # architecture contract. Invalidate before even a failed write/rollback.
         if many or not str(sql).lstrip().upper().startswith("SELECT "):
-            self.invalidate()
+            self.snapshots.clear()
         return execute(sql, params, many, context)
-
-    def invalidate(self) -> None:
-        self.snapshots.clear()
-        self.generation += 1
 
     def prepare(self, connection: BaseDatabaseWrapper) -> None:
         atomic = connection.in_atomic_block
@@ -57,7 +57,7 @@ class _ConnectionSchemas:
             entry[1] is self.marker for entry in connection.run_on_commit
         )
         if atomic != self.atomic or (atomic and not pending):
-            self.invalidate()
+            self.snapshots.clear()
             self.marker = None
         self.atomic = atomic
         if atomic and self.marker is None:
@@ -98,12 +98,6 @@ class SchemaScope:
                     entry for entry in connection.run_on_commit if entry[1] is not state.marker
                 ]
         self.connections.clear()
-
-    def generation(self, connection: BaseDatabaseWrapper) -> tuple[object, int]:
-        """Plan lifetime follows the same observer as schema pins."""
-        self.snapshots(connection)
-        state = self.connections[connection]
-        return state, state.generation
 
 
 operation_scope: ContextVar[SchemaScope | None] = ContextVar("rebac_schema_operation", default=None)

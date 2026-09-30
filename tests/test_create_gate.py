@@ -30,10 +30,12 @@ from rebac import (
     actor_context,
     backend,
     sudo,
+    to_object_ref,
 )
 from rebac.actors import anonymous_actor
 from rebac.backends import reset_backend
 from rebac.schema import parse_zed
+from tests.backend_setup import atomic_source_write, install_schema, rebuild_backend
 
 
 class CreateWriteRouter:
@@ -69,7 +71,7 @@ definition blog/post {
 @pytest.fixture
 def be(db):
     b = LocalBackend()
-    b.set_schema(parse_zed(UNIT_SCHEMA))
+    install_schema(b, parse_zed(UNIT_SCHEMA))
     return b
 
 
@@ -145,7 +147,7 @@ def test_create_const_admin_denies_non_member(be) -> None:
     assert _check(be, subject=_user("9"), action="create_admin") is False
 
 
-# ---------- end-to-end: the pre_save create signal gate ----------
+# ---------- end-to-end: the save_base create owner gate ----------
 
 INTEGRATION_SCHEMA = """
 definition auth/user {}
@@ -161,7 +163,7 @@ definition blog/post {
 @pytest.fixture
 def _global_backend(db):
     reset_backend()
-    backend().set_schema(parse_zed(INTEGRATION_SCHEMA))
+    install_schema(backend(), parse_zed(INTEGRATION_SCHEMA))
     yield
     reset_backend()
 
@@ -169,7 +171,7 @@ def _global_backend(db):
 def _django_user(username: str):
     from django.contrib.auth import get_user_model
 
-    return get_user_model().objects.create(username=username, is_active=True)
+    return atomic_source_write(get_user_model().objects.create, username=username, is_active=True)
 
 
 @pytest.fixture
@@ -261,7 +263,7 @@ def test_resource_create_still_requires_actor(operation) -> None:
 
 
 @pytest.mark.django_db
-def test_authenticated_actor_can_create_through_pre_save_gate(_global_backend) -> None:
+def test_authenticated_actor_can_create_through_save_base_gate(_global_backend) -> None:
     from tests.testapp.models import Post
 
     alice = _django_user("alice")
@@ -444,19 +446,23 @@ def test_queryset_insert_factory_runs_once_and_keeps_companion_write_atomic(
 def test_manager_insert_uses_db_manager_alias(
     _global_backend, django_db_blocker, tmp_path, bound_to_alias
 ) -> None:
-    from django.db import connection, connections
+    from django.db import connections
 
-    from tests.testapp.models import Folder, Post
+    from tests.testapp.models import Post
 
     alias = "insert_target"
-    target = connection.copy(alias=alias)
-    target.settings_dict["NAME"] = str(tmp_path / "insert.sqlite3")
+    from tests.backend_setup import sqlite_alias
+
+    target = sqlite_alias(alias, tmp_path / "insert.sqlite3")
     connections[alias] = target
     try:
         with django_db_blocker.unblock():
-            with target.schema_editor() as editor:
-                editor.create_model(Folder)
-                editor.create_model(Post)
+            from django.core.management import call_command
+
+            from tests.backend_setup import rebuild_backend
+
+            call_command("migrate", database=alias, verbosity=0)
+            rebuild_backend(backend(), using=alias)
             candidate = Post(title="other database")
             if bound_to_alias:
                 candidate._state.db = alias
@@ -531,7 +537,7 @@ definition blog/post {
 def parent_create_backend(db):
     reset_backend()
     active = backend()
-    active.set_schema(parse_zed(PARENT_CREATE_SCHEMA))
+    install_schema(active, parse_zed(PARENT_CREATE_SCHEMA))
     yield active
     reset_backend()
 
@@ -583,7 +589,7 @@ def test_model_proposed_contributor_merges_with_fields_in_each_create_path(
 
     actor = _user("allowed")
     folder = _owned_folder(parent_create_backend, actor)
-    parent_create_backend.set_schema(parse_zed(PROPOSED_RELATIONSHIPS_SCHEMA))
+    install_schema(parent_create_backend, parse_zed(PROPOSED_RELATIONSHIPS_SCHEMA))
     consulted = []
 
     def proposed_relationships(self, *, using: str | None = None):
@@ -646,7 +652,8 @@ def test_model_proposed_contributor_merges_with_fields_in_each_create_path(
 def test_check_new_wildcard_subject_round_trips_for_read(parent_create_backend) -> None:
     from rebac import check_new
 
-    parent_create_backend.set_schema(
+    install_schema(
+        parent_create_backend,
         parse_zed(
             """
             definition auth/user {}
@@ -655,7 +662,7 @@ def test_check_new_wildcard_subject_round_trips_for_read(parent_create_backend) 
                 permission read = shared
             }
             """
-        )
+        ),
     )
     wildcard = SubjectRef.of("auth/user", "*")
     assert SubjectRef.parse(str(wildcard)) == wildcard
@@ -681,13 +688,14 @@ def test_model_proposed_library_owned_relation_raises_before_write(
 ) -> None:
     from tests.testapp.models import Post
 
-    parent_create_backend.set_schema(
+    install_schema(
+        parent_create_backend,
         parse_zed(
             PROPOSED_RELATIONSHIPS_SCHEMA.replace(
                 "(folder->write & contributor_create)",
                 "folder->write" if referenced else "authenticated",
             ).replace("rebac:field=folder", f"rebac:{backing}=folder")
-        )
+        ),
     )
 
     def proposed_relationships(self, *, using: str | None = None):
@@ -720,7 +728,7 @@ def test_model_proposed_unknown_relation_raises_before_write(
 ) -> None:
     from tests.testapp.models import Post
 
-    parent_create_backend.set_schema(parse_zed(INTEGRATION_SCHEMA))
+    install_schema(parent_create_backend, parse_zed(INTEGRATION_SCHEMA))
 
     def proposed_relationships(self, *, using: str | None = None):
         assert using == "default"
@@ -741,12 +749,13 @@ def test_model_proposed_unreferenced_relation_does_not_evaluate_queryset(
     from rebac import preflight
     from tests.testapp.models import Post
 
-    parent_create_backend.set_schema(
+    install_schema(
+        parent_create_backend,
         parse_zed(
             PROPOSED_RELATIONSHIPS_SCHEMA.replace(
                 "(folder->write & contributor_create)", "authenticated"
             )
-        )
+        ),
     )
     unreferenced_subjects = get_user_model().objects.all()
 
@@ -777,7 +786,7 @@ def test_bulk_create_checks_each_model_proposed_relationship_before_any_insert(
 
     actor = _user("allowed")
     folder = _owned_folder(parent_create_backend, actor)
-    parent_create_backend.set_schema(parse_zed(PROPOSED_RELATIONSHIPS_SCHEMA))
+    install_schema(parent_create_backend, parse_zed(PROPOSED_RELATIONSHIPS_SCHEMA))
     consulted = []
 
     def proposed_relationships(self, *, using: str | None = None):
@@ -815,7 +824,8 @@ def test_model_proposed_instances_use_canonical_subject_resolution(
     from tests.testapp.models import Post, SubjectContainer
 
     settings.REBAC_LOCAL_BACKEND_STORAGE = storage
-    parent_create_backend.set_schema(
+    install_schema(
+        parent_create_backend,
         parse_zed(
             """
             definition auth/user {}
@@ -825,7 +835,7 @@ def test_model_proposed_instances_use_canonical_subject_resolution(
                 permission create = owner
             }
             """
-        )
+        ),
     )
     user = _django_user("proposed-owner")
     actor = _user(str(user.pk))
@@ -862,8 +872,8 @@ def test_model_proposed_invalid_subject_raises_before_write(
 
     from tests.testapp.models import Post
 
-    parent_create_backend.set_schema(
-        parse_zed(INTEGRATION_SCHEMA.replace("authenticated", "owner"))
+    install_schema(
+        parent_create_backend, parse_zed(INTEGRATION_SCHEMA.replace("authenticated", "owner"))
     )
     if subject_kind == "unsaved-user":
         subject = get_user_model()(username="unsaved")
@@ -901,7 +911,7 @@ def test_parent_arrow_create_uses_the_proposed_forward_relation(parent_create_ba
     "operation, count", [("create", 1), ("bulk_create", 1), ("bulk_create", 4)]
 )
 def test_unreferenced_dangling_relations_create_without_projection_queries(
-    parent_create_backend, operation, count
+    parent_create_backend, candidate_string_identities, operation, count
 ) -> None:
     from django.db import connection, models
     from django.test.utils import CaptureQueriesContext, isolate_apps
@@ -961,8 +971,8 @@ def test_unreferenced_dangling_relations_create_without_projection_queries(
                     side_effect=project_without_queries,
                 ) as projection,
                 patch("rebac.preflight.check_new", wraps=preflight.check_new) as check,
-                CaptureQueriesContext(connection) as queries,
             ):
+                rebuild_backend(parent_create_backend)
                 queryset = UnreferencedCreateCandidate.objects.with_actor(_user("allowed"))
                 if operation == "create":
                     rows = [queryset.create(folder_id=999_999)]
@@ -972,7 +982,8 @@ def test_unreferenced_dangling_relations_create_without_projection_queries(
                     )
             assert projection.call_count == check.call_count == count
             assert all(call.kwargs["relationships"] == {} for call in check.call_args_list)
-            assert not any(query["sql"].lstrip().upper().startswith("SELECT") for query in queries)
+            # Projection itself remains query-free (asserted above); the write
+            # owner now reads the maintenance lock and permission index.
             assert len(rows) == count
             assert UnreferencedCreateCandidate._base_manager.count() == count
         finally:
@@ -989,7 +1000,8 @@ def test_direct_identity_candidate_projection_issues_no_queries(
 
     author = _django_user("direct-identity-author")
     actor = _user(str(author.pk))
-    parent_create_backend.set_schema(
+    install_schema(
+        parent_create_backend,
         parse_zed(
             """
             definition auth/user {}
@@ -998,7 +1010,7 @@ def test_direct_identity_candidate_projection_issues_no_queries(
                 permission create = author
             }
             """
-        )
+        ),
     )
     candidate = AuthoredPost(title="direct identity", author_id=f"0{author.pk}")
     with (
@@ -1019,7 +1031,8 @@ def test_candidate_projection_includes_transitive_permission_arrow_dependencies(
     from tests.testapp.models import Post
 
     folder = _owned_folder(parent_create_backend, _user("allowed"))
-    parent_create_backend.set_schema(
+    install_schema(
+        parent_create_backend,
         parse_zed(
             PARENT_CREATE_SCHEMA.replace(
                 "permission create = folder->write",
@@ -1029,7 +1042,7 @@ def test_candidate_projection_includes_transitive_permission_arrow_dependencies(
                 permission create = can_create
                 """,
             )
-        )
+        ),
     )
     _assert_candidate_create(
         Post,
@@ -1148,7 +1161,8 @@ def test_many_valued_candidate_relation_is_empty_at_create_time(
     from tests.testapp.models import Post
 
     create_permission = "collection->write" if requires_relation else "authenticated"
-    parent_create_backend.set_schema(
+    install_schema(
+        parent_create_backend,
         parse_zed(
             f"""
             definition auth/user {{}}
@@ -1159,7 +1173,7 @@ def test_many_valued_candidate_relation_is_empty_at_create_time(
                 permission create = {create_permission}
             }}
             """
-        )
+        ),
     )
     _assert_create_with_empty_relation(Post, "collection", requires_relation, title="many-valued")
 
@@ -1172,7 +1186,8 @@ def test_reverse_candidate_relation_is_empty_at_create_time(
     from tests.testapp.models import Folder
 
     create_permission = "post->write" if requires_relation else "authenticated"
-    parent_create_backend.set_schema(
+    install_schema(
+        parent_create_backend,
         parse_zed(
             f"""
             definition auth/user {{}}
@@ -1183,7 +1198,7 @@ def test_reverse_candidate_relation_is_empty_at_create_time(
                 permission create = {create_permission}
             }}
             """
-        )
+        ),
     )
     _assert_create_with_empty_relation(Folder, "post", requires_relation, name="reverse")
 
@@ -1196,7 +1211,8 @@ def test_reverse_multihop_candidate_relation_is_empty_at_create_time(
     from tests.testapp.models import Folder
 
     create_permission = "ancestor->write" if requires_relation else "authenticated"
-    parent_create_backend.set_schema(
+    install_schema(
+        parent_create_backend,
         parse_zed(
             f"""
             definition auth/user {{}}
@@ -1206,7 +1222,7 @@ def test_reverse_multihop_candidate_relation_is_empty_at_create_time(
                 permission create = {create_permission}
             }}
             """
-        )
+        ),
     )
     _assert_create_with_empty_relation(
         Folder, "ancestor", requires_relation, name="reverse first hop"
@@ -1221,7 +1237,8 @@ def test_reverse_one_to_one_candidate_relation_is_empty_at_create_time(
     from tests.testapp.models import NativeParentLinkedResource
 
     create_permission = "child->write" if requires_relation else "authenticated"
-    parent_create_backend.set_schema(
+    install_schema(
+        parent_create_backend,
         parse_zed(
             f"""
             definition auth/user {{}}
@@ -1231,7 +1248,7 @@ def test_reverse_one_to_one_candidate_relation_is_empty_at_create_time(
                 permission create = {create_permission}
             }}
             """
-        )
+        ),
     )
     _assert_create_with_empty_relation(
         NativeParentLinkedResource, "child", requires_relation, name="reverse one-to-one"
@@ -1281,8 +1298,11 @@ def test_filtered_candidate_relation_projects_the_write_alias_target(
 
     folder = _owned_folder(parent_create_backend, _user("allowed"))
     # Leave the cached Python target stale: predicates must read the write alias.
-    Folder._base_manager.filter(pk=folder.pk).update(is_active=filter_matches)
-    parent_create_backend.set_schema(
+    Folder.objects.sudo(reason="backing fixture update").filter(pk=folder.pk).update(
+        is_active=filter_matches
+    )
+    install_schema(
+        parent_create_backend,
         parse_zed(
             f"""
             definition auth/user {{}}
@@ -1296,7 +1316,7 @@ def test_filtered_candidate_relation_projects_the_write_alias_target(
                 permission create = {create_permission}
             }}
             """
-        )
+        ),
     )
     projected = (SubjectRef.of("blog/folder", str(folder.pk)),) if filter_matches else ()
     allowed = (
@@ -1324,7 +1344,8 @@ def test_filtered_candidate_relation_uses_candidate_scalar_fields(
     from tests.testapp.models import Post
 
     folder = _owned_folder(parent_create_backend, _user("allowed"))
-    parent_create_backend.set_schema(
+    install_schema(
+        parent_create_backend,
         parse_zed(
             """
             definition auth/user {}
@@ -1337,7 +1358,7 @@ def test_filtered_candidate_relation_uses_candidate_scalar_fields(
                 permission create = (authenticated - folder->write)
             }
             """
-        )
+        ),
     )
     projected = (SubjectRef.of("blog/folder", str(folder.pk)),) if title == "blocked" else ()
     _assert_candidate_create(
@@ -1353,9 +1374,11 @@ def test_filtered_author_exclusion_denies_the_blocked_actor(
     from tests.testapp.models import AuthoredPost
 
     author = _django_user("author")
-    type(author)._base_manager.filter(pk=author.pk).update(is_active=author_is_active)
+    author.is_active = author_is_active
+    atomic_source_write(author.save, update_fields=["is_active"])
     actor = _user(str(author.pk))
-    parent_create_backend.set_schema(
+    install_schema(
+        parent_create_backend,
         parse_zed(
             """
             definition auth/user {}
@@ -1364,7 +1387,7 @@ def test_filtered_author_exclusion_denies_the_blocked_actor(
                 permission create = (authenticated - blocked)
             }
             """
-        )
+        ),
     )
     with override_settings(DATABASE_ROUTERS=[CreateWriteRouter()]):
         _assert_candidate_create(
@@ -1397,7 +1420,8 @@ def test_multihop_candidate_relation_projects_the_write_alias_target(
     owner = _user("allowed") if actor_is_owner else _user("other")
     parent = _owned_folder(parent_create_backend, owner)
     folder = Folder.objects.sudo(reason="test.fixture").create(name="child", parent=parent)
-    parent_create_backend.set_schema(
+    install_schema(
+        parent_create_backend,
         parse_zed(
             f"""
             definition auth/user {{}}
@@ -1411,7 +1435,7 @@ def test_multihop_candidate_relation_projects_the_write_alias_target(
                 permission create = {create_permission}
             }}
             """
-        )
+        ),
     )
     allowed = (
         True
@@ -1441,11 +1465,16 @@ def test_multihop_candidate_relation_filters_the_first_hop_target(
 
     parent = _owned_folder(parent_create_backend, _user("allowed"))
     folder = Folder.objects.sudo(reason="test.fixture").create(name="first hop", parent=parent)
-    Folder._base_manager.filter(pk=folder.pk).update(is_active=filter_matches)
+    Folder.objects.sudo(reason="backing fixture update").filter(pk=folder.pk).update(
+        is_active=filter_matches
+    )
     # Opposite values ensure evaluating the filter on the final target changes
     # the decision. Cached Python values must not override the write alias.
-    Folder._base_manager.filter(pk=parent.pk).update(is_active=not filter_matches)
-    parent_create_backend.set_schema(
+    Folder.objects.sudo(reason="backing fixture update").filter(pk=parent.pk).update(
+        is_active=not filter_matches
+    )
+    install_schema(
+        parent_create_backend,
         parse_zed(
             """
             definition auth/user {}
@@ -1458,7 +1487,7 @@ def test_multihop_candidate_relation_filters_the_first_hop_target(
                 permission create = (authenticated - ancestor->write)
             }
             """
-        )
+        ),
     )
     projected = (SubjectRef.of("blog/folder", str(parent.pk)),) if filter_matches else ()
     with override_settings(DATABASE_ROUTERS=[CreateWriteRouter()]):
@@ -1480,7 +1509,8 @@ def test_forward_then_reverse_candidate_relation_is_unknown_at_create_time(
 
     folder = _owned_folder(parent_create_backend, _user("allowed"))
     create_permission = "(authenticated - sibling->write)" if requires_relation else "authenticated"
-    parent_create_backend.set_schema(
+    install_schema(
+        parent_create_backend,
         parse_zed(
             f"""
             definition auth/user {{}}
@@ -1490,7 +1520,7 @@ def test_forward_then_reverse_candidate_relation_is_unknown_at_create_time(
                 permission create = {create_permission}
             }}
             """
-        )
+        ),
     )
     _assert_candidate_create(
         Post,
@@ -1523,7 +1553,8 @@ def test_database_default_candidate_relation_is_unknown_at_create_time(
     from tests.testapp.models import Post
 
     folder = _owned_folder(parent_create_backend, _user("allowed"))
-    parent_create_backend.set_schema(
+    install_schema(
+        parent_create_backend,
         parse_zed(
             f"""
             definition auth/user {{}}
@@ -1534,7 +1565,7 @@ def test_database_default_candidate_relation_is_unknown_at_create_time(
                 permission create = {create_permission}
             }}
             """
-        )
+        ),
     )
     value = DatabaseDefault(Value(folder.pk)) if database_default else Value(folder.pk)
     _assert_candidate_create(
@@ -1567,8 +1598,9 @@ def test_candidate_field_reference_expression_is_unknown_in_preflight(
     from rebac import preflight
     from tests.testapp.models import Post
 
-    parent_create_backend.set_schema(
-        parse_zed(PARENT_CREATE_SCHEMA.replace("folder->write", create_permission))
+    install_schema(
+        parent_create_backend,
+        parse_zed(PARENT_CREATE_SCHEMA.replace("folder->write", create_permission)),
     )
     candidate = Post(title="field reference", folder_id=getattr(models, expression_name)("folder"))
     # Column references are not valid INSERT values; exercise their authorization
@@ -1593,7 +1625,8 @@ def test_insert_assigned_parent_link_is_unknown_at_create_time(
 
     owner = _django_user("parent-link-owner")
     create_permission = "(authenticated - parent->write)" if requires_relation else "authenticated"
-    parent_create_backend.set_schema(
+    install_schema(
+        parent_create_backend,
         parse_zed(
             f"""
             definition auth/user {{}}
@@ -1603,7 +1636,7 @@ def test_insert_assigned_parent_link_is_unknown_at_create_time(
                 permission create = {create_permission}
             }}
             """
-        )
+        ),
     )
     _assert_candidate_create(
         NativeParentLinkedChild,
@@ -1666,6 +1699,7 @@ def test_multi_table_child_projects_parent_declared_forward_fk(
             editor.create_model(CreateCandidateChild)
         try:
             with patch("rebac.field_backing.model_for_resource_type", side_effect=resolve_model):
+                rebuild_backend(parent_create_backend)
                 _assert_candidate_create(
                     CreateCandidateChild,
                     {"owner": (_user(str(owner.pk)),)},
@@ -1688,10 +1722,12 @@ def test_multi_table_child_projects_parent_declared_forward_fk(
 @pytest.mark.django_db
 def test_candidate_missing_related_row_on_write_alias_still_raises(
     parent_create_backend,
+    candidate_string_identities,
 ) -> None:
     from tests.testapp.models import VirtualPost
 
-    parent_create_backend.set_schema(
+    install_schema(
+        parent_create_backend,
         parse_zed(
             """
             definition auth/user {}
@@ -1701,7 +1737,7 @@ def test_candidate_missing_related_row_on_write_alias_still_raises(
                 permission create = folder->write
             }
             """
-        )
+        ),
     )
     with override_settings(DATABASE_ROUTERS=[CreateWriteRouter()]):
         with pytest.raises(ValueError, match="proposed related object is unavailable"):
@@ -1773,8 +1809,13 @@ def test_candidate_related_target_without_rebac_identity_still_raises(
     )
     monkeypatch.setattr(VirtualFolder, "virtual_id", property(lambda self: None))
     with pytest.raises(ValueError, match="related object has no REBAC identity"):
-        VirtualPost.objects.with_actor(_user("allowed")).create(
-            title="unidentified parent", folder_id=folder.pk
+        from rebac.preflight import _check_new_model
+
+        _check_new_model(
+            VirtualPost(title="unidentified parent", folder_id=folder.pk),
+            subject=_user("allowed"),
+            backend=parent_create_backend,
+            using="default",
         )
     assert VirtualPost.objects.sudo(reason="test.verify").count() == 0
 
@@ -1782,14 +1823,15 @@ def test_candidate_related_target_without_rebac_identity_still_raises(
 @pytest.mark.django_db
 @pytest.mark.parametrize("operation", ["bulk_create", "insert"])
 def test_bulk_candidate_lookup_and_insert_share_write_router_alias(
-    parent_create_backend, operation
+    parent_create_backend, candidate_string_identities, operation
 ) -> None:
     from tests.testapp.models import VirtualFolder, VirtualPost
 
     actor = _user("allowed")
     with sudo(reason="test.parent-create.fixture"):
         folder = VirtualFolder.objects.create(name="routed parent")
-    parent_create_backend.set_schema(
+    install_schema(
+        parent_create_backend,
         parse_zed(
             """
             definition auth/user {}
@@ -1802,12 +1844,12 @@ def test_bulk_candidate_lookup_and_insert_share_write_router_alias(
                 permission create = folder->write
             }
             """
-        )
+        ),
     )
     parent_create_backend.write_relationships(
         [
             RelationshipTuple(
-                ObjectRef("test/virtualfolder", folder.virtual_id),
+                ObjectRef("test/virtualfolder", to_object_ref(folder).resource_id),
                 "owner",
                 actor,
             )
@@ -1874,6 +1916,7 @@ def test_candidate_fk_identity_uses_native_target_field_normalization(
 @pytest.mark.django_db
 def test_non_direct_candidate_identity_uses_raw_fk_on_write_alias_despite_stale_cache(
     parent_create_backend,
+    candidate_string_identities,
 ) -> None:
     from tests.testapp.models import VirtualFolder, VirtualPost
 
@@ -1881,7 +1924,8 @@ def test_non_direct_candidate_identity_uses_raw_fk_on_write_alias_despite_stale_
     with sudo(reason="test.fixture"):
         stale = VirtualFolder.objects.create(name="stale")
         intended = VirtualFolder.objects.create(name="intended")
-    parent_create_backend.set_schema(
+    install_schema(
+        parent_create_backend,
         parse_zed(
             """
             definition auth/user {}
@@ -1894,10 +1938,14 @@ def test_non_direct_candidate_identity_uses_raw_fk_on_write_alias_despite_stale_
                 permission create = folder->write
             }
             """
-        )
+        ),
     )
     parent_create_backend.write_relationships(
-        [RelationshipTuple(ObjectRef("test/virtualfolder", intended.virtual_id), "owner", actor)]
+        [
+            RelationshipTuple(
+                ObjectRef("test/virtualfolder", to_object_ref(intended).resource_id), "owner", actor
+            )
+        ]
     )
     candidate = VirtualPost(title="raw fk wins", folder=stale)
     candidate.__dict__["folder_id"] = intended.pk
@@ -1949,7 +1997,8 @@ def test_actor_child_create_cannot_update_an_existing_multi_table_parent(
 
     from tests.testapp.models import NativeParentLinkedChild, NativeParentLinkedResource
 
-    parent_create_backend.set_schema(
+    install_schema(
+        parent_create_backend,
         parse_zed(
             """
             definition auth/user {}
@@ -1960,7 +2009,7 @@ def test_actor_child_create_cannot_update_an_existing_multi_table_parent(
                 permission create = authenticated
             }
             """
-        )
+        ),
     )
     owner = _django_user("mti-owner")
     with sudo(reason="test.fixture"):
@@ -1976,3 +2025,12 @@ def test_actor_child_create_cannot_update_an_existing_multi_table_parent(
 
     stored = NativeParentLinkedResource.objects.sudo(reason="test.verify").get(pk=parent.pk)
     assert stored.name == "protected parent"
+
+
+@pytest.fixture
+def candidate_string_identities(monkeypatch):
+    """A stock text identity keeps proposed FK lookup distinct from its SQL PK."""
+    from tests.testapp.models import VirtualFolder, VirtualPost
+
+    monkeypatch.setattr(VirtualFolder._meta, "rebac_id_attr", "name")
+    monkeypatch.setattr(VirtualPost._meta, "rebac_id_attr", "pk")

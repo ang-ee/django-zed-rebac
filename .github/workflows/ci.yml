@@ -25,3 +25,35 @@ jobs:
           uv pip install -e '.[dev,caveats,drf,strawberry]' "django==${{ matrix.django-version }}.*"
       - name: Lint, format, types, and tests
         run: make lint format-check typecheck test-parallel
+
+  postgres:
+    runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_USER: postgres
+          POSTGRES_PASSWORD: rebac-test
+          POSTGRES_DB: rebac_test
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U postgres -d rebac_test"
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+    env:
+      REBAC_TEST_POSTGRES_URL: postgresql://postgres:rebac-test@127.0.0.1:5432/rebac_test
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-python@v6
+        with:
+          python-version: "3.14"
+      - name: Install uv
+        uses: astral-sh/setup-uv@v7
+      - name: Install dependencies and PostgreSQL driver
+        run: |
+          uv venv --python 3.14
+          uv pip install -e '.[dev,caveats,drf,strawberry]' 'django==6.0.*' 'psycopg[binary]>=3.2,<4'
+      - name: Index and behavioural suites on PostgreSQL
+        run: make test-postgres

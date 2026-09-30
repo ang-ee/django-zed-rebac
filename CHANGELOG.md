@@ -5,6 +5,110 @@ pre-1.0; breaking changes within a minor version are explicitly called out.
 
 ## [Unreleased]
 
+## [0.23.0] — 2026-09-29
+
+### Added
+
+- A derived LocalBackend permission index shared by both relationship storage
+  modes. Six tables store interned terms, projected edges, userset membership,
+  monotone grants, maintenance work and the per-alias lock. A grant can hold a
+  named intersection or subtraction site by reference. Reads evaluate that
+  site from indexed sets when the query runs.
+- `rebac index rebuild` and `rebac index verify`, with `--database` and
+  repeatable `--type` selection. Verify compares full payloads in a
+  rolled-back rebuild. Sync builds an unready index even when schema text
+  has not changed.
+- Checks E013 (readiness), E014 (identity codec), E015 (cross-alias backing),
+  E016 (site on a recursive cycle), E017 (condition limit), E018 (untracked
+  backing model) and E019 (static read-plan limit). E016 and E019 also run
+  when a schema row or an override is written, `sync` included: a refused
+  program raises `SchemaError` and rolls the write back.
+- `SchemaGeneration.index_program` records the program that derived the
+  index. Every read statement requires it to be the program the statement was
+  compiled with, so a queryset built before a policy change returns no rows
+  after it. An index derived by another program, as after an upgrade that
+  changes derivation, reports E013 until `sync` or `rebac index rebuild`.
+- `REBAC_INDEX_CONDITION_LIMIT=256` bounds caveat contributions and
+  `REBAC_INDEX_LOOKUP_LIMIT=64` bounds the number of lookups in a permission
+  read plan. E019 reports an oversized plan during checks.
+- Differential and finite-domain reference suites, structural read-plan and
+  scale tests, PostgreSQL CI, and an opt-in MySQL vendor suite.
+
+### Changed
+
+- Every persisted permission read uses the same index compiler, including
+  queryset scopes, checks, `accessible`, `lookup_subjects`, field gates
+  and bulk guards. The SQL shape depends on the static schema plan, not on
+  graph depth or number of users. Positive data cycles terminate at a
+  fixpoint. `REBAC_DEPTH_LIMIT` bounds only the `check_new` walker.
+- The index stores monotone sets; named set sites evaluate `&` and `-` at
+  read time. A site is evaluated at the object being checked, or at the holder
+  of the row that holds it: an arrow or constant target. Sites are named by
+  content, so a name keeps its meaning when an override is added or removed.
+  Rebuild derives each rule with a set-based queryset. Site read size grows
+  linearly with its plan; E019 bounds it. An arrow into a node with type-level
+  rows materializes one row per edge.
+- A grant holds a set by reference: a membership write never rewrites the
+  grants of the set's consumers. A relation has grant rows when a permission
+  names it, an arrow targets it or a site takes it as an operand, and a write
+  to it derives those again. Maintenance follows what derivation reads, not
+  holders, and a change at a type-level scope no longer derives every object
+  of the type again.
+- A caveat that its pinned context decides is decided at derivation, unless an
+  override can redefine it. Scopes and `accessible()` list such rows.
+- A maintenance pass reads and derives only the resource types its region
+  contains. It reads no whole source, model or index table, so one write costs
+  the same whatever the size of the index and of the schema.
+- The index reads the rows of a resource model only when Django manages its
+  table. An unmanaged model can be the anchor of a type whose objects exist
+  only in relationships and have no table; its objects are the ones that
+  relationships, constants and backings name. `resolve_subjects()` omits them.
+- Before the first `sync` on an alias there is no index to maintain: a source
+  write proceeds without a pass and reads stay closed. The same holds while
+  migrations run and the library's tables are missing or lack a column.
+- Extend/loosen override arms carry their deadlines into derived expiry.
+  Disable/tighten sites become identities when their deadlines pass;
+  recaveat selects the caveat definition at read time. Time passing does
+  not require index maintenance.
+- `lookup_subjects()` expands arrows and nested usersets completely. It
+  lists the subjects a stored row or membership names on a path to the
+  permission. `authenticated` and `anonymous` name nobody, as before; a stored
+  wildcard is listed as `type:*`. Enumeration returns only definite results.
+- A check that a caveat can reach reads its rows in one statement and keeps
+  the three states. **Changed:** a conditional result now reports the
+  parameters it still needs, whatever the order of arms and tuples. The
+  walker also reported the parameters of paths that cannot hold and of
+  alternatives made unnecessary by one that holds; those are no longer
+  reported. The set is always within the one 0.22 reported.
+- A read with `context` names the caveats the context decides to its statement
+  in one parameter; the statement does not grow with their number.
+- Source and index writes share one transaction and a global lock per
+  database alias. Explicit-sender lifecycle receivers preserve Django's
+  fast delete and unrelated M2M fast-add paths. RebacMixin gates create
+  and update in `save_base` before consumer `pre_save`; move preparation
+  into `save()` or `proposed_relationships`.
+- Added `RebacTrackedMixin` and `REBAC_TRACKED_MODELS` for backing models.
+  Third-party tracked model saves require `atomic()` or `ATOMIC_REQUESTS`.
+  In autocommit the receiver warns after the source write, then maintains
+  the index. Unsupported raw and signal-free writes require rebuild.
+- Override owners audit bulk create and delete. Only ContentType cascades
+  need override lifecycle receivers. Index foreign keys to terms use
+  `DO_NOTHING` with database constraints, and dependency-ordered public
+  `QuerySet.delete()` clears internal rows.
+- Migration `0007` creates the index and seeds its lock row. Reads fail
+  closed until sync or rebuild publishes the matching schema revision.
+
+### Limits
+
+- E016 rejects `&` and `-` sites on recursive cycles, including self-loops.
+  This is a deliberate LocalBackend divergence in 0.23.0. **Changed:** it
+  applies to overrides too. A `disable` or `tighten` on a recursive
+  permission, which 0.22 evaluated per object, is refused when written.
+- The index has no depth limit: where the walker raised
+  `PermissionDepthExceeded`, a read now terminates and answers.
+- Broad graph fan-out and the per-alias global lock can make maintenance
+  expensive. MySQL 8 vendor testing remains a release gate.
+
 ## [0.22.1] — 2026-09-29
 
 ### Fixed

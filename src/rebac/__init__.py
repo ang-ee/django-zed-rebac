@@ -19,7 +19,7 @@ from typing import TYPE_CHECKING, Any
 try:
     __version__ = version("django-zed-rebac")
 except PackageNotFoundError:
-    __version__ = "0.22.1"
+    __version__ = "0.23.0"
 
 default_app_config = "rebac.apps.RebacConfig"
 
@@ -79,7 +79,7 @@ if TYPE_CHECKING:
     from .decorators import rebac_resource, require_permission
     from .managers import RebacManager, RebacQuerySet
     from .mcp import default_actor_resolver, get_mcp_actor_resolver, rebac_mcp_tool
-    from .mixins import RebacMixin, RebacObjectMeta
+    from .mixins import RebacMixin, RebacObjectMeta, RebacTrackedMixin
     from .permissions_mixin import RebacPermissionsMixin
     from .relationships import (
         delete_relationship,
@@ -91,6 +91,7 @@ if TYPE_CHECKING:
 
 
 _LAZY = {
+    "RebacTrackedMixin": ("rebac.mixins", "RebacTrackedMixin"),
     "RebacMixin": ("rebac.mixins", "RebacMixin"),
     "RebacManager": ("rebac.managers", "RebacManager"),
     "RebacQuerySet": ("rebac.managers", "RebacQuerySet"),
@@ -143,6 +144,7 @@ __all__ = [
     "RelationshipTuple",
     # mixin / managers / metaclasses
     "RebacMixin",
+    "RebacTrackedMixin",
     "RebacManager",
     "RebacQuerySet",
     "RebacObjectMeta",

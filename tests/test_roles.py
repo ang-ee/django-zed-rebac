@@ -27,6 +27,7 @@ from rebac.roles import (
 )
 from rebac.schema import parse_zed
 from rebac.types import ObjectRef
+from tests.backend_setup import install_schema
 
 ROLE_SCHEMA_TEXT = """
 definition auth/user {}
@@ -64,7 +65,7 @@ def _role_schema(request):
         yield
         return
     reset_backend()
-    backend().set_schema(parse_zed(ROLE_SCHEMA_TEXT))
+    install_schema(backend(), parse_zed(ROLE_SCHEMA_TEXT))
     yield
     reset_backend()
 
@@ -497,8 +498,9 @@ def test_roles_of_filters_role_containers_in_sql(settings, storage):
 
     settings.REBAC_LOCAL_BACKEND_STORAGE = storage
     reset_backend()
-    backend().set_schema(
-        parse_zed(ROLE_SCHEMA_TEXT + "definition auth/team {\n relation member: auth/user\n}\n")
+    install_schema(
+        backend(),
+        parse_zed(ROLE_SCHEMA_TEXT + "definition auth/team {\n relation member: auth/user\n}\n"),
     )
     actor = SubjectRef.of("auth/user", "42")
     grant(actor=actor, role="storage/role:object_viewer")

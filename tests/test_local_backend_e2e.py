@@ -34,6 +34,7 @@ from rebac import (
 from rebac.backends import reset_backend
 from rebac.schema import parse_zed
 from rebac.types import RelationshipFilter
+from tests.backend_setup import install_schema
 
 SCHEMA_TEXT = """
 caveat link_not_expired(expires_at timestamp, now timestamp) {
@@ -99,7 +100,7 @@ def local_backend(db) -> Iterator[LocalBackend]:
     reset_backend()
     active_backend = backend()
     assert isinstance(active_backend, LocalBackend)
-    active_backend.set_schema(parse_zed(SCHEMA_TEXT))
+    install_schema(active_backend, parse_zed(SCHEMA_TEXT))
     yield active_backend
     reset_backend()
 

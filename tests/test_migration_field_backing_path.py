@@ -6,9 +6,9 @@ import importlib
 from types import SimpleNamespace
 
 import pytest
-from django.apps import apps
 from django.contrib.contenttypes.models import ContentType
 from django.db import connection
+from django.db.migrations.loader import MigrationLoader
 from django.utils import timezone
 
 from rebac.management.commands.rebac import Command
@@ -18,30 +18,41 @@ migration = importlib.import_module("rebac.migrations.0004_field_backing_path")
 _schema_editor = SimpleNamespace(connection=connection)
 
 
-def _relation(name: str, backing: dict | None, definition: SchemaDefinition) -> SchemaRelation:
-    return SchemaRelation.objects.create(
-        definition=definition,
+def _historical_apps():
+    return (
+        MigrationLoader(connection).project_state([("rebac", "0003_schema_relation_backing")]).apps
+    )
+
+
+def _relation(
+    name: str, backing: dict | None, definition: SchemaDefinition, historical_apps
+) -> SchemaRelation:
+    row = historical_apps.get_model("rebac", "SchemaRelation").objects.create(
+        definition_id=definition.pk,
         name=name,
         allowed_subjects=[{"type": "blog/folder"}],
         backing=backing,
     )
+    return SchemaRelation.objects.get(pk=row.pk)
 
 
 @pytest.mark.django_db
 def test_forward_renames_only_field_backings_and_preserves_other_keys() -> None:
+    historical_apps = _historical_apps()
     post_def = SchemaDefinition.objects.create(resource_type="blog/post")
-    explicit = _relation("folder", {"kind": "fk", "attname": "folder"}, post_def)
-    implicit_kind = _relation("parent", {"attname": "parent"}, post_def)
+    explicit = _relation("folder", {"kind": "fk", "attname": "folder"}, post_def, historical_apps)
+    implicit_kind = _relation("parent", {"attname": "parent"}, post_def, historical_apps)
     filtered = _relation(
         "editor",
         {"kind": "fk", "attname": "roster__user", "filters": {"roster__active": True}},
         post_def,
+        historical_apps,
     )
-    const = _relation("admin", {"kind": "const", "target_id": "admin"}, post_def)
-    attribute = _relation("kind", {"kind": "attribute", "field": "kind"}, post_def)
-    stored = _relation("viewer", None, post_def)
+    const = _relation("admin", {"kind": "const", "target_id": "admin"}, post_def, historical_apps)
+    attribute = _relation("kind", {"kind": "attribute", "field": "kind"}, post_def, historical_apps)
+    stored = _relation("viewer", None, post_def, historical_apps)
 
-    migration.forwards(apps, _schema_editor)
+    migration.forwards(historical_apps, _schema_editor)
 
     for row in (explicit, implicit_kind, filtered, const, attribute, stored):
         row.refresh_from_db()
@@ -59,25 +70,29 @@ def test_forward_renames_only_field_backings_and_preserves_other_keys() -> None:
 
 @pytest.mark.django_db
 def test_backward_is_the_symmetric_rename() -> None:
+    historical_apps = _historical_apps()
     post_def = SchemaDefinition.objects.create(resource_type="blog/post")
-    row = _relation("folder", {"kind": "fk", "path": "folder"}, post_def)
+    row = _relation("folder", {"kind": "fk", "path": "folder"}, post_def, historical_apps)
 
-    migration.backwards(apps, _schema_editor)
+    migration.backwards(historical_apps, _schema_editor)
     row.refresh_from_db()
     assert row.backing == {"kind": "fk", "attname": "folder"}
 
-    migration.forwards(apps, _schema_editor)
+    migration.forwards(historical_apps, _schema_editor)
     row.refresh_from_db()
     assert row.backing == {"kind": "fk", "path": "folder"}
 
 
 @pytest.mark.django_db
 def test_conflicting_keys_are_rejected_instead_of_overwritten() -> None:
+    historical_apps = _historical_apps()
     post_def = SchemaDefinition.objects.create(resource_type="blog/post")
-    _relation("folder", {"kind": "fk", "attname": "folder", "path": "other"}, post_def)
+    _relation(
+        "folder", {"kind": "fk", "attname": "folder", "path": "other"}, post_def, historical_apps
+    )
 
     with pytest.raises(ValueError, match="both 'attname' and 'path'"):
-        migration.forwards(apps, _schema_editor)
+        migration.forwards(historical_apps, _schema_editor)
 
 
 def _managed(row: SchemaRelation, payload: dict, *, external_id: str) -> PackageManagedRecord:
@@ -96,6 +111,7 @@ def _managed(row: SchemaRelation, payload: dict, *, external_id: str) -> Package
 
 @pytest.mark.django_db
 def test_migrated_rows_sync_without_drift_while_admin_edits_stay_drift() -> None:
+    historical_apps = _historical_apps()
     post_def = SchemaDefinition.objects.create(resource_type="blog/post")
     old_payload = {
         "allowed_subjects": [{"type": "blog/folder"}],
@@ -104,14 +120,15 @@ def test_migrated_rows_sync_without_drift_while_admin_edits_stay_drift() -> None
         "with_expiration": False,
     }
     new_payload = {**old_payload, "backing": {"kind": "fk", "path": "folder"}}
-    synced = _relation("folder", old_payload["backing"], post_def)
+    synced = _relation("folder", old_payload["backing"], post_def, historical_apps)
     _managed(synced, old_payload, external_id="blog/post#folder")
-    edited = _relation("parent", old_payload["backing"], post_def)
-    edited.allowed_subjects = [{"type": "blog/post"}]  # admin edit
-    edited.save(update_fields=["allowed_subjects"])
+    edited = _relation("parent", old_payload["backing"], post_def, historical_apps)
+    historical_apps.get_model("rebac", "SchemaRelation").objects.filter(pk=edited.pk).update(
+        allowed_subjects=[{"type": "blog/post"}]
+    )  # historical admin edit
     _managed(edited, old_payload, external_id="blog/post#parent")
 
-    migration.forwards(apps, _schema_editor)
+    migration.forwards(historical_apps, _schema_editor)
 
     command = Command()
     command.stdout = __import__("io").StringIO()

@@ -19,6 +19,7 @@ from django.test.utils import override_settings
 from rebac import LocalBackend, ObjectRef, RelationshipTuple, SubjectRef
 from rebac.models import RebacResource, Relationship, RelationshipRegistry
 from rebac.schema import parse_zed
+from tests.backend_setup import install_schema
 from tests.test_local_backend import SCHEMA_TEXT
 
 
@@ -43,7 +44,7 @@ def backend(db):
     """LocalBackend bound to the registry-mode active table."""
     with override_settings(REBAC_LOCAL_BACKEND_STORAGE="registry"):
         b = LocalBackend()
-        b.set_schema(parse_zed(SCHEMA_TEXT))
+        install_schema(b, parse_zed(SCHEMA_TEXT))
         yield b
 
 

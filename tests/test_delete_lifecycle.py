@@ -1,5 +1,6 @@
 """Relationship garbage collection follows both sides of Django identity."""
 
+from contextlib import nullcontext
 from unittest.mock import MagicMock, patch
 
 import pytest
@@ -10,6 +11,7 @@ from rebac.models import active_relationship_model
 from rebac.schema import parse_zed
 from rebac.signals import _rebac_cascade_resource
 from rebac.types import ObjectRef
+from tests.backend_setup import install_schema
 from tests.testapp.models import Folder, Post
 
 SCHEMA_TEXT = """
@@ -29,10 +31,16 @@ def test_delete_cleanup_uses_signal_database_alias(settings):
 
     with (
         patch("rebac.models.active_relationship_model", return_value=relationship_model),
+        patch("rebac.signals.router.allow_migrate_model", return_value=True),
+        patch("rebac.index.maintain.tuple_owner", return_value=nullcontext(None)),
+        patch("rebac.signals._finish_signal"),
         patch("rebac.backends.local.mark_relationships_changed") as invalidated,
+        patch("rebac.index.maintain.tuple_owner", return_value=nullcontext(MagicMock())) as owner,
+        patch("rebac.index.maintain.maintain_tuples", return_value=nullcontext()),
     ):
         _rebac_cascade_resource(sender=Post, instance=target, using="replica")
 
+    owner.assert_called_once_with("replica")
     # The delete joins the Collector's transaction on the signal's alias; the
     # handler opens none of its own, then drops cached decisions.
     relationship_model.objects.using.assert_called_once_with("replica")
@@ -45,7 +53,7 @@ def test_delete_cleanup_uses_signal_database_alias(settings):
 def test_delete_removes_resource_and_subject_occurrences(settings, storage):
     settings.REBAC_LOCAL_BACKEND_STORAGE = storage
     reset_backend()
-    backend().set_schema(parse_zed(SCHEMA_TEXT))
+    install_schema(backend(), parse_zed(SCHEMA_TEXT))
     with sudo(reason="delete lifecycle setup"):
         subject = Folder.objects.create(name="Subject")
         target = Post.objects.create(title="Target")

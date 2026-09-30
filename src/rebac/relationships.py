@@ -5,10 +5,10 @@ from __future__ import annotations
 from collections.abc import Iterable
 from typing import Any
 
-from django.db import models
+from django.db import models, router
 from django.db.models import QuerySet
 
-from .resources import model_for_subject_type
+from .resources import model_for_subject_type, stores_rows
 from .types import ObjectRef, RelationshipFilter, RelationshipTuple, SubjectRef, Zookie
 
 
@@ -56,9 +56,8 @@ def delete_relationships(filter_: RelationshipFilter) -> Zookie:
     from .models import PermissionAuditEvent, active_relationship_model
 
     # Snapshot the matched rows BEFORE the delete so we can audit each row's
-    # canonical wire string. Keep the matcher in lockstep with
-    # LocalBackend.delete_relationships — if a future filter field is added
-    # there, mirror it here. The audit projection always uses the
+    # canonical wire string. RelationshipFilter owns the matcher shared with
+    # LocalBackend.delete_relationships. The audit projection always uses the
     # denormalized field names (``resource_type``, ``subject_id``, etc.) —
     # the registry manager translates filters internally and the property
     # accessors expose the same names on instances, but for ``.values()``
@@ -68,21 +67,10 @@ def delete_relationships(filter_: RelationshipFilter) -> Zookie:
     # models; the FK-side lookups below only apply in registry mode
     # (guarded by ``is_registry``). Type as ``QuerySet[Any]`` so the
     # runtime-dispatched field names don't trip static field validation.
-    qs: QuerySet[Any] = RelationshipModel.objects.all()
-    if filter_.resource_type:
-        qs = qs.filter(resource_type=filter_.resource_type)
-    if filter_.resource_id:
-        qs = qs.filter(resource_id=filter_.resource_id)
-    if filter_.relation:
-        qs = qs.filter(relation=filter_.relation)
-    if filter_.subject_type:
-        qs = qs.filter(subject_type=filter_.subject_type)
-    if filter_.subject_id:
-        qs = qs.filter(subject_id=filter_.subject_id)
-    if filter_.optional_subject_relation:
-        qs = qs.filter(optional_subject_relation=filter_.optional_subject_relation)
-    if filter_.caveat_name:
-        qs = qs.filter(caveat_name=filter_.caveat_name)
+    qs: QuerySet[Any] = RelationshipModel.objects.using(
+        router.db_for_write(RelationshipModel)
+    ).all()
+    qs = qs.filter(**filter_.lookups())
     is_registry = RelationshipModel.__name__ == "RelationshipRegistry"
     if is_registry:
         snapshot = [
@@ -164,7 +152,7 @@ def delete_relationship(tuple_: RelationshipTuple) -> Zookie:
 
     RelationshipModel = active_relationship_model()
     snapshot = list(
-        RelationshipModel.objects.filter(
+        RelationshipModel.objects.using(router.db_for_write(RelationshipModel)).filter(
             resource_type=tuple_.resource.resource_type,
             resource_id=tuple_.resource.resource_id,
             relation=tuple_.relation,
@@ -211,6 +199,8 @@ def resolve_subjects(refs: Iterable[SubjectRef | str]) -> dict[SubjectRef, model
         if mapping is None:
             continue
         model, id_attr = mapping
+        if not stores_rows(model):
+            continue
         ids = {ref.subject_id for ref in refs_for_type}
         rows = model._base_manager.filter(**{f"{id_attr}__in": list(ids)})
         by_id = {str(getattr(row, id_attr)): row for row in rows}

@@ -182,3 +182,9 @@ class RelationshipFilter:
     subject_id: str = ""
     optional_subject_relation: str = ""
     caveat_name: str = ""
+
+    def lookups(self) -> dict[str, str]:
+        """Django lookups with the wire filter's wildcard-on-empty semantics."""
+        from dataclasses import fields
+
+        return {field.name: value for field in fields(self) if (value := getattr(self, field.name))}

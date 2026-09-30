@@ -37,6 +37,18 @@ WIRE_VALUE_FIELDS = (
     "caveat_name",
 )
 
+INDEX_PROJECTION_FIELDS = (
+    "resource_type",
+    "resource_id",
+    "relation",
+    "subject_type",
+    "subject_id",
+    "subject_relation",
+    "caveat_name",
+    "caveat_context",
+    "expires_at",
+)
+
 _REGISTRY_WIRE_FIELD_MAP = {
     "resource_type": "resource_fk__resource_type",
     "resource_id": "resource_fk__resource_id",
@@ -48,10 +60,12 @@ _REGISTRY_WIRE_FIELD_MAP = {
 class RelationshipQuerySet(models.QuerySet["Relationship"]):
     """Mode-agnostic queryset helpers for denormalized relationship rows."""
 
-    def with_wire_ids(self) -> RelationshipQuerySet:
-        """Expose wire IDs for scope expressions without storage-specific paths."""
-        return self.alias(_scope_subject_id=F("subject_id")).annotate(
-            _scope_resource_id=F("resource_id")
+    def index_projection(self) -> models.QuerySet[Any]:
+        return cast(
+            models.QuerySet[Any],
+            self.annotate(subject_relation=F("optional_subject_relation")).values(
+                *INDEX_PROJECTION_FIELDS
+            ),
         )
 
     def for_resource(self, resource_type: str, resource_id: str) -> RelationshipQuerySet:
@@ -283,6 +297,22 @@ class RelationshipRegistryQuerySet(models.QuerySet["RelationshipRegistry"]):
     returns this class so the rewrite is in scope for the whole chain.
     """
 
+    def index_projection(self) -> models.QuerySet[Any]:
+        # Every F expression uses a real FK path. The internal projection is a
+        # plain queryset: its wire aliases are now real annotations, and later
+        # derivation F()/OuterRef() expressions must not hit the public wire
+        # translator's intentional rejection of wire-field expressions.
+        projected = self.annotate(
+            **{name: F(path) for name, path in _REGISTRY_WIRE_FIELD_MAP.items()},
+            subject_relation=F("optional_subject_relation"),
+        )
+        return models.QuerySet(
+            model=self.model,
+            query=projected.query,
+            using=self.db,
+            hints=getattr(self, "_hints", None),
+        ).values(*INDEX_PROJECTION_FIELDS)
+
     def filter(self, *args: Any, **kwargs: Any) -> RelationshipRegistryQuerySet:
         return super().filter(*_translate_read_args(args), **_translate_read_kwargs(kwargs))
 
@@ -324,12 +354,6 @@ class RelationshipRegistryQuerySet(models.QuerySet["RelationshipRegistry"]):
         for value in (*args, *kwargs.values()):
             _raise_for_wire_field_expression(value, surface="annotate()")
         return super().annotate(*args, **kwargs)
-
-    def with_wire_ids(self) -> RelationshipRegistryQuerySet:
-        """Expose the same scope identities as denormalized storage."""
-        return self.alias(_scope_subject_id=F(_REGISTRY_WIRE_FIELD_MAP["subject_id"])).annotate(
-            _scope_resource_id=F(_REGISTRY_WIRE_FIELD_MAP["resource_id"])
-        )
 
     def for_resource(self, resource_type: str, resource_id: str) -> RelationshipRegistryQuerySet:
         return self.filter(**{"resource_type": resource_type, "resource_id": resource_id})

@@ -2,8 +2,9 @@
 
 from __future__ import annotations
 
-from collections.abc import Iterable, Iterator
+from collections.abc import Callable, Iterable, Iterator
 from dataclasses import dataclass
+from graphlib import CycleError, TopologicalSorter
 from typing import TYPE_CHECKING, Any
 
 from django.core.exceptions import FieldDoesNotExist, FieldError, ValidationError
@@ -67,8 +68,10 @@ class ResolvedFieldBacking(_SourceFilters):
     def source_id_attr(self) -> str:
         return resource_id_attr(self.source_model)
 
-    def source_filter(self, resource_id: str) -> Q:
-        return model_identity_filter(self.source_model, self.source_id_attr, resource_id)
+    def source_filter(self, resource_id: str, *, using: str = DEFAULT_DB_ALIAS) -> Q:
+        return model_identity_filter(
+            self.source_model, self.source_id_attr, resource_id, using=using
+        )
 
     def target_filter(self, subject: SubjectRef) -> dict[str, str]:
         return {self.target_values_path(): subject.subject_id}
@@ -110,14 +113,15 @@ class ResolvedFieldBacking(_SourceFilters):
     ) -> QuerySet[Any]:
         """Constrain the target and through-row predicates in the same SQL join."""
 
+        rows = self.source_model._base_manager.db_manager(using).all()
         predicate = Q(**self.filters)
         if resource_id is not None:
-            predicate &= self.source_filter(resource_id)
+            predicate &= self.source_filter(resource_id, using=rows.db)
         if subject is not None:
             predicate &= Q(**self.target_filter(subject))
         if target_ids is not None:
             predicate &= Q(**self.target_in_filter(target_ids))
-        return self.source_model._base_manager.db_manager(using).filter(predicate)
+        return rows.filter(predicate)
 
 
 def _proposed_forward_relationships(
@@ -308,16 +312,6 @@ class ResolvedAttributeBacking:
         rows = self.target_model._base_manager.db_manager(using)
         return rows.filter(self.target_filter(resource_id, subject)).exists()
 
-    def has_any_subject(
-        self, resource_id: str, target_ids: Iterable[str], using: str | None = None
-    ) -> bool:
-        """Whether any subject identified in ``target_ids`` is in the virtual container."""
-        rows = self.target_model._base_manager.db_manager(using)
-        predicate = self.subjects_filter(resource_id) & Q(
-            **{f"{self.target_id_attr}__in": target_ids}
-        )
-        return rows.filter(predicate).exists()
-
     def subject_ids(self, resource_id: str, using: str | None = None) -> QuerySet[Any, Any]:
         """Distinct identities of the subjects currently in the virtual container."""
         rows = self.target_model._base_manager.db_manager(using)
@@ -371,14 +365,13 @@ class ResolvedConstBacking(_SourceFilters):
         """Bare constants stay row-independent; filtered edges require a match."""
         if not self.filters:
             return True
-        return (
-            self.source_model._base_manager.db_manager(using)
-            .filter(
-                Q(**self.filters)
-                & model_identity_filter(self.source_model, self.source_id_attr, resource_id)
+        rows = self.source_model._base_manager.db_manager(using).all()
+        return rows.filter(
+            Q(**self.filters)
+            & model_identity_filter(
+                self.source_model, self.source_id_attr, resource_id, using=rows.db
             )
-            .exists()
-        )
+        ).exists()
 
     def matches_candidate(self, instance: models.Model, *, using: str | None = None) -> bool | None:
         """Evaluate local column values without reading a persisted source row."""
@@ -437,22 +430,39 @@ def _validate_const_filters(model: type[models.Model], backing: ConstBinding) ->
 
 
 def _relation_path(
-    source_model: type[models.Model], path: str
+    source_model: type[models.Model],
+    path: str,
+    *,
+    lookup: bool = False,
+    visit: Callable[[type[models.Model], ModelField, str], None] | None = None,
 ) -> tuple[type[models.Model], ModelField, str]:
-    """Resolve every path segment through Django's native relation metadata."""
+    """Resolve model hops using native metadata, optionally visiting each field.
+
+    By default the whole path must contain relations. With lookup=True, visit
+    the terminal scalar too, then stop before transforms/lookup suffixes. The
+    callback receives the owning model, field, and normalized path prefix.
+    """
 
     current = source_model
     names: list[str] = []
     last: ModelField | None = None
     for part in path.split("__"):
         try:
-            last = current._meta.get_field(part)
+            last = current._meta.pk if part == "pk" else current._meta.get_field(part)
         except FieldDoesNotExist as exc:
+            if lookup and last is not None:
+                break
             raise ValueError(f"missing field {part!r} on {current.__name__}") from exc
+        if last is None:
+            raise ValueError(f"missing field {part!r} on {current.__name__}")
+        names.append(last.name)
+        if visit is not None:
+            visit(current, last, "__".join(names))
         target = getattr(last, "related_model", None)
         if not last.is_relation or not isinstance(target, type):
+            if lookup:
+                break
             raise ValueError(f"{current.__name__}.{part} must be a model relation")
-        names.append(last.name)
         current = target
     if last is None:
         raise ValueError("field path must not be empty")
@@ -716,35 +726,13 @@ def _const_arrows_in(expr: PermExpr, const_relations: dict[str, str]) -> Iterato
 def _find_const_arrow_cycle(
     edges: dict[tuple[str, str], set[tuple[str, str]]],
 ) -> list[tuple[str, str]] | None:
-    """Return one cycle (as an ordered node path closing on itself) or ``None``.
-
-    Plain DFS with white/grey/black colouring. Iteration is ``sorted`` so the
-    reported cycle is deterministic across runs / Python versions.
-    """
-    WHITE, GREY, BLACK = 0, 1, 2
-    color: dict[tuple[str, str], int] = {}
-    stack: list[tuple[str, str]] = []
-
-    def visit(node: tuple[str, str]) -> list[tuple[str, str]] | None:
-        color[node] = GREY
-        stack.append(node)
-        for nxt in sorted(edges.get(node, ())):
-            state = color.get(nxt, WHITE)
-            if state == GREY:
-                return [*stack[stack.index(nxt) :], nxt]
-            if state == WHITE and nxt in edges:
-                found = visit(nxt)
-                if found is not None:
-                    return found
-        stack.pop()
-        color[node] = BLACK
-        return None
-
-    for start in sorted(edges):
-        if color.get(start, WHITE) == WHITE:
-            found = visit(start)
-            if found is not None:
-                return found
+    """Return a deterministic directed cycle, using the stdlib graph walker."""
+    try:
+        TopologicalSorter({key: sorted(edges[key]) for key in sorted(edges)}).prepare()
+    except CycleError as exc:
+        # TopologicalSorter follows predecessor edges: reverse the report to
+        # retain this module's source -> target diagnostic convention.
+        return list(reversed(exc.args[1]))
     return None
 
 

@@ -1,25 +1,13 @@
-"""Edge paths of the lazy SQL permission compiler (`backends/local_query.py`).
-
-These cover branches the broader parity suites in
-``test_queryset_permission_parity.py`` and ``test_encoded_resource_scope.py``
-do not exercise: a field-backed relation reached by a subject of a type the
-relation does not allow (fail-closed), a field-backed relation whose *subject*
-is keyed by a non-``pk`` identity, a stored arrow compiled through the encoded
-(non-native identity) fallback, and two expression shapes that must compile to
-a static deny. Every assertion checks that the compiled SQL predicate — not the
-enumerating ``accessible()`` fallback — produced the answer.
-"""
+"""Fail-closed scopes and canonical subject identities on the index read path."""
 
 from __future__ import annotations
 
 from contextlib import contextmanager
-from datetime import UTC, datetime, timedelta
 from unittest.mock import patch
 
 import pytest
 from django.contrib.auth import get_user_model
 from django.test import override_settings
-from django.utils import timezone
 
 from rebac import (
     LocalBackend,
@@ -32,7 +20,8 @@ from rebac import (
 )
 from rebac.backends import reset_backend
 from rebac.schema import parse_zed
-from tests.testapp.models import AuthoredPost, EncodedPost, Post
+from tests.backend_setup import atomic_source_write, install_schema
+from tests.testapp.models import AuthoredPost, EncodedPost, Post, TextIdentityPost
 
 pytestmark = pytest.mark.django_db(transaction=True)
 
@@ -47,7 +36,7 @@ def _schema(src, storage):
         reset_backend()
         local = backend()
         assert isinstance(local, LocalBackend)
-        local.set_schema(parse_zed(src))
+        install_schema(local, parse_zed(src))
         try:
             yield local
         finally:
@@ -77,7 +66,7 @@ def test_field_backed_permission_denies_subject_of_disallowed_type(storage):
 
     ``owner`` is declared ``auth/user`` and backed by the ``author`` FK. A
     group subject-set actor matches no allowed subject, so the compiled
-    predicate must be a static deny (``local_query`` line 209) rather than
+    predicate must deny rather than
     leaking every row.
     """
     src = """
@@ -89,7 +78,7 @@ def test_field_backed_permission_denies_subject_of_disallowed_type(storage):
     }
     """
     with _schema(src, storage) as active:
-        alice = get_user_model().objects.create_user(username="alice")
+        alice = atomic_source_write(get_user_model().objects.create_user, username="alice")
         with sudo(reason="disallowed-subject fixtures"):
             AuthoredPost.objects.create(title="owned", author=alice)
             AuthoredPost.objects.create(title="other", author=alice)
@@ -113,7 +102,7 @@ def test_field_backed_owner_resolves_non_pk_subject_identity(storage):
     With ``REBAC_USER_ID_ATTR = "username"`` the actor is
     ``auth/user:<username>`` while the ``author`` FK still stores the row's
     integer pk. The compiler must correlate through a destination subquery
-    keyed on ``username`` (``local_query`` lines 213-216) instead of matching
+    keyed on ``username`` instead of matching
     the raw subject id against ``author_id``.
     """
     src = """
@@ -124,8 +113,8 @@ def test_field_backed_owner_resolves_non_pk_subject_identity(storage):
     }
     """
     with override_settings(REBAC_USER_ID_ATTR="username"), _schema(src, storage) as active:
-        alice = get_user_model().objects.create_user(username="alice")
-        bob = get_user_model().objects.create_user(username="bob")
+        alice = atomic_source_write(get_user_model().objects.create_user, username="alice")
+        bob = atomic_source_write(get_user_model().objects.create_user, username="bob")
         alice_ref = to_subject_ref(alice)
         # The actor id is the username, not the pk.
         assert alice_ref == SubjectRef.of("auth/user", "alice")
@@ -142,32 +131,38 @@ def test_field_backed_owner_resolves_non_pk_subject_identity(storage):
             assert AuthoredPost.objects.with_actor(to_subject_ref(bob)).count() == 1
 
 
-def test_encoded_identity_stored_arrow_via_tuple_relation(storage):
-    """A tuple-backed arrow on a non-native identity compiles, not enumerates.
+def test_encoded_identity_stored_arrow_is_refused(storage):
+    from rebac.errors import SchemaError
+    from rebac.index.codec import identity_codec
 
-    ``blog/encodedpost`` is keyed by an ``EncodedIntegerField`` (wire value
-    ``item-<n>``), so its identity is non-native and the ``container`` arrow —
-    a plain relationship-row relation, not a field/const backing — routes
-    through ``ConvertedRelationIds`` with a target (``local_query`` line 75).
-    """
+    with pytest.raises(SchemaError, match=r"rebac\.E014"):
+        identity_codec(EncodedPost)
+
+
+def test_text_identity_stored_arrow_via_tuple_relation(storage):
+    """Tuple-backed arrows retain visibility, dangling-target and identity parity."""
     src = """
     definition auth/user {}
     definition work/container {
         relation viewer: auth/user
         permission read = viewer
     }
-    definition blog/encodedpost {
+    definition blog/textidentitypost {
         relation container: work/container
         permission read = container->read
     }
     """
     with _schema(src, storage) as active:
-        alice = get_user_model().objects.create_user(username="alice")
+        alice = atomic_source_write(get_user_model().objects.create_user, username="alice")
         alice_ref = to_subject_ref(alice)
         with sudo(reason="encoded stored-arrow fixtures"):
-            visible = EncodedPost.objects.create(public_id="item-1", title="visible", author=alice)
-            hidden = EncodedPost.objects.create(public_id="item-2", title="hidden", author=alice)
-            dangling = EncodedPost.objects.create(
+            visible = TextIdentityPost.objects.create(
+                public_id="item-1", title="visible", author=alice
+            )
+            hidden = TextIdentityPost.objects.create(
+                public_id="item-2", title="hidden", author=alice
+            )
+            dangling = TextIdentityPost.objects.create(
                 public_id="item-3", title="dangling", author=alice
             )
         container = SubjectRef.of("work/container", "c1")
@@ -182,13 +177,15 @@ def test_encoded_identity_stored_arrow_via_tuple_relation(storage):
         )
         with _assert_predicate_path(active):
             seen = set(
-                EncodedPost.objects.with_actor(alice_ref).values_list("public_id", flat=True)
+                TextIdentityPost.objects.with_actor(alice_ref).values_list("public_id", flat=True)
             )
         assert seen == {"item-1"}
-        assert EncodedPost.objects.with_actor(BOB).count() == 0
+        assert TextIdentityPost.objects.with_actor(BOB).count() == 0
         # Parity with the graph walk over encoded identities.
         assert set(
-            active.accessible(subject=alice_ref, action="read", resource_type="blog/encodedpost")
+            active.accessible(
+                subject=alice_ref, action="read", resource_type="blog/textidentitypost"
+            )
         ) == {"item-1"}
 
 
@@ -227,7 +224,7 @@ def test_arrow_via_undeclared_relation_compiles_to_static_deny(storage):
             reset_backend()
             active = backend()
             assert isinstance(active, LocalBackend)
-            active.set_schema(schema)
+            install_schema(active, schema)
     except Exception:  # pragma: no cover - schema validation may reject this shape
         reset_backend()
         pytest.skip("schema layer rejects arrows through undeclared relations")
@@ -241,15 +238,13 @@ def test_arrow_via_undeclared_relation_compiles_to_static_deny(storage):
         reset_backend()
 
 
-def test_expiry_filter_binds_app_clock_not_database_clock(storage):
-    """The SQL expiry predicate binds the app clock, matching the graph path.
+def test_scope_binds_application_clock_not_database_clock(storage, monkeypatch):
+    from datetime import timedelta
 
-    ``local._filter_active`` (used by ``accessible()`` and the enumeration
-    fallback) filters expiry with ``timezone.now()``. The compiled predicate
-    must bind that same app-server clock, not the database clock (``Now()``),
-    or the two evaluation strategies disagree inside the app/DB clock-skew
-    window and break the ``accessible() == queryset`` parity contract.
-    """
+    from django.utils import timezone
+
+    from rebac.index import time as index_time
+
     src = """
     use expiration
     definition auth/user {}
@@ -258,71 +253,22 @@ def test_expiry_filter_binds_app_clock_not_database_clock(storage):
         permission read = viewer
     }
     """
+    # The database clock stays near the real present throughout the test.
+    instant = timezone.now() + timedelta(days=100)
+    deadline = instant + timedelta(hours=1)
+    monkeypatch.setattr(index_time, "index_now", lambda: instant)
     with _schema(src, storage) as active:
-        with sudo(reason="clock parity fixtures"):
-            post = Post.objects.create(title="expiring")
-        future = timezone.now() + timedelta(days=1)
+        with sudo(reason="application clock regression"):
+            post = Post.objects.create(title="expires by the app clock")
         active.write_relationships(
-            [RelationshipTuple(to_object_ref(post), "viewer", ALICE, expires_at=future)]
+            [RelationshipTuple(to_object_ref(post), "viewer", ALICE, expires_at=deadline)]
         )
-        # A distinctive sentinel clock so the bound parameter is unmistakable.
-        fixed = datetime(2099, 1, 2, 3, 4, 5, tzinfo=UTC)
-        with patch("rebac.backends.local_query.timezone.now", return_value=fixed) as now:
-            queryset = Post.objects.with_actor(ALICE).with_action("read").scoped()
-            _sql, params = queryset.query.sql_with_params()
-        # The compiler consulted the app clock (a DB-clock Now() would not).
-        assert now.called
-        # ...and bound that timestamp as a query parameter rather than emitting
-        # a database-clock SQL function. (The DB adapter stringifies datetimes.)
-        assert any(isinstance(p, str) and p.startswith("2099-01-02 03:04:05") for p in params)
-
-
-def test_maybe_using_routes_manager_to_pinned_alias(storage):
-    """`_maybe_using` pins any alias, and keeps the routed/default DB for None.
-
-    This is the routing primitive behind the multi-database consistency fix: an
-    arbitrary alias flows through even when it is not the default, so tuple-grant
-    resolution reads from whatever database the queryset is bound to.
-    """
-    with _schema("definition auth/user {}", storage) as active:
-        assert active._maybe_using(EncodedPost._base_manager, "replica").all().db == "replica"
-        assert active._maybe_using(EncodedPost._base_manager, None).all().db == "default"
-
-
-def test_encoded_tuple_grant_resolution_uses_queryset_database(storage):
-    """ConvertedRelationIds resolves tuple grants from the queryset's own DB.
-
-    The encoded (non-native) identity routes ``shared`` through
-    ``ConvertedRelationIds``; its ``as_sql`` must resolve the grant rows from
-    ``self.scope.using`` — the queryset's alias — not the default alias, so the
-    resolved ids and the surrounding EXISTS subqueries agree on the database.
-    Before the fix the resolver was called with no alias at all.
-    """
-    src = """
-    definition auth/user {}
-    definition blog/encodedpost {
-        relation shared: auth/user
-        permission read = shared
-    }
-    """
-    with _schema(src, storage) as active:
-        alice = get_user_model().objects.create_user(username="alice")
-        alice_ref = to_subject_ref(alice)
-        with sudo(reason="encoded db-alias fixtures"):
-            post = EncodedPost.objects.create(public_id="item-1", title="shared", author=alice)
-        active.write_relationships([_grant(post, "shared", alice_ref)])
-
-        captured: dict[str, object] = {}
-        original = active._resources_via_relation
-
-        def spy(*args, **kwargs):
-            captured["using"] = kwargs.get("using")
-            return original(*args, **kwargs)
-
-        with patch.object(active, "_resources_via_relation", side_effect=spy):
-            seen = set(
-                EncodedPost.objects.with_actor(alice_ref).values_list("public_id", flat=True)
-            )
-        assert seen == {"item-1"}
-        # The queryset's alias reached the tuple-grant resolver.
-        assert captured.get("using") == EncodedPost.objects.db == "default"
+        scoped = Post.objects.with_actor(ALICE).scoped()
+        assert list(scoped.values_list("pk", flat=True)) == [post.pk]
+        instant = deadline
+        assert timezone.now() < deadline
+        assert list(scoped.values_list("pk", flat=True)) == []
+        sql, params = scoped.query.get_compiler(using="default").as_sql()
+        assert "CURRENT_TIMESTAMP" not in sql.upper()
+        assert "STATEMENT_TIMESTAMP" not in sql.upper()
+        assert any(str(deadline.date()) in str(value) for value in params)

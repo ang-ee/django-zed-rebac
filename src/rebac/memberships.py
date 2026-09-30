@@ -10,7 +10,7 @@ from __future__ import annotations
 from collections.abc import Iterator, Mapping
 from typing import TYPE_CHECKING, Any, cast
 
-from django.db import transaction
+from django.db import router, transaction
 
 from .actors import ActorLike, to_subject_ref
 from .resources import to_object_ref
@@ -51,9 +51,10 @@ def grant(
         caveat_name=caveat_name,
         caveat_context=dict(caveat_context or {}),
     )
-    with transaction.atomic():
+    alias = router.db_for_write(relationship_model)
+    with transaction.atomic(using=alias):
         write_relationships([tuple_])
-        row = relationship_model.objects.get(
+        row = relationship_model.objects.using(alias).get(
             resource_type=container_ref.resource_type,
             resource_id=container_ref.resource_id,
             relation=MEMBER_RELATION,
@@ -72,6 +73,7 @@ def revoke(
     caveat_name: str = "",
 ) -> int:
     """Revoke exactly one direct membership tuple, including its caveat name."""
+    from .index.maintain import tuple_owner
     from .models import active_relationship_model
     from .relationships import delete_relationship
 
@@ -84,16 +86,21 @@ def revoke(
         subject=subject_ref,
         caveat_name=caveat_name,
     )
-    with transaction.atomic():
-        exists = relationship_model.objects.filter(
-            resource_type=container_ref.resource_type,
-            resource_id=container_ref.resource_id,
-            relation=MEMBER_RELATION,
-            subject_type=subject_ref.subject_type,
-            subject_id=subject_ref.subject_id,
-            optional_subject_relation=subject_ref.optional_relation,
-            caveat_name=caveat_name,
-        ).exists()
+    alias = router.db_for_write(relationship_model)
+    with tuple_owner(alias, tuples=(tuple_,)):
+        exists = (
+            relationship_model.objects.using(alias)
+            .filter(
+                resource_type=container_ref.resource_type,
+                resource_id=container_ref.resource_id,
+                relation=MEMBER_RELATION,
+                subject_type=subject_ref.subject_type,
+                subject_id=subject_ref.subject_id,
+                optional_subject_relation=subject_ref.optional_relation,
+                caveat_name=caveat_name,
+            )
+            .exists()
+        )
         delete_relationship(tuple_)
     return int(exists)
 
