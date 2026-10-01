@@ -35,9 +35,102 @@ _subjects: WeakSet[type[Model]] = WeakSet()
 _tracked: WeakSet[type[Model]] = WeakSet()
 _throughs: WeakSet[type[Model]] = WeakSet()
 _through_candidates: WeakSet[type[Model]] = WeakSet()
-_related_m2m_write: ContextVar[type[Model] | None] = ContextVar(
+
+
+class _PreGatedThroughWrite:
+    """The through pairs a related-manager call already gated.
+
+    Only these exact rows skip the per-row gates while the call runs; any other
+    through row written during it, for example by a consumer ``m2m_changed``
+    handler, is gated on its own.
+    """
+
+    __slots__ = ("pairs", "through")
+
+    def __init__(self, through: type[Model], pairs: set[tuple[Any, Any]]) -> None:
+        self.through = through
+        self.pairs = frozenset(pairs)
+
+    def covers(
+        self,
+        sender: type[Model],
+        instance: Any,
+        reverse: bool,
+        pk_set: set[Any] | None,
+        using: str,
+    ) -> bool:
+        if sender is not self.through:
+            return False
+        return _through_pairs(sender, instance, reverse, pk_set, using) <= self.pairs
+
+    def covers_row(self, row: Model) -> bool:
+        if type(row)._meta.concrete_model is not self.through._meta.concrete_model:
+            return False
+        fields = [
+            field for field in self.through._meta.fields if isinstance(field, models.ForeignKey)
+        ]
+        return tuple(getattr(row, field.attname) for field in fields) in self.pairs
+
+
+_related_m2m_write: ContextVar[_PreGatedThroughWrite | None] = ContextVar(
     "rebac_related_m2m_write", default=None
 )
+
+
+def _through_pairs(
+    sender: type[Model],
+    instance: Any,
+    reverse: bool,
+    pk_set: set[Any] | None,
+    using: str,
+) -> set[tuple[Any, Any]]:
+    """The through rows ``(fk_a, fk_b)``, in field order, a signal is about."""
+    return _through_edges(sender, instance, reverse, pk_set, using)[0]
+
+
+def _through_edges(
+    sender: type[Model],
+    instance: Any,
+    reverse: bool,
+    pk_set: set[Any] | None,
+    using: str,
+) -> tuple[set[tuple[Any, Any]], set[Any]]:
+    """The through pairs of a related-manager signal and the other-side ids."""
+    fields = [field for field in sender._meta.fields if isinstance(field, models.ForeignKey)]
+    instance_model = instance._meta.concrete_model
+    assert instance_model is not None
+    # A multi-table child writes through its parent's M2M, so match by lineage.
+    own = [
+        field
+        for field in fields
+        if (target := field.remote_field.model._meta.concrete_model) is not None
+        and issubclass(instance_model, target)
+    ]
+    if not own:
+        return set(), set()
+    instance_field = fields[1 if reverse else 0] if len(own) == len(fields) else own[0]
+    other_field = next(field for field in fields if field is not instance_field)
+    other_ids = (
+        pk_set
+        if pk_set is not None
+        else set(
+            sender._base_manager.using(using)
+            .filter(**{instance_field.attname: instance.pk})
+            .values_list(other_field.attname, flat=True)
+        )
+    )
+    if instance_field is fields[0]:
+        pairs = {(instance.pk, other) for other in other_ids}
+    else:
+        pairs = {(other, instance.pk) for other in other_ids}
+    owner_meta = getattr(sender._meta.auto_created, "_meta", None)
+    if owner_meta is not None and any(
+        m2m.remote_field.through is sender and m2m.remote_field.symmetrical
+        for m2m in cast(Any, owner_meta).local_many_to_many
+    ):
+        # Django writes the mirror row of a symmetrical self-M2M in the same call.
+        pairs |= {(b, a) for a, b in pairs}
+    return pairs, set(other_ids)
 
 
 def tracked_model(model: type[Model]) -> bool:
@@ -196,8 +289,9 @@ def _wrap_related_m2m_writes() -> None:
                         **kwargs: Any,
                     ) -> Any:
                         with audit_backed_denials():
+                            gated_pairs: set[tuple[Any, Any]] = set()
                             if _operation in {"clear", "set"}:
-                                _gate_m2m(
+                                gated_pairs |= _gate_m2m(
                                     self.through,
                                     self.instance,
                                     self.reverse,
@@ -212,7 +306,7 @@ def _wrap_related_m2m_writes() -> None:
                                     else args
                                 )
                                 ids = {getattr(value, "pk", value) for value in values}
-                                _gate_m2m(
+                                gated_pairs |= _gate_m2m(
                                     self.through,
                                     self.instance,
                                     self.reverse,
@@ -235,7 +329,13 @@ def _wrap_related_m2m_writes() -> None:
                                 else None
                             )
                             scope = actor_context(carried) if carried is not None else nullcontext()
-                            token = _related_m2m_write.set(self.through)
+                            # Only the pairs gated above are exempt from the
+                            # per-row gates below; a consumer m2m_changed
+                            # handler writing other through rows during the
+                            # call is gated like any other write.
+                            token = _related_m2m_write.set(
+                                _PreGatedThroughWrite(self.through, gated_pairs)
+                            )
                             try:
                                 with scope:
                                     return _original(self, *args, **kwargs)
@@ -520,7 +620,8 @@ def _index_m2m(
     if sender not in _throughs:
         return
     if action in {"pre_add", "pre_remove", "pre_clear"}:
-        if _related_m2m_write.get() is not sender:
+        pre_gated = _related_m2m_write.get()
+        if pre_gated is None or not pre_gated.covers(sender, instance, reverse, pk_set, using):
             _gate_m2m(sender, instance, reverse, model, pk_set, using)
     if not _current_watch(sender, using):
         return
@@ -537,8 +638,13 @@ def _gate_m2m(
     model: type[Model],
     pk_set: set[Any] | None,
     using: str,
-) -> None:
-    """Gate each resource endpoint owning an affected M2M-backed edge."""
+) -> set[tuple[Any, Any]]:
+    """Gate each resource endpoint owning an affected M2M-backed edge.
+
+    Returns the through pairs the gate decided on, so the related-manager
+    wrapper can exempt exactly those rows from the per-row gates; an early
+    return yields no pairs, and the per-row gates then decide for themselves.
+    """
     from .actors import is_sudo
     from .index.maintain import current_pass, get_program
     from .mixins import RebacMixin
@@ -548,10 +654,10 @@ def _gate_m2m(
     if is_sudo() and (
         not isinstance(instance, RebacMixin) or not callable(pinned) or pinned() is None
     ):
-        return
+        return set()
     owner_model = sender._meta.auto_created
     if not isinstance(owner_model, type):
-        return
+        return set()
     owner_type = model_resource_type(owner_model)
     outer = current_pass(using)
     program = outer.load_program() if outer is not None else get_program(using)
@@ -561,31 +667,13 @@ def _gate_m2m(
         types.update(watched.resource_types)
     types = {type_ for type_ in types if (type_, "write") in program.nodes}
     if not types or pk_set == set():
-        return
+        return set()
     actor, bypass = _edge_actor(instance, relation=True)
     if bypass:
-        return
-    fields = [field for field in sender._meta.fields if isinstance(field, models.ForeignKey)]
+        return set()
     instance_model = instance._meta.concrete_model
     assert instance_model is not None
-    if all(field.remote_field.model._meta.concrete_model is instance_model for field in fields):
-        instance_field = fields[1 if reverse else 0]
-    else:
-        instance_field = next(
-            field
-            for field in fields
-            if field.remote_field.model._meta.concrete_model is instance_model
-        )
-    other_field = next(field for field in fields if field is not instance_field)
-    other_ids = (
-        pk_set
-        if pk_set is not None
-        else set(
-            sender._base_manager.using(using)
-            .filter(**{instance_field.attname: instance.pk})
-            .values_list(other_field.attname, flat=True)
-        )
-    )
+    pairs, other_ids = _through_edges(sender, instance, reverse, pk_set, using)
     owner_pks: dict[type[Model], set[Any]] = {instance_model: {instance.pk}}
     other_model = model._meta.concrete_model
     assert other_model is not None
@@ -606,6 +694,7 @@ def _gate_m2m(
                 ids.add(to_object_ref(row).resource_id)
         if ids:
             _check_edge_writes(actor, resource_type, ids)
+    return pairs
 
 
 def _affected_backing_ids(
@@ -826,8 +915,14 @@ def _gate_backed_rows(
         return
     changed_names = set(names) if names is not None else None
     materialized = list(rows)
-    if materialized and _related_m2m_write.get() is type(materialized[0]):
-        return  # Related-manager wrapper checked the whole changed pair set.
+    pre_gated = _related_m2m_write.get()
+    if pre_gated is not None and materialized and proposed is None:
+        # The related-manager wrapper checked exactly these pairs as inserts
+        # or deletes; rows a consumer handler adds during the call, and any
+        # update that would move a gated pair elsewhere, are still gated here.
+        materialized = [row for row in materialized if not pre_gated.covers_row(row)]
+        if not materialized:
+            return
     from .index.maintain import current_pass, get_program
 
     outer = current_pass(using)
@@ -874,15 +969,39 @@ def _gate_backed_rows(
                 if isinstance(value, Cast):
                     value = value.source_expressions[0]
                 if isinstance(value, models.Case):
-                    matched = [
-                        when.result.value
+                    # Only ``bulk_update``'s shape resolves: every arm is a
+                    # ``When(pk=<literal>, then=Value(...))``. Any other arm
+                    # (a non-pk condition, an expression result) could shadow
+                    # a row's value in SQL, so the whole Case is refused.
+                    literal_arms = [
+                        when
                         for when in value.cases
                         if isinstance(when, models.When)
                         and isinstance(when.result, models.Value)
                         and len(when.condition.children) == 1
-                        and when.condition.children[0] == ("pk", row.pk)
+                        and isinstance(when.condition.children[0], tuple)
+                        and when.condition.children[0][0] == "pk"
                     ]
-                    if len(matched) != 1:
+                    if len(literal_arms) != len(value.cases):
+                        raise PermissionDenied(
+                            "Bulk write cannot resolve a backed field expression; "
+                            "use checked saves or sudo."
+                        )
+                    matched = [
+                        when.result.value
+                        for when in literal_arms
+                        if when.condition.children[0] == ("pk", row.pk)
+                    ]
+                    # The rows here are the statement's own (the owner froze
+                    # them before the SQL), so every one of them is written:
+                    # a row without exactly one ``When(pk=...)`` literal, or a
+                    # ``Case`` whose default is not NULL (``bulk_update`` sets
+                    # none), cannot be resolved and is refused.
+                    default = value.default
+                    if (
+                        not (isinstance(default, models.Value) and default.value is None)
+                        or len(matched) != 1
+                    ):
                         raise PermissionDenied(
                             "Bulk write cannot resolve a backed field expression; "
                             "use checked saves or sudo."

@@ -62,6 +62,10 @@ gh run view <run-id> --log-failed               # the log of each failed step
   connections and prints the export line; run again, it reuses the container
   and prints the same line. The data lives in memory and is gone after
   `make pg-down`.
+- PostgreSQL targets run `PG_WORKERS` workers (default 4), not one per core:
+  one server serves every worker's test database and is the bottleneck, and
+  under 18 workers a cursor fetch on fresh, unanalyzed tables has run for
+  most of an hour. Override with `make test-postgres PG_WORKERS=2`.
 - Any other disposable PostgreSQL works: point `REBAC_TEST_POSTGRES_URL` at a
   database whose role may create databases. Pytest-django adds worker-specific
   test database names. `tests.settings_postgres` fails if the URL is absent;

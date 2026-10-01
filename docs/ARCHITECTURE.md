@@ -239,9 +239,13 @@ maintenance share these resolved owners.
 An edge change requires `write` on every affected resource row whose declared
 backing watches the changed column or through table, provided that resource
 type declares a `write` permission. This includes reverse FK and M2M accessors,
-tracked deletes, direct auto-created through-model writes, scalar predicate
-columns, nested field paths whose source is another model, and both mirror rows
-of a symmetrical self-M2M. The gate finds source rows through the unchanged
+`RebacTrackedMixin` deletes, queryset writes through an auto-created through
+model, scalar predicate columns, nested field paths whose source is another
+model, and both mirror rows of a symmetrical self-M2M. `RebacMixin` deletes
+are not gated; the collector's CASCADE and SET_NULL rows are gated under the
+ambient actor, not the actor pinned on the deleted row; instance-level
+through-model writes are neither gated nor maintained, so `rebac index verify`
+reports them as drift (all three: proposal 0011). The gate finds source rows through the unchanged
 prefix of each affected path, before mutation and under the carrying or ambient
 actor. Bulk owners snapshot watched columns per model, resolve changed FK
 targets and reverse sources once per watched field, and check the union of
@@ -1086,6 +1090,7 @@ System checks (in `rebac/checks.py`):
 | `rebac.E017` | Error | `REBAC_INDEX_CONDITION_LIMIT` is not a positive integer, or is a boolean. |
 | `rebac.E018` | Error | A backing-path model is neither `RebacMixin`, `RebacTrackedMixin`, nor explicitly tracked. Auto-created throughs with an owned/tracked endpoint and configured User/Group models are tracked automatically. Invalid `REBAC_TRACKED_MODELS` labels are errors too. |
 | `rebac.E019` | Error | A permission's static read plan exceeds `REBAC_INDEX_LOOKUP_LIMIT`, or the limit is not a positive integer. The diagnostic prints the plan. |
+| `rebac.E021` | Error | The schema declares a caveat but `cel-python` (the `caveats` extra) is not installed, so caveat bodies cannot be validated or evaluated. |
 | `rebac.W001` | Warning | `rebac.backends.RebacBackend` not in `AUTHENTICATION_BACKENDS`. |
 | `rebac.W002` | Warning | A model with `Meta.rebac_resource_type` is missing `RebacMixin`. |
 | `rebac.W003` | Warning | An RBAC-bound relation exists where bare `select_related("rel")` / `prefetch_related("rel")` can be unsafe outside the REBAC helpers or Strawberry-Django optimizer. |
@@ -1813,7 +1818,7 @@ The headline feature. By inclusion, every model operation is gated against the e
 ### What gets installed
 
 1. `objects = RebacManager.from_queryset(RebacQuerySet)()` replaces the default manager.
-2. `_default_manager` points at it; the metaclass injects `base_manager_name` naming an **owning, unscoped** manager, even when consumers declare their own `Meta`. It never applies actor scope or gates its update/delete/bulk infrastructure writes, but maintains index writes from reverse-FK `add(bulk=True)` and collector `SET_NULL`.
+2. `_default_manager` points at it; the metaclass injects `base_manager_name` naming an **owning, unscoped** manager, even when consumers declare their own `Meta`. It never applies actor scope to reads. Its writes maintain the index, and those that change a backed edge (reverse-FK `add(bulk=True)`, `update` of a watched column or FK) run the backed-edge gate of invariant 5d; collector `SET_NULL` rows are gated under the ambient actor only (proposal 0011).
 3. `save_base` owner — create/write and field gates before consumer `pre_save` receivers.
 4. `delete` owner — root gate and a deletion ContextVar carrying the root actor/bypass for collector children; explicit-sender `pre_delete` gates those children only. Owners batch identity tuple cleanup.
 5. Queryset materialisation hooks (`_fetch_all()` and iterators) stamp the resolved actor onto every loaded instance. `from_db()` snapshots original field values for write checks.
@@ -1985,9 +1990,13 @@ resource type that owns an affected backed edge, including reverse-manager and
 symmetrical self-M2M calls. The related manager preflights the changed pairs once
 outside Django's own atomic block so denial audit survives that rollback.
 Its `set()` wrapper accepts Django's positional and `objs=` keyword forms.
-The `m2m_changed` receiver maintains the index, while direct writes through
-the auto-created through model are tracked and gated. Through captures use the
-changed FK pairs and their source rows rather than the whole through table.
+The `m2m_changed` receiver maintains the index, while queryset writes through
+the auto-created through model (`bulk_create`, `update`, queryset `delete`)
+are tracked and gated; the related-manager wrapper exempts only the exact
+pairs it already gated, so rows a consumer `m2m_changed` handler writes during
+the call are gated on their own. Instance-level through writes are neither
+(proposal 0011). Through captures use the changed FK pairs and their source
+rows rather than the whole through table.
 The carrying actor wins over ambient context; instance sudo does not propagate
 to the related manager. Without an actor, strict mode raises `MissingActorError`
 only if an affected resource type declares `write`. An unwatched through table
@@ -2001,7 +2010,19 @@ backing columns because the insert candidate cannot identify the old edge of a c
 row; checked saves or explicit sudo are required.
 `RebacMixin._base_manager` remains an unscoped infrastructure write path and
 maintains the index. A reverse FK `add(bulk=True)` passes a related model value
-through that manager and is gated on the declaring resource before SQL.
+through that manager and is gated on the declaring resource before SQL, under
+the ambient actor: the actor pinned on the related manager's instance, the
+moved row's own `write`, and a block `sudo` over a pinned actor are not yet
+honoured there (proposal 0011).
+
+A `bulk_update` of a watched column is gated per statement. The owner freezes
+exactly the rows a statement writes, before its SQL, and resolves each row's
+value from the `Case`: every arm must be `When(pk=<literal>, then=Value(...))`
+with no default, the shape Django emits, so an arm with another condition, an
+expression result or a default is refused rather than guessed. An authorized
+update of more rows than `batch_size` is therefore not refused for rows
+written by an earlier batch, and a hand-written `update(field=Case(...))`
+cannot skip a row.
 
 `QuerySet.explain()` applies the same actor scope as the query it describes.
 `RebacManager.raw()` and `RebacQuerySet.raw()` cannot attach a REBAC scope to arbitrary SQL and therefore

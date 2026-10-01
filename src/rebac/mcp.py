@@ -223,8 +223,11 @@ def _create_overlay(
     ``create_relations`` maps each relation name the not-yet-persisted row would
     carry to the call argument holding the subject it would point at, as a
     canonical ref string (e.g. ``"blog/vault:v1"``). A relation whose argument is
-    absent, ``None``, or not a parseable ref contributes no candidate — so that
-    path resolves empty and the create check fails closed for it.
+    absent or ``None`` contributes no candidate, so that path resolves empty and
+    the create check fails closed for it. An argument that is present but not a
+    parseable ref the relation allows (canonical for model-backed subjects, the
+    declared target for const-backed ones) refuses the call: a malformed
+    candidate is never silently treated as an absent edge.
     """
     overlay: dict[str, Sequence[SubjectRef]] = {}
     for relation, arg_name in create_relations.items():

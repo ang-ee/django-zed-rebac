@@ -16,6 +16,7 @@ from rebac import (
     backend,
     check_new,
     sudo,
+    to_subject_ref,
 )
 from rebac.backends import reset_backend
 from rebac.drf import RebacPermission
@@ -283,6 +284,10 @@ def test_noncanonical_create_overlay_cannot_escape_concrete_ban(spelling):
 def test_create_overlay_exclusion_keeps_canonical_parent(spelling):
     from tests.testapp.models import Post
 
+    # A real user: ``auth/user:alice`` is not a canonical id, and a
+    # non-canonical author would refuse every check regardless of the parent.
+    author = to_subject_ref(_user("alice"))
+    author_wire = f"{author.subject_type}:{author.subject_id}"
     install_schema(
         backend(),
         parse_zed("""
@@ -300,18 +305,29 @@ def test_create_overlay_exclusion_keeps_canonical_parent(spelling):
     )
     with sudo(reason="fixture"):
         parent = Post.objects.create(title="locked parent")
+        open_parent = Post.objects.create(title="open parent")
     _grant(ObjectRef("blog/post", str(parent.pk)), "locked", SubjectRef.of("auth/user", "*"))
     wire = (
         f"blog/post:{spelling.format(parent.pk, pk=parent.pk)}"
         if spelling in {"{}", "0{}"}
         else spelling.format(parent.pk, pk=parent.pk)
     )
+    # Positive control: the same author under an unlocked, canonical parent.
+    assert check_new(
+        subject=author,
+        action="create",
+        resource_type="blog/post",
+        relationships={
+            "author": [author],
+            "parent": [SubjectRef.of("blog/post", str(open_parent.pk))],
+        },
+    ).allowed
     if ":" in wire:
         result = check_new(
-            subject=ALICE,
+            subject=author,
             action="create",
             resource_type="blog/post",
-            relationships={"author": [ALICE], "parent": [SubjectRef.parse(wire)]},
+            relationships={"author": [author], "parent": [SubjectRef.parse(wire)]},
         )
         assert result.result is PermissionResult.NO_PERMISSION
 
@@ -326,14 +342,16 @@ def test_create_overlay_exclusion_keeps_canonical_parent(spelling):
         calls.append(parent_ref)
         return "ok"
 
+    assert create_post(author_wire, f"blog/post:{open_parent.pk}", ctx=_ctx(author_wire)) == "ok"
+    calls.clear()
     with pytest.raises(PermissionDenied):
-        create_post("auth/user:alice", wire, ctx=_ctx("auth/user:alice"))
+        create_post(author_wire, wire, ctx=_ctx(author_wire))
     assert calls == []
     assert not check_new(
-        subject=ALICE,
+        subject=author,
         action="create",
         resource_type="blog/post",
-        relationships={"author": [ALICE], "unknown": [ALICE]},
+        relationships={"author": [author], "unknown": [author]},
     ).allowed
 
 

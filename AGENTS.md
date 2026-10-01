@@ -222,14 +222,21 @@ evaluation does not exclude them.
 
 Changing a column or through row watched by a field-backed relation requires
 `write` on every affected resource row of the relation's declaring type when
-that type declares a `write` permission. Reverse FK and M2M accessors, direct
-auto-created through writes, tracked backing sources and deletes, and
-symmetrical M2M mirror edges follow the same rule. Deny before mutation and
-audit the declaring resource after the rejected owner's transaction unwinds.
+that type declares a `write` permission. Reverse FK and M2M accessors, queryset
+writes through an auto-created through model, tracked backing sources and
+`RebacTrackedMixin` deletes, and symmetrical M2M mirror edges follow the same
+rule. Deny before mutation and audit the declaring resource after the rejected
+owner's transaction unwinds.
 Any declaring type without a permission literally named `write` is maintained
 without an actor gate, including resource types that use `edit` or `update`;
-consumers protect those backing columns with Django permissions. This boundary
-is tracked for revision in proposal 0011.
+consumers protect those backing columns with Django permissions. Pinned as
+expected failures for proposal 0011: `RebacMixin` deletes, which lift another
+type's backed edges with no `write` check; the collector's CASCADE and
+SET_NULL rows, which are gated under the ambient actor rather than the actor
+pinned on the deleted row; the moved row's own `write` and the pinned actor on
+reverse-FK `add(bulk=True)`; and instance-level through-model writes
+(`create`, `save`, `get_or_create`, `delete`), which are neither gated nor
+maintained.
 
 ### 6. Determinism is load-bearing
 

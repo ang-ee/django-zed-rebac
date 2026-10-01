@@ -358,13 +358,13 @@ class IndexMaintenance:
             ("pass_id", "kind", "term_id", "node", "phase"),
             using=self.using,
         )
-        frozen = IndexTerm.objects.using(self.using).filter(
-            type=type_, pk__in=Subquery(self.work().filter(kind="model").values("term_id"))
-        )
-        ids = frozen.annotate(column_pk=codec.to_column("object_id")).values("column_pk")
+        # The frozen set is this statement's rows, read before its SQL runs:
+        # the gates decide about exactly the rows the statement writes, and a
+        # later statement of the same pass does not inherit an earlier one's.
+        statement_pks = list(queryset.order_by().values_list("pk", flat=True))
         return cast(
             models.QuerySet[Any],
-            queryset.model._base_manager.using(self.using).filter(pk__in=Subquery(ids)),
+            queryset.model._base_manager.using(self.using).filter(pk__in=statement_pks),
         )
 
     def changed(

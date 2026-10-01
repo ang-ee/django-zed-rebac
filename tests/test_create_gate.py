@@ -76,7 +76,11 @@ def be(db):
 
 
 def _user(id_: str) -> SubjectRef:
-    return SubjectRef.of("auth/user", {"allowed": "1", "denied": "2", "other": "3"}.get(id_, id_))
+    # Symbolic ids sit far above any primary key a test creates, so "other"
+    # never coincides with a real user from an earlier transactional test.
+    return SubjectRef.of(
+        "auth/user", {"allowed": "1", "denied": "2", "other": "300003"}.get(id_, id_)
+    )
 
 
 def _new_post() -> ObjectRef:

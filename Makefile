@@ -8,6 +8,10 @@
 
 PYTEST := uv run --no-sync pytest -q
 PG := --ds=tests.settings_postgres
+# One PostgreSQL server serves every worker's test database. Beyond a few
+# workers it is the bottleneck, and fresh, unanalyzed tables under that load
+# have produced cursor fetches that ran for the better part of an hour.
+PG_WORKERS ?= 4
 # Extra pytest arguments for any test target: make test-pg ARGS=tests/test_index_read.py
 ARGS ?=
 
@@ -64,7 +68,7 @@ test:
 # The timeout counts each worker's test-database creation, several seconds on
 # a freshly started PostgreSQL, so it is wider than tier 1's.
 test-pg: require-postgres
-	$(PYTEST) $(PG) -n auto --dist worksteal -m '$(PG_DELTA_MARKS)' --timeout=60 --durations=10 $(ARGS)
+	$(PYTEST) $(PG) -n $(PG_WORKERS) --dist worksteal -m '$(PG_DELTA_MARKS)' --timeout=60 --durations=10 $(ARGS)
 
 # Tier 3 parts.
 test-slow:
@@ -72,7 +76,7 @@ test-slow:
 
 # The whole suite on PostgreSQL: the default selection plus slow.
 test-postgres: require-postgres
-	$(PYTEST) $(PG) -n auto --dist worksteal -m '$(FULL_MARKS)' $(LONG) --durations=25 $(ARGS)
+	$(PYTEST) $(PG) -n $(PG_WORKERS) --dist worksteal -m '$(FULL_MARKS)' $(LONG) --durations=25 $(ARGS)
 
 # Time, statement and plan budgets: alone, one test at a time.
 test-scale:
@@ -113,7 +117,7 @@ test-index:
 	$(PYTEST) -n auto --dist worksteal --durations=25 $(INDEX_TESTS) $(ARGS)
 
 test-index-postgres: require-postgres
-	$(PYTEST) $(PG) -n auto --dist worksteal --durations=25 $(INDEX_TESTS) $(ARGS)
+	$(PYTEST) $(PG) -n $(PG_WORKERS) --dist worksteal --durations=25 $(INDEX_TESTS) $(ARGS)
 
 # Data lives in memory (tmpfs) and is gone once the container stops. Status goes
 # to stderr and only the export line to stdout, so `eval "$(make -s pg-up)"`

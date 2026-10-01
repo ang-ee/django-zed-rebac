@@ -12,6 +12,7 @@ chaining via `_clone()` and propagates into instances via `from_db()`.
 
 from __future__ import annotations
 
+import re
 from collections.abc import AsyncIterator, Collection, Iterable
 from typing import Any, Self, TypeVar, cast
 
@@ -19,7 +20,7 @@ from asgiref.sync import sync_to_async
 from django.db import models
 from django.db.models.expressions import Col, RawSQL
 from django.db.models.sql import Query
-from django.db.models.sql.where import NothingNode, WhereNode
+from django.db.models.sql.where import ExtraWhere, NothingNode, WhereNode
 
 from ._id import resource_id_attr
 from .actors import current_actor as _current_actor
@@ -123,9 +124,45 @@ def _column_on_model_lineage(column: Col, model: type[models.Model]) -> bool:
 
 
 def _has_opaque_write_expression(expression: Any) -> bool:
-    """Raw SQL can read columns invisible to ORM expression inspection."""
-    if isinstance(expression, RawSQL):
+    """Raw SQL can read columns invisible to ORM expression inspection.
+
+    ``RawSQL``, a ``Func`` with a caller-supplied template, and a query that
+    carries ``extra()`` SQL all splice literal SQL into the statement, so the
+    columns they read cannot be enumerated by :func:`_expression_columns`.
+    """
+    if isinstance(expression, (RawSQL, ExtraWhere)):
         return True
+    if isinstance(expression, Query):
+        if expression.extra or expression.extra_tables or expression.extra_order_by:
+            return True
+        return any(
+            _has_opaque_write_expression(part)
+            for part in (
+                expression.where,
+                *expression.annotations.values(),
+                *expression.order_by,
+                *expression.select,
+                *expression.combined_queries,
+            )
+        )
+    # Func, Case and Subquery all accept a caller-supplied template or joiner
+    # through ``**extra``; a function name that is not an identifier is SQL too.
+    extra = getattr(expression, "extra", None)
+    if isinstance(extra, dict) and {"template", "arg_joiner"} & extra.keys():
+        return True
+    for attribute in ("template", "arg_joiner"):
+        # Subquery and friends store a caller-supplied template on the instance.
+        own = getattr(expression, "__dict__", {}).get(attribute)
+        if own is not None and own != getattr(type(expression), attribute, None):
+            return True
+    if isinstance(expression, models.Func):
+        function = (
+            extra.get("function") if isinstance(extra, dict) and "function" in extra else None
+        )
+        if function is None:
+            function = getattr(expression, "function", None)
+        if function is not None and not re.fullmatch(r"[A-Za-z_][A-Za-z0-9_.]*", str(function)):
+            return True
     sources = getattr(expression, "get_source_expressions", None)
     return callable(sources) and any(
         _has_opaque_write_expression(source) for source in cast(Iterable[Any], sources())

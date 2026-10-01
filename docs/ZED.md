@@ -699,7 +699,9 @@ pins the parameter to `None`; stored context still takes precedence.
 **`LocalBackend` caveat support.** Backed by [`cel-python`](https://pypi.org/project/cel-python/). Most CEL types work out of the box (`int`, `string`, `bool`, `list`, `map`, `timestamp`, `duration`). The `ipaddress` type is **not** in `cel-python`'s built-ins — `LocalBackend` raises `CaveatUnsupportedError`. Rewrite the caveat to take strings and do CIDR matching server-side, or move to the future `SpiceDBBackend` once it lands.
 Schema checks parse CEL with cel-python and validate only free identifiers
 against declared parameters and CEL built-ins. Macro variables in `exists`,
-`all`, `map`, `filter`, and `reduce` are local to their macro expression.
+`all`, `map`, and `filter` are local to their macro expression; `reduce` is
+not a CEL macro and is rejected. Leading-dot identifiers (`.name`) are
+rejected, and only declared parameters reach evaluation.
 Evaluation and parameter-coercion errors redact supplied values.
 
 ### MCP tools as resources

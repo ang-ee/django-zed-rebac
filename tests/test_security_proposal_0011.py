@@ -262,3 +262,44 @@ def test_actorless_tracked_create_must_not_grant_read_on_edit_only_resource():
     with pytest.raises(MissingActorError), transaction.atomic():
         BackingEntry.objects.create(round=round_, responder=user)
     assert not backend().has_access(subject=to_subject_ref(user), action="read", resource=resource)
+
+
+THROUGH_SCHEMA = """
+definition auth/user {}
+definition blog/post {
+    relation owner: auth/user
+    permission read = owner
+    permission write = owner
+}
+definition blog/folder {
+    relation owner: auth/user
+    relation items: blog/post // rebac:field=collected_posts
+    permission read = owner + items->read
+    permission write = owner
+}
+"""
+
+
+@pytest.mark.xfail(
+    strict=True,
+    reason="proposal 0011: instance-level through-model writes are neither gated nor maintained",
+)
+@pytest.mark.parametrize("method", ["create", "save", "get_or_create"])
+def test_instance_level_through_write_must_check_folder_write(method):
+    install_schema(backend(), parse_zed(THROUGH_SCHEMA))
+    with sudo(reason="fixture"):
+        post = Post.objects.create(title="mine")
+        victim = Folder.objects.create(name="victim")
+    grant("blog/post", post.pk, "owner", A)
+    grant("blog/folder", victim.pk, "owner", B)
+    through = Post.collections.through
+    with actor_context(A), pytest.raises(PermissionDenied):
+        if method == "create":
+            through.objects.create(post=post, folder=victim)
+        elif method == "save":
+            through(post=post, folder=victim).save()
+        else:
+            through.objects.get_or_create(post=post, folder=victim)
+    assert not backend().has_access(
+        subject=A, action="read", resource=ObjectRef("blog/folder", str(victim.pk))
+    )

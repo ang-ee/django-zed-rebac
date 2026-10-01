@@ -208,6 +208,16 @@ Measured on the branch (18-core laptop, PostgreSQL 16 in Docker):
 | `make test-random` | 2,909 passed, 4 skipped, 63 expected failures | 73 s |
 | `make test-schema-vendors` | not run: `mysqlclient` needs the MySQL client libraries | — |
 
+Those PostgreSQL figures are from 18 workers against one container. After
+the defect fixes, the same `make test-postgres` stalled twice for over an
+hour in `test_field_owner_sql_cost_is_independent_of_visible_row_count[2000]`:
+a cursor fetch inside index maintenance stayed active for 47 minutes. The
+test alone takes 15 to 37 seconds on PostgreSQL, and its scoped `COUNT`
+already costs 6 to 10 seconds there, so the stall is a bad plan on fresh,
+unanalyzed tables under load rather than a deadlock. The PostgreSQL targets
+therefore run `PG_WORKERS` (4) workers; the heavy scope query itself is a
+performance item for a later proposal.
+
 ## Not in scope
 
 - Fixing the defects the new tests expose.

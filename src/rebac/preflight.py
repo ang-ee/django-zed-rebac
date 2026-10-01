@@ -207,13 +207,24 @@ def check_new(
         declared = find_relation(definition, name)
         if declared is None:
             return CheckResult.no(reason=f"unknown proposed relation: {name}")
-        if declared is not None and isinstance(declared.backing, ConstBinding):
-            continue  # Schema-owned constants keep their declared wire spelling.
+        # Schema-owned constants keep their declared wire spelling, so only the
+        # canonical-identity check is skipped for them; a caller-supplied
+        # candidate must still be a subject the relation allows, and it can
+        # only ever be the constant's own target.
+        backing = declared.backing
+        if isinstance(backing, ConstBinding) and not backing.filters:
+            # An unfiltered constant is wholly schema-owned; a caller-supplied
+            # tuple for it is a programming error that the merge below raises.
+            continue
         for candidate in candidates or ():
             if not candidate.subject_id or not subject_allowed_by_relation(
                 declared, candidate, caveat_name=""
             ):
                 return CheckResult.no(reason=f"invalid candidate for relation: {name}")
+            if isinstance(backing, ConstBinding):
+                if candidate.subject_id != backing.target_id:
+                    return CheckResult.no(reason=f"invalid candidate for relation: {name}")
+                continue
             if candidate.subject_id == "*" and not candidate.optional_relation:
                 continue
             mapped = model_for_subject_type(candidate.subject_type)

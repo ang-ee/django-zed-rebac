@@ -33,6 +33,28 @@ pre-1.0; breaking changes within a minor version are explicitly called out.
   `write`; other types, including resources with `edit` or `update`, rely on
   the consumer's Django permissions pending proposal 0011. Reverse FK
   `add(bulk=True)` and direct auto-created through writes now receive this gate.
+- Base-manager `update()` and `bulk_update()` of a watched column, reverse FK
+  `add(bulk=True)` and collector `SET_NULL` on a backed FK raise
+  `MissingActorError` in strict mode without an actor.
+- An unwatched M2M on a `RebacMixin` owner still requires `write` on the owner
+  row; before the first `rebac sync`, such writes need sudo.
+- `Relationship.objects.bulk_create(update_conflicts=True)` raises `ValueError`
+  unless the conflict target is the tuple's identity and only metadata columns
+  update.
+- Create-relation overlays with a malformed, non-canonical, disallowed or
+  empty subject, or an undeclared relation name, refuse the preflight instead
+  of resolving as an absent edge.
+- A schema that declares a caveat needs the `caveats` extra (`cel-python`);
+  without it `manage.py check` reports `rebac.E021`.
+- Write expressions that splice literal SQL (`RawSQL`; a `Func`, `Case` or
+  `Subquery` with a caller-supplied `template` or `arg_joiner`; a `Func` whose
+  `function` is not an identifier; a subquery using `extra()` in its select,
+  where, tables or ordering) are refused on models with field read gates.
+- The D2 autocommit warning is emitted for tracked `auth.User` and `auth.Group`
+  writes again, including `createsuperuser`.
+- Stored overrides whose names no longer resolve against the baseline are
+  ignored with `rebac.W010`; narrowing overrides are therefore dropped whole
+  until proposal 0012 lands.
 - Direct `Relationship.objects.bulk_create()`, including conflict updates,
   participates in tuple ownership and index maintenance.
 
@@ -102,7 +124,18 @@ pre-1.0; breaking changes within a minor version are explicitly called out.
   backed resources; authorized literal `bulk_update` Case values proceed.
 - Backed-edge denial audit rows survive owner rollback and name the declaring
   resource. M2M related managers preflight outside Django's internal atomic.
-- Unwatched M2M writes before the first sync do not load a program.
+- Unwatched M2M writes under sudo before the first sync do not load a program.
+- The related-manager wrapper exempts only the pairs it gated from the
+  per-row gates; through rows written by consumer `m2m_changed` handlers during
+  the call are gated.
+- Caller-supplied subjects for a filtered const-backed relation must be the
+  constant's own target; an unfiltered constant still refuses any supplied
+  tuple.
+- Each `bulk_update` statement gates exactly the rows it writes, so a
+  multi-batch authorized update passes, while a `Case` with any arm other than
+  `When(pk=<literal>)`, an expression result or a default is refused.
+- A related-manager call from a multi-table child, and a symmetrical self-M2M,
+  gate their through pairs once.
 - Restored evaluated querysets redo field redaction and prefetch after unpickling.
 - CEL schema validation uses cel-python's syntax tree, accepting macro variables,
   hexadecimal and exponent literals, type constants and raw strings. Coercion

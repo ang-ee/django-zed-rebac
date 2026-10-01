@@ -23,7 +23,12 @@ failure in `tests/test_security_proposal_0011.py` naming this proposal.
    even when an actor is pinned, and the moved row's own `write` is never
    checked: a folder viewer can re-parent someone else's post, while
    `bulk=False` denies it.
-3. **The `write` boundary.** The exemption for "subject-only" types is
+3. **Instance-level through-model writes.** `through.objects.create()`,
+   `through(...).save()`, `get_or_create()` and instance `delete()` on an
+   auto-created through model are neither gated nor maintained: the actor
+   gains the edge after the next rebuild or the next legitimate write to the
+   same folder. Queryset writes through the same model are gated.
+4. **The `write` boundary.** The exemption for "subject-only" types is
    implemented as "any type without a permission literally named `write`". A
    resource type that names its write permission `edit`, or declares only
    `read`, is maintained without a gate and without an actor: in strict mode
