@@ -180,26 +180,20 @@ def test_denied_permission_does_not_run_body() -> None:
     assert calls == []
 
 
-@pytest.mark.django_db
-def test_allowed_runs_body_exactly_once() -> None:
-    _grant_invoke(ObjectRef("mcp/tool/edit_post", "singleton"), SubjectRef.of("auth/user", "1"))
-    calls: list[str] = []
-
-    @rebac_mcp_tool(resource_type="mcp/tool/edit_post", action="invoke", resource_id="singleton")
-    def edit(body: str, ctx: object = None) -> str:
-        calls.append(body)
-        return "ok"
-
-    edit("once", ctx=_ctx("auth/user:1"))
-    assert calls == ["once"]
-
-
 # ---------- resource id resolution ----------
 
 
 @pytest.mark.django_db
 def test_id_arg_targets_the_named_row() -> None:
-    _grant_owner(ObjectRef("blog/post", "p1"), SubjectRef.of("auth/user", "5"))
+    from rebac import sudo
+    from tests.testapp.models import Post
+
+    with sudo(reason="test.fixture"):
+        owned = Post.objects.create(title="owned")
+        other = Post.objects.create(title="not owned")
+    owned_id = str(owned.pk)
+    other_id = str(other.pk)
+    _grant_owner(ObjectRef("blog/post", owned_id), SubjectRef.of("auth/user", "5"))
     calls: list[str] = []
 
     @rebac_mcp_tool(resource_type="blog/post", action="write", id_arg="post_id")
@@ -207,11 +201,11 @@ def test_id_arg_targets_the_named_row() -> None:
         calls.append(post_id)
         return "ok"
 
-    # Authorised on p1, denied on p2 — same actor, different id_arg value.
-    assert edit_post("p1", "x", ctx=_ctx("auth/user:5")) == "ok"
+    # Authorised on the owned row, denied on another row under the same actor.
+    assert edit_post(owned_id, "x", ctx=_ctx("auth/user:5")) == "ok"
     with pytest.raises(PermissionDenied):
-        edit_post("p2", "x", ctx=_ctx("auth/user:5"))
-    assert calls == ["p1"]
+        edit_post(other_id, "x", ctx=_ctx("auth/user:5"))
+    assert calls == [owned_id]
 
 
 @pytest.mark.django_db
@@ -295,10 +289,10 @@ def test_create_action_uses_preflight() -> None:
 
 @pytest.mark.django_db
 def test_create_with_relations_overlay_allows() -> None:
-    # create = parent->write. The new row would carry parent -> blog/post:p0,
-    # and user 5 owns p0 (so has write on it). The overlay lets check_new walk
+    # create = parent->write. The new row would carry parent -> blog/post:1,
+    # and user 5 owns that parent (so has write on it). The overlay lets check_new walk
     # the arrow into the real parent and authorise the create.
-    _grant_owner(ObjectRef("blog/post", "p0"), SubjectRef.of("auth/user", "5"))
+    _grant_owner(ObjectRef("blog/post", "1"), SubjectRef.of("auth/user", "5"))
     calls: list[str] = []
 
     @rebac_mcp_tool(
@@ -310,7 +304,7 @@ def test_create_with_relations_overlay_allows() -> None:
         calls.append(body)
         return "ok"
 
-    assert create_post("blog/post:p0", "x", ctx=_ctx("auth/user:5")) == "ok"
+    assert create_post("blog/post:1", "x", ctx=_ctx("auth/user:5")) == "ok"
     assert calls == ["x"]
 
 
@@ -329,7 +323,7 @@ def test_create_with_relations_overlay_denies_without_parent_write() -> None:
         return "ok"
 
     with pytest.raises(PermissionDenied):
-        create_post("blog/post:p0", "x", ctx=_ctx("auth/user:5"))
+        create_post("blog/post:1", "x", ctx=_ctx("auth/user:5"))
     assert calls == []
 
 

@@ -1,8 +1,8 @@
 name: Publish to PyPI
 
-# Publishes a version tag once CI has passed on it. The tests already ran in
-# CI on the same commit, so this workflow only verifies the version, builds
-# and uploads. A manual run publishes a given tag.
+# Publishes a version tag once tier 1 has passed on it in CI. The tests already
+# ran in CI on the same commit, so this workflow only verifies the version,
+# builds and uploads. A manual run publishes a given tag.
 
 on:
   workflow_run:
@@ -22,13 +22,40 @@ concurrency:
   cancel-in-progress: false
 
 jobs:
+  # A tag publishes on tier 1 alone. The CI run also holds the postgres-delta
+  # job, and workflow_run.conclusion covers the whole run, so this job reads
+  # the result of the tier 1 job by its name instead.
+  tier1:
+    name: Tier 1 passed on the tag
+    if: >-
+      github.event_name == 'workflow_run' &&
+      github.event.workflow_run.event == 'push' &&
+      startsWith(github.event.workflow_run.head_branch, 'v')
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      actions: read
+    outputs:
+      conclusion: ${{ steps.job.outputs.conclusion }}
+    steps:
+      - name: Read the result of test (3.14, 6.0)
+        id: job
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RUN_ID: ${{ github.event.workflow_run.id }}
+        run: |
+          conclusion="$(gh api "repos/$GITHUB_REPOSITORY/actions/runs/$RUN_ID/jobs" \
+            --jq '.jobs[] | select(.name == "test (3.14, 6.0)") | .conclusion')"
+          echo "test (3.14, 6.0): ${conclusion:-not found}"
+          echo "conclusion=$conclusion" >> "$GITHUB_OUTPUT"
+
   publish:
     name: Build and publish
+    needs: tier1
     if: >-
-      github.event_name == 'workflow_dispatch' ||
-      (github.event.workflow_run.conclusion == 'success' &&
-       github.event.workflow_run.event == 'push' &&
-       startsWith(github.event.workflow_run.head_branch, 'v'))
+      !cancelled() &&
+      (github.event_name == 'workflow_dispatch' ||
+       needs.tier1.outputs.conclusion == 'success')
     runs-on: ubuntu-latest
     timeout-minutes: 15
     env:

@@ -17,10 +17,10 @@ returns the one selected by the setting. The wire shape (``RelationshipTuple``
 
 from __future__ import annotations
 
-from collections.abc import Iterable, Mapping
+from collections.abc import Callable, Collection, Iterable, Mapping
 from typing import Any, cast
 
-from django.db import models
+from django.db import models, router
 from django.db.models import F, Q
 
 from ..conf import app_settings
@@ -57,8 +57,94 @@ _REGISTRY_WIRE_FIELD_MAP = {
 }
 
 
+# A direct ``bulk_create`` of at least this many tuples rebuilds the index in
+# full rather than deriving incrementally; see ARCHITECTURE § Relationship writes.
+BULK_REBUILD_ROWS = 500
+
+
+def _tuple_of(row: Relationship | RelationshipRegistry) -> RelationshipTuple:
+    return RelationshipTuple(
+        resource=ObjectRef(row.resource_type, row.resource_id),
+        relation=row.relation,
+        subject=SubjectRef.of(row.subject_type, row.subject_id, row.optional_subject_relation),
+        caveat_name=row.caveat_name,
+        caveat_context=row.caveat_context or {},
+        expires_at=row.expires_at,
+    )
+
+
+def projected_tuples(rows: models.QuerySet[Any]) -> Iterable[RelationshipTuple]:
+    """Stream the wire identity from either storage shape for old-state capture."""
+    for row in rows.iterator(chunk_size=1000):
+        yield RelationshipTuple(
+            resource=ObjectRef(row["resource_type"], row["resource_id"]),
+            relation=row["relation"],
+            subject=SubjectRef.of(row["subject_type"], row["subject_id"], row["subject_relation"]),
+        )
+
+
+def _owned_instance_save(
+    row: Relationship | RelationshipRegistry, save: Callable[[], None], using: str | None
+) -> None:
+    from ..backends.local import mark_relationships_changed
+    from ..index.maintain import tuple_owner
+
+    using = using or router.db_for_write(type(row), instance=row)
+    with tuple_owner(using) as maintenance:
+        if maintenance is not None and not row._state.adding and row.pk is not None:
+            old = type(row)._base_manager.using(using).filter(pk=row.pk).first()
+            if old is not None:
+                maintenance.capture_old(tuples=[_tuple_of(old)])
+        save()
+        if maintenance is not None:
+            maintenance.changed(tuples=[_tuple_of(row)])
+    mark_relationships_changed()
+
+
+def _owned_instance_delete(
+    row: Relationship | RelationshipRegistry,
+    delete: Callable[[], tuple[int, dict[str, int]]],
+    using: str | None,
+) -> tuple[int, dict[str, int]]:
+    from ..backends.local import mark_relationships_changed
+    from ..index.maintain import tuple_owner
+
+    using = using or router.db_for_write(type(row), instance=row)
+    with tuple_owner(using) as maintenance:
+        if maintenance is not None:
+            maintenance.capture_old(tuples=[_tuple_of(row)])
+        result = delete()
+        if maintenance is not None:
+            maintenance.changed()
+    if result[0]:
+        mark_relationships_changed()
+    return result
+
+
 class RelationshipQuerySet(models.QuerySet["Relationship"]):
     """Mode-agnostic queryset helpers for denormalized relationship rows."""
+
+    def delete(self) -> tuple[int, dict[str, int]]:
+        return _owned_tuple_delete(self)
+
+    def bulk_create(
+        self,
+        objs: Iterable[Relationship],
+        batch_size: int | None = None,
+        ignore_conflicts: bool = False,
+        update_conflicts: bool = False,
+        update_fields: Collection[str] | None = None,
+        unique_fields: Collection[str] | None = None,
+    ) -> list[Relationship]:
+        return _owned_tuple_bulk_create(
+            self, objs, batch_size, ignore_conflicts, update_conflicts, update_fields, unique_fields
+        )
+
+    def update(self, **kwargs: Any) -> int:
+        raise NotImplementedError(
+            "Relationship queryset update() is unsupported; use delete_relationships() "
+            "and write_relationships() to change tuples."
+        )
 
     def index_projection(self) -> models.QuerySet[Any]:
         return cast(
@@ -127,6 +213,16 @@ class Relationship(models.Model):
     written_at_xid = models.BigIntegerField(default=0, db_index=True)
 
     objects = RelationshipManager()
+
+    def save(self, *args: Any, **kwargs: Any) -> None:
+        _owned_instance_save(
+            self, lambda: super(Relationship, self).save(*args, **kwargs), kwargs.get("using")
+        )
+
+    def delete(self, *args: Any, **kwargs: Any) -> tuple[int, dict[str, int]]:
+        return _owned_instance_delete(
+            self, lambda: super(Relationship, self).delete(*args, **kwargs), kwargs.get("using")
+        )
 
     class Meta:
         app_label = "rebac"
@@ -297,6 +393,28 @@ class RelationshipRegistryQuerySet(models.QuerySet["RelationshipRegistry"]):
     returns this class so the rewrite is in scope for the whole chain.
     """
 
+    def delete(self) -> tuple[int, dict[str, int]]:
+        return _owned_tuple_delete(self)
+
+    def bulk_create(
+        self,
+        objs: Iterable[RelationshipRegistry],
+        batch_size: int | None = None,
+        ignore_conflicts: bool = False,
+        update_conflicts: bool = False,
+        update_fields: Collection[str] | None = None,
+        unique_fields: Collection[str] | None = None,
+    ) -> list[RelationshipRegistry]:
+        return _owned_tuple_bulk_create(
+            self, objs, batch_size, ignore_conflicts, update_conflicts, update_fields, unique_fields
+        )
+
+    def update(self, **kwargs: Any) -> int:
+        raise NotImplementedError(
+            "Relationship queryset update() is unsupported; use delete_relationships() "
+            "and write_relationships() to change tuples."
+        )
+
     def index_projection(self) -> models.QuerySet[Any]:
         # Every F expression uses a real FK path. The internal projection is a
         # plain queryset: its wire aliases are now real annotations, and later
@@ -414,6 +532,110 @@ class RelationshipRegistryQuerySet(models.QuerySet["RelationshipRegistry"]):
         ]
 
 
+def _owned_tuple_bulk_create[T: Relationship | RelationshipRegistry](
+    rows: models.QuerySet[T],
+    objs: Iterable[T],
+    batch_size: int | None,
+    ignore_conflicts: bool,
+    update_conflicts: bool,
+    update_fields: Collection[str] | None,
+    unique_fields: Collection[str] | None,
+) -> list[T]:
+    from ..backends.local import mark_relationships_changed
+    from ..index.maintain import tuple_owner
+    from . import active_relationship_model
+
+    candidates = list(objs)
+    if not candidates:
+        return []
+    if update_conflicts:
+        constraint = (
+            {"resource_fk", "relation", "subject_fk", "optional_subject_relation", "caveat_name"}
+            if rows.model is RelationshipRegistry
+            else set(WIRE_VALUE_FIELDS)
+        )
+        if set(unique_fields or ()) != constraint or not set(update_fields or ()) <= {
+            "caveat_context",
+            "expires_at",
+            "written_at_xid",
+        }:
+            raise ValueError(
+                "Relationship upserts may update tuple metadata only, using the tuple unique constraint"
+            )
+    # Storage conversion writes the inactive table and publishes it with a
+    # separate rebuild. Only the active shape contributes to this index.
+    if rows.model is not active_relationship_model():
+        return models.QuerySet.bulk_create(
+            rows,
+            candidates,
+            batch_size,
+            ignore_conflicts,
+            update_conflicts,
+            update_fields,
+            unique_fields,
+        )
+    tuples = [_tuple_of(row) for row in candidates]
+    # Incremental maintenance expands a region to a fixpoint around each
+    # changed tuple; that is right for a write and pathological for a seed.
+    # A batch past this size rebuilds the index in full inside the same owner,
+    # the same pass `rebac index rebuild` runs, whose cost the scale budgets
+    # bound.
+    rebuild_in_full = len(tuples) >= BULK_REBUILD_ROWS
+    with tuple_owner(rows.db) as maintenance:
+        if maintenance is not None and not rebuild_in_full:
+            for tuple_ in tuples:
+                existing = rows.filter(
+                    resource_type=tuple_.resource.resource_type,
+                    resource_id=tuple_.resource.resource_id,
+                    relation=tuple_.relation,
+                    subject_type=tuple_.subject.subject_type,
+                    subject_id=tuple_.subject.subject_id,
+                    optional_subject_relation=tuple_.subject.optional_relation,
+                    caveat_name=tuple_.caveat_name,
+                )
+                maintenance.capture_old(
+                    tuples=projected_tuples(cast(Any, existing).index_projection())
+                )
+        result = models.QuerySet.bulk_create(
+            rows,
+            candidates,
+            batch_size,
+            ignore_conflicts,
+            update_conflicts,
+            update_fields,
+            unique_fields,
+        )
+        if maintenance is not None:
+            if rebuild_in_full:
+                maintenance.schema_changed = True
+                maintenance.schema_all = True
+            else:
+                maintenance.changed(tuples=tuples)
+    mark_relationships_changed()
+    return result
+
+
+def _owned_tuple_delete(
+    rows: RelationshipQuerySet | RelationshipRegistryQuerySet,
+) -> tuple[int, dict[str, int]]:
+    """Capture arbitrary queryset matches before their tuple rows disappear."""
+    from ..backends.local import mark_relationships_changed
+    from ..index.maintain import tuple_owner
+
+    owned_rows: Any = cast(Any, rows)._chain()
+    owned_rows._for_write = True
+    with tuple_owner(owned_rows.db) as maintenance:
+        if maintenance is not None:
+            projection = owned_rows.index_projection()
+            maintenance.capture_old(tuples=projected_tuples(projection))
+        result = models.QuerySet.delete(owned_rows)
+        if maintenance is not None:
+            maintenance.changed()
+    if result[0]:
+        mark_relationships_changed()
+    return result
+
+
 class RelationshipRegistryManager(models.Manager.from_queryset(RelationshipRegistryQuerySet)):  # type: ignore[misc]
     """Translating manager for :class:`RelationshipRegistry`.
 
@@ -529,6 +751,20 @@ class RelationshipRegistry(models.Model):
     written_at_xid = models.BigIntegerField(default=0, db_index=True)
 
     objects = RelationshipRegistryManager()
+
+    def save(self, *args: Any, **kwargs: Any) -> None:
+        _owned_instance_save(
+            self,
+            lambda: super(RelationshipRegistry, self).save(*args, **kwargs),
+            kwargs.get("using"),
+        )
+
+    def delete(self, *args: Any, **kwargs: Any) -> tuple[int, dict[str, int]]:
+        return _owned_instance_delete(
+            self,
+            lambda: super(RelationshipRegistry, self).delete(*args, **kwargs),
+            kwargs.get("using"),
+        )
 
     class Meta:
         app_label = "rebac"

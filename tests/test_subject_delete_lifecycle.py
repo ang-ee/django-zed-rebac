@@ -113,11 +113,9 @@ def test_subject_cleanup_uses_signal_database_alias(settings) -> None:
     with (
         patch("rebac.models.active_relationship_model", return_value=relationship_model),
         patch("rebac.signals.router.allow_migrate_model", return_value=True),
-        patch("rebac.index.maintain.tuple_owner", return_value=nullcontext(None)),
         patch("rebac.signals._finish_signal"),
         patch("rebac.backends.local.mark_relationships_changed") as invalidated,
         patch("rebac.index.maintain.tuple_owner", return_value=nullcontext(MagicMock())) as owner,
-        patch("rebac.index.maintain.maintain_tuples", return_value=nullcontext()),
     ):
         _rebac_cascade_resource(sender=get_user_model(), instance=user, using="replica")
 
@@ -162,10 +160,8 @@ def test_registered_model_subject_delete_still_uses_canonical_resolver(settings)
             patch("rebac.signals.to_subject_ref", wraps=to_subject_ref) as resolve_subject,
             patch("rebac.models.active_relationship_model", return_value=relationship_model),
             patch("rebac.signals.router.allow_migrate_model", return_value=True),
-            patch("rebac.index.maintain.tuple_owner", return_value=nullcontext(None)),
             patch("rebac.backends.local.mark_relationships_changed"),
             patch("rebac.index.maintain.tuple_owner", return_value=nullcontext(MagicMock())),
-            patch("rebac.index.maintain.maintain_tuples", return_value=nullcontext()),
         ):
             _rebac_cascade_resource(sender=Device, instance=instance)
     finally:

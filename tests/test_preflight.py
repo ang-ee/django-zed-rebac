@@ -79,11 +79,11 @@ def backend(db):
 
 
 def _user(id_: str) -> SubjectRef:
-    return SubjectRef.of("auth/user", id_)
+    return SubjectRef.of("auth/user", {"alice": "1", "bob": "2", "eve": "3"}.get(id_, id_))
 
 
 def _group(id_: str) -> SubjectRef:
-    return SubjectRef.of("auth/group", id_, "member")
+    return SubjectRef.of("auth/group", {"g1": "1"}.get(id_, id_), "member")
 
 
 def _vault(id_: str) -> SubjectRef:
@@ -199,7 +199,7 @@ def test_create_via_arrow_with_group_membership(backend):
     backend.write_relationships(
         [
             RelationshipTuple(
-                resource=ObjectRef("auth/group", "g1"),
+                resource=ObjectRef("auth/group", "1"),
                 relation="member",
                 subject=_user("alice"),
             ),
@@ -362,7 +362,7 @@ def test_virtual_relation_with_subject_set_candidate(backend):
     backend.write_relationships(
         [
             RelationshipTuple(
-                resource=ObjectRef("auth/group", "g1"),
+                resource=ObjectRef("auth/group", "1"),
                 relation="member",
                 subject=_user("alice"),
             ),
@@ -382,7 +382,7 @@ def test_virtual_relation_with_subject_set_candidate_denies_non_member(backend):
     backend.write_relationships(
         [
             RelationshipTuple(
-                resource=ObjectRef("auth/group", "g1"),
+                resource=ObjectRef("auth/group", "1"),
                 relation="member",
                 subject=_user("alice"),
             ),
@@ -402,7 +402,7 @@ def test_subject_set_candidate_must_be_allowed_by_virtual_relation_type_union(ba
     backend.write_relationships(
         [
             RelationshipTuple(
-                resource=ObjectRef("auth/group", "g1"),
+                resource=ObjectRef("auth/group", "1"),
                 relation="member",
                 subject=_user("alice"),
             ),
@@ -523,7 +523,7 @@ def test_depth_limit_on_subject_set_candidate_raises(settings, backend):
     backend.write_relationships(
         [
             RelationshipTuple(
-                resource=ObjectRef("auth/group", "g1"),
+                resource=ObjectRef("auth/group", "1"),
                 relation="member",
                 subject=_user("alice"),
             ),

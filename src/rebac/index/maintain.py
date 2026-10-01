@@ -164,6 +164,7 @@ class IndexMaintenance:
         self.schema_initial = False
         self.membership_only = True
         self.python_rows = 0
+        self.statements = 0
         self._outer: IndexMaintenance | None = None
         self._outer_state: tuple[bool, set[str], bool, bool, int, bool] | None = None
         self._token: Token[tuple[IndexMaintenance, ...]] | None = None
@@ -340,18 +341,25 @@ class IndexMaintenance:
             .values("pk")
             .annotate(type=Value(type_), object_id=codec.to_wire("pk"), relation=Value(""))
             .values("type", "object_id", "relation")
+            .distinct()
         )
         self.python_rows += intern_from(source, using=self.using)
         terms = IndexTerm.objects.using(self.using).filter(
             type=type_, object_id__in=Subquery(source.values("object_id"))
         )
-        present = self.work(phase="old").filter(kind="model", term_id=OuterRef("pk"), node="")
+        # The frozen set is this statement's rows, read before its SQL runs
+        # and kept in the database under a per-statement tag: the gates decide
+        # about exactly the rows the statement writes, a later statement of
+        # the same pass does not inherit an earlier one's, and no primary-key
+        # list ever travels through SQL parameters.
+        self.statements += 1
+        tag = f"statement:{self.statements}"
         self.python_rows += stream_create(
-            terms.filter(~Exists(present)).values(
+            terms.values(
                 pass_id=Value(self.pass_id, output_field=models.BigIntegerField()),
                 kind=Value("model"),
                 term_id=F("pk"),
-                node=Value(""),
+                node=Value(tag),
                 phase=Value("old"),
             ),
             IndexWork,
@@ -359,7 +367,10 @@ class IndexMaintenance:
             using=self.using,
         )
         frozen = IndexTerm.objects.using(self.using).filter(
-            type=type_, pk__in=Subquery(self.work().filter(kind="model").values("term_id"))
+            type=type_,
+            pk__in=Subquery(
+                self.work(phase="old").filter(kind="model", node=tag).values("term_id")
+            ),
         )
         ids = frozen.annotate(column_pk=codec.to_column("object_id")).values("column_pk")
         return cast(
@@ -508,10 +519,11 @@ class IndexMaintenance:
             prefixes.add("")
         from rebac.field_backing import _relation_path
 
-        through_changed = False
+        through_sources: set[tuple[str, str]] = set()
+        through_fallback = False
 
         def visit(owner: type[models.Model], field: ModelField, prefix: str) -> None:
-            nonlocal through_changed
+            nonlocal through_fallback
             target = getattr(field, "related_model", None)
             if not field.is_relation or not isinstance(target, type):
                 return
@@ -522,7 +534,17 @@ class IndexMaintenance:
                 and issubclass(through, models.Model)
                 and through._meta.concrete_model is changed._meta.concrete_model
             ):
-                through_changed = True
+                source_keys = {
+                    fk.attname
+                    for fk in through._meta.fields
+                    if isinstance(fk, models.ForeignKey)
+                    and fk.remote_field.model._meta.concrete_model is owner._meta.concrete_model
+                }
+                if source_keys:
+                    owner_prefix = prefix.rpartition("__")[0]
+                    through_sources.update((owner_prefix, key) for key in source_keys)
+                else:
+                    through_fallback = True
             if (
                 issubclass(target, models.Model)
                 and target._meta.concrete_model is changed._meta.concrete_model
@@ -531,8 +553,13 @@ class IndexMaintenance:
 
         for path in sorted(paths):
             _relation_path(source, path, lookup=True, visit=visit)
-        if through_changed:
+        if through_fallback:
             yield source._base_manager.using(self.using).all()
+        for prefix, key in sorted(through_sources):
+            lookup = prefix + "__pk__in" if prefix else "pk__in"
+            # Only the changed through rows' source keys are needed here.
+            source_ids = set(rows.order_by().values_list(key, flat=True))
+            yield source._base_manager.using(self.using).filter(**{lookup: source_ids})
         for prefix in sorted(prefixes):
             lookup = prefix + "__pk__in" if prefix else "pk__in"
             yield source._base_manager.using(self.using).filter(
@@ -599,7 +626,7 @@ class IndexMaintenance:
             if self.work(phase=phase).count() == before:
                 break
 
-    def finish(self) -> None:
+    def finish(self, *, nested: bool = False) -> None:
         from rebac.index.derive import derive_memberships, derive_nodes
         from rebac.index.project import Stats, project_edges
         from rebac.models.index import IndexCover, IndexEdge, IndexMember, IndexTerm
@@ -608,6 +635,10 @@ class IndexMaintenance:
             stats = self.completed_stats
             deleted, inserted, python_rows = stats.deleted, stats.inserted, stats.python_rows
         elif self.schema_changed:
+            if nested:
+                # The enclosing schema owner has published a new policy, but
+                # its savepoint is still open; the outer finish rebuilds it.
+                return
             from rebac.index.rebuild import _rebuild_locked
 
             self.program = get_program(self.using, self.backend)
@@ -675,13 +706,14 @@ class IndexMaintenance:
         )
         if (self.schema_changed or self.completed_stats is not None) and not types:
             types.update(key[0] for key in self.load_program().nodes)
-        self.work().delete()
-        from rebac.index.rebuild import _vacuum_terms
+        if not nested:
+            self.work().delete()
+            from rebac.index.rebuild import _vacuum_terms
 
-        _vacuum_terms(
-            using=self.using,
-            defined=[d.resource_type for d in self.load_program().baseline.definitions],
-        )
+            _vacuum_terms(
+                using=self.using,
+                defined=[d.resource_type for d in self.load_program().baseline.definitions],
+            )
         logger.info(
             "Permission index maintained",
             extra={
@@ -734,9 +766,13 @@ def maintain_tuples(
     backend: LocalBackend | None = None,
 ) -> Iterator[None]:
     from rebac.models import active_relationship_model
-    from rebac.models.relationship import RelationshipQuerySet, RelationshipRegistryQuerySet
-    from rebac.types import ObjectRef, SubjectRef
+    from rebac.models.relationship import (
+        RelationshipQuerySet,
+        RelationshipRegistryQuerySet,
+        projected_tuples,
+    )
 
+    nested = current_pass(using) is not None
     with IndexMaintenance(using=using, backend=backend) as maintenance:
         maintenance.capture_old(tuples=(*written, *deleted))
         if deleted_filter is not None:
@@ -747,20 +783,14 @@ def maintain_tuples(
             ).index_projection()
             # Streaming input is immediately materialized in IndexWork; there is
             # no queryset retained across the owner's DELETE.
-            maintenance.capture_old(
-                tuples=(
-                    RelationshipTuple(
-                        resource=ObjectRef(row["resource_type"], row["resource_id"]),
-                        relation=row["relation"],
-                        subject=SubjectRef.of(
-                            row["subject_type"], row["subject_id"], row["subject_relation"]
-                        ),
-                    )
-                    for row in rows.iterator(chunk_size=1000)
-                )
-            )
+            maintenance.capture_old(tuples=projected_tuples(rows))
         yield
         maintenance.changed(tuples=written)
+        if nested:
+            # A caller may check at the Zookie returned by this nested write
+            # before its enclosing model owner exits. Derive now; the outer
+            # owner can repeat the pass after its own final capture.
+            maintenance.finish(nested=True)
 
 
 @contextmanager

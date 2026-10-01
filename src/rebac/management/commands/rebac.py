@@ -776,6 +776,7 @@ class Command(BaseCommand):
         # Collect AST from every package, dropping per-source comments / headers.
         all_definitions: list[Any] = []
         all_caveats: list[Any] = []
+        has_expiration = False
         seen_definition_types: set[str] = set()
         seen_caveat_names: set[str] = set()
         for app_config in sorted(apps.get_app_configs(), key=lambda a: a.name):
@@ -783,6 +784,11 @@ class Command(BaseCommand):
             if path is None:
                 continue
             schema = parse_zed(path.read_text(encoding="utf-8"))
+            has_expiration |= "use expiration" in schema.directives or any(
+                relation.with_expiration
+                for definition in schema.definitions
+                for relation in definition.relations
+            )
             for d in schema.definitions:
                 if d.resource_type in seen_definition_types:
                     raise CommandError(
@@ -796,9 +802,14 @@ class Command(BaseCommand):
                 seen_caveat_names.add(c.name)
                 all_caveats.append(c)
 
-        body = "\n" + render_zed(
-            Schema(definitions=all_definitions, caveats=all_caveats),
-            include_backing=False,
+        expiration_directive = "use expiration\n" if has_expiration else ""
+        body = (
+            "\n"
+            + expiration_directive
+            + render_zed(
+                Schema(definitions=all_definitions, caveats=all_caveats),
+                include_backing=False,
+            )
         )
         content_hash = hashlib.sha256(body.encode("utf-8")).hexdigest()
 
@@ -1002,14 +1013,14 @@ class Command(BaseCommand):
         if "." not in target:
             raise CommandError("explain target must be <type>.<perm>")
         rt, perm = target.rsplit(".", 1)
-        from ...models import SchemaDefinition
+        from ...backends import backend
+        from ...schema.rendering import _render_expr
 
-        try:
-            d = SchemaDefinition.objects.get(resource_type=rt)
-        except SchemaDefinition.DoesNotExist as exc:
-            raise CommandError(f"No definition: {rt}") from exc
-        try:
-            p = d.permissions.get(name=perm)
-        except Exception as exc:
-            raise CommandError(f"No permission {perm!r} on {rt}: {exc}") from exc
-        self.stdout.write(f"{rt}#{perm} = {p.expression}")
+        schema = backend().schema()
+        definition = schema.get_definition(rt)
+        if definition is None:
+            raise CommandError(f"No definition: {rt}")
+        permission = schema.get_permission(rt, perm)
+        if permission is None:
+            raise CommandError(f"No permission {perm!r} on {rt}")
+        self.stdout.write(f"{rt}#{perm} = {_render_expr(permission.expression)}")

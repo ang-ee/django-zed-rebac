@@ -28,7 +28,7 @@ from typing import Any, cast
 
 from asgiref.sync import iscoroutinefunction, markcoroutinefunction, sync_to_async
 
-from .actors import _current_actor, asudo, get_actor_resolver, sudo
+from .actors import _current_actor, asudo, get_actor_resolver, sudo, to_subject_ref
 from .conf import app_settings
 from .consistency import current_zookie, zookie_scope
 from .evaluator import evaluator_scope
@@ -130,7 +130,7 @@ class ActorMiddleware:
             return self.__acall__(request)
         resolver = get_actor_resolver()
         actor_ref = resolver(request)
-        use_sudo = self._should_sudo(request)
+        use_sudo = self._should_sudo(request, actor_ref)
         # ``set`` is the LAST step before ``try:`` so the matching
         # ``reset`` in ``finally`` is unconditional — every successful
         # ``set`` must be paired with a ``reset``. Anything that can
@@ -169,7 +169,7 @@ class ActorMiddleware:
         actor_ref = await _aresolve_actor(resolver, request)
         # A custom resolver may leave Django's lazy session user unresolved.
         # The superuser probe can therefore perform its own synchronous lookup.
-        use_sudo = await sync_to_async(self._should_sudo, thread_sensitive=True)(request)
+        use_sudo = await sync_to_async(self._should_sudo, thread_sensitive=True)(request, actor_ref)
         # Install the actor token *immediately* before ``try:`` so the
         # ``finally`` block always pairs with the ``set``. The earlier
         # ordering put ``await self._arehydrate_zookie(...)`` between
@@ -192,7 +192,7 @@ class ActorMiddleware:
         finally:
             _current_actor.reset(actor_token)
 
-    def _should_sudo(self, request: Any) -> bool:
+    def _should_sudo(self, request: Any, actor_ref: Any) -> bool:
         """Whether the superuser bypass applies for this request."""
         user = getattr(request, "user", None)
         return bool(
@@ -201,7 +201,17 @@ class ActorMiddleware:
             and user is not None
             and getattr(user, "is_active", False)
             and getattr(user, "is_superuser", False)
+            and self._is_own_superuser_actor(actor_ref, user)
         )
+
+    @staticmethod
+    def _is_own_superuser_actor(actor_ref: Any, user: Any) -> bool:
+        from .errors import NoActorResolvedError
+
+        try:
+            return bool(actor_ref == to_subject_ref(user))
+        except NoActorResolvedError, TypeError:
+            return False
 
     # ---------- Zookie transport plumbing (opt-in) ----------
 

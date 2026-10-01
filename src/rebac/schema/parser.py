@@ -44,6 +44,19 @@ class ParseError(Exception):
     pass
 
 
+@dataclass(frozen=True)
+class ReferenceIssue:
+    resource_type: str
+    permission: str
+    kind: str
+    name: str
+
+    def message(self) -> str:
+        if self.kind == "arrow":
+            return f"{self.resource_type}: arrow walks via undefined relation {self.name!r}"
+        return f"{self.resource_type}: undefined reference {self.name!r} in expression"
+
+
 # ---------- Tokenizer ----------
 
 
@@ -59,7 +72,7 @@ _KEYWORDS = {"definition", "relation", "permission", "caveat", "use", "with", "n
 # Punct includes characters that legally appear inside caveat CEL bodies so
 # the tokenizer can sweep past them; the caveat parser re-reads the body
 # from raw source via offset scanning.
-_PUNCT = set("{}|+&-=:>,()*#.<[];!?")
+_PUNCT = set("{}|+&-=:>,()*#.<[];!?/%")
 
 
 def _tokenize(text: str) -> list[Token]:
@@ -130,9 +143,10 @@ def _tokenize(text: str) -> list[Token]:
             col += 1
             continue
         # String literals (used in caveat expressions if they appear inline — uncommon)
-        if c == '"':
+        if c in ('"', "'"):
+            quote = c
             j = i + 1
-            while j < n and text[j] != '"':
+            while j < n and text[j] != quote:
                 if text[j] == "\\":
                     j += 2
                 else:
@@ -493,10 +507,11 @@ class _Parser:
         n = len(self.text)
         while i < n:
             c = self.text[i]
-            if c == '"':
+            if c in ('"', "'"):
+                quote = c
                 # consume string
                 i += 1
-                while i < n and self.text[i] != '"':
+                while i < n and self.text[i] != quote:
                     if self.text[i] == "\\":
                         i += 2
                     else:
@@ -547,6 +562,85 @@ def parse_permission_expression(text: str) -> PermExpr:
     return _Parser(text).parse_permission_expression()
 
 
+def _caveat_identifier_errors(caveat_name: str, expression: str, declared: set[str]) -> list[str]:
+    """Find free CEL identifiers in cel-python's syntax tree."""
+    from typing import Any
+
+    from ..caveats import _load_celpy
+    from ..errors import CaveatUnsupportedError
+
+    try:
+        tree = _load_celpy().Environment().compile(expression)
+    except CaveatUnsupportedError as exc:
+        return [f"caveat {caveat_name}: {exc}"]
+    except Exception as exc:
+        return [f"caveat {caveat_name}: invalid CEL expression: {exc}"]
+
+    builtins = {
+        "bool",
+        "bytes",
+        "double",
+        "duration",
+        "dyn",
+        "int",
+        "list",
+        "map",
+        "null_type",
+        "string",
+        "timestamp",
+        "type",
+        "uint",
+    }
+    free: set[str] = set()
+    invalid: set[str] = set()
+
+    def bare_binding(node: Any) -> str | None:
+        if getattr(node, "data", None) == "ident":
+            return str(node.children[0])
+        children = list(getattr(node, "children", ()))
+        if len(children) == 1 and hasattr(children[0], "data"):
+            return bare_binding(children[0])
+        return None
+
+    def visit(node: Any, bound: frozenset[str]) -> None:
+        kind = getattr(node, "data", None)
+        if kind == "ident":
+            name = str(node.children[0])
+            if name not in declared | builtins | bound:
+                free.add(name)
+            return
+        if kind == "dot_ident":
+            invalid.add("leading-dot identifier")
+            return
+        if kind == "member_dot_arg" and len(node.children) >= 3:
+            receiver, method, arguments = node.children[:3]
+            visit(receiver, bound)
+            args = list(getattr(arguments, "children", ()))
+            if str(method) == "reduce":
+                invalid.add("unsupported CEL macro 'reduce'")
+            elif str(method) in {"exists", "exists_one", "all", "map", "filter"}:
+                binder_name = bare_binding(args[0]) if args else None
+                if binder_name is None:
+                    invalid.add(f"{method} macro requires a bare binder name")
+                for arg in args[1:]:
+                    visit(arg, bound | ({binder_name} if binder_name is not None else set()))
+            else:
+                visit(arguments, bound)
+            return
+        if kind == "ident_arg":
+            for child in node.children[1:]:
+                visit(child, bound)
+            return
+        for child in getattr(node, "children", ()):
+            visit(child, bound)
+
+    visit(tree, frozenset())
+    return [
+        *(f"caveat {caveat_name}: {issue}" for issue in sorted(invalid)),
+        *(f"caveat {caveat_name}: undeclared identifier {name!r}" for name in sorted(free)),
+    ]
+
+
 def validate_schema(schema: Schema) -> list[str]:
     """Cross-check references inside the schema. Returns a list of error strings.
 
@@ -554,6 +648,9 @@ def validate_schema(schema: Schema) -> list[str]:
     """
     errors = subject_relation_errors(schema)
     caveat_names = {c.name for c in schema.caveats}
+    for caveat in schema.caveats:
+        declared = {param.name for param in caveat.params}
+        errors.extend(_caveat_identifier_errors(caveat.name, caveat.expression, declared))
 
     for definition in schema.definitions:
         if definition.resource_type in BUILTIN_ACTOR_TYPES:
@@ -563,6 +660,10 @@ def validate_schema(schema: Schema) -> list[str]:
             )
         relation_names = {r.name for r in definition.relations}
         permission_names = {p.name for p in definition.permissions}
+        if len(relation_names) != len(definition.relations):
+            errors.append(f"{definition.resource_type}: duplicate relation name")
+        if len(permission_names) != len(definition.permissions):
+            errors.append(f"{definition.resource_type}: duplicate permission name")
 
         for relation in definition.relations:
             if relation.name in BUILTIN_ACTOR_TYPES:
@@ -616,7 +717,10 @@ def validate_schema(schema: Schema) -> list[str]:
 
         for perm in definition.permissions:
             errors.extend(
-                _validate_expr(perm.expression, definition, relation_names, permission_names)
+                issue.message()
+                for issue in _validate_expr(
+                    perm.expression, definition, perm.name, relation_names, permission_names
+                )
             )
         # Detect duplicate names within a definition.
         all_names = list(relation_names) + list(permission_names)
@@ -664,10 +768,11 @@ def subject_relation_errors(schema: Schema) -> list[str]:
 def _validate_expr(
     expr: PermExpr,
     definition: Definition,
+    permission: str,
     relation_names: set[str],
     permission_names: set[str],
-) -> list[str]:
-    errors: list[str] = []
+) -> list[ReferenceIssue]:
+    errors: list[ReferenceIssue] = []
     if isinstance(expr, PermNil):
         return errors
     if isinstance(expr, PermRef):
@@ -675,16 +780,34 @@ def _validate_expr(
             return errors
         if expr.name not in relation_names and expr.name not in permission_names:
             errors.append(
-                f"{definition.resource_type}: undefined reference {expr.name!r} in expression"
+                ReferenceIssue(definition.resource_type, permission, "reference", expr.name)
             )
         return errors
     if isinstance(expr, PermArrow):
         if expr.via not in relation_names:
-            errors.append(
-                f"{definition.resource_type}: arrow walks via undefined relation {expr.via!r}"
-            )
+            errors.append(ReferenceIssue(definition.resource_type, permission, "arrow", expr.via))
         return errors
     if isinstance(expr, PermBinOp):
-        errors.extend(_validate_expr(expr.left, definition, relation_names, permission_names))
-        errors.extend(_validate_expr(expr.right, definition, relation_names, permission_names))
+        errors.extend(
+            _validate_expr(expr.left, definition, permission, relation_names, permission_names)
+        )
+        errors.extend(
+            _validate_expr(expr.right, definition, permission, relation_names, permission_names)
+        )
     return errors
+
+
+def reference_issues(schema: Schema) -> list[ReferenceIssue]:
+    """Structured reference diagnostics for baseline/composition comparison."""
+    return [
+        issue
+        for definition in schema.definitions
+        for permission in definition.permissions
+        for issue in _validate_expr(
+            permission.expression,
+            definition,
+            permission.name,
+            {relation.name for relation in definition.relations},
+            {item.name for item in definition.permissions},
+        )
+    ]

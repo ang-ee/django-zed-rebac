@@ -17,6 +17,7 @@ from rebac.index.rebuild import rebuild
 from rebac.models.index import IndexCover, IndexEdge, IndexMember
 from rebac.schema import parse_zed
 from rebac.types import RelationshipFilter
+from tests.backend_setup import STORAGE_TIERS
 from tests.index_harness import assert_index_matches, assert_no_drift, assert_scope_matches, seed
 
 pytestmark = pytest.mark.django_db
@@ -70,6 +71,7 @@ definition test/doc {
 """
 
 
+@pytest.mark.parametrize("install", STORAGE_TIERS, indirect=True)
 def test_all_setop_lanes_and_finite_exclusion(install):
     install(BASE)
     seed(
@@ -625,6 +627,7 @@ definition test/doc {
 """
 
 
+@pytest.mark.parametrize("install", STORAGE_TIERS, indirect=True)
 def test_conditions_in_all_positions_and_membership_alternatives(install):
     active = install(CAVEATED)
     seed(["test/doc:root#b@test/group:g#member"])
@@ -909,6 +912,8 @@ def test_region_repair_preserves_unrelated_bans_on_type_level_cover(install):
     assert_no_drift()
 
 
+@pytest.mark.pg_delta
+@pytest.mark.parametrize("install", STORAGE_TIERS, indirect=True)
 def test_batched_expiry_growth_for_recursive_covers_and_memberships(install, monkeypatch):
     from django.db import connection
     from django.test.utils import CaptureQueriesContext
@@ -1151,8 +1156,9 @@ def test_dynamic_and_fixed_attributes_preserve_tuple_precedence(install):
             permission read = member
         }
     """)
-    staff = get_user_model().objects.create(username="alice", is_staff=True)
-    other = get_user_model().objects.create(username="bob", is_staff=False)
+    with sudo(reason="test.attribute-fixture"):
+        staff = get_user_model().objects.create(username="alice", is_staff=True)
+        other = get_user_model().objects.create(username="bob", is_staff=False)
     # Simulate persisted tuples predating the backing declaration. Projection
     # must suppress only the fixed anchor, and every dynamic container.
     model = active_relationship_model()
@@ -1232,7 +1238,7 @@ def test_projection_keeps_maximum_expiry_across_conflicts(install):
 
 def test_pinned_declared_context_does_not_drop_missing_runtime_global(install):
     active = install("""
-        caveat runtime(ok bool) { ok && runtime_flag }
+        caveat runtime(ok bool, runtime_flag bool) { ok && runtime_flag }
         definition auth/user {}
         definition test/doc {
             relation blocked: auth/user with runtime
@@ -1250,6 +1256,13 @@ def test_pinned_declared_context_does_not_drop_missing_runtime_global(install):
         actions=["read"],
         contexts=[None, {"runtime_flag": True}, {"runtime_flag": False}],
     )
+
+
+def test_undeclared_caveat_runtime_identifier_is_rejected():
+    from rebac.schema.parser import validate_schema
+
+    schema = parse_zed("caveat runtime(ok bool) { ok && runtime_flag }")
+    assert any("undeclared identifier 'runtime_flag'" in error for error in validate_schema(schema))
 
 
 @pytest.mark.parametrize("storage", ["denormalized", "registry"])

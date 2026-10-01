@@ -165,6 +165,7 @@ def test_related_query_name_reverse_path_resolves_from_binding_side(backend, act
     )
 
 
+@pytest.mark.slow  # Intrinsically slow: five full check-and-scope proofs over four hops.
 def test_four_hop_filtered_path_and_nil_fragment_exclusion_use_same_entry(backend, actors):
     alice, bob = actors
     with sudo(reason="deep reverse path fixtures"):
@@ -184,10 +185,13 @@ def test_four_hop_filtered_path_and_nil_fragment_exclusion_use_same_entry(backen
     # Revocation changes an already constructed SQL scope, with no tuple writes.
     pending = BackingQueue.objects.with_actor(bob)
     active.retired_at = timezone.now()
-    atomic_source_write(active.save, update_fields=["retired_at"])
+    # The four-hop backing declares on BackingQueue, whose write is gated.
+    with sudo(reason="deep reverse path fixture update"):
+        atomic_source_write(active.save, update_fields=["retired_at"])
     assert set(pending.values_list("pk", flat=True)) == {queue.pk, empty.pk}
     retired.retired_at = None
-    atomic_source_write(retired.save, update_fields=["retired_at"])
+    with sudo(reason="deep reverse path fixture update"):
+        atomic_source_write(retired.save, update_fields=["retired_at"])
     assert_read(backend, BackingQueue, alice, [empty])
     candidate = BackingQueue()
     projected = _proposed_forward_relationships(
@@ -242,6 +246,7 @@ def test_reverse_parent_link_then_owner_column(backend, actors):
     assert_empty_preflight(backend, NativeParentLinkedResource(name="new parent"), alice, "owner")
 
 
+@pytest.mark.slow  # Intrinsically slow: each case reinstalls and rebuilds the whole schema.
 @pytest.mark.parametrize("action", ["asker", "shared"])
 def test_donor_column_paths_use_root_row_filters_including_preflight(backend, actors, action):
     alice, bob = actors

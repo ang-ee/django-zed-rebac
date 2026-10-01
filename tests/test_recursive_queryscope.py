@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from contextlib import contextmanager, nullcontext
+from contextlib import contextmanager
 from itertools import pairwise
 from unittest.mock import patch
 
@@ -15,14 +15,14 @@ from django.test.utils import CaptureQueriesContext
 from rebac import (
     RelationshipTuple,
     SubjectRef,
+    app_settings,
     backend,
-    evaluator_scope,
     sudo,
     to_object_ref,
 )
 from rebac.backends import reset_backend
 from rebac.schema import parse_zed
-from tests.backend_setup import install_schema
+from tests.backend_setup import STORAGE_TIERS, install_schema
 from tests.testapp.models import Folder, Post
 
 pytestmark = pytest.mark.django_db
@@ -111,18 +111,27 @@ def grant(active, row, member, actor=ACTOR):
     active.write_relationships([RelationshipTuple(to_object_ref(row), member, actor)])
 
 
+@contextmanager
+def beyond_depth_limit(depth):
+    """Keep a chain of ``depth`` hops past REBAC_DEPTH_LIMIT, the old recursive read bound.
+
+    A short tier-1 chain lowers the limit below its depth; a long chain keeps the default.
+    """
+    with override_settings(REBAC_DEPTH_LIMIT=min(app_settings.REBAC_DEPTH_LIMIT, depth - 1)):
+        yield
+
+
 @pytest.mark.parametrize("storage", ["denormalized", "registry"])
 @pytest.mark.parametrize("shape", ["role", "folder"])
 @pytest.mark.parametrize("backing", ["tuple", "field"])
-@pytest.mark.parametrize("depth", [0, 1, 2, 8])
-@pytest.mark.parametrize("reuse", [False, True])
-def test_recursive_chain_parity(storage, shape, backing, depth, reuse):
+@pytest.mark.parametrize("depth", [0, 1, 2, pytest.param(8, marks=pytest.mark.slow)])
+def test_recursive_chain_parity(storage, shape, backing, depth):
     with schema_context(storage, shape, backing) as (active, member, hop, action):
         rows = chain(active, hop, backing, depth)
         actors = [SubjectRef.of("auth/user", str(100 + i)) for i in range(len(rows))]
         for row, actor in zip(rows, actors, strict=True):
             grant(active, row, member, actor)
-        with no_enumeration(active), evaluator_scope() if reuse else nullcontext():
+        with no_enumeration(active):
             for level, actor in enumerate([*actors, OUTSIDER, ANONYMOUS]):
                 expected = {row.pk for row in rows[level:]} if level < len(rows) else set()
                 scoped = Folder.objects.with_actor(actor).with_action(action)
@@ -144,29 +153,33 @@ def test_recursive_chain_parity(storage, shape, backing, depth, reuse):
 @pytest.mark.parametrize("storage", ["denormalized", "registry"])
 @pytest.mark.parametrize("shape", ["role", "folder"])
 @pytest.mark.parametrize("backing", ["tuple", "field"])
-@pytest.mark.parametrize("actor", [ACTOR, OUTSIDER, ANONYMOUS])
-def test_positive_recursion_has_no_read_depth_limit(storage, shape, backing, actor):
-    with schema_context(storage, shape, backing) as (active, member, hop, action):
-        rows = chain(active, hop, backing, 50)
+@pytest.mark.parametrize("depth", [3, pytest.param(50, marks=pytest.mark.slow)])
+def test_positive_recursion_has_no_read_depth_limit(storage, shape, backing, depth):
+    with (
+        beyond_depth_limit(depth),
+        schema_context(storage, shape, backing) as (active, member, hop, action),
+    ):
+        rows = chain(active, hop, backing, depth)
         grant(active, rows[0], member)
-        expected = actor == ACTOR
-        assert (
-            active.check_access(
-                subject=actor, action=action, resource=to_object_ref(rows[-1])
-            ).allowed
-            is expected
-        )
-        assert (
-            Folder.objects.with_actor(actor).with_action(action).filter(pk=rows[-1].pk).exists()
-            is expected
-        )
-        assert (
-            Folder.objects.with_actor(actor).with_action(action).filter(pk=rows[0].pk).exists()
-            is expected
-        )
+        for actor in (ACTOR, OUTSIDER, ANONYMOUS):
+            expected = actor == ACTOR
+            assert (
+                active.check_access(
+                    subject=actor, action=action, resource=to_object_ref(rows[-1])
+                ).allowed
+                is expected
+            )
+            assert (
+                Folder.objects.with_actor(actor).with_action(action).filter(pk=rows[-1].pk).exists()
+                is expected
+            )
+            assert (
+                Folder.objects.with_actor(actor).with_action(action).filter(pk=rows[0].pk).exists()
+                is expected
+            )
 
 
-@pytest.mark.parametrize("storage", ["denormalized", "registry"])
+@pytest.mark.parametrize("storage", STORAGE_TIERS)
 @pytest.mark.parametrize("shape", ["role", "folder"])
 @pytest.mark.parametrize("backing", ["tuple", "field", "path"])
 def test_recursive_builtin_and_exclusion(storage, shape, backing):
@@ -203,11 +216,15 @@ def test_recursive_builtin_and_exclusion(storage, shape, backing):
                 )
 
 
-@pytest.mark.parametrize("storage", ["denormalized", "registry"])
+@pytest.mark.parametrize("storage", STORAGE_TIERS)
 @pytest.mark.parametrize("backing", ["tuple", "field"])
-def test_early_grant_and_live_boundary(storage, backing):
-    with schema_context(storage, "folder", backing) as (active, member, hop, _action):
-        rows = chain(active, hop, backing, 12)
+@pytest.mark.parametrize("depth", [3, pytest.param(12, marks=pytest.mark.slow)])
+def test_early_grant_and_live_boundary(storage, backing, depth):
+    with (
+        beyond_depth_limit(depth),
+        schema_context(storage, "folder", backing) as (active, member, hop, _action),
+    ):
+        rows = chain(active, hop, backing, depth)
         grant(active, rows[0], member)
         pending = Folder.objects.with_actor(ACTOR).scoped().filter(pk=rows[-1].pk)
         with no_enumeration(active):
@@ -231,12 +248,14 @@ def test_early_grant_and_live_boundary(storage, backing):
             assert not pending.exists()
 
 
-@pytest.mark.parametrize("storage", ["denormalized", "registry"])
+@pytest.mark.pg_delta
+@pytest.mark.parametrize("storage", STORAGE_TIERS)
 @pytest.mark.parametrize("backing", ["tuple", "field"])
-def test_scope_query_count_is_independent_of_depth(storage, backing):
+@pytest.mark.parametrize("deep", [3, pytest.param(50, marks=pytest.mark.slow)])
+def test_scope_query_count_is_independent_of_depth(storage, backing, deep):
     costs = []
     with schema_context(storage, "folder", backing) as (active, member, hop, action):
-        for depth in (1, 50):
+        for depth in (1, deep):
             rows = chain(active, hop, backing, depth, prefix=str(depth))
             grant(active, rows[0], member)
             qs = (
@@ -248,7 +267,8 @@ def test_scope_query_count_is_independent_of_depth(storage, backing):
     assert costs == [1, 1]
 
 
-@pytest.mark.parametrize("storage", ["denormalized", "registry"])
+@pytest.mark.pg_delta
+@pytest.mark.parametrize("storage", STORAGE_TIERS)
 @pytest.mark.parametrize("backing", ["tuple", "field"])
 def test_recursive_scope_composition(storage, backing):
     with schema_context(storage, "folder", backing) as (active, member, hop, _action):
@@ -306,8 +326,7 @@ def test_recursive_group_before_self_arrow_still_compiles(storage, backing):
             ).allowed
 
 
-@pytest.mark.parametrize("storage", ["denormalized", "registry"])
-def test_set_operation_cycle_is_refused(storage):
+def test_set_operation_cycle_is_refused():
     from rebac.index.program import program_errors
 
     text, *_ = recursive_schema("folder", "tuple")

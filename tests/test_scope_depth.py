@@ -9,7 +9,7 @@ from django.utils import timezone
 
 from rebac import RelationshipTuple, to_object_ref
 from rebac.schema import parse_zed
-from tests.backend_setup import install_schema
+from tests.backend_setup import STORAGE_TIERS, install_schema
 from tests.test_recursive_queryscope import (
     ACTOR,
     OUTSIDER,
@@ -43,10 +43,10 @@ def parse_depth(sql):
     return maximum_selects, maximum_parens
 
 
-def deep_scope_proof(storage, backing):
+def deep_scope_proof(storage, backing, deep):
     measurements = []
     with schema_context(storage, "folder", backing) as (active, member, hop, action):
-        for depth in (1, 50):
+        for depth in (1, deep):
             rows = chain(active, hop, backing, depth, prefix=str(depth))
             grant(active, rows[0], member)
             assert active.check_access(
@@ -79,13 +79,15 @@ def deep_scope_proof(storage, backing):
     return measurements
 
 
-@pytest.mark.parametrize("storage", ["denormalized", "registry"])
+@pytest.mark.pg_delta
+@pytest.mark.parametrize("storage", STORAGE_TIERS)
 @pytest.mark.parametrize("backing", ["tuple", "field"])
-def test_deep_scopes_have_constant_parse_depth(storage, backing):
-    deep_scope_proof(storage, backing)
+@pytest.mark.parametrize("deep", [3, pytest.param(50, marks=pytest.mark.slow)])
+def test_deep_scopes_have_constant_parse_depth(storage, backing, deep):
+    deep_scope_proof(storage, backing, deep)
 
 
-@pytest.mark.parametrize("storage", ["denormalized", "registry"])
+@pytest.mark.parametrize("storage", STORAGE_TIERS)
 @pytest.mark.parametrize("backing", ["tuple", "field", "path"])
 def test_recursive_exclusions_keep_expiry_and_intermediate_denials(storage, backing):
     with (

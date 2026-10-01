@@ -154,6 +154,7 @@ def test_migrate_to_denormalized_copies_all_rows():
     assert direct.relation == "viewer"
 
 
+@pytest.mark.pg_delta
 @pytest.mark.django_db(transaction=True)
 def test_round_trip_denormalized_registry_denormalized():
     """denormalized → registry → denormalized → identical row set."""
@@ -219,6 +220,7 @@ def test_empty_source_short_circuits():
     assert RelationshipRegistry.objects.count() == 0
 
 
+@pytest.mark.pg_delta
 @pytest.mark.django_db(transaction=True)
 def test_batch_argument_controls_pagination():
     """``--batch`` slices the source query; behavior is identical for any batch."""

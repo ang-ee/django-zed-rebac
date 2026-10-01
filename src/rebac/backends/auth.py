@@ -16,9 +16,8 @@ Two distinct call shapes the backend has to answer:
   :class:`LocalBackend` already treats that as a non-empty
   ``accessible(...)`` probe (see ``backends/local.py § check_access``).
 
-``has_module_perms`` walks the app's models and short-circuits on the
-first non-empty ``accessible()`` result, matching the Django
-convention "any permission in this app at all".
+``has_module_perms`` walks the app's REBAC models and asks the same model-level
+question for each model's default action, short-circuiting on the first grant.
 
 Add to :setting:`AUTHENTICATION_BACKENDS` *before* ``ModelBackend`` —
 ``has_perm`` returns ``True`` short-circuits the chain, ``False`` lets
@@ -35,6 +34,7 @@ from __future__ import annotations
 
 from typing import Any
 
+from asgiref.sync import sync_to_async
 from django.apps import apps as django_apps
 from django.contrib.auth.base_user import AbstractBaseUser
 
@@ -109,6 +109,9 @@ class RebacBackend:
         except PermissionDepthExceeded:
             return False
 
+    async def ahas_perm(self, user_obj: Any, perm: str, obj: Any = None) -> bool:
+        return await sync_to_async(self.has_perm, thread_sensitive=True)(user_obj, perm, obj)
+
     def has_module_perms(self, user_obj: Any, app_label: str) -> bool:
         if not getattr(user_obj, "is_active", False):
             return False
@@ -128,30 +131,25 @@ class RebacBackend:
         except LookupError:
             return False
 
-        rebac_types = [
-            model_resource_type(model) for model in cfg.get_models(include_auto_created=False)
-        ]
-        rebac_types = [t for t in rebac_types if t]
-        if not rebac_types:
-            return False
+        from . import backend
 
-        # Cheap "any access?" probe: the user has module perms iff
-        # at least one Relationship row names them as subject for one
-        # of this app's resource types. Skips schema walking entirely.
-        # Trade-off: overshoots when a stale grant references a type
-        # whose schema no longer authorises ``read`` — for the
-        # admin-sidebar use case overshoot is fine (the per-row
-        # ``has_perm`` still gates the actual page render).
-        from ..models import active_relationship_model
+        for model in cfg.get_models(include_auto_created=False):
+            resource_type = model_resource_type(model)
+            if resource_type is None:
+                continue
+            action = getattr(model._meta, "rebac_default_action", "read")
+            try:
+                if backend().has_access(
+                    subject=subject, action=action, resource=ObjectRef(resource_type, "")
+                ):
+                    return True
+            except PermissionDepthExceeded:
+                continue
+        return False
 
-        return bool(
-            active_relationship_model()
-            .objects.filter(
-                subject_type=subject.subject_type,
-                subject_id=subject.subject_id,
-                resource_type__in=rebac_types,
-            )
-            .exists()
+    async def ahas_module_perms(self, user_obj: Any, app_label: str) -> bool:
+        return await sync_to_async(self.has_module_perms, thread_sensitive=True)(
+            user_obj, app_label
         )
 
 

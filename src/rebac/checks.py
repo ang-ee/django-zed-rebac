@@ -28,6 +28,9 @@ def _schema_for_checks() -> Schema | None:
 
     from .backends import backend
 
+    if app_settings.REBAC_BACKEND != "local":
+        return None
+
     try:
         try:
             return backend().schema()
@@ -102,6 +105,15 @@ def check_backend_setting(app_configs: Any = None, **kwargs: Any) -> list[checks
             )
         )
     if backend == "spicedb":
+        from importlib.util import find_spec
+
+        if find_spec("authzed") is None:
+            issues.append(
+                checks.Error(
+                    "REBAC_BACKEND='spicedb' requires the authzed client package",
+                    id="rebac.E002",
+                )
+            )
         if not app_settings.REBAC_SPICEDB_ENDPOINT:
             issues.append(
                 checks.Error(
@@ -119,6 +131,35 @@ def check_backend_setting(app_configs: Any = None, **kwargs: Any) -> list[checks
     return issues
 
 
+@checks.register("rebac")
+def check_caveat_dependency(app_configs: Any = None, **kwargs: Any) -> list[checks.CheckMessage]:
+    """Report the optional CEL dependency only for installed caveat schemas."""
+    from importlib.util import find_spec
+
+    from django.apps import apps
+
+    from .schema import ParseError, parse_zed, resolve_schema_path
+
+    if find_spec("celpy") is not None:
+        return []
+    for app_config in apps.get_app_configs():
+        path = resolve_schema_path(app_config)
+        if path is None:
+            continue
+        try:
+            has_caveats = bool(parse_zed(path.read_text(encoding="utf-8")).caveats)
+        except OSError, ParseError:
+            continue  # The schema parser/check command owns malformed source diagnostics.
+        if has_caveats:
+            return [
+                checks.Error(
+                    "Caveat schemas require cel-python; install django-zed-rebac[caveats].",
+                    id="rebac.E021",
+                )
+            ]
+    return []
+
+
 def _index_schema_for_checks(using: str) -> Schema | None:
     """Alias-specific loading, deferring checks until the schema is readable."""
     from django.db import connections
@@ -127,7 +168,11 @@ def _index_schema_for_checks(using: str) -> Schema | None:
     from .backends import backend
     from .backends.local import LocalBackend
 
-    active = backend()
+    try:
+        active = backend()
+    except ValueError:
+        # E001 reports an invalid backend setting; this check needs a backend.
+        return None
     if not isinstance(active, LocalBackend):
         return None
     try:
@@ -426,9 +471,21 @@ def check_auth_backend_installed(
 ) -> list[checks.CheckMessage]:
     """Warn if `rebac.backends.auth.RebacBackend` is not in AUTHENTICATION_BACKENDS."""
     from django.conf import settings
+    from django.utils.module_loading import import_string
+
+    from .backends.auth import RebacBackend
 
     backends = getattr(settings, "AUTHENTICATION_BACKENDS", [])
-    if not any(b.endswith(".RebacBackend") or b.endswith(".auth.RebacBackend") for b in backends):
+    found = False
+    for path in backends:
+        try:
+            cls = import_string(path)
+        except ImportError, AttributeError, TypeError:
+            continue
+        if isinstance(cls, type) and issubclass(cls, RebacBackend):
+            found = True
+            break
+    if not found:
         return [
             checks.Warning(
                 "rebac.backends.auth.RebacBackend not in AUTHENTICATION_BACKENDS. "
@@ -688,3 +745,47 @@ def check_tracked_models_setting(
                 checks.Error(f"REBAC_TRACKED_MODELS: unknown model {label!r}.", id="rebac.E018")
             )
     return issues
+
+
+@checks.register("rebac")
+def check_stale_override_references(
+    app_configs: Any = None, **kwargs: Any
+) -> list[checks.CheckMessage]:
+    """W010: a stored override no longer names a baseline relation/permission."""
+    from django.db import DEFAULT_DB_ALIAS, connections
+
+    from .backends import backend
+    from .backends.local import LocalBackend
+    from .composition import split_stale_overrides
+    from .conf import app_settings
+    from .models import SchemaOverride
+
+    if app_settings.REBAC_BACKEND != "local":
+        return []
+    try:
+        active = backend()
+    except ValueError:
+        # E001 reports an invalid backend setting; this check needs a backend.
+        return []
+    if not isinstance(active, LocalBackend) or active._schema_is_manual:
+        return []
+    try:
+        if active._read_schema_revision(connections[DEFAULT_DB_ALIAS]) is None:
+            return []
+        loaded = active._load_schema_from_db(DEFAULT_DB_ALIAS, overrides=())
+        rows = list(
+            SchemaOverride.objects.using(DEFAULT_DB_ALIAS)
+            .select_related("target_ct")
+            .order_by("pk")
+        )
+        _valid, stale = split_stale_overrides(loaded[0], rows)
+    except DatabaseError, RuntimeError, SchemaError:
+        return []
+    return [
+        checks.Warning(
+            f"Stored override {row.pk} references a name removed from the baseline; ignored.",
+            id="rebac.W010",
+            hint="Update or delete the stale SchemaOverride row.",
+        )
+        for row in stale
+    ]

@@ -433,6 +433,7 @@ def test_filtered_constant_export_is_byte_deterministic_and_legacy_compatible(
     assert _run_build(monkeypatch, [app], tmp_path / "legacy.zed") == first
 
 
+@pytest.mark.pg_delta
 @pytest.mark.django_db(transaction=True)
 @pytest.mark.parametrize("backing_kind", ["const", "field"])
 def test_candidate_column_collation_matches_stored_checks_and_exclusion(

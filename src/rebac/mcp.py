@@ -16,7 +16,7 @@ Actor resolution order (first hit wins):
    ``REBAC_MCP_ACTOR_RESOLVER`` (default :func:`default_actor_resolver`, which
    reads ``ctx.request_context.meta["actor_subject"]`` as a canonical
    :class:`~rebac.SubjectRef` string such as ``auth/user:42`` or
-   ``agents/grant:42.assistant#valid``).
+   ``agents/grant:v2_<digest>#valid``).
 2. The ambient :func:`rebac.current_actor` — a transport middleware may have
    populated it at the request boundary.
 
@@ -56,7 +56,9 @@ from .actors import actor_context, current_actor
 from .backends import backend
 from .conf import app_settings
 from .errors import PermissionDenied
+from .index.codec import identity_codec
 from .preflight import check_new
+from .resources import model_for_resource_type
 from .types import CheckResult, ObjectRef, PermissionResult, SubjectRef
 
 _F = TypeVar("_F", bound=Callable[..., Any])
@@ -106,7 +108,7 @@ def default_actor_resolver(ctx: Any) -> SubjectRef | None:
     """Resolve the actor from ``ctx.request_context.meta["actor_subject"]``.
 
     ``actor_subject`` is a canonical :class:`~rebac.SubjectRef` string —
-    ``auth/user:42``, ``agents/grant:42.assistant#valid``, ``auth/apikey:k_1``.
+    ``auth/user:42``, ``agents/grant:v2_<digest>#valid``, ``auth/apikey:k_1``.
     Returns ``None`` when no such key is present *or* when the value is not a
     parseable ref, so the decorator falls through to its fail-closed deny — a
     missing or malformed actor is a clean deny, never a 500.
@@ -197,8 +199,16 @@ def _object_ref(
     if id_arg is not None:
         value = bound.arguments.get(id_arg)
         if value is not None:
-            return ObjectRef(resource_type, str(value))
+            wire = str(value)
+            if not wire:
+                raise PermissionDenied(f"Empty resource ID for {resource_type}")
+            model = model_for_resource_type(resource_type)
+            if model is not None and not identity_codec(model).is_canonical(wire):
+                raise PermissionDenied(f"Non-canonical resource ID for {resource_type}: {wire!r}")
+            return ObjectRef(resource_type, wire)
     if resource_id is not None:
+        if not resource_id:
+            raise PermissionDenied(f"Empty resource ID for {resource_type}")
         return ObjectRef(resource_type, resource_id)
     return ObjectRef(resource_type, _SINGLETON_ID)
 
@@ -213,8 +223,11 @@ def _create_overlay(
     ``create_relations`` maps each relation name the not-yet-persisted row would
     carry to the call argument holding the subject it would point at, as a
     canonical ref string (e.g. ``"blog/vault:v1"``). A relation whose argument is
-    absent, ``None``, or not a parseable ref contributes no candidate — so that
-    path resolves empty and the create check fails closed for it.
+    absent or ``None`` contributes no candidate, so that path resolves empty and
+    the create check fails closed for it. An argument that is present but not a
+    parseable ref the relation allows (canonical for model-backed subjects, the
+    declared target for const-backed ones) refuses the call: a malformed
+    candidate is never silently treated as an absent edge.
     """
     overlay: dict[str, Sequence[SubjectRef]] = {}
     for relation, arg_name in create_relations.items():
@@ -222,9 +235,12 @@ def _create_overlay(
         if value is None:
             continue
         try:
-            overlay[relation] = [SubjectRef.parse(str(value))]
-        except ValueError:
-            continue
+            subject = SubjectRef.parse(str(value))
+        except ValueError as exc:
+            raise PermissionDenied(f"Invalid subject for create relation {relation}") from exc
+        if not subject.subject_id:
+            raise PermissionDenied(f"Empty subject ID for create relation {relation}")
+        overlay[relation] = [subject]
     return overlay
 
 

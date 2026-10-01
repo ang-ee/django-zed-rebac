@@ -59,7 +59,7 @@ async def search_documents(
 
 - The decorator resolves the actor from the MCP request context. Initial
   support should read `ctx.request_context.meta["actor_subject"]` as a canonical
-  string such as `auth/user:42` or `agents/grant:42.assistant#valid`.
+  string such as `auth/user:42` or `agents/grant:v2_<digest>#valid`.
 - The decorator constructs `ObjectRef(resource_type, resource_id)` where
   `resource_id` comes from `id_arg` or an explicit `resource_id`. In 0.23.0,
   use a concrete `resource_id="singleton"` for singleton tools; resource-side

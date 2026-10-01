@@ -32,11 +32,9 @@ def test_delete_cleanup_uses_signal_database_alias(settings):
     with (
         patch("rebac.models.active_relationship_model", return_value=relationship_model),
         patch("rebac.signals.router.allow_migrate_model", return_value=True),
-        patch("rebac.index.maintain.tuple_owner", return_value=nullcontext(None)),
         patch("rebac.signals._finish_signal"),
         patch("rebac.backends.local.mark_relationships_changed") as invalidated,
         patch("rebac.index.maintain.tuple_owner", return_value=nullcontext(MagicMock())) as owner,
-        patch("rebac.index.maintain.maintain_tuples", return_value=nullcontext()),
     ):
         _rebac_cascade_resource(sender=Post, instance=target, using="replica")
 

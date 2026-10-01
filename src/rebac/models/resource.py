@@ -115,6 +115,8 @@ class RebacResource(models.Model):
     def upsert_refs_bulk(
         cls,
         pairs: list[tuple[str, str]],
+        *,
+        using: str | None = None,
     ) -> dict[tuple[str, str], int]:
         """Batched variant of :meth:`upsert_ref` returning a ``(type, id) → pk`` map.
 
@@ -126,5 +128,5 @@ class RebacResource(models.Model):
         from rebac.index.write import bulk_intern
 
         return bulk_intern(
-            cls, ("resource_type", "resource_id"), pairs, using=router.db_for_write(cls)
+            cls, ("resource_type", "resource_id"), pairs, using=using or router.db_for_write(cls)
         )

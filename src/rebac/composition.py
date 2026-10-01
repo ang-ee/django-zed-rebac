@@ -23,6 +23,7 @@ happens at row evaluation time (LocalBackend), not here.
 
 from __future__ import annotations
 
+from collections import Counter
 from collections.abc import Iterable
 from dataclasses import dataclass
 from datetime import datetime
@@ -40,7 +41,7 @@ from .schema.ast import (
     PermRef,
     Schema,
 )
-from .schema.parser import parse_permission_expression
+from .schema.parser import parse_permission_expression, reference_issues
 
 if TYPE_CHECKING:
     from .models import SchemaOverride
@@ -141,8 +142,48 @@ def compose_tagged(baseline: Schema, overrides: Iterable[SchemaOverride]) -> Tag
     # Reject any composition that introduces a permission cycle that wasn't
     # present in the baseline.
     _detect_cycles(baseline, composed)
+    baseline_errors = Counter(reference_issues(baseline))
+    reference_errors = [
+        issue.message()
+        for issue in (Counter(reference_issues(composed)) - baseline_errors).elements()
+    ]
+    if reference_errors:
+        raise SchemaError("; ".join(reference_errors))
 
     return TaggedComposition(composed, arms, sites)
+
+
+def split_stale_overrides(
+    baseline: Schema, overrides: list[SchemaOverride]
+) -> tuple[list[SchemaOverride], list[SchemaOverride]]:
+    """Ignore stored arms whose names disappeared from the current baseline."""
+    groups, _caveats = _group_overrides(overrides)
+    stale: set[int] = set()
+    for (_kind, resource_type, permission_name), rows in groups.items():
+        definition = baseline.get_definition(resource_type)
+        if definition is None:
+            continue
+        for row in rows:
+            expression = parse_permission_expression(row.expression)
+            candidate = Definition(
+                resource_type,
+                definition.relations,
+                tuple(
+                    Permission(
+                        perm.name,
+                        expression if perm.name == permission_name else perm.expression,
+                    )
+                    for perm in definition.permissions
+                ),
+            )
+            before = Counter(reference_issues(Schema(definitions=[definition])))
+            after = Counter(reference_issues(Schema(definitions=[candidate])))
+            if after - before:
+                stale.add(id(row))
+    return (
+        [row for row in overrides if id(row) not in stale],
+        [row for row in overrides if id(row) in stale],
+    )
 
 
 def recaveat_targets(overrides: Iterable[SchemaOverride]) -> frozenset[str]:

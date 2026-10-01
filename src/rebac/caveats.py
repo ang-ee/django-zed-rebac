@@ -179,7 +179,7 @@ def evaluate(
 
     missing: list[str] = []
     for name in declared:
-        if name not in static and name not in dynamic:
+        if (static[name] if name in static else dynamic.get(name)) is None:
             missing.append(name)
 
     if missing:
@@ -192,34 +192,31 @@ def evaluate(
     for name, type_name in declared.items():
         # Stored policy wins when both supply.
         raw = static[name] if name in static else dynamic[name]
-        activation[name] = _coerce_param(raw, type_name, cel)
-
-    # Surface anything else the caller passed (caveats can reference globals
-    # like `request.ip` if the schema declares them; we already handled
-    # declared params above). Everything else is best-effort opaque.
-    for name, raw in dynamic.items():
-        if name in declared or name in activation:
-            continue
-        activation[name] = raw
-    for name, raw in static.items():
-        if name in declared:
-            continue
-        activation[name] = raw
+        failure: str | None = None
+        try:
+            activation[name] = _coerce_param(raw, type_name, cel)
+        except CaveatUnsupportedError:
+            failure = f"Caveat {caveat.name!r} requires a boolean value for parameter {name!r}"
+        except Exception:
+            failure = (
+                f"Caveat {caveat.name!r} has an invalid value for parameter {name!r}; "
+                "context value redacted"
+            )
+        if failure is not None:
+            raise CaveatUnsupportedError(failure)
 
     program = compile_caveat(caveat)
+    evaluation_failed = False
+    result: Any = None
     try:
         result = program.evaluate(activation)
-    except cel.CELEvalError as exc:
-        # Most commonly: a downstream sub-expression references an undeclared
-        # variable. Treat as CONDITIONAL when the underlying error is a
-        # KeyError (missing var); otherwise propagate as a CaveatUnsupportedError.
-        cause = exc.args[1] if len(exc.args) > 1 else None
-        names = exc.args[2] if len(exc.args) > 2 else None
-        if cause is KeyError and isinstance(names, tuple):
-            return None, tuple(sorted(str(n) for n in names))
+    except cel.CELEvalError:
+        evaluation_failed = True
+    if evaluation_failed:
         raise CaveatUnsupportedError(
-            f"Caveat {caveat.name!r} failed to evaluate: {exc.args[0] if exc.args else exc}"
-        ) from exc
+            f"Caveat {caveat.name!r} failed to evaluate with parameters "
+            f"{', '.join(sorted(activation))}; context values redacted"
+        )
 
     if not isinstance(result, (bool, cel.celtypes.BoolType)):
         raise CaveatUnsupportedError(f"Caveat {caveat.name!r} must evaluate to a boolean")

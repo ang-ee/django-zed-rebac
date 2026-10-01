@@ -1,8 +1,9 @@
 name: CI
 
-# The fast gate for every push and pull request. Longer suites run in their
-# own workflows after this one succeeds, so a slow suite never holds up the
-# lint, type and SQLite results, and publishing waits only on this gate.
+# Tier 1 and tier 2 (docs/ARCHITECTURE.md § Test tiers) as two parallel jobs.
+# Tier 1 is the gate for merging and for publishing: Publish to PyPI reads the
+# result of the `test (3.14, 6.0)` job, not of this whole run. Tier 3 runs in
+# release.yml.
 
 # Pushes to lane branches don't run CI; their commits run it on main or in a
 # pull request, so one commit is tested once.
@@ -21,7 +22,7 @@ jobs:
     # Branch protection requires this check name.
     name: test (3.14, 6.0)
     runs-on: ubuntu-latest
-    timeout-minutes: 30
+    timeout-minutes: 15
     steps:
       - uses: actions/checkout@v5
       # uv's managed Python bundles a current SQLite. The runner's system
@@ -33,10 +34,39 @@ jobs:
           uv venv --python 3.14 --python-preference only-managed
           uv run --no-sync python -c 'import sqlite3; print("SQLite", sqlite3.sqlite_version)'
           uv pip install -e '.[dev,caveats,drf,strawberry]' 'django==6.0.*'
-      - name: Lint, format and types
-        run: make lint format-check typecheck
-      - name: SQLite suite
-        run: make test-parallel
-      # Budgets measured with nothing else running, after the parallel suite.
-      - name: Scale budgets
-        run: make test-scale
+      - name: Lint, format, types and the SQLite suite
+        run: make check
+
+  postgres-delta:
+    name: postgres-delta
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    services:
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_USER: postgres
+          POSTGRES_PASSWORD: rebac-test
+          POSTGRES_DB: rebac_test
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U postgres -d rebac_test"
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+    env:
+      REBAC_TEST_POSTGRES_URL: postgresql://postgres:rebac-test@127.0.0.1:5432/rebac_test
+    steps:
+      - uses: actions/checkout@v5
+      # uv's managed Python bundles a current SQLite. The runner's system
+      # SQLite has a fixed parser stack that deep read plans overflow.
+      - name: Install uv
+        uses: astral-sh/setup-uv@v7
+      - name: Install dependencies and PostgreSQL driver
+        run: |
+          uv venv --python 3.14 --python-preference only-managed
+          uv run --no-sync python -c 'import sqlite3; print("SQLite", sqlite3.sqlite_version)'
+          uv pip install -e '.[dev,caveats,drf,strawberry]' 'django==6.0.*' 'psycopg[binary]>=3.2,<4'
+      - name: PostgreSQL delta
+        run: make test-pg

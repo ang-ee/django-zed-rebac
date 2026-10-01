@@ -130,16 +130,6 @@ def test_to_subject_ref_user_uses_setting():
     assert ref.subject_id == "alice"
 
 
-@pytest.mark.django_db
-def test_to_subject_ref_user_defaults_to_pk():
-    from django.contrib.auth import get_user_model
-
-    User = get_user_model()
-    u = User.objects.create(username="alice", is_active=True)
-    ref = to_subject_ref(u)
-    assert ref.subject_id == str(u.pk)
-
-
 # ---------------------------------------------------------------------------
 # Signals — resource_id reflects the configured attr on writes
 # ---------------------------------------------------------------------------

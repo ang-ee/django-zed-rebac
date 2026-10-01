@@ -19,7 +19,7 @@ from unittest.mock import patch
 
 import pytest
 
-from rebac.schema.ast import PermArrow, PermBinOp, Permission, PermRef
+from rebac.schema.ast import CaveatParam, PermArrow, PermBinOp, Permission, PermRef
 from rebac.schema.parser import parse_permission_expression, parse_zed
 from rebac.types import CheckResult, ObjectRef, RelationshipTuple, SubjectRef
 from tests.index_oracle import MemoryWalkerOracle
@@ -292,14 +292,31 @@ def test_model_level_check_preserves_empty_type_and_existing_row_semantics():
     assert compare(schema_for("r1"), [], resource=empty) == CheckResult.no()
 
 
-def test_fully_pinned_declared_params_do_not_erase_undeclared_runtime_condition():
+def test_fully_pinned_params_do_not_erase_missing_declared_runtime_condition():
     schema = schema_for("authenticated - r1")
     schema.caveats = [
-        replace(c, expression="a && runtime_flag") if c.name == "ca" else c for c in schema.caveats
+        replace(
+            c,
+            params=(*c.params, CaveatParam("runtime_flag", "bool")),
+            expression="a && runtime_flag",
+        )
+        if c.name == "ca"
+        else c
+        for c in schema.caveats
     ]
     tuples = [row("r1", ALICE, caveat="ca", pinned={"a": True})]
     result = compare(schema, tuples)
     assert result == CheckResult.conditional(("runtime_flag",))
+
+
+def test_reference_schema_rejects_undeclared_runtime_identifier():
+    from rebac.schema.parser import validate_schema
+
+    schema = schema_for("r1")
+    schema.caveats = [
+        replace(c, expression="a && runtime_flag") if c.name == "ca" else c for c in schema.caveats
+    ]
+    assert any("undeclared identifier 'runtime_flag'" in error for error in validate_schema(schema))
 
 
 def test_alternative_membership_paths_keep_all_missing_sets_and_last_expiry():

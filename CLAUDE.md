@@ -114,14 +114,18 @@ design that prevents the worst data-leakage bug class.
 
 - `REBAC_STRICT_MODE = True` is the production default.
 - Bypass requires explicit `.sudo(reason="...")` or `with sudo(reason="..."):`.
-  Both write a structured audit-log event.
+  Every public bypass writes one structured audit event when it takes effect:
+  block context at entry, queryset at first evaluation/update/delete, instance
+  at first check/save/delete. Engine-internal captures use a private non-audited
+  path. Rows are durable only if the enclosing transaction commits.
 - Empty `sudo()` calls without `reason` raise when
   `REBAC_REQUIRE_SUDO_REASON = True` (default).
 - **Superuser carve-out.** When `REBAC_SUPERUSER_BYPASS = True` (default),
   two surfaces short-circuit for active superusers: (a)
   `RebacBackend.has_perm` returns `True` immediately, and (b)
   `ActorMiddleware` opens a `sudo(reason="superuser-bypass")` bracket for
-  the request lifetime so QuerySet `accessible()` scoping also lifts —
+  the request lifetime only when its resolver returned that superuser's own
+  subject, so QuerySet `accessible()` scoping also lifts —
   matching the contrib.auth contract that admin sees every row. The
   middleware path routes through the public `sudo()`, so each elevated
   request emits a `KIND_SUDO_BYPASS` audit row and obeys
@@ -213,6 +217,26 @@ evaluation does not exclude them.
 - **Don't** introduce an `active_test`-style toggle (Odoo's per-call
   footgun) that flips visibility from inside the permission layer. It's a
   top-level policy.
+
+### 5d. Backed edge writes follow the declaring resource
+
+Changing a column or through row watched by a field-backed relation requires
+`write` on every affected resource row of the relation's declaring type when
+that type declares a `write` permission. Reverse FK and M2M accessors, queryset
+writes through an auto-created through model, tracked backing sources and
+`RebacTrackedMixin` deletes, and symmetrical M2M mirror edges follow the same
+rule. Deny before mutation and audit the declaring resource after the rejected
+owner's transaction unwinds.
+Any declaring type without a permission literally named `write` is maintained
+without an actor gate, including resource types that use `edit` or `update`;
+consumers protect those backing columns with Django permissions. Pinned as
+expected failures for proposal 0011: `RebacMixin` deletes, which lift another
+type's backed edges with no `write` check; the collector's CASCADE and
+SET_NULL rows, which are gated under the ambient actor rather than the actor
+pinned on the deleted row; the moved row's own `write` and the pinned actor on
+reverse-FK `add(bulk=True)`; and instance-level through-model writes
+(`create`, `save`, `get_or_create`, `delete`), which are neither gated nor
+maintained.
 
 ### 6. Determinism is load-bearing
 
@@ -320,9 +344,17 @@ In a fix loop:
   `make test-fast` (`-n auto --dist worksteal --lf --ff -x`);
 - never run a whole module that takes over 30 s inside the loop; the
   reference sweep and scale modules are reached by node id only;
-- run `make test-index` once when the loop is green, then `make test-parallel`
-  once; re-run a full gate only after source changes it actually covers;
-- static checks (ruff, mypy, pyright) once at the end.
+- when the loop is green, run tier 1 once (`make check`), and tier 2
+  (`make test-pg`; `make pg-up` prints the `REBAC_TEST_POSTGRES_URL` for a
+  disposable local PostgreSQL, `make pg-down` removes it) only if the change
+  touches SQL generation, transactions, locking or migrations;
+- never run tier 3 (`make test-release`: slow, full PostgreSQL suite, scale,
+  reference sweep, vendor contracts, random order) as part of a change. It
+  runs nightly in `.github/workflows/release.yml`, and locally before a
+  release when the user asks for it. See `docs/ARCHITECTURE.md § Test tiers`;
+- a new test over 2 s is marked `slow`, with a small representative case left
+  unmarked. The default per-test timeout is 10 s; to run a `slow` test by node
+  id, pass `-m slow --timeout=300`.
 
 ### Tooling
 
@@ -419,9 +451,11 @@ from rebac import (
     app_settings,
 )
 from rebac.drf import RebacPermission, RebacFilterBackend
-from rebac.celery import propagate_actor          # 0.3+
 from rebac.mcp import rebac_mcp_tool                # 0.6+
 ```
+
+`rebac.celery` is not shipped: automatic Celery propagation is planned
+(ARCHITECTURE.md § Celery); tasks use `actor_context()` / `.with_actor()`.
 
 `with_actor` itself is a method on `RebacManager` / `RebacQuerySet`, not
 a top-level import. The top-level `actor_context(actor)` is the
@@ -529,19 +563,21 @@ When implementing or modifying the plugin:
    emitter is two PRs.
 3. **Update specs first if the change is structural.** A new public API
    needs a spec entry before code lands.
-4. **Run the verification chain** before reporting complete:
-   - `ruff check src/ tests/`
-   - `ruff format --check src/ tests/`
-   - `mypy --strict src/`
-   - `pyright src/`
-   - `pytest` (default suite; excludes opt-in slow/vendor cases)
-   - `make test-index-reference` (complete reference sweep)
-   - `make test-postgres` (`REBAC_TEST_POSTGRES_URL` required)
-   - `make test-schema-vendors` (Docker PostgreSQL/MySQL contracts)
-   - `pytest -m spicedb` (Docker or `REBAC_TEST_SPICEDB_ENDPOINT`; once the
-     conformance suite lands)
+4. **Run the verification chain** before reporting complete. It is tier 1,
+   plus tier 2 when the change can behave differently on PostgreSQL; see
+   `docs/ARCHITECTURE.md § Test tiers`:
+   - `make check` — ruff lint and format, `mypy --strict`, pyright, and the
+     fast SQLite suite in parallel. Under a minute.
+   - `make test-pg` (`REBAC_TEST_POSTGRES_URL` required) — only for changes to
+     SQL generation, transactions, locking or migrations.
    - `python manage.py rebac sync --check` (in the integration test
-     project)
+     project) when the schema or sync command changed.
+
+   Tier 3 is **not** part of this chain: the reference sweep
+   (`make test-index-reference`), the full PostgreSQL suite, the scale
+   budgets, `make test-schema-vendors` and, once it lands, `pytest -m spicedb`
+   run nightly and before a release (`make test-release`). Say in the report
+   that tier 3 was not run; don't run it to be safe.
 5. **Determinism test on every emitter touch.** See
    [§ Don't ship a non-deterministic build](#dont-ship-a-non-deterministic-build).
 6. **No backwards-compat shims during 0.x.** Lockstep breaking changes are

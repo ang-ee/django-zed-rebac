@@ -147,20 +147,6 @@ def test_check_access_missing_param_no_context_arg(backend):
     assert result.conditional_on == ("now",)
 
 
-def test_check_access_dynamic_context_overrides_static(backend):
-    """Dynamic context wins over the row's pinned static context."""
-    # Row says `expires_at = FUTURE` but caller overrides with EXPIRED.
-    _write_caveated_viewer(backend, "p5", "u5", expires_at=FUTURE)
-    result = backend.check_access(
-        subject=_user("u5"),
-        action="read",
-        resource=_post("p5"),
-        context={"now": PAST, "expires_at": EXPIRED},
-    )
-    # PAST < EXPIRED → True
-    assert result.allowed is True
-
-
 def test_accessible_excludes_conditional_when_param_missing(backend):
     """Without `now`, all rows are CONDITIONAL → accessible() returns empty."""
     _write_caveated_viewer(backend, "p_a", "u", expires_at=FUTURE)
@@ -385,6 +371,244 @@ def test_caveat_unsupported_when_celpy_missing(monkeypatch):
     # Reset state for the next tests in the suite.
     caveats_mod._CELPY_TRIED = False
     caveats_mod._CELPY_MODULE = None
+
+
+# One caveat per declared parameter type (ZED.md § Conditional access). Values
+# are JSON-shaped, as ``caveat_context`` round-trips through a JSONField.
+PARAMETER_TYPES = [
+    ("int", "x > 1", 2, 0),
+    ("uint", "x > 1u", 2, 0),
+    ("double", "x > 1.5", 2.5, 1.0),
+    ("string", 'x == "abc"', "abc", "abd"),
+    ("bool", "x", True, False),
+    ("bytes", 'x == b"abc"', "abc", "abd"),
+    ("duration", 'x > duration("1h")', "7200s", "60s"),
+    (
+        "timestamp",
+        'x < timestamp("2100-01-01T00:00:00Z")',
+        "2020-01-01T00:00:00Z",
+        "2200-01-01T00:00:00Z",
+    ),
+    ("list<string>", '"a" in x', ["a", "b"], ["c"]),
+    ("map<int>", 'x["k"] == 1', {"k": 1}, {"k": 2}),
+]
+
+
+@pytest.mark.parametrize(
+    ("type_name", "expression", "allowed", "denied"),
+    PARAMETER_TYPES,
+    ids=[case[0] for case in PARAMETER_TYPES],
+)
+def test_each_parameter_type_evaluates(type_name, expression, allowed, denied):
+    from rebac.caveats import evaluate
+
+    caveat = parse_zed(f"caveat typed(x {type_name}) {{\n    {expression}\n}}\n").caveats[0]
+    assert evaluate(caveat, {}, {"x": allowed}) == (True, ())
+    assert evaluate(caveat, {"x": denied}, {}) == (False, ())
+    assert evaluate(caveat, {}, {}) == (None, ("x",))
+
+
+def test_parameter_types_through_the_backend(db):
+    """Stored JSON context of every type reaches the evaluator intact."""
+    caveats = "\n".join(
+        f"caveat typed_{index}(x {type_name}) {{\n    {expression}\n}}"
+        for index, (type_name, expression, _, _) in enumerate(PARAMETER_TYPES)
+    )
+    subjects = " | ".join(f"auth/user with typed_{index}" for index in range(len(PARAMETER_TYPES)))
+    local = LocalBackend()
+    install_schema(
+        local,
+        parse_zed(
+            f"""
+{caveats}
+definition auth/user {{}}
+definition blog/post {{
+    relation viewer: {subjects}
+    permission read = viewer
+}}
+"""
+        ),
+    )
+    writes = []
+    for index, (_, _, allowed, denied) in enumerate(PARAMETER_TYPES):
+        for user, value in (("allowed", allowed), ("denied", denied)):
+            writes.append(
+                RelationshipTuple(
+                    resource=_post(str(index)),
+                    relation="viewer",
+                    subject=_user(user),
+                    caveat_name=f"typed_{index}",
+                    caveat_context={"x": value},
+                )
+            )
+    local.write_relationships(writes)
+    expected = {str(index) for index in range(len(PARAMETER_TYPES))}
+    assert (
+        set(local.accessible(subject=_user("allowed"), action="read", resource_type="blog/post"))
+        == expected
+    )
+    assert (
+        set(local.accessible(subject=_user("denied"), action="read", resource_type="blog/post"))
+        == set()
+    )
+
+
+def test_cel_compile_error_raises_caveat_unsupported():
+    from rebac.caveats import evaluate
+    from rebac.schema.ast import Caveat, CaveatParam
+
+    caveat = Caveat("broken", (CaveatParam("x", "int"),), "x >")
+    with pytest.raises(CaveatUnsupportedError, match="compile"):
+        evaluate(caveat, {}, {"x": 1})
+
+
+@pytest.mark.parametrize(
+    ("type_name", "expression", "value"),
+    [
+        pytest.param("int", "10 / x > 1", 0, id="divide-by-zero"),
+        pytest.param("int", "[1, 2][x] > 0", 5, id="index-out-of-range"),
+        pytest.param("int", "x.size() > 0", 1, id="no-such-overload"),
+        pytest.param("string", "x > 1", "a", id="mismatched-operands"),
+        pytest.param(
+            "string",
+            '{"a": 1}[x] > 0',
+            "b",
+            id="missing-map-key",
+        ),
+        pytest.param(
+            "ipaddress",
+            'x.in_cidr("10.0.0.0/8")',
+            "10.0.0.1",
+            id="ipaddress",
+        ),
+    ],
+)
+def test_cel_runtime_error_raises_caveat_unsupported(type_name, expression, value):
+    from rebac.caveats import evaluate
+    from rebac.schema.ast import Caveat, CaveatParam
+
+    caveat = Caveat("failing", (CaveatParam("x", type_name),), expression)
+    with pytest.raises(CaveatUnsupportedError, match="failing"):
+        evaluate(caveat, {}, {"x": value})
+
+
+def test_cel_runtime_error_redacts_context_values():
+    from rebac.caveats import evaluate
+    from rebac.schema.ast import Caveat, CaveatParam
+
+    caveat = Caveat("redacted", (CaveatParam("secret", "string"),), "secret > 1")
+    with pytest.raises(CaveatUnsupportedError) as captured:
+        evaluate(caveat, {}, {"secret": "sensitive-token"})
+    assert "secret" in str(captured.value)
+    assert "sensitive-token" not in str(captured.value)
+    assert "sensitive-token" not in repr(captured.value.__cause__)
+    assert "sensitive-token" not in repr(captured.value.__context__)
+
+
+def test_cel_coercion_error_redacts_context_value():
+    from rebac.caveats import evaluate
+    from rebac.schema.ast import Caveat, CaveatParam
+
+    caveat = Caveat("limit", (CaveatParam("n", "int"),), "n > 1")
+    with pytest.raises(CaveatUnsupportedError) as captured:
+        evaluate(caveat, {}, {"n": "sensitive-token"})
+    assert "sensitive-token" not in str(captured.value)
+    assert "sensitive-token" not in repr(captured.value.__cause__)
+    assert "sensitive-token" not in repr(captured.value.__context__)
+
+
+@pytest.mark.parametrize(
+    "body, expected",
+    [
+        ("n > 100 || .admin", "leading-dot identifier"),
+        ("items.exists(z.w, z > 1)", "bare binder name"),
+        ("items.reduce(x, y, x + y)", "unsupported CEL macro"),
+    ],
+)
+def test_cel_validator_refuses_opaque_identifier_forms(body, expected):
+    from rebac.schema.parser import validate_schema
+
+    schema = parse_zed("caveat c(n int, items list<int>) { " + body + " }")
+    assert any(expected in error for error in validate_schema(schema))
+
+
+def test_undeclared_caller_context_does_not_enter_cel_activation():
+    from rebac.caveats import evaluate
+    from rebac.schema.ast import Caveat, CaveatParam
+
+    caveat = Caveat("guarded", (CaveatParam("n", "int"),), "n > 100 || admin")
+    with pytest.raises(CaveatUnsupportedError):
+        evaluate(caveat, {}, {"n": 1, "admin": True})
+
+
+def test_missing_optional_cel_dependency_is_checked_only_for_caveat_schemas(monkeypatch, tmp_path):
+    import importlib.util
+
+    from rebac.checks import check_caveat_dependency
+    from rebac.schema import validate_schema
+
+    path = tmp_path / "permissions.zed"
+    monkeypatch.setattr(importlib.util, "find_spec", lambda name: None)
+    monkeypatch.setattr("rebac.schema.resolve_schema_path", lambda config: path)
+    path.write_text("definition auth/user {}\n", encoding="utf-8")
+    assert validate_schema(parse_zed(path.read_text(encoding="utf-8"))) == []
+    assert check_caveat_dependency() == []
+    path.write_text("caveat c(n int) { n > 0 }\n", encoding="utf-8")
+    assert [issue.id for issue in check_caveat_dependency()] == ["rebac.E021"]
+
+
+@pytest.mark.parametrize(
+    "body",
+    [
+        "items.exists(x, x == 1)",
+        "items.all(item, item > 0)",
+        "n == 0x1F",
+        "d > 1e3",
+        "type(n) == int",
+        'name == r"abc"',
+        "items.map(v, v * 2).size() > 0",
+    ],
+)
+def test_cel_validator_accepts_valid_syntax_and_macro_variables(body):
+    from rebac.schema.parser import validate_schema
+
+    schema = parse_zed("caveat c(items list<int>, n int, d double, name string) { " + body + " }")
+    assert validate_schema(schema) == []
+
+
+def test_cel_runtime_error_surfaces_from_check_access(db):
+    local = LocalBackend()
+    install_schema(
+        local,
+        parse_zed(
+            """
+caveat indexed(x int) {
+    [1, 2][x] > 0
+}
+definition auth/user {}
+definition blog/post {
+    relation viewer: auth/user with indexed
+    permission read = viewer
+}
+"""
+        ),
+    )
+    local.write_relationships(
+        [
+            RelationshipTuple(
+                resource=_post("p"),
+                relation="viewer",
+                subject=_user("u"),
+                caveat_name="indexed",
+                caveat_context={},
+            )
+        ]
+    )
+    assert local.check_access(
+        subject=_user("u"), action="read", resource=_post("p"), context={"x": 0}
+    ).allowed
+    with pytest.raises(CaveatUnsupportedError, match="indexed"):
+        local.check_access(subject=_user("u"), action="read", resource=_post("p"), context={"x": 5})
 
 
 def test_unknown_caveat_in_row_is_treated_as_deny(backend):

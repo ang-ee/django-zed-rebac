@@ -11,6 +11,8 @@ from django.core import checks
 from django.test import override_settings
 
 from rebac.checks import (
+    check_auth_backend_installed,
+    check_backend_setting,
     check_cross_rbac_relations,
     check_field_read_mode_setting,
     check_universal_admin_in_roles,
@@ -368,3 +370,195 @@ def test_w004_errors_on_malformed_setting():
 def test_universal_admin_is_opt_in():
     assert app_settings.REBAC_UNIVERSAL_ADMIN_ROLE is None
     assert check_universal_admin_in_roles() == []
+
+
+# ---------------------------------------------------------------------------
+# Settings checks — ARCHITECTURE.md § AppConfig and system checks
+# ---------------------------------------------------------------------------
+
+
+def _ids(issues):
+    return [issue.id for issue in issues]
+
+
+@pytest.mark.parametrize("value", ["bogus", "", "LOCAL"])
+def test_e001_rejects_unknown_backend(value):
+    with override_settings(REBAC_BACKEND=value):
+        issues = check_backend_setting()
+    assert _ids(issues).count("rebac.E001") == 1
+    assert all(issue.level == checks.ERROR for issue in issues if issue.id == "rebac.E001")
+
+
+@pytest.mark.parametrize("value", ["local", "spicedb"])
+def test_e001_silent_for_supported_backends(value):
+    with override_settings(
+        REBAC_BACKEND=value, REBAC_SPICEDB_ENDPOINT="localhost:50051", REBAC_SPICEDB_TOKEN="t"
+    ):
+        assert "rebac.E001" not in _ids(check_backend_setting())
+
+
+def test_e001_is_reported_by_the_check_framework():
+    with override_settings(REBAC_BACKEND="bogus"):
+        issues = checks.run_checks(tags=["rebac"])
+    assert "rebac.E001" in _ids(issues)
+
+
+def test_e002_requires_spicedb_endpoint():
+    with override_settings(
+        REBAC_BACKEND="spicedb", REBAC_SPICEDB_ENDPOINT=None, REBAC_SPICEDB_TOKEN="t"
+    ):
+        issues = [i for i in check_backend_setting() if i.id == "rebac.E002"]
+    assert sum("REBAC_SPICEDB_ENDPOINT" in issue.msg for issue in issues) == 1
+
+
+def test_e002_requires_spicedb_token():
+    with override_settings(
+        REBAC_BACKEND="spicedb", REBAC_SPICEDB_ENDPOINT="localhost:50051", REBAC_SPICEDB_TOKEN=""
+    ):
+        issues = [i for i in check_backend_setting() if i.id == "rebac.E002"]
+    assert sum("REBAC_SPICEDB_TOKEN" in issue.msg for issue in issues) == 1
+
+
+@pytest.mark.parametrize("installed", [False, True])
+def test_e002_requires_client_even_when_spicedb_settings_are_configured(monkeypatch, installed):
+    import importlib.util
+
+    monkeypatch.setattr(
+        importlib.util,
+        "find_spec",
+        lambda name: object() if installed else None,
+    )
+    with override_settings(
+        REBAC_BACKEND="spicedb", REBAC_SPICEDB_ENDPOINT="localhost:50051", REBAC_SPICEDB_TOKEN="t"
+    ):
+        issues = [issue for issue in check_backend_setting() if issue.id == "rebac.E002"]
+        assert bool(issues) is not installed
+        assert all("authzed" in issue.msg for issue in issues)
+    with override_settings(REBAC_BACKEND="local", REBAC_SPICEDB_ENDPOINT=None):
+        assert "rebac.E002" not in _ids(check_backend_setting())
+
+
+def test_e002_is_reported_by_the_check_framework():
+    with override_settings(REBAC_BACKEND="spicedb", REBAC_SPICEDB_ENDPOINT=None):
+        issues = checks.run_checks(tags=["rebac"])
+    assert "rebac.E002" in _ids(issues)
+
+
+def test_e006_rejects_unknown_storage():
+    with override_settings(REBAC_LOCAL_BACKEND_STORAGE="columnar"):
+        ids = _ids(check_backend_setting())
+    assert ids.count("rebac.E006") == 1
+    assert "rebac.W005" not in ids
+
+
+@pytest.mark.parametrize("storage", ["denormalized", "registry"])
+def test_e006_silent_for_supported_storage(storage):
+    with override_settings(REBAC_LOCAL_BACKEND_STORAGE=storage):
+        assert "rebac.E006" not in _ids(check_backend_setting())
+
+
+def test_w005_recommends_registry_for_local_denormalized_storage():
+    with override_settings(REBAC_BACKEND="local", REBAC_LOCAL_BACKEND_STORAGE="denormalized"):
+        issues = [i for i in check_backend_setting() if i.id == "rebac.W005"]
+    assert len(issues) == 1
+    assert issues[0].level == checks.WARNING
+    assert "migrate-storage" in (issues[0].hint or "")
+
+
+def test_w005_silent_for_registry_storage_or_other_backend():
+    with override_settings(REBAC_BACKEND="local", REBAC_LOCAL_BACKEND_STORAGE="registry"):
+        assert "rebac.W005" not in _ids(check_backend_setting())
+    with override_settings(
+        REBAC_BACKEND="spicedb",
+        REBAC_LOCAL_BACKEND_STORAGE="denormalized",
+        REBAC_SPICEDB_ENDPOINT="localhost:50051",
+        REBAC_SPICEDB_TOKEN="t",
+    ):
+        assert "rebac.W005" not in _ids(check_backend_setting())
+
+
+def test_w001_warns_without_rebac_auth_backend():
+    with override_settings(AUTHENTICATION_BACKENDS=["django.contrib.auth.backends.ModelBackend"]):
+        issues = check_auth_backend_installed()
+    assert _ids(issues) == ["rebac.W001"]
+    assert issues[0].level == checks.WARNING
+
+
+@pytest.mark.parametrize(
+    "path", ["rebac.backends.auth.RebacBackend", "rebac.backends.RebacBackend"]
+)
+def test_w001_silent_with_rebac_auth_backend(path):
+    with override_settings(
+        AUTHENTICATION_BACKENDS=[path, "django.contrib.auth.backends.ModelBackend"]
+    ):
+        assert check_auth_backend_installed() == []
+
+
+def test_w001_not_silenced_by_a_foreign_class_named_rebac_backend():
+    with override_settings(AUTHENTICATION_BACKENDS=["example.auth.RebacBackend"]):
+        assert _ids(check_auth_backend_installed()) == ["rebac.W001"]
+
+
+def test_w101_is_a_deploy_only_check():
+    from django.core.checks.registry import registry
+
+    from rebac.checks import check_production_settings
+
+    assert check_production_settings in registry.get_checks(include_deployment_checks=True)
+    assert check_production_settings not in registry.get_checks(include_deployment_checks=False)
+
+
+def test_w101_warns_when_spicedb_tls_is_disabled():
+    from rebac.checks import check_production_settings
+
+    with override_settings(REBAC_BACKEND="spicedb", REBAC_SPICEDB_TLS=False):
+        issues = check_production_settings()
+    assert _ids(issues) == ["rebac.W101"]
+    assert issues[0].level == checks.WARNING
+
+
+def test_w101_silent_with_tls_or_local_backend():
+    from rebac.checks import check_production_settings
+
+    with override_settings(REBAC_BACKEND="spicedb", REBAC_SPICEDB_TLS=True):
+        assert check_production_settings() == []
+    with override_settings(REBAC_BACKEND="local", REBAC_SPICEDB_TLS=False):
+        assert check_production_settings() == []
+
+
+@pytest.mark.parametrize("transport", ["none", "header"])
+def test_e007_and_w006_silent_for_stateless_transports(transport):
+    from rebac.checks import check_zookie_transport_setting
+
+    with override_settings(REBAC_ZOOKIE_TRANSPORT=transport):
+        assert check_zookie_transport_setting() == []
+
+
+def test_w006_warns_for_session_transport_without_sessions_app():
+    from django.apps import apps
+
+    from rebac.checks import check_zookie_transport_setting
+
+    assert not apps.is_installed("django.contrib.sessions")
+    with override_settings(REBAC_ZOOKIE_TRANSPORT="session"):
+        assert _ids(check_zookie_transport_setting()) == ["rebac.W006"]
+
+
+def test_w006_silent_for_session_transport_with_sessions_app():
+    from django.apps import apps
+    from django.test import modify_settings
+
+    from rebac.checks import check_zookie_transport_setting
+
+    with (
+        override_settings(REBAC_ZOOKIE_TRANSPORT="session"),
+        modify_settings(INSTALLED_APPS={"append": "django.contrib.sessions"}),
+    ):
+        assert apps.is_installed("django.contrib.sessions")
+        assert check_zookie_transport_setting() == []
+
+
+@pytest.mark.parametrize("mode", ["allow", "redact", "omit", "raise"])
+def test_e008_silent_for_supported_field_read_modes(mode):
+    with override_settings(REBAC_FIELD_READ_MODE=mode):
+        assert "rebac.E008" not in _ids(check_field_read_mode_setting())

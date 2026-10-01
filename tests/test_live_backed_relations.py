@@ -10,6 +10,7 @@ from rebac import (
     SchemaError,
     SubjectRef,
     evaluator_scope,
+    sudo,
 )
 from rebac.schema import parse_zed
 from rebac.types import RelationshipFilter
@@ -39,9 +40,10 @@ def live_backend(db):
 
 
 def test_fixed_attribute_owns_only_its_anchor(live_backend):
-    user = atomic_source_write(
-        get_user_model().objects.create_user, username="staff", is_staff=True, is_active=True
-    )
+    with sudo(reason="test.attribute-fixture"):
+        user = atomic_source_write(
+            get_user_model().objects.create_user, username="staff", is_staff=True, is_active=True
+        )
     subject = SubjectRef.of("auth/user", str(user.pk))
     assert live_backend.has_access(
         subject=subject, action="access", resource=ObjectRef("test/role", "admin")
@@ -87,16 +89,21 @@ def test_fixed_attribute_owns_only_its_anchor(live_backend):
 def test_live_backings_disable_evaluator_result_caching():
     backend = LocalBackend()
     install_schema(backend, parse_zed(SCHEMA))
-    user = atomic_source_write(
-        get_user_model().objects.create_user, username="cache-staff", is_staff=True, is_active=True
-    )
+    with sudo(reason="test.attribute-fixture"):
+        user = atomic_source_write(
+            get_user_model().objects.create_user,
+            username="cache-staff",
+            is_staff=True,
+            is_active=True,
+        )
     subject = SubjectRef.of("auth/user", str(user.pk))
     resource = ObjectRef("test/role", "admin")
 
     with evaluator_scope() as evaluator:
         assert evaluator.check(backend, subject=subject, action="access", resource=resource).allowed
         user.is_staff = False
-        atomic_source_write(user.save, update_fields=["is_staff"])
+        with sudo(reason="test.attribute-fixture"):
+            atomic_source_write(user.save, update_fields=["is_staff"])
         assert not evaluator.check(
             backend, subject=subject, action="access", resource=resource
         ).allowed
@@ -139,9 +146,13 @@ def test_types_unreachable_from_live_backing_keep_caching_decisions():
 def test_types_reaching_live_backing_through_const_targets_bypass_caching():
     backend = LocalBackend()
     install_schema(backend, parse_zed(CACHE_SCHEMA))
-    user = atomic_source_write(
-        get_user_model().objects.create_user, username="cache-banner", is_staff=True, is_active=True
-    )
+    with sudo(reason="test.attribute-fixture"):
+        user = atomic_source_write(
+            get_user_model().objects.create_user,
+            username="cache-banner",
+            is_staff=True,
+            is_active=True,
+        )
     subject = SubjectRef.of("auth/user", str(user.pk))
     resource = ObjectRef("blog/post", "top")
 
@@ -151,7 +162,8 @@ def test_types_reaching_live_backing_through_const_targets_bypass_caching():
             backend, subject=subject, action="access", resource_type="test/role"
         ) == ("admin",)
         user.is_staff = False
-        atomic_source_write(user.save, update_fields=["is_staff"])
+        with sudo(reason="test.attribute-fixture"):
+            atomic_source_write(user.save, update_fields=["is_staff"])
         assert not evaluator.check(
             backend, subject=subject, action="read", resource=resource
         ).allowed

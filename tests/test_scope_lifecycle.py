@@ -23,8 +23,15 @@ from rebac import (
 )
 from rebac.backends import reset_backend
 from rebac.schema import parse_zed
-from tests.backend_setup import install_schema
-from tests.test_recursive_queryscope import ACTOR, OUTSIDER, chain, grant, schema_context
+from tests.backend_setup import STORAGE_TIERS, install_schema
+from tests.test_recursive_queryscope import (
+    ACTOR,
+    OUTSIDER,
+    beyond_depth_limit,
+    chain,
+    grant,
+    schema_context,
+)
 from tests.testapp.models import Folder, Post
 
 pytestmark = pytest.mark.django_db(transaction=True)
@@ -49,11 +56,7 @@ def fixture(request):
 @pytest.mark.parametrize("change", ["relationship", "sync", "rollback", "invalidate", "boundary"])
 def test_existing_invalidation_owner_rebuilds(fixture, change):
     active, _, visible, hidden = fixture
-    original = type(active).queryset_filter
-    with (
-        evaluator_scope() as evaluator,
-        patch.object(type(active), "queryset_filter", autospec=True, side_effect=original),
-    ):
+    with evaluator_scope() as evaluator:
         assert Post.objects.with_actor(ACTOR).count() == 1
 
         if change == "relationship":
@@ -121,13 +124,15 @@ def test_implicit_expression_scope(fixture, embedding, actor):
             assert evaluate() == expected[embedding]
 
 
-@pytest.mark.parametrize("storage", ["denormalized", "registry"])
+@pytest.mark.parametrize("storage", STORAGE_TIERS)
 @pytest.mark.parametrize("backing", ["tuple", "field"])
-def test_recursive_enumeration_and_bulk_guard_beyond_old_bound(storage, backing):
+@pytest.mark.parametrize("depth", [3, pytest.param(12, marks=pytest.mark.slow)])
+def test_recursive_enumeration_and_bulk_guard_beyond_old_bound(storage, backing, depth):
     with (
+        beyond_depth_limit(depth),
         schema_context(storage, "folder", backing) as (active, member, hop, action),
     ):
-        rows = chain(active, hop, backing, 12)
+        rows = chain(active, hop, backing, depth)
         grant(active, rows[0], member)
         assert set(
             active.accessible(subject=ACTOR, action=action, resource_type="blog/folder")
@@ -204,10 +209,7 @@ def test_expiration_is_bound_at_execution_even_on_a_reused_scope(fixture):
             )
         ]
     )
-    with (
-        evaluator_scope(),
-        patch.object(active, "queryset_filter", wraps=active.queryset_filter),
-    ):
+    with evaluator_scope():
         pending = Post.objects.with_actor(ACTOR).scoped()
         with patch("django.utils.timezone.now", return_value=now):
             assert pending.exists()
@@ -221,7 +223,7 @@ def test_schema_expiry_rebuilds_without_a_write(fixture):
 
     from rebac.models import SchemaOverride, SchemaPermission
 
-    active, _, visible, _ = fixture
+    _, _, visible, _ = fixture
     permission = SchemaPermission.objects.get(definition__resource_type="blog/post", name="read")
     now = timezone.now()
     SchemaOverride.objects.create(
@@ -232,11 +234,7 @@ def test_schema_expiry_rebuilds_without_a_write(fixture):
         reason="expiry regression",
         expires_at=now + timedelta(seconds=1),
     )
-    active = backend()
-    with (
-        evaluator_scope(),
-        patch.object(active, "queryset_filter", wraps=active.queryset_filter),
-    ):
+    with evaluator_scope():
         with patch("django.utils.timezone.now", return_value=now):
             assert not Post.objects.with_actor(ACTOR).exists()
         with patch("django.utils.timezone.now", return_value=now + timedelta(seconds=2)):
@@ -248,7 +246,6 @@ def test_savepoint_rollback_restores_index_visibility(fixture):
     with (
         transaction.atomic(),
         evaluator_scope(),
-        patch.object(active, "queryset_filter", wraps=active.queryset_filter),
     ):
         assert Post.objects.with_actor(ACTOR).count() == 1
         savepoint = transaction.savepoint()

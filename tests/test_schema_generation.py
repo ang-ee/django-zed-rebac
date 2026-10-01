@@ -34,10 +34,11 @@ from rebac.models import (
 )
 from rebac.models.generation import SchemaGeneration
 
+from .backend_setup import STORAGE_TIERS
 from .testapp.models import Folder, Post
 
 pytestmark = pytest.mark.django_db(transaction=True)
-ACTOR = SubjectRef.of("auth/user", "reader")
+ACTOR = SubjectRef.of("auth/user", "1")
 
 
 @pytest.fixture(params=["denormalized", "registry"])
@@ -573,6 +574,7 @@ def test_generation_migration_reverses_without_changing_schema(synced):
     assert not _check(local, resource)
 
 
+@pytest.mark.parametrize("synced", STORAGE_TIERS, indirect=True)
 def test_cached_schema_keeps_filtered_constants_and_fields_live(synced):
     local, _ = synced
     audience = SchemaDefinition.objects.create(resource_type="site/audience")
@@ -618,6 +620,7 @@ def test_cached_schema_keeps_filtered_constants_and_fields_live(synced):
         assert not evaluator.check(local, subject=ACTOR, action="read", resource=resource).allowed
 
 
+@pytest.mark.parametrize("synced", STORAGE_TIERS, indirect=True)
 def test_schema_and_override_cache_follow_routed_database(synced, tmp_path, django_db_blocker):
     local, resource = synced
     alias = "schema_target"
@@ -674,6 +677,7 @@ def test_schema_and_override_cache_follow_routed_database(synced, tmp_path, djan
         del connections[alias]
 
 
+@pytest.mark.parametrize("synced", STORAGE_TIERS, indirect=True)
 def test_sync_uses_one_schema_write_alias(synced, tmp_path, django_db_blocker):
     from django.test import override_settings
 
@@ -708,11 +712,13 @@ def test_sync_uses_one_schema_write_alias(synced, tmp_path, django_db_blocker):
         del connections[alias]
 
 
-def test_shared_snapshots_retain_only_latest_revision(synced):
+@pytest.mark.parametrize("writes", [3, pytest.param(51, marks=pytest.mark.slow)])
+@pytest.mark.parametrize("synced", STORAGE_TIERS, indirect=True)
+def test_shared_snapshots_retain_only_latest_revision(synced, writes):
     local, resource = synced
     permission = _permission()
     old = local._schema_snapshot()
-    for index in range(51):
+    for index in range(writes):
         _write_permission("nil" if index % 2 else "owner", permission.pk)
         with evaluator_scope() as evaluator:
             assert evaluator.check(

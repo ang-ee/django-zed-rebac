@@ -3,7 +3,199 @@
 All notable changes to `django-zed-rebac` are tracked here. The project is in
 pre-1.0; breaking changes within a minor version are explicitly called out.
 
-## [Unreleased]
+## [0.24.0] — 2026-10-01
+
+### Breaking
+
+- In 0.24.0, `grant_subject_ref` emits a 46-character `v2_` SHA-256 based ID over
+  length-prefixed principal and agent types and IDs. Migrate grant objects and
+  relationship tuples together; neither older dot-joined IDs nor `v2.` IDs match.
+- M2M writes need an actor and `write` on every resource endpoint whose backed
+  relation changes; reverse FK saves, backing-filter column changes, signal-free
+  bulk writes, and symmetrical self-M2M mirror edges follow the same rule.
+  Bulk expressions whose backed values cannot be resolved, and tracked-model
+  conflict updates to watched backing columns, are refused.
+- Manager and queryset `raw()` require an explicit bypass; actor-scoped raw SQL
+  is refused.
+- Relationship queryset `update()` is unsupported. Instance saves and deletes
+  now maintain the index through tuple owners.
+- Pickled querysets shed pinned actor, bypass, results, and applied scope.
+- CEL runtime errors raise `CaveatUnsupportedError`; stored `None` caveat
+  parameters count as missing, and undeclared identifiers fail schema validation.
+- Duplicate relation and permission names are rejected by schema validation.
+- Override composition rejects newly introduced undefined names. Pre-existing
+  baseline errors do not become new composition failures.
+- MCP refuses non-canonical model IDs in `id_arg` and create relation overlays.
+- `rebac.E002` fires when the configured authzed client is missing.
+- Schemas using expiration have a changed deterministic content hash.
+- Backed-edge writes and tracked deletes require an actor and declaring-resource
+  `write` only when that resource type declares a permission literally named
+  `write`; other types, including resources with `edit` or `update`, rely on
+  the consumer's Django permissions pending proposal 0011. Reverse FK
+  `add(bulk=True)` and direct auto-created through writes now receive this gate.
+- Base-manager `update()` and `bulk_update()` of a watched column, reverse FK
+  `add(bulk=True)` and collector `SET_NULL` on a backed FK raise
+  `MissingActorError` in strict mode without an actor.
+- An unwatched M2M on a `RebacMixin` owner still requires `write` on the owner
+  row; before the first `rebac sync`, such writes need sudo.
+- `Relationship.objects.bulk_create(update_conflicts=True)` raises `ValueError`
+  unless the conflict target is the tuple's identity and only metadata columns
+  update.
+- Create-relation overlays with a malformed, non-canonical, disallowed or
+  empty subject, or an undeclared relation name, refuse the preflight instead
+  of resolving as an absent edge.
+- A schema that declares a caveat needs the `caveats` extra (`cel-python`);
+  without it `manage.py check` reports `rebac.E021`.
+- Write expressions that splice literal SQL (`RawSQL`; a `Func`, `Case` or
+  `Subquery` with a caller-supplied `template` or `arg_joiner`; a `Func` whose
+  `function` is not an identifier; a subquery using `extra()` in its select,
+  where, tables or ordering) are refused on models with field read gates when
+  they appear in the written value's expression tree. A `Q` inside a `When`
+  condition and an `F()` over a destination annotation are not traversed;
+  pinned for proposal 0013.
+- Known gaps pinned as strict expected failures for proposal 0013
+  (`tests/test_security_proposal_0013.py`): a hand-built `Case` on a watched
+  column whose leading arm SQL evaluates before the literal `When(pk=...)`
+  arms; literal SQL behind a `Q` or a destination annotation; a related-manager
+  call from a multi-table child of the declaring model; queryset writes
+  through an auto-created through model's `_base_manager`; a `RebacMixin`
+  base-manager `update()` of a watched scalar column.
+- The D2 autocommit warning is emitted for tracked `auth.User` and `auth.Group`
+  writes again, including `createsuperuser`.
+- Stored overrides whose names no longer resolve against the baseline are
+  ignored with `rebac.W010`; narrowing overrides are therefore dropped whole
+  until proposal 0012 lands.
+- Direct `Relationship.objects.bulk_create()`, including conflict updates,
+  participates in tuple ownership and index maintenance; a batch of 500 or
+  more tuples rebuilds the index in full inside the owner rather than
+  deriving incrementally.
+
+### Fixed
+
+- M2M owner writes retain their `write` gate when the through table backs no
+  relation; watched through captures now follow changed FK pairs and avoid
+  duplicate related-manager gates. Through-source capture resolves the owner
+  before the M2M hop, so direct bulk inserts retain edges when source and
+  target primary keys differ.
+- Relationship conflict upserts cannot move tuple identity through a primary
+  key conflict; metadata-only upserts retain index maintenance in both stores.
+- Create overlays reject malformed and disallowed subjects and unknown relation
+  names before permission evaluation, including MCP create arguments.
+- CEL validation rejects leading-dot identifiers, invalid macro binders and
+  `reduce`; undeclared caller keys never enter evaluation. Missing cel-python
+  reports `rebac.E021` only when a caveat schema is installed.
+- PostgreSQL `Cast(Case(...))` bulk updates pass the backed-field gate when
+  authorized; `RawSQL` writes on field-gated models are refused.
+- Escaped `scoped()` bypasses receive their own audit row, CEL exception
+  contexts redact caller values, and FK attname updates use the backed gate.
+- Tracked models with a callable field named `actor` use ambient scope; M2M
+  `set(objs=...)` passes its keyword argument through the checked wrapper.
+- D2 autocommit warnings again include tracked auth users and groups. The
+  autocommit drift itself remains with proposal 0012.
+- Slow four-hop test fixtures write their gated backing field under sudo.
+- Backend relationship batches use one tuple owner without per-row savepoints
+  while retaining model signals; backed-row bulk gates batch watched FK and
+  reverse-source lookups.
+- Field-read write-expression checks include concrete parent columns on
+  multi-table-inheritance resources.
+- Middleware grants the superuser request bypass only when the resolved actor
+  is the active session superuser's own subject.
+- DRF denies unresolved identities on REBAC objects; unrelated objects retain
+  the adapter's pass-through behavior after actor and action admission.
+- MCP and create preflight refuse caller-supplied empty resource or overlay
+  subject IDs, keeping the backend's internal model-level sentinel private.
+- Create overlays validate every model-backed subject against its identity
+  codec, including MCP relations and subject-set candidates.
+- Backed M2M and FK writes check both affected resource endpoints, batch the
+  gate, and audit denials.
+- `QuerySet.explain()` describes an actor-scoped query.
+- Relationship instance saves/deletes and queryset deletes maintain the
+  permission index; backend-owned deletes capture tuples once.
+- Refreshing a redacted model instance leaves previously denied fields hidden.
+- Bulk updates and instance saves check read gates on source columns used by
+  `F()` and other ORM write expressions, and refuse subqueries over models
+  with gated fields.
+- Bulk denial messages reveal neither resource IDs nor unreadable row counts.
+- CEL runtime errors redact caller values while retaining parameter names.
+- Superuser middleware suppresses bypass when user identity resolution fails.
+- Every public queryset, instance, and block bypass emits one `sudo.bypass`
+  audit row when used. Engine-internal captures do not. Audit durability follows
+  the enclosing transaction.
+- Module permission checks use effective index grants for each model's default
+  action, including group and wildcard paths.
+- Nested relationship writes derive index effects before returning a Zookie;
+  outer tokens cover nested xids and ambient tokens never regress.
+- Nested tuple derivation preserves the outer owner's old-state work and defers
+  vacuum and schema rebuild until that owner exits. Consumer Relationship
+  signal writes receive their own tuple ownership instead of inheriting an
+  ambient engine exemption.
+- Non-canonical model-backed create-overlay subjects refuse the whole preflight;
+  schema-owned constant targets retain their declared wire spelling.
+- OuterRef reads of destination fields in subqueries obey field-read gates.
+- Tracked deletes, reverse FK bulk adds and direct through writes check affected
+  backed resources; authorized literal `bulk_update` Case values proceed.
+- Backed-edge denial audit rows survive owner rollback and name the declaring
+  resource. M2M related managers preflight outside Django's internal atomic.
+- Unwatched M2M writes under sudo before the first sync do not load a program.
+- The related-manager wrapper exempts only the pairs it gated from the
+  per-row gates; through rows written by consumer `m2m_changed` handlers during
+  the call are gated.
+- Caller-supplied subjects for a filtered const-backed relation must be the
+  constant's own target; an unfiltered constant still refuses any supplied
+  tuple.
+- Each `bulk_update` statement freezes the rows it writes under a
+  per-statement work tag, so a multi-batch authorized update passes and no
+  primary-key list travels through SQL parameters; a `Case` with an arm whose
+  condition is not a plain `pk=<literal>`, an expression result or a default
+  is refused by the shape check (see the pinned gaps above for the arms that
+  evade it).
+- A symmetrical self-M2M gates its through pairs once; a multi-table child's
+  related-manager call no longer crashes but is not gated (pinned).
+- Restored evaluated querysets redo field redaction and prefetch after unpickling.
+- CEL schema validation uses cel-python's syntax tree, accepting macro variables,
+  hexadecimal and exponent literals, type constants and raw strings. Coercion
+  errors and chained causes redact caller context values.
+- Explicit queryset sudo on `raw()` emits one audit row; `scoped()` under an
+  ambient sudo block does not emit a second row.
+- Stale stored overrides that reference removed baseline names are ignored and
+  reported by `rebac.W010` instead of breaking permission reads.
+- Queryset pickling no longer executes the query before dropping its results.
+- DRF denies declared non-model REBAC objects with missing or empty IDs.
+- Django async permission checks reach `RebacBackend` through `ahas_perm` and
+  `ahas_module_perms`.
+- The schema tokenizer accepts CEL division, modulo, and single-quoted string
+  literals in caveat bodies.
+- Backend configuration checks report invalid selection, missing SpiceDB
+  settings or client, and authenticate backend identity without crashing.
+- Admin autodiscovery imports `rebac.admin` without a runtime generic shim.
+- `build-zed` emits `use expiration` when required.
+- `rebac explain` prints the composed effective permission expression.
+
+### Tests
+
+- The test commands follow the three tiers of ARCHITECTURE.md § Test tiers.
+  `make check` (tier 1) runs lint, format, mypy and pyright, then the SQLite
+  suite in parallel with work stealing, stopping at the first failure.
+  `make test-pg` (tier 2) runs the tests marked `postgresql` or `pg_delta` on
+  PostgreSQL. `make test-release` (tier 3) runs `slow` on SQLite, the whole
+  suite on PostgreSQL, the scale budgets on both vendors, the reference sweep,
+  the vendor contracts and a random-order run in sequence; it continues past a
+  failing part and reports each one. `make test-parallel` is removed.
+- The default per-test timeout is 10 s instead of 300 s. The targets that
+  select `slow`, `scale`, `index_exhaustive` or `schema_vendors` pass
+  `--timeout=300`.
+- `make pg-up` starts a disposable `postgres:16` container on a
+  Docker-assigned port and prints the `REBAC_TEST_POSTGRES_URL` to export;
+  `make pg-down` removes it. The PostgreSQL and vendor targets fail naming a
+  missing URL, driver or Docker instead of skipping.
+- CI runs tier 1 (`test (3.14, 6.0)`) and tier 2 (`postgres-delta`) as two
+  parallel jobs; the scale budgets moved out of CI. The PostgreSQL workflow is
+  replaced by Release, which runs tier 3 nightly on `main` and on demand, one
+  job per part, with the reference sweep split across six jobs by expression
+  shape.
+- Publish to PyPI reads the result of the `test (3.14, 6.0)` job instead of
+  the conclusion of the whole CI run, so a tag publishes on tier 1 alone and a
+  `postgres-delta` failure does not hold it back.
 
 ## [0.23.2] — 2026-09-30
 

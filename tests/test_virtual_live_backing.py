@@ -19,7 +19,7 @@ from rebac import (
 )
 from rebac.backends import reset_backend
 from rebac.schema import parse_zed
-from tests.backend_setup import atomic_source_write, install_schema
+from tests.backend_setup import STORAGE_TIERS, atomic_source_write, install_schema
 from tests.testapp.models import (
     AuthoredPost,
     PrimarySluggedPost,
@@ -142,6 +142,7 @@ def test_virtual_source_and_fk_target_ids_use_field_conversion_everywhere(active
     assert list(VirtualPost.objects.with_actor(alice).scoped()) == [post]
 
 
+@pytest.mark.parametrize("active", STORAGE_TIERS, indirect=True)
 def test_virtual_scope_keeps_union_intersection_exclusion_and_revocation_lazy(active, actors):
     alice, bob = actors
     with sudo(reason="virtual permission expression fixtures"):
@@ -189,6 +190,7 @@ def test_virtual_scope_keeps_union_intersection_exclusion_and_revocation_lazy(ac
     )
 
 
+@pytest.mark.parametrize("active", STORAGE_TIERS, indirect=True)
 def test_filtered_reverse_roster_requires_one_matching_membership_row(active, actors):
     alice, _bob = actors
     with sudo(reason="virtual reverse roster fixtures"):
@@ -251,6 +253,7 @@ def test_attribute_kind_uses_virtual_subject_identity_for_checks_and_lookups(act
     }
 
 
+@pytest.mark.parametrize("active", STORAGE_TIERS, indirect=True)
 def test_virtual_m2m_arrow_and_lookup_revoke_before_queryset_evaluation(active, actors):
     alice, _bob = actors
     with sudo(reason="virtual m2m fixtures"):
@@ -284,6 +287,7 @@ def test_virtual_m2m_arrow_and_lookup_revoke_before_queryset_evaluation(active, 
     )
 
 
+@pytest.mark.parametrize("active", STORAGE_TIERS, indirect=True)
 def test_fixed_attribute_admin_membership_uses_virtual_identity_and_active_filter(active, actors):
     _alice, _bob = actors
     with sudo(reason="fixed virtual attribute fixtures"):

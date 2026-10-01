@@ -228,6 +228,12 @@ deny access. The gate does not verify these promises after writing. The
 application must persist the promised tuples in the same transaction.
 `bulk_create()` never calls `save()`, so bulk paths must write the promised
 tuples themselves.
+Caller-supplied `check_new()` and MCP create-relation subjects for model-backed
+types must use canonical IDs. A non-canonical subject refuses the entire
+preflight, including exclusions; it is never discarded as an absent edge.
+The same refusal applies to an empty ID, a subject type or `#relation` not
+allowed by the relation, or an overlay key that is not a declared relation.
+Schema-owned constant targets keep their declared wire spelling.
 
 Adding REBAC model instances are insert-only, including candidates with an
 explicit primary key. Load an existing row before updating it; a constructed
@@ -687,8 +693,16 @@ result = backend().check_access(
 ```
 
 If you check WITHOUT supplying `ip`, the result is `CONDITIONAL_PERMISSION(missing=["ip"])`. The application can re-check with the missing field — useful for two-pass evaluation (cheap relationship check + expensive context resolution).
+A supplied `None` is also missing, including when stored relationship context
+pins the parameter to `None`; stored context still takes precedence.
 
 **`LocalBackend` caveat support.** Backed by [`cel-python`](https://pypi.org/project/cel-python/). Most CEL types work out of the box (`int`, `string`, `bool`, `list`, `map`, `timestamp`, `duration`). The `ipaddress` type is **not** in `cel-python`'s built-ins — `LocalBackend` raises `CaveatUnsupportedError`. Rewrite the caveat to take strings and do CIDR matching server-side, or move to the future `SpiceDBBackend` once it lands.
+Schema checks parse CEL with cel-python and validate only free identifiers
+against declared parameters and CEL built-ins. Macro variables in `exists`,
+`all`, `map`, and `filter` are local to their macro expression; `reduce` is
+not a CEL macro and is rejected. Leading-dot identifiers (`.name`) are
+rejected, and only declared parameters reach evaluation.
+Evaluation and parameter-coercion errors redact supplied values.
 
 ### MCP tools as resources
 
@@ -788,6 +802,14 @@ or automatically inherit the owner's permissions.
 `agents/agent` and `agents/grant` are **not** auto-emitted. They live in an
 application you ship. Declare any User/Group definitions your schema uses too;
 automatic base-schema emission is not implemented.
+
+`grant_subject_ref(agent, on_behalf_of=user)` constructs a conventional
+`agents/grant:v2_<digest>#valid` subject. The ID is `v2_` plus unpadded
+base64url of SHA-256 over the UTF-8 principal type, principal ID, agent type,
+and agent ID, each prefixed by its unsigned 4-byte big-endian length. The
+`#valid` subject relation is carried separately and is not part of the digest.
+The ID is 46 characters and uses SpiceDB-legal object-ID characters. Existing
+grant rows and their relationship tuples must be recreated when adopting it.
 
 A typical `agents/permissions.zed`:
 
@@ -902,6 +924,9 @@ authorize this subject shape explicitly; constructing it neither impersonates
 the requester nor copies the requester's grants. The user-subject examples
 above illustrate permission arrows, not an automatic mapping from this grant
 subject back to a user.
+The helper uses the fixed-length `v2_` digest recipe above. It replaces both
+the old `<user-id>.<agent-id>` form and the interim dot-separated `v2.` form.
+Migrate stored grant objects and relationship tuples together before using it.
 
 ```python
 # Common case: HTTP request from a Django user
@@ -1342,7 +1367,12 @@ The plugin parses the SpiceDB-canonical subset relevant to Django projects:
 - `relation` declarations with type unions, subject sets, wildcards, `with <caveat>`, `with expiration`
 - `permission` expressions: `+`, `&`, `-`, arrows (`->`)
 - `caveat` blocks with parameters and CEL expressions
+- CEL caveat bodies retain their operators and string literals, including
+  division (`/`), modulo (`%`), and single-quoted strings
 - Directives: `use typechecking` (auto-emitted), `use expiration`
+
+Each relation and permission name may be declared only once within a
+definition; duplicate declarations fail schema validation.
 
 NOT yet supported by the parser (raw `.zed` import + `WriteSchema` only when running against SpiceDB):
 

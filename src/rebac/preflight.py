@@ -200,6 +200,44 @@ def check_new(
     if permission is None and relation is None:
         return CheckResult.no(reason=f"unknown action: {resource_type}#{action}")
 
+    from .index.codec import identity_codec
+    from .resources import model_for_subject_type, model_resource_type
+
+    for name, candidates in rels.items():
+        declared = find_relation(definition, name)
+        if declared is None:
+            return CheckResult.no(reason=f"unknown proposed relation: {name}")
+        # Schema-owned constants keep their declared wire spelling, so only the
+        # canonical-identity check is skipped for them; a caller-supplied
+        # candidate must still be a subject the relation allows, and it can
+        # only ever be the constant's own target.
+        backing = declared.backing
+        if isinstance(backing, ConstBinding) and not backing.filters:
+            # An unfiltered constant is wholly schema-owned; a caller-supplied
+            # tuple for it is a programming error that the merge below raises.
+            continue
+        for candidate in candidates or ():
+            if not candidate.subject_id or not subject_allowed_by_relation(
+                declared, candidate, caveat_name=""
+            ):
+                return CheckResult.no(reason=f"invalid candidate for relation: {name}")
+            if isinstance(backing, ConstBinding):
+                if candidate.subject_id != backing.target_id:
+                    return CheckResult.no(reason=f"invalid candidate for relation: {name}")
+                continue
+            if candidate.subject_id == "*" and not candidate.optional_relation:
+                continue
+            mapped = model_for_subject_type(candidate.subject_type)
+            if mapped is None:
+                continue
+            model, attr = mapped
+            if model_resource_type(model):
+                from ._id import resource_id_attr
+
+                attr = resource_id_attr(model)
+            if not identity_codec(model, attr).is_canonical(candidate.subject_id):
+                return CheckResult.no(reason="non-canonical candidate subject identity")
+
     rels = _merge_const_backed_relationships(definition, rels)
     required_relations = relation_dependencies(schema, resource_type, action)
 
@@ -297,11 +335,7 @@ def _build_ctx(
         proposed = relationships.get(relation, ())
         if proposed is None:
             raise _UnknownRelation(relation)
-        candidates = [
-            candidate
-            for candidate in proposed
-            if subject_allowed_by_relation(relation_def, candidate, caveat_name="")
-        ]
+        candidates = list(proposed)
         return _virtual_membership(
             ctx=ctx,
             backend=backend,
@@ -324,11 +358,7 @@ def _build_ctx(
         proposed = relationships.get(via, ())
         if proposed is None:
             raise _UnknownRelation(via)
-        candidates = [
-            candidate
-            for candidate in proposed
-            if subject_allowed_by_relation(via_relation, candidate, caveat_name="")
-        ]
+        candidates = list(proposed)
         if not candidates:
             return False
         # Each arrow hop is a dispatch into another (real) resource, so

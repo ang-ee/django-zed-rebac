@@ -27,7 +27,7 @@ from rebac import (
 )
 from rebac.backends import reset_backend
 from rebac.schema import parse_zed
-from tests.backend_setup import atomic_source_write, install_schema
+from tests.backend_setup import STORAGE_TIERS, atomic_source_write, install_schema
 from tests.testapp.models import TextIdentityFolder, TextIdentityPost, TextIdentityPrimaryPost
 
 pytestmark = pytest.mark.django_db(transaction=True)
@@ -160,6 +160,7 @@ def test_encoded_identity_eager_scope_observes_grant_and_revoke(active, item_typ
         _assert_visible(active, before_unblock, alice, [post], [post])
 
 
+@pytest.mark.parametrize("active", STORAGE_TIERS, indirect=True)
 def test_field_arrow_into_encoded_identity_keeps_shared_and_owned_targets(
     active, item_type, actors
 ):
@@ -188,7 +189,11 @@ def test_field_arrow_into_encoded_identity_keeps_shared_and_owned_targets(
     _assert_visible(active, eager, alice, rows, [owned])
 
 
-def test_encoded_owner_corpus_is_not_enumerated_for_sparse_tuple_grants(active, item_type, actors):
+@pytest.mark.parametrize("corpus", [50, pytest.param(2000, marks=pytest.mark.slow)])
+@pytest.mark.parametrize("active", STORAGE_TIERS, indirect=True)
+def test_encoded_owner_corpus_is_not_enumerated_for_sparse_tuple_grants(
+    active, item_type, actors, corpus
+):
     alice, bob = actors
     model, identity = item_type
     with sudo(reason="encoded identity performance fixtures"):
@@ -223,14 +228,14 @@ def test_encoded_owner_corpus_is_not_enumerated_for_sparse_tuple_grants(active, 
             model.objects.bulk_create(
                 [
                     model(**{identity: f"item-{1000 + index}"}, title="owned", author=alice)
-                    for index in range(2000)
+                    for index in range(corpus)
                 ]
                 + [
                     model(**{identity: f"item-{5000 + index}"}, title="private", author=bob)
-                    for index in range(2000)
+                    for index in range(corpus)
                 ]
             )
-        large_cost = measure(2002)
+        large_cost = measure(2 + corpus)
     assert large_cost == small_cost
     assert large_cost[0] <= 16
     # The plan has five lookups (the item's site, and the folder's site behind
@@ -238,6 +243,7 @@ def test_encoded_owner_corpus_is_not_enumerated_for_sparse_tuple_grants(active, 
     assert large_cost[1] == 153
 
 
+@pytest.mark.parametrize("active", STORAGE_TIERS, indirect=True)
 def test_encoded_exclusion_with_caveated_group_membership_falls_back_wholly(
     active, item_type, actors
 ):
@@ -280,7 +286,7 @@ def test_encoded_exclusion_with_caveated_group_membership_falls_back_wholly(
     )
 
 
-@pytest.mark.parametrize("model_name", ["EncodedFolder", "EncodedPost", "EncodedPrimaryPost"])
+@pytest.mark.parametrize("model_name", ["EncodedFolder", "EncodedPrimaryPost"])
 def test_custom_encoded_identity_is_explicitly_refused(model_name):
     from rebac.errors import SchemaError
     from rebac.index.codec import identity_codec

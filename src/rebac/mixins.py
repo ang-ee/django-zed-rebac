@@ -201,7 +201,7 @@ def deletion_owner(
     scope = DeleteScope(origin, using, actor, unscoped)
     if isinstance(origin, models.QuerySet):
         roots = (
-            origin.system_context(reason="rebac.delete.roots")
+            origin._system_capture(reason="rebac.delete.roots")
             if isinstance(origin, RebacQuerySet)
             else origin
         )
@@ -240,11 +240,18 @@ class RebacTrackedMixin(models.Model, metaclass=RebacModelBase):
         update_fields: Iterable[str] | None = None,
     ) -> None:
         from .index.maintain import model_write
+        from .signals import audit_backed_denials
 
         alias = using or router.db_for_write(type(self), instance=self)
         if raw:
             return super().save_base(raw, force_insert, force_update, alias, update_fields)
-        with model_write(model=type(self), using=alias, names=update_fields) as maintenance:
+        with (
+            audit_backed_denials(),
+            model_write(model=type(self), using=alias, names=update_fields) as maintenance,
+        ):
+            from .signals import _gate_backed_field_change
+
+            _gate_backed_field_change(type(self), self, alias, update_fields)
             if maintenance is not None and self.pk is not None:
                 maintenance.capture_old(model=type(self), pks=(self.pk,))
             super().save_base(raw, force_insert, force_update, alias, update_fields)
@@ -257,13 +264,17 @@ class RebacTrackedMixin(models.Model, metaclass=RebacModelBase):
         from .actors import current_actor, is_sudo
         from .conf import app_settings
         from .index.maintain import model_write
+        from .signals import audit_backed_denials
 
         alias = using or router.db_for_write(type(self), instance=self)
         if delete_scope(self, alias) is not None:
             return super().delete(using=alias, keep_parents=keep_parents)
         actor = current_actor()
         unscoped = is_sudo() or (actor is None and not app_settings.REBAC_STRICT_MODE)
-        with model_write(model=type(self), using=alias) as maintenance:
+        with audit_backed_denials(), model_write(model=type(self), using=alias) as maintenance:
+            from .signals import _gate_backed_field_change
+
+            _gate_backed_field_change(type(self), self, alias, None, deleting=True)
             if maintenance is not None:
                 maintenance.capture_old(model=type(self), pks=(self.pk,))
             with deletion_owner(self, alias, actor, unscoped):
@@ -324,6 +335,7 @@ class RebacMixin(RebacTrackedMixin):
     # forcing the consumer to re-attach via middleware / Celery hook.
     _rebac_actor: SubjectRef | None = None
     _rebac_sudo_reason: str | None = None
+    _rebac_sudo_audited: bool = False
     _rebac_field_deny: FieldDenyMode | None = None
     _rebac_resource_id: str | None = None
 
@@ -391,6 +403,22 @@ class RebacMixin(RebacTrackedMixin):
             pass
         return instance
 
+    def refresh_from_db(
+        self,
+        using: str | None = None,
+        fields: Iterable[str] | None = None,
+        from_queryset: models.QuerySet[Any] | None = None,
+    ) -> None:
+        redacted = frozenset(getattr(self, "_rebac_redacted_fields", frozenset()) or frozenset())
+        super().refresh_from_db(using=using, fields=fields, from_queryset=from_queryset)
+        if redacted:
+            from .field_visibility import mark_denied_fields
+
+            mode: FieldDenyMode = (
+                "omit" if getattr(self, "_rebac_omitted_fields", frozenset()) else "redact"
+            )
+            mark_denied_fields(self, redacted, mode=mode)
+
     def __getstate__(self) -> dict[str, Any]:
         """Strip per-instance REBAC binding before pickling.
 
@@ -405,6 +433,7 @@ class RebacMixin(RebacTrackedMixin):
         if isinstance(state, dict):
             state.pop("_rebac_actor", None)
             state.pop("_rebac_sudo_reason", None)
+            state.pop("_rebac_sudo_audited", None)
             state.pop("_rebac_loaded_values", None)
             state.pop("_rebac_field_deny", None)
         return state
@@ -426,6 +455,7 @@ class RebacMixin(RebacTrackedMixin):
 
         self._rebac_actor = actor if isinstance(actor, SubjectRef) else to_subject_ref(actor)
         self._rebac_sudo_reason = None
+        self._rebac_sudo_audited = False
         return self
 
     def as_user(self, user: Any) -> Self:
@@ -465,6 +495,7 @@ class RebacMixin(RebacTrackedMixin):
                 "sudo() requires reason= when REBAC_REQUIRE_SUDO_REASON=True"
             )
         self._rebac_sudo_reason = reason
+        self._rebac_sudo_audited = False
         return self
 
     def unsudo(self) -> Self:
@@ -475,7 +506,25 @@ class RebacMixin(RebacTrackedMixin):
         ``sudo(reason=...)`` for actorless paths.
         """
         self._rebac_sudo_reason = None
+        self._rebac_sudo_audited = False
         return self
+
+    def _audit_bypass_once(self) -> None:
+        if self._rebac_sudo_reason is None or self._rebac_sudo_audited:
+            return
+        from .actors import current_actor
+        from .audit import emit
+        from .models import PermissionAuditEvent
+
+        actor = current_actor()
+        emit(
+            PermissionAuditEvent.KIND_SUDO_BYPASS,
+            actor=actor,
+            origin=actor,
+            reason=self._rebac_sudo_reason,
+            defer_to_commit=False,
+        )
+        self._rebac_sudo_audited = True
 
     def is_sudo(self) -> bool:
         return self._rebac_sudo_reason is not None
@@ -502,6 +551,8 @@ class RebacMixin(RebacTrackedMixin):
         if insert is not None and insert[0] is self:
             return insert[1], insert[2]
         if self._rebac_sudo_reason is not None:
+            if strict:
+                self._audit_bypass_once()
             return (None, True)
         if self._rebac_actor is not None:
             return (self._rebac_actor, False)
@@ -687,6 +738,11 @@ class RebacMixin(RebacTrackedMixin):
 
     def _audit_denial_after_rollback(self, exc: Exception, *, default_action: str) -> None:
         from .conf import app_settings
+        from .signals import BackedEdgeDenied, audit_edge_denial
+
+        if isinstance(exc, BackedEdgeDenied):
+            audit_edge_denial(exc)
+            return
 
         if not app_settings.REBAC_AUDIT_DENIALS or " cannot " not in str(exc):
             return
@@ -776,8 +832,8 @@ class RebacMixin(RebacTrackedMixin):
 def _maybe_audit_denial(*, actor: SubjectRef | None, action: str, resource: ObjectRef) -> None:
     """Emit a denial audit row when REBAC_AUDIT_DENIALS is enabled.
 
-    Uses ``defer_to_commit=False`` so the row persists even though the
-    raising save / delete is about to roll back the surrounding transaction.
+    Owners call this after their failed atomic block unwinds. The row follows
+    any still-open caller transaction and is durable when that transaction commits.
 
     Audit kind reuses the relevant grant / revoke kind (a denied write is a
     grant that didn't happen; a denied delete is a revoke that didn't
@@ -852,6 +908,13 @@ def _gate_save(
     # trivially "dirty"; gating create on per-field permissions makes no
     # sense (use ``permission create = ...`` for that).
     if not is_create:
+        _enforce_expression_reads(
+            sender=sender,
+            instance=instance,
+            actor=actor,
+            resource=resource,
+            update_fields=update_fields,
+        )
         _enforce_redacted_field_writes(
             sender=sender,
             instance=instance,
@@ -896,6 +959,72 @@ def _gate_delete(
 
 
 # ---------- Per-field write helpers ----------
+
+
+def _enforce_expression_reads(
+    *,
+    sender: type[models.Model],
+    instance: Any,
+    actor: SubjectRef,
+    resource: ObjectRef,
+    update_fields: Iterable[str] | None,
+) -> None:
+    from django.db.models.sql import Query
+
+    from .backends import backend
+    from .field_visibility import (
+        check_field_access,
+        effective_field_deny_mode,
+        gated_read_fields,
+        runtime_field_deny_mode,
+    )
+    from .managers import (
+        _column_on_model_lineage,
+        _expression_columns,
+        _has_gated_subquery,
+        _has_opaque_write_expression,
+    )
+
+    gated = gated_read_fields(sender)
+    selected = (
+        set(_normalise_update_field_names(sender=sender, update_fields=update_fields))
+        if update_fields is not None
+        else {field.name for field in sender._meta.concrete_fields if not field.primary_key}
+    )
+    query = Query(sender)
+    required: set[str] = set()
+    for field in sender._meta.concrete_fields:
+        if field.name not in selected:
+            continue
+        value = getattr(instance, field.attname)
+        resolver = getattr(value, "resolve_expression", None)
+        if not callable(resolver):
+            continue
+        if gated and _has_opaque_write_expression(value):
+            raise PermissionDenied(
+                "Write expression has opaque SQL over a model with gated fields."
+            )
+        if (
+            runtime_field_deny_mode(effective_field_deny_mode(instance._rebac_field_deny))
+            == "allow"
+        ):
+            continue
+        resolved = resolver(query)
+        if _has_gated_subquery(resolved):
+            raise PermissionDenied("Write expression reads a subquery over gated fields.")
+        required.update(
+            column.target.name
+            for column in _expression_columns(resolved)
+            if _column_on_model_lineage(column, sender) and column.target.name in gated
+        )
+    for field_name in sorted(required):
+        if not check_field_access(
+            backend(),
+            subject=actor,
+            action=f"read__{field_name}",
+            resource=resource,
+        ).allowed:
+            raise PermissionDenied(f"Write expression reads denied field read__{field_name}.")
 
 
 def _enforce_redacted_field_writes(

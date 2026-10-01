@@ -64,6 +64,7 @@ def _baseline_with_perm(resource_type: str, perm_name: str, expr_text: str) -> S
         Relation("owner", (AllowedSubject("auth/user"),)),
         Relation("viewer", (AllowedSubject("auth/user"),)),
         Relation("auditor", (AllowedSubject("auth/user"),)),
+        Relation("is_active", (AllowedSubject("auth/user"),)),
     )
     perm = Permission(perm_name, expr, expr_text)
     return Schema(definitions=[Definition(resource_type, relations, (perm,))])
@@ -87,6 +88,11 @@ def _seed_db_schema(resource_type: str, perm_name: str, expr_text: str) -> Schem
     SchemaRelation.objects.create(
         definition=sd,
         name="auditor",
+        allowed_subjects=[{"type": "auth/user"}],
+    )
+    SchemaRelation.objects.create(
+        definition=sd,
+        name="is_active",
         allowed_subjects=[{"type": "auth/user"}],
     )
     sp = SchemaPermission.objects.create(definition=sd, name=perm_name, expression=expr_text)
@@ -232,6 +238,54 @@ def _make_ovr(target: SchemaPermission, kind: str, expression: str) -> SchemaOve
         expression=expression,
         reason="test",
     )
+
+
+@pytest.mark.django_db(transaction=True)
+def test_removed_baseline_relation_makes_stored_override_warning_not_read_failure():
+    from django.core import checks
+    from django.db import models
+
+    from rebac.checks import check_stale_override_references
+
+    target = _seed_db_schema("blog/post", "read", "owner")
+    _make_ovr(target, SchemaOverride.KIND_EXTEND, "viewer")
+    viewer = SchemaRelation.objects.get(definition=target.definition, name="viewer")
+    # Simulate a baseline revision installed by a separate package version.
+    models.QuerySet.delete(SchemaRelation.objects.filter(pk=viewer.pk))
+    local = LocalBackend()
+    assert local.schema().get_permission("blog/post", "read") is not None
+    warnings = check_stale_override_references()
+    assert any(issue.id == "rebac.W010" for issue in warnings)
+    assert all(isinstance(issue, checks.Warning) for issue in warnings)
+
+
+@pytest.mark.django_db(transaction=True)
+@pytest.mark.xfail(
+    strict=True, reason="proposal 0012: a stale narrowing override is dropped and widens read"
+)
+@pytest.mark.parametrize("kind", [SchemaOverride.KIND_DISABLE, SchemaOverride.KIND_TIGHTEN])
+def test_stale_narrowing_override_must_not_restore_excluded_reader(kind):
+    from django.db import models
+
+    from rebac.checks import check_stale_override_references
+
+    baseline = "is_active + viewer" if kind == SchemaOverride.KIND_DISABLE else "viewer"
+    target = _seed_db_schema("blog/post", "read", baseline)
+    _make_ovr(target, kind, "auditor + is_active")
+    local = LocalBackend()
+    user = SubjectRef.of("auth/user", "excluded")
+    post = ObjectRef("blog/post", "stale")
+    relation = "is_active" if kind == SchemaOverride.KIND_DISABLE else "viewer"
+    local.write_relationships([RelationshipTuple(post, relation, user)])
+    assert not local.has_access(subject=user, action="read", resource=post)
+    assert local.schema().get_permission(
+        "blog/post", "read"
+    ).expression != parse_permission_expression(baseline)
+    auditor = SchemaRelation.objects.get(definition=target.definition, name="auditor")
+    models.QuerySet.delete(SchemaRelation.objects.filter(pk=auditor.pk))
+    assert any(issue.id == "rebac.W010" for issue in check_stale_override_references())
+    effective = LocalBackend().schema().get_permission("blog/post", "read")
+    assert effective.expression != parse_permission_expression(baseline)
 
 
 # ---------------------------------------------------------------------------
@@ -539,6 +593,9 @@ def test_override_create_emits_audit_event() -> None:
     SchemaRelation.objects.create(
         definition=sd, name="owner", allowed_subjects=[{"type": "auth/user"}]
     )
+    SchemaRelation.objects.create(
+        definition=sd, name="is_active", allowed_subjects=[{"type": "auth/user"}]
+    )
     sp = SchemaPermission.objects.create(definition=sd, name="read", expression="owner")
 
     PermissionAuditEvent.objects.all().delete()
@@ -566,6 +623,9 @@ def test_override_delete_emits_audit_event() -> None:
     sd = SchemaDefinition.objects.create(resource_type="blog/post")
     SchemaRelation.objects.create(
         definition=sd, name="owner", allowed_subjects=[{"type": "auth/user"}]
+    )
+    SchemaRelation.objects.create(
+        definition=sd, name="auditor", allowed_subjects=[{"type": "auth/user"}]
     )
     sp = SchemaPermission.objects.create(definition=sd, name="read", expression="owner")
 
@@ -623,6 +683,22 @@ def test_baseline_cycle_is_not_attributed_to_override() -> None:
     # Composition with no overrides and a pre-existing cycle: must NOT raise.
     result = compose(bad_baseline, [])
     assert result.get_definition("blog/post") is not None
+
+
+@pytest.mark.django_db
+def test_baseline_undefined_reference_is_not_attributed_to_override() -> None:
+    sp = _seed_db_schema("blog/post", "read", "owner")
+    override = _make_ovr(sp, SchemaOverride.KIND_LOOSEN, "owner")
+    baseline = Schema(
+        definitions=[
+            Definition(
+                "blog/post",
+                relations=(Relation("owner", (AllowedSubject("auth/user"),)),),
+                permissions=(Permission("read", PermRef("missing"), "missing"),),
+            )
+        ]
+    )
+    assert compose(baseline, [override]).get_permission("blog/post", "read") is not None
 
 
 # ---------------------------------------------------------------------------

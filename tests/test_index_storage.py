@@ -90,11 +90,13 @@ def _exercise_insert(db):
     assert IndexTerm.objects.using(using).filter(type="storage/new").count() == 2
 
 
+@pytest.mark.pg_delta
 @pytest.mark.django_db
 def test_stream_create_contract():
     _exercise_insert(connection)
 
 
+@pytest.mark.pg_delta
 @pytest.mark.django_db(transaction=True)
 def test_stream_create_late_batch_failure_rolls_back_earlier_batches():
     with pytest.raises(IntegrityError):
@@ -128,6 +130,7 @@ def test_grant_site_rows_are_separate():
     assert all(value[1:] == ("read.1", "auth/user", "one") for value in values)
 
 
+@pytest.mark.pg_delta
 @pytest.mark.django_db
 def test_stream_create_required_fields_and_sql_null_defaults():
     ids = terms.intern([("storage/object", "one", ""), ("auth/user", "1", "")], using="default")
@@ -236,6 +239,7 @@ def _exercise_intern(using):
     assert IndexTerm.objects.using(using).filter(type="storage/intern-projection").count() == 1
 
 
+@pytest.mark.pg_delta
 @pytest.mark.django_db
 def test_intern_handles_preexisting_racing_inserts():
     _exercise_intern("default")
@@ -287,6 +291,7 @@ def test_registry_interning_missing_result_rolls_back(monkeypatch):
     assert not RebacResource.objects.filter(resource_type="storage/missing-registry").exists()
 
 
+@pytest.mark.pg_delta
 @pytest.mark.django_db
 @pytest.mark.parametrize("model", [IndexEdge, IndexMember, IndexCover])
 def test_expiry_upsert_keeps_max_across_batches_and_preserves_delta_tags(model, monkeypatch):
@@ -358,6 +363,7 @@ def test_expiry_upsert_keeps_max_across_batches_and_preserves_delta_tags(model, 
         assert (row.pass_id, row.round) == (3, 2)
 
 
+@pytest.mark.pg_delta
 @pytest.mark.django_db
 def test_work_and_exception_constraint_policy_matches_migration():
 
@@ -428,6 +434,7 @@ def test_intern_from_missing_rows_fail(monkeypatch):
         terms.intern_from(source, using="default")
 
 
+@pytest.mark.pg_delta
 @pytest.mark.django_db(transaction=True)
 def test_intern_from_rejects_overlong_source_without_truncation():
     RebacResource.objects.create(resource_type="storage/source", resource_id="one")
