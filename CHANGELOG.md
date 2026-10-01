@@ -35,18 +35,6 @@ pre-1.0; breaking changes within a minor version are explicitly called out.
   membership-removal branch deliberately recomputes the former container
   closure, as 0.24.1 did, to remove grants sustained by a cycle.
 
-### Known defects (not yet fixed; this section is not released)
-
-- A scope that joins a maintenance pass during projection is projected only
-  in part. When the same member is held twice on one relation under one
-  condition key, once without expiry and once with one, that partial
-  projection can shorten the stored edge's expiry, and access ends early.
-  Fails closed. `rebac index rebuild` repairs it.
-- A recursive stratum of more than 16 (type, node) keys with a region near
-  967 scopes exceeds the 999-parameter limit of SQLite 3.31; the write
-  raises and rolls back. Newer SQLite, PostgreSQL and MySQL are not
-  affected.
-
 ## [0.24.2] — 2026-10-01
 
 ### Fixed

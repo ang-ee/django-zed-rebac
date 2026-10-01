@@ -368,8 +368,11 @@ def _write_edge_difference(stats: Stats, *, using: str, sources: set[int]) -> No
     key_fields = ("resource_id", "relation", "subject_id", "source", "condition_key")
     complete_sources = set(sources)
     # Projection may discover a new target scope partway through its ordered
-    # rules. Its emitted rows can be compared, but earlier relations at that
-    # scope were not necessarily visited in this pass.
+    # rules. The rules that ran before it joined never visited it, so its
+    # candidates are a subset of its true edges: they can add an edge that is
+    # missing, but they neither remove nor replace one that is stored. (Two
+    # source rows may share a key and keep the later expiry; a partial
+    # candidate may hold only the earlier one.)
     sources.update(values["resource_id"] for values in stats.edge_candidates.values())
     max_params = connections[using].features.max_query_params or 5000
     batch_size = max(1, min(5000, max_params - 32))
@@ -406,7 +409,9 @@ def _write_edge_difference(stats: Stats, *, using: str, sources: set[int]) -> No
             created.append(tuple(values[name] for name in fields))
             mark(values["resource_type"], values["relation"], values["resource_id"])
             stats.added_edges.add((values["resource_id"], values["relation"]))
-        elif any(getattr(previous, name) != values[name] for name in fields):
+        elif key[0] in complete_sources and any(
+            getattr(previous, name) != values[name] for name in fields
+        ):
             for name in fields:
                 setattr(previous, name, values[name])
             updated.append(previous)

@@ -593,9 +593,10 @@ class IndexMaintenance:
             self.add_terms(IndexTerm.objects.using(self.using).filter(pk__in=batch), phase="region")
         self._region_ids = set(ids)
 
-    def _batches(self, ids: Iterable[int]) -> Iterator[tuple[int, ...]]:
+    def _batches(self, ids: Iterable[int], *, reserve: int = 0) -> Iterator[tuple[int, ...]]:
+        """Id chunks that fit one statement; ``reserve`` is its other parameters."""
         limit = connections[self.using].features.max_query_params or 5000
-        yield from batched(sorted(ids), max(1, min(5000, limit - 32)), strict=False)
+        yield from batched(sorted(ids), max(1, min(5000, limit - 32 - reserve)), strict=False)
 
     @staticmethod
     def _key_filter(keys: Iterable[tuple[str, str]]) -> Q:
@@ -613,7 +614,8 @@ class IndexMaintenance:
         if not scopes or not keys:
             return result
         selected = self._key_filter(keys)
-        for batch in self._batches(scopes):
+        # The key filter binds a type and a node per stratum key.
+        for batch in self._batches(scopes, reserve=2 * len(keys)):
             rows = IndexCover.objects.using(self.using).filter(selected, scope_id__in=batch)
             for scope, node, holder, site, expiry, condition_key, condition in rows.values_list(
                 "scope_id", "node", "holder_id", "site", "expires_at", "condition_key", "condition"
@@ -856,7 +858,7 @@ class IndexMaintenance:
                 )
             old = self._payloads(keys, region)
             selected = self._key_filter(keys)
-            for batch in self._batches(region):
+            for batch in self._batches(region, reserve=2 * len(keys)):
                 stats.deleted += (
                     IndexCover.objects.using(self.using)
                     .filter(selected, scope_id__in=batch)
