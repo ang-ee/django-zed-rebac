@@ -47,6 +47,7 @@ from ..field_backing import (
 from ..index.codec import identity_codec
 from ..resources import model_for_resource_type, model_for_subject_type
 from ..schema.ast import (
+    AllowedSubject,
     AttributeBinding,
     ConstBinding,
     Definition,
@@ -460,7 +461,12 @@ class Compiler:
             # fixed point has no new path on a revisit, in either bound.
             return _FALSE
         if count == 0 and key in self.program.recursive:
-            for flatten in (self._flat_self_userset, self._flat_self_fk, self._flat_self_tuple):
+            for flatten in (
+                self._flat_self_userset,
+                self._flat_self_fk,
+                self._flat_self_path,
+                self._flat_self_tuple,
+            ):
                 flattened = flatten(key, at, bound, depth_possible=depth_possible)
                 if flattened is not None:
                     return flattened
@@ -690,6 +696,90 @@ class Compiler:
                 parts.append(self._model_membership(at, source.filter(inherits), model, identity))
         return self._union(at, parts)
 
+    def _flat_self_path(
+        self,
+        key: Key,
+        at: At,
+        bound: Bound,
+        *,
+        depth_possible: bool,
+    ) -> Q | None:
+        """A parent->same-permission cycle over any backed path to the same model.
+
+        A many-to-many or reverse path has no single ancestor chain, so the
+        rows that inherit are a closure: the rows that hold the base, then
+        the rows whose path reaches the level below.
+        """
+        definition = self.schema.get_definition(key[0])
+        permission = self.schema.get_permission(*key)
+        model = model_for_resource_type(key[0])
+        if definition is None or permission is None or model is None:
+            return None
+        arms = self._union_arms(permission.expression)
+        recursive = [arm for arm in arms if isinstance(arm, PermArrow) and arm.target == key[1]]
+        if len(recursive) != 1 or len(arms) < 2 or self._tagged_inside(recursive[0]):
+            return None
+        arm = recursive[0]
+        base = [other for other in arms if other is not arm]
+        relation = next((r for r in definition.relations if r.name == arm.via), None)
+        if relation is None or not isinstance(relation.backing, FieldBinding):
+            return None
+        resolved = resolve_field_backing(definition, relation)
+        if (
+            resolved is None
+            or resolved.source_model is not model
+            or resolved.target_model is not model
+            or resolved.relation.allowed_subjects[0].relation
+        ):
+            return None
+        identity = resource_id_attr(model)
+        _, field = model_identity_fields(model, identity)
+        row_at = At(key[0], F(identity), field, True)
+        inside = {key: 1}
+
+        def base_at(where: At) -> list[Q]:
+            return [
+                self._expression(
+                    definition, other, where, bound, inside, depth_possible=depth_possible
+                )
+                for other in base
+            ]
+
+        parts = base_at(at)
+        if any(part is _TRUE for part in parts):
+            return _TRUE
+        base_row = self._union(row_at, base_at(row_at))
+        if base_row is _FALSE:
+            return self._union(at, parts)
+        source = model._base_manager.using(self.using)
+        seed = source.filter(base_row).order_by().values_list(identity, flat=True)
+        target_path = resolved.target_values_path()
+
+        def reaching(level: QuerySet[Any]) -> QuerySet[Any]:
+            # Filters and the path share one filter call, hence one join.
+            return (
+                source.filter(Q(**resolved.filters) & Q(**{f"{target_path}__in": _Compiled(level)}))
+                .order_by()
+                .values_list(identity, flat=True)
+            )
+
+        closure = seed
+        for _ in range(self.depth_limit - 1):
+            closure = seed.union(reaching(closure))
+        inherits = reaching(closure)
+        parts.append(
+            self._model_membership(
+                at, source.filter(**{f"{identity}__in": _Compiled(inherits)}), model, identity
+            )
+        )
+        if bound is Bound.UPPER and depth_possible:
+            # One more hop that reaches a row outside the closure and its
+            # inheritors means the closure has not converged.
+            known = seed.union(inherits)
+            beyond = reaching(inherits).exclude(**{f"{identity}__in": _Compiled(known)})
+            parts.append(_and(Q(Exists(beyond)), _not_null(at.ref)))
+        return self._union(at, parts)
+
     def _flat_self_tuple(
         self,
         key: Key,
@@ -702,7 +792,9 @@ class Compiler:
 
         The seed is the resources of the edges whose subject holds the base;
         the closure follows the edges from there.  The base is evaluated at
-        the edge's subject, so it may be any expression.
+        the edge's subject, so it may be any expression.  Subjects of the
+        relation that have another type do not recurse: the arrow through
+        them is one more arm of the base.
         """
         definition = self.schema.get_definition(key[0])
         permission = self.schema.get_permission(*key)
@@ -715,39 +807,50 @@ class Compiler:
         arm = recursive[0]
         base = [other for other in arms if other is not arm]
         relation = next((r for r in definition.relations if r.name == arm.via), None)
-        if (
-            relation is None
-            or relation.backing is not None
-            or len(relation.allowed_subjects) != 1
-            or relation.allowed_subjects[0].type != key[0]
-            or relation.allowed_subjects[0].relation
-            or relation.allowed_subjects[0].id
-            or relation.allowed_subjects[0].wildcard
-        ):
+        if relation is None or relation.backing is not None:
+            return None
+        same = [allowed for allowed in relation.allowed_subjects if allowed.type == key[0]]
+        other_types = [allowed for allowed in relation.allowed_subjects if allowed.type != key[0]]
+        if not same or any(allowed.wildcard for allowed in same):
             return None
         inside = {key: 1}
 
         def base_at(where: At) -> Q:
-            return self._union(
-                where,
-                [
-                    self._expression(
-                        definition, other, where, bound, inside, depth_possible=depth_possible
+            parts = [
+                self._expression(
+                    definition, other, where, bound, inside, depth_possible=depth_possible
+                )
+                for other in base
+            ]
+            if other_types:
+                parts.append(
+                    self._stored_relation(
+                        definition,
+                        relation,
+                        where,
+                        bound,
+                        inside,
+                        arm.target,
+                        depth_possible,
+                        only=other_types,
                     )
-                    for other in base
-                ],
-            )
+                )
+            return self._union(where, parts)
 
         point = base_at(at)
         if point is _TRUE:
             return _TRUE
         every = self._tuples().filter(resource_type=key[0], relation=relation.name)
+        # An arrow follows the subject's object, whatever relation suffix the
+        # edge carries, so every declared shape of the own type is an edge.
+        variants = _FALSE
+        for allowed in same:
+            shape = Q(subject_relation=allowed.relation, caveat_name=allowed.with_caveat)
+            if allowed.id:
+                shape &= Q(subject_id=allowed.id)
+            variants = _or(variants, shape)
         edges = self._live(
-            every.filter(
-                subject_type=key[0],
-                subject_relation="",
-                caveat_name=relation.allowed_subjects[0].with_caveat,
-            ).exclude(subject_id="*"),
+            every.filter(variants, subject_type=key[0]).exclude(subject_id="*"),
             relation,
             bound,
         )
@@ -1191,6 +1294,7 @@ class Compiler:
         visits: Mapping[Key, int],
         target: str | None,
         depth_possible: bool,
+        only: Sequence[AllowedSubject] | None = None,
     ) -> Q:
         rows = self._tuples().filter(resource_type=definition.resource_type, relation=relation.name)
         # Several allowed subjects can share one membership test: an arrow
@@ -1198,7 +1302,7 @@ class Compiler:
         # relation.  Each test is compiled once and joined with all its shapes,
         # so a recursive arrow stays one reference per level.
         shapes: dict[tuple[str, str, str], Q] = {}
-        for allowed in relation.allowed_subjects:
+        for allowed in relation.allowed_subjects if only is None else only:
             if allowed.relation and not self._is_relation(allowed.type, allowed.relation):
                 continue
             shape = Q(
