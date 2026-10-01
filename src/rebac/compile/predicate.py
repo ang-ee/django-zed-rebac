@@ -1209,6 +1209,14 @@ class Compiler:
         seed = base_at(At(key[0], F("subject_id"), None, False))
         if seed is _FALSE:
             return point
+        if at.key is None and _one_object(at.ref) and bound is Bound.LOWER:
+            # One object: follow the edges from it.  What it reaches is small,
+            # each level is one lookup by resource, and the base is named once.
+            reached: QuerySet[Any] | None = None
+            for _ in range(self.depth_limit - 1):
+                reached = edges.filter(self._from(at, reached)).order_by().values("subject_id")
+            holders = edges if seed is _TRUE else edges.filter(seed)
+            return _or(point, Q(Exists(holders.filter(self._from(at, reached)))))
         closure = self._closure(
             (edges if seed is _TRUE else edges.filter(seed)).order_by().values("resource_id"),
             edges,
@@ -1222,6 +1230,14 @@ class Compiler:
                     result, _and(self._not_converged(edges, closure, known), _not_null(at.ref))
                 )
         return result
+
+    @staticmethod
+    def _from(at: At, reached: QuerySet[Any] | None) -> Q:
+        """An edge leaves ``at`` or an object already reached from it."""
+        step = Q(resource_id=at.ref)
+        if reached is not None:
+            step |= Q(resource_id__in=_Compiled(reached))
+        return step
 
     # ---------- Expressions ----------
 

@@ -11,7 +11,7 @@ runs yields no rows instead of a stale answer.
 from __future__ import annotations
 
 from collections import OrderedDict
-from collections.abc import Callable, Iterable, Iterator, Mapping
+from collections.abc import Callable, Iterable, Iterator, Mapping, Sequence
 from dataclasses import dataclass, field
 from datetime import datetime
 from functools import partial
@@ -89,6 +89,9 @@ class _Kept:
 
 _policies: OrderedDict[tuple[Any, ...], _Policy] = OrderedDict()
 _statements: OrderedDict[tuple[Any, ...], _Kept | bool] = OrderedDict()
+# For each kept scope statement, the facts it asks for: a prefix of decisions
+# maps to the next fact asked, or to None when the statement asks no more.
+_fact_paths: OrderedDict[tuple[Any, ...], dict[tuple[Any, ...], Fact | None]] = OrderedDict()
 
 
 def reset() -> None:
@@ -96,6 +99,7 @@ def reset() -> None:
     with _lock:
         _policies.clear()
         _statements.clear()
+        _fact_paths.clear()
 
 
 # ---------- The policy a statement is compiled for ----------
@@ -227,6 +231,50 @@ class _Sql(Expression):
 
     def as_sql(self, compiler: Any, connection: Any) -> tuple[str, tuple[Any, ...]]:
         return f"EXISTS {self.sql}", self.params
+
+
+class _Facts(Mapping[Fact, bool]):
+    """Facts about fixed objects, each decided when a statement first asks for it.
+
+    A statement uses few of the facts in reach of its permission, and each at
+    one bound: a union stops at the first arm that holds, and a lower bound
+    asks for the upper one only under an exclusion.  ``asked`` keeps the
+    decisions in the order they were asked for.
+    """
+
+    def __init__(self, operation: _Operation, key: Key, verdicts: CaveatVerdicts) -> None:
+        self.operation = operation
+        self.verdicts = verdicts
+        self.known = frozenset(const_facts(operation.policy.schema, operation.policy.program, key))
+        self.asked: list[tuple[Fact, bool]] = []
+        self._decided: dict[Fact, bool] = {}
+
+    def __contains__(self, fact: object) -> bool:
+        return fact in self.known
+
+    def __iter__(self) -> Iterator[Fact]:
+        return iter(self.known)
+
+    def __len__(self) -> int:
+        return len(self.known)
+
+    def __getitem__(self, fact: Fact) -> bool:
+        if fact not in self._decided:
+            self._decided[fact] = self._decide(fact)
+            self.asked.append((fact, self._decided[fact]))
+        return self._decided[fact]
+
+    def _decide(self, fact: Fact) -> bool:
+        operation = self.operation
+        compiled = operation.statement(
+            ("fact", fact), self.verdicts, partial(operation._fact_rows, fact, self.verdicts)
+        )
+        if isinstance(compiled, bool):
+            return compiled
+        probe = _Sql(compiled.sql, operation.bound(compiled.params))
+        return (
+            SchemaGeneration.objects.using(operation.using).filter(pk=1).filter(Q(probe)).exists()
+        )
 
 
 @dataclass(frozen=True)
@@ -576,13 +624,19 @@ class _Operation:
         key: tuple[Any, ...],
         verdicts: CaveatVerdicts,
         build: Callable[[], models.QuerySet[Any] | bool | tuple[models.QuerySet[Any], bool]],
+        late: Callable[[], tuple[Any, ...]] | None = None,
     ) -> _Kept | bool:
-        """The SQL of ``build()``; a bool when it needs no rows to be decided."""
+        """The SQL of ``build()``; a bool when it needs no rows to be decided.
+
+        ``late`` gives the key to keep the statement under when part of it is
+        known only once the statement is built.
+        """
         # A statement can be kept when nothing in it varies but the actor's
         # id and the clock: that is, when it carries no caveat verdict list.
         keep = verdicts.empty
         sets = self.sets(verdicts)
-        full = (*self.shape, sets.digest if sets is not None else None, *key)
+        prefix = (*self.shape, sets.digest if sets is not None else None)
+        full = (*prefix, *key)
         if keep:
             with _lock:
                 kept = _statements.get(full)
@@ -597,6 +651,8 @@ class _Operation:
             # The build consulted the decider: the statement names an actor's
             # own rows, or would name them for another actor.
             keep = False
+        if late is not None:
+            full = (*prefix, *late())
         compiled: _Kept | bool
         if isinstance(built, bool):
             compiled = built
@@ -629,33 +685,6 @@ class _Operation:
         return result
 
     # ---------- Facts about fixed objects ----------
-
-    def decide(self, key: Key, verdicts: CaveatVerdicts) -> dict[Fact, bool]:
-        """Decide, in one statement, every fixed-object fact ``key`` can use."""
-        decided: dict[Fact, bool] = {}
-        probes: dict[str, _Sql] = {}
-        names: dict[str, Fact] = {}
-        for number, fact in enumerate(const_facts(self.policy.schema, self.policy.program, key)):
-            compiled = self.statement(
-                ("fact", fact), verdicts, partial(self._fact_rows, fact, verdicts)
-            )
-            if isinstance(compiled, bool):
-                decided[fact] = compiled
-            else:
-                name = f"_rebac_fact_{number}"
-                names[name] = fact
-                probes[name] = _Sql(compiled.sql, self.bound(compiled.params))
-        if probes:
-            row = (
-                SchemaGeneration.objects.using(self.using)
-                .filter(pk=1)
-                .annotate(**probes)
-                .values(*probes)
-                .first()
-            )
-            for name, fact in names.items():
-                decided[fact] = bool(row[name]) if row is not None else False
-        return decided
 
     def _fact_rows(self, fact: Fact, verdicts: CaveatVerdicts) -> models.QuerySet[Any] | bool:
         condition = self.compiler(verdicts).fact_q(fact)
@@ -836,11 +865,11 @@ def _scope_statement(operation: _Operation, model: type[models.Model], key: Key)
     and the SQL is only the gate: the policy fence and the fact witnesses.
     """
     verdicts = operation.verdicts(key)
-    decided = operation.decide(key, verdicts)
-    vector = tuple(sorted((str(fact), value) for fact, value in decided.items()))
+    decided = _Facts(operation, key, verdicts)
+    decider = operation.rows(verdicts)
+    label = model._meta.label_lower
 
     def build() -> bool | tuple[models.QuerySet[Any], bool]:
-        decider = operation.rows(verdicts)
         compiler = operation.compiler(verdicts, decided, rows=decider)
         predicate = compiler.holds(key, _model_at(model), Bound.LOWER)
         if is_false(predicate):
@@ -862,7 +891,47 @@ def _scope_statement(operation: _Operation, model: type[models.Model], key: Key)
         rows = model._base_manager.using(operation.using).filter(condition & predicate)
         return rows.order_by().values(resource_id_attr(model)), False
 
-    return operation.statement(("scope", model._meta.label_lower, key, vector), verdicts, build)
+    # A kept statement is keyed by the facts it asked for, in order.  The
+    # order is learned from the first build and replayed from then on.
+    sets = operation.sets(verdicts)
+    known = (*operation.shape, sets.digest if sets is not None else None, label, key)
+    path = _replay(known, decided)
+    asked = decider.asked
+    compiled = operation.statement(
+        ("scope", label, key, path),
+        verdicts,
+        build,
+        late=lambda: ("scope", label, key, tuple(decided.asked)),
+    )
+    if verdicts.empty and decider.asked == asked:
+        _remember(known, decided.asked)
+    return compiled
+
+
+def _replay(known: tuple[Any, ...], facts: _Facts) -> tuple[tuple[Fact, bool], ...] | None:
+    """Decide the facts a kept statement asked for, in its order; ``None`` when unknown."""
+    with _lock:
+        paths = _fact_paths.get(known)
+        if paths is not None:
+            _fact_paths.move_to_end(known)
+    path: tuple[tuple[Fact, bool], ...] = ()
+    while paths is not None and path in paths:
+        following = paths[path]
+        if following is None:
+            return path
+        path = (*path, (following, facts[following]))
+    return None
+
+
+def _remember(known: tuple[Any, ...], asked: Sequence[tuple[Fact, bool]]) -> None:
+    with _lock:
+        paths = _fact_paths.setdefault(known, {})
+        for position, (fact, _value) in enumerate(asked):
+            paths[tuple(asked[:position])] = fact
+        paths[tuple(asked)] = None
+        _fact_paths.move_to_end(known)
+        while len(_fact_paths) > _LIMIT:
+            _fact_paths.popitem(last=False)
 
 
 class _Scope(Expression):

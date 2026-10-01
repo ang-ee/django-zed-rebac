@@ -1653,10 +1653,14 @@ with two deliberate exceptions, in both of which the SQL is Django's own:
 
 An arrow over a const-backed relation (`admin->member` on a fixed role) is
 evaluated at a fixed object, so its value does not depend on the row. A
-queryset scope decides these facts before it compiles its statement:
+queryset scope decides such a fact when its statement first asks for it:
 
-1. Every fact the permission can use is probed in one statement, at both
-   bounds.
+1. The fact is probed by its own small statement, at the bound the statement
+   needs. A union asks for its constant arms first and stops at the first
+   one that holds, and a lower bound asks for an upper one only under an
+   exclusion, so a statement decides few of the facts in reach of its
+   permission. A fact about a stored set (membership of the admin role held
+   in tuples) is answered from the actor's stored sets and needs no probe.
 2. The scope statement is compiled with each decision folded in as a
    constant. For a member of the admin role the arm is true, and a union
    that contains it needs no predicate over the rows; for everyone else the
@@ -1667,9 +1671,16 @@ queryset scope decides these facts before it compiles its statement:
    of the statement. A decision that does not hold when the statement runs
    yields no rows.
 
+A kept scope statement is keyed by the facts it asked for and their values,
+in the order it asked. The order is learned from the first build and
+replayed afterwards, so a kept statement costs its probes and nothing else.
+
 A fact whose target lies in a recursive component that is being unrolled is
 evaluated inline instead. Point checks and the other operations evaluate the
-same sub-expression inline, as an uncorrelated predicate.
+same sub-expression inline, as an uncorrelated predicate. Recursion over a
+stored relation at one fixed object follows the relation's tuples from that
+object (the roles a role includes), a lookup by resource per level, and
+names the base once.
 
 #### The actor's stored sets
 
