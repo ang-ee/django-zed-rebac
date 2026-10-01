@@ -24,6 +24,7 @@ from typing import TYPE_CHECKING, Any, ClassVar, Self, cast
 from django.core.exceptions import ImproperlyConfigured
 from django.db import models, router
 from django.db.models.base import ModelBase
+from django.db.models.options import DEFAULT_NAMES
 
 from ._id import resource_id_attr
 from .conf import app_settings
@@ -165,18 +166,28 @@ class RebacModelBase(RebacObjectMeta, ModelBase):
         mcs, name: str, bases: tuple[type, ...], attrs: dict[str, Any], **kwargs: Any
     ) -> type:
         meta = attrs.get("Meta")
+        options: dict[str, Any] = {}
+        if meta is None:
+            # Django gives a class with no Meta the one its bases expose. The Meta built
+            # below would hide it, so its Django options are carried over; rebac_* options
+            # are per model and travel only through a Meta the class writes itself.
+            inherited = next(
+                (cast(Any, base).Meta for base in bases if hasattr(base, "Meta")), None
+            )
+            options = {
+                option: getattr(inherited, option)
+                for option in DEFAULT_NAMES
+                if option != "abstract" and hasattr(inherited, option)
+            }
         base_manager_name = _declared_base_manager(meta, bases)
         if base_manager_name is None:
             base_manager_name = INJECTED_BASE_MANAGER
             attrs[INJECTED_BASE_MANAGER] = TrackedManager()
-        attrs["Meta"] = type(
-            "Meta",
-            (meta,) if meta is not None else (),
-            {
-                "base_manager_name": base_manager_name,
-                "default_manager_name": getattr(meta, "default_manager_name", "objects"),
-            },
+        options["base_manager_name"] = base_manager_name
+        options["default_manager_name"] = getattr(
+            meta, "default_manager_name", options.get("default_manager_name", "objects")
         )
+        attrs["Meta"] = type("Meta", (meta,) if meta is not None else (), options)
         new_cls = cast(type[models.Model], super().__new__(mcs, name, bases, attrs, **kwargs))
         if not new_cls._meta.abstract:
             queryset_class = getattr(new_cls._meta.base_manager, "_queryset_class", None)
