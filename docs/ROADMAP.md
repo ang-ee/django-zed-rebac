@@ -1,23 +1,123 @@
 # ROADMAP
 
+## 1.0: integrate at Django's ORM, not at the consumer's models
+
+0.24.0 shipped the engine in the shape it will keep: the SpiceDB schema, the
+permission index, maintenance passes with a drift oracle, strict-by-default
+scoping, audited bypass, and three test tiers. What it did not fix is the
+layer that connects the engine to Django. That layer attaches to each model
+(`RebacMixin`, `RebacTrackedMixin`) and then chases every other way Django
+touches a row: patched related managers, a replaced through-model manager,
+signals on third-party models, collector hooks, twelve `ContextVar`s. Four
+fix rounds in 0.24.0 each closed some write paths and opened others, because
+the gate re-implements Django's query semantics in Python and the engine
+never sees the statement Django is about to run. The remaining holes are
+pinned as strict expected failures (`tests/test_security_proposal_0011.py`,
+`_0012.py`, `_0013.py`) and are the acceptance suite for this release.
+
+1.0 moves the integration to the one place every ORM statement passes
+through, Django's SQL compilers, and removes everything that existed to
+work around not being there. It is one breaking migration for consumers,
+so the storage and identity changes ride with it.
+
+### Order of work
+
+1. **Proposal 0013 spike: read scope at the compiler.** A `rebac.db.backends.postgresql`
+   wrapper whose select compiler adds the scope predicate for the base-table
+   alias only. Gate: the SQL is byte-identical with `RebacQuerySet` on
+   `tests/test_queryset_permission_parity.py` and `tests/test_scope_*.py`,
+   SQLite and PostgreSQL. If it is not, the design is wrong at the cheapest
+   point to find out. Days, not weeks.
+2. **Read scope for every alias.** Joined tables, `Subquery`, `Exists`,
+   combined queries, prefetches; field read gates as `NULL` projection of
+   gated columns. `select_related` and bare `prefetch_related` become safe;
+   W003 is retired.
+3. **Writes at the insert, update and delete compilers.** One gate computed
+   from the statement's `Query`: frozen rows as a subquery, written values
+   evaluated by the database, the backed-edge rule of invariant 5d applied
+   once (proposal 0011's rule), the index owner opened around the statement.
+   Delete the related-manager patches, the through-manager swap, the
+   `_base_manager` injection, the tracked signals, `RebacTrackedMixin`,
+   `REBAC_TRACKED_MODELS`, the write overrides on `RebacMixin` and
+   `RebacQuerySet`, and the D2 autocommit distinction. Each pinned test in
+   `test_security_proposal_0011.py` and `_0013.py` turns green as its path
+   moves; that is the progress meter.
+4. **The actor carrier.** `with_actor()` stores the actor on the `Query`
+   (`_hints`), so a pinned actor still outranks the ambient one and reaches
+   subqueries and prefetches; `actor_context()` and the middleware stay the
+   ambient source; `RebacMixin` keeps `check_access`, `with_actor` and `sudo`
+   as conveniences and becomes optional. Opt-in moves to the schema: a model
+   is a resource because the `.zed` schema declares its type.
+5. **Single storage.** Drop registry mode (`RelationshipRegistry`,
+   `RebacResource`, the lookup-rewriting queryset, `migrate-storage`, W005,
+   `REBAC_LOCAL_BACKEND_STORAGE`) and the storage axis in tests. The index's
+   term table already provides the integer keys the registry was built for
+   (proposal 0001, 0.3.0, before the index existed). One source table in
+   wire form; the migration refuses to run while registry rows exist.
+6. **Identity as a stored column.** The canonical wire id lives in an indexed
+   column on every resource model (or a generated column); the read side
+   compares on it and never computes or validates identity in SQL
+   (`_Conversion.as_sql`). Text identities such as sqids already work this
+   way; integer and UUID keys stop paying a per-row `CASE`/regex on every
+   scoped read.
+7. **One bypass primitive** with an explicit audit flag and reason, replacing
+   the `sudo`/`system_context` block, queryset and instance variants and the
+   engine's reason-string captures. **Overrides as AST operations** on named
+   nodes, validated at save time, with stale narrowing overrides failing
+   closed per name (proposal 0012's override half).
+8. **Proposal 0009** (maintenance that re-derives only changed inputs) and
+   the SpiceDB conformance suite, in parallel with the above; neither touches
+   the compilers.
+
+### What 1.0 does not change
+
+The schema language and SpiceDB wire compatibility, the index and its
+derivation, maintenance passes and the drift oracle, the audit event table,
+the DRF, MCP and GraphQL adapters, the system-check framework, and the test
+tiers. `raw()`, `extra()` and `cursor.execute` stay outside the compilers
+and stay refused under scope.
+
+### Consumer migration, once
+
+Set `DATABASES[...]["ENGINE"]` to the REBAC wrapper (a check, `rebac.E022`,
+fails startup if a resource model's database is not wrapped); run the storage
+and identity migrations; remove `RebacTrackedMixin` and `REBAC_TRACKED_MODELS`;
+drop `with_actor` from `select_related`/`prefetch_related` workarounds. Grant
+ids change format with the identity column, so the 0.24.0 `v2_` format is
+provisional.
+
+### Measurements that decide it
+
+- Spike parity: byte-identical scope SQL on the parity suites.
+- Write cost: one gate query per affected declaring type per statement; a
+  100,000-row update on SQLite and PostgreSQL completes within the scale
+  budgets.
+- The 0.24.0 probe corpus (`scratchpad` rounds r3 to r7, folded into
+  `tests/test_security_*.py`): every case denies.
+- `make test-release` green on SQLite, PostgreSQL 16 and MySQL 8.
+
 ## Product roadmap
+
+- [x] 0.24.0 test tiers, 49 engine fixes, pinned design gaps (proposals 0010
+  to 0013).
+  - Shipped surface: `make check` / `make test-pg` / `make test-release`;
+    94 security tests; the fixes listed in CHANGELOG 0.24.0; strict expected
+    failures for every known fail-open path, each naming its proposal.
+  - Follow-ups: 1.0 above.
 
 - [x] 0.23.0 permission index.
   - Shipped surface: seven internal derived tables; fixed-shape LocalBackend
     reads; synchronous Django write maintenance under one global lock per alias;
     complete subject expansion; rebuild/verify commands; E013–E017 and W010;
     reference/differential suites and PostgreSQL CI.
-  - Release gates: the full opt-in reference sweep, SQLite/PostgreSQL behavioral
-    suites, and MySQL 8 vendor contracts. See CONTRIBUTING.md for commands;
-    implementation status does not assert a gate has passed.
   - Follow-ups: measure lock contention and write/storage amplification before
     considering per-type locks or fan-out budgets. Monotone set operations on
     recursive cycles remain deferred; negative cycles stay unsupported.
 
-- [ ] SpiceDB conformance suite (right after 0.23.0).
-  - Why: 0.23.0's differential oracle compares the permission index with the
+- [ ] SpiceDB conformance suite.
+  - Why: the differential oracle compares the permission index with the
     library's own walker, which proves parity with current behaviour, not
-    correctness. SpiceDB is the contract (CLAUDE.md invariant 1).
+    correctness. SpiceDB is the contract (AGENTS.md invariant 1).
   - Outcome: `pytest -m spicedb` checks generated schemas and data against a
     pinned `spicedb serve-testing` container in dev and in a CI job, comparing
     `CheckPermission` (including caveat `missing_required_context`),
@@ -47,12 +147,8 @@
   - Outcome: proposal 0004 ships as `rebac.mcp.rebac_mcp_tool` with
     fail-closed actor resolution and sync/async tool support.
 
-- [ ] Decide the LocalBackend registry-storage default.
-  - Why: registry mode exists and is tested, but the package still defaults to
-    the historical denormalized table.
-  - Outcome: either flip the default in a future minor release after migration
-    confidence, or document denormalized as the long-lived compatibility
-    default and keep registry opt-in.
+- [x] Decide the LocalBackend registry-storage default: resolved by 1.0 step 5,
+  single storage. Registry mode stays opt-in until then and is not promoted.
 
 ## Code review follow-ups
 

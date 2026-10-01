@@ -1,6 +1,8 @@
 # AGENTS.md
 
-Guidance for Codex working in the `django-zed-rebac` repository.
+Guidance for coding agents (Claude Code reads this file through the
+`CLAUDE.md` symlink; Codex reads it directly) working in the
+`django-zed-rebac` repository.
 
 > See `docs/ARCHITECTURE.md` and `docs/ZED.md` for the design contract. Those docs are
 > the source of truth.
@@ -22,7 +24,7 @@ adapter modules are in flight per the ARCHITECTURE.md roadmap. Layout:
 ```
 django-zed-rebac/
 ├── README.md                 # Public pitch + quickstart + comparison
-├── AGENTS.md                 # This file
+├── AGENTS.md                 # This file (CLAUDE.md is a symlink to it)
 ├── docs/
 │   ├── ARCHITECTURE.md               # Implementation specification
 │   └── ZED.md                # Schema-authoring guide
@@ -596,7 +598,12 @@ When implementing or modifying the plugin:
 
 The spec calls out several open questions; don't re-decide them ad hoc:
 
-- **`select_related` SQL compiler propagation** (v1.x).
+- **Integration at the ORM's SQL compilers** (1.0): read scope for every
+  alias including `select_related`, one write gate from the statement's
+  `Query`, single storage, identity as a stored column. The plan and its
+  order of work are in `docs/ROADMAP.md § 1.0`; the design is proposal 0013.
+  Until it lands, do not add Python emulation of Django query semantics to
+  close a gating gap; pin it under proposal 0013 instead.
 - **PostgreSQL RLS defense-in-depth track** (post-1.0).
 - **Relationship table partitioning at scale** (post-1.0).
 - **Async ORM support** (0.5+).

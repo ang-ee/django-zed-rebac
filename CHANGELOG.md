@@ -3,6 +3,15 @@
 All notable changes to `django-zed-rebac` are tracked here. The project is in
 pre-1.0; breaking changes within a minor version are explicitly called out.
 
+## [Unreleased]
+
+### Docs
+
+- `docs/ROADMAP.md` states the 1.0 plan: integration at Django's SQL
+  compilers (proposal 0013), single storage, identity as a stored column, one
+  bypass primitive, overrides as AST operations, with the order of work and
+  the measurements that decide it. `CLAUDE.md` is a symlink to `AGENTS.md`.
+
 ## [0.24.0] — 2026-10-01
 
 ### Breaking
