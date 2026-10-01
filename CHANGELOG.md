@@ -3,7 +3,24 @@
 All notable changes to `django-zed-rebac` are tracked here. The project is in
 pre-1.0; breaking changes within a minor version are explicitly called out.
 
-## [Unreleased]
+## [0.24.1] — 2026-10-01
+
+### Fixed
+
+- The projection guard attributes a column to a queryset's projection only
+  when it is read from that queryset's own row. A column read inside a nested
+  query under the nested query's aliases is decided by that query's own scope:
+  a bypass subquery may read it, and an actor-scoped subquery answers for its
+  own projection when it is resolved. 0.24.0 attributed a nested alias's column
+  to the outer projection by field identity, so an `Exists` or `Subquery` over
+  a bypass queryset of the same model that read a gated column raised
+  "Cannot project gated field(s)" for every reader. A direct `F("gated")`
+  annotation and an `OuterRef("gated")` read of the outer row still raise.
+- A bypass queryset embedded in an expression (`Exists`, `Subquery`, a
+  `pk__in=` lookup) writes its `sudo.bypass` audit row when the statement it
+  was resolved into is compiled for execution, once per execution, not when
+  the expression is built. 0.24.0 wrote the row at resolution, which is a
+  database write during app initialisation for annotations built at import.
 
 ### Docs
 

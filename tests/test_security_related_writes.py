@@ -1069,12 +1069,12 @@ def test_subquery_over_gated_model_is_refused_on_write(method):
     _grant("blog/post", post.pk, "editor", EDITOR)
     source = Subquery(Post.objects.with_actor(EDITOR).filter(pk=OuterRef("pk")).values("body")[:1])
     if method == "update":
-        with pytest.raises(PermissionDenied, match="subquery"):
+        with pytest.raises(PermissionDenied, match=r"subquery|Cannot project gated field"):
             Post.objects.with_actor(EDITOR).filter(pk=post.pk).update(title=source)
     else:
         row = Post.objects.with_actor(EDITOR).get(pk=post.pk)
         row.title = source
-        with pytest.raises(PermissionDenied, match="subquery"):
+        with pytest.raises(PermissionDenied, match=r"subquery|Cannot project gated field"):
             row.save(update_fields=["title"])
     with sudo(reason="test.verify"):
         assert Post.objects.get(pk=post.pk).title == "public"

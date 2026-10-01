@@ -108,3 +108,30 @@ def test_block_sudo_row_follows_outer_transaction():
         with sudo(reason="audit.committed"):
             assert _bypass_rows("audit.committed").count() == 1
     assert _bypass_rows("audit.committed").count() == 1
+
+
+def test_building_a_sudo_subquery_writes_no_audit_row(post):
+    """Annotations are built at import time; building one runs no query and
+    must not write. The embedded bypass is audited each time the statement it
+    was resolved into executes."""
+    from django.db.models import Exists, OuterRef
+
+    expression = ~Exists(Post.objects.sudo(reason="audit.embedded").filter(pk=OuterRef("pk")))
+    queryset = Post.objects.sudo(reason="audit.outer").annotate(flag=expression)
+    assert not _bypass_rows("audit.embedded").exists()
+    assert not _bypass_rows("audit.outer").exists()
+
+    assert list(queryset.values("pk", "flag")) == [{"pk": post.pk, "flag": False}]
+    assert _bypass_rows("audit.embedded").count() == 1
+    assert list(queryset.values_list("flag", flat=True)) == [False]
+    assert _bypass_rows("audit.embedded").count() == 2
+
+
+def test_sudo_queryset_in_a_lookup_is_audited_at_execution(post):
+    inner = Post.objects.sudo(reason="audit.lookup").values("pk")
+    outer = Post.objects.sudo(reason="audit.outer").filter(pk__in=inner)
+    assert not _bypass_rows("audit.lookup").exists()
+    assert not _bypass_rows("audit.outer").exists()
+
+    assert [row.pk for row in outer] == [post.pk]
+    assert _bypass_rows("audit.lookup").count() == 1
