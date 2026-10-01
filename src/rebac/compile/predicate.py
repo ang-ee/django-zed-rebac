@@ -28,7 +28,6 @@ from typing import Any, Final, Protocol, cast
 from django.core.exceptions import FieldDoesNotExist
 from django.db import models
 from django.db.models import Exists, Expression, F, OuterRef, Q, QuerySet, Value
-from django.db.models.functions import Now
 from django.db.models.lookups import Exact, In, IsNull, LessThan
 
 from .._id import model_identity_fields, resource_id_attr
@@ -198,6 +197,7 @@ class _Marker:
 
 
 ACTOR_WIRE: Final = _Marker("actor wire id")
+CLOCK: Final = _Marker("clock")
 
 
 @dataclass(frozen=True, slots=True)
@@ -218,12 +218,33 @@ class _Param(Expression):
         return "%s", (self.marker,)
 
 
+def statement_now() -> datetime:
+    """The instant a statement is read at: the application clock, never the database's."""
+    from ..index import time as index_time
+
+    return index_time.index_now()
+
+
+def clock() -> Expression:
+    """The statement's instant, as one parameter bound when the statement runs."""
+    return _Param(CLOCK, models.DateTimeField())
+
+
 def bind(params: Iterable[Any], actor: SubjectRef, connection: Any) -> list[Any]:
-    """Replace the actor placeholders of a parametric statement."""
+    """Replace the actor and clock placeholders of a parametric statement.
+
+    Every occurrence of the clock in one statement gets the same instant: a
+    fact that appears under both polarities must not be read at two times.
+    """
     bound: list[Any] = []
+    now: Any = None
     for param in params:
         if param is ACTOR_WIRE:
             bound.append(actor.subject_id)
+        elif param is CLOCK:
+            if now is None:
+                now = models.DateTimeField().get_db_prep_value(statement_now(), connection, False)
+            bound.append(now)
         elif isinstance(param, ActorNative):
             field = param.field
             bound.append(
@@ -336,7 +357,15 @@ class Compiler:
         self.using = using
         self.tagged = tagged
         self.verdicts = verdicts
-        self.now = now if now is not None else Now()
+        # The application clock, never the database's.  A parametric
+        # statement binds it when it runs; any other reads it now.
+        self.now = (
+            now
+            if now is not None
+            else clock()
+            if parametric
+            else Value(statement_now(), output_field=models.DateTimeField())
+        )
         self.depth_limit = app_settings.REBAC_DEPTH_LIMIT if depth_limit is None else depth_limit
         self.program = program if program is not None else CompileProgram.build(self.schema)
         self.parametric = parametric

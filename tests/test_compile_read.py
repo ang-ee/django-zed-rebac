@@ -4,7 +4,6 @@ from datetime import timedelta
 
 import pytest
 from django.contrib.contenttypes.models import ContentType
-from django.db.models import DateTimeField, Value
 from django.utils import timezone
 
 from rebac import RelationshipTuple, sudo
@@ -31,9 +30,7 @@ def clocks(monkeypatch):
     clock = {"app": timezone.now(), "sql": timezone.now()}
     clock["sql"] = clock["app"]
     monkeypatch.setattr(timezone, "now", lambda: clock["app"])
-    monkeypatch.setattr(
-        "rebac.compile.read.Now", lambda: Value(clock["sql"], output_field=DateTimeField())
-    )
+    monkeypatch.setattr("rebac.compile.predicate.statement_now", lambda: clock["sql"])
     return clock
 
 

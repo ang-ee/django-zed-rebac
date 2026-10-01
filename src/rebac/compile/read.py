@@ -19,7 +19,6 @@ from typing import TYPE_CHECKING, Any, cast
 
 from django.db import connections, models
 from django.db.models import Exists, Expression, F, Q, Value
-from django.db.models.functions import Now
 from django.db.models.lookups import Exact, GreaterThanOrEqual, LessThan
 from django.utils import timezone
 
@@ -42,7 +41,7 @@ from rebac.schema.cache import SchemaSnapshot, schema_operation
 from rebac.schema.walker import find_relation
 from rebac.types import CheckResult, ObjectRef, SubjectRef
 
-from . import At, Bound, Compiler
+from . import At, Bound, Compiler, predicate
 from .conditions import CaveatVerdicts
 from .evaluate import named_subjects, residual
 from .predicate import (
@@ -53,6 +52,7 @@ from .predicate import (
     _Param,
     actor_shape,
     bind,
+    clock,
     const_facts,
     is_false,
     is_true,
@@ -62,8 +62,6 @@ from .program import CompileProgram, Key
 if TYPE_CHECKING:
     from rebac.backends.local import LocalBackend
 
-# The database clock; ``Now`` itself stays a module name tests can replace.
-_DatabaseNow = Now
 _MANUAL_REVISION = object()
 _RESOURCE_WIRE = object()
 _LIMIT = 512
@@ -191,11 +189,16 @@ def _fence(
         rows = rows.filter(Exact(Value(snapshot.revision), current))
     else:
         rows = rows.filter(revision=snapshot.revision)
+    now: Expression = (
+        clock()
+        if parametric
+        else Value(predicate.statement_now(), output_field=models.DateTimeField())
+    )
     for deadline in policy.caveat_deadlines:
         comparison = (
-            LessThan(Now(), Value(deadline, output_field=models.DateTimeField()))
+            LessThan(now, Value(deadline, output_field=models.DateTimeField()))
             if policy.selected_at < deadline
-            else GreaterThanOrEqual(Now(), Value(deadline, output_field=models.DateTimeField()))
+            else GreaterThanOrEqual(now, Value(deadline, output_field=models.DateTimeField()))
         )
         rows = rows.filter(comparison)
     return rows
@@ -218,16 +221,14 @@ class _Sql(Expression):
 
 @dataclass(frozen=True)
 class _Operation:
-    """What one statement is compiled for: a policy, an actor and a clock."""
+    """What one statement is compiled for: a policy and an actor."""
 
     backend: LocalBackend
     policy: _Policy
     actor: SubjectRef
     using: str
     context: Mapping[str, Any] | None
-    now: Expression
     shape: tuple[Any, ...]
-    keep: bool
     _verdicts: dict[Key, CaveatVerdicts] = field(default_factory=dict)
 
     @classmethod
@@ -240,14 +241,12 @@ class _Operation:
         policy: _Policy | None = None,
     ) -> _Operation:
         policy = policy if policy is not None else _policy(backend)
-        now = Now()
         return cls(
             backend,
             policy,
             actor,
             using,
             context,
-            now,
             (
                 policy.key,
                 actor_shape(policy.schema, actor, using),
@@ -256,9 +255,6 @@ class _Operation:
                 app_settings.REBAC_DEPTH_LIMIT,
                 active_relationship_model()._meta.label_lower,
             ),
-            # A statement can be kept when nothing in it varies but the
-            # actor's id: the database clock, and no caveat verdict lists.
-            isinstance(now, _DatabaseNow),
         )
 
     def verdicts(self, key: Key) -> CaveatVerdicts:
@@ -282,7 +278,6 @@ class _Operation:
             self.using,
             tagged=self.policy.tagged,
             verdicts=verdicts,
-            now=self.now,
             program=self.policy.program,
             parametric=parametric,
             facts=facts,
@@ -298,7 +293,9 @@ class _Operation:
         build: Callable[[], models.QuerySet[Any] | bool | tuple[models.QuerySet[Any], bool]],
     ) -> _Kept | bool:
         """The SQL of ``build()``; a bool when it needs no rows to be decided."""
-        keep = self.keep and verdicts.empty
+        # A statement can be kept when nothing in it varies but the actor's
+        # id and the clock: that is, when it carries no caveat verdict list.
+        keep = verdicts.empty
         full = (*self.shape, *key)
         if keep:
             with _lock:
@@ -816,6 +813,64 @@ def grants_all(
         using=using,
         lower_only=True,
     )[0]
+
+
+@schema_operation
+def held(
+    *,
+    backend: LocalBackend,
+    resource_type: str,
+    action: str,
+    actor: SubjectRef,
+    ids: Iterable[str],
+    using: str,
+    context: Mapping[str, Any] | None = None,
+) -> set[str]:
+    """The ids among ``ids`` on which the actor holds the action.
+
+    Ids that are rows of the type's model are tested by one scoped statement
+    per chunk; the others (no row, or not a valid identity) one by one.
+    """
+    pending = set(ids)
+    found: set[str] = set()
+    model = model_for_resource_type(resource_type)
+    if model is not None and stores_rows(model) and context is None and len(pending) > 4:
+        identity = resource_id_attr(model)
+        codec = identity_codec(model, identity)
+        _, identity_field = model_identity_fields(model, identity)
+        native = {
+            identity_field.to_python(value): value
+            for value in pending
+            if codec.is_canonical(value, using=using)
+        }
+        scope = scope_q(backend=backend, model=model, action=action, actor=actor, using=using)
+        rows = model._base_manager.using(using)
+        values = list(native)
+        for start in range(0, len(values), 500):
+            chunk = values[start : start + 500]
+            present = set(
+                rows.filter(**{f"{identity}__in": chunk}).values_list(identity, flat=True)
+            )
+            allowed = set(
+                rows.filter(**{f"{identity}__in": chunk})
+                .filter(scope)
+                .values_list(identity, flat=True)
+            )
+            for value in present:
+                pending.discard(native[value])
+            found.update(native[value] for value in allowed)
+    for value in sorted(pending):
+        if _point_result(
+            backend=backend,
+            resource=ObjectRef(resource_type, value),
+            action=action,
+            actor=actor,
+            context=context,
+            using=using,
+            lower_only=True,
+        )[0]:
+            found.add(value)
+    return found
 
 
 @schema_operation

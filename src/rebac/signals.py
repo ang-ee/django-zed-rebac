@@ -872,16 +872,17 @@ def _check_edge_writes(
     from .backends.local import LocalBackend
 
     if isinstance(active, LocalBackend):
-        from .index.read import accessible_ids, using_backend
+        from .compile.read import held
         from .models import active_relationship_model
 
-        using = active_relationship_model().objects.db
-        with using_backend(active):
-            allowed = set(
-                accessible_ids(
-                    resource_type=resource_type, action="write", actor=actor, using=using
-                ).filter(object_id__in=ids)
-            )
+        allowed = held(
+            backend=active,
+            resource_type=resource_type,
+            action="write",
+            actor=actor,
+            ids=ids,
+            using=active_relationship_model().objects.db,
+        )
     else:
         allowed = {
             id_

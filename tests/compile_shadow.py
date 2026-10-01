@@ -10,10 +10,9 @@ conftest explicitly excludes synthetic index-only fixtures.
 from contextlib import contextmanager
 from contextvars import ContextVar
 from functools import wraps
-from unittest.mock import patch
 
 from django.db import connections
-from django.db.models import BooleanField, DateTimeField, Expression, Q, Value
+from django.db.models import BooleanField, Expression, Q, Value
 
 from rebac.types import CheckResult
 
@@ -22,18 +21,12 @@ _comparing = ContextVar("compiled_shadow_comparing", default=False)
 
 @contextmanager
 def comparison(using):
-    from rebac.index.time import index_now
-
     token = _comparing.set(True)
     connection = connections[using]
     queries = tuple(connection.queries_log)
     try:
-        # Existing deadline tests control the oracle clock. Compare the
-        # candidate at that same instant, with one shared SQL parameter;
-        # production continues to use the database statement's Now().
-        at = index_now()
-        with patch("rebac.compile.read.Now", lambda: Value(at, output_field=DateTimeField())):
-            yield
+        # Both sides read the application clock when their statement runs.
+        yield
     finally:
         # Existing query-count assertions measure the unchanged production path.
         # Compiled-query budgets have their own focused tests.

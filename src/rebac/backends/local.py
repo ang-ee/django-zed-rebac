@@ -569,17 +569,17 @@ class LocalBackend(Backend):
         at_zookie: Zookie | None = None,
     ) -> CheckResult:
         self._validate_consistency(consistency, at_zookie)
-        from ..index.read import check, using_backend
+        from ..compile.read import check
         from ..models import active_relationship_model
 
-        with using_backend(self):
-            return check(
-                resource=resource,
-                action=action,
-                actor=subject,
-                context=context,
-                using=active_relationship_model().objects.db,
-            )
+        return check(
+            backend=self,
+            resource=resource,
+            action=action,
+            actor=subject,
+            context=context,
+            using=active_relationship_model().objects.db,
+        )
 
     @_schema_operation
     def queryset_filter(
@@ -590,12 +590,11 @@ class LocalBackend(Backend):
         action: str,
         using: str,
     ) -> models.Q | None:
-        from ..index.read import scope_q, using_backend
+        from ..compile.read import scope_q
 
         if model_resource_type(model) is None:
             return None
-        with using_backend(self):
-            return scope_q(model, action=action, actor=subject, using=using)
+        return scope_q(backend=self, model=model, action=action, actor=subject, using=using)
 
     @_schema_operation
     def accessible(
@@ -608,20 +607,20 @@ class LocalBackend(Backend):
         consistency: Consistency | None = None,
         at_zookie: Zookie | None = None,
     ) -> Iterable[str]:
-        from ..index.read import accessible_ids, using_backend
+        from ..compile.read import accessible_ids
         from ..models import active_relationship_model
 
         self._validate_consistency(consistency, at_zookie)
-        with using_backend(self):
-            return list(
-                accessible_ids(
-                    resource_type=resource_type,
-                    action=action,
-                    actor=subject,
-                    using=active_relationship_model().objects.db,
-                    context=context,
-                )
+        return list(
+            accessible_ids(
+                backend=self,
+                resource_type=resource_type,
+                action=action,
+                actor=subject,
+                using=active_relationship_model().objects.db,
+                context=context,
             )
+        )
 
     @_schema_operation
     def grants_all(
@@ -632,18 +631,18 @@ class LocalBackend(Backend):
         resource_type: str,
         context: dict[str, Any] | None = None,
     ) -> bool:
-        """Conservatively detect an index cover granting the whole type."""
-        from ..index.read import _grants_all, using_backend
+        """Whether the actor holds the action on every object of the type."""
+        from ..compile.read import grants_all
         from ..models import active_relationship_model
 
-        del context
-        with using_backend(self):
-            return _grants_all(
-                resource_type=resource_type,
-                action=action,
-                actor=subject,
-                using=active_relationship_model().objects.db,
-            )
+        return grants_all(
+            backend=self,
+            resource_type=resource_type,
+            action=action,
+            actor=subject,
+            using=active_relationship_model().objects.db,
+            context=context,
+        )
 
     @_schema_operation
     def lookup_subjects(
@@ -656,18 +655,18 @@ class LocalBackend(Backend):
         consistency: Consistency | None = None,
         at_zookie: Zookie | None = None,
     ) -> Iterable[SubjectRef]:
-        from ..index.read import lookup_subjects, using_backend
+        from ..compile.read import lookup_subjects
         from ..models import active_relationship_model
 
         self._validate_consistency(consistency, at_zookie)
-        with using_backend(self):
-            return lookup_subjects(
-                resource=resource,
-                action=action,
-                subject_type=subject_type,
-                using=active_relationship_model().objects.db,
-                context=context,
-            )
+        return lookup_subjects(
+            backend=self,
+            resource=resource,
+            action=action,
+            subject_type=subject_type,
+            using=active_relationship_model().objects.db,
+            context=context,
+        )
 
     @_schema_operation
     def write_relationships(self, writes: Iterable[RelationshipTuple]) -> Zookie:
