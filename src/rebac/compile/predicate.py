@@ -240,6 +240,11 @@ class _Compiled(Expression):
         return cached
 
 
+def _one_object(ref: Any) -> bool:
+    """The reference is a statement constant: a value or a bound parameter."""
+    return isinstance(ref, (Value, _Param))
+
+
 def _in(expr: Expression | F | OuterRef, rows: QuerySet[Any]) -> Q:
     """Two-valued membership: a NULL reference is not a member."""
     return _not_null(expr) & Q(In(expr, _Compiled(rows)))
@@ -906,27 +911,35 @@ class Compiler:
                 for arm in base
             ]
 
-        parts = base_at(at)
+        own_row = at.row and model_for_resource_type(at.resource_type) is model and at.key is field
+        # The holders are looked up by key, a row and its ancestors at a time,
+        # so their base is a plain disjunction: each arm is decided once.
+        base_row = _or(*base_at(row_at))
+        if base_row is _TRUE:
+            return _TRUE
+        # An object without a row inherits nothing; it holds its own base only.
+        parts = [] if own_row else base_at(at)
         if any(part is _TRUE for part in parts):
             return _TRUE
-        base_row = self._union(row_at, base_at(row_at))
         source = model._base_manager.using(self.using)
         if base_row is not _FALSE:
             # The parent column holds a value of the key's target field, at
-            # every level of the chain.
+            # every level of the chain.  The chain starts at the row itself.
             target = resolved.field.target_field.name
-            ancestors = [
-                OuterRef("__".join([resolved.path] * (hops - 1) + [resolved.field.attname]))
-                for hops in range(1, self.depth_limit + 1)
+            chain = [
+                OuterRef(target),
+                *(
+                    OuterRef("__".join([resolved.path] * (hops - 1) + [resolved.field.attname]))
+                    for hops in range(1, self.depth_limit + 1)
+                ),
             ]
-            inherits = Q(Exists(source.filter(**{f"{target}__in": ancestors}).filter(base_row)))
+            inherits = Q(Exists(source.filter(**{f"{target}__in": chain}).filter(base_row)))
             if bound is Bound.UPPER and depth_possible:
                 deep_path = "__".join([resolved.path] * (self.depth_limit + 1))
                 inherits = inherits | Q(**{f"{deep_path}__isnull": False})
-            if at.row and model_for_resource_type(at.resource_type) is model and at.key is field:
-                parts.append(inherits)
-            else:
-                parts.append(self._model_membership(at, source.filter(inherits), model, identity))
+            if own_row:
+                return inherits
+            parts.append(self._model_membership(at, source.filter(inherits), model, identity))
         return self._union(at, parts)
 
     def _flat_self_path(
@@ -1610,6 +1623,10 @@ class Compiler:
     # ---------- Identity ----------
 
     def _tuple_membership(self, at: At, rows: QuerySet[Any], last: Q | None = None) -> Q:
+        if at.key is None and _one_object(at.ref):
+            # One object: look its tuples up by key instead of building the set.
+            rows = rows.filter(resource_id=at.ref)
+            return Q(Exists(rows.filter(last) if last is not None else rows))
         return _in(at.ref, self._tuple_identity_rows(at, rows, last))
 
     def _tuple_identity_rows(
@@ -1657,7 +1674,11 @@ class Compiler:
         if at.key is None:
             # The model column remains native. Convert a wire reference when
             # the identity originates in a tuple or a constant.
-            return _in(identity_codec(model, identity).to_column(cast(Expression, at.ref)), native)
+            converted = identity_codec(model, identity).to_column(cast(Expression, at.ref))
+            if _one_object(at.ref):
+                # One object: look its row up by key instead of building the set.
+                return Q(Exists(rows.order_by().filter(**{identity: converted})))
+            return _in(converted, native)
         _, canonical = model_identity_fields(model, identity)
         if at.key is canonical:
             return _in(at.ref, native)
