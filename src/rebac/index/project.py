@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import logging
 from collections.abc import Iterable
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from itertools import batched
 from time import perf_counter
 from typing import Any, cast
@@ -54,6 +54,11 @@ class Stats:
     updated: int = 0
     python_rows: int = 0
     seconds: float = 0.0
+    changed_scopes: set[int] = field(default_factory=set)
+    changed_nodes: dict[tuple[str, str], set[int]] = field(default_factory=dict)
+    added_edges: set[tuple[int, str]] = field(default_factory=set)
+    removed_edges: set[tuple[int, str]] = field(default_factory=set)
+    edge_candidates: dict[tuple[Any, ...], dict[str, Any]] | None = None
 
     def add(self, other: Stats) -> None:
         self.inserted += other.inserted
@@ -61,6 +66,11 @@ class Stats:
         self.updated += other.updated
         self.python_rows += other.python_rows
         self.seconds += other.seconds
+        self.changed_scopes.update(other.changed_scopes)
+        for key, scopes in other.changed_nodes.items():
+            self.changed_nodes.setdefault(key, set()).update(scopes)
+        self.added_edges.update(other.added_edges)
+        self.removed_edges.update(other.removed_edges)
 
 
 def text(value: str) -> Value:
@@ -309,13 +319,108 @@ def _emit(
         condition=formula_value(condition),
         condition_key=text(conditions.key(condition)),
     )
-    upsert(
-        projected,
-        IndexEdge,
-        ("resource_id", "relation", "subject_id", "source", "condition_key"),
-        using=using,
-        stats=stats,
+    if stats.edge_candidates is None:
+        upsert(
+            projected,
+            IndexEdge,
+            ("resource_id", "relation", "subject_id", "source", "condition_key"),
+            using=using,
+            stats=stats,
+        )
+    else:
+        fields = (
+            "resource_id",
+            "resource_type",
+            "relation",
+            "subject_id",
+            "target_id",
+            "source",
+            "expires_at",
+            "condition",
+            "condition_key",
+        )
+        for row in projected_rows(projected, fields, using=using):
+            stats.python_rows += 1
+            values = cast(dict[str, Any], dict(zip(fields, row, strict=True)))
+            key = tuple(
+                values[name]
+                for name in ("resource_id", "relation", "subject_id", "source", "condition_key")
+            )
+            previous = stats.edge_candidates.get(key)
+            if previous is None or values["expires_at"] > previous["expires_at"]:
+                stats.edge_candidates[key] = values
+
+
+def _write_edge_difference(stats: Stats, *, using: str, sources: set[int]) -> None:
+    """Apply only changed projected edges in the bounded source region."""
+    assert stats.edge_candidates is not None
+    fields = (
+        "resource_id",
+        "resource_type",
+        "relation",
+        "subject_id",
+        "target_id",
+        "source",
+        "expires_at",
+        "condition",
+        "condition_key",
     )
+    key_fields = ("resource_id", "relation", "subject_id", "source", "condition_key")
+    complete_sources = set(sources)
+    # Projection may discover a new target scope partway through its ordered
+    # rules. Its emitted rows can be compared, but earlier relations at that
+    # scope were not necessarily visited in this pass.
+    sources.update(values["resource_id"] for values in stats.edge_candidates.values())
+    max_params = connections[using].features.max_query_params or 5000
+    batch_size = max(1, min(5000, max_params - 32))
+    old = {
+        tuple(getattr(edge, name) for name in key_fields): edge
+        for source_batch in batched(
+            sorted(source for source in sources if source is not None), batch_size, strict=False
+        )
+        for edge in IndexEdge.objects.using(using)
+        .filter(resource_id__in=source_batch)
+        .iterator(chunk_size=BATCH_SIZE)
+    }
+    stats.python_rows += len(old)
+
+    def mark(type_: str, relation: str, scope: int) -> None:
+        stats.changed_scopes.add(scope)
+        stats.changed_nodes.setdefault((type_, relation), set()).add(scope)
+
+    removed = {
+        key for key in old if key[0] in complete_sources and key not in stats.edge_candidates
+    }
+    if removed:
+        doomed = [old[key].pk for key in removed]
+        for key in removed:
+            mark(old[key].resource_type, old[key].relation, key[0])
+            stats.removed_edges.add((key[0], old[key].relation))
+        for batch in batched(doomed, batch_size, strict=False):
+            stats.deleted += IndexEdge.objects.using(using).filter(pk__in=batch).delete()[0]
+    created = []
+    updated = []
+    for key, values in stats.edge_candidates.items():
+        previous = old.get(key)
+        if previous is None:
+            created.append(tuple(values[name] for name in fields))
+            mark(values["resource_type"], values["relation"], values["resource_id"])
+            stats.added_edges.add((values["resource_id"], values["relation"]))
+        elif any(getattr(previous, name) != values[name] for name in fields):
+            for name in fields:
+                setattr(previous, name, values[name])
+            updated.append(previous)
+            mark(values["resource_type"], values["relation"], values["resource_id"])
+            stats.added_edges.add((values["resource_id"], values["relation"]))
+            stats.removed_edges.add((values["resource_id"], values["relation"]))
+    stats.inserted += stream_create(created, IndexEdge, fields, using=using)
+    if updated:
+        IndexEdge.objects.using(using).bulk_update(
+            updated,
+            ("resource_type", "target_id", "expires_at", "condition"),
+            batch_size=BATCH_SIZE,
+        )
+        stats.updated += len(updated)
 
 
 def _stored(
@@ -513,9 +618,16 @@ def _backed(
     )
 
 
-def project_edges(program: IndexProgram, *, using: str, region: int | None = None) -> Stats:
+def project_edges(
+    program: IndexProgram, *, using: str, region: int | None = None, diff: bool = False
+) -> Stats:
     started = perf_counter()
     stats = Stats()
+    source_scopes: set[int] = set()
+    if diff:
+        assert region is not None
+        stats.edge_candidates = {}
+        source_scopes = set(region_terms(using, region).values_list("term_id", flat=True))
     logger.info("phase=projection status=start region=%s", region)
     types = region_types(using, region)
     selected = [
@@ -638,6 +750,10 @@ def project_edges(program: IndexProgram, *, using: str, region: int | None = Non
                 ("pass_id", "kind", "term_id", "node", "phase"),
                 using=using,
             )
+    if diff:
+        assert region is not None
+        _write_edge_difference(stats, using=using, sources=source_scopes)
+        stats.edge_candidates = None
     stats.seconds = perf_counter() - started
     logger.info(
         "phase=projection status=done rows_out=%s python_rows=%s seconds=%.3f",
