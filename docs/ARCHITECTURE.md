@@ -1613,6 +1613,19 @@ matching the actor with a join instead of subqueries, 18.8 ms. Even a
 placeholder actor set, which is incorrect, only reaches 10.9 ms. The cached
 SQL takes about 1 ms.
 
+The same exception covers one fragment on the write side (proposal 0014,
+step 1, first part): the identity conversion's guard. `codec.to_wire()` and
+`codec.to_column()` wrap an expression in a validity check that reads it about
+ten times and depends only on the identity field, the direction and the
+connection. Django compiles that guard once around a placeholder; each use
+compiles its own expression once and takes the placeholder's positions. The
+guard was rebuilt, re-resolved and recompiled at every use, 186 times for one
+model save in the maintenance test schema, which was about 60% of the Python
+time of a pass: 110 to 120 ms per save became 50 to 60 ms on SQLite, with the
+same 102 statements. `tests/test_index_codec_cache.py` pins the cached SQL and
+parameters equal to the uncached ones for integer, text and UUID identities,
+on SQLite and PostgreSQL.
+
 #### Reads
 
 One `member(node, x, actor, polarity)` compiler tests whether the actor
