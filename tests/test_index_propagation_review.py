@@ -102,6 +102,64 @@ def test_scope_joining_mid_projection_keeps_its_stored_edge_expiry(joins_under_t
         ).allowed
 
 
+BANNED_SET_SCHEMA = """
+caveat gate(ok bool) { ok }
+definition auth/user {}
+definition g/team {
+    relation member: auth/user | g/team#member | auth/user with gate with expiration
+}
+definition r/doc {
+    relation viewer: auth/user | g/team#member
+    relation banned: g/team#member
+    permission read = viewer
+    permission safe = (viewer - banned)
+}
+"""
+
+
+@pytest.mark.parametrize("storage", ["denormalized", "registry"])
+def test_scope_joining_mid_projection_keeps_a_ban_in_force(settings, storage):
+    """The same shortened expiry on the subtracted side of an exclusion lifts a ban.
+
+    Found by the adversarial fuzz review: carol's membership of t2 is held by
+    an expired plain tuple and a live caveated one that share an edge key. A
+    write to t1, which only contains t2, must not replace the live expiry.
+    """
+    from rebac.testing import install_schema
+
+    settings.REBAC_LOCAL_BACKEND_STORAGE = storage
+    local = install_schema(BANNED_SET_SCHEMA)
+    now = timezone.now()
+    carol = SubjectRef.of("auth/user", "carol")
+    t1 = ObjectRef("g/team", "t1")
+    t2 = ObjectRef("g/team", "t2")
+    ban = ObjectRef("r/doc", "ban")
+    local.write_relationships(
+        [
+            RelationshipTuple(t2, "member", carol, expires_at=now - timedelta(minutes=1)),
+            RelationshipTuple(
+                t2,
+                "member",
+                carol,
+                caveat_name="gate",
+                caveat_context={"ok": True},
+                expires_at=now + timedelta(days=3),
+            ),
+            RelationshipTuple(t1, "member", SubjectRef.of("g/team", "t2", "member")),
+            RelationshipTuple(ban, "viewer", carol),
+            RelationshipTuple(ban, "banned", SubjectRef.of("g/team", "t1", "member")),
+        ]
+    )
+    assert_no_drift()
+    assert not local.check_access(subject=carol, resource=ban, action="safe").allowed
+
+    # Captures t1 only; t2 is reached as the subject set of t1's edge.
+    local.write_relationships([RelationshipTuple(t1, "member", SubjectRef.of("auth/user", "bob"))])
+
+    assert not local.check_access(subject=carol, resource=ban, action="safe").allowed
+    assert_no_drift()
+
+
 def _wide_stratum_schema(keys: int) -> str:
     permissions = "\n".join(
         f"    permission p{n} = viewer + parent->p{(n + 1) % keys}" for n in range(keys)
