@@ -2,8 +2,9 @@
 
 **Target version:** a green-field re-implementation of `LocalBackend`
 evaluation; candidate shape for 1.0.
-**Status:** draft 2 (2026-10-01), revised after a design review. The decision
-gates at the end are open. Nothing here is implemented.
+**Status:** draft 3 (2026-10-01), revised after a design review and after
+first measurements on a consumer database. The decision gates at the end are
+open. Nothing here is implemented.
 **Supersedes, if accepted:** proposals 0009 and 0014, and the maintenance
 half of 0012. Proposals 0011 and 0013 are narrowed, not superseded (§ 10).
 
@@ -20,6 +21,17 @@ A review found seven gaps. Each is resolved in the section named:
 | A foreign key's target column need not be the target's REBAC identity | An identity expression carries the field it is a value of (§ 2) |
 | Staging caveats makes `accessible(context=…)` disagree with a point check; the frozen walker is order-dependent | No staging: sets decide caveats as 0.24 does; the reference semantics stay the authority (§ 6) |
 | Refusing recursion in negative positions rejects ordinary group bans | Nothing is refused for position: a negative position is widened by the rows too deep to decide (§ 8) |
+
+Draft 3 adds two things the first measurements forced:
+
+- **Statement shape** (§ 4). Alternative paths OR-ed as separate `IN`
+  subqueries ran into a 120-second statement timeout on tables of six to
+  eight million rows. A disjunction is therefore compiled as a union of id
+  sets, never as `OR` over subqueries.
+- **Actor-side facts are decided, not joined** (§ 5), and the recursion they
+  contain is exact. Only structural recursion is unrolled, and real data
+  already exceeds the default depth: a folder chain of 12 hops against a
+  limit of 8 (§ 8, gate G2).
 
 ## Problem
 
@@ -177,7 +189,7 @@ each kind had to be copied; at read time a path is a path.
 Multi-valued joins follow the repository rule: one `Exists`/`OuterRef` or
 one `filter(Q & Q)` per join.
 
-### 4. Two-valued arms
+### 4. Two-valued arms and statement shape
 
 `NOT` is only sound over predicates that are never `NULL`:
 
@@ -185,6 +197,29 @@ one `filter(Q & Q)` per join.
   excludes `NULL` (a converted invalid id, a null column);
 - an arm over a nullable foreign key is false, not `NULL`, when the column
   is null (the 0.22.1 rule, kept).
+
+The table of § 3 says what each construct means. How it is written matters
+as much. PostgreSQL turns `x IN (subquery)` into a join only when it stands
+in a conjunction. Under `OR` it becomes a per-row subplan, hashed only if
+its result fits in `work_mem`; on the measured database (`work_mem` 4 MB)
+several OR-ed subqueries on a multi-million-row table did not finish in 120
+seconds. The index build was running on the same server, so the numbers are
+inflated, but the shape is the weak one. The compiler therefore normalizes
+before it emits:
+
+- **A disjunction is a union of id sets.** `A + B` at a row is
+  `id IN (ids(A) UNION ids(B))`: one semi-join, each branch a plain join
+  chain that the planner can drive from the actor's grants.
+- **A conjunction is `AND` of semi-joins.**
+- **A negated disjunction is a conjunction of `NOT EXISTS`**, one correlated
+  anti-join per branch: `NOT (B1 + B2)` is `NOT EXISTS(B1) AND NOT
+  EXISTS(B2)`. `NOT IN` is never emitted.
+- An arm that reads only the row's own columns stays an inline predicate
+  inside its branch.
+
+No `OR` is left above a subquery. (0.22.1 reached the same rule from the
+other side: "independent primary-key membership sets".) Gate G1 measures
+this shape, not the hand-written OR.
 
 ### 5. Subjects
 
@@ -199,6 +234,28 @@ A tuple admits the actor when its subject is:
 The third case is the arrow mechanism. Subject sets, nested groups and role
 inclusion need nothing of their own; a group that contains groups is a
 recursive node (§ 8).
+
+**Actor-side facts are decided, not joined.** A sub-expression evaluated at
+a constant object does not depend on the row: a constant arrow
+(`admin->member` on a fixed role), a fixed attribute container, a builtin.
+In the measured schema one such arm stands in almost every permission. The
+compiler decides these for the actor when the statement is compiled, one
+small query over tuples each, cached for the request by the evaluator, and
+folds the result into the predicate:
+
+- a member of the admin role gets no predicate at all, instead of a union
+  branch that lists every row;
+- for everyone else the arm disappears, and with it the statement text it
+  would have repeated in every nested permission;
+- recursion that lives entirely on this side (a role that includes roles,
+  reached through a constant) is closed by iterating over the tuple table
+  from the actor to a fixpoint. It is exact and has no depth limit, because
+  the set is the actor's own and small.
+
+The decision is taken in the expression's `as_sql`, not when the `Q` is
+built, so a lazy queryset evaluated later decides again (the 0.22 rule for
+tuple-derived grants, and the mechanism of the accepted plan cache). The
+plan cache key gains the decided bits.
 
 ### 6. Caveats and the three states
 
@@ -264,15 +321,45 @@ self-arrow (`parent->read`), a nested group, a role that includes roles.
   would unroll exponentially and is refused by the system check and by the
   policy write owners (the successor of E016), as 0.21 refused it.
 
-Inventory of one consumer schema (64 definitions, 559 nodes): seven
-recursive nodes, all single-node and linear (a folder's and a page's parent,
-a role's inclusion, one group permission); thirteen references in a negative
-position, none reaching a recursive node. Gate G2 repeats this inventory on
-every known schema before reads switch.
+Unrolling applies to **structural** recursion, the kind that runs through
+the application's rows. Actor-side recursion is exact (§ 5). For a backed
+self-FK the levels are flat: level `k` is "the `k`-th ancestor is in the
+base set", a chain of joins on the parent column, and the statement is the
+union of the levels.
 
-If measured depth or statement size demands more than unrolling gives, the
-next step is a closure table for the one recursive relation, over the
-objects of the recursive type only.
+Inventory of one consumer schema (129 definitions): eight types have a
+permission that reaches itself, all single-node and linear, with no cycle
+through several types.
+
+| Recursive permission | Kind | Deepest chain in the data |
+|---|---|---|
+| a folder's `parent->read`, `parent->write` | structural, self-FK | 12 hops, 66,668 folders, no cycles |
+| a page's `parent->read`, `write`, `delete` | structural, self-FK | 2 rows |
+| a run's `parent->read` | structural, self-FK | no rows |
+| one group permission through a self-relation | structural | flat |
+| four role types, `includes->effective_member` | actor-side, tuples | no tuples |
+
+A file inherits the folder recursion through its folder column. Nothing on
+the read path of the messaging types, which hold 14.6 of the 15.7 million
+rows, is recursive. No reference in a negative position reaches a recursive
+node.
+
+**The default depth of 8 is below the real folder chain of 12.** A lower
+bound at 8 would hide files that the index shows today. Gate G2 chooses
+among:
+
+1. **Raise the bound** for a deployment that needs it
+   (`REBAC_DEPTH_LIMIT = 16`). No state. The statement grows by one join
+   chain per level, and `rebac check` reports chains past the bound.
+2. **A closure table for the one recursive relation**, over the objects of
+   the recursive type only (folders, not files). No depth limit, small, but
+   writes to that one column are tracked again.
+3. **A recursive common table expression.** The natural SQL for it, with no
+   state and no limit; Django has no public API for it, so it means SQL the
+   project does not write by hand, or a dependency.
+
+The proposal builds option 1 first, because it needs nothing new, and
+measures it on the folder data before reads switch.
 
 ### 9. What is built from `holds`
 
@@ -455,12 +542,16 @@ Changed, observably:
 ## Decision gates
 
 - **G1, plans.** On the 15.7-million-row database, with compiler-generated
-  SQL: thread page, newest 50 across threads, counts, point checks, for an
-  admin, the heaviest non-admin, a sparse actor and an actor with no access.
-  Report compile, planning and execution time. Hand-written filters
-  (requested 2026-10-01, pending) only establish feasibility.
-- **G2, recursion.** The inventory of § 8 on every known schema; the depth
-  of real chains. Unrolling, or a closure for one relation.
+  SQL in the shape of § 4: thread page, newest 50 across threads, counts,
+  point checks, for an admin, the heaviest non-admin, a sparse actor and an
+  actor with no access. Report compile, planning and execution time.
+  Hand-written filters only establish feasibility; their first result is
+  that the OR shape does not finish and must not be emitted. The union shape
+  is being measured (requested 2026-10-01, report pending). If the union
+  shape is also poor for sparse actors, stop: the design does not hold.
+- **G2, recursion.** The inventory of § 8 is done for one schema. Decide
+  among the three options there with the folder data: statement size and
+  plans at a bound of 16.
 - **G3, contracts.** The compatibility list above, accepted before reads
   switch: depth behaviour, the concurrency contract, `caveat_key`.
 - **G4, compilation cost.** Public ORM per statement, or the accepted
