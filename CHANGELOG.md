@@ -7,6 +7,14 @@ pre-1.0; breaking changes within a minor version are explicitly called out.
 
 ### Changed
 
+- The identity conversion's guard (`codec.to_wire()` / `to_column()`) is
+  compiled by Django once per identity field, direction and connection, and
+  reused: each use compiles only its own expression. The guard was rebuilt and
+  recompiled at every use, 186 times for one model save in the maintenance
+  test schema. A save there went from 110–120 ms to 50–60 ms on SQLite with
+  the same 102 statements; scoped reads use the same conversion. The SQL and
+  parameters are unchanged, pinned by `tests/test_index_codec_cache.py` on
+  SQLite and PostgreSQL. This is the first part of proposal 0014 step 1.
 - Permission-index maintenance now compares projected edges and derives grant
   nodes stratum by stratum only where an edge or input row changed. Membership
   removals clear the former container closure before deriving it; additions
