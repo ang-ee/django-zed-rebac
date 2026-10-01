@@ -817,3 +817,24 @@ def test_library_uses_public_orm_without_database_sql():
         if path.name == "0005_schema_generation.py":
             continue
         assert not banned.search(path.read_text()), path
+
+
+@pytest.mark.django_db
+def test_a_writer_at_an_earlier_migration_state_can_insert_a_relationship():
+    from django.db import connection
+    from django.db.migrations.loader import MigrationLoader
+
+    from rebac.models import Relationship
+
+    # The model as migration 0007 knew it has no ``caveat_key`` field.
+    state = MigrationLoader(connection).project_state(("rebac", "0007_permission_index"))
+    historical = state.apps.get_model("rebac", "Relationship")
+    assert "caveat_key" not in {field.name for field in historical._meta.get_fields()}
+    historical.objects.create(
+        resource_type="docs/doc",
+        resource_id="d",
+        relation="viewer",
+        subject_type="auth/user",
+        subject_id="alice",
+    )
+    assert Relationship.objects.get(resource_id="d").caveat_key == ""

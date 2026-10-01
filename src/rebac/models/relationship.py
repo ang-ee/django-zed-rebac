@@ -177,7 +177,9 @@ class _CaveatedRelationship(models.Model):
 
     caveat_name = models.CharField(max_length=64, blank=True, default="")
     caveat_context = models.JSONField(null=True, blank=True)
-    caveat_key = models.CharField(max_length=64, blank=True, default="", editable=False)
+    caveat_key = models.CharField(
+        max_length=64, blank=True, default="", db_default="", editable=False
+    )
     _caveat_write: tuple[str, set[str] | None] | None = None
 
     class Meta:

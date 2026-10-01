@@ -1542,7 +1542,9 @@ At(resource_type, ref, key, row)
 A queryset scope evaluates the predicate at the model's identity column with
 `row=True`. A point check evaluates it at a wire id bound as a parameter, so
 an object that exists only in tuples takes part in grants and in exclusions
-without a model row.
+without a model row. Membership of such a statement constant is an `EXISTS`
+with an equality on the key, so the database looks up one row or one
+resource's tuples instead of building the set of every qualifying object.
 
 A model column is never converted. Where a tuple column meets a model column,
 the tuple column is converted with `identity_codec(...).to_column()` inside
@@ -1762,7 +1764,7 @@ from the schema as its least fixed point and consumes no depth.
 | Recursive shape | Statement | Upper bound adds |
 |---|---|---|
 | A relation whose subject set is itself (nested groups), when it is not decided as a stored set | The sets that hold the actor directly, then the sets that contain them, level by level. The closure starts from the actor, so it is the actor's own. | One more hop reaches a set outside the closure. |
-| `p = base + parent->p` over a self foreign key | The row inherits when one of its nearest `REBAC_DEPTH_LIMIT` ancestors holds `base`: a chain of joins on the parent column, with `base` tested once against all of them. | The row has more than `REBAC_DEPTH_LIMIT` ancestors. |
+| `p = base + parent->p` over a self foreign key | The row inherits when it, or one of its nearest `REBAC_DEPTH_LIMIT` ancestors, holds `base`: a chain of joins on the parent column, with `base` tested once against all of them. Arrows of `base` to a like-named permission of another type (`drive->read`) are not recursive arms. | The row has more than `REBAC_DEPTH_LIMIT` ancestors. |
 | `p = base + parent->p` over another backed path to the same model (reverse, many-to-many, filtered) | The rows that hold `base`, then the rows whose path reaches the level below. | One more hop reaches a row outside the closure. |
 | `p = base + parent->p` over a stored relation | The resources of the edges whose subject holds `base`, then the resources of the edges above them. | One more hop reaches an object outside the closure. |
 | Any other shape (a cycle through several types, a recursive arm that carries an override) | The body nested in itself. | Every object reached past the bound. |

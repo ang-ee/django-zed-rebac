@@ -173,3 +173,51 @@ def test_denied_check_through_a_cycle_of_mutually_recursive_permissions_is_decid
     assert not local.check_access(subject=alice, action="view", resource=folder).allowed
     local.write_relationships([RelationshipTuple(project, "member", alice)])
     assert local.check_access(subject=alice, action="view", resource=folder).allowed
+
+
+def test_arrows_to_a_like_named_permission_of_another_type_keep_the_self_foreign_key_form(
+    settings,
+):
+    local = install_schema("""
+        definition auth/user {}
+        definition docs/drive {
+            relation viewer: auth/user
+            permission read = viewer
+        }
+        definition blog/folder {
+            relation drive: docs/drive
+            relation parent: blog/folder // rebac:field=parent
+            relation viewer: auth/user
+            permission read = ((drive->read + parent->read) + viewer)
+        }
+    """)
+    actor = SubjectRef.of("auth/user", "alice")
+    with sudo(reason="test.fixture"):
+        root = Folder.objects.create(name="root")
+        middle = Folder.objects.create(name="middle", parent=root)
+        leaf = Folder.objects.create(name="leaf", parent=middle)
+        other = Folder.objects.create(name="other")
+    local.write_relationships(
+        [
+            RelationshipTuple(
+                ObjectRef("blog/folder", str(middle.pk)), "drive", SubjectRef.of("docs/drive", "d")
+            ),
+            RelationshipTuple(ObjectRef("docs/drive", "d"), "viewer", actor),
+        ]
+    )
+    sizes = []
+    for limit in (4, 12):
+        settings.REBAC_DEPTH_LIMIT = limit
+        scoped = Folder.objects.with_actor(actor).scoped()
+        assert set(scoped.values_list("pk", flat=True)) == {middle.pk, leaf.pk}
+        sql, _params = scoped.query.sql_with_params()
+        # The base is named once whatever the bound: only the chain grows.
+        sizes.append((sql.count("docs/drive"), len(sql)))
+    assert sizes[0][0] == sizes[1][0]
+    assert sizes[1][1] - sizes[0][1] < 2000
+    assert not local.check_access(
+        subject=actor, action="read", resource=ObjectRef("blog/folder", str(other.pk))
+    ).allowed
+    assert root.pk not in set(
+        Folder.objects.with_actor(actor).scoped().values_list("pk", flat=True)
+    )

@@ -786,6 +786,29 @@ class Compiler:
             return _in(at.ref, closure)
         return self._tuple_membership(at, relation_rows, Q(resource_id__in=_Compiled(closure)))
 
+    def _self_arrows(
+        self, key: Key, definition: Definition, arms: Sequence[PermExpr]
+    ) -> list[PermArrow]:
+        """The arms that lead back to ``key``: an arrow to the same permission
+        through a relation that admits the key's own type.
+
+        ``drive->read`` on a folder is not one of them, whatever its name: it
+        reads another type.  A key that also recurses through other nodes has
+        no flat form, so its component must be the key alone.
+        """
+        if self.program.components.get(key) != frozenset({key}):
+            return []
+        found = []
+        for arm in arms:
+            if not isinstance(arm, PermArrow) or arm.target != key[1]:
+                continue
+            relation = next((r for r in definition.relations if r.name == arm.via), None)
+            if relation is not None and any(
+                allowed.type == key[0] for allowed in relation.allowed_subjects
+            ):
+                found.append(arm)
+        return found
+
     def _flat_self_userset(
         self,
         key: Key,
@@ -880,7 +903,7 @@ class Compiler:
         if definition is None or permission is None or model is None:
             return None
         arms = self._union_arms(permission.expression)
-        recursive = [arm for arm in arms if isinstance(arm, PermArrow) and arm.target == key[1]]
+        recursive = self._self_arrows(key, definition, arms)
         if len(recursive) != 1 or len(arms) < 2 or self._tagged_inside(recursive[0]):
             return None
         recursive_arm = recursive[0]
@@ -962,7 +985,7 @@ class Compiler:
         if definition is None or permission is None or model is None:
             return None
         arms = self._union_arms(permission.expression)
-        recursive = [arm for arm in arms if isinstance(arm, PermArrow) and arm.target == key[1]]
+        recursive = self._self_arrows(key, definition, arms)
         if len(recursive) != 1 or len(arms) < 2 or self._tagged_inside(recursive[0]):
             return None
         arm = recursive[0]
@@ -1047,7 +1070,7 @@ class Compiler:
         if definition is None or permission is None:
             return None
         arms = self._union_arms(permission.expression)
-        recursive = [arm for arm in arms if isinstance(arm, PermArrow) and arm.target == key[1]]
+        recursive = self._self_arrows(key, definition, arms)
         if len(recursive) != 1 or len(arms) < 2 or self._tagged_inside(recursive[0]):
             return None
         arm = recursive[0]

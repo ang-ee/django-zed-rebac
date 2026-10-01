@@ -81,6 +81,9 @@ rules and the names exported by `rebac` are unchanged. The specification is
   `0008` adds the column and fills it for existing rows, 1,000 per batch.
 - Migration `0009` drops the index tables and columns and creates the
   `SchemaGeneration` row (`pk=1`) when it is absent.
+- Migration `0010` gives `caveat_key` a database default, so a writer that
+  does not know the column (a historical model at an earlier migration state,
+  a raw insert) can still insert a relationship row.
 
 ### Changed
 
