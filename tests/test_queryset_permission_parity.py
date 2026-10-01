@@ -459,8 +459,9 @@ def test_field_owner_sql_cost_is_independent_of_visible_row_count(active, corpus
             )
         large_cost = measure(1 + corpus)
     assert large_cost == small_cost
-    # One aggregate and one bounded page, each after the actor's stored sets.
-    assert large_cost[0] == 4
+    # One aggregate and one bounded page; the evaluator scope keeps the
+    # actor's stored sets from the warm-up read.
+    assert large_cost[0] == 2
     # A fixed statement, independent of the number of visible IDs. The count
     # changes only with the compiler.
     assert large_cost[1] == 93

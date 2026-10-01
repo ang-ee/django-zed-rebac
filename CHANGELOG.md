@@ -105,8 +105,9 @@ rules and the names exported by `rebac` are unchanged. The specification is
   from the actor until no new set appears, one statement per level of
   nesting, and binds the sets as id lists. It is exact at any nesting depth,
   data cycles included, and a statement that authorizes re-reads the
-  decision in its own snapshot. A set that admits a column-backed set, and an
-  actor in more than 256 sets, keep the membership inside the statement.
+  decision in its own snapshot. An evaluator scope keeps the decision until a
+  tuple is written in the process. A set that admits a column-backed set, and
+  an actor in more than 256 sets, keep the membership inside the statement.
 - A caveated read decides the distinct caveat instances of the relations in
   its reach in Python, from one query, and binds the decided keys into the
   statement. A permission with no caveated relation in reach runs no such

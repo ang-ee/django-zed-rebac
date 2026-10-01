@@ -1695,6 +1695,13 @@ it first:
    a set outside the upper bound, so no exclusion misses a membership that
    has appeared. When either fails the statement selects nothing.
 
+Inside an evaluator scope (a request under `ActorMiddleware`, an explicit
+`evaluator_scope()`) the decision is kept per actor, context and stored sets
+in reach, until a tuple is written in the process or the scope ends. A kept
+decision can be stale when another process changes a membership; the witness
+then selects nothing, so staleness denies and never grants. Outside a scope
+every operation decides afresh.
+
 A set that admits a column-backed set (`org/team#staff` over a foreign key)
 is not a stored set, and an actor found in more than 256 sets is not
 decided: membership is then compiled inline, as the closure described under
@@ -1980,8 +1987,8 @@ of its own.
 #### Known limits
 
 - An operation whose permission reaches a stored set costs the expansion
-  statements before its own, at every operation: nothing is cached between
-  operations.
+  statements before its own, once per evaluator scope; outside a scope, at
+  every operation.
 - Permissions that recurse through each other are unrolled without a
   convergence test (see [Recursion](#recursion)).
 - Statement size follows the unfolded permission, times the depth limit for

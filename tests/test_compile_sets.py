@@ -13,6 +13,7 @@ from rebac import ObjectRef, PermissionResult, RelationshipTuple, SubjectRef
 from rebac.compile import read
 from rebac.compile.predicate import Bound
 from rebac.compile.program import CompileProgram
+from rebac.evaluator import evaluator_scope
 from rebac.schema import parse_zed
 from rebac.testing import install_schema
 
@@ -206,3 +207,30 @@ def test_a_granted_check_costs_one_statement_per_level_of_nesting_and_the_check(
     # Two levels of sets, the read that finds no third, and the check.
     assert len(queries) == 4
     assert max(len(query["sql"]) for query in queries) < 6000
+
+
+def test_an_evaluator_scope_decides_the_sets_once_until_a_tuple_is_written():
+    local = install_schema(SCHEMA)
+    local.write_relationships(
+        [member("staff", ALICE), RelationshipTuple(DOC, "viewer", members("staff"))]
+    )
+    other = ObjectRef("docs/doc", "other")
+
+    def expansions(queries):
+        return sum("DISTINCT" in query["sql"] and "subject_id" in query["sql"] for query in queries)
+
+    with evaluator_scope():
+        with CaptureQueriesContext(connection) as first:
+            assert local.check_access(subject=ALICE, action="view", resource=DOC).allowed
+        with CaptureQueriesContext(connection) as second:
+            assert not local.check_access(subject=ALICE, action="view", resource=other).allowed
+        assert expansions(first) > 0
+        assert expansions(second) == 0
+        # A tuple write in this process starts a new decision.
+        local.write_relationships([RelationshipTuple(other, "viewer", members("staff"))])
+        with CaptureQueriesContext(connection) as third:
+            assert local.check_access(subject=ALICE, action="view", resource=other).allowed
+        assert expansions(third) > 0
+    with CaptureQueriesContext(connection) as outside:
+        assert local.check_access(subject=ALICE, action="view", resource=DOC).allowed
+    assert expansions(outside) > 0

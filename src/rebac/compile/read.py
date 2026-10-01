@@ -279,8 +279,36 @@ class _Operation:
         """The stored sets in reach of the verdicts' permission that hold the actor."""
         token = id(verdicts)
         if token not in self._sets:
-            self._sets[token] = self._decide_sets(self._roots[token], verdicts)
+            self._sets[token] = self._scoped_sets(self._roots[token], verdicts)
         return self._sets[token]
+
+    def _scoped_sets(self, key: Key, verdicts: CaveatVerdicts) -> ActorSets | None:
+        """Decide the sets once per evaluator scope, actor and tuple generation.
+
+        A kept decision can be stale: another process may have changed a
+        membership.  The witness of every authorizing statement then selects
+        nothing, so staleness denies and never grants.
+        """
+        from rebac.backends import local
+        from rebac.evaluator import _ctx_key, current_evaluator
+
+        evaluator = current_evaluator()
+        context = _ctx_key(dict(self.context)) if self.context else ()
+        if evaluator is None or context is None:
+            return self._decide_sets(key, verdicts)
+        program = self.policy.program
+        kept = (
+            self.shape,
+            self.actor,
+            program.stored_sets & program.reachable(key),
+            context,
+            local._relationship_generation,
+        )
+        if kept not in evaluator._actor_sets:
+            if len(evaluator._actor_sets) >= _LIMIT:
+                evaluator._actor_sets.clear()
+            evaluator._actor_sets[kept] = self._decide_sets(key, verdicts)
+        return cast("ActorSets | None", evaluator._actor_sets[kept])
 
     def _decide_sets(self, key: Key, verdicts: CaveatVerdicts) -> ActorSets | None:
         """Follow the tuple table from the actor until no new set appears.
