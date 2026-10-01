@@ -65,9 +65,9 @@ so the storage and identity changes ride with it.
    engine's reason-string captures. **Overrides as AST operations** on named
    nodes, validated at save time, with stale narrowing overrides failing
    closed per name (proposal 0012's override half).
-8. **Proposal 0009** (maintenance that re-derives only changed inputs) and
-   the SpiceDB conformance suite, in parallel with the above; neither touches
-   the compilers.
+8. **Proposal 0009 — implemented** (maintenance that re-derives only changed
+   inputs). The SpiceDB conformance suite remains planned in parallel with
+   the above; neither touches the compilers.
 
 ### What 1.0 does not change
 

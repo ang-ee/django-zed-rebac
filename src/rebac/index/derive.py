@@ -246,10 +246,13 @@ def _seed_relations(
     region: int | None,
     stats: Stats,
     types: frozenset[str] | None,
+    keys: frozenset[Key] | None = None,
 ) -> int:
     selected = Q(pk__in=[])
     for key, node in sorted(program.nodes.items()):
         if types is not None and key[0] not in types:
+            continue
+        if keys is not None and key not in keys:
             continue
         if node.kind == "relation" and key not in program.userset_only_relations:
             selected |= Q(resource_type=key[0], relation=key[1])
@@ -652,14 +655,33 @@ def _grant_limits(*, using: str, node: NodeSpec, region: int | None, stats: Stat
         conditions.enforce_limit(formulas, label=f"{node.type}#{node.name}")
 
 
-def derive_nodes(program: IndexProgram, *, using: str, region: int | None = None) -> Stats:
+def derive_nodes(
+    program: IndexProgram,
+    *,
+    using: str,
+    region: int | None = None,
+    selected_stratum: int | None = None,
+) -> Stats:
     started = perf_counter()
     stats = Stats()
     logger.info("phase=nodes status=start region=%s", region)
     # A row is derived at a scope of its own type.
     types = region_types(using, region)
-    _seed_relations(program, using=using, region=region, stats=stats, types=types)
+    if selected_stratum is None:
+        _seed_relations(program, using=using, region=region, stats=stats, types=types)
+    else:
+        relation_keys = frozenset(program.strata[selected_stratum])
+        _seed_relations(
+            program,
+            using=using,
+            region=region,
+            stats=stats,
+            types=types,
+            keys=relation_keys,
+        )
     for stratum_number, whole in enumerate(program.strata):
+        if selected_stratum is not None and stratum_number != selected_stratum:
+            continue
         recursive = frozenset(whole)
         stratum = tuple(key for key in whole if types is None or key[0] in types)
         if not stratum:

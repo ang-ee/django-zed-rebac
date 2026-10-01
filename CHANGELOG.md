@@ -3,6 +3,38 @@
 All notable changes to `django-zed-rebac` are tracked here. The project is in
 pre-1.0; breaking changes within a minor version are explicitly called out.
 
+## [Unreleased]
+
+### Changed
+
+- Permission-index maintenance now compares projected edges and derives grant
+  nodes stratum by stratum only where an edge or input row changed. Membership
+  removals clear the former container closure before deriving it; additions
+  propagate in waves. Arrow via-edge changes seed their readers even when the
+  via relation stores no grant rows, and recursive strata address only their
+  exact type/node pairs. Grants continue to hold sets by reference. The
+  existing global lock, nested Zookie behavior and large-batch rebuild remain.
+- Focused SQLite cost cases, measured on this change against 0.24.1. Each cell
+  is deleted / inserted / Python rows / SQL statements for one maintenance pass;
+  deleted and inserted count actual index writes, including unchanged grant or
+  membership rows still rewritten inside a reached stratum.
+
+  | Case | 0.24.1 | New pass |
+  |---|---:|---:|
+  | Own-object grant | 0 / 3 / 21 / 73 | 0 / 3 / 24 / 78 |
+  | Identical source projection, 12 arrow dependents | 39 / 39 / 172 / 119 | 0 / 0 / 21 / 64 |
+  | Changed follower node, 20 arrows reading unchanged read node | 63 / 66 / 277 / 123 | 0 / 3 / 32 / 87 |
+  | Recursive revocation through three roles and a document | 12 / 6 / 61 / 152 | 6 / 0 / 24 / 112 |
+  | Set-membership revocation | 7 / 4 / 27 / 101 | 6 / 3 / 25 / 85 |
+  | Expiry payload update through an arrow | 6 / 6 / 42 / 118 | 3 / 3 / 34 / 101 |
+  | Condition payload update through an arrow | 6 / 6 / 40 / 116 | 4 / 4 / 32 / 100 |
+
+  SQL statement counts increased from the first 0009 implementation in six of
+  these seven cases (by 3 to 12 statements) because each stratum now reads and
+  clears its exact type/node rows and checks direct edge inputs. The
+  membership-removal branch deliberately recomputes the former container
+  closure, as 0.24.1 did, to remove grants sustained by a cycle.
+
 ## [0.24.1] — 2026-10-01
 
 ### Fixed
