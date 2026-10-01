@@ -55,6 +55,16 @@ class _RebacQuery(Query):
 
     _rebac_state: dict[str, Any]
 
+    # The bypass reason of an embedded queryset, audited when the statement it
+    # was resolved into is compiled for execution, never when it is built.
+    _rebac_pending_bypass_audit: str | None = None
+
+    def as_sql(self, compiler: Any, connection: Any) -> Any:
+        reason = self._rebac_pending_bypass_audit
+        if reason is not None:
+            _emit_bypass_audit(reason)
+        return super().as_sql(compiler, connection)
+
     def resolve_expression(self, *args: Any, **kwargs: Any) -> Self:
         clone = cast(Self, self.clone())
         state = getattr(self, "_rebac_state", {})
@@ -63,7 +73,21 @@ class _RebacQuery(Query):
         )
         for name, value in state.items():
             setattr(queryset, name, value)
-        queryset._apply_scope_in_place()
+        applied_here = not queryset._rebac_scope_applied
+        # Building an expression runs no query, so it must write no audit row
+        # (annotations are built at import time, during app initialisation).
+        queryset._apply_scope_in_place(audit=False)
+        pending: str | None = None
+        if applied_here:
+            actor, bypass = queryset.effective_actor(strict=True)
+            if bypass:
+                pending = queryset._bypass_audit_reason()
+            else:
+                # This subquery carries its own scope decision, so it answers
+                # for its own projection; the outer guard attributes only
+                # columns of the outer row to the outer projection.
+                cast(Any, queryset)._fields = tuple(clone.values_select) or None
+                queryset._guard_projected_field_reads(actor, False, query=clone)
 
         # A set combination has one actor policy, owned by its root queryset.
         # _scope_query already applied it to each operand (or the root bypass
@@ -77,7 +101,24 @@ class _RebacQuery(Query):
                 resolved_parts(part)
 
         resolved_parts(clone)
-        return cast(Self, Query.resolve_expression(clone, *args, **kwargs))
+        resolved = cast(Self, Query.resolve_expression(clone, *args, **kwargs))
+        if pending is not None:
+            resolved._rebac_pending_bypass_audit = pending
+        return resolved
+
+
+def _emit_bypass_audit(reason: str) -> None:
+    from .audit import emit
+    from .models import PermissionAuditEvent
+
+    actor = _current_actor()
+    emit(
+        PermissionAuditEvent.KIND_SUDO_BYPASS,
+        actor=actor,
+        origin=actor,
+        reason=reason,
+        defer_to_commit=False,
+    )
 
 
 def _without_scope(node: WhereNode) -> WhereNode:
@@ -97,12 +138,22 @@ def _without_query_scope(query: Query) -> Query:
     return clone
 
 
-def _expression_columns(expression: Any) -> Iterable[Col]:
-    """Inspect resolved ORM expressions, including aliases and SQL functions."""
+def _expression_columns(
+    expression: Any, _inner_aliases: frozenset[str] = frozenset()
+) -> Iterable[Col]:
+    """Columns of the enclosing row that a resolved ORM expression reads.
+
+    A nested query reads two kinds of column: its own tables' (under its own
+    aliases, decided by its own scope) and the enclosing row's, reached through
+    ``OuterRef``. Only the latter belong to the enclosing projection, so a
+    column resolved against an alias of a nested query is not attributed to it.
+    """
     if isinstance(expression, Col):
-        yield expression
+        if expression.alias not in _inner_aliases:
+            yield expression
         return
     if isinstance(expression, Query):
+        inner = _inner_aliases | frozenset(expression.alias_map)
         for part in (
             expression.where,
             *expression.annotations.values(),
@@ -110,12 +161,12 @@ def _expression_columns(expression: Any) -> Iterable[Col]:
             *expression.select,
             *expression.combined_queries,
         ):
-            yield from _expression_columns(part)
+            yield from _expression_columns(part, inner)
         return
     sources = getattr(expression, "get_source_expressions", None)
     if callable(sources):
         for source in cast(Iterable[Any], sources()):
-            yield from _expression_columns(source)
+            yield from _expression_columns(source, _inner_aliases)
 
 
 def _column_on_model_lineage(column: Col, model: type[models.Model]) -> bool:
@@ -304,8 +355,14 @@ class RebacQuerySet(models.QuerySet[_M]):
 
     def resolve_expression(self, *args: Any, **kwargs: Any) -> Query:
         clone = self._clone()
-        clone._apply_scope_in_place()
-        return cast(Query, super(RebacQuerySet, clone).resolve_expression(*args, **kwargs))
+        # Resolution builds an expression; the bypass is exercised, and
+        # audited, when the statement it lands in is compiled for execution.
+        clone._apply_scope_in_place(audit=False)
+        pending = clone._bypass_audit_reason()
+        resolved = cast(Query, super(RebacQuerySet, clone).resolve_expression(*args, **kwargs))
+        if pending is not None and isinstance(resolved, _RebacQuery):
+            resolved._rebac_pending_bypass_audit = pending
+        return resolved
 
     def explain(self, *, format: str | None = None, **options: Any) -> str:
         scoped = self._clone()
@@ -438,25 +495,23 @@ class RebacQuerySet(models.QuerySet[_M]):
         clone._refresh_scope()
         return clone
 
-    def _audit_bypass_once(self) -> None:
+    def _bypass_audit_reason(self) -> str | None:
+        """The reason to audit for this queryset's bypass, or ``None``."""
         if (
             self._rebac_sudo_reason is None
-            or self._rebac_sudo_audited
             or (self._rebac_internal_bypass and not self._rebac_ambient_bypass)
             or (self._rebac_ambient_bypass and _is_sudo_ambient())
         ):
-            return
-        from .audit import emit
-        from .models import PermissionAuditEvent
+            return None
+        return self._rebac_sudo_reason
 
-        actor = _current_actor()
-        emit(
-            PermissionAuditEvent.KIND_SUDO_BYPASS,
-            actor=actor,
-            origin=actor,
-            reason=self._rebac_sudo_reason,
-            defer_to_commit=False,
-        )
+    def _audit_bypass_once(self) -> None:
+        if self._rebac_sudo_audited:
+            return
+        reason = self._bypass_audit_reason()
+        if reason is None:
+            return
+        _emit_bypass_audit(reason)
         self._rebac_sudo_audited = True
 
     def actor(self) -> SubjectRef | None:
@@ -540,7 +595,7 @@ class RebacQuerySet(models.QuerySet[_M]):
         # STRICT_MODE=False: fall through unscoped.
         return (None, True)
 
-    def _resolve_effective_actor(self) -> tuple[SubjectRef | None, bool]:
+    def _resolve_effective_actor(self, *, audit: bool = True) -> tuple[SubjectRef | None, bool]:
         """Deprecated private wrapper for :meth:`effective_actor`.
 
         Removal target: 0.14. Use ``effective_actor(strict=True)`` for
@@ -548,12 +603,13 @@ class RebacQuerySet(models.QuerySet[_M]):
         paths.
         """
         result = self.effective_actor(strict=True)
-        self._audit_bypass_once()
+        if audit:
+            self._audit_bypass_once()
         return result
 
     _rebac_scope_applied: bool = False
 
-    def _apply_scope_in_place(self) -> None:
+    def _apply_scope_in_place(self, *, audit: bool = True) -> None:
         """Inject ``<id_attr>__in=<accessible>`` onto the query's WHERE clause.
 
         ``id_attr`` defaults to ``"pk"`` but can be flipped per-model via
@@ -574,7 +630,7 @@ class RebacQuerySet(models.QuerySet[_M]):
         """
         if self._rebac_scope_applied:
             return
-        actor, sudo = self._resolve_effective_actor()
+        actor, sudo = self._resolve_effective_actor(audit=audit)
         self._rebac_scope_applied = True
         if sudo:
             return

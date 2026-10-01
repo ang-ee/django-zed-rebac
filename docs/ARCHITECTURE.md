@@ -986,6 +986,11 @@ class PermissionAuditEvent(models.Model):
 Written by every Tier 2 / Tier 3 mutation and every effective public bypass.
 Queryset bypasses are audited at first evaluation or write, instance bypasses
 at the first check or write, and block bypasses at entry, once per bypass.
+A bypass queryset embedded in an expression (`Exists`, `Subquery`, a
+`pk__in=` lookup) is audited when the statement it was resolved into is
+compiled for execution, once per execution; building the expression runs no
+query and writes no row, so an annotation built at import time does not touch
+the database during app initialisation.
 Engine-internal captures use a private non-audited path. An audit row is durable
 only when its enclosing transaction commits. Append-only.
 
@@ -2091,6 +2096,15 @@ protected column raise `PermissionDenied`: scalar SQL results cannot carry
 instance-level redaction. The same guard rejects projections of protected
 `rebac_select_related()` paths, even through aliases or an explicitly sudoed
 root. `.for_write()` retains its explicit bypass of root field redaction.
+The guard attributes a column to a queryset's projection only when it is read
+from that queryset's own row: directly, or through `OuterRef` from a nested
+query. A column a nested query reads from its own tables belongs to that
+query's scope decision, not the outer one: a bypass (`sudo` /
+`system_context`) subquery may read it, and an actor-scoped subquery answers
+for its own projection when it is resolved, so
+`Subquery(Model.objects.with_actor(a).values("gated"))` still raises while an
+`Exists` over a bypass queryset that filters on a gated column hands the outer
+row only its boolean.
 These guards inspect Django column expressions; raw SQL and arbitrary custom
 SQL expressions remain outside that inspection boundary.
 

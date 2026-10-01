@@ -646,3 +646,69 @@ def test_on_field_deny_raise_surfaces_runtime_w008():
 
     with pytest.warns(RuntimeWarning, match="rebac.W008"):
         Post.objects.on_field_deny("raise")
+
+
+@override_settings(REBAC_FIELD_READ_MODE="redact")
+def test_bypass_subquery_reading_a_gated_column_does_not_block_the_outer_projection(alice, bob):
+    """A column read inside a subquery with its own scope decision is not the
+    outer row's projection: the outer row receives only what the subquery
+    selects (0.24.0 attributed the inner alias's column to the outer query)."""
+    from django.db.models import Case, Exists, OuterRef, Q, Subquery, Value, When
+
+    from tests.testapp.models import Post
+
+    post = _post(title="projected secret")
+    _grant(post.pk, bob, "owner")
+    _grant(post.pk, alice, "viewer")
+    flagged = Exists(
+        Post.objects.sudo(reason="test.flag").filter(
+            pk=OuterRef("pk"), title__startswith="projected"
+        )
+    )
+    blocker = Subquery(
+        Post.objects.sudo(reason="test.blocker")
+        .filter(pk=OuterRef("pk"))
+        .annotate(
+            _blocker=Case(When(Q(title__isnull=False), then=Value(True)), default=Value(False))
+        )
+        .values("_blocker")[:1]
+    )
+    rows = list(
+        Post.objects.as_user(alice)
+        .annotate(flagged=flagged, blocked=blocker)
+        .values("pk", "flagged", "blocked")
+    )
+    assert rows == [{"pk": post.pk, "flagged": True, "blocked": True}]
+
+
+@override_settings(REBAC_FIELD_READ_MODE="redact")
+def test_outer_row_read_of_a_gated_column_inside_a_subquery_fails_closed(alice, bob):
+    from django.db.models import OuterRef, Subquery
+
+    from tests.testapp.models import Post
+
+    post = _post(title="projected secret")
+    _grant(post.pk, bob, "owner")
+    _grant(post.pk, alice, "viewer")
+    leak = Subquery(
+        Post.objects.sudo(reason="test.leak").annotate(v=OuterRef("title")).values("v")[:1]
+    )
+    with pytest.raises(PermissionDenied) as excinfo:
+        list(Post.objects.as_user(alice).annotate(x=leak).values("x"))
+    assert "read__title" in str(excinfo.value)
+
+
+@override_settings(REBAC_FIELD_READ_MODE="redact")
+def test_actor_scoped_subquery_projecting_a_gated_column_fails_closed(alice, bob):
+    """An actor-scoped subquery answers for its own projection."""
+    from django.db.models import OuterRef, Subquery
+
+    from tests.testapp.models import Post
+
+    post = _post(title="projected secret")
+    _grant(post.pk, bob, "owner")
+    _grant(post.pk, alice, "viewer")
+    with pytest.raises(PermissionDenied) as excinfo:
+        leak = Subquery(Post.objects.as_user(alice).filter(pk=OuterRef("pk")).values("title")[:1])
+        list(Post.objects.as_user(alice).annotate(x=leak).values("x"))
+    assert "read__title" in str(excinfo.value)
