@@ -165,11 +165,15 @@ This proposal replaces proposal 0011 and the maintenance half of proposal
   compiler emits and the gate decision are compared with the 0.24 behaviour
   on SQLite and PostgreSQL; the read scope SQL for base-table queries is
   byte-identical.
-- The review probe corpus from the 0.24 rounds (`r3` to `r7`: crafted
-  `Case`, `RawSQL` through `Q` and annotations, MTI children, mirrored pairs,
-  consumer handlers during related-manager calls, pk-changing updates,
-  collector rows, through-table base-manager writes) becomes a permanent
-  tier-1 suite; every case must deny.
+- The strict expected failures in `tests/test_security_proposal_0013.py`
+  become ordinary tests: a crafted `Case` whose leading arm SQL evaluates
+  first (negated `Q`, `F("pk")`, string or `Value` pk); literal SQL behind a
+  `Q` in a `When` or an `F()` over a destination annotation; a multi-table
+  child's related-manager call; through-model `_base_manager` writes; a
+  base-manager `update` of a watched scalar column. The rest of the review
+  probe corpus from the 0.24 rounds (mirrored pairs, consumer handlers during
+  related-manager calls, pk-changing updates, collector rows) joins them as a
+  permanent tier-1 suite; every case must deny.
 - `select_related` and bare `prefetch_related` on a resource relation return
   scoped rows.
 - A write of 100,000 rows on SQLite and PostgreSQL completes with one gate

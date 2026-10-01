@@ -226,7 +226,13 @@ that type declares a `write` permission. Reverse FK and M2M accessors, queryset
 writes through an auto-created through model, tracked backing sources and
 `RebacTrackedMixin` deletes, and symmetrical M2M mirror edges follow the same
 rule. Deny before mutation and audit the declaring resource after the rejected
-owner's transaction unwinds.
+owner's transaction unwinds. The gates inspect the ORM call, not the SQL, so
+an expression whose SQL meaning differs from the Python reading (a crafted
+`Case`, literal SQL behind a `Q` or an annotation, a multi-table child's
+related-manager call, a through model's `_base_manager`, a base-manager
+`update` of a watched scalar column) is pinned for proposal 0013, which gates
+from the statement's own `Query`; do not add further Python emulation of
+Django query semantics to close such a case.
 Any declaring type without a permission literally named `write` is maintained
 without an actor gate, including resource types that use `edit` or `update`;
 consumers protect those backing columns with Django permissions. Pinned as

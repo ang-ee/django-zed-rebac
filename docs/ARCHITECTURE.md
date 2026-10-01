@@ -1818,7 +1818,7 @@ The headline feature. By inclusion, every model operation is gated against the e
 ### What gets installed
 
 1. `objects = RebacManager.from_queryset(RebacQuerySet)()` replaces the default manager.
-2. `_default_manager` points at it; the metaclass injects `base_manager_name` naming an **owning, unscoped** manager, even when consumers declare their own `Meta`. It never applies actor scope to reads. Its writes maintain the index, and those that change a backed edge (reverse-FK `add(bulk=True)`, `update` of a watched column or FK) run the backed-edge gate of invariant 5d; collector `SET_NULL` rows are gated under the ambient actor only (proposal 0011).
+2. `_default_manager` points at it; the metaclass injects `base_manager_name` naming an **owning, unscoped** manager, even when consumers declare their own `Meta`. It never applies actor scope to reads. Its writes maintain the index, and those that change a backed FK edge (reverse-FK `add(bulk=True)`, `update` of a watched FK) run the backed-edge gate of invariant 5d; an `update` of a watched scalar column through the base manager is not gated (proposal 0013), and collector `SET_NULL` rows are gated under the ambient actor only (proposal 0011).
 3. `save_base` owner — create/write and field gates before consumer `pre_save` receivers.
 4. `delete` owner — root gate and a deletion ContextVar carrying the root actor/bypass for collector children; explicit-sender `pre_delete` gates those children only. Owners batch identity tuple cleanup.
 5. Queryset materialisation hooks (`_fetch_all()` and iterators) stamp the resolved actor onto every loaded instance. `from_db()` snapshots original field values for write checks.
@@ -1991,12 +1991,15 @@ symmetrical self-M2M calls. The related manager preflights the changed pairs onc
 outside Django's own atomic block so denial audit survives that rollback.
 Its `set()` wrapper accepts Django's positional and `objs=` keyword forms.
 The `m2m_changed` receiver maintains the index, while queryset writes through
-the auto-created through model (`bulk_create`, `update`, queryset `delete`)
-are tracked and gated; the related-manager wrapper exempts only the exact
-pairs it already gated, so rows a consumer `m2m_changed` handler writes during
-the call are gated on their own. Instance-level through writes are neither
-(proposal 0011). Through captures use the changed FK pairs and their source
-rows rather than the whole through table.
+the auto-created through model's `objects` manager (`bulk_create`, `update`,
+queryset `delete`) are tracked and gated; the related-manager wrapper exempts
+only the exact pairs it already gated, as inserts or deletes, so rows a
+consumer `m2m_changed` handler writes during the call are gated on their own.
+Instance-level through writes are neither gated nor maintained (proposal
+0011); writes through the through model's `_base_manager`, and a
+related-manager call from a multi-table child of the declaring model, are
+not gated (proposal 0013). Through captures use the changed FK pairs and
+their source rows rather than the whole through table.
 The carrying actor wins over ambient context; instance sudo does not propagate
 to the related manager. Without an actor, strict mode raises `MissingActorError`
 only if an affected resource type declares `write`. An unwatched through table
@@ -2016,13 +2019,23 @@ moved row's own `write`, and a block `sudo` over a pinned actor are not yet
 honoured there (proposal 0011).
 
 A `bulk_update` of a watched column is gated per statement. The owner freezes
-exactly the rows a statement writes, before its SQL, and resolves each row's
-value from the `Case`: every arm must be `When(pk=<literal>, then=Value(...))`
-with no default, the shape Django emits, so an arm with another condition, an
-expression result or a default is refused rather than guessed. An authorized
-update of more rows than `batch_size` is therefore not refused for rows
-written by an earlier batch, and a hand-written `update(field=Case(...))`
-cannot skip a row.
+the rows a statement writes, before its SQL, under a per-statement tag in the
+work table, and resolves each row's value from the `Case` in Python: every arm
+must be `When(pk=<literal>, then=Value(...))` with no default, the shape
+Django emits, so an arm with another condition, an expression result or a
+default is refused. An authorized update of more rows than `batch_size` is
+therefore not refused for rows written by an earlier batch. The resolution is
+an emulation of SQL and can be fooled: an arm whose condition is a negated
+`Q`, an `F("pk")`, or a pk spelled as a string or `Value` passes the shape
+check while SQL evaluates it first. Those cases are pinned as expected
+failures for proposal 0013, which gates from the statement's own `Query`;
+until then, `update()` with a hand-built `Case` on a watched column is an
+unsupported write on a model whose declaring type grants `write`.
+
+Write-expression read gates inspect the unresolved expression tree. A `Q`
+inside a `When`, and an `F()` over a destination annotation or alias, are not
+traversed, so literal SQL placed there reaches the write; also pinned for
+proposal 0013.
 
 `QuerySet.explain()` applies the same actor scope as the query it describes.
 `RebacManager.raw()` and `RebacQuerySet.raw()` cannot attach a REBAC scope to arbitrary SQL and therefore

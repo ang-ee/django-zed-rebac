@@ -3,7 +3,7 @@
 All notable changes to `django-zed-rebac` are tracked here. The project is in
 pre-1.0; breaking changes within a minor version are explicitly called out.
 
-## [Unreleased]
+## [0.24.0] — 2026-10-01
 
 ### Breaking
 
@@ -49,7 +49,17 @@ pre-1.0; breaking changes within a minor version are explicitly called out.
 - Write expressions that splice literal SQL (`RawSQL`; a `Func`, `Case` or
   `Subquery` with a caller-supplied `template` or `arg_joiner`; a `Func` whose
   `function` is not an identifier; a subquery using `extra()` in its select,
-  where, tables or ordering) are refused on models with field read gates.
+  where, tables or ordering) are refused on models with field read gates when
+  they appear in the written value's expression tree. A `Q` inside a `When`
+  condition and an `F()` over a destination annotation are not traversed;
+  pinned for proposal 0013.
+- Known gaps pinned as strict expected failures for proposal 0013
+  (`tests/test_security_proposal_0013.py`): a hand-built `Case` on a watched
+  column whose leading arm SQL evaluates before the literal `When(pk=...)`
+  arms; literal SQL behind a `Q` or a destination annotation; a related-manager
+  call from a multi-table child of the declaring model; queryset writes
+  through an auto-created through model's `_base_manager`; a `RebacMixin`
+  base-manager `update()` of a watched scalar column.
 - The D2 autocommit warning is emitted for tracked `auth.User` and `auth.Group`
   writes again, including `createsuperuser`.
 - Stored overrides whose names no longer resolve against the baseline are
@@ -131,11 +141,14 @@ pre-1.0; breaking changes within a minor version are explicitly called out.
 - Caller-supplied subjects for a filtered const-backed relation must be the
   constant's own target; an unfiltered constant still refuses any supplied
   tuple.
-- Each `bulk_update` statement gates exactly the rows it writes, so a
-  multi-batch authorized update passes, while a `Case` with any arm other than
-  `When(pk=<literal>)`, an expression result or a default is refused.
-- A related-manager call from a multi-table child, and a symmetrical self-M2M,
-  gate their through pairs once.
+- Each `bulk_update` statement freezes the rows it writes under a
+  per-statement work tag, so a multi-batch authorized update passes and no
+  primary-key list travels through SQL parameters; a `Case` with an arm whose
+  condition is not a plain `pk=<literal>`, an expression result or a default
+  is refused by the shape check (see the pinned gaps above for the arms that
+  evade it).
+- A symmetrical self-M2M gates its through pairs once; a multi-table child's
+  related-manager call no longer crashes but is not gated (pinned).
 - Restored evaluated querysets redo field redaction and prefetch after unpickling.
 - CEL schema validation uses cel-python's syntax tree, accepting macro variables,
   hexadecimal and exponent literals, type constants and raw strings. Coercion

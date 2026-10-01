@@ -511,15 +511,18 @@ def test_independent_owner_restores_enclosing_owner(indexed):
     assert not IndexWork.objects.exists()
 
 
-def test_repeated_queryset_snapshot_has_one_work_row_per_identity(indexed, django_user_model):
+def test_repeated_queryset_snapshot_freezes_each_statement_separately(indexed, django_user_model):
     actor = django_user_model.objects.create(username="snapshot-dedup")
+    other = django_user_model.objects.create(username="snapshot-other")
     with IndexMaintenance(using="default") as owner:
-        source = django_user_model.objects.filter(pk=actor.pk)
-        first = owner.snapshot_queryset(source)
-        second = owner.snapshot_queryset(source)
+        first = owner.snapshot_queryset(django_user_model.objects.filter(pk=actor.pk))
+        second = owner.snapshot_queryset(django_user_model.objects.filter(pk=other.pk))
+        # Each statement's frozen set is its own rows under its own tag, so a
+        # later statement of the pass does not inherit an earlier one's rows.
         assert list(first.values_list("pk", flat=True)) == [actor.pk]
-        assert list(second.values_list("pk", flat=True)) == [actor.pk]
-        assert owner.work().filter(kind="model").count() == 1
+        assert list(second.values_list("pk", flat=True)) == [other.pk]
+        assert owner.work().filter(kind="model", node="statement:1").count() == 1
+        assert owner.work().filter(kind="model", node="statement:2").count() == 1
         assert owner.python_rows >= 3
     assert not IndexWork.objects.exists()
     assert not IndexTerm.objects.filter(type__startswith="$model/").exists()

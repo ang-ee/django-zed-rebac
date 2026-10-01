@@ -164,6 +164,7 @@ class IndexMaintenance:
         self.schema_initial = False
         self.membership_only = True
         self.python_rows = 0
+        self.statements = 0
         self._outer: IndexMaintenance | None = None
         self._outer_state: tuple[bool, set[str], bool, bool, int, bool] | None = None
         self._token: Token[tuple[IndexMaintenance, ...]] | None = None
@@ -340,31 +341,41 @@ class IndexMaintenance:
             .values("pk")
             .annotate(type=Value(type_), object_id=codec.to_wire("pk"), relation=Value(""))
             .values("type", "object_id", "relation")
+            .distinct()
         )
         self.python_rows += intern_from(source, using=self.using)
         terms = IndexTerm.objects.using(self.using).filter(
             type=type_, object_id__in=Subquery(source.values("object_id"))
         )
-        present = self.work(phase="old").filter(kind="model", term_id=OuterRef("pk"), node="")
+        # The frozen set is this statement's rows, read before its SQL runs
+        # and kept in the database under a per-statement tag: the gates decide
+        # about exactly the rows the statement writes, a later statement of
+        # the same pass does not inherit an earlier one's, and no primary-key
+        # list ever travels through SQL parameters.
+        self.statements += 1
+        tag = f"statement:{self.statements}"
         self.python_rows += stream_create(
-            terms.filter(~Exists(present)).values(
+            terms.values(
                 pass_id=Value(self.pass_id, output_field=models.BigIntegerField()),
                 kind=Value("model"),
                 term_id=F("pk"),
-                node=Value(""),
+                node=Value(tag),
                 phase=Value("old"),
             ),
             IndexWork,
             ("pass_id", "kind", "term_id", "node", "phase"),
             using=self.using,
         )
-        # The frozen set is this statement's rows, read before its SQL runs:
-        # the gates decide about exactly the rows the statement writes, and a
-        # later statement of the same pass does not inherit an earlier one's.
-        statement_pks = list(queryset.order_by().values_list("pk", flat=True))
+        frozen = IndexTerm.objects.using(self.using).filter(
+            type=type_,
+            pk__in=Subquery(
+                self.work(phase="old").filter(kind="model", node=tag).values("term_id")
+            ),
+        )
+        ids = frozen.annotate(column_pk=codec.to_column("object_id")).values("column_pk")
         return cast(
             models.QuerySet[Any],
-            queryset.model._base_manager.using(self.using).filter(pk__in=statement_pks),
+            queryset.model._base_manager.using(self.using).filter(pk__in=Subquery(ids)),
         )
 
     def changed(
