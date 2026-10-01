@@ -80,6 +80,7 @@ if TYPE_CHECKING:
     from .managers import RebacManager, RebacQuerySet, TrackedManager, TrackedQuerySet
     from .mcp import default_actor_resolver, get_mcp_actor_resolver, rebac_mcp_tool
     from .mixins import RebacMixin, RebacObjectMeta, RebacTrackedMixin
+    from .models.schema_write import schema_changes
     from .permissions_mixin import RebacPermissionsMixin
     from .relationships import (
         delete_relationship,
@@ -109,6 +110,7 @@ _LAZY = {
     "require_permission": ("rebac.decorators", "require_permission"),
     "rebac_resource": ("rebac.decorators", "rebac_resource"),
     "write_relationships": ("rebac.relationships", "write_relationships"),
+    "schema_changes": ("rebac.models.schema_write", "schema_changes"),
     "delete_relationship": ("rebac.relationships", "delete_relationship"),
     "delete_relationships": ("rebac.relationships", "delete_relationships"),
     "resolve_subjects": ("rebac.relationships", "resolve_subjects"),
@@ -199,6 +201,7 @@ __all__ = [
     "delete_relationship",
     "delete_relationships",
     "resolve_subjects",
+    "schema_changes",
     "emit_audit_event",
     "aemit_audit_event",
     # evaluator

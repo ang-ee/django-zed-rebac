@@ -45,6 +45,7 @@ ARCHITECTURE_SURFACE = {
         "anonymous_actor",
         "is_anonymous_actor",
         "write_relationships",
+        "schema_changes",
         "delete_relationships",
         "delete_relationship",
         "backend",

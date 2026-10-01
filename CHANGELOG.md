@@ -3,7 +3,7 @@
 All notable changes to `django-zed-rebac` are tracked here. The project is in
 pre-1.0; breaking changes within a minor version are explicitly called out.
 
-## [Unreleased]
+## [0.24.2] — 2026-10-01
 
 ### Changed
 
@@ -43,10 +43,13 @@ pre-1.0; breaking changes within a minor version are explicitly called out.
   membership-removal branch deliberately recomputes the former container
   closure, as 0.24.1 did, to remove grants sustained by a cycle.
 
-## [0.24.2] — 2026-10-01
-
 ### Fixed
 
+- A stale grant in 0.24.1: an arrow whose via relation is used only as a
+  subject set (so it stores no grant rows) did not see that relation's edge
+  changes, and a revoke through it left the arrow's grant in the index. The
+  change-propagating maintenance above seeds arrows from the via relation's
+  edges directly.
 - A `RebacMixin` or `RebacTrackedMixin` model keeps the base manager it
   declares. Since 0.23.0 the metaclass set `base_manager_name = "_rebac_base"`
   on every model, so a declared `Meta.base_manager_name` was discarded without
@@ -88,6 +91,13 @@ pre-1.0; breaking changes within a minor version are explicitly called out.
   `LocalBackend` with a manual schema the active backend and rebuilds the
   index to match the stored rows. It replaces writing the private
   `rebac.backends._backend` in a dependent project's tests.
+- `rebac.schema_changes(using=None)`: a context manager that groups writes to
+  stored schema rows (definitions, relations, permissions, overrides) into one
+  maintenance pass, so the index is rebuilt once when the block exits. Outside
+  it each schema-row write rebuilds the affected types and their dependents on
+  its own: deleting thirteen relations of a type one by one walked that type's
+  rows thirteen times. The block is one transaction and holds the index lock;
+  change the schema before writing relationships inside it.
 
 ### Migration notes
 
