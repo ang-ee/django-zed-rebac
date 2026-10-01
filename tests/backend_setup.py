@@ -29,13 +29,11 @@ def rebuild_backend(local, *, using=None):
 
 def install_schema(local, schema, *, using=None):
     """Install a manual schema and explicitly build its matching index."""
-    import rebac.backends
+    from rebac.testing import install_schema as install
 
-    local.set_schema(schema)
     # Model write owners must see the same schema as this fixture's tuple owner.
     # The autouse process-isolation fixture resets this singleton after each test.
-    rebac.backends._backend = local
-    rebuild_backend(local, using=using)
+    install(schema, backend=local, using=using)
 
 
 def atomic_source_write(method, *args, **kwargs):

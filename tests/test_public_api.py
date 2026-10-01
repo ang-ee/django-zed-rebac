@@ -16,6 +16,8 @@ ARCHITECTURE_SURFACE = {
         "RebacTrackedMixin",
         "RebacManager",
         "RebacQuerySet",
+        "TrackedManager",
+        "TrackedQuerySet",
         "require_permission",
         "rebac_resource",
         "Backend",
@@ -56,6 +58,7 @@ ARCHITECTURE_SURFACE = {
     "rebac.schema": ["parse_zed", "validate_schema"],
     "rebac.memberships": ["grant", "revoke", "members_of", "containers_of"],
     "rebac.roles": ["grant", "revoke", "roles_of", "members_of"],
+    "rebac.testing": ["install_schema"],
 }
 
 # CLAUDE.md § Public API surface.

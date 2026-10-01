@@ -748,6 +748,47 @@ def check_tracked_models_setting(
 
 
 @checks.register("rebac")
+def check_declared_base_managers(
+    app_configs: Any = None, **kwargs: Any
+) -> list[checks.CheckMessage]:
+    """E023: a declared base manager must return every row through a TrackedQuerySet."""
+    from django.apps import apps
+
+    from .managers import RebacQuerySet, TrackedQuerySet
+    from .mixins import INJECTED_BASE_MANAGER, RebacTrackedMixin
+
+    configs = apps.get_app_configs() if app_configs is None else app_configs
+    issues: list[checks.CheckMessage] = []
+    for config in configs:
+        for model in config.get_models():
+            if not issubclass(model, RebacTrackedMixin):
+                continue
+            name = model._meta.base_manager_name
+            if name == INJECTED_BASE_MANAGER:
+                continue
+            rows = model._base_manager.all()
+            if isinstance(rows, RebacQuerySet) or not isinstance(rows, TrackedQuerySet):
+                problem = f"returns {type(rows).__name__}, which is not a rebac.TrackedQuerySet"
+            elif rows.query.where or rows.query.is_sliced:
+                problem = "filters rows"
+            else:
+                continue
+            issues.append(
+                checks.Error(
+                    f"{model._meta.label}: the declared base manager {name!r} {problem}.",
+                    hint=(
+                        "The library reads a model's source rows and maintains the permission "
+                        "index through its base manager. Return an unfiltered, unscoped "
+                        "TrackedQuerySet from get_queryset()."
+                    ),
+                    obj=model,
+                    id="rebac.E023",
+                )
+            )
+    return issues
+
+
+@checks.register("rebac")
 def check_stale_override_references(
     app_configs: Any = None, **kwargs: Any
 ) -> list[checks.CheckMessage]:

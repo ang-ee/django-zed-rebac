@@ -219,7 +219,9 @@ schema.
 
 `LocalBackend` derives the relation's edges from the Django column through the
 model's `_base_manager`, so application default managers cannot move the
-authorization boundary, and writes to that column maintain the permission index
+authorization boundary (a base manager the model declares itself must return
+every row; see [What gets installed](#what-gets-installed)), and writes to that
+column maintain the permission index
 (see [Maintenance](#maintenance-and-transaction-ownership)). Tuple
 writes/deletes targeting the backed relation raise `SchemaError` with the
 actionable Django field to update instead.
@@ -409,6 +411,7 @@ which has two consequences in
 from rebac import (
     # Mixin and managers
     RebacMixin, RebacTrackedMixin, RebacManager, RebacQuerySet,
+    TrackedManager, TrackedQuerySet,    # unscoped, index-maintaining; the base for a declared base manager
 
     # Decorators
     require_permission, rebac_resource,
@@ -452,7 +455,16 @@ from rebac.mcp    import rebac_mcp_tool, default_actor_resolver, get_mcp_actor_r
 from rebac.schema import parse_zed, validate_schema   # for tooling
 from rebac.memberships import grant, revoke, members_of, containers_of   # direct `member` tuples
 from rebac.roles  import grant, revoke, roles_of, members_of   # role-as-namespace helpers
+from rebac.testing import install_schema   # test helper: make a schema and backend current
 ```
+
+`rebac.testing.install_schema(schema, *, backend=None, using=None)` is the
+supported way for a dependent project's tests to run against a schema of
+their own. It installs `schema` (a parsed `Schema` or `.zed` text) as a manual
+schema on `backend` (a new `LocalBackend` by default), makes that instance the
+one `rebac.backend()` returns in this process, rebuilds the permission index on
+`using` so it matches the rows already stored, and returns the backend.
+`rebac.backends.reset_backend()` undoes it; call it in teardown.
 
 `rebac.memberships` owns direct `member`-tuple creation, exact (caveat-aware)
 revocation and enumeration for any container type. `rebac.roles` composes it
@@ -1096,6 +1108,7 @@ System checks (in `rebac/checks.py`):
 | `rebac.E018` | Error | A backing-path model is neither `RebacMixin`, `RebacTrackedMixin`, nor explicitly tracked. Auto-created throughs with an owned/tracked endpoint and configured User/Group models are tracked automatically. Invalid `REBAC_TRACKED_MODELS` labels are errors too. |
 | `rebac.E019` | Error | A permission's static read plan exceeds `REBAC_INDEX_LOOKUP_LIMIT`, or the limit is not a positive integer. The diagnostic prints the plan. |
 | `rebac.E021` | Error | The schema declares a caveat but `cel-python` (the `caveats` extra) is not installed, so caveat bodies cannot be validated or evaluated. |
+| `rebac.E023` | Error | A `RebacMixin` / `RebacTrackedMixin` model's declared base manager returns a queryset that is not a `TrackedQuerySet`, or one that filters rows. The library reads source rows and maintains the index through the base manager. (`E020` and `E022` are reserved by proposals 0011 and 0013.) |
 | `rebac.W001` | Warning | `rebac.backends.RebacBackend` not in `AUTHENTICATION_BACKENDS`. |
 | `rebac.W002` | Warning | A model with `Meta.rebac_resource_type` is missing `RebacMixin`. |
 | `rebac.W003` | Warning | An RBAC-bound relation exists where bare `select_related("rel")` / `prefetch_related("rel")` can be unsafe outside the REBAC helpers or Strawberry-Django optimizer. |
@@ -1827,7 +1840,7 @@ The headline feature. By inclusion, every model operation is gated against the e
 ### What gets installed
 
 1. `objects = RebacManager.from_queryset(RebacQuerySet)()` replaces the default manager.
-2. `_default_manager` points at it; the metaclass injects `base_manager_name` naming an **owning, unscoped** manager, even when consumers declare their own `Meta`. It never applies actor scope to reads. Its writes maintain the index, and those that change a backed FK edge (reverse-FK `add(bulk=True)`, `update` of a watched FK) run the backed-edge gate of invariant 5d; an `update` of a watched scalar column through the base manager is not gated (proposal 0013), and collector `SET_NULL` rows are gated under the ambient actor only (proposal 0011).
+2. `_default_manager` points at it; the base manager is an **owning, unscoped** manager. When the model declares none, the metaclass injects `_rebac_base = TrackedManager()` and names it in `base_manager_name`, even when consumers declare their own `Meta`. A model that declares `Meta.base_manager_name` keeps its manager, and so does a model whose parent model declares one: every parent model is read in base order, not only the first as in Django's own fallback, so listing `RebacMixin` first does not discard a base manager declared by an abstract parent. `base_manager_name = "_rebac_base"` on the model opts back into the injected one. A declared base manager must be built over a `TrackedQuerySet` subclass (`models.Manager.from_queryset(...)`); class creation raises `ImproperlyConfigured` otherwise, the scoped `RebacManager` included. It may add methods and refuse writes (an append-only queryset), but it must return every row: the library projects edges and captures old state through `_base_manager`, so a base manager that filters rows would leave their edges out of a rebuild and stale after a write. `rebac.E023` reports a declared base manager whose `get_queryset()` returns another queryset class or carries a filter. The base manager never applies actor scope to reads. Its writes maintain the index, and those that change a backed FK edge (reverse-FK `add(bulk=True)`, `update` of a watched FK) run the backed-edge gate of invariant 5d; an `update` of a watched scalar column through the base manager is not gated (proposal 0013), and collector `SET_NULL` rows are gated under the ambient actor only (proposal 0011).
 3. `save_base` owner — create/write and field gates before consumer `pre_save` receivers.
 4. `delete` owner — root gate and a deletion ContextVar carrying the root actor/bypass for collector children; explicit-sender `pre_delete` gates those children only. Owners batch identity tuple cleanup.
 5. Queryset materialisation hooks (`_fetch_all()` and iterators) stamp the resolved actor onto every loaded instance. `from_db()` snapshots original field values for write checks.

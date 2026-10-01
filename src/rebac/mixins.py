@@ -21,6 +21,7 @@ from dataclasses import dataclass
 from dataclasses import field as dataclass_field
 from typing import TYPE_CHECKING, Any, ClassVar, Self, cast
 
+from django.core.exceptions import ImproperlyConfigured
 from django.db import models, router
 from django.db.models.base import ModelBase
 
@@ -28,7 +29,7 @@ from ._id import resource_id_attr
 from .conf import app_settings
 from .errors import PermissionDenied
 from .field_visibility import backend_schema
-from .managers import RebacManager, TrackedManager
+from .managers import RebacManager, TrackedManager, TrackedQuerySet
 from .preflight import _check_new_model
 from .resources import model_resource_type
 from .schema.walker import field_gated_actions
@@ -72,6 +73,28 @@ def _capture_rebac_meta(attrs: dict[str, Any]) -> dict[str, Any]:
         elif hasattr(meta, key):
             captured[key] = getattr(meta, key)
     return captured
+
+
+INJECTED_BASE_MANAGER = "_rebac_base"
+
+
+def _declared_base_manager(meta: Any, bases: tuple[type, ...]) -> str | None:
+    """The base manager a model declares, in its own ``Meta`` or through a parent model.
+
+    Django's fallback (``Options.base_manager``) reads only the first parent
+    model. Every parent is read here, in order, so listing a library mixin
+    first cannot discard a base manager declared by a later parent. The
+    injected manager and Django's automatic one are not declarations.
+    """
+    name = getattr(meta, "base_manager_name", None)
+    if name is not None:
+        return None if name == INJECTED_BASE_MANAGER else str(name)
+    for base in bases:
+        if hasattr(base, "_meta"):
+            inherited = cast(Any, base)._base_manager.name
+            if inherited not in ("_base_manager", INJECTED_BASE_MANAGER):
+                return str(inherited)
+    return None
 
 
 class RebacObjectMeta(type):
@@ -142,17 +165,31 @@ class RebacModelBase(RebacObjectMeta, ModelBase):
         mcs, name: str, bases: tuple[type, ...], attrs: dict[str, Any], **kwargs: Any
     ) -> type:
         meta = attrs.get("Meta")
+        base_manager_name = _declared_base_manager(meta, bases)
+        if base_manager_name is None:
+            base_manager_name = INJECTED_BASE_MANAGER
+            attrs[INJECTED_BASE_MANAGER] = TrackedManager()
         attrs["Meta"] = type(
             "Meta",
             (meta,) if meta is not None else (),
             {
-                "base_manager_name": "_rebac_base",
+                "base_manager_name": base_manager_name,
                 "default_manager_name": getattr(meta, "default_manager_name", "objects"),
             },
         )
-        attrs["_rebac_base"] = TrackedManager()
         new_cls = cast(type[models.Model], super().__new__(mcs, name, bases, attrs, **kwargs))
         if not new_cls._meta.abstract:
+            queryset_class = getattr(new_cls._meta.base_manager, "_queryset_class", None)
+            if not (
+                isinstance(queryset_class, type) and issubclass(queryset_class, TrackedQuerySet)
+            ):
+                raise ImproperlyConfigured(
+                    f"{new_cls._meta.label} declares the base manager {base_manager_name!r}, "
+                    "whose queryset is not a rebac.TrackedQuerySet. Writes through a model's "
+                    "base manager must maintain the permission index: build the manager with "
+                    "models.Manager.from_queryset() over a TrackedQuerySet subclass that "
+                    "applies no actor scope and filters no rows."
+                )
             from .signals import connect_owned_model
 
             connect_owned_model(new_cls)
