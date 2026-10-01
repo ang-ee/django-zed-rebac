@@ -510,6 +510,11 @@ manager as `objects` (`_default_manager`). RebacMixin and RebacTrackedMixin inje
 an owning, unscoped base manager through `base_manager_name`: it maintains writes
 but never filters reads or applies actor scope. This preserves the unfiltered
 base-manager rule and covers reverse-FK bulk add and collector SET_NULL.
+A model that declares its own base manager (in its `Meta` or on any parent
+model) keeps it; nothing is injected then. That manager must be built over a
+`TrackedQuerySet` subclass and return every row, unscoped and unfiltered: class
+creation refuses any other queryset and `rebac.E023` reports one that filters.
+Don't weaken either check to admit a consumer's manager.
 This is why bare-string `prefetch_related("rel")` doesn't auto-scope and the
 spec requires the explicit `Prefetch(queryset=...)` form.
 

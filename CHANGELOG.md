@@ -3,6 +3,44 @@
 All notable changes to `django-zed-rebac` are tracked here. The project is in
 pre-1.0; breaking changes within a minor version are explicitly called out.
 
+## [0.24.2] — 2026-10-01
+
+### Fixed
+
+- A `RebacMixin` or `RebacTrackedMixin` model keeps the base manager it
+  declares. Since 0.23.0 the metaclass set `base_manager_name = "_rebac_base"`
+  on every model, so a declared `Meta.base_manager_name` was discarded without
+  an error and the model's own base-manager methods and write policy were
+  gone from `Model._base_manager`. The declaration is now honoured from the
+  model's own `Meta` or from any parent model, read in base order (Django's
+  own fallback reads only the first parent, which would be the library mixin).
+  `_rebac_base` is injected only when nothing is declared;
+  `base_manager_name = "_rebac_base"` opts back into it.
+
+### Added
+
+- `rebac.TrackedQuerySet` and `rebac.TrackedManager` are public: the unscoped
+  queryset and manager whose writes maintain the permission index. A declared
+  base manager must be built over a `TrackedQuerySet` subclass, for example
+  `models.Manager.from_queryset(MyTrackedQuerySet)()`. Class creation raises
+  `ImproperlyConfigured` for any other queryset, including the scoped
+  `RebacQuerySet`.
+- System check `rebac.E023`: a declared base manager whose `get_queryset()`
+  returns another queryset class, or filters rows. The library reads source
+  rows through the base manager, so it must return every row.
+- `rebac.testing.install_schema(schema, *, backend=None, using=None)` makes a
+  `LocalBackend` with a manual schema the active backend and rebuilds the
+  index to match the stored rows. It replaces writing the private
+  `rebac.backends._backend` in a dependent project's tests.
+
+### Migration notes
+
+- A model that already declared `Meta.base_manager_name` gets a migration:
+  its recorded `base_manager_name` changes from `_rebac_base` to the declared
+  name. Run `makemigrations`.
+- Such a model now fails at import if its base manager's queryset is not a
+  `TrackedQuerySet`. Derive the queryset from `rebac.TrackedQuerySet`.
+
 ## [0.24.1] — 2026-10-01
 
 ### Fixed

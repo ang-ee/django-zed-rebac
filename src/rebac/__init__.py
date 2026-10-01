@@ -19,7 +19,7 @@ from typing import TYPE_CHECKING, Any
 try:
     __version__ = version("django-zed-rebac")
 except PackageNotFoundError:
-    __version__ = "0.24.1"
+    __version__ = "0.24.2"
 
 default_app_config = "rebac.apps.RebacConfig"
 
@@ -77,7 +77,7 @@ if TYPE_CHECKING:
     from .audit import emit as emit_audit_event
     from .backends import Backend, LocalBackend, SpiceDBBackend, backend
     from .decorators import rebac_resource, require_permission
-    from .managers import RebacManager, RebacQuerySet
+    from .managers import RebacManager, RebacQuerySet, TrackedManager, TrackedQuerySet
     from .mcp import default_actor_resolver, get_mcp_actor_resolver, rebac_mcp_tool
     from .mixins import RebacMixin, RebacObjectMeta, RebacTrackedMixin
     from .permissions_mixin import RebacPermissionsMixin
@@ -95,6 +95,8 @@ _LAZY = {
     "RebacMixin": ("rebac.mixins", "RebacMixin"),
     "RebacManager": ("rebac.managers", "RebacManager"),
     "RebacQuerySet": ("rebac.managers", "RebacQuerySet"),
+    "TrackedManager": ("rebac.managers", "TrackedManager"),
+    "TrackedQuerySet": ("rebac.managers", "TrackedQuerySet"),
     "RebacObjectMeta": ("rebac.mixins", "RebacObjectMeta"),
     "RebacPermissionsMixin": (
         "rebac.permissions_mixin",
@@ -147,6 +149,8 @@ __all__ = [
     "RebacTrackedMixin",
     "RebacManager",
     "RebacQuerySet",
+    "TrackedManager",
+    "TrackedQuerySet",
     "RebacObjectMeta",
     "RebacPermissionsMixin",
     # decorators

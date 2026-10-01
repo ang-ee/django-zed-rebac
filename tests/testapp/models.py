@@ -7,7 +7,7 @@ from django.contrib.contenttypes.fields import GenericForeignKey, GenericRelatio
 from django.contrib.contenttypes.models import ContentType
 from django.db import models
 
-from rebac import RebacMixin, RebacTrackedMixin
+from rebac import RebacMixin, RebacTrackedMixin, TrackedQuerySet
 
 from .fields import (
     ColumnlessIdentityField,
@@ -400,3 +400,34 @@ class TextIdentityPrimaryPost(RebacMixin, models.Model):
     class Meta:
         app_label = "testapp"
         rebac_resource_type = "blog/textidentityprimarypost"
+
+
+class OwnerQuerySet(TrackedQuerySet["DeclaredBasePost"]):
+    """A consumer base queryset: the library's tracking plus its own method and policy."""
+
+    def owner_bulk_create(self, rows):
+        return self.bulk_create(rows)
+
+    def delete(self):
+        raise TypeError("rows of this model are never deleted in bulk")
+
+
+class DeclaredBaseParent(models.Model):
+    """A plain abstract parent that declares the base manager of its children."""
+
+    system_objects = models.Manager.from_queryset(OwnerQuerySet)()
+
+    class Meta:
+        abstract = True
+        base_manager_name = "system_objects"
+
+
+class DeclaredBasePost(RebacMixin, DeclaredBaseParent):
+    title = models.CharField(max_length=100)
+    folder = models.ForeignKey(
+        Folder, null=True, on_delete=models.SET_NULL, related_name="declared_posts"
+    )
+
+    class Meta:
+        app_label = "testapp"
+        rebac_resource_type = "test/declaredbasepost"
