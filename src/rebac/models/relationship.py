@@ -20,9 +20,10 @@ from __future__ import annotations
 from collections.abc import Callable, Collection, Iterable, Mapping
 from typing import Any, cast
 
-from django.db import models, router
+from django.db import models, router, transaction
 from django.db.models import F, Q
 
+from ..caveats import instance_key
 from ..conf import app_settings
 from ..errors import RelationshipReadError
 from ..types import ObjectRef, RelationshipTuple, SubjectRef
@@ -198,7 +199,88 @@ class RelationshipManager(models.Manager.from_queryset(RelationshipQuerySet)):  
     """Manager exposing the public relationship-query helper surface."""
 
 
-class Relationship(models.Model):
+class _CaveatedRelationship(models.Model):
+    """Keep the SQL caveat identity on every supported instance write path."""
+
+    caveat_name = models.CharField(max_length=64, blank=True, default="")
+    caveat_context = models.JSONField(null=True, blank=True)
+    caveat_key = models.CharField(max_length=64, blank=True, default="", editable=False)
+    _caveat_write: tuple[str, set[str] | None] | None = None
+
+    class Meta:
+        abstract = True
+
+    def _derive_caveat_key(self) -> str:
+        values: dict[str, Any] = {
+            "caveat_name": self.caveat_name,
+            "caveat_context": self.caveat_context,
+        }
+        if self._caveat_write is not None:
+            using, fields = self._caveat_write
+            omitted = set() if fields is None else {"caveat_name", "caveat_context"} - fields
+            if omitted and self.pk is not None:
+                stored = (
+                    type(self)
+                    ._base_manager.using(using)
+                    .select_for_update()
+                    .filter(pk=self.pk)
+                    .values(*sorted(omitted))
+                    .first()
+                )
+                if stored is not None:
+                    values.update(stored)
+        return instance_key(values["caveat_name"], values["caveat_context"])
+
+    def save_base(
+        self,
+        raw: bool = False,
+        force_insert: Any = False,
+        force_update: bool = False,
+        using: str | None = None,
+        update_fields: Iterable[str] | None = None,
+    ) -> None:
+        using = using or router.db_for_write(type(self), instance=self)
+        fields = None if update_fields is None else set(update_fields)
+        caveat_fields = {"caveat_name", "caveat_context"}
+        changed = fields is None or bool(fields & (caveat_fields | {"caveat_key"}))
+        # A partial save may leave a dirty, excluded attribute on the instance.
+        # Read that attribute's stored value under the same row lock as the save.
+        with transaction.atomic(using=using, savepoint=False):
+            previous = self._caveat_write
+            self._caveat_write = using, fields
+            try:
+                if changed:
+                    if fields is not None:
+                        fields.add("caveat_key")
+                super().save_base(raw, force_insert, force_update, using, fields)
+            finally:
+                self._caveat_write = previous
+
+    def _save_table(
+        self,
+        raw: bool = False,
+        cls: type[models.Model] | None = None,
+        force_insert: Any = False,
+        force_update: bool = False,
+        using: str | None = None,
+        update_fields: Iterable[str] | None = None,
+    ) -> bool:
+        # Django 6 calls this after every pre_save receiver, for both normal
+        # and raw fixture saves, and before post_save. The key must be final
+        # before either SQL or post_save can observe the tuple; a field hook
+        # alone is insufficient because raw saves skip those hooks.
+        if update_fields is None or "caveat_key" in update_fields:
+            self.caveat_key = self._derive_caveat_key()
+        # django-stubs omits this Django 6 model hook.
+        return cast(
+            bool,
+            cast(Any, super())._save_table(
+                raw, cls, force_insert, force_update, using, update_fields
+            ),
+        )
+
+
+class Relationship(_CaveatedRelationship):
     """Denormalized relationship row — historical default storage shape."""
 
     resource_type = models.CharField(max_length=64, db_index=True)
@@ -207,8 +289,6 @@ class Relationship(models.Model):
     subject_type = models.CharField(max_length=64, db_index=True)
     subject_id = models.CharField(max_length=64, db_index=True)
     optional_subject_relation = models.CharField(max_length=64, blank=True, default="")
-    caveat_name = models.CharField(max_length=64, blank=True, default="")
-    caveat_context = models.JSONField(null=True, blank=True)
     expires_at = models.DateTimeField(null=True, blank=True, db_index=True)
     written_at_xid = models.BigIntegerField(default=0, db_index=True)
 
@@ -224,7 +304,8 @@ class Relationship(models.Model):
             self, lambda: super(Relationship, self).delete(*args, **kwargs), kwargs.get("using")
         )
 
-    class Meta:
+    class Meta(_CaveatedRelationship.Meta):
+        abstract = False
         app_label = "rebac"
         verbose_name = "Relationship"
         verbose_name_plural = "Relationships"
@@ -562,6 +643,10 @@ def _owned_tuple_bulk_create[T: Relationship | RelationshipRegistry](
             raise ValueError(
                 "Relationship upserts may update tuple metadata only, using the tuple unique constraint"
             )
+        if update_fields and "caveat_context" in update_fields:
+            update_fields = [*update_fields, "caveat_key"]
+    for row in candidates:
+        row.caveat_key = instance_key(row.caveat_name, row.caveat_context)
     # Storage conversion writes the inactive table and publishes it with a
     # separate rebuild. Only the active shape contributes to this index.
     if rows.model is not active_relationship_model():
@@ -717,7 +802,7 @@ class RelationshipRegistryManager(models.Manager.from_queryset(RelationshipRegis
         return result
 
 
-class RelationshipRegistry(models.Model):
+class RelationshipRegistry(_CaveatedRelationship):
     """Registry-mode relationship row.
 
     Same wire-shape as :class:`Relationship` but ``resource_*`` and
@@ -745,8 +830,6 @@ class RelationshipRegistry(models.Model):
         db_column="subject_fk_id",
     )
     optional_subject_relation = models.CharField(max_length=64, blank=True, default="")
-    caveat_name = models.CharField(max_length=64, blank=True, default="")
-    caveat_context = models.JSONField(null=True, blank=True)
     expires_at = models.DateTimeField(null=True, blank=True, db_index=True)
     written_at_xid = models.BigIntegerField(default=0, db_index=True)
 
@@ -766,7 +849,8 @@ class RelationshipRegistry(models.Model):
             kwargs.get("using"),
         )
 
-    class Meta:
+    class Meta(_CaveatedRelationship.Meta):
+        abstract = False
         app_label = "rebac"
         verbose_name = "Relationship (registry)"
         verbose_name_plural = "Relationships (registry)"

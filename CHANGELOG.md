@@ -3,6 +3,21 @@
 All notable changes to `django-zed-rebac` are tracked here. The project is in
 pre-1.0; breaking changes within a minor version are explicitly called out.
 
+## [Unreleased]
+
+### Added
+
+- Proposal 0015's experimental permission compiler lives beside the existing
+  index. Public reads and write gates still use the existing implementation;
+  the test-only `--compiled-shadow` option compares source-backed reads at the
+  shared reader seam, including scopes when their SQL executes. Switching
+  reads remains subject to the proposal's correctness, query-plan and contract
+  gates.
+- Both relationship storage layouts carry a deterministic `caveat_key` for
+  compiled predicates. Migration `0008` backfills existing rows in bounded
+  batches. Supported instance, fixture, backend and bulk write paths maintain
+  the key together with the caveat name and pinned context.
+
 ## [0.24.2] — 2026-10-01
 
 ### Changed

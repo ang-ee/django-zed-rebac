@@ -11,6 +11,13 @@
 
 ## TL;DR
 
+> **0015 implementation branch:**
+> [Proposal 0015](./proposals/0015-permissions-compiled-to-queries.md) is the
+> contract for the compiler being built beside the index. Existing production
+> reads remain on the index until semantic tests and the measured query-plan
+> gates pass. Authorization rules remain unchanged. Obsolete compatibility
+> shims are not a requirement for the eventual cutover.
+
 `django-zed-rebac` is a **drop-in REBAC engine** for Django 6.0 projects. Add it to `INSTALLED_APPS`, declare your authorisation schema in a per-package `permissions.zed` file, and every queryset, save, and method call is gated against the effective user — without rewriting your viewsets.
 
 Core capabilities:

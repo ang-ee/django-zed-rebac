@@ -31,15 +31,28 @@ from __future__ import annotations
 
 import hashlib
 import importlib.util
+from collections.abc import Mapping
 from threading import Lock
 from typing import TYPE_CHECKING, Any
 
 from .errors import CaveatUnsupportedError
 from .schema.ast import Caveat
+from .schema.serialization import digest
 
 if TYPE_CHECKING:
     # Imported only for type-checkers. The runtime import is lazy.
     import celpy  # noqa: F401
+
+
+def instance_key(name: str, context: Mapping[str, Any] | None) -> str:
+    """Write-owned label of a pinned payload, independent of its verdict.
+
+    Database JSON serialization can change numeric representation. Reads use
+    the stored label together with the stored context, without rehashing it.
+    Distinct labels may identify equivalent stored contexts; differing contexts
+    must never share a label (in particular, keep ``1`` and ``1.0`` distinct).
+    """
+    return digest({"caveat": name, "context": dict(context or {})}) if name else ""
 
 
 # Module-level compile cache, keyed by (caveat_name, expression_hash) so a

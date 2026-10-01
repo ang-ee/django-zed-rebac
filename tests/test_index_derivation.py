@@ -26,7 +26,9 @@ pytestmark = pytest.mark.django_db
 @pytest.fixture(params=("denormalized", "registry"))
 def install(request, settings):
     settings.REBAC_LOCAL_BACKEND_STORAGE = request.param
-    settings.REBAC_DEPTH_LIMIT = 128  # The walker oracle needs headroom; the index does not use it.
+    # The frozen walker falls back to the finite-path reference on overflow
+    # in assert_index_matches. Keep the actual backend's configured depth;
+    # inflating it for that oracle also inflates compiled SQL in shadow runs.
     reset_backend()
 
     def apply(schema):

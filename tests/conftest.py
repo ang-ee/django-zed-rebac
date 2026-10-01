@@ -7,6 +7,29 @@ import pytest
 from django.conf import settings
 
 
+def pytest_addoption(parser):
+    parser.addoption(
+        "--compiled-shadow",
+        action="store_true",
+        default=False,
+        help="Compare source-backed public index reads against proposal 0015's compiler.",
+    )
+
+
+@pytest.fixture(autouse=True)
+def compiled_shadow(request, monkeypatch):
+    if request.config.getoption("--compiled-shadow"):
+        if request.node.path.name == "test_index_read.py" and "active" in request.fixturenames:
+            # This fixture writes synthetic IndexCover/IndexMember rows without
+            # source relationships. Its index representation tests cannot be
+            # differential source tests. Source-based tests in the same module
+            # use their own setup and still run through the shadow hook.
+            return
+        from tests.compile_shadow import install
+
+        install(monkeypatch)
+
+
 def pytest_configure() -> None:
     if not settings.configured:
         from . import settings as test_settings  # noqa: F401

@@ -226,7 +226,7 @@ def installed_database_objects(db):
 def upgrade_schema_owners(db):
     """Exercise actual 0.21.0 -> 0.22.0 migration states on each vendor."""
     previous = [("rebac", "0005_schema_generation")]
-    current = [("rebac", "0007_permission_index")]
+    current = MigrationExecutor(db).loader.graph.leaf_nodes("rebac")
     # Start below 0005, since reversing removal deliberately never reinstalls.
     MigrationExecutor(db).migrate([("rebac", "0004_field_backing_path")])
     try:

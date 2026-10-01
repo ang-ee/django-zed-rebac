@@ -563,7 +563,7 @@ def test_generation_migration_reverses_without_changing_schema(synced):
         assert "rebac_schemageneration" not in connection.introspection.table_names()
         assert list(SchemaPermission.objects.order_by("pk").values()) == before
     finally:
-        call_command("migrate", "rebac", "0007", verbosity=0)
+        call_command("migrate", "rebac", verbosity=0)
     assert list(SchemaPermission.objects.order_by("pk").values()) == before
     from tests.backend_setup import rebuild_backend
 
