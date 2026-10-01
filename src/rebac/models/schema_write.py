@@ -25,6 +25,30 @@ def schema_index_write(using: str) -> Iterator[IndexMaintenance]:
         yield maintenance
 
 
+@contextmanager
+def schema_changes(using: str | None = None) -> Iterator[None]:
+    """Group stored-schema writes so the permission index is rebuilt once, when the block exits.
+
+    A write to a schema row (definition, relation, permission, override) owns
+    a maintenance pass of its own and rebuilds the index for the types it
+    affects, and every type that depends on them, when it finishes. Deleting
+    thirteen relations one by one walks those types thirteen times. Inside
+    this block the writes join one pass, and one rebuild runs at exit.
+
+    The block is one transaction on ``using`` (the relationship write alias by
+    default) and holds the index lock until it exits; an exception rolls the
+    writes back and leaves the index as it was. A relationship write made
+    after a schema change in the block is covered by that rebuild. Made before
+    any schema change, it is maintained on its own as usual, so change the
+    schema first. Blocks nest: an inner one joins the outer one.
+    """
+    from . import active_relationship_model
+
+    alias = using or router.db_for_write(active_relationship_model())
+    with schema_index_write(alias):
+        yield
+
+
 def _affected_types(rows: models.QuerySet[Any]) -> set[str] | None:
     from .overrides import SchemaOverride
     from .schema import SchemaDefinition, SchemaPermission, SchemaRelation

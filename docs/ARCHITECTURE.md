@@ -440,6 +440,9 @@ from rebac import (
     # Convenience helpers
     write_relationships, delete_relationships, delete_relationship, backend,
 
+    # One index rebuild for a block of stored-schema writes
+    schema_changes,
+
     # Preflight against not-yet-persisted resources (0.4+)
     check_new,
 
@@ -465,6 +468,19 @@ schema on `backend` (a new `LocalBackend` by default), makes that instance the
 one `rebac.backend()` returns in this process, rebuilds the permission index on
 `using` so it matches the rows already stored, and returns the backend.
 `rebac.backends.reset_backend()` undoes it; call it in teardown.
+
+`rebac.schema_changes(using=None)` groups writes to stored schema rows
+(`SchemaDefinition`, `SchemaRelation`, `SchemaPermission`, `SchemaOverride`).
+Each such write owns a maintenance pass and rebuilds the index for the types it
+affects and every type that depends on them, so a provisioning step that
+deletes many rows one by one walks the same source tables once per row. Inside
+the block the writes join one pass and one rebuild runs at exit. The block is
+one transaction on `using` (the relationship write alias by default) and holds
+the index lock until it exits; an exception rolls the writes back. A
+relationship write made after a schema change in the block is covered by that
+rebuild; made before any schema change it is maintained on its own, so change
+the schema first. Blocks nest. It applies to the stored schema of
+`LocalBackend`; it is not a way to suspend maintenance, and there is none.
 
 `rebac.memberships` owns direct `member`-tuple creation, exact (caveat-aware)
 revocation and enumeration for any container type. `rebac.roles` composes it
