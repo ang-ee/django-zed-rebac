@@ -6,6 +6,7 @@ the reserved '*' type-level ID cannot reach an integer or UUID cast.
 
 from __future__ import annotations
 
+from collections.abc import Sequence
 from dataclasses import dataclass
 from typing import Any, Protocol
 
@@ -103,6 +104,40 @@ class _IdentityCodec:
         return valid
 
 
+_CONVERTED: Any = object()
+# (alias, vendor, native uuid, codec, direction) -> the guard's SQL split at the
+# converted expression's positions, and its parameters with _CONVERTED markers.
+_fragments: dict[tuple[Any, ...], tuple[tuple[str, ...], tuple[Any, ...]]] = {}
+
+
+class _Converted(Expression):
+    """Stands for the converted expression while its guard is compiled."""
+
+    def __init__(self) -> None:
+        super().__init__(output_field=models.TextField())
+
+    def as_sql(self, compiler: SQLCompiler, connection: BaseDatabaseWrapper) -> tuple[str, Any]:
+        return "%s", (_CONVERTED,)
+
+
+def _chunks(sql: str, params: Sequence[Any]) -> tuple[str, ...]:
+    """Split compiled SQL at the placeholders that stand for the converted expression."""
+    chunks: list[str] = []
+    start = position = index = 0
+    while (position := sql.find("%", position)) != -1:
+        if sql.startswith("%%", position):
+            position += 2
+            continue
+        assert sql.startswith("%s", position), "Django compiles positional placeholders"
+        if params[index] is _CONVERTED:
+            chunks.append(sql[start:position])
+            start = position + 2
+        index += 1
+        position += 2
+    chunks.append(sql[start:])
+    return tuple(chunks)
+
+
 class _Conversion(Func):
     """Select vendor-native ORM expressions at compilation, without SQL text."""
 
@@ -123,7 +158,47 @@ class _Conversion(Func):
         arg_joiner: str | None = None,
         **extra_context: Any,
     ) -> tuple[str, tuple[Any, ...]]:
+        """Compile the guard around the converted expression once per field.
+
+        The guard reads the converted expression about ten times and depends
+        only on the field, the direction and the connection. Building,
+        resolving and compiling it again for every use was most of the time of
+        a maintenance pass. Django compiles it once around a placeholder; each
+        use compiles its own expression once and takes the placeholder's
+        positions. No SQL is written by hand, and ``_compile_fresh`` is the
+        same statement without the cache (pinned by test_index_codec_cache).
+        """
+        key = (
+            connection.alias,
+            connection.vendor,
+            connection.features.has_native_uuid_field,
+            self.codec,
+            self.to_wire,
+        )
+        fragment = _fragments.get(key)
+        if fragment is None:
+            guard = self._expression(_Converted(), connection).resolve_expression(compiler.query)
+            guard_sql, guard_params = compiler.compile(guard)
+            fragment = _fragments[key] = _chunks(guard_sql, guard_params), tuple(guard_params)
+        chunks, guard_params = fragment
+        inner_sql, inner_params = compiler.compile(self.get_source_expressions()[0])
+        params: list[Any] = []
+        for param in guard_params:
+            if param is _CONVERTED:
+                params.extend(inner_params)
+            else:
+                params.append(param)
+        return inner_sql.join(chunks), tuple(params)
+
+    def _compile_fresh(
+        self, compiler: SQLCompiler, connection: BaseDatabaseWrapper, **extra_context: Any
+    ) -> tuple[str, tuple[Any, ...]]:
         original = self.get_source_expressions()[0]
+        expression = self._expression(original, connection).resolve_expression(compiler.query)
+        sql, params = compiler.compile(expression)
+        return sql, tuple(params)
+
+    def _expression(self, original: Any, connection: BaseDatabaseWrapper) -> Expression:
         text = Cast(original, models.TextField())
         candidate: Expression = text
         if (
@@ -158,9 +233,7 @@ class _Conversion(Func):
             # Guard the cast INPUT, including literal expressions, so no
             # optimizer can eagerly cast an invalid constant in a CASE arm.
             expression = Cast(cast_input, self.codec.field)
-        expression = expression.resolve_expression(compiler.query)
-        sql, params = compiler.compile(expression)
-        return sql, tuple(params)
+        return expression
 
 
 def identity_codec(model: type[models.Model], attr: str | None = None) -> Codec:
