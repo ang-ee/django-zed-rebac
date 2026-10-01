@@ -23,6 +23,15 @@ pre-1.0; breaking changes within a minor version are explicitly called out.
   Django never looked at the parent's and the options were dropped without an
   error. The `rebac_*` options are unchanged: they pass to a child only
   through a `Meta` the child writes, as before 0.23.0.
+- `exclude()` across a to-many relation works on a scoped queryset
+  (`Model.objects.with_actor(a).exclude(children__field=value)`, reverse
+  foreign keys and many-to-many alike). Django builds the `NOT EXISTS` for
+  such an exclude from the outer query's class; since 0.22.0 the library
+  treated that inner query as an embedded queryset and scoped it, which
+  raised `MissingActorError` without an ambient actor and compiled invalid
+  SQL (two tables, no join) with one. It is now left as the correlated piece
+  of the outer statement it is. A queryset passed inside the exclude keeps
+  its own scope.
 
 ### Added
 

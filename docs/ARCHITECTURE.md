@@ -2118,6 +2118,11 @@ for its own projection when it is resolved, so
 `Subquery(Model.objects.with_actor(a).values("gated"))` still raises while an
 `Exists` over a bypass queryset that filters on a gated column hands the outer
 row only its boolean.
+The `NOT EXISTS` Django builds for an `exclude()` across a to-many relation
+(`Query.split_exclude`) is not an embedded queryset: it is a correlated piece
+of the outer statement, like the join a `filter()` across the same relation
+adds, and it is not scoped on its own. A queryset the caller passes inside
+that exclude (`rel__in=Model.objects...`) keeps its own scope.
 These guards inspect Django column expressions; raw SQL and arbitrary custom
 SQL expressions remain outside that inspection boundary.
 
