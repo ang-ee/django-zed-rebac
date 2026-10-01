@@ -66,7 +66,9 @@ pre-1.0; breaking changes within a minor version are explicitly called out.
   ignored with `rebac.W010`; narrowing overrides are therefore dropped whole
   until proposal 0012 lands.
 - Direct `Relationship.objects.bulk_create()`, including conflict updates,
-  participates in tuple ownership and index maintenance.
+  participates in tuple ownership and index maintenance; a batch of 500 or
+  more tuples rebuilds the index in full inside the owner rather than
+  deriving incrementally.
 
 ### Fixed
 

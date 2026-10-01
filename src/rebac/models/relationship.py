@@ -57,6 +57,11 @@ _REGISTRY_WIRE_FIELD_MAP = {
 }
 
 
+# A direct ``bulk_create`` of at least this many tuples rebuilds the index in
+# full rather than deriving incrementally; see ARCHITECTURE § Relationship writes.
+BULK_REBUILD_ROWS = 500
+
+
 def _tuple_of(row: Relationship | RelationshipRegistry) -> RelationshipTuple:
     return RelationshipTuple(
         resource=ObjectRef(row.resource_type, row.resource_id),
@@ -570,8 +575,14 @@ def _owned_tuple_bulk_create[T: Relationship | RelationshipRegistry](
             unique_fields,
         )
     tuples = [_tuple_of(row) for row in candidates]
+    # Incremental maintenance expands a region to a fixpoint around each
+    # changed tuple; that is right for a write and pathological for a seed.
+    # A batch past this size rebuilds the index in full inside the same owner,
+    # the same pass `rebac index rebuild` runs, whose cost the scale budgets
+    # bound.
+    rebuild_in_full = len(tuples) >= BULK_REBUILD_ROWS
     with tuple_owner(rows.db) as maintenance:
-        if maintenance is not None:
+        if maintenance is not None and not rebuild_in_full:
             for tuple_ in tuples:
                 existing = rows.filter(
                     resource_type=tuple_.resource.resource_type,
@@ -595,7 +606,11 @@ def _owned_tuple_bulk_create[T: Relationship | RelationshipRegistry](
             unique_fields,
         )
         if maintenance is not None:
-            maintenance.changed(tuples=tuples)
+            if rebuild_in_full:
+                maintenance.schema_changed = True
+                maintenance.schema_all = True
+            else:
+                maintenance.changed(tuples=tuples)
     mark_relationships_changed()
     return result
 

@@ -1709,7 +1709,11 @@ it can change a tuple's wire identity or policy without a matching tuple
 write owner; use `delete_relationships()` and `write_relationships()`.
 Their `bulk_create()`, including conflict updates, is tuple-owned as well: it
 captures existing matching tuple identities before SQL and derives the new
-state before returning. Conflict updates must target the tuple unique constraint
+state before returning. A batch of 500 tuples or more (`BULK_REBUILD_ROWS`)
+rebuilds the whole index inside the same owner instead of deriving
+incrementally: region expansion is bounded by a write's neighbourhood and
+pathological for a seed, while a full rebuild is the pass `rebac index
+rebuild` runs and the scale budgets bound. Conflict updates must target the tuple unique constraint
 and update only `caveat_context`, `expires_at`, or `written_at_xid`; a primary-key
 upsert or tuple-identity move is refused with `ValueError`.
 `write_relationships()` runs under one tuple owner, interns registry references
