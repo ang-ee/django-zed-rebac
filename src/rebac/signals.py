@@ -2,7 +2,9 @@
 
 from __future__ import annotations
 
-from collections.abc import Iterable
+from collections.abc import Iterable, Iterator
+from contextlib import contextmanager, nullcontext
+from contextvars import ContextVar
 from itertools import batched
 from typing import Any, cast
 from weakref import WeakSet
@@ -10,6 +12,7 @@ from weakref import WeakSet
 from django.apps import apps
 from django.db import models, router
 from django.db.models import Model, Q
+from django.db.models.functions import Cast
 from django.db.models.signals import (
     class_prepared,
     m2m_changed,
@@ -22,7 +25,7 @@ from django.dispatch import receiver
 
 from .actors import model_can_resolve_subject, to_subject_ref
 from .conf import app_settings
-from .errors import NoActorResolvedError
+from .errors import NoActorResolvedError, PermissionDenied
 from .resources import model_resource_type, to_object_ref
 from .types import ObjectRef, SubjectRef
 
@@ -32,6 +35,9 @@ _subjects: WeakSet[type[Model]] = WeakSet()
 _tracked: WeakSet[type[Model]] = WeakSet()
 _throughs: WeakSet[type[Model]] = WeakSet()
 _through_candidates: WeakSet[type[Model]] = WeakSet()
+_related_m2m_write: ContextVar[type[Model] | None] = ContextVar(
+    "rebac_related_m2m_write", default=None
+)
 
 
 def tracked_model(model: type[Model]) -> bool:
@@ -145,6 +151,99 @@ def connect_tracked_signals() -> None:
             _throughs.discard(model)
     for model in apps.get_models(include_auto_created=True):
         _register_model(model)
+    _own_through_managers()
+    _wrap_related_m2m_writes()
+
+
+def _own_through_managers() -> None:
+    from .managers import TrackedManager
+
+    for through in tuple(_throughs):
+        if getattr(through, "_rebac_owned_through_manager", False):
+            continue
+        through._meta.local_managers = [
+            manager for manager in through._meta.local_managers if manager.name != "objects"
+        ]
+        through.add_to_class("objects", TrackedManager())
+        cast(Any, through._meta)._expire_cache()
+        cast(Any, through)._rebac_owned_through_manager = True
+
+
+def _wrap_related_m2m_writes() -> None:
+    """Preflight related-manager calls outside Django's internal atomic block."""
+    for source in apps.get_models():
+        for field in source._meta.local_many_to_many:
+            through = field.remote_field.through
+            if through not in _throughs:
+                continue
+            target = field.remote_field.model
+            descriptors = [getattr(source, field.name)]
+            accessor = field.remote_field.get_accessor_name()
+            if accessor and hasattr(target, accessor):
+                descriptors.append(getattr(target, accessor))
+            for descriptor in descriptors:
+                manager_class = descriptor.related_manager_cls
+                if manager_class.__dict__.get("_rebac_edge_gate_wrapped"):
+                    continue
+                for operation in ("add", "remove", "clear", "set"):
+                    original = getattr(manager_class, operation)
+
+                    def guarded(
+                        self: Any,
+                        *args: Any,
+                        _original: Any = original,
+                        _operation: str = operation,
+                        **kwargs: Any,
+                    ) -> Any:
+                        with audit_backed_denials():
+                            if _operation in {"clear", "set"}:
+                                _gate_m2m(
+                                    self.through,
+                                    self.instance,
+                                    self.reverse,
+                                    self.model,
+                                    None,
+                                    self.db,
+                                )
+                            if _operation != "clear":
+                                values = (
+                                    tuple(args[0] if args else kwargs["objs"])
+                                    if _operation == "set"
+                                    else args
+                                )
+                                ids = {getattr(value, "pk", value) for value in values}
+                                _gate_m2m(
+                                    self.through,
+                                    self.instance,
+                                    self.reverse,
+                                    self.model,
+                                    ids,
+                                    self.db,
+                                )
+                                if _operation == "set":
+                                    if args:
+                                        args = (values, *args[1:])
+                                    else:
+                                        kwargs["objs"] = values
+                            from .actors import actor_context
+                            from .mixins import RebacMixin
+
+                            pinned = getattr(self.instance, "actor", None)
+                            carried = (
+                                pinned()
+                                if isinstance(self.instance, RebacMixin) and callable(pinned)
+                                else None
+                            )
+                            scope = actor_context(carried) if carried is not None else nullcontext()
+                            token = _related_m2m_write.set(self.through)
+                            try:
+                                with scope:
+                                    return _original(self, *args, **kwargs)
+                            finally:
+                                _related_m2m_write.reset(token)
+
+                    setattr(manager_class, operation, guarded)
+                manager_class._rebac_edge_gate_wrapped = True
 
 
 @receiver(class_prepared, dispatch_uid="rebac.model_prepared")
@@ -198,7 +297,7 @@ def cleanup_identities(identities: Iterable[ObjectRef], *, using: str) -> None:
     from .backends.local import mark_relationships_changed
     from .index.maintain import tuple_owner
     from .models import RebacResource, active_relationship_model
-    from .models.relationship import engine_tuple_write, projected_tuples
+    from .models.relationship import projected_tuples
 
     identities = sorted(set(identities), key=str)
     if not identities or not router.allow_migrate_model(using, active_relationship_model()):
@@ -216,11 +315,10 @@ def cleanup_identities(identities: Iterable[ObjectRef], *, using: str) -> None:
             rows = active_relationship_model().objects.using(using).filter(references)
             if maintenance is not None:
                 maintenance.capture_old(tuples=projected_tuples(cast(Any, rows).index_projection()))
-            with engine_tuple_write():
-                if app_settings.REBAC_LOCAL_BACKEND_STORAGE == "registry":
-                    RebacResource.objects.using(using).filter(registry).delete()
-                else:
-                    rows.delete()
+            if app_settings.REBAC_LOCAL_BACKEND_STORAGE == "registry":
+                RebacResource.objects.using(using).filter(registry).delete()
+            else:
+                rows.delete()
         mark_relationships_changed()
 
 
@@ -422,7 +520,8 @@ def _index_m2m(
     if sender not in _throughs:
         return
     if action in {"pre_add", "pre_remove", "pre_clear"}:
-        _gate_m2m(sender, instance, reverse, model, pk_set, using)
+        if _related_m2m_write.get() is not sender:
+            _gate_m2m(sender, instance, reverse, model, pk_set, using)
     if not _current_watch(sender, using):
         return
     if action in {"pre_add", "pre_remove", "pre_clear"}:
@@ -440,32 +539,43 @@ def _gate_m2m(
     using: str,
 ) -> None:
     """Gate each resource endpoint owning an affected M2M-backed edge."""
+    from .actors import is_sudo
     from .index.maintain import current_pass, get_program
+    from .mixins import RebacMixin
     from .resources import model_for_resource_type
 
-    del reverse
+    pinned = getattr(instance, "actor", None)
+    if is_sudo() and (
+        not isinstance(instance, RebacMixin) or not callable(pinned) or pinned() is None
+    ):
+        return
     owner_model = sender._meta.auto_created
     if not isinstance(owner_model, type):
         return
     owner_type = model_resource_type(owner_model)
     outer = current_pass(using)
     program = outer.load_program() if outer is not None else get_program(using)
-    watched = (
-        program.watched.get(sender._meta.label_lower) if _current_watch(sender, using) else None
-    )
-    types = set(watched.resource_types if watched is not None else ())
-    if owner_type is not None:
-        types.add(owner_type)
+    watched = program.watched.get(sender._meta.label_lower)
+    types = {owner_type} if owner_type is not None else set()
+    if watched is not None:
+        types.update(watched.resource_types)
+    types = {type_ for type_ in types if (type_, "write") in program.nodes}
     if not types or pk_set == set():
         return
-    actor, bypass = _edge_actor(instance)
+    actor, bypass = _edge_actor(instance, relation=True)
     if bypass:
         return
     fields = [field for field in sender._meta.fields if isinstance(field, models.ForeignKey)]
     instance_model = instance._meta.concrete_model
-    instance_field = next(
-        field for field in fields if field.remote_field.model._meta.concrete_model is instance_model
-    )
+    assert instance_model is not None
+    if all(field.remote_field.model._meta.concrete_model is instance_model for field in fields):
+        instance_field = fields[1 if reverse else 0]
+    else:
+        instance_field = next(
+            field
+            for field in fields
+            if field.remote_field.model._meta.concrete_model is instance_model
+        )
     other_field = next(field for field in fields if field is not instance_field)
     other_ids = (
         pk_set
@@ -614,13 +724,22 @@ def _changed_hop_prefixes(
     return prefixes
 
 
-def _edge_actor(instance: Any) -> tuple[SubjectRef | None, bool]:
+def _edge_actor(instance: Any, *, relation: bool = False) -> tuple[SubjectRef | None, bool]:
     from .actors import current_actor, is_sudo
     from .errors import MissingActorError
+    from .mixins import RebacMixin
 
     effective = getattr(instance, "effective_actor", None)
-    if callable(effective):
+    if isinstance(instance, RebacMixin) and callable(effective) and not relation:
         return cast(tuple[SubjectRef | None, bool], effective(strict=True))
+    if relation:
+        pinned = getattr(instance, "actor", None)
+        if (
+            isinstance(instance, RebacMixin)
+            and callable(pinned)
+            and (actor := pinned()) is not None
+        ):
+            return cast(SubjectRef, actor), False
     if is_sudo():
         return None, True
     actor = current_actor()
@@ -629,22 +748,65 @@ def _edge_actor(instance: Any) -> tuple[SubjectRef | None, bool]:
     return actor, actor is None
 
 
+class BackedEdgeDenied(PermissionDenied):
+    """Carry the denied declaring resource across an owner's rollback."""
+
+    def __init__(self, message: str, actor: SubjectRef, resource: ObjectRef) -> None:
+        super().__init__(message)
+        self.actor = actor
+        self.resource = resource
+
+
+def audit_edge_denial(exc: BaseException) -> None:
+    if isinstance(exc, BackedEdgeDenied):
+        from .mixins import _maybe_audit_denial
+
+        _maybe_audit_denial(actor=exc.actor, action="write", resource=exc.resource)
+
+
+@contextmanager
+def audit_backed_denials() -> Iterator[None]:
+    try:
+        yield
+    except BackedEdgeDenied as exc:
+        audit_edge_denial(exc)
+        raise
+
+
 def _check_edge_writes(
     actor: SubjectRef | None, resource_type: str, ids: set[str], *, bulk: bool = False
 ) -> None:
     from .backends import backend
-    from .errors import PermissionDenied
-    from .mixins import _maybe_audit_denial
 
     assert actor is not None
-    allowed = set(backend().accessible(subject=actor, action="write", resource_type=resource_type))
+    active = backend()
+    from .backends.local import LocalBackend
+
+    if isinstance(active, LocalBackend):
+        from .index.read import accessible_ids, using_backend
+        from .models import active_relationship_model
+
+        using = active_relationship_model().objects.db
+        with using_backend(active):
+            allowed = set(
+                accessible_ids(
+                    resource_type=resource_type, action="write", actor=actor, using=using
+                ).filter(object_id__in=ids)
+            )
+    else:
+        allowed = {
+            id_
+            for id_ in ids
+            if active.check_access(
+                subject=actor, action="write", resource=ObjectRef(resource_type, id_)
+            ).allowed
+        }
     denied = ids - allowed
     if denied:
         resource = ObjectRef(resource_type, sorted(denied)[0])
-        _maybe_audit_denial(actor=actor, action="write", resource=resource)
         if bulk:
-            raise PermissionDenied("Bulk write: row outside actor scope.")
-        raise PermissionDenied(f"Denied: {actor} cannot write {resource}")
+            raise BackedEdgeDenied("Bulk write: row outside actor scope.", actor, resource)
+        raise BackedEdgeDenied(f"Denied: {actor} cannot write {resource}", actor, resource)
 
 
 def _gate_backed_rows(
@@ -655,21 +817,52 @@ def _gate_backed_rows(
     proposed: dict[str, Any] | None = None,
     actor: SubjectRef | None = None,
     bypass: bool = False,
+    deleting: bool = False,
 ) -> None:
     """Batch the backed-edge gate for signal-free queryset writes."""
     from .errors import PermissionDenied
 
     if bypass:
         return
-    candidates: dict[str, set[str]] = {}
-    last_row: Model | None = None
-    for row in rows:
-        last_row = row
-        if proposed is not None:
-            from .index.maintain import current_pass, get_program
+    changed_names = set(names) if names is not None else None
+    materialized = list(rows)
+    if materialized and _related_m2m_write.get() is type(materialized[0]):
+        return  # Related-manager wrapper checked the whole changed pair set.
+    from .index.maintain import current_pass, get_program
 
-            outer = current_pass(using)
-            program = outer.load_program() if outer is not None else get_program(using)
+    outer = current_pass(using)
+    program = outer.load_program() if outer is not None else get_program(using)
+    stored: dict[tuple[type[Model], Any], dict[str, Any]] = {}
+    model_pks: dict[type[Model], set[Any]] = {}
+    for row in materialized:
+        if row.pk is not None and not row._state.adding:
+            model_pks.setdefault(type(row), set()).add(row.pk)
+    for model, pks in model_pks.items():
+        if not _current_watch(model, using, changed_names):
+            continue
+        watch = program.watched.get(model._meta.label_lower)
+        if watch is None:
+            continue
+        columns = sorted(
+            {
+                field.attname
+                for field in model._meta.concrete_fields
+                if {field.name, field.attname} & watch.fields
+                and (changed_names is None or {field.name, field.attname} & changed_names)
+            }
+            - {model._meta.pk.attname}
+        )
+        if not columns:
+            continue
+        for values in model._base_manager.using(using).filter(pk__in=pks).values("pk", *columns):
+            stored[(model, values["pk"])] = values
+    through_pairs: dict[type[Model], set[tuple[Any, Any]]] = {}
+    last_row: Model | None = None
+    for row in materialized:
+        last_row = row
+        if row._meta.auto_created:
+            _collect_through_pair(row, through_pairs)
+        if proposed is not None:
             watch = program.watched.get(row._meta.label_lower)
             for field in row._meta.concrete_fields:
                 if watch is None or not {field.name, field.attname} & watch.fields:
@@ -678,6 +871,23 @@ def _gate_backed_rows(
                 if key not in proposed:
                     continue
                 value = proposed[key]
+                if isinstance(value, Cast):
+                    value = value.source_expressions[0]
+                if isinstance(value, models.Case):
+                    matched = [
+                        when.result.value
+                        for when in value.cases
+                        if isinstance(when, models.When)
+                        and isinstance(when.result, models.Value)
+                        and len(when.condition.children) == 1
+                        and when.condition.children[0] == ("pk", row.pk)
+                    ]
+                    if len(matched) != 1:
+                        raise PermissionDenied(
+                            "Bulk write cannot resolve a backed field expression; "
+                            "use checked saves or sudo."
+                        )
+                    value = matched[0]
                 if callable(getattr(value, "resolve_expression", None)):
                     raise PermissionDenied(
                         "Bulk write cannot resolve a backed field expression; "
@@ -687,8 +897,17 @@ def _gate_backed_rows(
                     setattr(row, field.name, value)
                 else:
                     setattr(row, field.attname, value)
-        for type_, ids in _backed_field_change_candidates(type(row), row, using, names).items():
-            candidates.setdefault(type_, set()).update(ids)
+            if row._meta.auto_created:
+                _collect_through_pair(row, through_pairs)
+    candidates = _batched_backed_field_candidates(
+        materialized, stored, program, using, changed_names, deleting=deleting
+    )
+    _gate_direct_through_rows(through_pairs, using)
+    if not candidates:
+        return
+    candidates = {
+        type_: ids for type_, ids in candidates.items() if (type_, "write") in program.nodes
+    }
     if not candidates:
         return
     if actor is None:
@@ -701,11 +920,191 @@ def _gate_backed_rows(
         _check_edge_writes(actor, resource_type, ids, bulk=True)
 
 
+def _batched_backed_field_candidates(
+    rows: list[Model],
+    stored: dict[tuple[type[Model], Any], dict[str, Any]],
+    program: Any,
+    using: str,
+    changed_names: set[str] | None,
+    *,
+    deleting: bool,
+) -> dict[str, set[str]]:
+    """Resolve each watched FK and reverse source once for a queryset write."""
+    from .field_backing import resolve_attribute_backing
+
+    groups: dict[
+        tuple[type[Model], models.Field[Any, Any]],
+        tuple[dict[type[Model], set[Any]], set[Any], list[Model], set[str]],
+    ] = {}
+    for row in rows:
+        model = type(row)
+        watch = program.watched.get(model._meta.label_lower)
+        if watch is None:
+            continue
+        old_values = stored.get((model, row.pk), {})
+        for field in model._meta.concrete_fields:
+            if changed_names is not None and not {field.name, field.attname} & changed_names:
+                continue
+            if not {field.name, field.attname} & watch.fields:
+                continue
+            old = old_values.get(field.attname)
+            new = None if deleting else getattr(row, field.attname)
+            if old == new:
+                continue
+            concrete = model._meta.concrete_model
+            assert concrete is not None
+            owner_pks, fk_values, proposed_rows, resource_types = groups.setdefault(
+                (model, field), ({}, set(), [], set(watch.resource_types))
+            )
+            owner_pks.setdefault(concrete, set())
+            if row.pk is not None and not row._state.adding:
+                owner_pks[concrete].add(row.pk)
+            if isinstance(field, (models.ForeignKey, models.OneToOneField)):
+                fk_values.update(value for value in (old, new) if value is not None)
+            if not deleting:
+                proposed_rows.append(row)
+    candidates: dict[str, set[str]] = {}
+    for (model, field), (owner_pks, fk_values, proposed_rows, resource_types) in groups.items():
+        if fk_values and isinstance(field, (models.ForeignKey, models.OneToOneField)):
+            target_model = field.related_model._meta.concrete_model
+            assert target_model is not None
+            owner_pks.setdefault(target_model, set()).update(
+                field.related_model._base_manager.using(using)
+                .filter(**{f"{field.target_field.name}__in": fk_values})
+                .values_list("pk", flat=True)
+            )
+        for type_, ids in _affected_backing_ids(
+            program,
+            using=using,
+            owner_pks=owner_pks,
+            changed_field=field,
+            resource_types=resource_types,
+        ).items():
+            candidates.setdefault(type_, set()).update(ids)
+        for definition in program.baseline.definitions:
+            if definition.resource_type not in resource_types:
+                continue
+            for relation in definition.relations:
+                attribute = resolve_attribute_backing(definition, relation)
+                if (
+                    attribute is None
+                    or attribute.field is not field
+                    or attribute.target_model._meta.concrete_model is not model._meta.concrete_model
+                ):
+                    continue
+                for row in proposed_rows:
+                    value = getattr(row, field.attname)
+                    new_id = (
+                        attribute.container_id_of(value)
+                        if attribute.resource is None
+                        else attribute.resource
+                        if value == attribute.value
+                        else None
+                    )
+                    if new_id is not None:
+                        candidates.setdefault(definition.resource_type, set()).add(new_id)
+    return candidates
+
+
+def _collect_through_pair(row: Model, pairs: dict[type[Model], set[tuple[Any, Any]]]) -> None:
+    owner_model = row._meta.auto_created
+    if not isinstance(owner_model, type):
+        return
+    fields = [field for field in row._meta.fields if isinstance(field, models.ForeignKey)]
+    source_field = next(
+        (field for field in fields if field.remote_field.model is owner_model), None
+    )
+    if source_field is None:
+        return
+    target_field = next(field for field in fields if field is not source_field)
+    source_pk = getattr(row, source_field.attname)
+    target_pk = getattr(row, target_field.attname)
+    if source_pk is None or target_pk is None:
+        return
+    pairs.setdefault(type(row), set()).add((source_pk, target_pk))
+
+
+def _gate_direct_through_rows(pairs: dict[type[Model], set[tuple[Any, Any]]], using: str) -> None:
+    from .index.maintain import current_pass, get_program
+    from .resources import model_for_resource_type
+
+    outer = current_pass(using)
+    program = outer.load_program() if outer is not None else get_program(using)
+    for through, changed in pairs.items():
+        owner_model = through._meta.auto_created
+        if not isinstance(owner_model, type):
+            continue
+        fields = [field for field in through._meta.fields if isinstance(field, models.ForeignKey)]
+        source_field = next(
+            (field for field in fields if field.remote_field.model is owner_model), None
+        )
+        if source_field is None:
+            continue
+        target_field = next(field for field in fields if field is not source_field)
+        owner_type = model_resource_type(owner_model)
+        watched = program.watched.get(through._meta.label_lower)
+        types = {owner_type} if owner_type is not None else set()
+        if watched is not None:
+            types.update(watched.resource_types)
+        types = {type_ for type_ in types if (type_, "write") in program.nodes}
+        if not types:
+            continue
+        source_ids = {source_pk for source_pk, _ in changed}
+        target_ids = {target_pk for _, target_pk in changed}
+        sources = list(owner_model._base_manager.using(using).filter(pk__in=source_ids))
+        if not sources:
+            continue
+        actor, bypass = _edge_actor(sources[0], relation=True)
+        if bypass:
+            continue
+        target_model = target_field.remote_field.model
+        source_concrete = owner_model._meta.concrete_model
+        target_concrete = target_model._meta.concrete_model
+        assert source_concrete is not None and target_concrete is not None
+        owner_pks: dict[type[Model], set[Any]] = {source_concrete: {row.pk for row in sources}}
+        owner_pks.setdefault(target_concrete, set()).update(target_ids)
+        backing_ids = _affected_backing_ids(
+            program, using=using, owner_pks=owner_pks, through=through, resource_types=types
+        )
+        for resource_type in sorted(types):
+            ids = backing_ids.get(resource_type, set())
+            resource_model = model_for_resource_type(resource_type)
+            if resource_model is not None:
+                concrete = resource_model._meta.concrete_model
+                if concrete is source_concrete:
+                    ids.update(to_object_ref(row).resource_id for row in sources)
+                if concrete is target_concrete:
+                    ids.update(
+                        to_object_ref(row).resource_id
+                        for row in resource_model._base_manager.using(using).filter(
+                            pk__in=target_ids
+                        )
+                    )
+            if ids:
+                _check_edge_writes(actor, resource_type, ids, bulk=True)
+
+
 def _gate_backed_field_change(
-    sender: type[Model], instance: Any, using: str, update_fields: Iterable[str] | None
+    sender: type[Model],
+    instance: Any,
+    using: str,
+    update_fields: Iterable[str] | None,
+    *,
+    deleting: bool = False,
 ) -> None:
     """Check old and new owners when a watched backing column changes."""
-    candidates = _backed_field_change_candidates(sender, instance, using, update_fields)
+    candidates = _backed_field_change_candidates(
+        sender, instance, using, update_fields, deleting=deleting
+    )
+    if not candidates:
+        return
+    from .index.maintain import current_pass, get_program
+
+    outer = current_pass(using)
+    program = outer.load_program() if outer is not None else get_program(using)
+    candidates = {
+        type_: ids for type_, ids in candidates.items() if (type_, "write") in program.nodes
+    }
     if not candidates:
         return
     actor, bypass = _edge_actor(instance)
@@ -716,7 +1115,13 @@ def _gate_backed_field_change(
 
 
 def _backed_field_change_candidates(
-    sender: type[Model], instance: Any, using: str, update_fields: Iterable[str] | None
+    sender: type[Model],
+    instance: Any,
+    using: str,
+    update_fields: Iterable[str] | None,
+    *,
+    deleting: bool = False,
+    stored: dict[str, Any] | None = None,
 ) -> dict[str, set[str]]:
     from .index.maintain import current_pass, get_program
 
@@ -735,14 +1140,18 @@ def _backed_field_change_candidates(
         if not {field.name, field.attname} & watch.fields:
             continue
         old = (
-            sender._base_manager.using(using)
-            .filter(pk=instance.pk)
-            .values_list(field.attname, flat=True)
-            .first()
-            if not instance._state.adding
-            else None
+            stored.get(field.attname)
+            if stored is not None
+            else (
+                sender._base_manager.using(using)
+                .filter(pk=instance.pk)
+                .values_list(field.attname, flat=True)
+                .first()
+                if not instance._state.adding
+                else None
+            )
         )
-        new = getattr(instance, field.attname)
+        new = None if deleting else getattr(instance, field.attname)
         if old == new:
             continue
         sender_model = sender._meta.concrete_model
@@ -764,7 +1173,7 @@ def _backed_field_change_candidates(
             using=using,
             owner_pks=owner_pks,
             changed_field=field,
-            proposed=instance,
+            proposed=None if deleting else instance,
             resource_types=set(watch.resource_types),
         ).items():
             candidates.setdefault(type_, set()).update(ids)

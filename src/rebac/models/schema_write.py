@@ -13,6 +13,7 @@ from .generation import SchemaGeneration, schema_write_atomic
 
 if TYPE_CHECKING:
     from ..index.maintain import IndexMaintenance
+    from .overrides import SchemaOverride
 
 
 @contextmanager
@@ -90,6 +91,15 @@ def _old_program(maintenance: IndexMaintenance) -> None:
         maintenance.schema_initial = True
 
 
+def _validate_override_rows(using: str, rows: Iterable[SchemaOverride]) -> None:
+    """Reject invalid new arms while allowing old stale arms to be ignored on reads."""
+    from ..backends.local import LocalBackend
+    from ..composition import compose
+
+    baseline, _deadline = LocalBackend()._load_schema_from_db(using, overrides=())
+    compose(baseline, rows)
+
+
 class SchemaQuerySet[T: models.Model](models.QuerySet[T]):
     def update(self, **kwargs: Any) -> int:
         self._for_write = True
@@ -104,6 +114,10 @@ class SchemaQuerySet[T: models.Model](models.QuerySet[T]):
                 from .overrides import SchemaOverride
 
                 if issubclass(self.model, SchemaOverride):
+                    _validate_override_rows(
+                        self.db,
+                        self.model._base_manager.using(self.db).filter(pk__in=pks),
+                    )
                     from ..backends import reset_backend
 
                     reset_backend()
@@ -133,6 +147,10 @@ class SchemaQuerySet[T: models.Model](models.QuerySet[T]):
                 objs, batch_size, ignore_conflicts, update_conflicts, update_fields, unique_fields
             )
             if rows:
+                from .overrides import SchemaOverride
+
+                if issubclass(self.model, SchemaOverride):
+                    _validate_override_rows(self.db, cast("list[SchemaOverride]", rows))
                 for row in rows:
                     cast("SchemaRow", row)._write_effects(created=True)
                 SchemaGeneration.objects.advance(using=self.db)
@@ -210,6 +228,10 @@ class SchemaRow(models.Model):
             adding = self._state.adding
             super().save_base(raw, force_insert, force_update, alias, update_fields)
             if not raw:
+                from .overrides import SchemaOverride
+
+                if isinstance(self, SchemaOverride):
+                    _validate_override_rows(alias, [self])
                 self._write_effects(created=adding)
             SchemaGeneration.objects.advance(using=alias)
             _publish(maintenance, affected)

@@ -542,6 +542,9 @@ class LocalBackend(Backend):
         selected_overrides = [
             row for row in all_overrides if row.expires_at is None or row.expires_at > now
         ]
+        from ..composition import split_stale_overrides
+
+        selected_overrides, _stale = split_stale_overrides(baseline, selected_overrides)
         expires_at = min(
             (row.expires_at for row in selected_overrides if row.expires_at is not None),
             default=None,
@@ -672,7 +675,8 @@ class LocalBackend(Backend):
 
         from ..index.maintain import maintain_tuples
         from ..models import active_relationship_model
-        from ..models.relationship import engine_tuple_write
+        from ..models.relationship import RelationshipRegistry
+        from ..models.resource import RebacResource
 
         RelationshipModel = active_relationship_model()
 
@@ -682,28 +686,60 @@ class LocalBackend(Backend):
         with (
             transaction.atomic(using=using),
             maintain_tuples(written=rows, using=using, backend=self),
-            engine_tuple_write(),
         ):
             schema = self._write_schema(using)
             for tup in rows:
                 self._validate_relationship_tuple(tup, schema=schema)
+            ids: dict[tuple[str, str], int] = {}
+            if RelationshipModel is RelationshipRegistry:
+                ids = RebacResource.upsert_refs_bulk(
+                    sorted(
+                        {(tup.resource.resource_type, tup.resource.resource_id) for tup in rows}
+                        | {(tup.subject.subject_type, tup.subject.subject_id) for tup in rows}
+                    ),
+                    using=using,
+                )
+            manager = RelationshipModel._base_manager.db_manager(using)
             for tup in rows:
                 xid = self._next_xid()
-                if xid > max_xid:
-                    max_xid = xid
-                RelationshipModel.objects.db_manager(using).update_or_create(
-                    resource_type=tup.resource.resource_type,
-                    resource_id=tup.resource.resource_id,
-                    relation=tup.relation,
-                    subject_type=tup.subject.subject_type,
-                    subject_id=tup.subject.subject_id,
-                    optional_subject_relation=tup.subject.optional_relation,
-                    caveat_name=tup.caveat_name,
-                    defaults={
-                        "caveat_context": tup.caveat_context or None,
-                        "expires_at": tup.expires_at,
-                        "written_at_xid": xid,
-                    },
+                max_xid = max(max_xid, xid)
+                if RelationshipModel is RelationshipRegistry:
+                    key = {
+                        "resource_fk_id": ids[
+                            (tup.resource.resource_type, tup.resource.resource_id)
+                        ],
+                        "relation": tup.relation,
+                        "subject_fk_id": ids[(tup.subject.subject_type, tup.subject.subject_id)],
+                        "optional_subject_relation": tup.subject.optional_relation,
+                        "caveat_name": tup.caveat_name,
+                    }
+                else:
+                    key = {
+                        "resource_type": tup.resource.resource_type,
+                        "resource_id": tup.resource.resource_id,
+                        "relation": tup.relation,
+                        "subject_type": tup.subject.subject_type,
+                        "subject_id": tup.subject.subject_id,
+                        "optional_subject_relation": tup.subject.optional_relation,
+                        "caveat_name": tup.caveat_name,
+                    }
+                existing = manager.filter(**key).first()
+                row = existing if existing is not None else RelationshipModel(**key)
+                row.caveat_context = tup.caveat_context or None
+                row.expires_at = tup.expires_at
+                row.written_at_xid = xid
+                # The enclosing maintain_tuples owner captured the full batch.
+                # Call Model.save directly so consumer pre/post_save handlers run
+                # without opening a second tuple owner/savepoint per row.
+                models.Model.save(
+                    row,
+                    using=using,
+                    force_insert=existing is None,
+                    update_fields=(
+                        ["caveat_context", "expires_at", "written_at_xid"]
+                        if existing is not None
+                        else None
+                    ),
                 )
         # Zookie token == the maximum xid actually written in the batch,
         # so the token witnesses every row written by this batch. Newer
@@ -720,14 +756,12 @@ class LocalBackend(Backend):
 
         from ..index.maintain import maintain_tuples
         from ..models import active_relationship_model
-        from ..models.relationship import engine_tuple_write
 
         RelationshipModel = active_relationship_model()
         using = router.db_for_write(RelationshipModel)
         with (
             transaction.atomic(using=using),
             maintain_tuples(deleted_filter=filter_, using=using, backend=self),
-            engine_tuple_write(),
         ):
             schema = self._write_schema(using)
             backed = self._backed_relation_for_filter(
@@ -753,14 +787,12 @@ class LocalBackend(Backend):
 
         from ..index.maintain import maintain_tuples
         from ..models import active_relationship_model
-        from ..models.relationship import engine_tuple_write
 
         RelationshipModel = active_relationship_model()
         using = router.db_for_write(RelationshipModel)
         with (
             transaction.atomic(using=using),
             maintain_tuples(deleted=[tuple_], using=using, backend=self),
-            engine_tuple_write(),
         ):
             schema = self._write_schema(using)
             definition = schema.get_definition(tuple_.resource.resource_type)

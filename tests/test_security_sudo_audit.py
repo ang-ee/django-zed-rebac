@@ -62,6 +62,18 @@ def test_queryset_sudo_audits_only_when_used_once(post):
     assert _bypass_rows("audit.lazy").count() == 1
 
 
+def test_queryset_sudo_raw_is_audited(post):
+    rows = list(Post.objects.sudo(reason="audit.raw").raw(f"SELECT * FROM {Post._meta.db_table}"))
+    assert [row.pk for row in rows] == [post.pk]
+    assert _bypass_rows("audit.raw").count() == 1
+
+
+def test_scoped_under_block_sudo_does_not_audit_twice(post):
+    with sudo(reason="audit.scoped-block"):
+        assert list(Post.objects.scoped()) == [post]
+    assert _bypass_rows("audit.scoped-block").count() == 1
+
+
 def test_queryset_system_context_writes_bypass_row(post):
     assert list(Post.objects.system_context(reason="audit.queryset-system")) == [post]
 

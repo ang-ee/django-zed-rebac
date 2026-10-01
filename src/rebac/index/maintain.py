@@ -508,10 +508,11 @@ class IndexMaintenance:
             prefixes.add("")
         from rebac.field_backing import _relation_path
 
-        through_changed = False
+        through_sources: set[tuple[str, str]] = set()
+        through_fallback = False
 
         def visit(owner: type[models.Model], field: ModelField, prefix: str) -> None:
-            nonlocal through_changed
+            nonlocal through_fallback
             target = getattr(field, "related_model", None)
             if not field.is_relation or not isinstance(target, type):
                 return
@@ -522,7 +523,17 @@ class IndexMaintenance:
                 and issubclass(through, models.Model)
                 and through._meta.concrete_model is changed._meta.concrete_model
             ):
-                through_changed = True
+                source_keys = {
+                    fk.attname
+                    for fk in through._meta.fields
+                    if isinstance(fk, models.ForeignKey)
+                    and fk.remote_field.model._meta.concrete_model is owner._meta.concrete_model
+                }
+                if source_keys:
+                    owner_prefix = prefix.rpartition("__")[0]
+                    through_sources.update((owner_prefix, key) for key in source_keys)
+                else:
+                    through_fallback = True
             if (
                 issubclass(target, models.Model)
                 and target._meta.concrete_model is changed._meta.concrete_model
@@ -531,8 +542,13 @@ class IndexMaintenance:
 
         for path in sorted(paths):
             _relation_path(source, path, lookup=True, visit=visit)
-        if through_changed:
+        if through_fallback:
             yield source._base_manager.using(self.using).all()
+        for prefix, key in sorted(through_sources):
+            lookup = prefix + "__pk__in" if prefix else "pk__in"
+            # Only the changed through rows' source keys are needed here.
+            source_ids = set(rows.order_by().values_list(key, flat=True))
+            yield source._base_manager.using(self.using).filter(**{lookup: source_ids})
         for prefix in sorted(prefixes):
             lookup = prefix + "__pk__in" if prefix else "pk__in"
             yield source._base_manager.using(self.using).filter(
@@ -599,7 +615,7 @@ class IndexMaintenance:
             if self.work(phase=phase).count() == before:
                 break
 
-    def finish(self) -> None:
+    def finish(self, *, nested: bool = False) -> None:
         from rebac.index.derive import derive_memberships, derive_nodes
         from rebac.index.project import Stats, project_edges
         from rebac.models.index import IndexCover, IndexEdge, IndexMember, IndexTerm
@@ -608,6 +624,10 @@ class IndexMaintenance:
             stats = self.completed_stats
             deleted, inserted, python_rows = stats.deleted, stats.inserted, stats.python_rows
         elif self.schema_changed:
+            if nested:
+                # The enclosing schema owner has published a new policy, but
+                # its savepoint is still open; the outer finish rebuilds it.
+                return
             from rebac.index.rebuild import _rebuild_locked
 
             self.program = get_program(self.using, self.backend)
@@ -675,13 +695,14 @@ class IndexMaintenance:
         )
         if (self.schema_changed or self.completed_stats is not None) and not types:
             types.update(key[0] for key in self.load_program().nodes)
-        self.work().delete()
-        from rebac.index.rebuild import _vacuum_terms
+        if not nested:
+            self.work().delete()
+            from rebac.index.rebuild import _vacuum_terms
 
-        _vacuum_terms(
-            using=self.using,
-            defined=[d.resource_type for d in self.load_program().baseline.definitions],
-        )
+            _vacuum_terms(
+                using=self.using,
+                defined=[d.resource_type for d in self.load_program().baseline.definitions],
+            )
         logger.info(
             "Permission index maintained",
             extra={
@@ -758,7 +779,7 @@ def maintain_tuples(
             # A caller may check at the Zookie returned by this nested write
             # before its enclosing model owner exits. Derive now; the outer
             # owner can repeat the pass after its own final capture.
-            maintenance.finish()
+            maintenance.finish(nested=True)
 
 
 @contextmanager

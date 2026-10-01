@@ -200,6 +200,33 @@ def check_new(
     if permission is None and relation is None:
         return CheckResult.no(reason=f"unknown action: {resource_type}#{action}")
 
+    from .index.codec import identity_codec
+    from .resources import model_for_subject_type, model_resource_type
+
+    for name, candidates in rels.items():
+        declared = find_relation(definition, name)
+        if declared is None:
+            return CheckResult.no(reason=f"unknown proposed relation: {name}")
+        if declared is not None and isinstance(declared.backing, ConstBinding):
+            continue  # Schema-owned constants keep their declared wire spelling.
+        for candidate in candidates or ():
+            if not candidate.subject_id or not subject_allowed_by_relation(
+                declared, candidate, caveat_name=""
+            ):
+                return CheckResult.no(reason=f"invalid candidate for relation: {name}")
+            if candidate.subject_id == "*" and not candidate.optional_relation:
+                continue
+            mapped = model_for_subject_type(candidate.subject_type)
+            if mapped is None:
+                continue
+            model, attr = mapped
+            if model_resource_type(model):
+                from ._id import resource_id_attr
+
+                attr = resource_id_attr(model)
+            if not identity_codec(model, attr).is_canonical(candidate.subject_id):
+                return CheckResult.no(reason="non-canonical candidate subject identity")
+
     rels = _merge_const_backed_relationships(definition, rels)
     required_relations = relation_dependencies(schema, resource_type, action)
 
@@ -283,34 +310,6 @@ def _build_ctx(
     doesn't have to know about either.
     """
 
-    from .index.codec import identity_codec
-    from .resources import model_for_subject_type, model_resource_type
-
-    canonical: dict[str, tuple[SubjectRef, ...] | None] = {}
-    for name, candidates in relationships.items():
-        if candidates is None:
-            canonical[name] = None
-            continue
-        kept: list[SubjectRef] = []
-        for candidate in candidates:
-            if candidate.subject_id == "*" and not candidate.optional_relation:
-                # Wildcards are a schema-declared subject class, not a model ID.
-                kept.append(candidate)
-                continue
-            mapped = model_for_subject_type(candidate.subject_type)
-            if mapped is not None:
-                model, attr = mapped
-                # A REBAC model's object identity is also its subject identity.
-                if model_resource_type(model):
-                    from ._id import resource_id_attr
-
-                    attr = resource_id_attr(model)
-                if not identity_codec(model, attr).is_canonical(candidate.subject_id):
-                    continue
-            kept.append(candidate)
-        canonical[name] = tuple(kept)
-    relationships = canonical
-
     def resolve_relation(
         ctx: WalkContext,
         definition: Definition,
@@ -325,12 +324,7 @@ def _build_ctx(
         proposed = relationships.get(relation, ())
         if proposed is None:
             raise _UnknownRelation(relation)
-        candidates = [
-            candidate
-            for candidate in proposed
-            if candidate.subject_id
-            and subject_allowed_by_relation(relation_def, candidate, caveat_name="")
-        ]
+        candidates = list(proposed)
         return _virtual_membership(
             ctx=ctx,
             backend=backend,
@@ -353,12 +347,7 @@ def _build_ctx(
         proposed = relationships.get(via, ())
         if proposed is None:
             raise _UnknownRelation(via)
-        candidates = [
-            candidate
-            for candidate in proposed
-            if candidate.subject_id
-            and subject_allowed_by_relation(via_relation, candidate, caveat_name="")
-        ]
+        candidates = list(proposed)
         if not candidates:
             return False
         # Each arrow hop is a dispatch into another (real) resource, so

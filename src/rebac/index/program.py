@@ -740,7 +740,10 @@ def program_for(backend: LocalBackend, *, using: str, now: datetime | None = Non
         if not manual and not pinned and not transactional:
             baseline, _deadline = backend._load_schema_from_db(using, overrides=())
         assert baseline is not None
-        tagged = compose_tagged(baseline, overrides)
+        from ..composition import split_stale_overrides
+
+        valid_overrides, _stale = split_stale_overrides(baseline, overrides)
+        tagged = compose_tagged(baseline, valid_overrides)
         errors = program_errors(tagged.schema, tagged)
         if errors:
             raise SchemaError("; ".join(str(error) for error in errors))

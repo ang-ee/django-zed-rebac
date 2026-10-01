@@ -233,8 +233,8 @@ def _create_overlay(
             continue
         try:
             subject = SubjectRef.parse(str(value))
-        except ValueError:
-            continue
+        except ValueError as exc:
+            raise PermissionDenied(f"Invalid subject for create relation {relation}") from exc
         if not subject.subject_id:
             raise PermissionDenied(f"Empty subject ID for create relation {relation}")
         overlay[relation] = [subject]

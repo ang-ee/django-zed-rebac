@@ -14,12 +14,12 @@ says so. Each is pinned by a strict expected failure naming this proposal.
    (`tests/test_overrides.py`, narrowing case).
 2. **Autocommit writes on tracked third-party models lose their old state.**
    An autocommit `user.save()` that changes an attribute-backed `last_name`
-   while a consumer `pre_save` handler writes a tuple emits no D2 warning
-   (0.24.0 suppressed it for `auth.User` and `auth.Group`), and the user keeps
+   while a consumer `pre_save` handler writes a tuple now emits D2's warning,
+   but the user still keeps
    read on `test/bucket:a` after moving to `b`. The consumer's owner reaps the
    old-state work rows that the autocommit pass never registered
    (`maintain.py`, `defer_signal_pass`), and a concurrent process can do the
-   same (`tests/test_signals_owners.py`).
+   same (`tests/test_security_proposal_0012.py`).
 
 ## Rule
 
@@ -54,7 +54,7 @@ says so. Each is pinned by a strict expected failure naming this proposal.
 3. `index/maintain.py`: tag work rows with their pass id (they already carry
    `region`); the reap at owner exit deletes only rows of the exiting pass and
    its nested passes. Register autocommit passes in `defer_signal_pass`.
-   Restore the D2 warning for all tracked models.
+   Keep the restored D2 warning for all tracked models.
 
 ## Correctness
 

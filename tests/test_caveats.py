@@ -501,6 +501,79 @@ def test_cel_runtime_error_redacts_context_values():
         evaluate(caveat, {}, {"secret": "sensitive-token"})
     assert "secret" in str(captured.value)
     assert "sensitive-token" not in str(captured.value)
+    assert "sensitive-token" not in repr(captured.value.__cause__)
+    assert "sensitive-token" not in repr(captured.value.__context__)
+
+
+def test_cel_coercion_error_redacts_context_value():
+    from rebac.caveats import evaluate
+    from rebac.schema.ast import Caveat, CaveatParam
+
+    caveat = Caveat("limit", (CaveatParam("n", "int"),), "n > 1")
+    with pytest.raises(CaveatUnsupportedError) as captured:
+        evaluate(caveat, {}, {"n": "sensitive-token"})
+    assert "sensitive-token" not in str(captured.value)
+    assert "sensitive-token" not in repr(captured.value.__cause__)
+    assert "sensitive-token" not in repr(captured.value.__context__)
+
+
+@pytest.mark.parametrize(
+    "body, expected",
+    [
+        ("n > 100 || .admin", "leading-dot identifier"),
+        ("items.exists(z.w, z > 1)", "bare binder name"),
+        ("items.reduce(x, y, x + y)", "unsupported CEL macro"),
+    ],
+)
+def test_cel_validator_refuses_opaque_identifier_forms(body, expected):
+    from rebac.schema.parser import validate_schema
+
+    schema = parse_zed("caveat c(n int, items list<int>) { " + body + " }")
+    assert any(expected in error for error in validate_schema(schema))
+
+
+def test_undeclared_caller_context_does_not_enter_cel_activation():
+    from rebac.caveats import evaluate
+    from rebac.schema.ast import Caveat, CaveatParam
+
+    caveat = Caveat("guarded", (CaveatParam("n", "int"),), "n > 100 || admin")
+    with pytest.raises(CaveatUnsupportedError):
+        evaluate(caveat, {}, {"n": 1, "admin": True})
+
+
+def test_missing_optional_cel_dependency_is_checked_only_for_caveat_schemas(monkeypatch, tmp_path):
+    import importlib.util
+
+    from rebac.checks import check_caveat_dependency
+    from rebac.schema import validate_schema
+
+    path = tmp_path / "permissions.zed"
+    monkeypatch.setattr(importlib.util, "find_spec", lambda name: None)
+    monkeypatch.setattr("rebac.schema.resolve_schema_path", lambda config: path)
+    path.write_text("definition auth/user {}\n", encoding="utf-8")
+    assert validate_schema(parse_zed(path.read_text(encoding="utf-8"))) == []
+    assert check_caveat_dependency() == []
+    path.write_text("caveat c(n int) { n > 0 }\n", encoding="utf-8")
+    assert [issue.id for issue in check_caveat_dependency()] == ["rebac.E021"]
+
+
+@pytest.mark.parametrize(
+    "body",
+    [
+        "items.exists(x, x == 1)",
+        "items.all(item, item > 0)",
+        "n == 0x1F",
+        "d > 1e3",
+        "type(n) == int",
+        'name == r"abc"',
+        "items.map(v, v * 2).size() > 0",
+    ],
+)
+def test_cel_validator_accepts_valid_syntax_and_macro_variables(body):
+    from rebac.schema.parser import validate_schema
+
+    schema = parse_zed("caveat c(items list<int>, n int, d double, name string) { " + body + " }")
+    assert validate_schema(schema) == []
 
 
 def test_cel_runtime_error_surfaces_from_check_access(db):

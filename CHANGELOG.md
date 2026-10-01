@@ -28,9 +28,42 @@ pre-1.0; breaking changes within a minor version are explicitly called out.
 - MCP refuses non-canonical model IDs in `id_arg` and create relation overlays.
 - `rebac.E002` fires when the configured authzed client is missing.
 - Schemas using expiration have a changed deterministic content hash.
+- Backed-edge writes and tracked deletes require an actor and declaring-resource
+  `write` only when that resource type declares a permission literally named
+  `write`; other types, including resources with `edit` or `update`, rely on
+  the consumer's Django permissions pending proposal 0011. Reverse FK
+  `add(bulk=True)` and direct auto-created through writes now receive this gate.
+- Direct `Relationship.objects.bulk_create()`, including conflict updates,
+  participates in tuple ownership and index maintenance.
 
 ### Fixed
 
+- M2M owner writes retain their `write` gate when the through table backs no
+  relation; watched through captures now follow changed FK pairs and avoid
+  duplicate related-manager gates. Through-source capture resolves the owner
+  before the M2M hop, so direct bulk inserts retain edges when source and
+  target primary keys differ.
+- Relationship conflict upserts cannot move tuple identity through a primary
+  key conflict; metadata-only upserts retain index maintenance in both stores.
+- Create overlays reject malformed and disallowed subjects and unknown relation
+  names before permission evaluation, including MCP create arguments.
+- CEL validation rejects leading-dot identifiers, invalid macro binders and
+  `reduce`; undeclared caller keys never enter evaluation. Missing cel-python
+  reports `rebac.E021` only when a caveat schema is installed.
+- PostgreSQL `Cast(Case(...))` bulk updates pass the backed-field gate when
+  authorized; `RawSQL` writes on field-gated models are refused.
+- Escaped `scoped()` bypasses receive their own audit row, CEL exception
+  contexts redact caller values, and FK attname updates use the backed gate.
+- Tracked models with a callable field named `actor` use ambient scope; M2M
+  `set(objs=...)` passes its keyword argument through the checked wrapper.
+- D2 autocommit warnings again include tracked auth users and groups. The
+  autocommit drift itself remains with proposal 0012.
+- Slow four-hop test fixtures write their gated backing field under sudo.
+- Backend relationship batches use one tuple owner without per-row savepoints
+  while retaining model signals; backed-row bulk gates batch watched FK and
+  reverse-source lookups.
+- Field-read write-expression checks include concrete parent columns on
+  multi-table-inheritance resources.
 - Middleware grants the superuser request bypass only when the resolved actor
   is the active session superuser's own subject.
 - DRF denies unresolved identities on REBAC objects; unrelated objects retain
@@ -58,6 +91,26 @@ pre-1.0; breaking changes within a minor version are explicitly called out.
   action, including group and wildcard paths.
 - Nested relationship writes derive index effects before returning a Zookie;
   outer tokens cover nested xids and ambient tokens never regress.
+- Nested tuple derivation preserves the outer owner's old-state work and defers
+  vacuum and schema rebuild until that owner exits. Consumer Relationship
+  signal writes receive their own tuple ownership instead of inheriting an
+  ambient engine exemption.
+- Non-canonical model-backed create-overlay subjects refuse the whole preflight;
+  schema-owned constant targets retain their declared wire spelling.
+- OuterRef reads of destination fields in subqueries obey field-read gates.
+- Tracked deletes, reverse FK bulk adds and direct through writes check affected
+  backed resources; authorized literal `bulk_update` Case values proceed.
+- Backed-edge denial audit rows survive owner rollback and name the declaring
+  resource. M2M related managers preflight outside Django's internal atomic.
+- Unwatched M2M writes before the first sync do not load a program.
+- Restored evaluated querysets redo field redaction and prefetch after unpickling.
+- CEL schema validation uses cel-python's syntax tree, accepting macro variables,
+  hexadecimal and exponent literals, type constants and raw strings. Coercion
+  errors and chained causes redact caller context values.
+- Explicit queryset sudo on `raw()` emits one audit row; `scoped()` under an
+  ambient sudo block does not emit a second row.
+- Stale stored overrides that reference removed baseline names are ignored and
+  reported by `rebac.W010` instead of breaking permission reads.
 - Queryset pickling no longer executes the query before dropping its results.
 - DRF denies declared non-model REBAC objects with missing or empty IDs.
 - Django async permission checks reach `RebacBackend` through `ahas_perm` and

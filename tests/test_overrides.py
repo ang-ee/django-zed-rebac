@@ -240,6 +240,54 @@ def _make_ovr(target: SchemaPermission, kind: str, expression: str) -> SchemaOve
     )
 
 
+@pytest.mark.django_db(transaction=True)
+def test_removed_baseline_relation_makes_stored_override_warning_not_read_failure():
+    from django.core import checks
+    from django.db import models
+
+    from rebac.checks import check_stale_override_references
+
+    target = _seed_db_schema("blog/post", "read", "owner")
+    _make_ovr(target, SchemaOverride.KIND_EXTEND, "viewer")
+    viewer = SchemaRelation.objects.get(definition=target.definition, name="viewer")
+    # Simulate a baseline revision installed by a separate package version.
+    models.QuerySet.delete(SchemaRelation.objects.filter(pk=viewer.pk))
+    local = LocalBackend()
+    assert local.schema().get_permission("blog/post", "read") is not None
+    warnings = check_stale_override_references()
+    assert any(issue.id == "rebac.W010" for issue in warnings)
+    assert all(isinstance(issue, checks.Warning) for issue in warnings)
+
+
+@pytest.mark.django_db(transaction=True)
+@pytest.mark.xfail(
+    strict=True, reason="proposal 0012: a stale narrowing override is dropped and widens read"
+)
+@pytest.mark.parametrize("kind", [SchemaOverride.KIND_DISABLE, SchemaOverride.KIND_TIGHTEN])
+def test_stale_narrowing_override_must_not_restore_excluded_reader(kind):
+    from django.db import models
+
+    from rebac.checks import check_stale_override_references
+
+    baseline = "is_active + viewer" if kind == SchemaOverride.KIND_DISABLE else "viewer"
+    target = _seed_db_schema("blog/post", "read", baseline)
+    _make_ovr(target, kind, "auditor + is_active")
+    local = LocalBackend()
+    user = SubjectRef.of("auth/user", "excluded")
+    post = ObjectRef("blog/post", "stale")
+    relation = "is_active" if kind == SchemaOverride.KIND_DISABLE else "viewer"
+    local.write_relationships([RelationshipTuple(post, relation, user)])
+    assert not local.has_access(subject=user, action="read", resource=post)
+    assert local.schema().get_permission(
+        "blog/post", "read"
+    ).expression != parse_permission_expression(baseline)
+    auditor = SchemaRelation.objects.get(definition=target.definition, name="auditor")
+    models.QuerySet.delete(SchemaRelation.objects.filter(pk=auditor.pk))
+    assert any(issue.id == "rebac.W010" for issue in check_stale_override_references())
+    effective = LocalBackend().schema().get_permission("blog/post", "read")
+    assert effective.expression != parse_permission_expression(baseline)
+
+
 # ---------------------------------------------------------------------------
 # Identity test — load-bearing.
 # ---------------------------------------------------------------------------

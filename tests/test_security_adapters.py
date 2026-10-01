@@ -277,6 +277,66 @@ def test_noncanonical_create_overlay_cannot_escape_concrete_ban(spelling):
     assert calls == []
 
 
+@pytest.mark.parametrize(
+    "spelling", ["{}", "0{}", "{pk}", "blog/folder:{pk}", "blog/post:{pk}#lock"]
+)
+def test_create_overlay_exclusion_keeps_canonical_parent(spelling):
+    from tests.testapp.models import Post
+
+    install_schema(
+        backend(),
+        parse_zed("""
+        definition auth/user {}
+        definition blog/post {
+            relation parent: blog/post
+            relation author: auth/user
+            relation locked: auth/user:*
+            permission lock = locked
+            permission read = author
+            permission write = author
+            permission create = author - parent->lock
+        }
+        """),
+    )
+    with sudo(reason="fixture"):
+        parent = Post.objects.create(title="locked parent")
+    _grant(ObjectRef("blog/post", str(parent.pk)), "locked", SubjectRef.of("auth/user", "*"))
+    wire = (
+        f"blog/post:{spelling.format(parent.pk, pk=parent.pk)}"
+        if spelling in {"{}", "0{}"}
+        else spelling.format(parent.pk, pk=parent.pk)
+    )
+    if ":" in wire:
+        result = check_new(
+            subject=ALICE,
+            action="create",
+            resource_type="blog/post",
+            relationships={"author": [ALICE], "parent": [SubjectRef.parse(wire)]},
+        )
+        assert result.result is PermissionResult.NO_PERMISSION
+
+    calls: list[str] = []
+
+    @rebac_mcp_tool(
+        resource_type="blog/post",
+        action="create",
+        create_relations={"author": "author_ref", "parent": "parent_ref"},
+    )
+    def create_post(author_ref: str, parent_ref: str, ctx: object = None) -> str:
+        calls.append(parent_ref)
+        return "ok"
+
+    with pytest.raises(PermissionDenied):
+        create_post("auth/user:alice", wire, ctx=_ctx("auth/user:alice"))
+    assert calls == []
+    assert not check_new(
+        subject=ALICE,
+        action="create",
+        resource_type="blog/post",
+        relationships={"author": [ALICE], "unknown": [ALICE]},
+    ).allowed
+
+
 # ---------- backend.check_access identity ----------
 
 

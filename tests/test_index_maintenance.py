@@ -457,7 +457,6 @@ def test_verify_detects_complete_payload_drift_and_never_commits(indexed, payloa
     [
         "plain_update",
         "raw_save",
-        "through_bulk_create",
     ],
 )
 @pytest.mark.parametrize("indexed", STORAGE_TIERS, indirect=True)
@@ -468,12 +467,6 @@ def test_unsupported_paths_drift_and_rebuild_repairs(indexed, unsupported):
     if unsupported == "raw_save":
         post.folder = None
         post.save_base(raw=True)
-    elif unsupported == "through_bulk_create":
-        post.folder = None
-        post.save(update_fields=["folder"])
-        Post.collections.through.objects.bulk_create(
-            [Post.collections.through(post_id=post.pk, folder_id=folder.pk)]
-        )
     else:
         queue = BackingQueue.objects.create()
         stage = BackingStage.objects.create(hidden=False)

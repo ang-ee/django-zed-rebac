@@ -17,7 +17,7 @@ from typing import Any, Self, TypeVar, cast
 
 from asgiref.sync import sync_to_async
 from django.db import models
-from django.db.models.expressions import Col
+from django.db.models.expressions import Col, RawSQL
 from django.db.models.sql import Query
 from django.db.models.sql.where import NothingNode, WhereNode
 
@@ -101,10 +101,35 @@ def _expression_columns(expression: Any) -> Iterable[Col]:
     if isinstance(expression, Col):
         yield expression
         return
+    if isinstance(expression, Query):
+        for part in (
+            expression.where,
+            *expression.annotations.values(),
+            *expression.order_by,
+            *expression.select,
+            *expression.combined_queries,
+        ):
+            yield from _expression_columns(part)
+        return
     sources = getattr(expression, "get_source_expressions", None)
     if callable(sources):
         for source in cast(Iterable[Any], sources()):
             yield from _expression_columns(source)
+
+
+def _column_on_model_lineage(column: Col, model: type[models.Model]) -> bool:
+    """A parent-table column still belongs to an MTI child's gated fields."""
+    return any(column.target is field for field in model._meta.concrete_fields)
+
+
+def _has_opaque_write_expression(expression: Any) -> bool:
+    """Raw SQL can read columns invisible to ORM expression inspection."""
+    if isinstance(expression, RawSQL):
+        return True
+    sources = getattr(expression, "get_source_expressions", None)
+    return callable(sources) and any(
+        _has_opaque_write_expression(source) for source in cast(Iterable[Any], sources())
+    )
 
 
 def _has_gated_subquery(expression: Any) -> bool:
@@ -175,6 +200,7 @@ class RebacQuerySet(models.QuerySet[_M]):
         self._rebac_sudo_reason = None
         self._rebac_sudo_audited = False
         self._rebac_internal_bypass = False
+        self._rebac_ambient_bypass = False
         self._rebac_field_deny = None
         self._rebac_select_related_guards = ()
         self._rebac_eager_scope = False
@@ -192,8 +218,11 @@ class RebacQuerySet(models.QuerySet[_M]):
         state["_rebac_sudo_reason"] = None
         state["_rebac_sudo_audited"] = False
         state["_rebac_internal_bypass"] = False
+        state["_rebac_ambient_bypass"] = False
         state["_rebac_scope_applied"] = False
         state["_rebac_eager_scope"] = False
+        state["_rebac_visibility_applied"] = False
+        state["_prefetch_done"] = False
         state["_result_cache"] = None
         query = state.get("_query")
         if isinstance(query, _RebacQuery):
@@ -209,7 +238,7 @@ class RebacQuerySet(models.QuerySet[_M]):
     def raw(
         self, raw_query: Any, params: Any = (), translations: Any = None, using: Any = None
     ) -> Any:
-        _, bypass = self.effective_actor(strict=True)
+        _, bypass = self._resolve_effective_actor()
         if not bypass:
             raise PermissionDenied("raw() cannot be actor-scoped; use sudo or system_context")
         raw_method = super().raw
@@ -259,6 +288,7 @@ class RebacQuerySet(models.QuerySet[_M]):
         clone._rebac_sudo_reason = None
         clone._rebac_sudo_audited = False
         clone._rebac_internal_bypass = False
+        clone._rebac_ambient_bypass = False
         clone._refresh_scope()
         return clone
 
@@ -311,6 +341,8 @@ class RebacQuerySet(models.QuerySet[_M]):
             clone._rebac_actor = actor
         elif bypass and _is_sudo_ambient() and not clone.is_sudo():
             clone._rebac_sudo_reason = current_sudo_reason()
+            clone._rebac_internal_bypass = True
+            clone._rebac_ambient_bypass = True
         clone._rebac_eager_scope = True
         clone._apply_scope_in_place()
         return clone
@@ -365,6 +397,7 @@ class RebacQuerySet(models.QuerySet[_M]):
         clone._rebac_sudo_reason = reason
         clone._rebac_sudo_audited = False
         clone._rebac_internal_bypass = internal
+        clone._rebac_ambient_bypass = False
         clone._refresh_scope()
         return clone
 
@@ -372,7 +405,8 @@ class RebacQuerySet(models.QuerySet[_M]):
         if (
             self._rebac_sudo_reason is None
             or self._rebac_sudo_audited
-            or self._rebac_internal_bypass
+            or (self._rebac_internal_bypass and not self._rebac_ambient_bypass)
+            or (self._rebac_ambient_bypass and _is_sudo_ambient())
         ):
             return
         from .audit import emit
@@ -592,6 +626,7 @@ class RebacQuerySet(models.QuerySet[_M]):
         clone._rebac_sudo_reason = self._rebac_sudo_reason
         clone._rebac_sudo_audited = self._rebac_sudo_audited
         clone._rebac_internal_bypass = self._rebac_internal_bypass
+        clone._rebac_ambient_bypass = self._rebac_ambient_bypass
         clone._rebac_field_deny = self._rebac_field_deny
         clone._rebac_select_related_guards = self._rebac_select_related_guards
         clone._rebac_eager_scope = self._rebac_eager_scope
@@ -668,7 +703,7 @@ class RebacQuerySet(models.QuerySet[_M]):
             requested.update(
                 column.target.name
                 for column in _expression_columns(expression)
-                if column.alias == query.base_table and column.target.name in gated
+                if _column_on_model_lineage(column, self.model) and column.target.name in gated
             )
         if requested:
             names = ", ".join(f"read__{name}" for name in sorted(requested))
@@ -910,10 +945,11 @@ class RebacQuerySet(models.QuerySet[_M]):
         unique_fields: Collection[str] | None = None,
     ) -> list[_M]:
         from .index.maintain import model_write
+        from .signals import audit_backed_denials
 
         self._for_write = True
         candidates = list(objs)
-        with model_write(model=self.model, using=self.db) as maintenance:
+        with audit_backed_denials(), model_write(model=self.model, using=self.db) as maintenance:
             if maintenance is not None:
                 if ignore_conflicts or update_conflicts:
                     maintenance.capture_old(queryset=self.model._base_manager.using(self.db).all())
@@ -999,10 +1035,13 @@ class RebacQuerySet(models.QuerySet[_M]):
 
     def update(self, **kwargs: Any) -> int:
         from .index.maintain import model_write
-        from .signals import _gate_backed_rows
+        from .signals import _gate_backed_rows, audit_backed_denials
 
         self._for_write = True
-        with model_write(model=self.model, using=self.db, names=kwargs) as maintenance:
+        with (
+            audit_backed_denials(),
+            model_write(model=self.model, using=self.db, names=kwargs) as maintenance,
+        ):
             frozen = None
             if maintenance is not None:
                 frozen = maintenance.snapshot_queryset(
@@ -1026,12 +1065,16 @@ class RebacQuerySet(models.QuerySet[_M]):
         self, objs: Iterable[_M], fields: Iterable[str], batch_size: int | None = None
     ) -> int:
         from .index.maintain import model_write
+        from .signals import audit_backed_denials
 
         self._for_write = True
         # Django dispatches batches through update(); this outer owner merely
         # keeps all batches in one pass and never captures or derives twice.
         field_names = tuple(fields)
-        with model_write(model=self.model, using=self.db, names=field_names):
+        with (
+            audit_backed_denials(),
+            model_write(model=self.model, using=self.db, names=field_names),
+        ):
             return super().bulk_update(objs, field_names, batch_size=batch_size)
 
     def _rebac_update(self, **kwargs: Any) -> int:
@@ -1149,9 +1192,13 @@ class RebacQuerySet(models.QuerySet[_M]):
                 )
 
     def _guard_bulk_expression_reads(self, actor: SubjectRef, kwargs: dict[str, Any]) -> None:
+        gated = gated_read_fields(self.model)
+        if gated and any(_has_opaque_write_expression(value) for value in kwargs.values()):
+            raise PermissionDenied(
+                "Write expression has opaque SQL over a model with gated fields."
+            )
         if runtime_field_deny_mode(self._effective_field_mode()) == "allow":
             return
-        gated = gated_read_fields(self.model)
         from .backends import backend
 
         query = self.query.clone()
@@ -1166,7 +1213,7 @@ class RebacQuerySet(models.QuerySet[_M]):
             required.update(
                 column.target.name
                 for column in _expression_columns(resolved)
-                if column.alias == query.base_table and column.target.name in gated
+                if _column_on_model_lineage(column, self.model) and column.target.name in gated
             )
         if not required:
             return
@@ -1265,21 +1312,40 @@ class TrackedQuerySet[T: models.Model](models.QuerySet[T]):
         from .actors import is_sudo
         from .index.maintain import model_write
         from .mixins import RebacMixin
-        from .signals import _gate_backed_rows
+        from .signals import _edge_actor, _gate_backed_rows, audit_backed_denials
 
         self._for_write = True
-        with model_write(model=self.model, using=self.db, names=kwargs) as maintenance:
+        with (
+            audit_backed_denials(),
+            model_write(model=self.model, using=self.db, names=kwargs) as maintenance,
+        ):
             frozen = maintenance.snapshot_queryset(self) if maintenance is not None else None
             if maintenance is not None:
                 maintenance.capture_old(queryset=frozen)
                 assert frozen is not None
-                if not issubclass(self.model, RebacMixin):
+                related_owner = cast(Any, self)._hints.get("instance")
+                related_fk_write = any(
+                    isinstance(field, (models.ForeignKey, models.OneToOneField))
+                    and {field.name, field.attname} & kwargs.keys()
+                    for field in self.model._meta.concrete_fields
+                )
+                if (
+                    not issubclass(self.model, RebacMixin)
+                    or related_owner is not None
+                    or related_fk_write
+                ):
+                    actor, bypass = (
+                        _edge_actor(related_owner, relation=True)
+                        if related_owner is not None
+                        else (None, is_sudo())
+                    )
                     _gate_backed_rows(
                         frozen,
                         using=self.db,
                         names=kwargs,
                         proposed=kwargs,
-                        bypass=is_sudo(),
+                        actor=actor,
+                        bypass=bypass,
                     )
             count = super().update(**kwargs)
             if maintenance is not None and frozen is not None:
@@ -1295,6 +1361,7 @@ class TrackedQuerySet[T: models.Model](models.QuerySet[T]):
         from .conf import app_settings
         from .index.maintain import model_write
         from .mixins import deletion_owner
+        from .signals import _gate_backed_rows, audit_backed_denials
 
         self._for_write = True
         actor = current_actor()
@@ -1307,9 +1374,12 @@ class TrackedQuerySet[T: models.Model](models.QuerySet[T]):
             or is_sudo()
             or (actor is None and not app_settings.REBAC_STRICT_MODE)
         )
-        with model_write(model=self.model, using=self.db) as maintenance:
+        with audit_backed_denials(), model_write(model=self.model, using=self.db) as maintenance:
             if maintenance is not None:
-                maintenance.capture_old(queryset=self)
+                frozen = maintenance.snapshot_queryset(self)
+                if not issubclass(self.model, RebacMixin):
+                    _gate_backed_rows(frozen, using=self.db, bypass=is_sudo(), deleting=True)
+                maintenance.capture_old(queryset=frozen)
             with deletion_owner(self, self.db, actor, unscoped):
                 return super().delete()
 
@@ -1325,11 +1395,11 @@ class TrackedQuerySet[T: models.Model](models.QuerySet[T]):
         from .actors import is_sudo
         from .index.maintain import model_write
         from .mixins import RebacMixin
-        from .signals import _gate_backed_rows
+        from .signals import _gate_backed_rows, audit_backed_denials
 
         self._for_write = True
         candidates = list(objs)
-        with model_write(model=self.model, using=self.db) as maintenance:
+        with audit_backed_denials(), model_write(model=self.model, using=self.db) as maintenance:
             if not issubclass(self.model, RebacMixin):
                 if update_conflicts and update_fields and not is_sudo() and maintenance:
                     watch = maintenance.load_program().watched.get(self.model._meta.label_lower)
@@ -1343,9 +1413,31 @@ class TrackedQuerySet[T: models.Model](models.QuerySet[T]):
                         )
                 _gate_backed_rows(candidates, using=self.db, bypass=is_sudo())
             all_rows = self.model._base_manager.using(self.db).all()
+            capture_rows = all_rows
+            if self.model._meta.auto_created and candidates:
+                foreign_keys = [
+                    field
+                    for field in self.model._meta.concrete_fields
+                    if isinstance(field, models.ForeignKey)
+                ]
+                if len(foreign_keys) == 2:
+                    pairs = {
+                        tuple(getattr(row, field.attname) for field in foreign_keys)
+                        for row in candidates
+                    }
+                    if all(all(value is not None for value in pair) for pair in pairs):
+                        predicate = models.Q(pk__in=[])
+                        for pair in sorted(pairs):
+                            predicate |= models.Q(
+                                **dict(
+                                    (field.attname, value)
+                                    for field, value in zip(foreign_keys, pair, strict=True)
+                                )
+                            )
+                        capture_rows = all_rows.filter(predicate)
             if maintenance is not None:
                 if ignore_conflicts or update_conflicts:
-                    maintenance.capture_old(queryset=all_rows)
+                    maintenance.capture_old(queryset=capture_rows)
                 else:
                     maintenance.capture_old(
                         model=self.model, pks=[row.pk for row in candidates if row.pk is not None]
@@ -1361,7 +1453,7 @@ class TrackedQuerySet[T: models.Model](models.QuerySet[T]):
             if maintenance is not None:
                 if ignore_conflicts or update_conflicts or any(row.pk is None for row in rows):
                     maintenance._capture(
-                        model=self.model, pks=(), tuples=(), queryset=all_rows, phase="new"
+                        model=self.model, pks=(), tuples=(), queryset=capture_rows, phase="new"
                     )
                 else:
                     maintenance.changed(model=self.model, pks=[row.pk for row in rows])
@@ -1371,10 +1463,14 @@ class TrackedQuerySet[T: models.Model](models.QuerySet[T]):
         self, objs: Iterable[T], fields: Iterable[str], batch_size: int | None = None
     ) -> int:
         from .index.maintain import model_write
+        from .signals import audit_backed_denials
 
         self._for_write = True
         field_names = tuple(fields)
-        with model_write(model=self.model, using=self.db, names=field_names):
+        with (
+            audit_backed_denials(),
+            model_write(model=self.model, using=self.db, names=field_names),
+        ):
             return super().bulk_update(objs, field_names, batch_size=batch_size)
 
 

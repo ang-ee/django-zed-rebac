@@ -5,12 +5,14 @@ from __future__ import annotations
 import pickle
 
 import pytest
+from django.test import override_settings
 
 from rebac import (
     MissingActorError,
     ObjectRef,
     RelationshipTuple,
     SubjectRef,
+    actor_context,
     backend,
     sudo,
     write_relationships,
@@ -105,3 +107,28 @@ def test_pickled_query_attribute_does_not_carry_bypass(posts):
 def test_pickle_does_not_evaluate_queryset(posts, django_assert_num_queries):
     with django_assert_num_queries(0):
         pickle.dumps(Post.objects.all())
+
+
+@override_settings(REBAC_FIELD_READ_MODE="redact")
+def test_evaluated_queryset_is_redacted_after_unpickling():
+    install_schema(
+        backend(),
+        parse_zed("""
+        definition auth/user {}
+        definition blog/post {
+            relation owner: auth/user
+            relation editor: auth/user
+            permission read = owner + editor
+            permission read__body = owner
+        }
+        """),
+    )
+    editor = SubjectRef.of("auth/user", "editor")
+    with sudo(reason="fixture"):
+        post = Post.objects.create(title="public", body="secret body")
+    write_relationships([RelationshipTuple(ObjectRef("blog/post", str(post.pk)), "editor", editor)])
+    rows = Post.objects.with_actor(editor)
+    assert next(iter(rows)).body in (None, "")
+    restored = pickle.loads(pickle.dumps(rows))
+    with actor_context(editor):
+        assert next(iter(restored)).body in (None, "")

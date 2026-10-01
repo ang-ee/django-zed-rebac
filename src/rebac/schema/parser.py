@@ -562,6 +562,85 @@ def parse_permission_expression(text: str) -> PermExpr:
     return _Parser(text).parse_permission_expression()
 
 
+def _caveat_identifier_errors(caveat_name: str, expression: str, declared: set[str]) -> list[str]:
+    """Find free CEL identifiers in cel-python's syntax tree."""
+    from typing import Any
+
+    from ..caveats import _load_celpy
+    from ..errors import CaveatUnsupportedError
+
+    try:
+        tree = _load_celpy().Environment().compile(expression)
+    except CaveatUnsupportedError as exc:
+        return [f"caveat {caveat_name}: {exc}"]
+    except Exception as exc:
+        return [f"caveat {caveat_name}: invalid CEL expression: {exc}"]
+
+    builtins = {
+        "bool",
+        "bytes",
+        "double",
+        "duration",
+        "dyn",
+        "int",
+        "list",
+        "map",
+        "null_type",
+        "string",
+        "timestamp",
+        "type",
+        "uint",
+    }
+    free: set[str] = set()
+    invalid: set[str] = set()
+
+    def bare_binding(node: Any) -> str | None:
+        if getattr(node, "data", None) == "ident":
+            return str(node.children[0])
+        children = list(getattr(node, "children", ()))
+        if len(children) == 1 and hasattr(children[0], "data"):
+            return bare_binding(children[0])
+        return None
+
+    def visit(node: Any, bound: frozenset[str]) -> None:
+        kind = getattr(node, "data", None)
+        if kind == "ident":
+            name = str(node.children[0])
+            if name not in declared | builtins | bound:
+                free.add(name)
+            return
+        if kind == "dot_ident":
+            invalid.add("leading-dot identifier")
+            return
+        if kind == "member_dot_arg" and len(node.children) >= 3:
+            receiver, method, arguments = node.children[:3]
+            visit(receiver, bound)
+            args = list(getattr(arguments, "children", ()))
+            if str(method) == "reduce":
+                invalid.add("unsupported CEL macro 'reduce'")
+            elif str(method) in {"exists", "exists_one", "all", "map", "filter"}:
+                binder_name = bare_binding(args[0]) if args else None
+                if binder_name is None:
+                    invalid.add(f"{method} macro requires a bare binder name")
+                for arg in args[1:]:
+                    visit(arg, bound | ({binder_name} if binder_name is not None else set()))
+            else:
+                visit(arguments, bound)
+            return
+        if kind == "ident_arg":
+            for child in node.children[1:]:
+                visit(child, bound)
+            return
+        for child in getattr(node, "children", ()):
+            visit(child, bound)
+
+    visit(tree, frozenset())
+    return [
+        *(f"caveat {caveat_name}: {issue}" for issue in sorted(invalid)),
+        *(f"caveat {caveat_name}: undeclared identifier {name!r}" for name in sorted(free)),
+    ]
+
+
 def validate_schema(schema: Schema) -> list[str]:
     """Cross-check references inside the schema. Returns a list of error strings.
 
@@ -571,23 +650,7 @@ def validate_schema(schema: Schema) -> list[str]:
     caveat_names = {c.name for c in schema.caveats}
     for caveat in schema.caveats:
         declared = {param.name for param in caveat.params}
-        # CEL bodies are stored opaquely by the schema parser. Check free
-        # identifier roots without treating string contents, member names, or
-        # function names as caveat parameters.
-        body = re.sub(r"""(?:\bb)?(?:"(?:\\.|[^"\\])*"|'(?:\\.|[^'\\])*')""", "", caveat.expression)
-        for match in re.finditer(r"[A-Za-z_][A-Za-z0-9_]*", body):
-            name = match.group()
-            prefix = body[: match.start()].rstrip()
-            suffix = body[match.end() :].lstrip()
-            if (
-                name in {"true", "false", "null", "in"}
-                or prefix.endswith(".")
-                or suffix.startswith("(")
-                or (name == "u" and prefix and prefix[-1].isdigit())
-            ):
-                continue
-            if name not in declared:
-                errors.append(f"caveat {caveat.name}: undeclared identifier {name!r}")
+        errors.extend(_caveat_identifier_errors(caveat.name, caveat.expression, declared))
 
     for definition in schema.definitions:
         if definition.resource_type in BUILTIN_ACTOR_TYPES:

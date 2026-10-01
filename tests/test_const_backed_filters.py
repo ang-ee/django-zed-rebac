@@ -464,7 +464,7 @@ def test_candidate_column_collation_matches_stored_checks_and_exclusion(
             lambda name: CollatedRow if name == "test/collatedrow" else original_resolver(name),
         )
         directive = (
-            'const={"target_id":"1","filters":{"audience":"PUBLIC"}}'
+            'const={"target_id":"public","filters":{"audience":"PUBLIC"}}'
             if backing_kind == "const"
             else 'field={"path":"target","filters":{"audience":"PUBLIC"}}'
         )

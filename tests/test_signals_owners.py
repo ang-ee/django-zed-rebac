@@ -7,11 +7,13 @@ import pytest
 from django.contrib.auth import get_user_model
 from django.contrib.auth.models import Group
 from django.contrib.contenttypes.models import ContentType
+from django.core.management import call_command
 from django.db import connection, models, transaction
 from django.db.models.signals import m2m_changed, post_delete, post_save, pre_delete, pre_save
 from django.test.utils import CaptureQueriesContext, isolate_apps
 
 from rebac import (
+    MissingActorError,
     PermissionDenied,
     RebacTrackedMixin,
     backend,
@@ -33,7 +35,7 @@ from rebac.models import (
 from rebac.models.generation import SchemaGeneration
 from rebac.schema import parse_zed
 from tests import test_index_maintenance as maintenance_cases
-from tests.backend_setup import STORAGE_TIERS
+from tests.backend_setup import STORAGE_TIERS, install_schema
 from tests.index_harness import assert_no_drift
 from tests.test_index_maintenance import ALICE, grant_folder
 from tests.testapp.models import (
@@ -195,12 +197,12 @@ def test_delete_owner_batches_identity_cleanup_once(indexed):
     "operation", ["update", "bulk_create", "bulk_update", "reverse_add", "set_null", "delete"]
 )
 @pytest.mark.parametrize("indexed", STORAGE_TIERS, indirect=True)
-def test_owning_base_manager_maintains_without_actor_scope(indexed, operation):
+def test_owning_base_manager_maintains_or_gates_without_actor_scope(indexed, operation):
     folder = Folder.objects.create(name="folder")
     post = Post.objects.create(title="post", folder=folder)
     grant_folder(folder)
     if operation == "update":
-        with no_ambient_scope():
+        with no_ambient_scope(), pytest.raises(MissingActorError):
             Post._base_manager.filter(pk=post.pk).update(folder=None)
     elif operation == "bulk_create":
         with no_ambient_scope():
@@ -210,23 +212,24 @@ def test_owning_base_manager_maintains_without_actor_scope(indexed, operation):
         ).allowed
     elif operation == "bulk_update":
         post.folder = None
-        with no_ambient_scope():
+        with no_ambient_scope(), pytest.raises(MissingActorError):
             Post._base_manager.bulk_update([post], ["folder"])
     elif operation == "reverse_add":
         post.folder = None
         post.save(update_fields=["folder"])
         with no_ambient_scope():
-            folder.posts.add(post, bulk=True)
+            with pytest.raises(MissingActorError):
+                folder.posts.add(post, bulk=True)
         post.refresh_from_db()
-        assert post.folder_id == folder.pk
+        assert post.folder_id is None
     elif operation == "delete":
         with no_ambient_scope():
             Post._base_manager.filter(pk=post.pk).delete()
     else:
-        with no_ambient_scope():
+        with no_ambient_scope(), pytest.raises(MissingActorError):
             folder.sudo(reason="collector SET_NULL").delete()
         post.refresh_from_db()
-        assert post.folder_id is None
+        assert post.folder_id == folder.pk
     assert_no_drift()
     assert Post._meta.base_manager_name == "_rebac_base"
     assert Post._default_manager is Post.objects
@@ -349,6 +352,42 @@ def test_fresh_worker_user_revoke_loads_current_program(settings, explicit):
         .check_access(subject=to_subject_ref(user), action="read", resource=resource)
         .allowed
     )
+
+
+@pytest.mark.django_db(transaction=True)
+def test_createsuperuser_maintains_subject_attribute_without_actor():
+    install_schema(
+        backend(),
+        parse_zed("""
+        definition auth/user {}
+        definition test/role {
+            relation member: auth/user // rebac:attribute={"field":"is_staff","resource":"admin","value":true}
+            permission access = member
+        }
+        """),
+    )
+    with no_ambient_scope(), pytest.warns(RuntimeWarning, match="D2"):
+        call_command(
+            "createsuperuser",
+            interactive=False,
+            username="root",
+            email="root@example.com",
+            verbosity=0,
+        )
+    assert get_user_model().objects.get(username="root").is_superuser
+    assert_no_drift()
+
+
+@pytest.mark.django_db
+def test_unwatched_groups_add_before_first_sync_needs_no_program():
+    SchemaGeneration.objects.all().delete()
+    reset_backend()
+    with transaction.atomic():
+        user = get_user_model().objects.create_user(username="group before sync")
+        group = Group.objects.create(name="before sync")
+    with sudo(reason="group setup"):
+        user.groups.add(group)
+    assert user.groups.filter(pk=group.pk).exists()
 
 
 @pytest.mark.django_db
@@ -609,18 +648,18 @@ def test_tracked_through_bulk_owners_grant_and_revoke_existing_resource(indexed)
     actor = to_subject_ref(user)
     resource = to_object_ref(round_)
     assert not indexed.check_access(subject=actor, action="read", resource=resource).allowed
-    with no_ambient_scope(), sudo(reason="test.tracked-backing-maintenance"):
+    with no_ambient_scope():
         entry = BackingEntry.objects.bulk_create(
             [BackingEntry(round=round_, responder=user, retired_at=None)]
         )[0]
     assert indexed.check_access(subject=actor, action="read", resource=resource).allowed
     assert_no_drift()
-    with no_ambient_scope(), sudo(reason="test.tracked-backing-maintenance"):
+    with no_ambient_scope():
         BackingEntry._base_manager.filter(pk=entry.pk).update(retired_at=timezone.now())
     assert not indexed.check_access(subject=actor, action="read", resource=resource).allowed
     assert_no_drift()
     entry.retired_at = None
-    with no_ambient_scope(), sudo(reason="test.tracked-backing-maintenance"):
+    with no_ambient_scope():
         BackingEntry.objects.bulk_update([entry], ["retired_at"])
     assert indexed.check_access(subject=actor, action="read", resource=resource).allowed
     assert_no_drift()

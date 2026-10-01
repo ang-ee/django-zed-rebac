@@ -228,6 +228,12 @@ deny access. The gate does not verify these promises after writing. The
 application must persist the promised tuples in the same transaction.
 `bulk_create()` never calls `save()`, so bulk paths must write the promised
 tuples themselves.
+Caller-supplied `check_new()` and MCP create-relation subjects for model-backed
+types must use canonical IDs. A non-canonical subject refuses the entire
+preflight, including exclusions; it is never discarded as an absent edge.
+The same refusal applies to an empty ID, a subject type or `#relation` not
+allowed by the relation, or an overlay key that is not a declared relation.
+Schema-owned constant targets keep their declared wire spelling.
 
 Adding REBAC model instances are insert-only, including candidates with an
 explicit primary key. Load an existing row before updating it; a constructed
@@ -691,6 +697,10 @@ A supplied `None` is also missing, including when stored relationship context
 pins the parameter to `None`; stored context still takes precedence.
 
 **`LocalBackend` caveat support.** Backed by [`cel-python`](https://pypi.org/project/cel-python/). Most CEL types work out of the box (`int`, `string`, `bool`, `list`, `map`, `timestamp`, `duration`). The `ipaddress` type is **not** in `cel-python`'s built-ins — `LocalBackend` raises `CaveatUnsupportedError`. Rewrite the caveat to take strings and do CIDR matching server-side, or move to the future `SpiceDBBackend` once it lands.
+Schema checks parse CEL with cel-python and validate only free identifiers
+against declared parameters and CEL built-ins. Macro variables in `exists`,
+`all`, `map`, `filter`, and `reduce` are local to their macro expression.
+Evaluation and parameter-coercion errors redact supplied values.
 
 ### MCP tools as resources
 

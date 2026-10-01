@@ -8,14 +8,16 @@ needs an authorization decision. Invariant 5d (added with 0.24.0) states the
 rule for the common paths, and the code gates M2M writes, reverse-FK accessors,
 tracked saves and symmetrical mirror edges. Three groups of paths are still
 ungated or gated against the wrong actor. Each is pinned by a strict expected
-failure in `tests/test_security_related_writes.py` naming this proposal.
+failure in `tests/test_security_proposal_0011.py` naming this proposal.
 
-1. **Deletes and collector side effects.** `RebacMixin.delete()`, queryset
-   `delete()`, CASCADE and SET_NULL all lift backed edges on another type with
-   no `write` check on that type. With `folder.read = viewer - items->locked`,
-   the owner of a locked post deletes the post and gains read on the folder.
-   Deleting a task cascades to the entries that back `banned` on its round.
-   The equivalent `post.folder = None; post.save()` is denied.
+1. **Deletes and collector side effects.** `RebacMixin.delete()` and queryset
+   `delete()` lift backed edges on another type without checking that type's
+   `write`. With `folder.read = viewer - items->locked`, the owner of a locked
+   post deletes the post and gains read on the folder. CASCADE and SET_NULL
+   also need a gate using the initiating actor's scope. The current column
+   gate catches actorless collector updates, but a pinned actor on the row
+   being deleted can still differ from the ambient actor used for collected
+   rows. The equivalent explicit `post.folder = None; post.save()` is denied.
 2. **Reverse-FK `add(bulk=True)`.** The gate reads the ambient actor instead
    of the actor pinned on the folder (invariant 5), a block `sudo` bypasses it
    even when an actor is pinned, and the moved row's own `write` is never
