@@ -59,6 +59,18 @@ class _RebacQuery(Query):
     # was resolved into is compiled for execution, never when it is built.
     _rebac_pending_bypass_audit: str | None = None
 
+    # Django constructs a query of this class itself only as a piece of the
+    # statement it is building: the NOT EXISTS of an exclude() across a to-many
+    # relation (Query.split_exclude). A queryset's query gets this class by
+    # assignment and never runs __init__, so a query constructed here is not an
+    # embedded queryset. It has no scope decision of its own; the queryset
+    # that owns the statement scopes it.
+    _rebac_statement_part = False
+
+    def __init__(self, *args: Any, **kwargs: Any) -> None:
+        super().__init__(*args, **kwargs)
+        self._rebac_statement_part = True
+
     def as_sql(self, compiler: Any, connection: Any) -> Any:
         reason = self._rebac_pending_bypass_audit
         if reason is not None:
@@ -66,6 +78,8 @@ class _RebacQuery(Query):
         return super().as_sql(compiler, connection)
 
     def resolve_expression(self, *args: Any, **kwargs: Any) -> Self:
+        if self._rebac_statement_part and not hasattr(self, "_rebac_state"):
+            return cast(Self, super().resolve_expression(*args, **kwargs))
         clone = cast(Self, self.clone())
         state = getattr(self, "_rebac_state", {})
         queryset: RebacQuerySet[Any] = RebacQuerySet(
