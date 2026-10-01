@@ -16,6 +16,13 @@ pre-1.0; breaking changes within a minor version are explicitly called out.
   own fallback reads only the first parent, which would be the library mixin).
   `_rebac_base` is injected only when nothing is declared;
   `base_manager_name = "_rebac_base"` opts back into it.
+- A `RebacMixin` or `RebacTrackedMixin` model with no `Meta` of its own takes
+  its parent's Django options again (`ordering`, `indexes`, `constraints`,
+  `permissions`, verbose names, `default_manager_name`). Since 0.23.0 the
+  metaclass handed Django a `Meta` holding only the two manager names, so
+  Django never looked at the parent's and the options were dropped without an
+  error. The `rebac_*` options are unchanged: they pass to a child only
+  through a `Meta` the child writes, as before 0.23.0.
 
 ### Added
 
@@ -40,6 +47,11 @@ pre-1.0; breaking changes within a minor version are explicitly called out.
   name. Run `makemigrations`.
 - Such a model now fails at import if its base manager's queryset is not a
   `TrackedQuerySet`. Derive the queryset from `rebac.TrackedQuerySet`.
+- A model with no `Meta` of its own whose abstract parent declares options
+  gets a migration restoring them (`AlterModelOptions`, `AddIndex`,
+  `AddConstraint`). Run `makemigrations` and read it before applying: a
+  restored unique or check constraint fails if rows written under 0.23.0 to
+  0.24.1 violate it.
 
 ## [0.24.1] — 2026-10-01
 
