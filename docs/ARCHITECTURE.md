@@ -1746,8 +1746,8 @@ tuple write derives its effects before returning its Zookie, even inside an
 open model owner. It leaves the outer owner's captured work intact for a final
 derivation after the source write. Only the outer owner consumes work, vacuums
 terms, or rebuilds a changed schema. This extra derivation is the cost of
-read-your-writes correctness within a transaction. A nested pass currently
-re-derives the accumulated outer region; proposal 0009 tracks that cost.
+read-your-writes correctness within a transaction. A nested pass sees the
+accumulated outer work but re-derives only rows whose inputs changed.
 Plain third-party tracked models use explicit-sender signals; their callers
 must use `atomic()` or `ATOMIC_REQUESTS`. In autocommit, the receiver
 logs and warns under decision D2. `rebac.E018` rejects unowned,
@@ -1766,15 +1766,37 @@ reads no whole source table, model table or index table, so its cost does not
 depend on the size of the index or of the schema. A full rebuild does.
 
 Each pass locks `IndexState("global")` before source reads, captures old
-identities durably in `IndexWork`, applies the source write, projects new
-edges, materializes the affected region and deletes and re-derives it in
-dependency order. Region closure follows same-resource dependencies,
-incoming arrows, membership ancestors and old/new backing paths. It does not
-follow holders: a grant that holds a set by reference does not change when
-the set's members do. Nor does it take in an edge's target: an edge belongs
-to its source, and no rule reads the edges that point at an object, so
-writing a row does not re-derive the other rows that share its target. A write to a relation no node
-references repairs only memberships. Schema owners rebuild
+identities durably in `IndexWork`, and applies the source write. Projection
+compares the seed scopes' new edges with their old rows and writes only added,
+removed or changed edge payloads. Every captured set is then derived, including
+one with no changed edge; grant strata with no changed input do no work. Old and new backing paths still determine
+the seed scopes; no dependent closure is computed up front.
+
+If a captured set loses an edge or an edge payload changes, membership
+maintenance closes the seed sets over their former containers before deleting
+and deriving the whole region to a fixpoint. For additions only, it compares
+each wave's membership rows and follows changed sets through containing edges,
+including sets already processed. Grants hold sets by reference, so membership
+changes do not re-derive consumers' grants. Grant nodes run one stratum at a
+time in dependency order. A node's region contains scopes whose own edges it
+reads changed, whose same-scope input rows changed, or whose arrow target rows
+changed, including type-level rows. A via relation seeds its arrow directly
+from changed edges even if the via relation stores no grant rows. Each stratum's
+rows are addressed by exact (type, node) pairs, read, deleted, derived, then
+compared by holder, site, expiry and condition. A removed row propagates as a
+change. Before a recursive stratum is cleared, its region closes over incoming
+arrows within that strongly connected component; semi-naive rounds then derive
+its least fixpoint.
+The comparison is bounded by the region. Identical grant and membership rows
+in a re-derived region are still rewritten; staging those rows separately
+would permit a later keyed diff.
+
+An edge belongs to its source; no rule reads the edges that point at an
+object, so writing a row does not re-derive the other rows that share its
+target. A write to a relation no node reads as edges yields an empty grant
+region unless another input changes; captured sets still receive membership
+maintenance.
+Schema owners rebuild
 affected definitions and dependents and publish `index_revision` only
 after success. A missing lock row after flush is repaired in the owner.
 Work rows and unused snapshot terms are cleared at pass end. The index

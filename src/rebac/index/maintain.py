@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 import logging
 from collections.abc import Iterable, Iterator, Mapping, Sequence
 from contextlib import ExitStack, contextmanager
@@ -15,6 +16,7 @@ from django.db import DatabaseError, connections, models, transaction
 from django.db.models import Exists, F, OuterRef, Q, Subquery, Value
 
 from rebac.errors import SchemaError
+from rebac.schema.ast import PermArrow, PermBinOp, PermRef
 from rebac.types import RelationshipFilter, RelationshipTuple
 
 if TYPE_CHECKING:
@@ -162,11 +164,10 @@ class IndexMaintenance:
         self.schema_types: set[str] = set()
         self.schema_all = False
         self.schema_initial = False
-        self.membership_only = True
         self.python_rows = 0
         self.statements = 0
         self._outer: IndexMaintenance | None = None
-        self._outer_state: tuple[bool, set[str], bool, bool, int, bool] | None = None
+        self._outer_state: tuple[bool, set[str], bool, bool, int] | None = None
         self._token: Token[tuple[IndexMaintenance, ...]] | None = None
         self._stack = ExitStack()
         self._started = 0.0
@@ -174,6 +175,7 @@ class IndexMaintenance:
         self._independent = independent
         self.completed_stats: Stats | None = None
         self.resume_pass = resume_pass
+        self._region_ids: set[int] | None = None
 
     def __enter__(self) -> IndexMaintenance:
         from rebac.models.index import IndexState, IndexWork
@@ -199,7 +201,6 @@ class IndexMaintenance:
                     self._outer.schema_all,
                     self._outer.schema_initial,
                     self._outer.python_rows,
-                    self._outer.membership_only,
                 )
                 self._stack = stack.pop_all()
                 return self._outer
@@ -324,7 +325,7 @@ class IndexMaintenance:
         if queryset is not None:
             model = queryset.model
         self._capture(model=model, pks=pks, queryset=queryset, tuples=tuples, phase="old")
-        # Preserve dependents before a deleted/reparented edge disappears.
+        # Preserve the seed sets while their old edges still exist.
         self.expand_region(phase="old")
 
     def snapshot_queryset(self, queryset: models.QuerySet[Any]) -> models.QuerySet[Any]:
@@ -407,16 +408,18 @@ class IndexMaintenance:
         )
         from rebac.resources import model_for_resource_type
 
-        if model is not None:
-            self.membership_only = False
+        if model is not None and queryset is None:
+            for pk_batch in self._batches(pks):
+                self._capture(
+                    model=model,
+                    pks=(),
+                    tuples=(),
+                    phase=phase,
+                    queryset=model._base_manager.using(self.using).filter(pk__in=pk_batch),
+                )
+            model = None
 
         for batch in batched(tuples, 200, strict=False):
-            program = self.load_program()
-            if any(
-                (row.resource.resource_type, row.relation) not in program.userset_only_relations
-                for row in batch
-            ):
-                self.membership_only = False
             self.add_triples(
                 (
                     triple
@@ -559,7 +562,8 @@ class IndexMaintenance:
             lookup = prefix + "__pk__in" if prefix else "pk__in"
             # Only the changed through rows' source keys are needed here.
             source_ids = set(rows.order_by().values_list(key, flat=True))
-            yield source._base_manager.using(self.using).filter(**{lookup: source_ids})
+            for batch in self._batches(source_ids):
+                yield source._base_manager.using(self.using).filter(**{lookup: batch})
         for prefix in sorted(prefixes):
             lookup = prefix + "__pk__in" if prefix else "pk__in"
             yield source._base_manager.using(self.using).filter(
@@ -567,69 +571,319 @@ class IndexMaintenance:
             )
 
     def expand_region(self, *, phase: str = "region") -> None:
-        """Close the work set over what derivation reads.
-
-        The rows at a scope are derived from the scope's edges, from the
-        rows at the targets of its arrows, and from the type-level rows of
-        those targets' types. The members of a set are derived from its edges
-        and from the members of the sets it contains. A grant holds a set by
-        reference: it does not change when the set's members do, so holders
-        are not followed.
-        """
-        from rebac.index.terms import intern_from
-        from rebac.models.index import IndexEdge, IndexMember, IndexTerm
+        """Add the seed scope's sets, without closing over dependents."""
+        from rebac.models.index import IndexTerm
 
         terms = IndexTerm.objects.using(self.using)
-        arrows = Q(pk__in=[])
-        for type_, via in sorted(self.load_program().arrow_vias):
-            arrows |= Q(resource_type=type_, relation=via)
-        while True:
-            before = self.work(phase=phase).count()
-            work = self.work(phase=phase).exclude(term_id=None)
-            scopes = work.filter(kind="scope").values("term_id")
-            sets = work.filter(kind="set").values("term_id")
-            # The sets of a changed object: intern the ones its edges name,
-            # then take every set of the object.
-            edges = IndexEdge.objects.using(self.using).filter(resource_id__in=Subquery(scopes))
-            self.python_rows += intern_from(
-                edges.order_by()
-                .values("relation", type=F("resource__type"), object_id=F("resource__object_id"))
-                .values("type", "object_id", "relation"),
-                using=self.using,
-            )
-            changed = terms.filter(
-                pk__in=Subquery(scopes), type=OuterRef("type"), object_id=OuterRef("object_id")
-            )
-            self.add_terms(
-                terms.filter(Exists(changed)).exclude(relation__in=("", "$type")), phase=phase
-            )
-            # The sets that contain a changed set.
-            containers = IndexMember.objects.using(self.using).filter(member_id__in=Subquery(sets))
-            self.add_terms(terms.filter(pk__in=Subquery(containers.values("set_id"))), phase=phase)
-            # The scopes whose arrows read the rows of a changed scope.
-            incoming = IndexEdge.objects.using(self.using).filter(
-                arrows, target_id__in=Subquery(scopes)
-            )
-            self.add_terms(
-                terms.filter(pk__in=Subquery(incoming.values("resource_id"))), phase=phase
-            )
-            # And those whose arrows read the type-level rows of a changed type.
-            for type_ in (
-                terms.filter(pk__in=Subquery(scopes), relation="$type")
-                .values_list("type", flat=True)
-                .distinct()
-            ):
-                incoming = IndexEdge.objects.using(self.using).filter(arrows, target__type=type_)
-                self.add_terms(
-                    terms.filter(pk__in=Subquery(incoming.values("resource_id"))), phase=phase
+        scopes = terms.filter(
+            pk__in=Subquery(self.work(phase=phase).filter(kind="scope").values("term_id"))
+        )
+        sets = terms.exclude(relation__in=("", "$type")).filter(
+            Exists(scopes.filter(type=OuterRef("type"), object_id=OuterRef("object_id")))
+        )
+        self.add_terms(sets, phase=phase)
+
+    def _set_region(self, ids: set[int]) -> None:
+        from rebac.models.index import IndexTerm
+
+        if ids == self._region_ids:
+            return
+        self.work(phase="region").delete()
+        for batch in self._batches(ids):
+            self.add_terms(IndexTerm.objects.using(self.using).filter(pk__in=batch), phase="region")
+        self._region_ids = set(ids)
+
+    def _batches(self, ids: Iterable[int]) -> Iterator[tuple[int, ...]]:
+        limit = connections[self.using].features.max_query_params or 5000
+        yield from batched(sorted(ids), max(1, min(5000, limit - 32)), strict=False)
+
+    @staticmethod
+    def _key_filter(keys: Iterable[tuple[str, str]]) -> Q:
+        selected = Q(pk__in=[])
+        for type_, node in sorted(keys):
+            selected |= Q(resource_type=type_, node=node)
+        return selected
+
+    def _payloads(
+        self, keys: set[tuple[str, str]], scopes: set[int]
+    ) -> dict[tuple[int, str], set[tuple[Any, ...]]]:
+        from rebac.models.index import IndexCover
+
+        result: dict[tuple[int, str], set[tuple[Any, ...]]] = {}
+        if not scopes or not keys:
+            return result
+        selected = self._key_filter(keys)
+        for batch in self._batches(scopes):
+            rows = IndexCover.objects.using(self.using).filter(selected, scope_id__in=batch)
+            for scope, node, holder, site, expiry, condition_key, condition in rows.values_list(
+                "scope_id", "node", "holder_id", "site", "expires_at", "condition_key", "condition"
+            ).iterator(chunk_size=256):
+                self.python_rows += 1
+                result.setdefault((scope, node), set()).add(
+                    (holder, site, expiry, condition_key, json.dumps(condition, sort_keys=True))
                 )
-            if self.work(phase=phase).count() == before:
+        return result
+
+    def _inputs(
+        self, key: tuple[str, str]
+    ) -> tuple[set[tuple[str, str]], set[tuple[str, str, str]], set[tuple[str, str]]]:
+        """Same-scope, arrow-grant, and direct edge inputs of a node."""
+        node = self.load_program().nodes[key]
+        same: set[tuple[str, str]] = set()
+        arrows: set[tuple[str, str, str]] = set()
+        edges: set[tuple[str, str]] = set()
+        if node.kind == "relation":
+            return same, arrows, {(node.type, node.name)}
+        if node.operands is not None:
+            return {(node.type, name) for name in node.operands}, arrows, edges
+
+        def visit(expr: Any) -> None:
+            if isinstance(expr, PermRef):
+                same.add((node.type, expr.name))
+            elif isinstance(expr, PermArrow):
+                edges.add((node.type, expr.via))
+                arrows.update(
+                    (type_, expr.target, expr.via)
+                    for type_, name in node.deps
+                    if name == expr.target
+                )
+            elif isinstance(expr, PermBinOp):
+                visit(expr.left)
+                visit(expr.right)
+
+        if node.expr is not None:
+            visit(node.expr)
+        return same, arrows, edges
+
+    def _input_scopes(
+        self, key: tuple[str, str], changes: dict[tuple[str, str], set[int]]
+    ) -> set[int]:
+        from rebac.models.index import IndexEdge, IndexTerm
+
+        same, arrows, _ = self._inputs(key)
+        found = set().union(*(changes.get(dep, set()) for dep in same))
+        for type_, target, via in sorted(arrows):
+            changed = changes.get((type_, target), set())
+            if not changed:
+                continue
+            edges = IndexEdge.objects.using(self.using).filter(
+                resource_type=key[0], relation=via, target__type=type_
+            )
+            for batch in self._batches(changed):
+                found.update(
+                    edges.filter(target_id__in=batch).values_list("resource_id", flat=True)
+                )
+            if any(
+                IndexTerm.objects.using(self.using).filter(pk__in=batch, relation="$type").exists()
+                for batch in self._batches(changed)
+            ):
+                found.update(edges.values_list("resource_id", flat=True))
+        return found
+
+    def _member_payloads(self, sets: set[int]) -> dict[int, set[tuple[Any, ...]]]:
+        from rebac.models.index import IndexMember
+
+        result: dict[int, set[tuple[Any, ...]]] = {}
+        for batch in self._batches(sets):
+            rows = IndexMember.objects.using(self.using).filter(set_id__in=batch)
+            for set_id, member, member_type, key, expiry, condition in rows.values_list(
+                "set_id", "member_id", "member_type", "condition_key", "expires_at", "condition"
+            ).iterator(chunk_size=256):
+                self.python_rows += 1
+                result.setdefault(set_id, set()).add(
+                    (member, member_type, key, expiry, json.dumps(condition, sort_keys=True))
+                )
+        return result
+
+    def _delete_members(self, sets: set[int]) -> int:
+        from rebac.models.index import IndexMember
+
+        return sum(
+            IndexMember.objects.using(self.using).filter(set_id__in=batch).delete()[0]
+            for batch in self._batches(sets)
+        )
+
+    def _containing_sets(self, members: set[int], *, edges: bool) -> set[int]:
+        from rebac.models.index import IndexEdge, IndexMember, IndexTerm
+
+        result: set[int] = set()
+        for batch in self._batches(members):
+            if edges:
+                contained = IndexEdge.objects.using(self.using).filter(
+                    subject_id__in=batch,
+                    resource__type=OuterRef("type"),
+                    resource__object_id=OuterRef("object_id"),
+                    relation=OuterRef("relation"),
+                )
+                result.update(
+                    IndexTerm.objects.using(self.using)
+                    .exclude(relation__in=("", "$type"))
+                    .filter(Exists(contained))
+                    .values_list("pk", flat=True)
+                )
+            else:
+                result.update(
+                    IndexMember.objects.using(self.using)
+                    .filter(member_id__in=batch)
+                    .values_list("set_id", flat=True)
+                )
+        return result
+
+    def _maintain_memberships(
+        self, program: IndexProgram, seeds: set[int], removed_edges: set[tuple[int, str]]
+    ) -> Stats:
+        from rebac.index.derive import derive_memberships
+        from rebac.index.project import Stats
+        from rebac.models.index import IndexTerm
+
+        stats = Stats()
+        if not seeds:
+            return stats
+        source_ids = {scope for scope, _ in removed_edges}
+        sources: dict[int, tuple[str, str]] = {}
+        for batch in self._batches(source_ids):
+            sources.update(
+                (pk, (type_, object_id))
+                for pk, type_, object_id in IndexTerm.objects.using(self.using)
+                .filter(pk__in=batch)
+                .values_list("pk", "type", "object_id")
+            )
+        removed_sets = {
+            (*sources[scope], relation) for scope, relation in removed_edges if scope in sources
+        }
+        removal = False
+        for batch in self._batches(seeds):
+            if any(
+                (type_, object_id, relation) in removed_sets
+                for type_, object_id, relation in IndexTerm.objects.using(self.using)
+                .filter(pk__in=batch)
+                .values_list("type", "object_id", "relation")
+            ):
+                removal = True
                 break
+        if removal:
+            region = set(seeds)
+            frontier = set(seeds)
+            while frontier:
+                frontier = self._containing_sets(frontier, edges=False) - region
+                region.update(frontier)
+            self._set_region(region)
+            stats.deleted += self._delete_members(region)
+            stats.add(derive_memberships(program, using=self.using, region=self.pass_id))
+            return stats
+        pending = set(seeds)
+        while pending:
+            current = pending
+            self._set_region(current)
+            old = self._member_payloads(current)
+            stats.deleted += self._delete_members(current)
+            stats.add(derive_memberships(program, using=self.using, region=self.pass_id))
+            new = self._member_payloads(current)
+            changed = {set_id for set_id in current if old.get(set_id) != new.get(set_id)}
+            pending = self._containing_sets(changed, edges=True) if changed else set()
+        return stats
+
+    def _recursive_region(self, stratum: tuple[tuple[str, str], ...], region: set[int]) -> set[int]:
+        """Clear the connected SCC at once so old cycle rows cannot support themselves."""
+        from rebac.models.index import IndexEdge, IndexTerm
+
+        whole = set(stratum)
+        pending = set(region)
+        while pending:
+            frontier: dict[int, str] = {}
+            for batch in self._batches(pending):
+                frontier.update(
+                    IndexTerm.objects.using(self.using)
+                    .filter(pk__in=batch)
+                    .values_list("pk", "type")
+                )
+            pending = set()
+            for key in stratum:
+                _, arrows, _ = self._inputs(key)
+                for type_, target, via in sorted(arrows):
+                    if (type_, target) not in whole:
+                        continue
+                    targets = {pk for pk, scope_type in frontier.items() if scope_type == type_}
+                    if not targets:
+                        continue
+                    edges = IndexEdge.objects.using(self.using).filter(
+                        resource_type=key[0], relation=via, target__type=type_
+                    )
+                    for batch in self._batches(targets):
+                        pending.update(
+                            edges.filter(target_id__in=batch).values_list("resource_id", flat=True)
+                        )
+                    if any(
+                        IndexTerm.objects.using(self.using)
+                        .filter(pk__in=batch, relation="$type")
+                        .exists()
+                        for batch in self._batches(targets)
+                    ):
+                        pending.update(edges.values_list("resource_id", flat=True))
+            pending.difference_update(region)
+            region.update(pending)
+        return region
+
+    def _maintain_grants(
+        self, program: IndexProgram, edges: dict[tuple[str, str], set[int]]
+    ) -> Stats:
+        from rebac.index.derive import derive_nodes
+        from rebac.index.project import Stats
+        from rebac.models.index import IndexCover, IndexTerm
+
+        stats = Stats()
+        changes: dict[tuple[str, str], set[int]] = {}
+        for number, stratum in enumerate(program.strata):
+            region: set[int] = set()
+            for key in stratum:
+                _, _, edge_inputs = self._inputs(key)
+                for edge_key in edge_inputs:
+                    region.update(edges.get(edge_key, set()))
+                region.update(self._input_scopes(key, changes))
+            if not region:
+                continue
+            recursive = any(program.nodes[key].recursive for key in stratum)
+            if recursive:
+                region = self._recursive_region(stratum, region)
+            self._set_region(region)
+            keys = set(stratum)
+            scope_types: dict[int, str] = {}
+            for batch in self._batches(region):
+                scope_types.update(
+                    IndexTerm.objects.using(self.using)
+                    .filter(pk__in=batch)
+                    .values_list("pk", "type")
+                )
+            old = self._payloads(keys, region)
+            selected = self._key_filter(keys)
+            for batch in self._batches(region):
+                stats.deleted += (
+                    IndexCover.objects.using(self.using)
+                    .filter(selected, scope_id__in=batch)
+                    .delete()[0]
+                )
+            stats.add(
+                derive_nodes(
+                    program, using=self.using, region=self.pass_id, selected_stratum=number
+                )
+            )
+            new = self._payloads(keys, region)
+            for key in stratum:
+                node = program.nodes[key]
+                if node.operands is not None:
+                    changes[key] = self._input_scopes(key, changes)
+                else:
+                    changes[key] = {
+                        scope
+                        for scope in region
+                        if scope_types.get(scope) == key[0]
+                        and old.get((scope, key[1]), set()) != new.get((scope, key[1]), set())
+                    }
+        return stats
 
     def finish(self, *, nested: bool = False) -> None:
-        from rebac.index.derive import derive_memberships, derive_nodes
         from rebac.index.project import Stats, project_edges
-        from rebac.models.index import IndexCover, IndexEdge, IndexMember, IndexTerm
+        from rebac.models.index import IndexTerm
 
         if self.completed_stats is not None:
             stats = self.completed_stats
@@ -660,6 +914,9 @@ class IndexMaintenance:
             deleted, inserted, python_rows = stats.deleted, stats.inserted, stats.python_rows
         elif self.work().exclude(kind="pass").exists():
             program = self.load_program()
+            # Nested finishes leave work rows for the outer owner. Its next
+            # projection widens the region outside _set_region's cache.
+            self._region_ids = None
             terms = IndexTerm.objects.using(self.using)
             self.add_terms(
                 terms.filter(
@@ -667,28 +924,14 @@ class IndexMaintenance:
                 ),
                 phase="region",
             )
-            # project_edges emits current sources; remove the old projection
-            # only after its dependents have been captured in the old workset.
-            edge_deleted = (
-                IndexEdge.objects.using(self.using)
-                .filter(resource_id__in=Subquery(self.work(phase="region").values("term_id")))
-                .delete()[0]
-            )
-            projection = project_edges(program, using=self.using, region=self.pass_id)
+            projection = project_edges(program, using=self.using, region=self.pass_id, diff=True)
             self.expand_region()
-            ids = self.work(phase="region").values("term_id")
-            covers = IndexCover.objects.using(self.using).filter(scope_id__in=Subquery(ids))
-            deleted = 0 if self.membership_only else covers.delete()[0]
-            deleted += (
-                IndexMember.objects.using(self.using).filter(set_id__in=Subquery(ids)).delete()[0]
+            seed_sets = set(
+                self.work(phase="region").filter(kind="set").values_list("term_id", flat=True)
             )
-            membership = derive_memberships(program, using=self.using, region=self.pass_id)
-            nodes = (
-                Stats()
-                if self.membership_only
-                else derive_nodes(program, using=self.using, region=self.pass_id)
-            )
-            stats = Stats(deleted=deleted + edge_deleted)
+            membership = self._maintain_memberships(program, seed_sets, projection.removed_edges)
+            nodes = self._maintain_grants(program, projection.changed_nodes)
+            stats = Stats()
             for result in (projection, membership, nodes):
                 stats.add(result)
             deleted, inserted, python_rows = stats.deleted, stats.inserted, stats.python_rows
@@ -750,7 +993,6 @@ class IndexMaintenance:
                     self._outer.schema_all,
                     self._outer.schema_initial,
                     self._outer.python_rows,
-                    self._outer.membership_only,
                 ) = self._outer_state
             if self._token is not None:
                 _passes.reset(self._token)
