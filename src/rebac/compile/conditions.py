@@ -115,7 +115,9 @@ class CaveatVerdicts:
             .filter(selected)
             .exclude(caveat_name="")
             .index_projection()
+            .order_by()
             .values_list("caveat_name", "caveat_context", "caveat_key")
+            .distinct()
         )
         seen: set[str] = set()
         true_keys: set[str] = set()
@@ -139,6 +141,11 @@ class CaveatVerdicts:
                 unknown[stored_key] = missing
         return cls(frozenset(true_keys), frozenset(false_keys), unknown)
 
+    @property
+    def empty(self) -> bool:
+        """No caveated tuple is in reach: both bounds read the same rows."""
+        return not (self.true_keys or self.false_keys or self.unknown)
+
     def condition_q(self, prefix: str, bound: Any) -> Q:
         """The two-valued condition on a tuple row for one bound."""
 
@@ -146,5 +153,10 @@ class CaveatVerdicts:
         digest = f"{prefix}caveat_key"
         lower = str(getattr(bound, "value", bound)).lower() == "lower"
         if lower:
-            return Q(**{name: ""}) | Q(**{f"{digest}__in": tuple(sorted(self.true_keys))})
+            unconditional = Q(**{name: ""})
+            if not self.true_keys:
+                return unconditional
+            return unconditional | Q(**{f"{digest}__in": tuple(sorted(self.true_keys))})
+        if not self.false_keys:
+            return Q()
         return ~Q(**{f"{digest}__in": tuple(sorted(self.false_keys))})

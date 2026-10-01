@@ -1,21 +1,32 @@
-"""Execute compiled LocalBackend predicates without a derived permission index."""
+"""Execute compiled LocalBackend predicates without a derived permission index.
+
+A statement is compiled once per policy, permission and actor shape, and kept
+as Django's own SQL with placeholders for the actor's id (the accepted
+plan-cache exception of ARCHITECTURE).  Facts about fixed objects, such as
+membership of a constant role, are decided before the statement is compiled
+and witnessed inside it, so a decision that no longer holds when the statement
+runs yields no rows instead of a stale answer.
+"""
 
 from __future__ import annotations
 
-from collections.abc import Iterable, Iterator, Mapping
-from dataclasses import dataclass
+from collections import OrderedDict
+from collections.abc import Callable, Iterable, Iterator, Mapping
+from dataclasses import dataclass, field
 from datetime import datetime
+from threading import RLock
 from typing import TYPE_CHECKING, Any, cast
 
-from django.db import models
-from django.db.models import Exists, Expression, F, Q, Subquery, Value
+from django.db import connections, models
+from django.db.models import Exists, Expression, F, Q, Value
 from django.db.models.functions import Now
-from django.db.models.lookups import Exact, GreaterThanOrEqual, In, LessThan
+from django.db.models.lookups import Exact, GreaterThanOrEqual, LessThan
 from django.utils import timezone
 
 from rebac._id import model_identity_fields, resource_id_attr
 from rebac.composition import TaggedComposition, compose_tagged, split_stale_overrides
-from rebac.errors import PermissionDepthExceeded
+from rebac.conf import app_settings
+from rebac.errors import PermissionDepthExceeded, SchemaError
 from rebac.field_backing import resolve_attribute_backing, resolve_field_backing
 from rebac.index.codec import identity_codec
 from rebac.models import active_relationship_model
@@ -33,10 +44,68 @@ from rebac.types import CheckResult, ObjectRef, SubjectRef
 
 from . import At, Bound, Compiler
 from .conditions import CaveatVerdicts
-from .evaluate import named_candidates, residual
+from .evaluate import named_subjects, residual
+from .predicate import (
+    Fact,
+    _and,
+    _Compiled,
+    _not,
+    _Param,
+    actor_shape,
+    bind,
+    const_facts,
+    is_false,
+    is_true,
+)
+from .program import CompileProgram, Key
 
 if TYPE_CHECKING:
     from rebac.backends.local import LocalBackend
+
+# The database clock; ``Now`` itself stays a module name tests can replace.
+_DatabaseNow = Now
+_MANUAL_REVISION = object()
+_RESOURCE_WIRE = object()
+_LIMIT = 512
+_lock = RLock()
+
+
+@dataclass(frozen=True, slots=True)
+class _Kept:
+    """One compiled statement.  ``every`` marks a gate that admits every row."""
+
+    sql: str
+    params: tuple[Any, ...]
+    every: bool = False
+
+
+_policies: OrderedDict[tuple[Any, ...], _Policy] = OrderedDict()
+_statements: OrderedDict[tuple[Any, ...], _Kept | bool] = OrderedDict()
+
+
+def reset() -> None:
+    """Forget every kept policy and statement (settings or registries changed)."""
+    with _lock:
+        _policies.clear()
+        _statements.clear()
+
+
+# ---------- The policy a statement is compiled for ----------
+
+
+@dataclass(frozen=True)
+class _Policy:
+    key: tuple[Any, ...]
+    snapshot: SchemaSnapshot
+    tagged: TaggedComposition
+    effective: Schema
+    program: CompileProgram
+    selected_at: datetime
+    caveat_deadlines: tuple[datetime, ...]
+
+    @property
+    def schema(self) -> Schema:
+        return self.tagged.schema
 
 
 def _schema(backend: LocalBackend) -> tuple[Schema, SchemaSnapshot]:
@@ -44,20 +113,23 @@ def _schema(backend: LocalBackend) -> tuple[Schema, SchemaSnapshot]:
     return snapshot.schema, snapshot
 
 
-@dataclass(frozen=True)
-class _Plan:
-    snapshot: SchemaSnapshot
-    tagged: TaggedComposition
-    effective: Schema
-    selected_at: datetime
-    caveat_deadlines: tuple[datetime, ...]
-
-
-def _plan(backend: LocalBackend) -> _Plan:
+def _policy(backend: LocalBackend) -> _Policy:
     from rebac.models import SchemaOverride
 
     _effective, snapshot = _schema(backend)
     baseline = snapshot.baseline or snapshot.schema
+    key = (
+        snapshot.using,
+        snapshot.revision,
+        backend._schema_is_manual,
+        id(baseline),
+        tuple(getattr(row, "pk", None) for row in snapshot.overrides),
+    )
+    with _lock:
+        kept = _policies.get(key)
+        if kept is not None and kept.snapshot.schema is snapshot.schema:
+            _policies.move_to_end(key)
+            return kept
     overrides, _stale = split_stale_overrides(baseline, list(snapshot.overrides))
     selected_at = timezone.now()
     active = [row for row in overrides if row.expires_at is None or row.expires_at > selected_at]
@@ -82,64 +154,266 @@ def _plan(backend: LocalBackend) -> _Plan:
             }
         )
     )
-    return _Plan(snapshot, tagged, compose_tagged(baseline, active).schema, selected_at, deadlines)
+    policy = _Policy(
+        key,
+        snapshot,
+        tagged,
+        compose_tagged(baseline, active).schema,
+        CompileProgram.build(tagged.schema),
+        selected_at,
+        deadlines,
+    )
+    if not deadlines:
+        # A caveat override with a deadline selects its expression by the
+        # clock, so such a policy is prepared afresh each time.
+        with _lock:
+            _policies[key] = policy
+            while len(_policies) > _LIMIT:
+                _policies.popitem(last=False)
+    return policy
 
 
-class _ManualRevision(Expression):
-    def __init__(self, backend: LocalBackend) -> None:
-        super().__init__(output_field=models.CharField())
-        self.backend = backend
-
-    def as_sql(self, compiler: Any, connection: Any) -> tuple[str, tuple[Any, ...]]:
-        sql, params = compiler.compile(Value(self.backend._manual_schema_revision()))
-        return sql, tuple(params)
-
-
-def _fence(plan: _Plan, *, backend: LocalBackend, using: str) -> models.QuerySet[Any]:
+def _fence(
+    policy: _Policy, *, backend: LocalBackend, using: str, parametric: bool
+) -> models.QuerySet[Any]:
     """Close a prepared predicate when its policy revision or deadline changes."""
 
-    snapshot = plan.snapshot
+    snapshot = policy.snapshot
     rows = SchemaGeneration.objects.using(using).filter(pk=1)
     if snapshot.revision is None:
         return rows.none()
     if backend._schema_is_manual:
-        rows = rows.filter(Exact(Value(snapshot.revision), _ManualRevision(backend)))
+        current: Expression = (
+            _Param(_MANUAL_REVISION, models.CharField())
+            if parametric
+            else Value(backend._manual_schema_revision())
+        )
+        rows = rows.filter(Exact(Value(snapshot.revision), current))
     else:
         rows = rows.filter(revision=snapshot.revision)
-    for deadline in plan.caveat_deadlines:
+    for deadline in policy.caveat_deadlines:
         comparison = (
             LessThan(Now(), Value(deadline, output_field=models.DateTimeField()))
-            if plan.selected_at < deadline
+            if policy.selected_at < deadline
             else GreaterThanOrEqual(Now(), Value(deadline, output_field=models.DateTimeField()))
         )
         rows = rows.filter(comparison)
     return rows
 
 
-def _compiler(
-    plan: _Plan,
-    key: tuple[str, str],
-    actor: SubjectRef,
-    *,
-    context: Mapping[str, Any] | None,
-    using: str,
-) -> Compiler:
-    schema = plan.tagged.schema
-    verdicts = CaveatVerdicts.prepare(schema, key, context=context, using=using)
-    return Compiler(schema, actor, using, tagged=plan.tagged, verdicts=verdicts, now=Now())
+# ---------- Kept statements ----------
 
 
-def _point_at(resource: ObjectRef) -> At:
-    return At(resource.resource_type, Value(resource.resource_id), None, False)
+class _Sql(Expression):
+    """``EXISTS`` over Django-compiled SQL whose parameters are already bound."""
+
+    def __init__(self, sql: str, params: Iterable[Any]) -> None:
+        super().__init__(output_field=models.BooleanField())
+        self.sql = sql
+        self.params = tuple(params)
+
+    def as_sql(self, compiler: Any, connection: Any) -> tuple[str, tuple[Any, ...]]:
+        return f"EXISTS {self.sql}", self.params
+
+
+@dataclass(frozen=True)
+class _Operation:
+    """What one statement is compiled for: a policy, an actor and a clock."""
+
+    backend: LocalBackend
+    policy: _Policy
+    actor: SubjectRef
+    using: str
+    context: Mapping[str, Any] | None
+    now: Expression
+    shape: tuple[Any, ...]
+    keep: bool
+    _verdicts: dict[Key, CaveatVerdicts] = field(default_factory=dict)
+
+    @classmethod
+    def begin(
+        cls,
+        backend: LocalBackend,
+        actor: SubjectRef,
+        using: str,
+        context: Mapping[str, Any] | None = None,
+        policy: _Policy | None = None,
+    ) -> _Operation:
+        policy = policy if policy is not None else _policy(backend)
+        now = Now()
+        return cls(
+            backend,
+            policy,
+            actor,
+            using,
+            context,
+            now,
+            (
+                policy.key,
+                actor_shape(policy.schema, actor, using),
+                using,
+                connections[using].vendor,
+                app_settings.REBAC_DEPTH_LIMIT,
+                active_relationship_model()._meta.label_lower,
+            ),
+            # A statement can be kept when nothing in it varies but the
+            # actor's id: the database clock, and no caveat verdict lists.
+            isinstance(now, _DatabaseNow),
+        )
+
+    def verdicts(self, key: Key) -> CaveatVerdicts:
+        found = self._verdicts.get(key)
+        if found is None:
+            found = self._verdicts[key] = CaveatVerdicts.prepare(
+                self.policy.schema, key, context=self.context, using=self.using
+            )
+        return found
+
+    def compiler(
+        self,
+        verdicts: CaveatVerdicts,
+        facts: Mapping[Fact, bool] | None = None,
+        *,
+        parametric: bool = True,
+    ) -> Compiler:
+        return Compiler(
+            self.policy.schema,
+            self.actor,
+            self.using,
+            tagged=self.policy.tagged,
+            verdicts=verdicts,
+            now=self.now,
+            program=self.policy.program,
+            parametric=parametric,
+            facts=facts,
+        )
+
+    def gate(self, *, parametric: bool = True) -> models.QuerySet[Any]:
+        return _fence(self.policy, backend=self.backend, using=self.using, parametric=parametric)
+
+    def statement(
+        self,
+        key: tuple[Any, ...],
+        verdicts: CaveatVerdicts,
+        build: Callable[[], models.QuerySet[Any] | bool | tuple[models.QuerySet[Any], bool]],
+    ) -> _Kept | bool:
+        """The SQL of ``build()``; a bool when it needs no rows to be decided."""
+        keep = self.keep and verdicts.empty
+        full = (*self.shape, *key)
+        if keep:
+            with _lock:
+                kept = _statements.get(full)
+                if kept is not None:
+                    _statements.move_to_end(full)
+                    return kept
+        built = build()
+        compiled: _Kept | bool
+        if isinstance(built, bool):
+            compiled = built
+        else:
+            rows, every = built if isinstance(built, tuple) else (built, False)
+            sql, params = _Compiled(rows).as_sql(None, connections[self.using])
+            compiled = _Kept(sql, params, every)
+        if keep:
+            with _lock:
+                _statements[full] = compiled
+                while len(_statements) > _LIMIT:
+                    _statements.popitem(last=False)
+        return compiled
+
+    def bound(self, params: Iterable[Any], resource_id: str | None = None) -> list[Any]:
+        result = []
+        for param in bind(params, self.actor, connections[self.using]):
+            if param is _MANUAL_REVISION:
+                result.append(self.backend._manual_schema_revision())
+            elif param is _RESOURCE_WIRE:
+                result.append(resource_id)
+            else:
+                result.append(param)
+        return result
+
+    # ---------- Facts about fixed objects ----------
+
+    def decide(self, key: Key, verdicts: CaveatVerdicts) -> dict[Fact, bool]:
+        """Decide, in one statement, every fixed-object fact ``key`` can use."""
+        decided: dict[Fact, bool] = {}
+        probes: dict[str, _Sql] = {}
+        names: dict[str, Fact] = {}
+        for number, fact in enumerate(const_facts(self.policy.schema, self.policy.program, key)):
+            compiled = self.statement(
+                ("fact", fact), verdicts, lambda fact=fact: self._fact_rows(fact, verdicts)
+            )
+            if isinstance(compiled, bool):
+                decided[fact] = compiled
+            else:
+                name = f"_rebac_fact_{number}"
+                names[name] = fact
+                probes[name] = _Sql(compiled.sql, self.bound(compiled.params))
+        if probes:
+            row = (
+                SchemaGeneration.objects.using(self.using)
+                .filter(pk=1)
+                .annotate(**probes)
+                .values(*probes)
+                .first()
+            )
+            for name, fact in names.items():
+                decided[fact] = bool(row[name]) if row is not None else False
+        return decided
+
+    def _fact_rows(self, fact: Fact, verdicts: CaveatVerdicts) -> models.QuerySet[Any] | bool:
+        condition = self.compiler(verdicts).fact_q(fact)
+        if is_true(condition) or is_false(condition):
+            return is_true(condition)
+        return (
+            SchemaGeneration.objects.using(self.using).filter(pk=1).filter(condition).values("pk")
+        )
+
+    def witness(
+        self, used: Iterable[Fact], decided: Mapping[Fact, bool], verdicts: CaveatVerdicts
+    ) -> Q:
+        """Each decision used must still be true of the statement's own snapshot."""
+        inline = self.compiler(verdicts)
+        parts = []
+        for fact in sorted(used, key=str):
+            condition = inline.fact_q(fact)
+            parts.append(condition if decided[fact] else _not(condition))
+        return _and(*parts)
 
 
 def _model_at(model: type[models.Model]) -> At:
     identity = resource_id_attr(model)
-    _, field = model_identity_fields(model, identity)
+    _, identity_field = model_identity_fields(model, identity)
     resource_type = model_resource_type(model)
     if resource_type is None:
         raise ValueError(f"{model.__name__} has no REBAC resource type")
-    return At(resource_type, F(identity), field, True)
+    return At(resource_type, F(identity), identity_field, True)
+
+
+# ---------- Point checks ----------
+
+
+def _point(operation: _Operation, key: Key, resource_id: str, which: str) -> bool:
+    """One bound of ``key`` at one identity, as one statement."""
+    verdicts = operation.verdicts(key)
+
+    def build() -> models.QuerySet[Any] | bool:
+        compiler = operation.compiler(verdicts)
+        at = At(key[0], _Param(_RESOURCE_WIRE, models.TextField()), None, False)
+        if which == "depth":
+            condition = compiler.depth_unknown(key, at)
+        else:
+            condition = compiler.holds(key, at, Bound(which))
+        if is_false(condition):
+            return False
+        rows = operation.gate()
+        return (rows if is_true(condition) else rows.filter(condition)).values("pk")
+
+    compiled = operation.statement(("point", key, which), verdicts, build)
+    if isinstance(compiled, bool):
+        return compiled and operation.gate(parametric=False).exists()
+    probe = _Sql(compiled.sql, operation.bound(compiled.params, resource_id))
+    return SchemaGeneration.objects.using(operation.using).filter(pk=1).filter(Q(probe)).exists()
 
 
 def _point_result(
@@ -151,25 +425,22 @@ def _point_result(
     context: Mapping[str, Any] | None,
     using: str,
     lower_only: bool = False,
-) -> tuple[bool, bool, bool, _Plan]:
-    plan = _plan(backend)
+) -> tuple[bool, bool, bool, _Policy]:
+    operation = _Operation.begin(backend, actor, using, context)
     key = resource.resource_type, action
-    compiler = _compiler(plan, key, actor, context=context, using=using)
-    at = _point_at(resource)
-    lower = compiler.holds(key, at, Bound.LOWER)
-    rows = _fence(plan, backend=backend, using=using)
     # Only LOWER may authorize, and it is one SQL statement with every fact
     # witnessed in that statement.  Subsequent probes can only return NO,
-    # CONDITIONAL, or a depth error.  This split also bounds SQLite expression
-    # depth for recursive policies without compromising READ COMMITTED safety.
-    if rows.filter(lower).exists():
-        return True, True, False, plan
-    if lower_only:
-        return False, False, False, plan
-    if not rows.filter(compiler.holds(key, at, Bound.UPPER)).exists():
-        return False, False, False, plan
-    deep = compiler.has_recursion(key) and rows.filter(compiler.depth_unknown(key, at)).exists()
-    return False, True, deep, plan
+    # CONDITIONAL, or a depth error.
+    if _point(operation, key, resource.resource_id, "lower"):
+        return True, True, False, operation.policy
+    recursive = bool(operation.policy.program.reachable(key) & operation.policy.program.recursive)
+    # The bounds differ only where a caveat or a recursion is in reach.
+    if lower_only or not (recursive or not operation.verdicts(key).empty):
+        return False, False, False, operation.policy
+    if not _point(operation, key, resource.resource_id, "upper"):
+        return False, False, False, operation.policy
+    deep = recursive and _point(operation, key, resource.resource_id, "depth")
+    return False, True, deep, operation.policy
 
 
 @schema_operation
@@ -214,7 +485,7 @@ def check(
         )
         return CheckResult.has() if ids.exists() else CheckResult.no()
 
-    lower, upper, deep, plan = _point_result(
+    lower, upper, deep, policy = _point_result(
         backend=backend,
         resource=resource,
         action=action,
@@ -230,7 +501,7 @@ def check(
     # only the SQL lower bound above may allow.  A reduced Boolean formula
     # reports only the caveat instances that can still change this result.
     uncertainty = residual(
-        schema=plan.effective,
+        schema=policy.effective,
         resource=resource,
         action=action,
         actor=actor,
@@ -246,31 +517,45 @@ def check(
     return CheckResult.no()
 
 
-def _scope_q_now(
-    backend: LocalBackend,
-    plan: _Plan,
-    model: type[models.Model],
-    action: str,
-    actor: SubjectRef,
-    using: str,
-) -> Q:
-    resource_type = model_resource_type(model)
-    if resource_type is None:
-        return Q(pk__in=[])
-    key = resource_type, action
-    compiler = _compiler(plan, key, actor, context=None, using=using)
-    return Q(Exists(_fence(plan, backend=backend, using=using))) & compiler.holds(
-        key, _model_at(model), Bound.LOWER
-    )
+# ---------- Scopes ----------
 
 
-class _LiveScopeIds(Expression):
-    """Compile a complete child queryset when a lazy scope statement runs.
+def _scope_statement(operation: _Operation, model: type[models.Model], key: Key) -> _Kept | bool:
+    """The ids of ``model`` the actor holds ``key`` on, as SQL.
 
-    Schema overrides and caveat instances can change after a queryset was
-    constructed.  Building the child query here refreshes both without
-    introducing joins into an already resolved outer query.  The child still
-    carries the policy fence and witnesses all mutable tuple facts in SQL.
+    ``False`` when there are none.  ``every`` is set when every row qualifies
+    and the SQL is only the gate: the policy fence and the fact witnesses.
+    """
+    verdicts = operation.verdicts(key)
+    decided = operation.decide(key, verdicts)
+    vector = tuple(sorted((str(fact), value) for fact, value in decided.items()))
+
+    def build() -> bool | tuple[models.QuerySet[Any], bool]:
+        compiler = operation.compiler(verdicts, decided)
+        predicate = compiler.holds(key, _model_at(model), Bound.LOWER)
+        if is_false(predicate):
+            return False
+        witness = operation.witness(compiler.used_facts, decided, verdicts)
+        if is_false(witness):
+            return False
+        gate = operation.gate()
+        if is_true(predicate):
+            return (gate if is_true(witness) else gate.filter(witness)).values("pk"), True
+        # The row predicate goes last: it holds the nested subqueries.
+        condition = Q(Exists(gate))
+        if not is_true(witness):
+            condition &= witness
+        rows = model._base_manager.using(operation.using).filter(condition & predicate)
+        return rows.order_by().values(resource_id_attr(model)), False
+
+    return operation.statement(("scope", model._meta.label_lower, key, vector), verdicts, build)
+
+
+class _Scope(Expression):
+    """The scope of one queryset, decided when its statement is compiled.
+
+    Schema overrides, caveat instances and fixed-object facts can change after
+    a queryset was constructed, so nothing is prepared before this point.
     """
 
     def __init__(
@@ -282,30 +567,37 @@ class _LiveScopeIds(Expression):
         using: str,
         revision: str | None,
     ) -> None:
-        identity = resource_id_attr(model)
-        _, field = model_identity_fields(model, identity)
-        super().__init__(output_field=field)
+        super().__init__(output_field=models.BooleanField())
         self.backend = backend
         self.model = model
         self.action = action
         self.actor = actor
         self.using = using
         self.revision = revision
+        self.lhs: Any = F(resource_id_attr(model))
+
+    def get_source_expressions(self) -> list[Any]:
+        return [self.lhs]
+
+    def set_source_expressions(self, expressions: Any) -> None:
+        [self.lhs] = expressions
 
     @schema_operation
     def as_sql(self, compiler: Any, connection: Any) -> tuple[str, tuple[Any, ...]]:
-        identity = resource_id_attr(self.model)
-        plan = _plan(self.backend)
-        rows = self.model._base_manager.using(self.using)
-        if plan.snapshot.revision != self.revision:
-            ids = rows.none().values(identity)
-        else:
-            predicate = _scope_q_now(
-                self.backend, plan, self.model, self.action, self.actor, self.using
-            )
-            ids = rows.filter(predicate).order_by().values(identity)
-        sql, params = compiler.compile(Subquery(ids))
-        return sql, tuple(params)
+        resource_type = model_resource_type(self.model)
+        policy = _policy(self.backend)
+        if resource_type is None or policy.snapshot.revision != self.revision:
+            return "(1 = 0)", ()
+        operation = _Operation.begin(self.backend, self.actor, self.using, policy=policy)
+        compiled = _scope_statement(operation, self.model, (resource_type, self.action))
+        if isinstance(compiled, bool):
+            # ``True`` cannot occur: a statement that admits rows is a gate.
+            return "(1 = 0)", ()
+        params = operation.bound(compiled.params)
+        if compiled.every:
+            return f"EXISTS {compiled.sql}", tuple(params)
+        lhs_sql, lhs_params = compiler.compile(self.lhs)
+        return f"({lhs_sql} IN {compiled.sql})", (*lhs_params, *params)
 
 
 @schema_operation
@@ -319,18 +611,23 @@ def scope_q(
 ) -> Q:
     if model_resource_type(model) is None:
         return Q(pk__in=[])
-    identity = resource_id_attr(model)
     _schema_at_build, snapshot = _schema(backend)
-    return Q(
-        In(F(identity), _LiveScopeIds(backend, model, action, actor, using, snapshot.revision))
-    )
+    return Q(_Scope(backend, model, action, actor, using, snapshot.revision))
 
 
-def _tuple_universe(
-    resource_type: str,
-    *,
-    using: str,
+# ---------- Enumeration ----------
+
+
+def _named_parts(
+    resource_type: str, *, schema: Schema, using: str
 ) -> Iterable[tuple[models.QuerySet[Any], str]]:
+    """Identities of the type that no model row carries, as wire-id querysets.
+
+    They are the ids that tuples name at either end, the fixed targets of
+    constants, and the containers of attribute backings.  A foreign key can
+    only name an existing row, so a field backing adds ids only when its
+    target model keeps no rows.
+    """
     rows = cast(Any, active_relationship_model().objects.using(using)).index_projection()
     for type_column, id_column in (
         ("resource_type", "resource_id"),
@@ -340,66 +637,27 @@ def _tuple_universe(
             rows.filter(**{type_column: resource_type}).exclude(**{f"{id_column}__in": ("", "*")}),
             id_column,
         )
-
-
-def _universe_parts(
-    *, resource_type: str, schema: Schema, using: str
-) -> Iterable[tuple[models.QuerySet[Any], str, At]]:
-    model = model_for_resource_type(resource_type)
-    subject_model = model_for_subject_type(resource_type) if model is None else None
-    if model is None and subject_model is not None:
-        model = subject_model[0]
-    if model is not None and stores_rows(model):
-        identity = subject_model[1] if subject_model is not None else resource_id_attr(model)
-        codec = identity_codec(model, identity)
-        rows = (
-            model._base_manager.using(using)
-            .order_by()
-            .annotate(_rebac_wire_id=codec.to_wire(identity))
-            .exclude(_rebac_wire_id__isnull=True)
-        )
-        if model_resource_type(model) == resource_type:
-            yield rows, "_rebac_wire_id", _model_at(model)
-        else:
-            # A configured User/Group mapping can have no RebacMixin model.
-            yield rows, "_rebac_wire_id", At(resource_type, F("_rebac_wire_id"), None, False)
-    for rows, id_column in _tuple_universe(resource_type, using=using):
-        yield rows, id_column, At(resource_type, F(id_column), None, False)
+    one_row = SchemaGeneration.objects.using(using).filter(pk=1)
     for definition in schema.definitions:
         for relation in definition.relations:
-            if (
-                isinstance(relation.backing, FieldBinding)
-                and relation.allowed_subjects
-                and relation.allowed_subjects[0].type == resource_type
-            ):
+            targets_type = bool(
+                relation.allowed_subjects and relation.allowed_subjects[0].type == resource_type
+            )
+            if targets_type and isinstance(relation.backing, ConstBinding):
+                fixed = Value(relation.backing.target_id, output_field=models.CharField())
+                yield one_row.annotate(_rebac_wire_id=fixed), "_rebac_wire_id"
+            if targets_type and isinstance(relation.backing, FieldBinding):
                 resolved_field = resolve_field_backing(definition, relation)
-                if resolved_field is not None:
-                    target_codec = identity_codec(
+                if resolved_field is not None and not stores_rows(resolved_field.target_model):
+                    codec = identity_codec(
                         resolved_field.target_model, resolved_field.target_id_attr
                     )
-                    backing_rows = (
+                    yield (
                         resolved_field.queryset(using=using)
                         .order_by()
-                        .annotate(
-                            _rebac_wire_id=target_codec.to_wire(resolved_field.target_values_path())
-                        )
-                        .exclude(_rebac_wire_id__isnull=True)
-                    )
-                    yield (
-                        backing_rows,
+                        .annotate(_rebac_wire_id=codec.to_wire(resolved_field.target_values_path()))
+                        .exclude(_rebac_wire_id__isnull=True),
                         "_rebac_wire_id",
-                        At(resource_type, F("_rebac_wire_id"), None, False),
-                    )
-            if relation.allowed_subjects and relation.allowed_subjects[0].type == resource_type:
-                if isinstance(relation.backing, ConstBinding):
-                    fixed = relation.backing.target_id
-                    rows = SchemaGeneration.objects.using(using).annotate(
-                        _rebac_wire_id=Value(fixed, output_field=models.CharField())
-                    )
-                    yield (
-                        rows,
-                        "_rebac_wire_id",
-                        At(resource_type, F("_rebac_wire_id"), None, False),
                     )
             if definition.resource_type != resource_type or not isinstance(
                 relation.backing, AttributeBinding
@@ -409,11 +667,10 @@ def _universe_parts(
             if attribute is None:
                 continue
             if attribute.resource is not None:
-                rows = SchemaGeneration.objects.using(using).annotate(
-                    _rebac_wire_id=Value(attribute.resource, output_field=models.CharField())
-                )
+                container = Value(attribute.resource, output_field=models.CharField())
+                yield one_row.annotate(_rebac_wire_id=container), "_rebac_wire_id"
             else:
-                rows = (
+                yield (
                     attribute.target_model._base_manager.using(using)
                     .filter(**attribute.filters)
                     .annotate(
@@ -421,38 +678,9 @@ def _universe_parts(
                             attribute.target_model, attribute.field.name
                         ).to_wire(attribute.field.name)
                     )
-                    .exclude(_rebac_wire_id__isnull=True)
+                    .exclude(_rebac_wire_id__isnull=True),
+                    "_rebac_wire_id",
                 )
-            yield rows, "_rebac_wire_id", At(resource_type, F("_rebac_wire_id"), None, False)
-
-
-def _accessible_now(
-    *,
-    backend: LocalBackend,
-    plan: _Plan,
-    resource_type: str,
-    action: str,
-    actor: SubjectRef,
-    using: str,
-    context: Mapping[str, Any] | None = None,
-) -> models.QuerySet[Any]:
-    key = resource_type, action
-    compiler = _compiler(plan, key, actor, context=context, using=using)
-    fence = Q(Exists(_fence(plan, backend=backend, using=using)))
-    branches = [
-        rows.filter(fence & compiler.holds(key, at, Bound.LOWER))
-        .order_by()
-        .values_list(column, flat=True)
-        for rows, column, at in _universe_parts(
-            resource_type=resource_type, schema=plan.tagged.schema, using=using
-        )
-    ]
-    if branches:
-        return branches[0].union(*branches[1:])
-    return cast(
-        models.QuerySet[Any],
-        active_relationship_model().objects.using(using).none().values_list("pk", flat=True),
-    )
 
 
 @dataclass(frozen=True)
@@ -468,27 +696,89 @@ class _AccessibleResources:
     revision: str | None
 
     @schema_operation
-    def _query(self) -> models.QuerySet[Any]:
-        plan = _plan(self.backend)
-        if plan.snapshot.revision != self.revision:
-            return (
-                SchemaGeneration.objects.using(self.using).none().values_list("revision", flat=True)
-            )
-        return _accessible_now(
-            backend=self.backend,
-            plan=plan,
-            resource_type=self.resource_type,
-            action=self.action,
-            actor=self.actor,
-            using=self.using,
-            context=self.context,
-        )
+    def _branches(self) -> list[tuple[models.QuerySet[Any], Callable[[Any], str | None]]]:
+        policy = _policy(self.backend)
+        if policy.snapshot.revision != self.revision:
+            return []
+        operation = _Operation.begin(self.backend, self.actor, self.using, self.context, policy)
+        return _accessible_branches(self, operation)
 
     def __iter__(self) -> Iterator[str]:
-        return iter(self._query())
+        seen: set[str] = set()
+        for rows, wire in self._branches():
+            for value in rows.iterator(chunk_size=1000):
+                converted = wire(value)
+                if converted is not None and converted not in seen:
+                    seen.add(converted)
+                    yield converted
 
     def exists(self) -> bool:
-        return self._query().exists()
+        return any(rows.exists() for rows, _wire in self._branches())
+
+
+def _accessible_branches(
+    self: _AccessibleResources, operation: _Operation
+) -> list[tuple[models.QuerySet[Any], Callable[[Any], str | None]]]:
+    """One queryset per part of the type's universe, with its id conversion."""
+    policy = operation.policy
+    key = self.resource_type, self.action
+    verdicts = operation.verdicts(key)
+    compiler = operation.compiler(verdicts, parametric=False)
+    gate = Q(Exists(operation.gate(parametric=False)))
+    branches: list[tuple[models.QuerySet[Any], Callable[[Any], str | None]]] = []
+
+    model = model_for_resource_type(self.resource_type)
+    if model is not None and stores_rows(model):
+        identity = resource_id_attr(model)
+        codec = identity_codec(model, identity)
+
+        def wire(value: Any) -> str | None:
+            try:
+                return codec.wire(value, using=self.using)
+            except SchemaError:
+                return None
+
+        if self.context is None:
+            condition = Q(
+                _Scope(self.backend, model, self.action, self.actor, self.using, self.revision)
+            )
+        else:
+            condition = gate & compiler.holds(key, _model_at(model), Bound.LOWER)
+        rows = model._base_manager.using(self.using).filter(condition)
+        branches.append((rows.order_by().values_list(identity, flat=True), wire))
+    elif model is None:
+        # A configured User or Group mapping has rows but no resource model.
+        subject = model_for_subject_type(self.resource_type)
+        if subject is not None and stores_rows(subject[0]):
+            subject_codec = identity_codec(subject[0], subject[1])
+            subject_rows = (
+                subject[0]
+                ._base_manager.using(self.using)
+                .order_by()
+                .annotate(_rebac_wire_id=subject_codec.to_wire(subject[1]))
+                .exclude(_rebac_wire_id__isnull=True)
+            )
+            at = At(self.resource_type, F("_rebac_wire_id"), None, False)
+            branches.append(
+                (
+                    subject_rows.filter(gate & compiler.holds(key, at, Bound.LOWER))
+                    .order_by()
+                    .values_list("_rebac_wire_id", flat=True),
+                    lambda value: value or None,
+                )
+            )
+    for named, column in _named_parts(self.resource_type, schema=policy.schema, using=self.using):
+        at = At(self.resource_type, F(column), None, False)
+        branches.append(
+            (
+                named.filter(gate & compiler.holds(key, at, Bound.LOWER))
+                .order_by()
+                .values_list(column, flat=True)
+                .distinct(),
+                lambda value: value or None,
+            )
+        )
+    return branches
 
 
 @schema_operation
@@ -538,65 +828,21 @@ def lookup_subjects(
     using: str,
     context: Mapping[str, Any] | None = None,
 ) -> list[SubjectRef]:
+    """The subjects of a type that hold the permission on one resource.
+
+    Candidates are the subjects that tuples, backed columns and constants
+    name on a path from the resource; each is then tested by the lower bound.
+    """
     schema, _snapshot = _schema(backend)
-    candidates: set[SubjectRef] = set()
-    rows = cast(Any, active_relationship_model().objects.using(using)).index_projection()
-    for id_, relation in (
-        rows.filter(subject_type=subject_type)
-        .values_list("subject_id", "subject_relation")
-        .iterator(chunk_size=1000)
-    ):
-        if id_:
-            candidates.add(SubjectRef.of(subject_type, id_, relation))
-    for id_ in (
-        rows.filter(resource_type=subject_type)
-        .values_list("resource_id", flat=True)
-        .iterator(chunk_size=1000)
-    ):
-        if id_ and id_ != "*":
-            candidates.add(SubjectRef.of(subject_type, id_))
-    target = model_for_subject_type(subject_type)
-    allowed_relations = {
-        allowed.relation
-        for definition in schema.definitions
-        for relation in definition.relations
-        for allowed in relation.allowed_subjects
-        if allowed.type == subject_type and allowed.relation
-    }
-    if target is not None and stores_rows(target[0]):
-        model, identity = target
-        codec = identity_codec(model, identity)
-        for id_ in (
-            model._base_manager.using(using)
-            .annotate(_rebac_wire_id=codec.to_wire(identity))
-            .values_list("_rebac_wire_id", flat=True)
-            .iterator(chunk_size=1000)
-        ):
-            if id_:
-                candidates.add(SubjectRef.of(subject_type, id_))
-                candidates.update(
-                    SubjectRef.of(subject_type, id_, relation) for relation in allowed_relations
-                )
-    for definition in schema.definitions:
-        for relation in definition.relations:
-            if isinstance(relation.backing, ConstBinding):
-                for allowed in relation.allowed_subjects:
-                    if allowed.type == subject_type:
-                        candidates.add(
-                            SubjectRef.of(
-                                subject_type, relation.backing.target_id, allowed.relation
-                            )
-                        )
-    named = named_candidates(
-        schema=schema,
-        resource=resource,
-        action=action,
-        candidates=candidates,
-        using=using,
-    )
     return [
         candidate
-        for candidate in named
+        for candidate in named_subjects(
+            schema=schema,
+            resource=resource,
+            action=action,
+            subject_type=subject_type,
+            using=using,
+        )
         if _point_result(
             backend=backend,
             resource=resource,

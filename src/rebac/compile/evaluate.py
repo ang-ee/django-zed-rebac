@@ -457,6 +457,67 @@ class _Evaluator:
             for row in self._rows(resource, relation, definition)
         )
 
+    def subjects(
+        self,
+        resource: ObjectRef,
+        name: str,
+        subject_type: str,
+        seen: frozenset[tuple[ObjectRef, str]] = frozenset(),
+    ) -> set[SubjectRef]:
+        """Every subject of ``subject_type`` that ``named`` would accept here."""
+
+        key = resource, name
+        if key in seen:
+            return set()
+        definition = self.schema.get_definition(resource.resource_type)
+        if definition is None:
+            return set()
+        seen = seen | {key}
+        permission = self.schema.get_permission(resource.resource_type, name)
+        if permission is not None:
+            return self._subjects_expr(
+                permission.expression, definition, resource, subject_type, seen
+            )
+        relation = find_relation(definition, name)
+        if relation is None:
+            return set()
+        found: set[SubjectRef] = set()
+        for row in self._rows(resource, relation, definition):
+            if row.subject.subject_type == subject_type and row.subject.subject_id:
+                found.add(row.subject)
+            if row.subject.optional_relation:
+                found |= self.subjects(
+                    row.subject.object, row.subject.optional_relation, subject_type, seen
+                )
+        return found
+
+    def _subjects_expr(
+        self,
+        expr: PermExpr,
+        definition: Definition,
+        resource: ObjectRef,
+        subject_type: str,
+        seen: frozenset[tuple[ObjectRef, str]],
+    ) -> set[SubjectRef]:
+        if isinstance(expr, PermRef):
+            if expr.name in {"anonymous", "authenticated"}:
+                return set()
+            return self.subjects(resource, expr.name, subject_type, seen)
+        if isinstance(expr, PermArrow):
+            relation = find_relation(definition, expr.via)
+            if relation is None:
+                return set()
+            found: set[SubjectRef] = set()
+            for row in self._rows(resource, relation, definition):
+                found |= self.subjects(row.subject.object, expr.target, subject_type, seen)
+            return found
+        if isinstance(expr, PermBinOp):
+            left = self._subjects_expr(expr.left, definition, resource, subject_type, seen)
+            if expr.op == "-":
+                return left
+            return left | self._subjects_expr(expr.right, definition, resource, subject_type, seen)
+        return set()
+
     def _named_expr(
         self,
         expr: PermExpr,
@@ -497,21 +558,19 @@ def residual(
     return _Evaluator(schema, actor, context, using, timezone.now()).residual(resource, action)
 
 
-def named_candidates(
+def named_subjects(
     *,
     schema: Schema,
     resource: ObjectRef,
     action: str,
-    candidates: set[SubjectRef],
+    subject_type: str,
     using: str,
 ) -> list[SubjectRef]:
-    """Retain subjects actually named by a source path to ``action``."""
+    """The subjects of a type that a source path from ``resource`` names.
 
-    # Naming does not use the actor, but shares its backing/tuple row cache
-    # across every candidate for this one resource.
+    Only the tuples, backed columns and constants on paths above this one
+    resource are read; no table is enumerated.
+    """
+
     evaluator = _Evaluator(schema, SubjectRef.of("rebac/internal", ""), None, using, timezone.now())
-    return [
-        candidate
-        for candidate in sorted(candidates, key=str)
-        if evaluator.named(resource, action, candidate)
-    ]
+    return sorted(evaluator.subjects(resource, action, subject_type), key=str)

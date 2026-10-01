@@ -216,12 +216,12 @@ def test_revision_change_during_lazy_compilation_cannot_replace_the_pinned_polic
         rows = Post._base_manager.filter(
             scope_q(backend=local, model=Post, action="read", actor=actor, using="default")
         )
-        seam = "_scope_q_now"
+        seam = "_scope_statement"
     else:
         rows = accessible_ids(
             backend=local, resource_type="blog/post", action="read", actor=actor, using="default"
         )
-        seam = "_accessible_now"
+        seam = "_accessible_branches"
     compile_now = getattr(read, seam)
 
     def change_policy(*args, **kwargs):

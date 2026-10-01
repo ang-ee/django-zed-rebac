@@ -1,4 +1,4 @@
-"""Defects found reviewing the proposal-0015 prototype, pinned until fixed."""
+"""Regressions found reviewing the proposal-0015 prototype."""
 
 from __future__ import annotations
 
@@ -29,13 +29,6 @@ definition blog/post {
 """
 
 
-@pytest.mark.xfail(
-    strict=True,
-    reason=(
-        "proposal 0015: two arms over one multi-valued path share a join in a row scope, "
-        "so the intersection is under-approximated and its exclusion grants"
-    ),
-)
 def test_intersection_over_one_multivalued_path_agrees_with_the_index():
     """A post in two collections: the actor reads one and edits the other.
 
