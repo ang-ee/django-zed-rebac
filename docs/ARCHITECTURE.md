@@ -1709,6 +1709,45 @@ is not a stored set, and an actor found in more than 256 sets is not
 decided: membership is then compiled inline, as the closure described under
 [Recursion](#recursion).
 
+#### Decided rows
+
+A scope reaches other tables through arrows: a file through its folder, a
+part through its message and that message's thread. Compiled inline, each
+arrow is a subquery whose size the planner cannot know, and a hierarchy is
+tested for every row of its table. A scope therefore decides the small sets
+first:
+
+1. **Arrow targets.** For an arrow over a field- or attribute-backed
+   relation, the rows of the target model on which the actor holds the target
+   permission are selected by their own statement, limited to 501 rows. Up to
+   500 rows, the arrow is compiled as `column IN (keys)`. The target's
+   statement is compiled the same way, so its own arrows are lists too.
+2. **Hierarchies.** For `p = base + parent->p` over a self foreign key, the
+   rows that hold `base` are selected, then their children by the parent
+   column, level by level to `REBAC_DEPTH_LIMIT` or until a level is empty:
+   the same rows as the inline form, reached from the seeds instead of from
+   every row. A scope over the hierarchy's own model uses the set as well.
+3. **Fallback.** A set over 500 rows, a target every row of which holds the
+   permission, and a node that is being decided stay inline, as the subquery
+   or the ancestor chain described above.
+4. **Witness.** A decided set is a lower bound. The scope statement re-reads
+   it in its own snapshot: each listed row still holds the permission (the
+   permission's own predicate, evaluated on the listed keys only), and in a
+   hierarchy each row below a seed still hangs under a row of the set. When a
+   witness fails the scope selects nothing; the next operation decides
+   afresh.
+
+Decided rows are used by queryset scopes and by what is built on them
+(`accessible()` without a context, bulk guards, the backed-edge gate over
+more than four rows). A point check stays one statement at its one object.
+A statement that carries decided keys is compiled for that operation and is
+not kept. Nothing is kept between operations: the sets depend on model rows,
+which change without the library seeing it.
+
+A union is compiled constants first (an arrow over a const-backed relation,
+`authenticated`), and stops at the first arm that holds outright, so an
+administrator's scope decides nothing.
+
 #### Kept statements and the policy fence
 
 A statement is compiled once and kept as Django's SQL with placeholders. The
@@ -1862,7 +1901,7 @@ needs one is not in its lower bound.
 | Operation | Implementation |
 |---|---|
 | `check_access()` | The actor's stored sets, when one is in reach. Then the lower bound at the resource id, selected from the fenced generation row: one statement, which alone can answer `HAS`. When it does not hold and neither a caveat nor a recursion is in reach, the answer is `NO`. Otherwise the upper bound is a second statement: when it fails, `NO`. Otherwise, when a recursion is in reach, a third statement probes whether the uncertainty is depth, and the residual evaluator names what is undecided. |
-| Queryset scope (`queryset_filter()`) | `Model.filter(holds(key, At(type, identity column, identity field, row=True), LOWER))`, decided when the statement that embeds it is compiled. |
+| Queryset scope (`queryset_filter()`) | `Model.filter(holds(key, At(type, identity column, identity field, row=True), LOWER))`, decided when the statement that embeds it is compiled, after the small row sets in its reach (see [Decided rows](#decided-rows)). |
 | `accessible()` | The lower bound over each part of the type's universe: the model's rows, the ids that tuples name at either end, constant targets, attribute containers, and field-backed targets whose model stores no rows. Wildcard and empty ids are excluded and the result is deduplicated. |
 | `lookup_subjects()` | Candidates are the subjects that tuples, backed columns and constants name on a path from the one resource; each is tested by its own point check, so the cost grows with the number of candidates. |
 | Model-level check (empty resource id) | A row-independent grant, or any accessible identity of the type. |
@@ -1991,6 +2030,10 @@ of its own.
 - An operation whose permission reaches a stored set costs the expansion
   statements before its own, once per evaluator scope; outside a scope, at
   every operation.
+- A scope costs one statement per decided arrow target in its reach, and one
+  per level of a decided hierarchy, at every operation. They are index
+  lookups for a sparse actor; their number follows the schema and the depth
+  of the accessible subtree, not the size of the tables.
 - Permissions that recurse through each other are unrolled without a
   convergence test (see [Recursion](#recursion)).
 - Statement size follows the unfolded permission, times the depth limit for

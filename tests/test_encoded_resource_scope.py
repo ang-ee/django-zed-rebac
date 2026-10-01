@@ -240,7 +240,7 @@ def test_encoded_owner_corpus_is_not_enumerated_for_sparse_tuple_grants(
     assert large_cost[0] <= 16
     # A fixed statement, independent of the corpus. The count changes only
     # with the compiler.
-    assert large_cost[1] == 70
+    assert large_cost[1] == 37
 
 
 @pytest.mark.parametrize("active", STORAGE_TIERS, indirect=True)

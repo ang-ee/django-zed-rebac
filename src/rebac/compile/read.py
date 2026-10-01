@@ -49,6 +49,7 @@ from .evaluate import named_subjects, residual
 from .predicate import (
     ActorSets,
     Fact,
+    SelfChain,
     Support,
     _and,
     _Compiled,
@@ -72,6 +73,8 @@ _LIMIT = 512
 # An actor in more stored sets than this keeps their membership inside the
 # statement, as a closure over the tuple table.
 _SET_LIMIT = 256
+# A set of target rows larger than this stays a subquery of the statement.
+_ROW_LIMIT = 500
 _lock = RLock()
 
 
@@ -227,6 +230,145 @@ class _Sql(Expression):
 
 
 @dataclass(frozen=True)
+class _Decision:
+    """The rows decided for one node, and what keeps the decision true."""
+
+    ids: tuple[Any, ...]
+    witness: Q
+    uses: frozenset[Key]
+
+
+class _Rows:
+    """Small sets of rows on which the actor holds a node, decided for one operation.
+
+    A scope reaches other tables through arrows: a file through its folder, a
+    part through its message and thread.  Compiled inline, each arrow is a
+    subquery whose size the planner cannot know, and a hierarchy is tested
+    for every row of its table.  When the set behind an arrow is small it is
+    decided first, by its own statement, and bound into the scope as a list
+    of keys, which the planner can drive an index from.  A set larger than
+    ``_ROW_LIMIT`` stays inline.
+
+    Every decision is a lower bound.  The statement that uses it re-reads it
+    in its own snapshot (``witness``): each listed row still holds the node,
+    so nothing is granted through a row that has left the set.
+    """
+
+    def __init__(self, operation: _Operation, verdicts: CaveatVerdicts) -> None:
+        self.operation = operation
+        self.verdicts = verdicts
+        self.asked = 0
+        self._found: dict[Key, _Decision | None] = {}
+        self._pending: set[Key] = set()
+
+    def rows(self, key: Key) -> tuple[Any, ...] | None:
+        self.asked += 1
+        if key not in self._found:
+            if key in self._pending:
+                # The node is being decided: its own body compiles it inline.
+                return None
+            self._pending.add(key)
+            try:
+                self._found[key] = self._decide(key)
+            finally:
+                self._pending.discard(key)
+        decision = self._found[key]
+        return decision.ids if decision is not None else None
+
+    def witness(self, used: Iterable[Key]) -> Q:
+        """Every decision the statement rests on, directly or through another one."""
+        parts: dict[Key, Q] = {}
+        pending = list(used)
+        while pending:
+            key = pending.pop()
+            decision = self._found.get(key)
+            if key in parts or decision is None:
+                continue
+            parts[key] = decision.witness
+            pending.extend(decision.uses)
+        return _and(*(parts[key] for key in sorted(parts)))
+
+    def _decide(self, key: Key) -> _Decision | None:
+        model = model_for_resource_type(key[0])
+        if model is None or not stores_rows(model):
+            return None
+        operation = self.operation
+        compiler = operation.compiler(self.verdicts, parametric=False, rows=self)
+        gate = Q(Exists(operation.gate(parametric=False)))
+        source = model._base_manager.using(operation.using).order_by()
+        chain = compiler.self_chain(key)
+        if chain is not None:
+            return self._closure(chain, source, gate, frozenset(compiler.used_rows))
+        identity = resource_id_attr(model)
+        member = compiler.holds(key, _model_at(model), Bound.LOWER)
+        uses = frozenset(compiler.used_rows)
+        if is_true(member):
+            return None
+        if is_false(member):
+            return _Decision((), _and(), uses)
+        ids = tuple(
+            source.filter(gate).filter(member).values_list(identity, flat=True)[: _ROW_LIMIT + 1]
+        )
+        if len(ids) > _ROW_LIMIT:
+            return None
+        if not ids:
+            return _Decision((), _and(), uses)
+        left = source.filter(**{f"{identity}__in": ids}).filter(_not(member))
+        return _Decision(ids, ~Q(Exists(left)), uses)
+
+    def _closure(
+        self, chain: SelfChain, source: models.QuerySet[Any], gate: Q, uses: frozenset[Key]
+    ) -> _Decision | None:
+        """A hierarchy followed from its seeds: the rows that hold the base,
+        then their children, level by level to the depth limit."""
+        if is_true(chain.base):
+            return None
+        if is_false(chain.base):
+            return _Decision((), _and(), uses)
+        seeds = list(
+            source.filter(gate)
+            .filter(chain.base)
+            .values_list(chain.identity, chain.target)[: _ROW_LIMIT + 1]
+        )
+        if len(seeds) > _ROW_LIMIT:
+            return None
+        known = dict(seeds)
+        frontier = [target for _identity, target in seeds]
+        for _ in range(app_settings.REBAC_DEPTH_LIMIT):
+            if not frontier:
+                break
+            children = list(
+                source.filter(**{f"{chain.parent}__in": frontier})
+                .exclude(**{f"{chain.identity}__in": list(known)})
+                .values_list(chain.identity, chain.target)[: _ROW_LIMIT + 1 - len(known)]
+            )
+            if len(known) + len(children) > _ROW_LIMIT:
+                return None
+            known.update(children)
+            frontier = [target for _identity, target in children]
+        if not known:
+            return _Decision((), _and(), uses)
+        held = [identity for identity, _target in seeds]
+        derived = [identity for identity in known if identity not in set(held)]
+        # The seeds still hold the base, and every other row still hangs under
+        # a row of the set: by induction each row still inherits.
+        parts = [
+            ~Q(Exists(source.filter(**{f"{chain.identity}__in": held}).filter(_not(chain.base))))
+        ]
+        if derived:
+            parts.append(
+                ~Q(
+                    Exists(
+                        source.filter(**{f"{chain.identity}__in": derived}).exclude(
+                            **{f"{chain.parent}__in": list(known.values())}
+                        )
+                    )
+                )
+            )
+        return _Decision(tuple(known), _and(*parts), uses)
+
+
+@dataclass(frozen=True)
 class _Operation:
     """What one statement is compiled for: a policy and an actor."""
 
@@ -239,6 +381,7 @@ class _Operation:
     _verdicts: dict[Key, CaveatVerdicts] = field(default_factory=dict)
     _roots: dict[int, Key] = field(default_factory=dict)
     _sets: dict[int, ActorSets | None] = field(default_factory=dict)
+    _rows: dict[int, _Rows] = field(default_factory=dict)
 
     @classmethod
     def begin(
@@ -397,12 +540,20 @@ class _Operation:
             decided[bound] = {found: frozenset(ids) for found, ids in members.items()}
         return ActorSets(keys, decided[Bound.LOWER], decided[Bound.UPPER], tuple(support))
 
+    def rows(self, verdicts: CaveatVerdicts) -> _Rows:
+        """The decider of small row sets for the verdicts' permission."""
+        token = id(verdicts)
+        if token not in self._rows:
+            self._rows[token] = _Rows(self, verdicts)
+        return self._rows[token]
+
     def compiler(
         self,
         verdicts: CaveatVerdicts,
         facts: Mapping[Fact, bool] | None = None,
         *,
         parametric: bool = True,
+        rows: _Rows | None = None,
     ) -> Compiler:
         return Compiler(
             self.policy.schema,
@@ -414,6 +565,7 @@ class _Operation:
             parametric=parametric,
             facts=facts,
             sets=self.sets(verdicts),
+            rows=rows,
         )
 
     def gate(self, *, parametric: bool = True) -> models.QuerySet[Any]:
@@ -437,7 +589,14 @@ class _Operation:
                 if kept is not None:
                     _statements.move_to_end(full)
                     return kept
+        decider = self._rows.get(id(verdicts))
+        asked = decider.asked if decider is not None else 0
         built = build()
+        decider = self._rows.get(id(verdicts))
+        if decider is not None and decider.asked != asked:
+            # The build consulted the decider: the statement names an actor's
+            # own rows, or would name them for another actor.
+            keep = False
         compiled: _Kept | bool
         if isinstance(built, bool):
             compiled = built
@@ -681,12 +840,15 @@ def _scope_statement(operation: _Operation, model: type[models.Model], key: Key)
     vector = tuple(sorted((str(fact), value) for fact, value in decided.items()))
 
     def build() -> bool | tuple[models.QuerySet[Any], bool]:
-        compiler = operation.compiler(verdicts, decided)
+        decider = operation.rows(verdicts)
+        compiler = operation.compiler(verdicts, decided, rows=decider)
         predicate = compiler.holds(key, _model_at(model), Bound.LOWER)
         if is_false(predicate):
             return False
         witness = _and(
-            operation.witness(compiler.used_facts, decided, verdicts), compiler.sets_witness()
+            operation.witness(compiler.used_facts, decided, verdicts),
+            compiler.sets_witness(),
+            decider.witness(compiler.used_rows),
         )
         if is_false(witness):
             return False

@@ -204,9 +204,9 @@ def exercise_binding_scope(db, monkeypatch, storage):
 
                 with db.execute_wrapper(record):
                     sql, params = qs.query.get_compiler(using=db.alias).as_sql()
-                # Compilation reads the actor's stored sets and nothing else.
-                assert all('"rebac_' in probe_sql for probe_sql, _ in probes)
-                assert len(probes) <= 3
+                # Compilation decides the actor's sets and the small row sets
+                # behind arrows; it reads, and writes nothing.
+                assert all(probe_sql.lstrip().startswith("SELECT") for probe_sql, _ in probes)
                 sizes[action] = (len(sql), len(params))
                 expected = set()
                 for position, row in enumerate([*rows, *beyond]):

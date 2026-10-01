@@ -275,8 +275,15 @@ def test_scope_query_count_is_independent_of_depth(storage, backing, deep):
             with CaptureQueriesContext(connection) as queries:
                 assert qs.exists()
             costs.append(len(queries))
-    # The actor's stored sets, then the scope.
-    assert costs == [2, 2]
+    if backing == "tuple":
+        # The actor's stored sets, then the scope.
+        assert costs == [2, 2]
+    else:
+        # A hierarchy over a foreign key is followed from its seeds first: the
+        # seeds, then one statement per level until one finds nothing or the
+        # depth limit is reached.
+        levels = [min(depth + 1, app_settings.REBAC_DEPTH_LIMIT) for depth in (1, deep)]
+        assert costs == [3 + levels[0], 3 + levels[1]]
 
 
 @pytest.mark.pg_delta

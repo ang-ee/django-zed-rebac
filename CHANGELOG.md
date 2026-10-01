@@ -111,6 +111,13 @@ rules and the names exported by `rebac` are unchanged. The specification is
   decision in its own snapshot. An evaluator scope keeps the decision until a
   tuple is written in the process. A set that admits a column-backed set, and
   an actor in more than 256 sets, keep the membership inside the statement.
+- A scope decides the small sets of rows behind its arrows first (the
+  folders a file's scope reaches, the messages a part's scope reaches) and
+  binds them as key lists, up to 500 rows each; a hierarchy over a self
+  foreign key is followed from its seeds, level by level. The scope statement
+  re-reads every decided set in its own snapshot. Larger sets stay inline.
+- A point check looks its one object up by key instead of building the set of
+  every qualifying row.
 - A caveated read decides the distinct caveat instances of the relations in
   its reach in Python, from one query, and binds the decided keys into the
   statement. A permission with no caveated relation in reach runs no such

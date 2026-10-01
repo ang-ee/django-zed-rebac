@@ -156,6 +156,26 @@ class CaveatVerdicts(Protocol):
     def condition_q(self, prefix: str, bound: Bound) -> Q: ...
 
 
+class DecidedRows(Protocol):
+    """Small sets of model rows on which the actor holds a node, decided before a statement."""
+
+    def rows(self, key: Key) -> tuple[Any, ...] | None:
+        """The identities of the key's model rows in its lower bound, or ``None``
+        when the set is not decided (too large, or not a set of rows)."""
+        ...
+
+
+@dataclass(frozen=True, slots=True)
+class SelfChain:
+    """A permission that recurses over a self foreign key, taken apart."""
+
+    model: type[models.Model]
+    identity: str
+    target: str
+    parent: str
+    base: Q
+
+
 # ---------- Constants and two-valued connectives ----------
 
 _TRUE: Final = Q(Value(True, output_field=models.BooleanField()))
@@ -238,6 +258,12 @@ class _Compiled(Expression):
             sql, params = query.as_sql(compiler, connection)
             cached = self._sql[connection.alias] = sql, tuple(params)
         return cached
+
+
+class Decided(tuple[Any, ...]):
+    """The keys of a set of rows decided before the statement."""
+
+    __slots__ = ()
 
 
 def _one_object(ref: Any) -> bool:
@@ -405,6 +431,9 @@ class Compiler:
     in ``used_facts`` and must be witnessed by the statement that uses it.
     ``sets`` supplies the stored sets the actor belongs to; membership in one
     of them is then a list of ids instead of a closure over the tuple table.
+    ``rows`` supplies small sets of rows on which the actor holds a node; an
+    arrow into one of them is then a list of keys instead of a subquery, and
+    each one used is recorded in ``used_rows`` for the statement's witness.
     """
 
     def __init__(
@@ -421,6 +450,7 @@ class Compiler:
         parametric: bool = False,
         facts: Mapping[Fact, bool] | None = None,
         sets: ActorSets | None = None,
+        rows: DecidedRows | None = None,
     ) -> None:
         self.schema = tagged.schema if tagged is not None else schema
         self.actor = actor
@@ -442,6 +472,8 @@ class Compiler:
         self.facts = facts
         self.used_facts: set[Fact] = set()
         self.sets = sets
+        self.rows = rows
+        self.used_rows: set[Key] = set()
         self.shape = actor_shape(self.schema, actor, using)
         self._memo: dict[tuple[Any, ...], Q] = {}
         self._own_identity = model_for_subject_type(actor.subject_type)
@@ -881,22 +913,20 @@ class Compiler:
             )
         return result
 
-    def _flat_self_fk(
-        self,
-        key: Key,
-        at: At,
-        bound: Bound,
-        *,
-        depth_possible: bool,
-    ) -> Q | None:
-        """A parent->same-permission cycle over a self foreign key.
-
-        A row inherits when one of its ancestors holds the base.  The
-        ancestors are a chain of joins on the parent column and the base is
-        tested once, against all of them: the statement names the base once
-        whatever the bound.  Tuple grants on a rowless object still
-        contribute at depth zero.
-        """
+    def _self_fk(
+        self, key: Key
+    ) -> (
+        tuple[
+            Definition,
+            list[PermExpr],
+            ResolvedFieldBacking,
+            type[models.Model],
+            str,
+            models.Field[Any, Any],
+        ]
+        | None
+    ):
+        """The parts of ``p = base + parent->p`` over a self foreign key, if ``key`` is one."""
         definition = self.schema.get_definition(key[0])
         permission = self.schema.get_permission(*key)
         model = model_for_resource_type(key[0])
@@ -923,18 +953,70 @@ class Compiler:
             return None
         identity = resource_id_attr(model)
         _, field = model_identity_fields(model, identity)
+        return definition, base, resolved, model, identity, field
+
+    def self_chain(self, key: Key) -> SelfChain | None:
+        """A self-foreign-key recursion as its seeds and its edge, for a closure
+        followed from the seeds: the rows that hold the base (lower bound), then
+        the rows whose parent column names a row already found."""
+        parts_of = self._self_fk(key)
+        if parts_of is None:
+            return None
+        definition, base, resolved, model, identity, field = parts_of
+        row_at = At(key[0], F(identity), field, True)
+        base_row = _or(*self._arms(definition, base, row_at, Bound.LOWER, {key: 1}, True))
+        parent = cast("models.ForeignKey[Any, Any]", resolved.field)
+        return SelfChain(model, identity, parent.target_field.name, parent.attname, base_row)
+
+    def _decided(
+        self,
+        key: Key,
+        model: type[models.Model],
+        identity: str,
+        bound: Bound,
+        depth_possible: bool,
+    ) -> tuple[Any, ...] | None:
+        """The rows decided for ``key``, when it is a lower bound over its own model's rows."""
+        if self.rows is None or bound is not Bound.LOWER or not depth_possible:
+            return None
+        if model_for_resource_type(key[0]) is not model or resource_id_attr(model) != identity:
+            return None
+        decided = self.rows.rows(key)
+        if decided is not None:
+            self.used_rows.add(key)
+        return decided
+
+    def _flat_self_fk(
+        self,
+        key: Key,
+        at: At,
+        bound: Bound,
+        *,
+        depth_possible: bool,
+    ) -> Q | None:
+        """A parent->same-permission cycle over a self foreign key.
+
+        A row inherits when one of its ancestors holds the base.  The
+        ancestors are a chain of joins on the parent column and the base is
+        tested once, against all of them: the statement names the base once
+        whatever the bound.  Tuple grants on a rowless object still
+        contribute at depth zero.
+        """
+        parts_of = self._self_fk(key)
+        if parts_of is None:
+            return None
+        definition, base, resolved, model, identity, field = parts_of
         row_at = At(key[0], F(identity), field, True)
         inside = {key: 1}
 
         def base_at(where: At) -> list[Q]:
-            return [
-                self._expression(
-                    definition, arm, where, bound, inside, depth_possible=depth_possible
-                )
-                for arm in base
-            ]
+            return self._arms(definition, base, where, bound, inside, depth_possible)
 
         own_row = at.row and model_for_resource_type(at.resource_type) is model and at.key is field
+        if own_row:
+            decided = self._decided(key, model, identity, bound, depth_possible)
+            if decided is not None:
+                return Q(In(at.ref, list(decided))) if decided else _FALSE
         # The holders are looked up by key, a row and its ancestors at a time,
         # so their base is a plain disjunction: each arm is decided once.
         base_row = _or(*base_at(row_at))
@@ -948,11 +1030,12 @@ class Compiler:
         if base_row is not _FALSE:
             # The parent column holds a value of the key's target field, at
             # every level of the chain.  The chain starts at the row itself.
-            target = resolved.field.target_field.name
+            parent = cast("models.ForeignKey[Any, Any]", resolved.field)
+            target = parent.target_field.name
             chain = [
                 OuterRef(target),
                 *(
-                    OuterRef("__".join([resolved.path] * (hops - 1) + [resolved.field.attname]))
+                    OuterRef("__".join([resolved.path] * (hops - 1) + [parent.attname]))
                     for hops in range(1, self.depth_limit + 1)
                 ),
             ]
@@ -1188,13 +1271,7 @@ class Compiler:
                     # A tagged union: its own tag applies below, its operands here.
                     arms = [expr.left, expr.right]
                 result = self._union(
-                    at,
-                    [
-                        self._expression(
-                            definition, arm, at, bound, visits, depth_possible=depth_possible
-                        )
-                        for arm in arms
-                    ],
+                    at, self._arms(definition, arms, at, bound, visits, depth_possible)
                 )
             elif expr.op == "&":
                 left = self._expression(
@@ -1229,6 +1306,37 @@ class Compiler:
         if arm is not None and arm.deadline:
             return _and(result, _before(self.now, arm.deadline))
         return result
+
+    def _arms(
+        self,
+        definition: Definition,
+        arms: Sequence[PermExpr],
+        at: At,
+        bound: Bound,
+        visits: Mapping[Key, int],
+        depth_possible: bool,
+    ) -> list[Q]:
+        """The arms of a union, compiled until one holds outright.
+
+        Arrows over constants come first: they fold to a decision (a member
+        of the admin role), and when one holds nothing else is compiled.
+        """
+
+        def constant(arm: PermExpr) -> bool:
+            if not isinstance(arm, PermArrow):
+                return isinstance(arm, PermRef) and arm.name in ("authenticated", "anonymous")
+            relation = next((r for r in definition.relations if r.name == arm.via), None)
+            return relation is not None and isinstance(relation.backing, ConstBinding)
+
+        parts: list[Q] = []
+        for arm in sorted(arms, key=lambda arm: not constant(arm)):
+            part = self._expression(
+                definition, arm, at, bound, visits, depth_possible=depth_possible
+            )
+            if part is _TRUE:
+                return [_TRUE]
+            parts.append(part)
+        return parts
 
     def _anti_expression(
         self,
@@ -1356,13 +1464,13 @@ class Compiler:
         bound: Bound,
         visits: Mapping[Key, int],
         depth_possible: bool,
-    ) -> QuerySet[Any] | bool:
+    ) -> QuerySet[Any] | Decided | bool:
         """The subject-model rows that admit the actor; ``True`` for every row.
 
         With ``name`` (an arrow target or a subject-set relation) a row admits
         the actor when the actor holds it there, or, for a bare subject set,
         when the actor is that very subject set.  Without it the actor must be
-        the row.
+        the row.  A set decided before the statement comes back as its keys.
         """
         rows = model._base_manager.using(self.using)
         own = self.shape.type == allowed_type and self._canonical(model, identity)
@@ -1371,6 +1479,11 @@ class Compiler:
                 return False
             return rows.filter(**{identity: self._native(model, identity)})
         _, field = model_identity_fields(model, identity)
+        itself = bool(relation_name and own and self.shape.relation == relation_name)
+        if not itself:
+            decided = self._decided((allowed_type, name), model, identity, bound, depth_possible)
+            if decided is not None:
+                return Decided(decided) if decided else False
         member = self._holds(
             (allowed_type, name),
             At(allowed_type, F(identity), field, True),
@@ -1378,7 +1491,7 @@ class Compiler:
             visits,
             depth_possible=depth_possible,
         )
-        if relation_name and own and self.shape.relation == relation_name:
+        if itself:
             member = _or(member, Q(**{identity: self._native(model, identity)}))
         if member is _FALSE:
             return False
@@ -1414,6 +1527,8 @@ class Compiler:
             return _FALSE
         if subjects is True:
             source_q = Q(**{f"{target_path}__isnull": False})
+        elif isinstance(subjects, Decided):
+            source_q = Q(**{f"{target_path}__in": list(subjects)})
         elif name is None:
             source_q = Q(
                 **{target_path: self._native(resolved.target_model, resolved.target_id_attr)}
@@ -1523,9 +1638,10 @@ class Compiler:
         )
         if found is False:
             return _FALSE
-        subjects = (
-            resolved.target_model._base_manager.using(self.using) if found is True else found
-        ).filter(Q(**resolved.filters))
+        every = resolved.target_model._base_manager.using(self.using)
+        if isinstance(found, Decided):
+            found = every.filter(**{f"{resolved.target_id_attr}__in": list(found)})
+        subjects = (every if found is True else found).filter(Q(**resolved.filters))
         if resolved.resource is not None:
             subjects = subjects.filter(**{resolved.field.name: resolved.value})
             derived = self._wire_equal(at, resolved.resource) & Q(Exists(subjects))
