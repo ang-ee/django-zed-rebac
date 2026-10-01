@@ -10,8 +10,8 @@ from django.db.models import F, OuterRef, Subquery, Value
 from django.db.models.functions import Concat
 from django.test.utils import isolate_apps
 
-from rebac.index import codec as codec_module
-from rebac.index.codec import _Conversion, _IdentityCodec, identity_codec
+from rebac import codec as codec_module
+from rebac.codec import _Conversion, _IdentityCodec, identity_codec
 from tests.testapp.models import Folder, Post, TextIdentityFolder
 
 pytestmark = pytest.mark.pg_delta  # the compiled SQL is vendor-specific

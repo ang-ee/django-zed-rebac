@@ -10,14 +10,13 @@ from typing import Any, cast
 from weakref import WeakSet
 
 from django.apps import apps
-from django.db import models, router
+from django.db import connections, models, router
 from django.db.models import Model, Q
 from django.db.models.functions import Cast
 from django.db.models.signals import (
     class_prepared,
     m2m_changed,
     post_delete,
-    post_save,
     pre_delete,
     pre_save,
 )
@@ -193,8 +192,7 @@ def _register_model(model: type[Model]) -> None:
     if not issubclass(model, RebacTrackedMixin) and tracked_model(model):
         if model not in _tracked:
             _tracked.add(model)
-            _connect(pre_save, _index_pre_save, model)
-            _connect(post_save, _index_post_save, model)
+            _connect(pre_save, _tracked_pre_save, model)
             _connect(pre_delete, _rebac_pre_delete, model)
             connect_subject_model(model)  # also finishes non-identity tracked deletes
     # Avoid get_user_model() during class preparation; labels/lineage suffice.
@@ -220,7 +218,7 @@ def _register_model(model: type[Model]) -> None:
             )
         if eligible and through not in _throughs:
             _throughs.add(through)
-            _connect(m2m_changed, _index_m2m, through)
+            _connect(m2m_changed, _tracked_m2m, through)
 
 
 def connect_tracked_signals() -> None:
@@ -229,8 +227,7 @@ def connect_tracked_signals() -> None:
     for model in tuple(_tracked):
         if not tracked_model(model):
             for signal, handler in (
-                (pre_save, _index_pre_save),
-                (post_save, _index_post_save),
+                (pre_save, _tracked_pre_save),
                 (pre_delete, _rebac_pre_delete),
             ):
                 signal.disconnect(sender=model, dispatch_uid=handler.__name__)
@@ -240,7 +237,7 @@ def connect_tracked_signals() -> None:
                 _subjects.discard(model)
     for model in tuple(_throughs):
         if not tracked_through(model):
-            m2m_changed.disconnect(sender=model, dispatch_uid="_index_m2m")
+            m2m_changed.disconnect(sender=model, dispatch_uid="_tracked_m2m")
             _throughs.discard(model)
     for model in apps.get_models(include_auto_created=True):
         _register_model(model)
@@ -362,22 +359,27 @@ def _current_watch(
     using: str,
     names: Iterable[str] | None = None,
 ) -> bool:
-    from .backends import backend
-    from .backends.local import LocalBackend
-    from .index.maintain import current_pass, get_program, installed, model_is_watched
     from .models import active_relationship_model
+    from .watch import gate_policy, model_is_watched
 
     if not router.allow_migrate_model(using, active_relationship_model()):
         return False
-    active = backend()
-    if not isinstance(active, LocalBackend):
-        return False
-    outer = current_pass(using)
-    if outer is not None:
-        return outer.watches(sender, names)
-    if not installed(using, active):
-        return False
-    return model_is_watched(get_program(using, active).watched, sender, names)
+    policy = gate_policy(using)
+    return policy is not None and model_is_watched(policy.watched, sender, names)
+
+
+def _stored(model: type[Model], using: str) -> models.QuerySet[Any]:
+    """The model's rows as a gate reads them before the write that follows.
+
+    A gate decides on the stored values and the write then replaces them.
+    Inside a transaction the rows are locked, so that no other writer changes
+    them between the decision and the write.
+    """
+    rows = model._base_manager.using(using).order_by()
+    connection = connections[using]
+    if connection.features.has_select_for_update and connection.in_atomic_block:
+        return rows.select_for_update()
+    return rows
 
 
 def _identities(sender: type[Model], instance: Any) -> set[ObjectRef]:
@@ -393,16 +395,16 @@ def _identities(sender: type[Model], instance: Any) -> set[ObjectRef]:
 
 
 def cleanup_identities(identities: Iterable[ObjectRef], *, using: str) -> None:
-    """Batch both sides of every identity inside the deletion owner's pass."""
+    """Remove the tuples that name deleted objects, at either end."""
+    from django.db import transaction
+
     from .backends.local import mark_relationships_changed
-    from .index.maintain import tuple_owner
     from .models import RebacResource, active_relationship_model
-    from .models.relationship import projected_tuples
 
     identities = sorted(set(identities), key=str)
     if not identities or not router.allow_migrate_model(using, active_relationship_model()):
         return
-    with tuple_owner(using) as maintenance:
+    with transaction.atomic(using=using):
         for batch in batched(identities, 200, strict=False):
             references = Q()
             registry = Q()
@@ -413,8 +415,6 @@ def cleanup_identities(identities: Iterable[ObjectRef], *, using: str) -> None:
                     subject_type=identity.resource_type, subject_id=identity.resource_id
                 )
             rows = active_relationship_model().objects.using(using).filter(references)
-            if maintenance is not None:
-                maintenance.capture_old(tuples=projected_tuples(cast(Any, rows).index_projection()))
             if app_settings.REBAC_LOCAL_BACKEND_STORAGE == "registry":
                 RebacResource.objects.using(using).filter(registry).delete()
             else:
@@ -449,8 +449,6 @@ def _rebac_pre_delete(
             instance,
             scope=(scope.actor, scope.unscoped) if scope is not None else None,
         )
-    if not covered:
-        _capture_signal_old(sender, instance, using)
 
 
 def _rebac_cascade_resource(
@@ -469,8 +467,6 @@ def _rebac_cascade_resource(
         return  # the owner holds the old captures and finishes once for the collection
     else:
         cleanup_identities(identities, using=using)
-    if sender in _owned or sender in _tracked:
-        _finish_signal(sender, instance, using)
 
 
 @receiver(post_delete, sender="rebac.SchemaOverride")
@@ -479,19 +475,11 @@ def _rebac_schema_cascade_revision(
 ) -> None:
     """Cover collector cascades whose origin does not own schema publication."""
     from .models.generation import SchemaGeneration
-    from .models.schema_write import SchemaQuerySet, SchemaRow, _publish, schema_index_write
+    from .models.schema_write import SchemaQuerySet, SchemaRow, schema_index_write
 
     if not isinstance(origin, (SchemaRow, SchemaQuerySet)):
-        from .index.maintain import forget_signal_pass
-        from .models.index import IndexWork
-
-        with schema_index_write(using) as maintenance:
-            old_pass = instance.__dict__.pop("_rebac_index_schema_pass", None)
-            if old_pass is not None:
-                IndexWork.objects.using(using).filter(pass_id=old_pass).delete()
-                forget_signal_pass(using, old_pass)
+        with schema_index_write(using):
             SchemaGeneration.objects.advance(using=using)
-            _publish(maintenance, None)
             instance._audit_change(created=False)
 
 
@@ -499,88 +487,14 @@ def _rebac_schema_cascade_revision(
 def _rebac_schema_cascade_begin(
     sender: type[Model], *, instance: Any, using: str, origin: Any = None, **_: Any
 ) -> None:
-    from django.db import connections
+    from .models.schema_write import SchemaQuerySet, SchemaRow
 
-    from .index.maintain import IndexMaintenance, current_pass, defer_signal_pass
-    from .models.schema_write import SchemaQuerySet, SchemaRow, _old_program
-
-    if isinstance(origin, (SchemaRow, SchemaQuerySet)) or current_pass(using) is not None:
-        return
-    instance._audit_target = instance._audit_target_repr()
-    caller_atomic = (
-        connections[using].atomic_blocks[-1] if connections[using].in_atomic_block else None
-    )
-    with IndexMaintenance(using=using) as maintenance:
-        _old_program(maintenance)
-        maintenance.deferred = True
-        instance.__dict__["_rebac_index_schema_pass"] = maintenance.pass_id
-        defer_signal_pass(maintenance, caller_atomic)
+    if not isinstance(origin, (SchemaRow, SchemaQuerySet)):
+        # The target content type is gone after the delete; name it now.
+        instance._audit_target = instance._audit_target_repr()
 
 
-def _plain_write_warning(sender: type[Model], using: str, *, in_atomic: bool) -> None:
-    import warnings
-
-    from .index.maintain import logger
-
-    if not in_atomic:
-        message = f"{sender._meta.label} changes permission backing fields outside atomic(using={using!r}); source and index cannot roll back together (D2)."
-        logger.error(message)
-        warnings.warn(message, RuntimeWarning, stacklevel=4)
-
-
-def _capture_signal_old(
-    sender: type[Model],
-    instance: Any,
-    using: str,
-    *,
-    names: Iterable[str] | None = None,
-    warn: bool = False,
-) -> None:
-    from django.db import connections
-
-    from .index.maintain import IndexMaintenance, current_pass, defer_signal_pass
-
-    if not _current_watch(sender, using, names):
-        return
-    was_atomic = connections[using].in_atomic_block
-    caller_atomic = connections[using].atomic_blocks[-1] if was_atomic else None
-    outer = current_pass(using)
-    with IndexMaintenance(using=using) as maintenance:
-        if not maintenance.watches(sender, names):
-            return
-        if warn:
-            instance.__dict__["_rebac_index_plain_atomic"] = was_atomic
-        maintenance.capture_old(model=sender, pks=(instance.pk,))
-        if outer is None:
-            # Do not hold an unmanaged context manager across Django's signal
-            # dispatch: a failed save never sends post_save. The enclosing
-            # caller transaction retains the row lock and rolls this work back.
-            maintenance.deferred = True
-            instance.__dict__["_rebac_index_old_pass"] = maintenance.pass_id
-            defer_signal_pass(maintenance, caller_atomic)
-
-
-def _finish_signal(
-    sender: type[Model], instance: Any, using: str, *, names: Iterable[str] | None = None
-) -> None:
-    from .index.maintain import IndexMaintenance, forget_signal_pass
-    from .models.index import IndexWork
-
-    old_pass = instance.__dict__.pop("_rebac_index_old_pass", None)
-    if old_pass is None and not _current_watch(sender, using, names):
-        return
-    with IndexMaintenance(using=using, resume_pass=old_pass) as maintenance:
-        if old_pass is not None:
-            IndexWork.objects.using(using).filter(pass_id=old_pass).exclude(kind="pass").update(
-                pass_id=maintenance.pass_id
-            )
-            IndexWork.objects.using(using).filter(pass_id=old_pass).delete()
-            forget_signal_pass(using, old_pass)
-        if maintenance.watches(sender, names):
-            maintenance.changed(model=sender, pks=(instance.pk,))
-
-
-def _index_pre_save(
+def _tracked_pre_save(
     sender: type[Model],
     instance: Any,
     using: str,
@@ -590,24 +504,9 @@ def _index_pre_save(
 ) -> None:
     if not raw:
         _gate_backed_field_change(sender, instance, using, update_fields)
-        _capture_signal_old(sender, instance, using, names=update_fields, warn=True)
 
 
-def _index_post_save(
-    sender: type[Model],
-    instance: Any,
-    using: str,
-    raw: bool = False,
-    update_fields: Iterable[str] | None = None,
-    **kwargs: Any,
-) -> None:
-    if not raw:
-        _finish_signal(sender, instance, using, names=update_fields)
-        was_atomic = instance.__dict__.pop("_rebac_index_plain_atomic", True)
-        _plain_write_warning(sender, using, in_atomic=was_atomic)
-
-
-def _index_m2m(
+def _tracked_m2m(
     sender: type[Model],
     instance: Any,
     action: str,
@@ -623,12 +522,6 @@ def _index_m2m(
         pre_gated = _related_m2m_write.get()
         if pre_gated is None or not pre_gated.covers(sender, instance, reverse, pk_set, using):
             _gate_m2m(sender, instance, reverse, model, pk_set, using)
-    if not _current_watch(sender, using):
-        return
-    if action in {"pre_add", "pre_remove", "pre_clear"}:
-        _capture_signal_old(type(instance), instance, using)
-    elif action in {"post_add", "post_remove", "post_clear"}:
-        _finish_signal(type(instance), instance, using)
 
 
 def _gate_m2m(
@@ -646,9 +539,9 @@ def _gate_m2m(
     return yields no pairs, and the per-row gates then decide for themselves.
     """
     from .actors import is_sudo
-    from .index.maintain import current_pass, get_program
     from .mixins import RebacMixin
     from .resources import model_for_resource_type
+    from .watch import gate_policy
 
     pinned = getattr(instance, "actor", None)
     if is_sudo() and (
@@ -659,13 +552,14 @@ def _gate_m2m(
     if not isinstance(owner_model, type):
         return set()
     owner_type = model_resource_type(owner_model)
-    outer = current_pass(using)
-    program = outer.load_program() if outer is not None else get_program(using)
+    program = gate_policy(using)
+    if program is None:
+        return set()
     watched = program.watched.get(sender._meta.label_lower)
     types = {owner_type} if owner_type is not None else set()
     if watched is not None:
         types.update(watched.resource_types)
-    types = {type_ for type_ in types if (type_, "write") in program.nodes}
+    types = {type_ for type_ in types if program.has_node(type_, "write")}
     if not types or pk_set == set():
         return set()
     actor, bypass = _edge_actor(instance, relation=True)
@@ -715,7 +609,7 @@ def _affected_backing_ids(
     )
 
     affected: dict[str, set[str]] = {}
-    for definition in program.baseline.definitions:
+    for definition in program.schema.definitions:
         type_ = definition.resource_type
         if type_ not in resource_types:
             continue
@@ -924,10 +818,11 @@ def _gate_backed_rows(
         materialized = [row for row in materialized if not pre_gated.covers_row(row)]
         if not materialized:
             return
-    from .index.maintain import current_pass, get_program
+    from .watch import gate_policy
 
-    outer = current_pass(using)
-    program = outer.load_program() if outer is not None else get_program(using)
+    program = gate_policy(using)
+    if program is None:
+        return
     stored: dict[tuple[type[Model], Any], dict[str, Any]] = {}
     model_pks: dict[type[Model], set[Any]] = {}
     for row in materialized:
@@ -950,7 +845,7 @@ def _gate_backed_rows(
         )
         if not columns:
             continue
-        for values in model._base_manager.using(using).filter(pk__in=pks).values("pk", *columns):
+        for values in _stored(model, using).filter(pk__in=pks).values("pk", *columns):
             stored[(model, values["pk"])] = values
     through_pairs: dict[type[Model], set[tuple[Any, Any]]] = {}
     last_row: Model | None = None
@@ -1026,7 +921,7 @@ def _gate_backed_rows(
     if not candidates:
         return
     candidates = {
-        type_: ids for type_, ids in candidates.items() if (type_, "write") in program.nodes
+        type_: ids for type_, ids in candidates.items() if program.has_node(type_, "write")
     }
     if not candidates:
         return
@@ -1101,7 +996,7 @@ def _batched_backed_field_candidates(
             resource_types=resource_types,
         ).items():
             candidates.setdefault(type_, set()).update(ids)
-        for definition in program.baseline.definitions:
+        for definition in program.schema.definitions:
             if definition.resource_type not in resource_types:
                 continue
             for relation in definition.relations:
@@ -1145,11 +1040,12 @@ def _collect_through_pair(row: Model, pairs: dict[type[Model], set[tuple[Any, An
 
 
 def _gate_direct_through_rows(pairs: dict[type[Model], set[tuple[Any, Any]]], using: str) -> None:
-    from .index.maintain import current_pass, get_program
     from .resources import model_for_resource_type
+    from .watch import gate_policy
 
-    outer = current_pass(using)
-    program = outer.load_program() if outer is not None else get_program(using)
+    program = gate_policy(using)
+    if program is None:
+        return
     for through, changed in pairs.items():
         owner_model = through._meta.auto_created
         if not isinstance(owner_model, type):
@@ -1166,7 +1062,7 @@ def _gate_direct_through_rows(pairs: dict[type[Model], set[tuple[Any, Any]]], us
         types = {owner_type} if owner_type is not None else set()
         if watched is not None:
             types.update(watched.resource_types)
-        types = {type_ for type_ in types if (type_, "write") in program.nodes}
+        types = {type_ for type_ in types if program.has_node(type_, "write")}
         if not types:
             continue
         source_ids = {source_pk for source_pk, _ in changed}
@@ -1218,12 +1114,13 @@ def _gate_backed_field_change(
     )
     if not candidates:
         return
-    from .index.maintain import current_pass, get_program
+    from .watch import gate_policy
 
-    outer = current_pass(using)
-    program = outer.load_program() if outer is not None else get_program(using)
+    program = gate_policy(using)
+    if program is None:
+        return
     candidates = {
-        type_: ids for type_, ids in candidates.items() if (type_, "write") in program.nodes
+        type_: ids for type_, ids in candidates.items() if program.has_node(type_, "write")
     }
     if not candidates:
         return
@@ -1243,12 +1140,13 @@ def _backed_field_change_candidates(
     deleting: bool = False,
     stored: dict[str, Any] | None = None,
 ) -> dict[str, set[str]]:
-    from .index.maintain import current_pass, get_program
+    from .watch import gate_policy
 
     if not _current_watch(sender, using, update_fields):
         return {}
-    outer = current_pass(using)
-    program = outer.load_program() if outer is not None else get_program(using)
+    program = gate_policy(using)
+    if program is None:
+        return {}
     watch = program.watched.get(sender._meta.label_lower)
     if watch is None:
         return {}
@@ -1263,7 +1161,7 @@ def _backed_field_change_candidates(
             stored.get(field.attname)
             if stored is not None
             else (
-                sender._base_manager.using(using)
+                _stored(sender, using)
                 .filter(pk=instance.pk)
                 .values_list(field.attname, flat=True)
                 .first()

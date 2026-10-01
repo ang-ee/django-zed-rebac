@@ -1,8 +1,8 @@
-"""The small-model semantic gate; no database, index tables, or SQL derivation.
+"""The small-model semantic gate; no database and no SQL.
 
 The default gate retains every named counterexample plus every one/two-leaf
 expression and a deterministic sample of larger trees. The full 64,426,320
-comparison sweep is opt-in: pytest -m index_exhaustive -n auto. It is split
+comparison sweep is opt-in: pytest -m reference_exhaustive -n auto. It is split
 by shape, universe, instant, context, and 32 expression shards (at most 1,094
 expressions / 15,316 comparisons per case). Scheduling targets, not measured
 claims: default reference gate <= 60 seconds; full shard <= 120 seconds on one
@@ -22,13 +22,13 @@ import pytest
 from rebac.schema.ast import CaveatParam, PermArrow, PermBinOp, Permission, PermRef
 from rebac.schema.parser import parse_permission_expression, parse_zed
 from rebac.types import CheckResult, ObjectRef, RelationshipTuple, SubjectRef
-from tests.index_oracle import MemoryWalkerOracle
-from tests.index_reference import (
+from tests.reference_model import (
     FALSE,
     TRUE,
     Formula,
     ReferenceModel,
 )
+from tests.reference_oracle import MemoryWalkerOracle
 
 NOW = datetime(2030, 1, 2, tzinfo=UTC)
 DOC = ObjectRef("test/doc", "one")
@@ -377,8 +377,8 @@ SHAPES = [
 @pytest.mark.parametrize("instant", [-1, 0, 1])
 @pytest.mark.parametrize("context", CONTEXTS)
 @pytest.mark.parametrize("shard", range(32))
-@pytest.mark.index_exhaustive
-@pytest.mark.index_shard
+@pytest.mark.reference_exhaustive
+@pytest.mark.reference_shard
 def test_exhaustive_expression_small_models(shape, users, instant, context, shard):
     _compare_expressions(islice(_expressions(shape), shard, None, 32), users, instant, context)
 
@@ -429,8 +429,8 @@ def _compare_expressions(expressions, users, instant, context):
 @pytest.mark.parametrize("op", "+&-")
 @pytest.mark.parametrize("users", [1, 2, 3])
 @pytest.mark.parametrize("shard", range(16))
-@pytest.mark.index_exhaustive
-@pytest.mark.index_shard
+@pytest.mark.reference_exhaustive
+@pytest.mark.reference_shard
 def test_exhaustive_direct_tuple_presence(op, users, shard):
     _compare_presence(op, users, shard=shard, shards=16)
 

@@ -1,6 +1,8 @@
 """Lazy queryset scope composes live attribute-backed membership."""
 
 import pytest
+from django.db import connection
+from django.test.utils import CaptureQueriesContext
 
 from rebac import (
     ObjectRef,
@@ -182,8 +184,8 @@ def test_dynamic_container_parity_holds_for_noncanonical_stored_values(field, ex
 
     reset_backend()
     if not expect_sql:
+        from rebac.codec import identity_codec
         from rebac.errors import SchemaError
-        from rebac.index.codec import identity_codec
 
         with pytest.raises(SchemaError, match=r"rebac\.E014"):
             identity_codec(Folder, field)
@@ -233,9 +235,7 @@ definition blog/post {
 
 
 @pytest.mark.django_db
-def test_direct_live_checks_use_witness_and_one_index_query(
-    django_user_model, django_assert_num_queries
-):
+def test_a_granted_live_check_is_one_statement(django_user_model, django_assert_num_queries):
     reset_backend()
     install_schema(
         backend(),
@@ -260,13 +260,13 @@ def test_direct_live_checks_use_witness_and_one_index_query(
         AuthoredPost.objects.create(title="allowed", folder=folder, author=alice)
     subject = to_subject_ref(alice)
 
-    with django_assert_num_queries(2):
+    with django_assert_num_queries(1):
         assert (
             backend()
             .check_access(subject=subject, action="read", resource=to_object_ref(folder))
             .allowed
         )
-    with django_assert_num_queries(2):
+    with django_assert_num_queries(1):
         assert (
             backend()
             .check_access(
@@ -284,9 +284,7 @@ CAVEATED_ARROW_SCHEMA = ARROW_SCHEMA.replace(
 
 
 @pytest.mark.django_db
-def test_attribute_arrow_preserves_caveats_in_one_index_query(
-    django_user_model, django_assert_num_queries
-):
+def test_attribute_arrow_preserves_caveats_without_per_target_reads(django_user_model):
     """Caveated arrows preserve tri-state results without per-target reads."""
     reset_backend()
     install_schema(backend(), parse_zed(CAVEATED_ARROW_SCHEMA))
@@ -310,12 +308,32 @@ def test_attribute_arrow_preserves_caveats_in_one_index_query(
             AuthoredPost.objects.create(title="k-two", folder=folder, author=member)
     subject = to_subject_ref(reader)
 
-    with django_assert_num_queries(2):
-        assert (
-            not backend()
-            .check_access(subject=subject, action="read", resource=ObjectRef("blog/post", "one"))
-            .allowed
-        )
+    def denied_check_cost():
+        with CaptureQueriesContext(connection) as queries:
+            assert (
+                not backend()
+                .check_access(
+                    subject=subject, action="read", resource=ObjectRef("blog/post", "one")
+                )
+                .allowed
+            )
+        return len(queries)
+
+    cost = denied_check_cost()
+    with sudo(reason="test.attribute-fixture"):
+        more = [
+            atomic_source_write(
+                django_user_model.objects.create,
+                username=f"more{i}",
+                is_active=True,
+                is_staff=True,
+            )
+            for i in range(5)
+        ]
+    with sudo(reason="test.fixture"):
+        for member in more:
+            AuthoredPost.objects.create(title="k-one", folder=folder, author=member)
+    assert denied_check_cost() == cost
 
     from rebac import PermissionResult
 
@@ -326,10 +344,9 @@ def test_attribute_arrow_preserves_caveats_in_one_index_query(
             ),
         ]
     )
-    with django_assert_num_queries(2):
-        conditional = backend().check_access(
-            subject=subject, action="read", resource=ObjectRef("blog/post", "one")
-        )
+    conditional = backend().check_access(
+        subject=subject, action="read", resource=ObjectRef("blog/post", "one")
+    )
     assert conditional.result == PermissionResult.CONDITIONAL_PERMISSION
     assert conditional.conditional_on == ("token",)
     assert (

@@ -1,5 +1,10 @@
 # Proposal 0012: stale overrides and autocommit writes
 
+**Status:** the maintenance half (autocommit writes on tracked models) is
+superseded by [proposal 0015](./0015-permissions-compiled-to-queries.md):
+nothing is maintained after a write, so an autocommit save leaves nothing
+behind. The override half (a stale narrowing override) stays open.
+
 ## Problem
 
 Two lifecycle gaps let the effective permission widen without any write that

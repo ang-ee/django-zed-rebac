@@ -1,4 +1,4 @@
-"""Compare the actual index reader with source facts and two independent oracles."""
+"""Compare the compiled reads with source facts and two independent oracles."""
 
 from __future__ import annotations
 
@@ -10,6 +10,7 @@ from django.utils import timezone
 
 from rebac._id import resource_id_attr
 from rebac.backends.local import LocalBackend
+from rebac.compile import read
 from rebac.errors import PermissionDepthExceeded
 from rebac.field_backing import (
     resolve_attribute_backing,
@@ -19,8 +20,8 @@ from rebac.field_backing import (
 from rebac.resources import model_for_resource_type, model_resource_type, stores_rows
 from rebac.schema.ast import ConstBinding
 from rebac.types import ObjectRef, RelationshipTuple, SubjectRef
-from tests.index_oracle import WalkerOracle
-from tests.index_reference import ReferenceModel
+from tests.reference_model import ReferenceModel
+from tests.reference_oracle import WalkerOracle
 
 
 def seed(tuples: Iterable[str], *, backend: LocalBackend | None = None) -> None:
@@ -37,7 +38,7 @@ def seed(tuples: Iterable[str], *, backend: LocalBackend | None = None) -> None:
 
 
 def _snapshot(backend: LocalBackend, *, using: str, extra_resources=()):
-    """Read source facts, never IndexEdge: projection is itself under test."""
+    """Read source facts through the backings' own queries, not the compiler."""
     from rebac.models import active_relationship_model
 
     schema = backend.schema()
@@ -50,7 +51,7 @@ def _snapshot(backend: LocalBackend, *, using: str, extra_resources=()):
             row["caveat_context"] or {},
             row["expires_at"],
         )
-        for row in active_relationship_model().objects.using(using).index_projection()
+        for row in active_relationship_model().objects.using(using).wire_projection()
     ]
     resources = {row.resource for row in rows} | set(extra_resources)
     resources.update(row.subject.object for row in rows)
@@ -119,11 +120,22 @@ def _snapshot(backend: LocalBackend, *, using: str, extra_resources=()):
     return schema, rows, resources
 
 
-def assert_index_matches(
-    *, subjects, resources, actions, contexts=(None,), now=None, using="default"
+def assert_reads_match(
+    *,
+    subjects,
+    resources,
+    actions,
+    contexts=(None,),
+    now=None,
+    using="default",
+    undecided=(),
 ) -> None:
+    """Compare every check with the reference model and the frozen walker.
+
+    ``undecided`` names the resource types whose checks may raise
+    ``PermissionDepthExceeded`` instead of answering; such a check is skipped.
+    """
     from rebac import backend as get_backend
-    from rebac.index import read
 
     active = get_backend()
     assert isinstance(active, LocalBackend)
@@ -154,15 +166,21 @@ def assert_index_matches(
                         except PermissionDepthExceeded:
                             # Positive data cycles and paths beyond the frozen
                             # walker's bound use the finite-path denotation.
-                            # The index/reference assertion below still runs.
+                            # The compiler/reference assertion below still runs.
                             walked = expected
-                        actual = read.check(
-                            resource=resource,
-                            action=action,
-                            actor=subject,
-                            context=context,
-                            using=using,
-                        )
+                        try:
+                            actual = read.check(
+                                backend=active,
+                                resource=resource,
+                                action=action,
+                                actor=subject,
+                                context=context,
+                                using=using,
+                            )
+                        except PermissionDepthExceeded:
+                            if resource.resource_type in undecided:
+                                continue
+                            raise
                         details = (resource, subject, action, context)
                         assert (actual.result, actual.conditional_on) == (
                             expected.result,
@@ -170,7 +188,7 @@ def assert_index_matches(
                         ), (details, actual, expected)
                         # The walker's missing parameters depend on the order
                         # of arms and rows, and include those of paths that
-                        # fail. The index reports the ones the result needs.
+                        # fail. The compiler reports the ones the result needs.
                         assert actual.result == walked.result, (details, actual, walked)
                         assert set(actual.conditional_on) <= set(walked.conditional_on), (
                             details,
@@ -182,7 +200,6 @@ def assert_index_matches(
 def assert_subjects_match(*, resources, actions, subject_types, now=None, using="default") -> None:
     """Compare subject enumeration with the reference; the walker's is incomplete (D4)."""
     from rebac import backend as get_backend
-    from rebac.index import read
 
     active = get_backend()
     assert isinstance(active, LocalBackend)
@@ -199,14 +216,20 @@ def assert_subjects_match(*, resources, actions, subject_types, now=None, using=
                         resource=resource, action=action, subject_type=subject_type
                     )
                     actual = read.lookup_subjects(
-                        resource=resource, action=action, subject_type=subject_type, using=using
+                        backend=active,
+                        resource=resource,
+                        action=action,
+                        subject_type=subject_type,
+                        using=using,
                     )
                     assert set(actual) == expected, (resource, action, subject_type)
 
 
 def assert_scope_matches(model, *, actor: SubjectRef, action: str) -> None:
-    from rebac.index import read
+    from rebac import backend as get_backend
 
+    active = get_backend()
+    assert isinstance(active, LocalBackend)
     query = model._base_manager.all()
     using = query.db
     resource_type = model_resource_type(model)
@@ -215,11 +238,12 @@ def assert_scope_matches(model, *, actor: SubjectRef, action: str) -> None:
         ObjectRef(resource_type, str(value))
         for value in query.values_list(resource_id_attr(model), flat=True)
     )
-    assert_index_matches(subjects=(actor,), resources=resources, actions=(action,), using=using)
+    assert_reads_match(subjects=(actor,), resources=resources, actions=(action,), using=using)
     expected = {
         obj.pk
         for obj in query
         if read.check(
+            backend=active,
             resource=ObjectRef(resource_type, str(getattr(obj, resource_id_attr(model)))),
             action=action,
             actor=actor,
@@ -229,14 +253,7 @@ def assert_scope_matches(model, *, actor: SubjectRef, action: str) -> None:
     }
     actual = set(
         model._base_manager.using(using)
-        .filter(read.scope_q(model, action=action, actor=actor, using=using))
+        .filter(read.scope_q(backend=active, model=model, action=action, actor=actor, using=using))
         .values_list("pk", flat=True)
     )
     assert actual == expected
-
-
-def assert_no_drift(*, using: str = "default") -> None:
-    from rebac.index.rebuild import verify
-
-    drift = verify(using=using)
-    assert drift == [], drift

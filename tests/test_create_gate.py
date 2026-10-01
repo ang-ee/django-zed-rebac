@@ -35,7 +35,7 @@ from rebac import (
 from rebac.actors import anonymous_actor
 from rebac.backends import reset_backend
 from rebac.schema import parse_zed
-from tests.backend_setup import atomic_source_write, install_schema, rebuild_backend
+from tests.backend_setup import atomic_source_write, install_schema
 
 
 class CreateWriteRouter:
@@ -463,10 +463,7 @@ def test_manager_insert_uses_db_manager_alias(
         with django_db_blocker.unblock():
             from django.core.management import call_command
 
-            from tests.backend_setup import rebuild_backend
-
             call_command("migrate", database=alias, verbosity=0)
-            rebuild_backend(backend(), using=alias)
             candidate = Post(title="other database")
             if bound_to_alias:
                 candidate._state.db = alias
@@ -976,7 +973,6 @@ def test_unreferenced_dangling_relations_create_without_projection_queries(
                 ) as projection,
                 patch("rebac.preflight.check_new", wraps=preflight.check_new) as check,
             ):
-                rebuild_backend(parent_create_backend)
                 queryset = UnreferencedCreateCandidate.objects.with_actor(_user("allowed"))
                 if operation == "create":
                     rows = [queryset.create(folder_id=999_999)]
@@ -986,8 +982,8 @@ def test_unreferenced_dangling_relations_create_without_projection_queries(
                     )
             assert projection.call_count == check.call_count == count
             assert all(call.kwargs["relationships"] == {} for call in check.call_args_list)
-            # Projection itself remains query-free (asserted above); the write
-            # owner now reads the maintenance lock and permission index.
+            # Projection itself is query-free (asserted above); the create gate reads
+            # the permission.
             assert len(rows) == count
             assert UnreferencedCreateCandidate._base_manager.count() == count
         finally:
@@ -1703,7 +1699,6 @@ def test_multi_table_child_projects_parent_declared_forward_fk(
             editor.create_model(CreateCandidateChild)
         try:
             with patch("rebac.field_backing.model_for_resource_type", side_effect=resolve_model):
-                rebuild_backend(parent_create_backend)
                 _assert_candidate_create(
                     CreateCandidateChild,
                     {"owner": (_user(str(owner.pk)),)},

@@ -13,6 +13,7 @@ chaining via `_clone()` and propagates into instances via `from_db()`.
 from __future__ import annotations
 
 import re
+from collections import Counter
 from collections.abc import AsyncIterator, Collection, Iterable
 from typing import Any, Self, TypeVar, cast
 
@@ -1051,39 +1052,19 @@ class RebacQuerySet(models.QuerySet[_M]):
         update_fields: Collection[str] | None = None,
         unique_fields: Collection[str] | None = None,
     ) -> list[_M]:
-        from .index.maintain import model_write
         from .signals import audit_backed_denials
+        from .watch import model_write
 
         self._for_write = True
-        candidates = list(objs)
-        with audit_backed_denials(), model_write(model=self.model, using=self.db) as maintenance:
-            if maintenance is not None:
-                if ignore_conflicts or update_conflicts:
-                    maintenance.capture_old(queryset=self.model._base_manager.using(self.db).all())
-                else:
-                    maintenance.capture_old(
-                        model=self.model, pks=[row.pk for row in candidates if row.pk is not None]
-                    )
-            rows = self._rebac_bulk_create(
-                candidates,
+        with audit_backed_denials(), model_write(model=self.model, using=self.db):
+            return self._rebac_bulk_create(
+                list(objs),
                 batch_size,
                 ignore_conflicts,
                 update_conflicts,
                 update_fields,
                 unique_fields,
             )
-            if maintenance is not None:
-                if ignore_conflicts or update_conflicts or any(row.pk is None for row in rows):
-                    maintenance._capture(
-                        model=self.model,
-                        pks=(),
-                        tuples=(),
-                        phase="new",
-                        queryset=self.model._base_manager.using(self.db).all(),
-                    )
-                else:
-                    maintenance.changed(model=self.model, pks=[row.pk for row in rows])
-            return rows
 
     def _rebac_bulk_create(
         self,
@@ -1141,42 +1122,37 @@ class RebacQuerySet(models.QuerySet[_M]):
         return rows
 
     def update(self, **kwargs: Any) -> int:
-        from .index.maintain import model_write
         from .signals import _gate_backed_rows, audit_backed_denials
+        from .watch import by_key, model_write, statement_keys
 
         self._for_write = True
         with (
             audit_backed_denials(),
-            model_write(model=self.model, using=self.db, names=kwargs) as maintenance,
+            model_write(model=self.model, using=self.db, names=kwargs) as watched,
         ):
-            frozen = None
-            if maintenance is not None:
-                frozen = maintenance.snapshot_queryset(
-                    self._system_capture(reason="rebac.index.capture")
-                )
-                maintenance.capture_old(queryset=frozen)
-                actor, bypass = self._resolve_effective_actor()
+            if not watched or self.query.is_sliced:
+                return self._rebac_update(**kwargs)
+            actor, bypass = self._resolve_effective_actor()
+            if bypass:
+                return self._rebac_update(**kwargs)
+            # The statement changes a column the policy reads: the gate
+            # decides on its rows, and exactly those rows are written.
+            keys = statement_keys(self._system_capture(reason="rebac.write.rows"))
+            for rows in by_key(self.model._base_manager.using(self.db), keys):
                 _gate_backed_rows(
-                    frozen, using=self.db, names=kwargs, proposed=kwargs, actor=actor, bypass=bypass
+                    rows, using=self.db, names=kwargs, proposed=kwargs, actor=actor, bypass=bypass
                 )
-            count = self._rebac_update(**kwargs)
-            if maintenance is not None and frozen is not None:
-                if {"pk", self.model._meta.pk.name, self.model._meta.pk.attname} & kwargs.keys():
-                    frozen = self.model._base_manager.using(self.db).all()
-                maintenance._capture(
-                    model=self.model, pks=(), tuples=(), queryset=frozen, phase="new"
-                )
-            return count
+            return sum(rows._rebac_update(**kwargs) for rows in by_key(self, keys))
 
     def bulk_update(
         self, objs: Iterable[_M], fields: Iterable[str], batch_size: int | None = None
     ) -> int:
-        from .index.maintain import model_write
         from .signals import audit_backed_denials
+        from .watch import model_write
 
         self._for_write = True
-        # Django dispatches batches through update(); this outer owner merely
-        # keeps all batches in one pass and never captures or derives twice.
+        # Django dispatches batches through update(); this outer owner keeps
+        # all batches in one transaction.
         field_names = tuple(fields)
         with (
             audit_backed_denials(),
@@ -1200,12 +1176,10 @@ class RebacQuerySet(models.QuerySet[_M]):
         return super().update(**kwargs)
 
     def delete(self) -> tuple[int, dict[str, int]]:
-        from .index.maintain import model_write
+        from .watch import model_write
 
         self._for_write = True
-        with model_write(model=self.model, using=self.db) as maintenance:
-            if maintenance is not None:
-                maintenance.capture_old(queryset=self._system_capture(reason="rebac.index.capture"))
+        with model_write(model=self.model, using=self.db):
             from .mixins import deletion_owner
 
             actor, unscoped = self._resolve_effective_actor()
@@ -1417,78 +1391,80 @@ class TrackedQuerySet[T: models.Model](models.QuerySet[T]):
 
     def update(self, **kwargs: Any) -> int:
         from .actors import is_sudo
-        from .index.maintain import model_write
         from .mixins import RebacMixin
         from .signals import _edge_actor, _gate_backed_rows, audit_backed_denials
+        from .watch import by_key, model_write, statement_keys
 
         self._for_write = True
         with (
             audit_backed_denials(),
-            model_write(model=self.model, using=self.db, names=kwargs) as maintenance,
+            model_write(model=self.model, using=self.db, names=kwargs) as watched,
         ):
-            frozen = maintenance.snapshot_queryset(self) if maintenance is not None else None
-            if maintenance is not None:
-                maintenance.capture_old(queryset=frozen)
-                assert frozen is not None
-                related_owner = cast(Any, self)._hints.get("instance")
-                related_fk_write = any(
-                    isinstance(field, (models.ForeignKey, models.OneToOneField))
-                    and {field.name, field.attname} & kwargs.keys()
-                    for field in self.model._meta.concrete_fields
-                )
-                if (
+            related_owner = cast(Any, self)._hints.get("instance")
+            related_fk_write = any(
+                isinstance(field, (models.ForeignKey, models.OneToOneField))
+                and {field.name, field.attname} & kwargs.keys()
+                for field in self.model._meta.concrete_fields
+            )
+            if (
+                not watched
+                or self.query.is_sliced
+                or not (
                     not issubclass(self.model, RebacMixin)
                     or related_owner is not None
                     or related_fk_write
-                ):
-                    actor, bypass = (
-                        _edge_actor(related_owner, relation=True)
-                        if related_owner is not None
-                        else (None, is_sudo())
-                    )
-                    _gate_backed_rows(
-                        frozen,
-                        using=self.db,
-                        names=kwargs,
-                        proposed=kwargs,
-                        actor=actor,
-                        bypass=bypass,
-                    )
-            count = super().update(**kwargs)
-            if maintenance is not None and frozen is not None:
-                if {"pk", self.model._meta.pk.name, self.model._meta.pk.attname} & kwargs.keys():
-                    frozen = self.model._base_manager.using(self.db).all()
-                maintenance._capture(
-                    model=self.model, pks=(), tuples=(), queryset=frozen, phase="new"
                 )
-            return count
+            ):
+                return super().update(**kwargs)
+            actor, bypass = (
+                _edge_actor(related_owner, relation=True)
+                if related_owner is not None
+                else (None, is_sudo())
+            )
+            if bypass:
+                return super().update(**kwargs)
+            # The gate decides on the statement's rows, and exactly those rows
+            # are written.
+            keys = statement_keys(self)
+            for rows in by_key(self.model._base_manager.using(self.db), keys):
+                _gate_backed_rows(
+                    rows, using=self.db, names=kwargs, proposed=kwargs, actor=actor, bypass=bypass
+                )
+            return sum(models.QuerySet.update(rows, **kwargs) for rows in by_key(self, keys))
 
     def delete(self) -> tuple[int, dict[str, int]]:
         from .actors import current_actor, is_sudo
         from .conf import app_settings
-        from .index.maintain import model_write
-        from .mixins import deletion_owner
+        from .mixins import RebacMixin, deletion_owner
         from .signals import _gate_backed_rows, audit_backed_denials
+        from .watch import by_key, model_write, statement_keys
 
         self._for_write = True
         actor = current_actor()
         # Resource base-manager writes are intentionally unscoped infrastructure
         # operations. Plain tracked roots retain ambient scope for resource cascades.
-        from .mixins import RebacMixin
-
         unscoped = (
             issubclass(self.model, RebacMixin)
             or is_sudo()
             or (actor is None and not app_settings.REBAC_STRICT_MODE)
         )
-        with audit_backed_denials(), model_write(model=self.model, using=self.db) as maintenance:
-            if maintenance is not None:
-                frozen = maintenance.snapshot_queryset(self)
-                if not issubclass(self.model, RebacMixin):
-                    _gate_backed_rows(frozen, using=self.db, bypass=is_sudo(), deleting=True)
-                maintenance.capture_old(queryset=frozen)
-            with deletion_owner(self, self.db, actor, unscoped):
-                return super().delete()
+        with audit_backed_denials(), model_write(model=self.model, using=self.db) as watched:
+            if (
+                not watched
+                or issubclass(self.model, RebacMixin)
+                or is_sudo()
+                or self.query.is_sliced
+            ):
+                with deletion_owner(self, self.db, actor, unscoped):
+                    return super().delete()
+            keys = statement_keys(self)
+            for rows in by_key(self.model._base_manager.using(self.db), keys):
+                _gate_backed_rows(rows, using=self.db, deleting=True)
+            deleted: Counter[str] = Counter()
+            for rows in by_key(self, keys):
+                with deletion_owner(rows, self.db, actor, unscoped):
+                    deleted.update(models.QuerySet.delete(rows)[1])
+            return sum(deleted.values()), dict(deleted)
 
     def bulk_create(
         self,
@@ -1500,16 +1476,17 @@ class TrackedQuerySet[T: models.Model](models.QuerySet[T]):
         unique_fields: Collection[str] | None = None,
     ) -> list[T]:
         from .actors import is_sudo
-        from .index.maintain import model_write
         from .mixins import RebacMixin
         from .signals import _gate_backed_rows, audit_backed_denials
+        from .watch import gate_policy, model_write
 
         self._for_write = True
         candidates = list(objs)
-        with audit_backed_denials(), model_write(model=self.model, using=self.db) as maintenance:
+        with audit_backed_denials(), model_write(model=self.model, using=self.db) as watched:
             if not issubclass(self.model, RebacMixin):
-                if update_conflicts and update_fields and not is_sudo() and maintenance:
-                    watch = maintenance.load_program().watched.get(self.model._meta.label_lower)
+                policy = gate_policy(self.db) if watched else None
+                if update_conflicts and update_fields and not is_sudo() and policy is not None:
+                    watch = policy.watched.get(self.model._meta.label_lower)
                     if watch is not None and any(
                         {field.name, field.attname} & set(update_fields) & watch.fields
                         for field in self.model._meta.concrete_fields
@@ -1519,37 +1496,7 @@ class TrackedQuerySet[T: models.Model](models.QuerySet[T]):
                             "use checked saves or sudo."
                         )
                 _gate_backed_rows(candidates, using=self.db, bypass=is_sudo())
-            all_rows = self.model._base_manager.using(self.db).all()
-            capture_rows = all_rows
-            if self.model._meta.auto_created and candidates:
-                foreign_keys = [
-                    field
-                    for field in self.model._meta.concrete_fields
-                    if isinstance(field, models.ForeignKey)
-                ]
-                if len(foreign_keys) == 2:
-                    pairs = {
-                        tuple(getattr(row, field.attname) for field in foreign_keys)
-                        for row in candidates
-                    }
-                    if all(all(value is not None for value in pair) for pair in pairs):
-                        predicate = models.Q(pk__in=[])
-                        for pair in sorted(pairs):
-                            predicate |= models.Q(
-                                **dict(
-                                    (field.attname, value)
-                                    for field, value in zip(foreign_keys, pair, strict=True)
-                                )
-                            )
-                        capture_rows = all_rows.filter(predicate)
-            if maintenance is not None:
-                if ignore_conflicts or update_conflicts:
-                    maintenance.capture_old(queryset=capture_rows)
-                else:
-                    maintenance.capture_old(
-                        model=self.model, pks=[row.pk for row in candidates if row.pk is not None]
-                    )
-            rows = super().bulk_create(
+            return super().bulk_create(
                 candidates,
                 batch_size,
                 ignore_conflicts,
@@ -1557,20 +1504,12 @@ class TrackedQuerySet[T: models.Model](models.QuerySet[T]):
                 update_fields,
                 unique_fields,
             )
-            if maintenance is not None:
-                if ignore_conflicts or update_conflicts or any(row.pk is None for row in rows):
-                    maintenance._capture(
-                        model=self.model, pks=(), tuples=(), queryset=capture_rows, phase="new"
-                    )
-                else:
-                    maintenance.changed(model=self.model, pks=[row.pk for row in rows])
-            return rows
 
     def bulk_update(
         self, objs: Iterable[T], fields: Iterable[str], batch_size: int | None = None
     ) -> int:
-        from .index.maintain import model_write
         from .signals import audit_backed_denials
+        from .watch import model_write
 
         self._for_write = True
         field_names = tuple(fields)
@@ -1582,4 +1521,4 @@ class TrackedQuerySet[T: models.Model](models.QuerySet[T]):
 
 
 class TrackedManager(models.Manager.from_queryset(TrackedQuerySet)):  # type: ignore[misc]
-    """Unfiltered manager whose writes maintain the permission index."""
+    """Unfiltered manager whose writes to columns the policy reads are gated."""

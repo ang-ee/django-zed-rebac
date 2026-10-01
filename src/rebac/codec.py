@@ -161,12 +161,11 @@ class _Conversion(Func):
         """Compile the guard around the converted expression once per field.
 
         The guard reads the converted expression about ten times and depends
-        only on the field, the direction and the connection. Building,
-        resolving and compiling it again for every use was most of the time of
-        a maintenance pass. Django compiles it once around a placeholder; each
-        use compiles its own expression once and takes the placeholder's
-        positions. No SQL is written by hand, and ``_compile_fresh`` is the
-        same statement without the cache (pinned by test_index_codec_cache).
+        only on the field, the direction and the connection. Django compiles
+        it once around a placeholder; each use compiles its own expression
+        once and takes the placeholder's positions. No SQL is written by hand,
+        and ``_compile_fresh`` is the same statement without the cache (pinned
+        by test_codec_cache).
         """
         key = (
             connection.alias,
@@ -259,7 +258,7 @@ def identity_codec(model: type[models.Model], attr: str | None = None) -> Codec:
         if any(name in cls.__dict__ for name in conversions):
             raise SchemaError(
                 f"rebac.E014: unsupported encoded identity {model._meta.label}.{attr}; "
-                "custom field conversions cannot be reproduced in permission-index SQL."
+                "custom field conversions cannot be reproduced in a permission statement."
             )
     if isinstance(field, models.IntegerField):
         return _IdentityCodec(field, "integer")

@@ -19,13 +19,13 @@ from django.utils import timezone
 
 from rebac.actors import is_anonymous_actor
 from rebac.caveats import evaluate as evaluate_caveat
+from rebac.codec import identity_codec
 from rebac.conf import app_settings
 from rebac.field_backing import (
     resolve_attribute_backing,
     resolve_const_backing,
     resolve_field_backing,
 )
-from rebac.index.codec import identity_codec
 from rebac.models import active_relationship_model
 from rebac.schema.ast import (
     AttributeBinding,
@@ -250,7 +250,7 @@ class _Evaluator:
                 cast(Any, active_relationship_model().objects.using(self.using))
                 .for_resource(resource.resource_type, resource.resource_id)
                 .filter(relation=relation.name)
-                .index_projection()
+                .wire_projection()
                 .values(
                     "subject_type",
                     "subject_id",

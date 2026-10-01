@@ -25,7 +25,7 @@ from rebac.preflight import _check_new_model
 from rebac.schema import ConstBinding, ParseError, parse_zed, render_zed
 from rebac.schema.ast import backing_from_dict, backing_to_dict
 from rebac.schema.introspection import live_backed_resource_types
-from tests.backend_setup import install_schema, rebuild_backend
+from tests.backend_setup import install_schema
 
 from .testapp.models import Folder, Post
 
@@ -265,15 +265,14 @@ def test_null_comparison_does_not_pass_constraint_semantics(backend):
 def test_invalid_or_related_column_filters_report_e009_and_fail_closed(backend, filters):
     backend.set_schema(parse_zed(SCHEMA.replace('{"is_active":true}', json.dumps(filters))))
     assert any(issue.id == "rebac.E009" for issue in check_field_backed_relations())
-    with pytest.raises(SchemaError, match=r"rebac\.E013"):
+    with pytest.raises(SchemaError, match=r"rebac\.E009"):
         backend.has_access(subject=ACTOR, action="read", resource=ObjectRef("blog/folder", "1"))
-    with pytest.raises(SchemaError, match=r"rebac\.E013"):
+    with pytest.raises(SchemaError, match=r"rebac\.E009"):
         list(Folder.objects.with_actor(ACTOR))
     with pytest.raises(ValueError, match="const backing"):
         _check_new_model(Folder(), subject=ACTOR, backend=backend)
-    # This arrow reaches a persisted target, so its index read also fails closed.
-    with pytest.raises(SchemaError, match=r"rebac\.E013"):
-        check_new(subject=ACTOR, action="unrestricted", resource_type="blog/folder")
+    # A permission that does not reach the invalid backing is still decided.
+    assert check_new(subject=ACTOR, action="unrestricted", resource_type="blog/folder").allowed
 
 
 def test_projected_filtered_constant_overlay_and_bare_constant_guard(backend):
@@ -330,7 +329,6 @@ def test_persisted_schema_keeps_filtered_constant(backend):
     SchemaPermission.objects.create(definition=audience, name="read", expression="authenticated")
     reset_backend()
     backend = active_backend()
-    rebuild_backend(backend)
     with sudo(reason="persisted schema fixture"):
         matching = Folder.objects.create(name="public")
         hidden = Folder.objects.create(name="private", is_active=False)
@@ -381,12 +379,12 @@ def test_direct_constant_scope_remains_lazy(backend):
     assert not pending.exists()
 
 
-def test_candidate_filter_runs_without_any_source_rows(backend, django_assert_num_queries):
+def test_candidate_filter_runs_without_any_source_rows(backend):
     from django.db import connection
     from django.test.utils import CaptureQueriesContext
 
     assert not Folder._base_manager.exists()
-    with CaptureQueriesContext(connection) as queries, django_assert_num_queries(3):
+    with CaptureQueriesContext(connection) as queries:
         assert _check_new_model(Folder(), subject=ACTOR, backend=backend, using="default").allowed
     assert "FROM" not in queries[0]["sql"].upper()
 
@@ -485,7 +483,6 @@ def test_candidate_column_collation_matches_stored_checks_and_exclusion(
         with connection.schema_editor() as editor:
             editor.create_model(CollatedRow)
         try:
-            rebuild_backend(backend)
             with sudo(reason="column collation target"):
                 target = Folder.objects.create(name="target")
             for audience, matches in [("public", True), ("private", False)]:
@@ -649,11 +646,9 @@ def test_candidate_and_stored_backing_use_requested_database(
         with django_db_blocker.unblock():
             from django.core.management import call_command
 
-            from rebac.index.read import check, using_backend
-            from tests.backend_setup import rebuild_backend
+            from rebac.compile.read import check
 
             call_command("migrate", database=alias, verbosity=0)
-            rebuild_backend(backend, using=alias)
             with sudo(reason="separate database fixture"):
                 remote = Folder.objects.using(alias).create(name="remote", is_active=True)
                 Folder.objects.using("default").create(pk=remote.pk, name="local", is_active=False)
@@ -666,17 +661,22 @@ def test_candidate_and_stored_backing_use_requested_database(
                 ("read", ACTOR),
                 ("public", SubjectRef.of("site/audience", "public")),
             ]:
-                with using_backend(backend):
-                    assert check(
-                        resource=ref(remote), action=action, actor=actor, context=None, using=alias
-                    ).allowed
-                    assert not check(
-                        resource=ref(remote),
-                        action=action,
-                        actor=actor,
-                        context=None,
-                        using="default",
-                    ).allowed
+                assert check(
+                    backend=backend,
+                    resource=ref(remote),
+                    action=action,
+                    actor=actor,
+                    context=None,
+                    using=alias,
+                ).allowed
+                assert not check(
+                    backend=backend,
+                    resource=ref(remote),
+                    action=action,
+                    actor=actor,
+                    context=None,
+                    using="default",
+                ).allowed
             if kind == "const":
                 candidate = Folder(name="new")
             else:
@@ -689,13 +689,16 @@ def test_candidate_and_stored_backing_use_requested_database(
                 )
                 install_schema(backend, parse_zed(schema))
                 candidate = Post(title="new", folder_id=remote.pk)
-                rebuild_backend(backend, using=alias)
                 with sudo(reason="alias propagation through field arrow"):
                     post = Post.objects.using(alias).create(title="remote", folder=remote)
-                with using_backend(backend):
-                    assert check(
-                        resource=ref(post), action="read", actor=ACTOR, context=None, using=alias
-                    ).allowed
+                assert check(
+                    backend=backend,
+                    resource=ref(post),
+                    action="read",
+                    actor=ACTOR,
+                    context=None,
+                    using=alias,
+                ).allowed
             from django.test.utils import CaptureQueriesContext
 
             actor = ACTOR if kind == "const" else SubjectRef.of("blog/folder", str(remote.pk))

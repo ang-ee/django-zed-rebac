@@ -1,5 +1,11 @@
 # Proposal 0013: integrate at the ORM's SQL compilers, not at the models
 
+**Status:** open, narrowed by
+[proposal 0015](./0015-permissions-compiled-to-queries.md) § 10. The read
+half stands. The write half is not needed for maintenance; how far it is
+needed for the gates follows § 13 of that proposal. The expected failures in
+`tests/test_security_proposal_0013.py` stay pinned.
+
 ## Problem
 
 The engine (schema, index, derivation, maintenance passes) is sound. The

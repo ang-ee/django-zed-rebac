@@ -1,4 +1,4 @@
-"""Proposal 0009: a maintenance frontier advances only when stored rows differ."""
+"""A tuple, model or schema write reaches every permission that depends on it."""
 
 from __future__ import annotations
 
@@ -9,24 +9,35 @@ from unittest.mock import patch
 
 import pytest
 from django.contrib.contenttypes.models import ContentType
-from django.db import connection, transaction
-from django.test.utils import CaptureQueriesContext
+from django.db import transaction
 from django.utils import timezone
 
-from rebac import ObjectRef, RelationshipTuple, SubjectRef, backend, sudo, to_object_ref
-from rebac.index import derive
-from rebac.index.maintain import IndexMaintenance
-from rebac.index.rebuild import rebuild
-from rebac.models import Relationship, SchemaOverride, SchemaPermission, active_relationship_model
-from rebac.models.index import IndexTerm, IndexWork
-from rebac.schema import parse_zed
-from tests.index_harness import assert_no_drift
-from tests.test_index_maintenance import persisted  # noqa: F401
+from rebac import (
+    ObjectRef,
+    RelationshipTuple,
+    SubjectRef,
+    backend,
+    schema_changes,
+    sudo,
+    to_object_ref,
+)
+from rebac.backends import reset_backend
+from rebac.models import (
+    Relationship,
+    SchemaDefinition,
+    SchemaOverride,
+    SchemaPermission,
+    SchemaRelation,
+    active_relationship_model,
+)
+from rebac.testing import install_schema
+from tests.reference_harness import assert_reads_match
 from tests.testapp.models import Folder, Post
 
 pytestmark = pytest.mark.django_db
 
 USER = SubjectRef.of("auth/user", "alice")
+BOB = SubjectRef.of("auth/user", "bob")
 SCHEMA = """
 caveat gate(ok bool) { ok }
 definition auth/user {}
@@ -73,61 +84,39 @@ definition test/expiringdoc {
 
 @pytest.fixture
 def active():
-    local = backend()
-    local.set_schema(parse_zed(SCHEMA))
-    rebuild(using="default")
-    return local
+    return install_schema(SCHEMA)
 
 
 def row(type_: str, id_: str, relation: str, subject: SubjectRef = USER, **metadata):
     return RelationshipTuple(ObjectRef(type_, id_), relation, subject, **metadata)
 
 
-def measure(caplog, write):
-    """Count one pass, excluding the drift oracle's full rebuild."""
-    caplog.set_level("INFO", logger="rebac.index")
-    scopes: set[tuple[str, str]] = set()
-    original = derive.derive_nodes
-
-    def traced(*args, **kwargs):
-        region = kwargs["region"]
-        scopes.update(
-            IndexTerm.objects.filter(
-                pk__in=IndexWork.objects.filter(pass_id=region, phase="region").values("term_id"),
-                relation__in=("", "$type"),
-            ).values_list("type", "object_id")
-        )
-        return original(*args, **kwargs)
-
-    caplog.clear()
-    with patch.object(derive, "derive_nodes", traced), CaptureQueriesContext(connection) as queries:
-        write()
-    records = [r for r in caplog.records if r.getMessage() == "Permission index maintained"]
-    assert len(records) == 1
-    record = records[0]
-    result = {
-        "deleted": record.deleted,
-        "inserted": record.inserted,
-        "python_rows": record.python_rows,
-        "statements": len(queries),
-        "scopes": scopes,
-    }
-    assert_no_drift()
-    return result
+def read_at(local, resource: ObjectRef, action: str, when, subject: SubjectRef = USER):
+    """A point check with the application clock at ``when``."""
+    with patch("django.utils.timezone.now", return_value=when):
+        return local.check_access(subject=subject, resource=resource, action=action)
 
 
-def test_own_object_write_stays_local(active, caplog):
+def test_own_object_write_grants_that_object_only(active):
     active.write_relationships([row("test/leaf", str(n), "viewer") for n in range(8)])
-    result = measure(
-        caplog, lambda: active.write_relationships([row("test/leaf", "fresh", "viewer")])
+    active.write_relationships([row("test/leaf", "fresh", "viewer")])
+    assert active.check_access(
+        subject=USER, resource=ObjectRef("test/leaf", "fresh"), action="read"
+    ).allowed
+    assert set(active.accessible(subject=USER, action="read", resource_type="test/leaf")) == {
+        "fresh",
+        *(str(n) for n in range(8)),
+    }
+    assert_reads_match(
+        subjects=[USER, BOB],
+        resources=[ObjectRef("test/leaf", name) for name in ("fresh", "0", "7", "absent")],
+        actions=["read"],
     )
-    assert result["scopes"] == {("test/leaf", "fresh")}
-    assert result["inserted"] > 0
-    assert result["statements"] <= 85
 
 
-def test_unchanged_projection_writes_no_index_rows(active, caplog):
+def test_rewriting_a_stored_tuple_keeps_dependent_reads(active):
     initial = row("test/thread", "root", "viewer")
+    messages = [ObjectRef("test/message", str(n)) for n in range(12)]
     active.write_relationships(
         [initial]
         + [
@@ -135,14 +124,21 @@ def test_unchanged_projection_writes_no_index_rows(active, caplog):
             for n in range(12)
         ]
     )
-    result = measure(caplog, lambda: active.write_relationships([initial]))
-    assert result["scopes"] == set()
-    assert (result["deleted"], result["inserted"]) == (0, 0)
-    assert result["python_rows"] <= 50
-    assert result["statements"] <= 75
+    active.write_relationships([initial])
+    assert all(
+        active.check_access(subject=USER, resource=message, action="read").allowed
+        for message in messages
+    )
+    assert_reads_match(
+        subjects=[USER, BOB],
+        resources=[ObjectRef("test/thread", "root"), *messages],
+        actions=["read"],
+    )
 
 
-def test_fan_in_stops_when_target_node_does_not_change(active, caplog):
+def test_fan_in_readers_follow_only_the_permission_they_read(active):
+    thread = ObjectRef("test/thread", "root")
+    messages = [ObjectRef("test/message", str(n)) for n in range(20)]
     active.write_relationships(
         [row("test/thread", "root", "viewer")]
         + [
@@ -150,18 +146,25 @@ def test_fan_in_stops_when_target_node_does_not_change(active, caplog):
             for n in range(20)
         ]
     )
-    result = measure(
-        caplog,
-        lambda: active.write_relationships([row("test/thread", "root", "follower")]),
+    active.write_relationships(
+        [row("test/thread", "root", "follower"), row("test/thread", "root", "follower", BOB)]
     )
-    assert all(type_ != "test/message" for type_, _ in result["scopes"])
-    assert result["inserted"] > 0
-    assert result["python_rows"] <= 70
-    assert result["statements"] <= 100
+    for subject in (USER, BOB):
+        assert active.check_access(subject=subject, resource=thread, action="follow").allowed
+    assert all(
+        active.check_access(subject=USER, resource=message, action="read").allowed
+        for message in messages
+    )
+    assert not any(
+        active.check_access(subject=BOB, resource=message, action="read").allowed
+        for message in messages
+    )
+    assert_reads_match(subjects=[USER, BOB], resources=[thread, *messages], actions=["read"])
 
 
-def test_revocation_crosses_recursive_stratum(active, caplog):
+def test_revocation_crosses_recursive_component(active):
     root = row("test/role", "root", "member")
+    document = ObjectRef("test/doc", "one")
     active.write_relationships(
         [
             root,
@@ -170,13 +173,13 @@ def test_revocation_crosses_recursive_stratum(active, caplog):
             row("test/doc", "one", "role", SubjectRef.of("test/role", "grandchild")),
         ]
     )
-    result = measure(caplog, lambda: active.delete_relationship(root))
-    assert {("test/role", name) for name in ("root", "child", "grandchild")} <= result["scopes"]
-    assert ("test/doc", "one") in result["scopes"]
-    assert result["statements"] <= 150
-    assert not active.check_access(
-        subject=USER, resource=ObjectRef("test/doc", "one"), action="read"
-    ).allowed
+    assert active.check_access(subject=USER, resource=document, action="read").allowed
+    active.delete_relationship(root)
+    assert not active.check_access(subject=USER, resource=document, action="read").allowed
+    for name in ("root", "child", "grandchild"):
+        assert not active.check_access(
+            subject=USER, resource=ObjectRef("test/role", name), action="effective_member"
+        ).allowed
 
 
 def test_recursive_cycle_revocation_removes_old_fixpoint(active):
@@ -190,13 +193,12 @@ def test_recursive_cycle_revocation_removes_old_fixpoint(active):
         ]
     )
     active.delete_relationship(root)
-    assert_no_drift()
     assert not active.check_access(
         subject=USER, resource=ObjectRef("test/doc", "one"), action="read"
     ).allowed
 
 
-def test_membership_revocation_reaches_containers_without_rewriting_grants(active, caplog):
+def test_membership_revocation_reaches_containers_and_keeps_other_members(active):
     child = row("test/group", "child", "member")
     bob = SubjectRef.of("auth/user", "bob")
     active.write_relationships(
@@ -207,10 +209,10 @@ def test_membership_revocation_reaches_containers_without_rewriting_grants(activ
             row("test/groupdoc", "one", "viewer", SubjectRef.of("test/group", "parent", "member")),
         ]
     )
-    result = measure(caplog, lambda: active.delete_relationship(child))
-    assert all(type_ != "test/groupdoc" for type_, _ in result["scopes"])
-    assert result["deleted"] > 0
-    assert result["statements"] <= 90
+    assert active.check_access(
+        subject=USER, resource=ObjectRef("test/groupdoc", "one"), action="read"
+    ).allowed
+    active.delete_relationship(child)
     assert not active.check_access(
         subject=USER, resource=ObjectRef("test/groupdoc", "one"), action="read"
     ).allowed
@@ -219,7 +221,7 @@ def test_membership_revocation_reaches_containers_without_rewriting_grants(activ
     ).allowed
 
 
-def test_target_only_projection_preserves_independent_set_edges(active):
+def test_direct_grant_revocation_preserves_independent_subject_set_grant(active):
     bob = SubjectRef.of("auth/user", "bob")
     direct = row("test/groupdoc", "one", "viewer")
     active.write_relationships(
@@ -230,7 +232,6 @@ def test_target_only_projection_preserves_independent_set_edges(active):
         ]
     )
     active.delete_relationship(direct)
-    assert_no_drift()
     assert active.check_access(
         subject=bob, resource=ObjectRef("test/groupdoc", "one"), action="read"
     ).allowed
@@ -256,58 +257,59 @@ def test_membership_cycle_change_reaches_fixpoint(active, length, change):
         active.delete_relationship(direct)
     else:
         active.write_relationships([direct])
-    assert_no_drift()
     assert active.check_access(
         subject=USER, resource=ObjectRef("test/groupdoc", "one"), action="read"
     ).allowed is (change == "grant")
 
 
-def test_expiry_and_condition_payload_changes_propagate(active, caplog):
+def test_expiry_and_condition_payload_changes_propagate(active):
     early = timezone.now() + timedelta(days=1)
     late = early + timedelta(days=1)
-    initial = row("test/expiring", "one", "viewer", caveat_name="gate", expires_at=early)
+    between = early + timedelta(hours=1)
+    resources = [ObjectRef("test/expiring", "one"), ObjectRef("test/expiringdoc", "child")]
+
+    def read_between(resource, context=None):
+        with patch("django.utils.timezone.now", return_value=between):
+            return active.check_access(
+                subject=USER, resource=resource, action="read", context=context
+            )
+
     active.write_relationships(
         [
-            initial,
+            row("test/expiring", "one", "viewer", caveat_name="gate", expires_at=early),
             row("test/expiringdoc", "child", "parent", SubjectRef.of("test/expiring", "one")),
         ]
     )
-    expiry = measure(
-        caplog,
-        lambda: active.write_relationships(
-            [row("test/expiring", "one", "viewer", caveat_name="gate", expires_at=late)]
-        ),
+    for resource in resources:
+        assert not read_between(resource, {"ok": True}).allowed
+    active.write_relationships(
+        [row("test/expiring", "one", "viewer", caveat_name="gate", expires_at=late)]
     )
-    condition = measure(
-        caplog,
-        lambda: active.write_relationships(
-            [
-                row(
-                    "test/expiring",
-                    "one",
-                    "viewer",
-                    caveat_name="gate",
-                    caveat_context={"ok": True},
-                    expires_at=late,
-                )
-            ]
-        ),
+    for resource in resources:
+        assert read_between(resource, {"ok": True}).allowed
+        assert read_between(resource).conditional_on == ("ok",)
+    active.write_relationships(
+        [
+            row(
+                "test/expiring",
+                "one",
+                "viewer",
+                caveat_name="gate",
+                caveat_context={"ok": True},
+                expires_at=late,
+            )
+        ]
     )
-    assert ("test/expiring", "one") in expiry["scopes"]
-    assert ("test/expiring", "one") in condition["scopes"]
-    assert ("test/expiringdoc", "child") in expiry["scopes"]
-    assert ("test/expiringdoc", "child") in condition["scopes"]
-    assert expiry["deleted"] and expiry["inserted"]
-    assert condition["deleted"] and condition["inserted"]
-    assert expiry["statements"] <= 110
-    assert condition["statements"] <= 110
-
-
-def install(schema: str):
-    local = backend()
-    local.set_schema(parse_zed(schema))
-    rebuild(using="default")
-    return local
+    for resource in resources:
+        assert read_between(resource).allowed
+    for now in (between, late):
+        assert_reads_match(
+            subjects=[USER, BOB],
+            resources=resources,
+            actions=["read"],
+            contexts=[None, {"ok": True}, {"ok": False}],
+            now=now,
+        )
 
 
 VIA_USERSET_SCHEMA = """
@@ -327,12 +329,12 @@ definition test/other {
 @pytest.mark.parametrize("change", ["grant", "revoke"])
 @pytest.mark.parametrize("mixed", [False, True])
 def test_arrow_via_userset_only_relation_changes_grant(change, mixed):
-    local = install(VIA_USERSET_SCHEMA)
+    local = install_schema(VIA_USERSET_SCHEMA)
     link = row("test/team", "b", "member", SubjectRef.of("test/team", "a", "member"))
     local.write_relationships([row("test/team", "a", "admin")])
     if change == "revoke":
         local.write_relationships([link])
-    with IndexMaintenance(using="default") if mixed else nullcontext():
+    with transaction.atomic() if mixed else nullcontext():
         if change == "revoke":
             local.delete_relationship(link)
         else:
@@ -341,7 +343,6 @@ def test_arrow_via_userset_only_relation_changes_grant(change, mixed):
             local.write_relationships(
                 [row("test/other", "x", "viewer", SubjectRef.of("auth/user", "bob"))]
             )
-    assert_no_drift()
     assert local.check_access(
         subject=USER, resource=ObjectRef("test/team", "b"), action="manage"
     ).allowed is (change == "grant")
@@ -367,17 +368,16 @@ definition test/doc {
 """
 
 
-def test_two_type_recursive_stratum_preserves_other_stratum_rows():
-    local = install(TWO_TYPE_SCHEMA)
+def test_two_type_recursive_component_reads_direct_grant():
+    local = install_schema(TWO_TYPE_SCHEMA)
     local.write_relationships([row("test/folder", "f", "viewer")])
-    assert_no_drift()
     assert local.check_access(
         subject=USER, resource=ObjectRef("test/folder", "f"), action="access"
     ).allowed
 
 
-def test_two_type_recursive_stratum_revocation_reaches_both_types():
-    local = install(TWO_TYPE_SCHEMA)
+def test_two_type_recursive_component_revocation_reaches_both_types():
+    local = install_schema(TWO_TYPE_SCHEMA)
     local.write_relationships(
         [
             row("test/folder", "f", "viewer"),
@@ -386,7 +386,6 @@ def test_two_type_recursive_stratum_revocation_reaches_both_types():
         ]
     )
     local.delete_relationship(row("test/folder", "f", "viewer"))
-    assert_no_drift()
     assert not local.check_access(
         subject=USER, resource=ObjectRef("test/folder", "g"), action="view"
     ).allowed
@@ -395,8 +394,8 @@ def test_two_type_recursive_stratum_revocation_reaches_both_types():
     ).allowed
 
 
-def test_two_type_stratum_revoke_reaches_reader_after_collateral_delete():
-    local = install(TWO_TYPE_SCHEMA)
+def test_two_type_recursive_component_revoke_reaches_arrow_reader():
+    local = install_schema(TWO_TYPE_SCHEMA)
     local.write_relationships(
         [
             row("test/folder", "f", "viewer"),
@@ -404,7 +403,6 @@ def test_two_type_stratum_revoke_reaches_reader_after_collateral_delete():
         ]
     )
     local.delete_relationship(row("test/folder", "f", "viewer"))
-    assert_no_drift()
     assert not local.check_access(
         subject=USER, resource=ObjectRef("test/doc", "d"), action="x"
     ).allowed
@@ -429,11 +427,10 @@ definition blog/post {
 """
 
 
-def test_new_model_row_derives_const_userset_without_changed_edges():
-    local = install(CONST_USERSET_SCHEMA)
-    with sudo(reason="index propagation test"):
+def test_new_model_row_grants_through_const_subject_set():
+    local = install_schema(CONST_USERSET_SCHEMA)
+    with sudo(reason="write propagation test"):
         folder = Folder.objects.create(name="new")
-    assert_no_drift()
     local.write_relationships(
         [
             row(
@@ -444,7 +441,6 @@ def test_new_model_row_derives_const_userset_without_changed_edges():
             )
         ]
     )
-    assert_no_drift()
     assert local.check_access(
         subject=USER, resource=ObjectRef("blog/post", "p"), action="read"
     ).allowed
@@ -562,6 +558,20 @@ def differential_pool(length: int) -> list[RelationshipTuple]:
     return result
 
 
+# ``open`` is left out: its constant relation needs a model, and ``test/folder`` has none.
+# ``test/folder#view`` and ``test/project#access`` recurse through each other.
+# Over a data cycle a check that is not granted within the depth bound raises
+# (pinned in test_compile_regressions), and so does a document that reads them.
+MUTUALLY_RECURSIVE = ("test/folder", "test/project", "test/doc")
+
+DIFFERENTIAL_PROBES = [
+    *((ObjectRef("test/doc", name), ["read", "safe", "both"]) for name in ("d0", "d1")),
+    *((ObjectRef("test/folder", name), ["view", "safe", "both"]) for name in ("f0", "f1")),
+    (ObjectRef("test/project", "p0"), ["access"]),
+    *((ObjectRef("test/team", name), ["manage"]) for name in ("t0", "t1")),
+]
+
+
 @pytest.mark.parametrize(
     "seed,steps",
     [
@@ -579,19 +589,21 @@ def differential_pool(length: int) -> list[RelationshipTuple]:
         pytest.param(13, 300, marks=pytest.mark.slow),
     ],
 )
-def test_seeded_randomized_change_sequences_match_rebuild(seed: int, steps: int):
+def test_seeded_randomized_change_sequences_match_reference(seed: int, steps: int):
     rng = random.Random(seed)
-    local = install(DIFFERENTIAL_SCHEMA if steps > 40 else FAST_DIFFERENTIAL_SCHEMA)
-    candidates = (
-        differential_pool(2 + seed % 4) if steps > 40 else fast_differential_pool(2 + seed % 4)
-    )
+    wide = steps > 40
+    local = install_schema(DIFFERENTIAL_SCHEMA if wide else FAST_DIFFERENTIAL_SCHEMA)
+    candidates = differential_pool(2 + seed % 4) if wide else fast_differential_pool(2 + seed % 4)
+    subjects = [USER, BOB, SubjectRef.of("auth/user", "nobody")]
+    probes = DIFFERENTIAL_PROBES if wide else [(ObjectRef("test/doc", "d"), ["read"])]
+    # The probe has its own generator, so it does not alter the sequence of changes.
+    probe = random.Random(seed)
     present: set[int] = set()
     for step in range(steps):
         choices = rng.sample(range(len(candidates)), rng.choice((1, 1, 2, 3)))
         if present and step % 3 == 0:
             choices[0] = rng.choice(sorted(present))
-        grouped = step % 5 == 0
-        with transaction.atomic(), IndexMaintenance(using="default") if grouped else nullcontext():
+        with transaction.atomic():
             for index in choices:
                 if index in present and rng.random() < 0.7:
                     local.delete_relationship(candidates[index])
@@ -599,12 +611,27 @@ def test_seeded_randomized_change_sequences_match_rebuild(seed: int, steps: int)
                 else:
                     local.write_relationships([candidates[index]])
                     present.add(index)
-        assert_no_drift()
         assert not local.check_access(
             subject=SubjectRef.of("auth/user", "nobody"),
             resource=ObjectRef("test/team", "t0"),
             action="manage",
         ).allowed
+        resource, actions = probe.choice(probes)
+        assert_reads_match(
+            subjects=subjects,
+            resources=[resource],
+            actions=actions,
+            contexts=[{"ok": True}],
+            undecided=MUTUALLY_RECURSIVE,
+        )
+    for resource, actions in probes:
+        assert_reads_match(
+            subjects=subjects,
+            resources=[resource],
+            actions=actions,
+            contexts=[None, {"ok": True}, {"ok": False}] if wide else [None],
+            undecided=MUTUALLY_RECURSIVE,
+        )
 
 
 REVOKE_SCHEMA = """
@@ -759,7 +786,7 @@ def revocation_cases():
 
 @pytest.mark.parametrize("initial,changed,check", revocation_cases())
 def test_revocation_operand_reaches_all_readers(initial, changed, check):
-    local = install(REVOKE_SCHEMA)
+    local = install_schema(REVOKE_SCHEMA)
     local.write_relationships(initial)
     resource_type, resource_id, action = check
     assert local.check_access(
@@ -769,7 +796,6 @@ def test_revocation_operand_reaches_all_readers(initial, changed, check):
         local.delete_relationship(changed)
     else:
         local.write_relationships([changed])
-    assert_no_drift()
     assert not local.check_access(
         subject=USER, resource=ObjectRef(resource_type, resource_id), action=action
     ).allowed
@@ -808,35 +834,33 @@ def payload_chain(depth: int) -> list[RelationshipTuple]:
 
 
 def test_root_caveat_replacement_revokes_depth_eight():
-    local = install(PAYLOAD_SCHEMA)
+    local = install_schema(PAYLOAD_SCHEMA)
     chain = payload_chain(8)
     local.write_relationships(chain)
-    with IndexMaintenance(using="default"):
+    with transaction.atomic():
         local.delete_relationship(chain[0])
         local.write_relationships([row("test/folder", "f0", "viewer", caveat_name="gate")])
-    assert_no_drift()
     assert not local.check_access(
         subject=USER, resource=ObjectRef("test/doc", "d"), action="read", context={"ok": False}
     ).allowed
 
 
 def test_root_expiry_payload_change_reaches_depth_eight():
-    local = install(PAYLOAD_SCHEMA)
+    local = install_schema(PAYLOAD_SCHEMA)
     soon = timezone.now() + timedelta(minutes=1)
     later = soon + timedelta(days=2)
     chain = payload_chain(8)
     chain[0] = row("test/folder", "f0", "viewer", expires_at=soon)
     local.write_relationships(chain)
     local.write_relationships([row("test/folder", "f0", "viewer", expires_at=later)])
-    assert_no_drift()
-    assert local.check_access(
-        subject=USER, resource=ObjectRef("test/doc", "d"), action="read"
-    ).allowed
+    document = ObjectRef("test/doc", "d")
+    assert local.check_access(subject=USER, resource=document, action="read").allowed
+    assert read_at(local, document, "read", soon + timedelta(hours=1)).allowed
 
 
 @pytest.mark.parametrize("relation", ["folder", "parent"])
 def test_arrow_via_edge_caveat_replacement_revokes(relation):
-    local = install(PAYLOAD_SCHEMA)
+    local = install_schema(PAYLOAD_SCHEMA)
     chain = payload_chain(2)
     old = chain[-1] if relation == "folder" else chain[2]
     local.write_relationships(chain)
@@ -847,17 +871,16 @@ def test_arrow_via_edge_caveat_replacement_revokes(relation):
         old.subject,
         caveat_name="gate",
     )
-    with IndexMaintenance(using="default"):
+    with transaction.atomic():
         local.delete_relationship(old)
         local.write_relationships([replacement])
-    assert_no_drift()
     assert not local.check_access(
         subject=USER, resource=ObjectRef("test/doc", "d"), action="read", context={"ok": False}
     ).allowed
 
 
 def test_arrow_via_edge_expiry_payload_shortening_reaches_reader():
-    local = install(PAYLOAD_SCHEMA)
+    local = install_schema(PAYLOAD_SCHEMA)
     soon = timezone.now() + timedelta(minutes=1)
     later = soon + timedelta(days=2)
     local.write_relationships(
@@ -869,14 +892,13 @@ def test_arrow_via_edge_expiry_payload_shortening_reaches_reader():
     local.write_relationships(
         [row("test/doc", "d", "folder", SubjectRef.of("test/folder", "f"), expires_at=soon)]
     )
-    assert_no_drift()
-    assert local.check_access(
-        subject=USER, resource=ObjectRef("test/doc", "d"), action="read"
-    ).allowed
+    document = ObjectRef("test/doc", "d")
+    assert local.check_access(subject=USER, resource=document, action="read").allowed
+    assert not read_at(local, document, "read", soon + timedelta(hours=1)).allowed
 
 
 def test_membership_expiry_payload_change_reaches_container():
-    local = install(PAYLOAD_SCHEMA)
+    local = install_schema(PAYLOAD_SCHEMA)
     soon = timezone.now() + timedelta(minutes=1)
     later = soon + timedelta(days=1)
     local.write_relationships(
@@ -888,52 +910,48 @@ def test_membership_expiry_payload_change_reaches_container():
         ]
     )
     local.write_relationships([row("test/group", "g", "member", expires_at=later)])
-    assert_no_drift()
-    assert local.check_access(
-        subject=USER, resource=ObjectRef("test/doc", "d"), action="read"
-    ).allowed
+    document = ObjectRef("test/doc", "d")
+    assert local.check_access(subject=USER, resource=document, action="read").allowed
+    assert read_at(local, document, "read", soon + timedelta(hours=1)).allowed
 
 
 def test_same_scope_grant_change_reaches_arrow_reader():
-    local = install(PAYLOAD_SCHEMA)
+    local = install_schema(PAYLOAD_SCHEMA)
     local.write_relationships([row("test/doc", "d", "folder", SubjectRef.of("test/folder", "f"))])
     local.write_relationships([row("test/folder", "f", "follower")])
     local.delete_relationship(row("test/folder", "f", "follower"))
-    assert_no_drift()
     assert not local.check_access(
         subject=USER, resource=ObjectRef("test/doc", "d"), action="follow"
     ).allowed
 
 
 @pytest.mark.parametrize("order", ["delete_first", "write_first"])
-def test_tuple_remove_and_readd_in_one_owner_uses_final_edges(order):
-    local = install(PAYLOAD_SCHEMA)
+def test_tuple_remove_and_readd_in_one_transaction_reads_final_tuples(order):
+    local = install_schema(PAYLOAD_SCHEMA)
     chain = payload_chain(3)
     local.write_relationships(chain)
-    with transaction.atomic(), IndexMaintenance(using="default"):
+    with transaction.atomic():
         if order == "delete_first":
             local.delete_relationship(chain[0])
             local.write_relationships([chain[0]])
         else:
             local.write_relationships([chain[0]])
             local.delete_relationship(chain[0])
-    assert_no_drift()
     assert local.check_access(
         subject=USER, resource=ObjectRef("test/doc", "d"), action="read"
     ).allowed is (order == "delete_first")
 
 
-def test_tuple_grant_and_revoke_related_edges_in_one_owner():
-    local = install(PAYLOAD_SCHEMA)
+def test_tuple_grant_and_revoke_related_tuples_in_one_transaction():
+    local = install_schema(PAYLOAD_SCHEMA)
     bob = SubjectRef.of("auth/user", "bob")
     chain = payload_chain(3)
     local.write_relationships(chain)
-    with transaction.atomic(), IndexMaintenance(using="default"):
+    with transaction.atomic():
         local.write_relationships([row("test/folder", "f2", "viewer", bob)])
         local.delete_relationship(chain[0])
         local.write_relationships([row("test/folder", "x", "viewer")])
         local.delete_relationship(chain[2])
-    assert_no_drift()
     assert not local.check_access(
         subject=USER, resource=ObjectRef("test/doc", "d"), action="read"
     ).allowed
@@ -942,7 +960,7 @@ def test_tuple_grant_and_revoke_related_edges_in_one_owner():
     ).allowed
 
 
-LARGE_REGION_SCHEMA = """
+LARGE_FAN_OUT_SCHEMA = """
 definition auth/user {}
 definition test/thread {
     relation viewer: auth/user
@@ -956,8 +974,8 @@ definition test/message {
 
 
 @pytest.mark.slow
-def test_thirty_three_thousand_scope_fan_out_is_chunked():
-    local = install(LARGE_REGION_SCHEMA)
+def test_thirty_three_thousand_arrow_readers_see_a_new_grant():
+    local = install_schema(LARGE_FAN_OUT_SCHEMA)
     local.write_relationships(
         [
             row("test/message", str(n), "thread", SubjectRef.of("test/thread", "root"))
@@ -965,15 +983,14 @@ def test_thirty_three_thousand_scope_fan_out_is_chunked():
         ]
     )
     local.write_relationships([row("test/thread", "root", "viewer")])
-    assert_no_drift()
     assert local.check_access(
         subject=USER, resource=ObjectRef("test/message", "32999"), action="read"
     ).allowed
 
 
 @pytest.mark.slow
-def test_thirty_three_thousand_bulk_seed_then_fan_out_is_chunked():
-    local = install(LARGE_REGION_SCHEMA)
+def test_thirty_three_thousand_bulk_created_tuples_see_a_new_grant():
+    local = install_schema(LARGE_FAN_OUT_SCHEMA)
     Relationship.objects.bulk_create(
         [
             Relationship(
@@ -989,7 +1006,6 @@ def test_thirty_three_thousand_bulk_seed_then_fan_out_is_chunked():
         batch_size=256,
     )
     local.write_relationships([row("test/thread", "root", "viewer")])
-    assert_no_drift()
     assert local.check_access(
         subject=USER, resource=ObjectRef("test/message", "32999"), action="read"
     ).allowed
@@ -1015,22 +1031,39 @@ definition blog/post {
 
 
 @pytest.mark.slow
-def test_thirty_three_thousand_model_ids_are_captured_in_chunks():
-    local = install(MODEL_SCALE_SCHEMA)
-    with sudo(reason="index propagation scale test"):
+def test_thirty_three_thousand_bulk_created_rows_read_through_their_folder():
+    local = install_schema(MODEL_SCALE_SCHEMA)
+    with sudo(reason="write propagation scale test"):
         folder = Folder.objects.create(name="root")
         local.write_relationships([row("blog/folder", str(folder.pk), "viewer")])
         posts = Post.objects.bulk_create(
             [Post(title=str(n), folder=folder) for n in range(33_000)], batch_size=500
         )
-    assert_no_drift()
     assert local.check_access(
         subject=USER, resource=to_object_ref(posts[-1]), action="read"
     ).allowed
 
 
+@pytest.fixture
+def persisted(db):
+    """A stored policy with one grant; returns its ``read`` permission row."""
+    reset_backend()
+    with schema_changes():
+        SchemaDefinition.objects.create(resource_type="auth/user")
+        definition = SchemaDefinition.objects.create(resource_type="test/policy")
+        SchemaRelation.objects.create(
+            definition=definition, name="viewer", allowed_subjects=[{"type": "auth/user"}]
+        )
+        permission = SchemaPermission.objects.create(
+            definition=definition, name="read", expression="viewer"
+        )
+        SchemaPermission.objects.create(definition=definition, name="dependent", expression="read")
+    backend().write_relationships([row("test/policy", "one", "viewer")])
+    return permission
+
+
 @pytest.mark.parametrize("order", ["first", "middle", "last"])
-def test_nested_override_and_interleaved_grant_revoke_match_rebuild(persisted, order):  # noqa: F811
+def test_nested_override_and_interleaved_grant_revoke_read_final_policy(persisted, order):
     local = backend()
 
     def disable_read():
@@ -1042,7 +1075,7 @@ def test_nested_override_and_interleaved_grant_revoke_match_rebuild(persisted, o
             reason="propagation test",
         )
 
-    with transaction.atomic(), IndexMaintenance(using="default", backend=local):
+    with transaction.atomic():
         if order == "first":
             disable_read()
         local.write_relationships(
@@ -1054,7 +1087,6 @@ def test_nested_override_and_interleaved_grant_revoke_match_rebuild(persisted, o
         local.write_relationships([row("test/policy", "three", "viewer")])
         if order == "last":
             disable_read()
-    assert_no_drift()
     assert all(
         not local.check_access(
             subject=subject, resource=ObjectRef("test/policy", name), action="read"
@@ -1067,10 +1099,10 @@ def test_nested_override_and_interleaved_grant_revoke_match_rebuild(persisted, o
     )
 
 
-def test_nested_override_create_then_delete_keeps_tuple_revoke(persisted):  # noqa: F811
+def test_nested_override_create_then_delete_keeps_tuple_revoke(persisted):
     local = backend()
     bob = SubjectRef.of("auth/user", "bob")
-    with transaction.atomic(), IndexMaintenance(using="default", backend=local):
+    with transaction.atomic():
         override = SchemaOverride.objects.create(
             kind="disable",
             target_ct=ContentType.objects.get_for_model(SchemaPermission),
@@ -1081,7 +1113,6 @@ def test_nested_override_create_then_delete_keeps_tuple_revoke(persisted):  # no
         local.write_relationships([row("test/policy", "two", "viewer", bob)])
         override.delete()
         local.delete_relationship(row("test/policy", "one", "viewer"))
-    assert_no_drift()
     assert not local.check_access(
         subject=USER, resource=ObjectRef("test/policy", "one"), action="read"
     ).allowed
@@ -1111,33 +1142,32 @@ definition blog/post {
 """
 
 
-def test_nested_field_reparent_a_b_a_uses_final_projection():
-    local = install(MODEL_PROPAGATION_SCHEMA)
+def test_nested_field_reparent_a_b_a_reads_final_folder():
+    local = install_schema(MODEL_PROPAGATION_SCHEMA)
     bob = SubjectRef.of("auth/user", "bob")
-    with sudo(reason="index propagation test"):
+    with sudo(reason="write propagation test"):
         a, b = Folder.objects.create(name="a"), Folder.objects.create(name="b")
         post = Post.objects.create(title="p", folder=a)
         local.write_relationships([row("blog/folder", str(a.pk), "viewer")])
         local.write_relationships([row("blog/folder", str(b.pk), "viewer", bob)])
-        with transaction.atomic(), IndexMaintenance(using="default"):
+        with transaction.atomic():
             post.folder = b
             post.save(update_fields=["folder"])
             post.folder = a
             post.save(update_fields=["folder"])
-    assert_no_drift()
     assert local.check_access(subject=USER, resource=to_object_ref(post), action="read").allowed
     assert not local.check_access(subject=bob, resource=to_object_ref(post), action="read").allowed
 
 
 @pytest.mark.slow
 def test_nested_field_reparent_with_interleaved_grant_and_revoke():
-    local = install(MODEL_PROPAGATION_SCHEMA)
+    local = install_schema(MODEL_PROPAGATION_SCHEMA)
     bob = SubjectRef.of("auth/user", "bob")
-    with sudo(reason="index propagation test"):
+    with sudo(reason="write propagation test"):
         a, b = Folder.objects.create(name="a"), Folder.objects.create(name="b")
         post = Post.objects.create(title="p", folder=a)
         local.write_relationships([row("blog/folder", str(a.pk), "viewer")])
-        with transaction.atomic(), IndexMaintenance(using="default"):
+        with transaction.atomic():
             post.folder = b
             post.save(update_fields=["folder"])
             local.write_relationships([row("blog/folder", str(b.pk), "viewer", bob)])
@@ -1145,40 +1175,36 @@ def test_nested_field_reparent_with_interleaved_grant_and_revoke():
             post.folder = a
             post.save(update_fields=["folder"])
             local.write_relationships([row("blog/folder", str(a.pk), "viewer", bob)])
-    assert_no_drift()
     assert not local.check_access(subject=USER, resource=to_object_ref(post), action="read").allowed
     assert local.check_access(subject=bob, resource=to_object_ref(post), action="read").allowed
 
 
 @pytest.mark.slow
 def test_duplicate_field_and_collection_edges_survive_each_other():
-    local = install(MODEL_PROPAGATION_SCHEMA)
-    with sudo(reason="index propagation test"):
+    local = install_schema(MODEL_PROPAGATION_SCHEMA)
+    with sudo(reason="write propagation test"):
         folder = Folder.objects.create(name="f")
         post = Post.objects.create(title="p", folder=folder)
         local.write_relationships([row("blog/folder", str(folder.pk), "viewer")])
         post.collections.add(folder)
         post.collections.remove(folder)
-        assert_no_drift()
         assert local.check_access(subject=USER, resource=to_object_ref(post), action="read").allowed
         post.collections.add(folder)
         post.folder = None
         post.save(update_fields=["folder"])
-        assert_no_drift()
         assert local.check_access(subject=USER, resource=to_object_ref(post), action="read").allowed
         post.collections.clear()
-    assert_no_drift()
     assert not local.check_access(subject=USER, resource=to_object_ref(post), action="read").allowed
 
 
-def test_nested_savepoint_rollback_discards_inner_projection():
-    local = install(MODEL_PROPAGATION_SCHEMA)
+def test_nested_savepoint_rollback_discards_inner_writes():
+    local = install_schema(MODEL_PROPAGATION_SCHEMA)
     bob = SubjectRef.of("auth/user", "bob")
-    with sudo(reason="index propagation test"):
+    with sudo(reason="write propagation test"):
         a, b = Folder.objects.create(name="a"), Folder.objects.create(name="b")
         post = Post.objects.create(title="p", folder=a)
         local.write_relationships([row("blog/folder", str(a.pk), "viewer")])
-        with transaction.atomic(), IndexMaintenance(using="default"):
+        with transaction.atomic():
             try:
                 with transaction.atomic():
                     post.folder = b
@@ -1189,12 +1215,11 @@ def test_nested_savepoint_rollback_discards_inner_projection():
                 pass
             post.refresh_from_db()
             local.write_relationships([row("blog/folder", str(a.pk), "viewer", bob)])
-    assert_no_drift()
     assert local.check_access(subject=USER, resource=to_object_ref(post), action="read").allowed
     assert local.check_access(subject=bob, resource=to_object_ref(post), action="read").allowed
 
 
-STRATA_SCHEMA = """
+SET_OPERATION_SCHEMA = """
 definition auth/user {}
 definition test/folder {
     relation viewer: auth/user | auth/user with expiration
@@ -1221,8 +1246,8 @@ definition test/doc {
 
 
 @pytest.mark.slow
-def test_exclusion_intersection_nil_and_type_level_strata_sequence():
-    local = install(STRATA_SCHEMA)
+def test_exclusion_intersection_nil_and_type_level_sequence():
+    local = install_schema(SET_OPERATION_SCHEMA)
     doc_folder = row("test/doc", "d", "folder", SubjectRef.of("test/folder", "f"))
     local.write_relationships([doc_folder])
     steps = [
@@ -1243,7 +1268,16 @@ def test_exclusion_intersection_nil_and_type_level_strata_sequence():
             local.write_relationships([tuple_])
         else:
             local.delete_relationship(tuple_)
-        assert_no_drift()
+        assert_reads_match(
+            subjects=[USER, BOB],
+            resources=[ObjectRef("test/folder", name) for name in ("f", "root")],
+            actions=["read", "safe", "open", "none", "minus_nil", "and_nil"],
+        )
+        assert_reads_match(
+            subjects=[USER, BOB],
+            resources=[ObjectRef("test/doc", "d")],
+            actions=["safe", "open", "mix", "mix2", "nn"],
+        )
     assert local.check_access(
         subject=USER, resource=ObjectRef("test/doc", "d"), action="open"
     ).allowed
@@ -1252,8 +1286,8 @@ def test_exclusion_intersection_nil_and_type_level_strata_sequence():
     ).allowed
 
 
-def test_site_left_operand_expiry_change_reaches_arrow_reader():
-    local = install(STRATA_SCHEMA)
+def test_exclusion_left_operand_expiry_change_reaches_arrow_reader():
+    local = install_schema(SET_OPERATION_SCHEMA)
     soon = timezone.now() + timedelta(minutes=1)
     later = soon + timedelta(days=2)
     local.write_relationships(
@@ -1266,16 +1300,16 @@ def test_site_left_operand_expiry_change_reaches_arrow_reader():
     local.write_relationships(
         [row("test/folder", "f", "viewer", SubjectRef.of("auth/user", "bob"))]
     )
-    assert_no_drift()
-    assert local.check_access(
-        subject=USER, resource=ObjectRef("test/doc", "d"), action="mix"
-    ).allowed
+    document = ObjectRef("test/doc", "d")
+    assert local.check_access(subject=USER, resource=document, action="mix").allowed
+    assert read_at(local, document, "mix", soon + timedelta(hours=1)).allowed
+    assert not read_at(local, document, "mix", later).allowed
 
 
 @pytest.mark.slow
 def test_model_bulk_update_delete_and_cascade_revoke_access():
-    local = install(MODEL_PROPAGATION_SCHEMA)
-    with sudo(reason="index propagation test"):
+    local = install_schema(MODEL_PROPAGATION_SCHEMA)
+    with sudo(reason="write propagation test"):
         left, right = Folder.objects.create(name="left"), Folder.objects.create(name="right")
         local.write_relationships([row("blog/folder", str(left.pk), "viewer")])
         posts = Post.objects.bulk_create(
@@ -1287,7 +1321,6 @@ def test_model_bulk_update_delete_and_cascade_revoke_access():
         Post.objects.filter(pk__in=[post.pk for post in posts[10:20]]).update(folder=right)
         Post.objects.filter(pk__in=[post.pk for post in posts[20:]]).delete()
         left.delete()
-    assert_no_drift()
     assert not any(
         local.check_access(subject=USER, resource=to_object_ref(post), action="read").allowed
         for post in posts[:20]
@@ -1295,8 +1328,8 @@ def test_model_bulk_update_delete_and_cascade_revoke_access():
 
 
 def test_model_cascade_delete_removes_recursive_field_grants():
-    local = install(MODEL_PROPAGATION_SCHEMA)
-    with sudo(reason="index propagation test"):
+    local = install_schema(MODEL_PROPAGATION_SCHEMA)
+    with sudo(reason="write propagation test"):
         root = Folder.objects.create(name="root")
         mid = Folder.objects.create(name="mid", parent=root)
         leaf = Folder.objects.create(name="leaf", parent=mid)
@@ -1304,14 +1337,13 @@ def test_model_cascade_delete_removes_recursive_field_grants():
         local.write_relationships([row("blog/folder", str(root.pk), "viewer")])
         mid.delete()
         post.refresh_from_db()
-    assert_no_drift()
     assert not local.check_access(subject=USER, resource=to_object_ref(post), action="read").allowed
 
 
 @pytest.mark.slow
 def test_model_reverse_m2m_remove_set_and_clear_revoke_access():
-    local = install(MODEL_PROPAGATION_SCHEMA)
-    with sudo(reason="index propagation test"):
+    local = install_schema(MODEL_PROPAGATION_SCHEMA)
+    with sudo(reason="write propagation test"):
         folder, other = Folder.objects.create(name="f"), Folder.objects.create(name="other")
         local.write_relationships([row("blog/folder", str(folder.pk), "viewer")])
         posts = [Post.objects.create(title=str(n)) for n in range(4)]
@@ -1319,38 +1351,26 @@ def test_model_reverse_m2m_remove_set_and_clear_revoke_access():
         folder.collected_posts.remove(posts[0])
         posts[1].collections.set([other])
         folder.collected_posts.clear()
-    assert_no_drift()
     assert not any(
         local.check_access(subject=USER, resource=to_object_ref(post), action="read").allowed
         for post in posts
     )
 
 
-def test_model_partial_derivation_exception_rolls_back():
-    local = install(MODEL_PROPAGATION_SCHEMA)
-    with sudo(reason="index propagation test"):
+def test_model_reader_keeps_grant_when_nested_revocation_rolls_back():
+    local = install_schema(MODEL_PROPAGATION_SCHEMA)
+    with sudo(reason="write propagation test"):
         folder = Folder.objects.create(name="f")
         post = Post.objects.create(title="p", folder=folder)
         grant = row("blog/folder", str(folder.pk), "viewer")
         local.write_relationships([grant])
-        original = derive.derive_nodes
-        calls = 0
-
-        def flaky(*args, **kwargs):
-            nonlocal calls
-            calls += 1
-            if calls == 3:
-                raise RuntimeError("mid pass")
-            return original(*args, **kwargs)
-
         with transaction.atomic():
             with pytest.raises(RuntimeError):
-                with transaction.atomic(), patch.object(derive, "derive_nodes", flaky):
+                with transaction.atomic():
                     local.delete_relationship(grant)
-        assert_no_drift()
+                    raise RuntimeError("mid write")
         assert local.check_access(subject=USER, resource=to_object_ref(post), action="read").allowed
         local.delete_relationship(grant)
-    assert_no_drift()
     assert not local.check_access(subject=USER, resource=to_object_ref(post), action="read").allowed
 
 
@@ -1380,8 +1400,8 @@ definition blog/post {
 
 @pytest.mark.slow
 def test_model_field_chain_reparent_and_const_filter_transition():
-    local = install(MODEL_FILTER_SCHEMA)
-    with sudo(reason="index propagation test"):
+    local = install_schema(MODEL_FILTER_SCHEMA)
+    with sudo(reason="write propagation test"):
         root = Folder.objects.create(name="root")
         child = Folder.objects.create(name="child", parent=root)
         leaf = Folder.objects.create(name="leaf", parent=child)
@@ -1389,25 +1409,22 @@ def test_model_field_chain_reparent_and_const_filter_transition():
         local.write_relationships([row("blog/folder", str(root.pk), "viewer")])
         child.parent = None
         child.save(update_fields=["parent"])
-        assert_no_drift()
         assert not local.check_access(
             subject=USER, resource=to_object_ref(post), action="read"
         ).allowed
         leaf.is_active = False
         leaf.save(update_fields=["is_active"])
-        assert_no_drift()
         assert not local.check_access(
             subject=USER, resource=to_object_ref(post), action="open"
         ).allowed
         Folder.objects.filter(pk=leaf.pk).update(is_active=True)
-    assert_no_drift()
     assert local.check_access(subject=USER, resource=to_object_ref(post), action="open").allowed
 
 
 @pytest.mark.slow
-def test_bulk_tuple_rebuild_then_queryset_delete_revokes_field_reader():
-    local = install(MODEL_PROPAGATION_SCHEMA)
-    with sudo(reason="index propagation test"):
+def test_bulk_tuple_write_then_queryset_delete_revokes_field_reader():
+    local = install_schema(MODEL_PROPAGATION_SCHEMA)
+    with sudo(reason="write propagation test"):
         folder = Folder.objects.create(name="f")
         post = Post.objects.create(title="p", folder=folder)
         local.write_relationships(
@@ -1424,5 +1441,4 @@ def test_bulk_tuple_rebuild_then_queryset_delete_revokes_field_reader():
         active_relationship_model().objects.filter(
             resource_type="blog/folder", resource_id=str(folder.pk)
         ).delete()
-    assert_no_drift()
     assert not local.check_access(subject=USER, resource=to_object_ref(post), action="read").allowed

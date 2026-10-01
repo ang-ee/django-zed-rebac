@@ -2,10 +2,12 @@
 
 ## 1.0: integrate at Django's ORM, not at the consumer's models
 
-0.24.0 shipped the engine in the shape it will keep: the SpiceDB schema, the
-permission index, maintenance passes with a drift oracle, strict-by-default
-scoping, audited bypass, and three test tiers. What it did not fix is the
-layer that connects the engine to Django. That layer attaches to each model
+The engine has the shape it will keep: the SpiceDB schema, permissions
+compiled to queries over the application's own tables
+([proposal 0015](./proposals/0015-permissions-compiled-to-queries.md)),
+strict-by-default scoping, audited bypass, and three test tiers. What is not
+fixed is the layer that connects the engine to Django. That layer attaches to
+each model
 (`RebacMixin`, `RebacTrackedMixin`) and then chases every other way Django
 touches a row: patched related managers, a replaced through-model manager,
 signals on third-party models, collector hooks, twelve `ContextVar`s. Four
@@ -30,18 +32,21 @@ so the storage and identity changes ride with it.
    point to find out. Days, not weeks.
 2. **Read scope for every alias.** Joined tables, `Subquery`, `Exists`,
    combined queries, prefetches; field read gates as `NULL` projection of
-   gated columns. `select_related` and bare `prefetch_related` become safe;
-   W003 is retired.
+   gated columns. The scope of an alias is the compiled predicate at that
+   alias's identity column (proposal 0015 § 9). `select_related` and bare
+   `prefetch_related` become safe; W003 is retired.
 3. **Writes at the insert, update and delete compilers.** One gate computed
    from the statement's `Query`: frozen rows as a subquery, written values
    evaluated by the database, the backed-edge rule of invariant 5d applied
-   once (proposal 0011's rule), the index owner opened around the statement.
+   once (proposal 0011's rule).
    Delete the related-manager patches, the through-manager swap, the
    `_base_manager` injection, the tracked signals, `RebacTrackedMixin`,
-   `REBAC_TRACKED_MODELS`, the write overrides on `RebacMixin` and
-   `RebacQuerySet`, and the D2 autocommit distinction. Each pinned test in
+   `REBAC_TRACKED_MODELS` and the write overrides on `RebacMixin` and
+   `RebacQuerySet`. Each pinned test in
    `test_security_proposal_0011.py` and `_0013.py` turns green as its path
-   moves; that is the progress meter.
+   moves; that is the progress meter. Nothing is maintained after a write, so
+   this step exists for the gates alone; how far it goes follows the decision
+   on the gates (proposal 0015 § 13).
 4. **The actor carrier.** `with_actor()` stores the actor on the `Query`
    (`_hints`), so a pinned actor still outranks the ambient one and reaches
    subqueries and prefetches; `actor_context()` and the middleware stay the
@@ -50,29 +55,24 @@ so the storage and identity changes ride with it.
    is a resource because the `.zed` schema declares its type.
 5. **Single storage.** Drop registry mode (`RelationshipRegistry`,
    `RebacResource`, the lookup-rewriting queryset, `migrate-storage`, W005,
-   `REBAC_LOCAL_BACKEND_STORAGE`) and the storage axis in tests. The index's
-   term table already provides the integer keys the registry was built for
-   (proposal 0001, 0.3.0, before the index existed). One source table in
-   wire form; the migration refuses to run while registry rows exist.
-6. **Identity as a stored column.** The canonical wire id lives in an indexed
-   column on every resource model (or a generated column); the read side
-   compares on it and never computes or validates identity in SQL
-   (`_Conversion.as_sql`). Text identities such as sqids already work this
-   way; integer and UUID keys stop paying a per-row `CASE`/regex on every
-   scoped read.
+   `REBAC_LOCAL_BACKEND_STORAGE`) and the storage axis in tests. One source
+   table in wire form; the migration refuses to run while registry rows
+   exist.
+6. **Identity as a stored column: dropped.** A compiled statement never
+   converts a model column; a tuple column is converted where the two meet
+   (proposal 0015 § 2), so no resource model needs a stored wire id.
 7. **One bypass primitive** with an explicit audit flag and reason, replacing
    the `sudo`/`system_context` block, queryset and instance variants and the
    engine's reason-string captures. **Overrides as AST operations** on named
    nodes, validated at save time, with stale narrowing overrides failing
    closed per name (proposal 0012's override half).
-8. **Proposal 0009 — implemented** (maintenance that re-derives only changed
-   inputs). The SpiceDB conformance suite remains planned in parallel with
-   the above; neither touches the compilers.
+8. The SpiceDB conformance suite remains planned in parallel with the above;
+   it does not touch the compilers.
 
 ### What 1.0 does not change
 
-The schema language and SpiceDB wire compatibility, the index and its
-derivation, maintenance passes and the drift oracle, the audit event table,
+The schema language and SpiceDB wire compatibility, the permission compiler
+(`rebac.compile`) and what the library stores, the audit event table,
 the DRF, MCP and GraphQL adapters, the system-check framework, and the test
 tiers. `raw()`, `extra()` and `cursor.execute` stay outside the compilers
 and stay refused under scope.
@@ -81,17 +81,17 @@ and stay refused under scope.
 
 Set `DATABASES[...]["ENGINE"]` to the REBAC wrapper (a check, `rebac.E022`,
 fails startup if a resource model's database is not wrapped); run the storage
-and identity migrations; remove `RebacTrackedMixin` and `REBAC_TRACKED_MODELS`;
-drop `with_actor` from `select_related`/`prefetch_related` workarounds. Grant
-ids change format with the identity column, so the 0.24.0 `v2_` format is
-provisional.
+migration; remove `RebacTrackedMixin` and `REBAC_TRACKED_MODELS`;
+drop `with_actor` from `select_related`/`prefetch_related` workarounds.
 
 ### Measurements that decide it
 
 - Spike parity: byte-identical scope SQL on the parity suites.
 - Write cost: one gate query per affected declaring type per statement; a
-  100,000-row update on SQLite and PostgreSQL completes within the scale
-  budgets.
+  100,000-row update on SQLite and PostgreSQL completes within a budget still
+  to be set (there is no scale suite at the moment).
+- Query plans of compiled scopes on a PostgreSQL database of tens of millions
+  of rows (proposal 0015, gate G1): under trial, not verified.
 - The 0.24.0 probe corpus (`scratchpad` rounds r3 to r7, folded into
   `tests/test_security_*.py`): every case denies.
 - `make test-release` green on SQLite, PostgreSQL 16 and MySQL 8.
@@ -105,25 +105,31 @@ provisional.
     failures for every known fail-open path, each naming its proposal.
   - Follow-ups: 1.0 above.
 
-- [x] 0.23.0 permission index.
-  - Shipped surface: seven internal derived tables; fixed-shape LocalBackend
-    reads; synchronous Django write maintenance under one global lock per alias;
-    complete subject expansion; rebuild/verify commands; E013–E017 and W010;
-    reference/differential suites and PostgreSQL CI.
-  - Follow-ups: measure lock contention and write/storage amplification before
-    considering per-type locks or fan-out budgets. Monotone set operations on
-    recursive cycles remain deferred; negative cycles stay unsupported.
+- [x] Permissions compiled to queries (proposal 0015; unreleased).
+  - Shipped surface: `rebac.compile`; no table that holds a row per
+    application row and no build step; recursion unrolled to
+    `REBAC_DEPTH_LIMIT`; gated queryset writes that select, gate and write
+    their rows by key; policy writes serialized on the generation row;
+    migrations `0008` and `0009`. It replaces the derived permission store of
+    0.23.0 with its commands, checks and settings (CHANGELOG, Unreleased).
+  - Follow-ups: the trial on a consumer database at scale (gate G1); the
+    decision on the write gates (proposal 0015 § 13); a scale suite; a
+    recursion mechanism without a bound, if a deployment needs one.
+
+- [x] 0.23.0: complete subject expansion, W010, reference/differential suites
+  and PostgreSQL CI.
 
 - [ ] SpiceDB conformance suite.
-  - Why: the differential oracle compares the permission index with the
-    library's own walker, which proves parity with current behaviour, not
-    correctness. SpiceDB is the contract (AGENTS.md invariant 1).
+  - Why: the differential oracle compares the compiled reads with the
+    library's own walker and reference model, which proves parity with the
+    library's reading of the semantics, not with SpiceDB. SpiceDB is the
+    contract (AGENTS.md invariant 1).
   - Outcome: `pytest -m spicedb` checks generated schemas and data against a
     pinned `spicedb serve-testing` container in dev and in a CI job, comparing
     `CheckPermission` (including caveat `missing_required_context`),
-    `LookupResources` and `LookupSubjects`. Deliberate divergences (data
-    cycles, E016 recursive set-operation refusals, expiring overrides,
-    `check_new`) are listed in ARCHITECTURE and pinned by
+    `LookupResources` and `LookupSubjects`. Deliberate divergences (the depth
+    bound, data cycles, E016 refusals of recursive components, expiring
+    overrides, `check_new`) are listed in ARCHITECTURE and pinned by
     tests. The in-process oracle then shrinks to a spec-written reference
     model. ARCHITECTURE.md § SpiceDB conformance suite has the design.
   - Include: the test-side projector of field, attribute and constant

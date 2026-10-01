@@ -1,4 +1,4 @@
-"""``rebac.schema_changes()``: stored-schema writes in one block rebuild the index once."""
+"""``rebac.schema_changes()``: one transaction and one validation for a block of schema writes."""
 
 from __future__ import annotations
 
@@ -7,22 +7,22 @@ from unittest.mock import patch
 import pytest
 
 import rebac
-from rebac import ObjectRef, RelationshipTuple, SubjectRef, backend, schema_changes
+from rebac import ObjectRef, RelationshipTuple, SchemaError, SubjectRef, backend, schema_changes
 from rebac.backends import reset_backend
-from rebac.index import rebuild as rebuild_module
-from rebac.models import SchemaDefinition, SchemaPermission, SchemaRelation
+from rebac.models import SchemaDefinition, SchemaPermission, SchemaRelation, schema_write
 from rebac.models.generation import SchemaGeneration
-from rebac.models.index import IndexState
-from tests.index_harness import assert_no_drift
 
 ALICE = SubjectRef.of("auth/user", "alice")
 DOC = ObjectRef("test/policy", "one")
+
+# An owner of policy writes reads the stored policy when it starts and
+# validates the composed one when it exits.
+ONE_OWNER = 2
 
 
 @pytest.fixture
 def stored(db):
     reset_backend()
-    IndexState.objects.get_or_create(key="global")
     with schema_changes():
         SchemaDefinition.objects.create(resource_type="auth/user")
         definition = SchemaDefinition.objects.create(resource_type="test/policy")
@@ -37,78 +37,152 @@ def stored(db):
     return definition
 
 
-def _rebuilds():
-    return patch.object(rebuild_module, "_rebuild_locked", wraps=rebuild_module._rebuild_locked)
+def _validations():
+    return patch.object(
+        schema_write, "_stored_policy_errors", wraps=schema_write._stored_policy_errors
+    )
 
 
 def _readable():
     return backend().check_access(subject=ALICE, resource=DOC, action="read").allowed
 
 
-def test_schema_writes_outside_the_block_rebuild_once_each(stored):
+def _revision():
+    return SchemaGeneration.objects.get(pk=1).revision
+
+
+def _cycle_through_an_exclusion(definition):
+    """Two permissions, each valid alone, that compose into a refused recursion."""
+    SchemaPermission.objects.create(definition=definition, name="inner", expression="viewer")
+    SchemaPermission.objects.create(definition=definition, name="outer", expression="inner")
+    SchemaPermission.objects.filter(definition=definition, name="inner").update(
+        expression="viewer - outer"
+    )
+
+
+def test_schema_writes_outside_the_block_validate_once_each(stored):
     stale = SchemaRelation.objects.filter(definition=stored, name__in=("editor", "auditor"))
 
-    with _rebuilds() as rebuilds:
+    with _validations() as validations:
         for relation in stale:
             relation.delete()
 
-    assert rebuilds.call_count == 2
-    assert_no_drift()
+    assert validations.call_count == 2 * ONE_OWNER
 
 
-def test_schema_writes_inside_the_block_rebuild_once(stored):
+def test_schema_writes_inside_the_block_validate_once(stored):
     stale = SchemaRelation.objects.filter(definition=stored, name__in=("editor", "auditor"))
 
-    with _rebuilds() as rebuilds, schema_changes():
+    with _validations() as validations, schema_changes():
         for relation in stale:
             relation.delete()
-        assert rebuilds.call_count == 0
+        assert validations.call_count == ONE_OWNER - 1
 
-    assert rebuilds.call_count == 1
-    generation = SchemaGeneration.objects.get(pk=1)
-    assert generation.revision == generation.index_revision
+    assert validations.call_count == ONE_OWNER
+    assert not stale.all().exists()
     assert _readable()
-    assert_no_drift()
 
 
-def test_relationship_delete_after_a_schema_change_is_covered_by_the_rebuild(stored):
+def test_permissions_follow_the_block_as_soon_as_it_exits(stored):
+    before = _revision()
+
+    with schema_changes():
+        SchemaPermission.objects.filter(definition=stored, name="read").update(expression="editor")
+        SchemaRelation.objects.filter(definition=stored, name="auditor").delete()
+
+    assert _revision() != before
+    assert not _readable()
+    backend().write_relationships([RelationshipTuple(DOC, "editor", ALICE)])
+    assert _readable()
+
+
+def test_relationship_delete_after_a_schema_change_shares_the_block(stored):
     from rebac.models import active_relationship_model
 
-    with _rebuilds() as rebuilds, schema_changes(using="default"):
-        SchemaRelation.objects.filter(definition=stored, name="legacy").delete()
-        active_relationship_model().objects.filter(
-            resource_type="test/policy", relation="legacy"
-        ).delete()
+    relationships = active_relationship_model().objects
 
-    assert rebuilds.call_count == 1
-    assert not active_relationship_model().objects.filter(relation="legacy").exists()
+    def drop_legacy():
+        SchemaRelation.objects.filter(definition=stored, name="legacy").delete()
+        relationships.filter(resource_type="test/policy", relation="legacy").delete()
+
+    with pytest.raises(RuntimeError, match="stop"), schema_changes(using="default"):
+        drop_legacy()
+        raise RuntimeError("stop")
+
+    assert SchemaRelation.objects.filter(definition=stored, name="legacy").exists()
+    assert relationships.filter(relation="legacy").exists()
+
+    with schema_changes(using="default"):
+        drop_legacy()
+
+    assert not SchemaRelation.objects.filter(definition=stored, name="legacy").exists()
+    assert not relationships.filter(relation="legacy").exists()
     assert _readable()
-    assert_no_drift()
 
 
 def test_an_exception_rolls_the_block_back(stored):
-    before = SchemaGeneration.objects.get(pk=1).revision
+    before = _revision()
 
-    with _rebuilds() as rebuilds, pytest.raises(RuntimeError, match="stop"), schema_changes():
+    with _validations() as validations, pytest.raises(RuntimeError, match="stop"), schema_changes():
         SchemaRelation.objects.filter(definition=stored, name="viewer").delete()
+        SchemaPermission.objects.filter(definition=stored, name="read").update(expression="nil")
+        assert not _readable()
         raise RuntimeError("stop")
 
-    assert rebuilds.call_count == 0
+    assert validations.call_count == ONE_OWNER - 1
     assert SchemaRelation.objects.filter(definition=stored, name="viewer").exists()
-    assert SchemaGeneration.objects.get(pk=1).revision == before
+    assert SchemaPermission.objects.get(definition=stored, name="read").expression == "viewer"
+    assert _revision() == before
     assert _readable()
-    assert_no_drift()
+
+
+def test_an_invalid_composed_policy_is_refused_when_the_block_exits(stored):
+    before = _revision()
+
+    with pytest.raises(SchemaError, match="inner"), schema_changes():
+        SchemaRelation.objects.filter(definition=stored, name="auditor").delete()
+        _cycle_through_an_exclusion(stored)
+
+    assert SchemaRelation.objects.filter(definition=stored, name="auditor").exists()
+    assert not SchemaPermission.objects.filter(
+        definition=stored, name__in=("inner", "outer")
+    ).exists()
+    assert _revision() == before
+    assert _readable()
+
+
+def test_the_block_validates_only_the_policy_it_ends_with(stored):
+    with schema_changes():
+        _cycle_through_an_exclusion(stored)
+        SchemaPermission.objects.filter(definition=stored, name="outer").update(expression="editor")
+
+    assert SchemaPermission.objects.get(definition=stored, name="inner").expression == (
+        "viewer - outer"
+    )
+    assert _readable()
+    SchemaPermission.objects.filter(definition=stored, name__in=("inner", "outer")).delete()
+
+    # The same writes each validate on their own outside a block.
+    with pytest.raises(SchemaError, match="inner"):
+        _cycle_through_an_exclusion(stored)
+    assert SchemaPermission.objects.get(definition=stored, name="inner").expression == "viewer"
 
 
 def test_nested_blocks_join_the_outer_one(stored):
-    with _rebuilds() as rebuilds, schema_changes():
+    with _validations() as validations, schema_changes():
         with schema_changes():
             SchemaRelation.objects.filter(definition=stored, name="editor").delete()
-        assert rebuilds.call_count == 0
+        assert validations.call_count == ONE_OWNER - 1
         SchemaRelation.objects.filter(definition=stored, name="auditor").delete()
 
-    assert rebuilds.call_count == 1
-    assert_no_drift()
+    assert validations.call_count == ONE_OWNER
+
+    with pytest.raises(RuntimeError, match="stop"), schema_changes():
+        with schema_changes():
+            SchemaRelation.objects.filter(definition=stored, name="legacy").delete()
+        raise RuntimeError("stop")
+
+    assert SchemaRelation.objects.filter(definition=stored, name="legacy").exists()
 
 
 def test_schema_changes_is_public():

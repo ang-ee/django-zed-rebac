@@ -14,17 +14,19 @@ from django.test.utils import CaptureQueriesContext, isolate_apps
 
 from rebac import (
     MissingActorError,
+    ObjectRef,
     PermissionDenied,
     RebacTrackedMixin,
+    RelationshipTuple,
+    SubjectRef,
     backend,
     rebac_subject,
     sudo,
     to_object_ref,
+    to_subject_ref,
 )
 from rebac.actors import _current_actor, _sudo_state
 from rebac.backends import reset_backend
-from rebac.index.maintain import IndexMaintenance
-from rebac.index.rebuild import rebuild
 from rebac.models import (
     PermissionAuditEvent,
     SchemaDefinition,
@@ -34,10 +36,7 @@ from rebac.models import (
 )
 from rebac.models.generation import SchemaGeneration
 from rebac.schema import parse_zed
-from tests import test_index_maintenance as maintenance_cases
 from tests.backend_setup import STORAGE_TIERS, install_schema
-from tests.index_harness import assert_no_drift
-from tests.test_index_maintenance import ALICE, grant_folder
 from tests.testapp.models import (
     BackingProject,
     BackingQueue,
@@ -47,7 +46,62 @@ from tests.testapp.models import (
     Post,
 )
 
-indexed = maintenance_cases.indexed
+SCHEMA = """
+definition auth/user {}
+definition auth/group {
+    relation member: auth/user | auth/group#member
+}
+definition blog/folder {
+    relation viewer: auth/user | auth/group#member
+    relation parent: blog/folder // rebac:field=parent
+    permission read = viewer + parent->read
+    permission create = authenticated
+    permission write = authenticated
+    permission delete = authenticated
+}
+definition blog/post {
+    relation folder: blog/folder // rebac:field=folder
+    relation collections: blog/folder // rebac:field=collections
+    permission read = folder->read + collections->read
+    permission create = authenticated
+    permission write = authenticated
+    permission delete = authenticated
+}
+definition test/backingqueue {
+    relation viewer: auth/user
+    permission read = viewer
+}
+definition test/backingtask {
+    relation queue: test/backingqueue // rebac:field={"path":"queue","filters":{"stage__hidden":false}}
+    permission read = queue->read
+}
+definition test/backinground {
+    relation queue: test/backingqueue // rebac:field=project__task__queue
+    permission read = queue->read
+}
+"""
+
+ALICE = SubjectRef.of("auth/user", "alice")
+BOB = SubjectRef.of("auth/user", "bob")
+
+
+@pytest.fixture(params=["denormalized", "registry"])
+def active(db, settings, request):
+    settings.REBAC_LOCAL_BACKEND_STORAGE = request.param
+    local = backend()
+    install_schema(local, parse_zed(SCHEMA))
+    with sudo(reason="write owner tests"):
+        yield local
+
+
+def grant_folder(folder, actor=ALICE):
+    backend().write_relationships([RelationshipTuple(to_object_ref(folder), "viewer", actor)])
+
+
+def allowed(actor, action, resource):
+    if not isinstance(resource, ObjectRef):
+        resource = to_object_ref(resource)
+    return backend().check_access(subject=actor, action=action, resource=resource).allowed
 
 
 @contextmanager
@@ -94,7 +148,7 @@ def test_unwatched_untracked_m2m_add_has_no_extra_select():
         tag = UntrackedTag.objects.create()
         assert not m2m_changed.has_listeners(UntrackedCatalog.tags.through)
         with (
-            patch.object(IndexMaintenance, "__enter__", side_effect=AssertionError("index owner")),
+            patch("rebac.watch.gate_policy", side_effect=AssertionError("write owner")),
             CaptureQueriesContext(connection) as queries,
         ):
             catalog.tags.add(tag)
@@ -107,7 +161,7 @@ def test_unwatched_untracked_m2m_add_has_no_extra_select():
 
 
 @pytest.mark.parametrize("operation", ["instance", "queryset"])
-def test_delete_owner_carries_explicit_sudo_without_ambient_actor(indexed, operation):
+def test_delete_owner_carries_explicit_sudo_without_ambient_actor(active, operation):
     parent = Folder.objects.create(name="parent")
     child = Folder.objects.create(name="child", parent=parent)
     parent_pk, child_pk = parent.pk, child.pk
@@ -117,11 +171,10 @@ def test_delete_owner_carries_explicit_sudo_without_ambient_actor(indexed, opera
         else:
             Folder.objects.sudo(reason="explicit owner").filter(pk=parent.pk).delete()
     assert not Folder._base_manager.filter(pk__in=[parent_pk, child_pk]).exists()
-    assert_no_drift()
 
 
 @pytest.mark.parametrize("operation", ["instance", "queryset"])
-def test_delete_owner_carries_actor_to_same_model_children(indexed, operation):
+def test_delete_owner_carries_actor_to_same_model_children(active, operation):
     parent = Folder.objects.create(name="parent")
     child = Folder.objects.create(name="child", parent=parent)
     grant_folder(parent)
@@ -132,12 +185,11 @@ def test_delete_owner_carries_actor_to_same_model_children(indexed, operation):
         else:
             Folder.objects.with_actor(ALICE).filter(pk=parent.pk).delete()
     assert not Folder._base_manager.filter(pk__in=[parent_pk, child_pk]).exists()
-    assert_no_drift()
 
 
 @pytest.mark.parametrize("operation", ["instance", "queryset"])
-def test_cascade_child_gate_is_not_skipped_or_replaced_by_root_gate(indexed, operation):
-    indexed.set_schema(
+def test_cascade_child_gate_is_not_skipped_or_replaced_by_root_gate(active, operation):
+    active.set_schema(
         parse_zed("""
         definition auth/user {}
         definition blog/folder {
@@ -148,7 +200,6 @@ def test_cascade_child_gate_is_not_skipped_or_replaced_by_root_gate(indexed, ope
         }
     """)
     )
-    rebuild(using="default")
     parent = Folder.objects.create(name="allowed root")
     child = Folder.objects.create(name="denied child", parent=parent)
     grant_folder(parent)
@@ -161,24 +212,23 @@ def test_cascade_child_gate_is_not_skipped_or_replaced_by_root_gate(indexed, ope
     from rebac.mixins import _delete_scopes
 
     assert _delete_scopes.get() == ()
-    assert_no_drift()
 
 
-def test_queryset_roots_are_not_point_checked_again(indexed):
+def test_queryset_roots_are_not_point_checked_again(active):
     roots = Folder.objects.bulk_create([Folder(name="one"), Folder(name="two")])
     for root in roots:
         grant_folder(root)
     with (
         no_ambient_scope(),
-        patch.object(indexed, "check_access", wraps=indexed.check_access) as check,
+        patch.object(active, "check_access", wraps=active.check_access) as check,
     ):
         Folder.objects.with_actor(ALICE).filter(pk__in=[r.pk for r in roots]).delete()
     assert not any(call.kwargs.get("action") == "delete" for call in check.call_args_list)
-    assert_no_drift()
+    assert not Folder._base_manager.filter(pk__in=[r.pk for r in roots]).exists()
 
 
-@pytest.mark.parametrize("indexed", STORAGE_TIERS, indirect=True)
-def test_delete_owner_batches_identity_cleanup_once(indexed):
+@pytest.mark.parametrize("active", STORAGE_TIERS, indirect=True)
+def test_delete_owner_batches_identity_cleanup_once(active):
     from rebac import signals
 
     parent = Folder.objects.create(name="root")
@@ -189,31 +239,34 @@ def test_delete_owner_batches_identity_cleanup_once(indexed):
         parent.delete()
     assert cleanup.call_count == 1
     assert len(cleanup.call_args.args[0]) == 6
-    assert_no_drift()
 
 
 @pytest.mark.pg_delta
 @pytest.mark.parametrize(
     "operation", ["update", "bulk_create", "bulk_update", "reverse_add", "set_null", "delete"]
 )
-@pytest.mark.parametrize("indexed", STORAGE_TIERS, indirect=True)
-def test_owning_base_manager_maintains_or_gates_without_actor_scope(indexed, operation):
+@pytest.mark.parametrize("active", STORAGE_TIERS, indirect=True)
+def test_owning_base_manager_writes_or_gates_without_actor_scope(active, operation):
     folder = Folder.objects.create(name="folder")
     post = Post.objects.create(title="post", folder=folder)
     grant_folder(folder)
     if operation == "update":
         with no_ambient_scope(), pytest.raises(MissingActorError):
             Post._base_manager.filter(pk=post.pk).update(folder=None)
+        post.refresh_from_db()
+        assert post.folder_id == folder.pk
+        assert allowed(ALICE, "read", post)
     elif operation == "bulk_create":
         with no_ambient_scope():
             post = Post._base_manager.bulk_create([Post(title="base bulk", folder=folder)])[0]
-        assert indexed.check_access(
-            subject=ALICE, action="read", resource=to_object_ref(post)
-        ).allowed
+        assert allowed(ALICE, "read", post)
     elif operation == "bulk_update":
         post.folder = None
         with no_ambient_scope(), pytest.raises(MissingActorError):
             Post._base_manager.bulk_update([post], ["folder"])
+        post.refresh_from_db()
+        assert post.folder_id == folder.pk
+        assert allowed(ALICE, "read", post)
     elif operation == "reverse_add":
         post.folder = None
         post.save(update_fields=["folder"])
@@ -222,6 +275,7 @@ def test_owning_base_manager_maintains_or_gates_without_actor_scope(indexed, ope
                 folder.posts.add(post, bulk=True)
         post.refresh_from_db()
         assert post.folder_id is None
+        assert not allowed(ALICE, "read", post)
     elif operation == "delete":
         with no_ambient_scope():
             Post._base_manager.filter(pk=post.pk).delete()
@@ -230,7 +284,7 @@ def test_owning_base_manager_maintains_or_gates_without_actor_scope(indexed, ope
             folder.sudo(reason="collector SET_NULL").delete()
         post.refresh_from_db()
         assert post.folder_id == folder.pk
-    assert_no_drift()
+        assert allowed(ALICE, "read", post)
     assert Post._meta.base_manager_name == "_rebac_base"
     assert Post._default_manager is Post.objects
     with no_ambient_scope():
@@ -240,22 +294,30 @@ def test_owning_base_manager_maintains_or_gates_without_actor_scope(indexed, ope
 @pytest.mark.parametrize(
     "operation", ["save_base", "update", "bulk_create", "bulk_update", "delete", "queryset_delete"]
 )
-@pytest.mark.parametrize("indexed", STORAGE_TIERS, indirect=True)
-def test_tracked_mixin_owners_maintain_nonresource_paths(indexed, operation):
+@pytest.mark.parametrize("active", STORAGE_TIERS, indirect=True)
+def test_tracked_mixin_owner_writes_move_reads_through_nonresource_paths(active, operation):
     assert issubclass(BackingProject, RebacTrackedMixin)
     one, two = BackingQueue.objects.create(), BackingQueue.objects.create()
     task = BackingTask.objects.create(queue=one)
     other_task = BackingTask.objects.create(queue=two)
     project = BackingProject.objects.create(task=task)
     round_ = BackingRound.objects.create(project=project)
-    with no_ambient_scope(), sudo(reason="test.maintenance-owner"):
+    active.write_relationships(
+        [
+            RelationshipTuple(to_object_ref(one), "viewer", ALICE),
+            RelationshipTuple(to_object_ref(two), "viewer", BOB),
+        ]
+    )
+    assert allowed(ALICE, "read", round_)
+    assert not allowed(BOB, "read", round_)
+    with no_ambient_scope(), sudo(reason="test.tracked-owner"):
         if operation == "save_base":
             project.task = other_task
             project.save_base(update_fields=["task"])
         elif operation == "update":
             BackingProject.objects.filter(pk=project.pk).update(task=other_task)
         elif operation == "bulk_create":
-            BackingProject.objects.bulk_create([BackingProject(task=other_task)])
+            created = BackingProject.objects.bulk_create([BackingProject(task=other_task)])[0]
         elif operation == "bulk_update":
             project.task = other_task
             BackingProject.objects.bulk_update([project], ["task"])
@@ -266,11 +328,21 @@ def test_tracked_mixin_owners_maintain_nonresource_paths(indexed, operation):
     if operation in {"delete", "queryset_delete"}:
         round_.refresh_from_db()
         assert round_.project_id is None
-    assert_no_drift()
+        assert not allowed(ALICE, "read", round_)
+        assert not allowed(BOB, "read", round_)
+    elif operation == "bulk_create":
+        assert allowed(ALICE, "read", round_)
+        assert not allowed(BOB, "read", round_)
+        other_round = BackingRound.objects.create(project=created)
+        assert allowed(BOB, "read", other_round)
+        assert not allowed(ALICE, "read", other_round)
+    else:
+        assert allowed(BOB, "read", round_)
+        assert not allowed(ALICE, "read", round_)
 
 
 @pytest.mark.parametrize("adding", [True, False])
-def test_save_gate_precedes_consumer_pre_save(indexed, adding):
+def test_save_gate_precedes_consumer_pre_save(active, adding):
     from rebac import mixins
 
     post = Post(title="new") if adding else Post.objects.create(title="old")
@@ -293,9 +365,8 @@ def test_save_gate_precedes_consumer_pre_save(indexed, adding):
     assert events == ["gate", "consumer"]
 
 
-def test_denied_create_does_not_run_consumer_pre_save(indexed):
-    indexed.set_schema(parse_zed("definition blog/post { permission create = nil }"))
-    rebuild(using="default")
+def test_denied_create_does_not_run_consumer_pre_save(active):
+    active.set_schema(parse_zed("definition blog/post { permission create = nil }"))
     consumer = []
 
     def prepare(**kwargs):
@@ -313,7 +384,7 @@ def test_denied_create_does_not_run_consumer_pre_save(indexed):
 
 @pytest.mark.django_db
 @pytest.mark.parametrize("explicit", [False, True])
-def test_fresh_worker_user_revoke_loads_current_program(settings, explicit):
+def test_fresh_worker_user_revoke_uses_current_policy(settings, explicit):
     settings.REBAC_TRACKED_MODELS = ["auth.User"] if explicit else []
     with transaction.atomic():
         definition = SchemaDefinition.objects.create(resource_type="test/active")
@@ -330,32 +401,21 @@ def test_fresh_worker_user_revoke_loads_current_program(settings, explicit):
             },
         )
         SchemaPermission.objects.create(definition=definition, name="read", expression="member")
-    with sudo(reason="test.tracked-user-maintenance"):
+    with sudo(reason="test.tracked-user-write"):
         user = get_user_model().objects.create_user(username="fresh", is_active=True)
-    from rebac import ObjectRef, to_subject_ref
-
     resource = ObjectRef("test/active", "active")
-    assert (
-        backend()
-        .check_access(subject=to_subject_ref(user), action="read", resource=resource)
-        .allowed
-    )
-    # Drop all backend programs as a newly started process would. Connections
-    # remain static; no rebuild or permission read may warm the write path.
+    assert allowed(to_subject_ref(user), "read", resource)
+    # Drop the backend as a newly started process would. Connections remain
+    # static; no permission read warms the write path.
     reset_backend()
     user.is_active = False
-    with sudo(reason="test.tracked-user-maintenance"):
+    with sudo(reason="test.tracked-user-write"):
         user.save(update_fields=["is_active"])
-    assert_no_drift()
-    assert (
-        not backend()
-        .check_access(subject=to_subject_ref(user), action="read", resource=resource)
-        .allowed
-    )
+    assert not allowed(to_subject_ref(user), "read", resource)
 
 
 @pytest.mark.django_db(transaction=True)
-def test_createsuperuser_maintains_subject_attribute_without_actor():
+def test_createsuperuser_writes_subject_attribute_without_actor():
     install_schema(
         backend(),
         parse_zed("""
@@ -366,7 +426,7 @@ def test_createsuperuser_maintains_subject_attribute_without_actor():
         }
         """),
     )
-    with no_ambient_scope(), pytest.warns(RuntimeWarning, match="D2"):
+    with no_ambient_scope():
         call_command(
             "createsuperuser",
             interactive=False,
@@ -374,12 +434,13 @@ def test_createsuperuser_maintains_subject_attribute_without_actor():
             email="root@example.com",
             verbosity=0,
         )
-    assert get_user_model().objects.get(username="root").is_superuser
-    assert_no_drift()
+    root = get_user_model().objects.get(username="root")
+    assert root.is_superuser
+    assert allowed(to_subject_ref(root), "access", ObjectRef("test/role", "admin"))
 
 
 @pytest.mark.django_db
-def test_unwatched_groups_add_before_first_sync_needs_no_program():
+def test_unwatched_groups_add_before_first_sync_needs_no_policy():
     SchemaGeneration.objects.all().delete()
     reset_backend()
     with transaction.atomic():
@@ -418,7 +479,6 @@ def test_override_owners_and_contenttype_cascade_audit(django_capture_on_commit_
     event = PermissionAuditEvent.objects.get(kind="override.delete", reason="bulk")
     assert event.target_repr == f"disable:rebac.schemapermission/{permission.pk}"
     assert SchemaGeneration.objects.get(pk=1).revision != before
-    assert_no_drift()
 
 
 def test_static_sender_registration_never_reads_database_or_resolves_backend():
@@ -454,7 +514,6 @@ def test_late_subject_and_proxy_have_explicit_identity_senders():
     assert post_delete.has_listeners(DeviceProxy)
     assert post_delete.has_listeners(UserProxy)
     assert pre_save.has_listeners(UserProxy)
-    assert post_save.has_listeners(UserProxy)
     assert pre_delete.has_listeners(UserProxy)
     assert post_delete.has_listeners(Group)
 
@@ -463,8 +522,8 @@ def test_late_subject_and_proxy_have_explicit_identity_senders():
 def test_db_only_m2m_watch_added_by_another_worker_needs_no_reconnection(monkeypatch):
     from rebac import sudo
     from rebac.backends.local import LocalBackend
-    from rebac.index.program import program_for
     from rebac.models.schema_write import schema_index_write
+    from rebac.watch import gate_policy
 
     with schema_index_write("default"):
         SchemaDefinition.objects.create(resource_type="auth/user")
@@ -482,7 +541,7 @@ def test_db_only_m2m_watch_added_by_another_worker_needs_no_reconnection(monkeyp
         post.collections.add(folder)
     grant_folder(folder)
     stale_worker = backend()
-    old = program_for(stale_worker, using="default")
+    old = gate_policy("default", stale_worker)
     assert Post.collections.through._meta.label_lower not in old.watched
 
     # Another worker publishes a DB-only path: no local invalidation or sender
@@ -501,16 +560,15 @@ def test_db_only_m2m_watch_added_by_another_worker_needs_no_reconnection(monkeyp
                 definition=post_definition, name="read", expression="collections->read"
             )
     assert backend() is stale_worker
-    # First local operation is a revoke, before any scope/check warms its plan.
+    # First local operation is a revoke, before any scope/check reads the new policy.
     with patch("rebac.signals.connect_tracked_signals", side_effect=AssertionError("reconnect")):
-        with sudo(reason="index maintenance fixture"):
+        with sudo(reason="revoke fixture"):
             post.collections.remove(folder)
-    assert_no_drift()
-    assert (
-        not backend()
-        .check_access(subject=ALICE, action="read", resource=to_object_ref(post))
-        .allowed
-    )
+        assert not allowed(ALICE, "read", post)
+        with sudo(reason="grant fixture"):
+            post.collections.add(folder)
+        assert allowed(ALICE, "read", post)
+    assert Post.collections.through._meta.label_lower in gate_policy("default").watched
 
 
 @pytest.mark.django_db
@@ -560,7 +618,6 @@ def test_override_create_delete_owner_audits_once_and_rollback_discards_audit(
         PermissionAuditEvent.objects.filter(kind="override.delete", reason="owner audit").count()
         == 1
     )
-    assert_no_drift()
 
 
 @isolate_apps("tests.testapp")
@@ -622,18 +679,18 @@ def test_identity_cleanup_skips_alias_routed_away_from_rebac():
 
     with (
         patch("rebac.signals.router.allow_migrate_model", return_value=False),
-        patch("rebac.index.maintain.tuple_owner", side_effect=AssertionError("wrong alias lock")),
+        patch("django.db.transaction.atomic", side_effect=AssertionError("wrong alias owner")),
     ):
         cleanup_identities([ObjectRef("auth/user", "deleted")], using="no_rebac_tables")
 
 
-def test_tracked_through_bulk_owners_grant_and_revoke_existing_resource(indexed):
+def test_tracked_through_bulk_owners_grant_and_revoke_existing_resource(active):
     from django.utils import timezone
 
     from rebac import to_subject_ref
     from tests.testapp.models import BackingEntry
 
-    indexed.set_schema(
+    active.set_schema(
         parse_zed("""
         definition auth/user {}
         definition test/backinground {
@@ -642,28 +699,23 @@ def test_tracked_through_bulk_owners_grant_and_revoke_existing_resource(indexed)
         }
     """)
     )
-    rebuild(using="default")
     round_ = BackingRound.objects.create()
     user = get_user_model().objects.create_user(username="tracked responder")
     actor = to_subject_ref(user)
     resource = to_object_ref(round_)
-    assert not indexed.check_access(subject=actor, action="read", resource=resource).allowed
+    assert not active.check_access(subject=actor, action="read", resource=resource).allowed
     with no_ambient_scope():
         entry = BackingEntry.objects.bulk_create(
             [BackingEntry(round=round_, responder=user, retired_at=None)]
         )[0]
-    assert indexed.check_access(subject=actor, action="read", resource=resource).allowed
-    assert_no_drift()
+    assert active.check_access(subject=actor, action="read", resource=resource).allowed
     with no_ambient_scope():
         BackingEntry._base_manager.filter(pk=entry.pk).update(retired_at=timezone.now())
-    assert not indexed.check_access(subject=actor, action="read", resource=resource).allowed
-    assert_no_drift()
+    assert not active.check_access(subject=actor, action="read", resource=resource).allowed
     entry.retired_at = None
     with no_ambient_scope():
         BackingEntry.objects.bulk_update([entry], ["retired_at"])
-    assert indexed.check_access(subject=actor, action="read", resource=resource).allowed
-    assert_no_drift()
+    assert active.check_access(subject=actor, action="read", resource=resource).allowed
     with no_ambient_scope():
         BackingEntry.objects.filter(pk=entry.pk).delete()
-    assert not indexed.check_access(subject=actor, action="read", resource=resource).allowed
-    assert_no_drift()
+    assert not active.check_access(subject=actor, action="read", resource=resource).allowed

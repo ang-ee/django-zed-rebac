@@ -238,9 +238,9 @@ def test_encoded_owner_corpus_is_not_enumerated_for_sparse_tuple_grants(
         large_cost = measure(2 + corpus)
     assert large_cost == small_cost
     assert large_cost[0] <= 16
-    # The plan has five lookups (the item's site, and the folder's site behind
-    # the arrow); each compiles once. The count changes only with the compiler.
-    assert large_cost[1] == 153
+    # A fixed statement, independent of the corpus. The count changes only
+    # with the compiler.
+    assert large_cost[1] == 70
 
 
 @pytest.mark.parametrize("active", STORAGE_TIERS, indirect=True)
@@ -288,8 +288,8 @@ def test_encoded_exclusion_with_caveated_group_membership_falls_back_wholly(
 
 @pytest.mark.parametrize("model_name", ["EncodedFolder", "EncodedPrimaryPost"])
 def test_custom_encoded_identity_is_explicitly_refused(model_name):
+    from rebac.codec import identity_codec
     from rebac.errors import SchemaError
-    from rebac.index.codec import identity_codec
     from tests.testapp import models
 
     with pytest.raises(SchemaError, match=r"rebac\.E014"):

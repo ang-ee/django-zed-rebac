@@ -37,7 +37,7 @@ from rebac import (
     SubjectRef,
 )
 from rebac.schema import parse_zed
-from tests.backend_setup import install_schema, rebuild_backend
+from tests.backend_setup import install_schema
 
 SCHEMA_TEXT = """
 caveat link_not_expired(expires_at timestamp, now timestamp) {
@@ -624,7 +624,6 @@ def test_unknown_caveat_in_row_is_treated_as_deny(backend):
         subject_id="u_unknown",
         caveat_name="does_not_exist",
     )
-    rebuild_backend(backend)
     result = backend.check_access(
         subject=_user("u_unknown"),
         action="read",

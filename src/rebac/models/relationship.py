@@ -38,7 +38,7 @@ WIRE_VALUE_FIELDS = (
     "caveat_name",
 )
 
-INDEX_PROJECTION_FIELDS = (
+WIRE_PROJECTION_FIELDS = (
     "resource_type",
     "resource_id",
     "relation",
@@ -58,11 +58,6 @@ _REGISTRY_WIRE_FIELD_MAP = {
 }
 
 
-# A direct ``bulk_create`` of at least this many tuples rebuilds the index in
-# full rather than deriving incrementally; see ARCHITECTURE § Relationship writes.
-BULK_REBUILD_ROWS = 500
-
-
 def _tuple_of(row: Relationship | RelationshipRegistry) -> RelationshipTuple:
     return RelationshipTuple(
         resource=ObjectRef(row.resource_type, row.resource_id),
@@ -74,31 +69,14 @@ def _tuple_of(row: Relationship | RelationshipRegistry) -> RelationshipTuple:
     )
 
 
-def projected_tuples(rows: models.QuerySet[Any]) -> Iterable[RelationshipTuple]:
-    """Stream the wire identity from either storage shape for old-state capture."""
-    for row in rows.iterator(chunk_size=1000):
-        yield RelationshipTuple(
-            resource=ObjectRef(row["resource_type"], row["resource_id"]),
-            relation=row["relation"],
-            subject=SubjectRef.of(row["subject_type"], row["subject_id"], row["subject_relation"]),
-        )
-
-
 def _owned_instance_save(
     row: Relationship | RelationshipRegistry, save: Callable[[], None], using: str | None
 ) -> None:
     from ..backends.local import mark_relationships_changed
-    from ..index.maintain import tuple_owner
 
     using = using or router.db_for_write(type(row), instance=row)
-    with tuple_owner(using) as maintenance:
-        if maintenance is not None and not row._state.adding and row.pk is not None:
-            old = type(row)._base_manager.using(using).filter(pk=row.pk).first()
-            if old is not None:
-                maintenance.capture_old(tuples=[_tuple_of(old)])
+    with transaction.atomic(using=using):
         save()
-        if maintenance is not None:
-            maintenance.changed(tuples=[_tuple_of(row)])
     mark_relationships_changed()
 
 
@@ -108,15 +86,10 @@ def _owned_instance_delete(
     using: str | None,
 ) -> tuple[int, dict[str, int]]:
     from ..backends.local import mark_relationships_changed
-    from ..index.maintain import tuple_owner
 
     using = using or router.db_for_write(type(row), instance=row)
-    with tuple_owner(using) as maintenance:
-        if maintenance is not None:
-            maintenance.capture_old(tuples=[_tuple_of(row)])
+    with transaction.atomic(using=using):
         result = delete()
-        if maintenance is not None:
-            maintenance.changed()
     if result[0]:
         mark_relationships_changed()
     return result
@@ -147,11 +120,11 @@ class RelationshipQuerySet(models.QuerySet["Relationship"]):
             "and write_relationships() to change tuples."
         )
 
-    def index_projection(self) -> models.QuerySet[Any]:
+    def wire_projection(self) -> models.QuerySet[Any]:
         return cast(
             models.QuerySet[Any],
             self.annotate(subject_relation=F("optional_subject_relation")).values(
-                *INDEX_PROJECTION_FIELDS
+                *WIRE_PROJECTION_FIELDS
             ),
         )
 
@@ -496,7 +469,7 @@ class RelationshipRegistryQuerySet(models.QuerySet["RelationshipRegistry"]):
             "and write_relationships() to change tuples."
         )
 
-    def index_projection(self) -> models.QuerySet[Any]:
+    def wire_projection(self) -> models.QuerySet[Any]:
         # Every F expression uses a real FK path. The internal projection is a
         # plain queryset: its wire aliases are now real annotations, and later
         # derivation F()/OuterRef() expressions must not hit the public wire
@@ -510,7 +483,7 @@ class RelationshipRegistryQuerySet(models.QuerySet["RelationshipRegistry"]):
             query=projected.query,
             using=self.db,
             hints=getattr(self, "_hints", None),
-        ).values(*INDEX_PROJECTION_FIELDS)
+        ).values(*WIRE_PROJECTION_FIELDS)
 
     def filter(self, *args: Any, **kwargs: Any) -> RelationshipRegistryQuerySet:
         return super().filter(*_translate_read_args(args), **_translate_read_kwargs(kwargs))
@@ -623,8 +596,6 @@ def _owned_tuple_bulk_create[T: Relationship | RelationshipRegistry](
     unique_fields: Collection[str] | None,
 ) -> list[T]:
     from ..backends.local import mark_relationships_changed
-    from ..index.maintain import tuple_owner
-    from . import active_relationship_model
 
     candidates = list(objs)
     if not candidates:
@@ -647,40 +618,7 @@ def _owned_tuple_bulk_create[T: Relationship | RelationshipRegistry](
             update_fields = [*update_fields, "caveat_key"]
     for row in candidates:
         row.caveat_key = instance_key(row.caveat_name, row.caveat_context)
-    # Storage conversion writes the inactive table and publishes it with a
-    # separate rebuild. Only the active shape contributes to this index.
-    if rows.model is not active_relationship_model():
-        return models.QuerySet.bulk_create(
-            rows,
-            candidates,
-            batch_size,
-            ignore_conflicts,
-            update_conflicts,
-            update_fields,
-            unique_fields,
-        )
-    tuples = [_tuple_of(row) for row in candidates]
-    # Incremental maintenance expands a region to a fixpoint around each
-    # changed tuple; that is right for a write and pathological for a seed.
-    # A batch past this size rebuilds the index in full inside the same owner,
-    # the same pass `rebac index rebuild` runs, whose cost the scale budgets
-    # bound.
-    rebuild_in_full = len(tuples) >= BULK_REBUILD_ROWS
-    with tuple_owner(rows.db) as maintenance:
-        if maintenance is not None and not rebuild_in_full:
-            for tuple_ in tuples:
-                existing = rows.filter(
-                    resource_type=tuple_.resource.resource_type,
-                    resource_id=tuple_.resource.resource_id,
-                    relation=tuple_.relation,
-                    subject_type=tuple_.subject.subject_type,
-                    subject_id=tuple_.subject.subject_id,
-                    optional_subject_relation=tuple_.subject.optional_relation,
-                    caveat_name=tuple_.caveat_name,
-                )
-                maintenance.capture_old(
-                    tuples=projected_tuples(cast(Any, existing).index_projection())
-                )
+    with transaction.atomic(using=rows.db):
         result = models.QuerySet.bulk_create(
             rows,
             candidates,
@@ -690,12 +628,6 @@ def _owned_tuple_bulk_create[T: Relationship | RelationshipRegistry](
             update_fields,
             unique_fields,
         )
-        if maintenance is not None:
-            if rebuild_in_full:
-                maintenance.schema_changed = True
-                maintenance.schema_all = True
-            else:
-                maintenance.changed(tuples=tuples)
     mark_relationships_changed()
     return result
 
@@ -703,19 +635,13 @@ def _owned_tuple_bulk_create[T: Relationship | RelationshipRegistry](
 def _owned_tuple_delete(
     rows: RelationshipQuerySet | RelationshipRegistryQuerySet,
 ) -> tuple[int, dict[str, int]]:
-    """Capture arbitrary queryset matches before their tuple rows disappear."""
+    """Delete tuple rows and invalidate the decisions that read them."""
     from ..backends.local import mark_relationships_changed
-    from ..index.maintain import tuple_owner
 
     owned_rows: Any = cast(Any, rows)._chain()
     owned_rows._for_write = True
-    with tuple_owner(owned_rows.db) as maintenance:
-        if maintenance is not None:
-            projection = owned_rows.index_projection()
-            maintenance.capture_old(tuples=projected_tuples(projection))
+    with transaction.atomic(using=owned_rows.db):
         result = models.QuerySet.delete(owned_rows)
-        if maintenance is not None:
-            maintenance.changed()
     if result[0]:
         mark_relationships_changed()
     return result

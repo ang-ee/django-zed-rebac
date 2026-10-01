@@ -1,4 +1,4 @@
-"""Canonical JSON for schema and index payloads, preserving datetime precision."""
+"""Canonical JSON for schema payloads, preserving datetime precision."""
 
 import hashlib
 import json
@@ -9,7 +9,7 @@ from typing import Any
 def _json_default(value: Any) -> str:
     if isinstance(value, datetime):
         return value.isoformat(timespec="microseconds")
-    raise TypeError(f"Unexpected schema/index payload {type(value).__name__}")
+    raise TypeError(f"Unexpected schema payload {type(value).__name__}")
 
 
 def canonical_json(value: Any) -> str:

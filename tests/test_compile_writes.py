@@ -8,7 +8,7 @@ from django.db.migrations.loader import MigrationLoader
 from django.db.models.signals import post_save, pre_save
 
 from rebac.caveats import instance_key
-from rebac.index import conditions
+from rebac.compile import formulas as conditions
 from rebac.models.relationship import WIRE_VALUE_FIELDS, Relationship, RelationshipRegistry
 from rebac.models.resource import RebacResource
 from rebac.testing import install_schema

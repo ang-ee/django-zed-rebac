@@ -194,8 +194,8 @@ def test_parent_link_stored_viewer_union_stays_lazy_through_revocation(
 
 @pytest.mark.parametrize("model_name", ["ParentLinkedChild", "ParentLinkedResource"])
 def test_encoded_parent_link_identity_is_refused(model_name):
+    from rebac.codec import identity_codec
     from rebac.errors import SchemaError
-    from rebac.index.codec import identity_codec
     from tests.testapp import models
 
     with pytest.raises(SchemaError, match=r"rebac\.E014"):

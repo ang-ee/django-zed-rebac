@@ -1,4 +1,4 @@
-"""LocalBackend — Django permission-index reads and transactional tuple writes.
+"""LocalBackend — permissions compiled to queries, and transactional tuple writes.
 
 Proposed-object evaluation lives in preflight and the shared schema walker.
 """
@@ -8,10 +8,10 @@ from __future__ import annotations
 import time
 from collections.abc import Iterable
 from concurrent.futures import Future
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from datetime import datetime
 from threading import Lock
-from typing import TYPE_CHECKING, Any
+from typing import Any
 from weakref import WeakSet
 
 from django.core.signals import setting_changed
@@ -56,24 +56,19 @@ _backend_registry_lock = Lock()
 _db_loaded_backends: WeakSet[LocalBackend] = WeakSet()
 
 
-if TYPE_CHECKING:
-    from ..index.program import IndexProgram
-
-
 @dataclass
 class _SchemaFacts:
     """Whole-schema facts memoised per schema generation (see ``_schema_facts``)."""
 
     generation: int
     live_types: frozenset[str] | None = None
-    programs: dict[tuple[Any, ...], IndexProgram] = field(default_factory=dict)
 
 
 _relationship_generation = 0
 
 
 class _LoadedSchema(tuple[Schema, datetime | None]):
-    """Keep the two-value loader API while retaining its index inputs."""
+    """Keep the two-value loader API while retaining the baseline and its overrides."""
 
     def __new__(
         cls,
@@ -104,7 +99,7 @@ def _enforced_schema_errors(schema: Schema) -> list[str]:
 
 
 class LocalBackend(Backend):
-    """Permission-index backend with transactional relationship write owners."""
+    """Evaluates permissions as queries over the application's own tables."""
 
     kind = "local"
 
@@ -174,17 +169,12 @@ class LocalBackend(Backend):
         return self._schema_snapshot().schema
 
     def _manual_schema_revision(self) -> str:
-        """Same digest as the manual index program; set_schema performs no I/O."""
+        """The digest of the manual schema; set_schema performs no I/O."""
         with self._schema_lock:
             return self._manual_revision
 
     def _schema_snapshot(self) -> SchemaSnapshot:
-        from ..index.read import pin_snapshot, using_backend
-
-        with using_backend(self):
-            snapshot = self._load_schema_snapshot()
-            pin_snapshot(snapshot)
-            return snapshot
+        return self._load_schema_snapshot()
 
     def _load_schema_snapshot(self) -> SchemaSnapshot:
         from django.db import connections
@@ -231,8 +221,7 @@ class LocalBackend(Backend):
         for _attempt in range(3):
             with self._schema_invalidation_lock:
                 invalidation = self._schema_invalidation_generation
-            pair = SchemaGeneration.objects.witness(connection.alias)
-            revision = pair[0] if pair else None
+            revision = SchemaGeneration.objects.revision(connection.alias)
             if revision is None:
                 with self._schema_lock:
                     self._evict_schema_alias(connection.alias)
@@ -277,8 +266,7 @@ class LocalBackend(Backend):
                                 raise
                             snapshot = None
                         else:
-                            pair = SchemaGeneration.objects.witness(connection.alias)
-                            after = pair[0] if pair else None
+                            after = SchemaGeneration.objects.revision(connection.alias)
                             snapshot = None
                             if after == revision:
                                 with self._schema_lock, self._schema_invalidation_lock:
@@ -291,11 +279,9 @@ class LocalBackend(Backend):
                                             self._schema_generation,
                                             0,
                                             revision,
-                                            pair[1] if pair else None,
                                             connection.alias,
                                             getattr(loaded, "baseline", None),
                                             getattr(loaded, "overrides", ()),
-                                            pair[2] if pair else "",
                                         )
                                         self._schema_snapshots[key] = snapshot
                         pending.set_result(snapshot)
@@ -311,34 +297,28 @@ class LocalBackend(Backend):
                 if invalidation != self._schema_invalidation_generation:
                     continue
             if snapshot is not None:
-                pin = snapshot._replace(
-                    invalidation_generation=invalidation,
-                    index_revision=pair[1] if pair else None,
-                    index_program=pair[2] if pair else "",
-                )
+                pin = snapshot._replace(invalidation_generation=invalidation)
                 if pins is not None:
                     pins[self] = pin
                 return pin
-        # Do not retain the final fallback, but fence its schema/index payload
-        # with actual paired witnesses. A loader retry miss alone must not deny
-        # otherwise stable reads; genuinely changing payloads must fail closed.
-        before = SchemaGeneration.objects.witness(connection.alias)
+        # Do not retain the final fallback, but fence its schema with the
+        # revision read on both sides of the load. A loader retry miss alone
+        # must not deny otherwise stable reads; a changing policy fails closed.
+        before = SchemaGeneration.objects.revision(connection.alias)
         loaded = self._load_schema_from_db(connection.alias)
         schema, expires_at = loaded
-        final_pair = SchemaGeneration.objects.witness(connection.alias)
-        if before != final_pair:
+        final = SchemaGeneration.objects.revision(connection.alias)
+        if before != final:
             raise SchemaError("Schema changed throughout loading; retry the permission operation.")
         return SchemaSnapshot(
             schema,
             expires_at,
             -1,
             invalidation,
-            revision=final_pair[0] if final_pair else None,
-            index_revision=final_pair[1] if final_pair else None,
+            revision=final,
             using=connection.alias,
             baseline=getattr(loaded, "baseline", None),
             overrides=getattr(loaded, "overrides", ()),
-            index_program=final_pair[2] if final_pair else "",
         )
 
     def _evict_schema_alias(self, alias: str) -> None:
@@ -349,11 +329,10 @@ class LocalBackend(Backend):
                 self._schema_facts_memo.pop(snapshot.generation, None)
 
     def _read_schema_revision(self, connection: BaseDatabaseWrapper) -> str | None:
-        """Read schema and index witnesses together for the active operation."""
+        """The published policy revision on the connection's alias."""
         from ..models.generation import SchemaGeneration
 
-        pair = SchemaGeneration.objects.revision_pair(connection.alias)
-        return pair[0] if pair else None
+        return SchemaGeneration.objects.revision(connection.alias)
 
     def _cache_generation(self, resource_type: str) -> tuple[Any, ...] | None:
         """Return a decision generation for ``resource_type``, or ``None`` to bypass caching.
@@ -522,13 +501,11 @@ class LocalBackend(Backend):
         # single source of determinism (it re-sorts disables by
         # (created_at, pk) per kind), so the loader-side order_by is just
         # cosmetic; we keep it for readable EXPLAIN plans.
-        # The walker's effective schema composes only the overrides active now;
-        # an expired override must not grant. The permission index, though, is
-        # compiled from EVERY override row, expired ones included: site names
-        # and index rows are derived from them, and a timed disable/tighten
-        # becomes the identity at read time rather than vanishing from the
-        # program. Dropping an expired row here would recompile the program
-        # without its site and orphan the rows that reference it.
+        # The effective schema composes only the overrides active now; an
+        # expired override must not grant. The compiler, though, reads EVERY
+        # override row, expired ones included, from ``overrides``: a timed
+        # disable or tighten carries its deadline into the statement and
+        # becomes the identity when the statement's clock passes it.
         all_overrides = (
             list(
                 SchemaOverride.objects.using(using)
@@ -672,7 +649,6 @@ class LocalBackend(Backend):
     def write_relationships(self, writes: Iterable[RelationshipTuple]) -> Zookie:
         from django.db import router, transaction
 
-        from ..index.maintain import maintain_tuples
         from ..models import active_relationship_model
         from ..models.relationship import RelationshipRegistry
         from ..models.resource import RebacResource
@@ -682,10 +658,7 @@ class LocalBackend(Backend):
         rows = list(writes)
         using = router.db_for_write(RelationshipModel)
         max_xid = 0
-        with (
-            transaction.atomic(using=using),
-            maintain_tuples(written=rows, using=using, backend=self),
-        ):
+        with transaction.atomic(using=using):
             schema = self._write_schema(using)
             for tup in rows:
                 self._validate_relationship_tuple(tup, schema=schema)
@@ -727,9 +700,8 @@ class LocalBackend(Backend):
                 row.caveat_context = tup.caveat_context or None
                 row.expires_at = tup.expires_at
                 row.written_at_xid = xid
-                # The enclosing maintain_tuples owner captured the full batch.
                 # Call Model.save directly so consumer pre/post_save handlers run
-                # without opening a second tuple owner/savepoint per row.
+                # without opening a savepoint per row.
                 models.Model.save(
                     row,
                     using=using,
@@ -753,15 +725,11 @@ class LocalBackend(Backend):
     def delete_relationships(self, filter_: RelationshipFilter) -> Zookie:
         from django.db import router, transaction
 
-        from ..index.maintain import maintain_tuples
         from ..models import active_relationship_model
 
         RelationshipModel = active_relationship_model()
         using = router.db_for_write(RelationshipModel)
-        with (
-            transaction.atomic(using=using),
-            maintain_tuples(deleted_filter=filter_, using=using, backend=self),
-        ):
+        with transaction.atomic(using=using):
             schema = self._write_schema(using)
             backed = self._backed_relation_for_filter(
                 filter_.resource_type, filter_.resource_id, filter_.relation, schema=schema
@@ -784,15 +752,11 @@ class LocalBackend(Backend):
         # updates — see ARCHITECTURE.md.
         from django.db import router, transaction
 
-        from ..index.maintain import maintain_tuples
         from ..models import active_relationship_model
 
         RelationshipModel = active_relationship_model()
         using = router.db_for_write(RelationshipModel)
-        with (
-            transaction.atomic(using=using),
-            maintain_tuples(deleted=[tuple_], using=using, backend=self),
-        ):
+        with transaction.atomic(using=using):
             schema = self._write_schema(using)
             definition = schema.get_definition(tuple_.resource.resource_type)
             if definition is not None:
@@ -824,20 +788,15 @@ class LocalBackend(Backend):
         return Zookie(self.kind, str(self._next_xid()))
 
     def _write_schema(self, using: str) -> Schema:
-        """Validate against the locked write alias and current policy."""
-        from ..index.maintain import current_pass
-        from ..index.time import index_now
-
-        owner = current_pass(using)
-        if owner is None:
-            raise RuntimeError("Relationship validation requires a locked index owner.")
-        return owner.load_program().schema_at(index_now())
+        """The effective policy a relationship write is validated against."""
+        del using
+        return self._schema_snapshot().schema
 
     def _validate_relationship_tuple(self, tup: RelationshipTuple, *, schema: Schema) -> None:
         from django.conf import settings
         from django.utils import timezone
 
-        from ..index.time import time_max, time_min
+        from ..clock import time_max, time_min
 
         if not tup.resource.resource_id:
             raise ValueError("Resource IDs cannot be empty.")

@@ -18,9 +18,12 @@ callers writing string kwargs see no shape change.
 
 from __future__ import annotations
 
+from itertools import batched
 from typing import TYPE_CHECKING
 
-from django.db import models, router, transaction
+from django.db import connections, models, router, transaction
+
+from ..errors import SchemaError
 
 if TYPE_CHECKING:
     from django.contrib.contenttypes.models import ContentType
@@ -125,8 +128,35 @@ class RebacResource(models.Model):
         SELECT resolves and validates all primary keys, including existing rows. Returns an empty dict on empty
         input — the caller can branch on emptiness without a query.
         """
-        from rebac.index.write import bulk_intern
-
-        return bulk_intern(
-            cls, ("resource_type", "resource_id"), pairs, using=using or router.db_for_write(cls)
-        )
+        alias = using or router.db_for_write(cls)
+        ordered = sorted(set(pairs))
+        if not ordered:
+            return {}
+        features = connections[alias].features
+        batch_size = min(200, (features.max_query_params or 600) // 2)
+        manager = cls._default_manager.using(alias)
+        result: dict[tuple[str, str], int] = {}
+        with transaction.atomic(using=alias, savepoint=False):
+            for batch in batched(ordered, batch_size, strict=False):
+                manager.bulk_create(
+                    [cls(resource_type=type_, resource_id=id_) for type_, id_ in batch],
+                    ignore_conflicts=True,
+                    batch_size=batch_size,
+                )
+                lookup = models.Q()
+                for type_, id_ in batch:
+                    lookup |= models.Q(resource_type=type_, resource_id=id_)
+                found = {
+                    (type_, id_): pk
+                    for type_, id_, pk in manager.filter(lookup).values_list(
+                        "resource_type", "resource_id", "pk"
+                    )
+                }
+                missing = [pair for pair in batch if pair not in found]
+                if missing:
+                    raise SchemaError(
+                        f"RebacResource interning failed to retrieve {len(missing)} identities: "
+                        f"{missing[:3]!r}"
+                    )
+                result.update(found)
+        return result

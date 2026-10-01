@@ -197,7 +197,7 @@ class RebacModelBase(RebacObjectMeta, ModelBase):
                 raise ImproperlyConfigured(
                     f"{new_cls._meta.label} declares the base manager {base_manager_name!r}, "
                     "whose queryset is not a rebac.TrackedQuerySet. Writes through a model's "
-                    "base manager must maintain the permission index: build the manager with "
+                    "base manager must be gated: build the manager with "
                     "models.Manager.from_queryset() over a TrackedQuerySet subclass that "
                     "applies no actor scope and filters no rows."
                 )
@@ -287,44 +287,38 @@ class RebacTrackedMixin(models.Model, metaclass=RebacModelBase):
         using: str | None = None,
         update_fields: Iterable[str] | None = None,
     ) -> None:
-        from .index.maintain import model_write
         from .signals import audit_backed_denials
+        from .watch import model_write
 
         alias = using or router.db_for_write(type(self), instance=self)
         if raw:
             return super().save_base(raw, force_insert, force_update, alias, update_fields)
         with (
             audit_backed_denials(),
-            model_write(model=type(self), using=alias, names=update_fields) as maintenance,
+            model_write(model=type(self), using=alias, names=update_fields),
         ):
             from .signals import _gate_backed_field_change
 
             _gate_backed_field_change(type(self), self, alias, update_fields)
-            if maintenance is not None and self.pk is not None:
-                maintenance.capture_old(model=type(self), pks=(self.pk,))
             super().save_base(raw, force_insert, force_update, alias, update_fields)
-            if maintenance is not None:
-                maintenance.changed(model=type(self), pks=(self.pk,))
 
     def delete(
         self, using: str | None = None, keep_parents: bool = False
     ) -> tuple[int, dict[str, int]]:
         from .actors import current_actor, is_sudo
         from .conf import app_settings
-        from .index.maintain import model_write
         from .signals import audit_backed_denials
+        from .watch import model_write
 
         alias = using or router.db_for_write(type(self), instance=self)
         if delete_scope(self, alias) is not None:
             return super().delete(using=alias, keep_parents=keep_parents)
         actor = current_actor()
         unscoped = is_sudo() or (actor is None and not app_settings.REBAC_STRICT_MODE)
-        with audit_backed_denials(), model_write(model=type(self), using=alias) as maintenance:
+        with audit_backed_denials(), model_write(model=type(self), using=alias):
             from .signals import _gate_backed_field_change
 
             _gate_backed_field_change(type(self), self, alias, None, deleting=True)
-            if maintenance is not None:
-                maintenance.capture_old(model=type(self), pks=(self.pk,))
             with deletion_owner(self, alias, actor, unscoped):
                 return super().delete(using=alias, keep_parents=keep_parents)
 
@@ -336,7 +330,7 @@ class RebacMixin(RebacTrackedMixin):
 
     What this installs:
       - `objects = RebacManager()` — replaces the default manager.
-      - `_default_manager` points at it; `_base_manager` owns index maintenance
+      - `_default_manager` points at it; `_base_manager` owns gated writes
         and remains unfiltered for Django's relationship infrastructure.
       - save_base/delete owners gate writes; explicit-sender signals cover cascades.
       - ``from_db()`` propagates the queryset's actor onto loaded instances
@@ -744,19 +738,15 @@ class RebacMixin(RebacTrackedMixin):
         update_fields: Iterable[str] | None = None,
     ) -> None:
         from .errors import PermissionDenied
-        from .index.maintain import model_write
+        from .watch import model_write
 
         alias = using or router.db_for_write(type(self), instance=self)
         if raw:
             return super().save_base(raw, force_insert, force_update, alias, update_fields)
         try:
-            with model_write(model=type(self), using=alias, names=update_fields) as maintenance:
-                if maintenance is not None and self.pk is not None:
-                    maintenance.capture_old(model=type(self), pks=(self.pk,))
+            with model_write(model=type(self), using=alias, names=update_fields):
                 _gate_save(type(self), self, using=alias, update_fields=update_fields)
                 super().save_base(raw, force_insert, force_update, alias, update_fields)
-                if maintenance is not None:
-                    maintenance.changed(model=type(self), pks=(self.pk,))
         except PermissionDenied as exc:
             # The gate's audit write was inside the rolled-back owner block
             # (model_write always opens one). Re-emit it after the rollback,
@@ -768,15 +758,13 @@ class RebacMixin(RebacTrackedMixin):
         self, using: str | None = None, keep_parents: bool = False
     ) -> tuple[int, dict[str, int]]:
         from .errors import PermissionDenied
-        from .index.maintain import model_write
+        from .watch import model_write
 
         alias = using or router.db_for_write(type(self), instance=self)
         scope = self.effective_actor(strict=bool(model_resource_type(self)))
         try:
-            with model_write(model=type(self), using=alias) as maintenance:
+            with model_write(model=type(self), using=alias):
                 _gate_delete(type(self), self, scope=scope)
-                if maintenance is not None:
-                    maintenance.capture_old(model=type(self), pks=(self.pk,))
                 with deletion_owner(self, alias, *scope):
                     # The tracked base reuses this scope, preserving consumer MRO.
                     return super().delete(using=alias, keep_parents=keep_parents)

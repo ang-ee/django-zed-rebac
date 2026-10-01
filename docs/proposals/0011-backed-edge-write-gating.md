@@ -1,5 +1,11 @@
 # Proposal 0011: write gating for backed edges
 
+**Status:** open, narrowed by
+[proposal 0015](./0015-permissions-compiled-to-queries.md) § 10 and § 13.
+Writes are no longer maintained, so every statement below about maintenance
+or drift is moot; the gate questions stay open and the expected failures in
+`tests/test_security_proposal_0011.py` stay pinned.
+
 ## Problem
 
 A field-backed relation turns an ordinary column or through row into a

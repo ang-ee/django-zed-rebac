@@ -8,8 +8,6 @@ from itertools import product
 from typing import Any
 
 from rebac.caveats import evaluate as evaluate_caveat
-from rebac.conf import app_settings
-from rebac.errors import SchemaError
 from rebac.schema.ast import Schema
 from rebac.schema.serialization import canonical_json, digest
 
@@ -29,7 +27,7 @@ def pinned(
     schema: Schema,
     recaveated: Iterable[str] = (),
 ) -> Formula:
-    """The condition a tuple's caveat contributes to the index.
+    """The condition a tuple's caveat contributes to a decision.
 
     A caveat its pinned context decides is decided here: true stores the row
     without a condition and false stores no row, so scopes are exact for it.
@@ -95,22 +93,6 @@ def size(f: Formula) -> int:
     for child in children:
         total += size(child)
     return total
-
-
-def enforce_limit(formulas: Iterable[Formula], *, label: str) -> None:
-    """Bound a complete contribution, including alternative condition-key rows."""
-    contribution = or_(*formulas)
-    enforce_size(size(contribution), label=label)
-
-
-def enforce_size(count: int, *, label: str) -> None:
-    """Check an already-normalized contribution with distinct holder predicates."""
-    limit = app_settings.REBAC_INDEX_CONDITION_LIMIT
-    if count > limit:
-        raise SchemaError(
-            f"Permission index condition for {label} has {count} caveat instances "
-            f"(REBAC_INDEX_CONDITION_LIMIT={limit})"
-        )
 
 
 type Path = frozenset[str]

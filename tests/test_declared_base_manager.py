@@ -1,4 +1,4 @@
-"""A model's declared base manager is kept, validated, and still maintains the index."""
+"""A model's declared base manager is kept, validated, and its writes are gated, and reads follow them."""
 
 import pytest
 from django.core import checks
@@ -7,11 +7,14 @@ from django.db import models
 from django.test.utils import isolate_apps
 
 from rebac import (
+    MissingActorError,
+    PermissionDenied,
     RebacManager,
     RebacMixin,
     RebacTrackedMixin,
     TrackedManager,
     TrackedQuerySet,
+    actor_context,
     sudo,
     to_object_ref,
 )
@@ -21,7 +24,6 @@ from rebac.checks import check_declared_base_managers
 from rebac.schema import parse_zed
 from rebac.testing import install_schema
 from rebac.types import RelationshipTuple, SubjectRef
-from tests.index_harness import assert_no_drift
 from tests.testapp.models import DeclaredBasePost, Folder, OwnerQuerySet, Post
 
 ALICE = SubjectRef.of("auth/user", "alice")
@@ -35,6 +37,20 @@ definition blog/folder {
 definition test/declaredbasepost {
     relation folder: blog/folder // rebac:field=folder
     permission read = folder->read
+}
+"""
+
+GATED_SCHEMA = """
+definition auth/user {}
+definition blog/folder {
+    relation viewer: auth/user
+    permission read = viewer
+}
+definition test/declaredbasepost {
+    relation folder: blog/folder // rebac:field=folder
+    relation editor: auth/user
+    permission read = folder->read
+    permission write = editor
 }
 """
 
@@ -225,7 +241,7 @@ def test_check_accepts_the_injected_and_the_declared_tracked_base_managers():
 
 
 @pytest.fixture
-def indexed(db):
+def installed(db):
     local = install_schema(parse_zed(SCHEMA))
     with sudo(reason="declared base manager tests"):
         yield local
@@ -235,7 +251,7 @@ def _readable(local, row):
     return local.check_access(subject=ALICE, action="read", resource=to_object_ref(row)).allowed
 
 
-def test_install_schema_makes_the_backend_current_with_a_consistent_index(db):
+def test_install_schema_makes_the_backend_current_over_existing_rows(db):
     first = install_schema("definition auth/user {}")
     assert backend() is first
     with sudo(reason="rows written before their schema is installed"):
@@ -245,10 +261,9 @@ def test_install_schema_makes_the_backend_current_with_a_consistent_index(db):
 
     assert install_schema(parse_zed(SCHEMA), backend=explicit) is explicit
     assert backend() is explicit
-    assert_no_drift()
+    assert not _readable(explicit, post)
     backend().write_relationships([RelationshipTuple(to_object_ref(folder), "viewer", ALICE)])
     assert _readable(explicit, post)
-    assert_no_drift()
 
 
 def test_install_schema_parses_schema_text(db):
@@ -258,11 +273,11 @@ def test_install_schema_parses_schema_text(db):
     assert {d.resource_type for d in local.schema().definitions} >= {"test/declaredbasepost"}
 
 
-def test_writes_through_a_declared_base_manager_maintain_the_index(indexed):
+def test_writes_through_a_declared_base_manager_change_reads(installed):
     assert DeclaredBasePost._base_manager._queryset_class is OwnerQuerySet
     shared = Folder.objects.create(name="shared")
     private = Folder.objects.create(name="private")
-    indexed.write_relationships([RelationshipTuple(to_object_ref(shared), "viewer", ALICE)])
+    installed.write_relationships([RelationshipTuple(to_object_ref(shared), "viewer", ALICE)])
 
     created, moved = DeclaredBasePost._base_manager.owner_bulk_create(
         [
@@ -270,25 +285,52 @@ def test_writes_through_a_declared_base_manager_maintain_the_index(indexed):
             DeclaredBasePost(title="moved", folder=private),
         ]
     )
-    assert _readable(indexed, created)
-    assert not _readable(indexed, moved)
-    assert_no_drift()
+    assert _readable(installed, created)
+    assert not _readable(installed, moved)
 
     DeclaredBasePost._base_manager.filter(pk=moved.pk).update(folder=shared)
-    assert _readable(indexed, moved)
-    assert_no_drift()
+    assert _readable(installed, moved)
 
     created.folder = private
     DeclaredBasePost._base_manager.bulk_update([created], ["folder"])
-    assert not _readable(indexed, created)
-    assert_no_drift()
+    assert not _readable(installed, created)
 
 
-def test_django_reaches_a_declared_base_manager_and_keeps_its_policy(indexed):
+@pytest.mark.parametrize("operation", ["update", "bulk_update"])
+def test_writes_through_a_declared_base_manager_are_gated(db, operation):
+    local = install_schema(GATED_SCHEMA)
+    with sudo(reason="declared base manager fixture"):
+        shared = Folder.objects.create(name="shared")
+        private = Folder.objects.create(name="private")
+        post = DeclaredBasePost.objects.create(title="post", folder=private)
+    local.write_relationships([RelationshipTuple(to_object_ref(shared), "viewer", ALICE)])
+
+    def move():
+        if operation == "update":
+            DeclaredBasePost._base_manager.filter(pk=post.pk).update(folder=shared)
+        else:
+            post.folder = shared
+            DeclaredBasePost._base_manager.bulk_update([post], ["folder"])
+
+    with pytest.raises(MissingActorError):
+        move()
+    with actor_context(ALICE), pytest.raises(PermissionDenied):
+        move()
+    assert DeclaredBasePost._base_manager.get(pk=post.pk).folder_id == private.pk
+    assert not _readable(local, post)
+
+    local.write_relationships([RelationshipTuple(to_object_ref(post), "editor", ALICE)])
+    with actor_context(ALICE):
+        move()
+    assert DeclaredBasePost._base_manager.get(pk=post.pk).folder_id == shared.pk
+    assert _readable(local, post)
+
+
+def test_django_reaches_a_declared_base_manager_and_keeps_its_policy(installed):
     shared = Folder.objects.create(name="shared")
-    indexed.write_relationships([RelationshipTuple(to_object_ref(shared), "viewer", ALICE)])
+    installed.write_relationships([RelationshipTuple(to_object_ref(shared), "viewer", ALICE)])
     post = DeclaredBasePost.objects.create(title="post", folder=shared)
-    assert _readable(indexed, post)
+    assert _readable(installed, post)
 
     with pytest.raises(TypeError, match="never deleted in bulk"):
         DeclaredBasePost._base_manager.filter(pk=post.pk).delete()
@@ -296,5 +338,4 @@ def test_django_reaches_a_declared_base_manager_and_keeps_its_policy(indexed):
     shared.delete()  # the collector's SET_NULL runs through the declared base manager
     post.refresh_from_db()
     assert post.folder_id is None
-    assert not _readable(indexed, post)
-    assert_no_drift()
+    assert not _readable(installed, post)

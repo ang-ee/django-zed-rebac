@@ -1,6 +1,6 @@
 .PHONY: install-dev lint format-check typecheck check ci \
-	test test-fast test-index test-pg test-index-postgres \
-	test-slow test-postgres test-scale test-scale-postgres test-index-reference \
+	test test-fast test-pg \
+	test-slow test-postgres test-reference \
 	test-schema-vendors test-random test-release \
 	pg-up pg-down require-postgres require-docker require-vendor-drivers
 
@@ -12,27 +12,23 @@ PG := --ds=tests.settings_postgres
 # workers it is the bottleneck, and fresh, unanalyzed tables under that load
 # have produced cursor fetches that ran for the better part of an hour.
 PG_WORKERS ?= 4
-# Extra pytest arguments for any test target: make test-pg ARGS=tests/test_index_read.py
+# Extra pytest arguments for any test target: make test-pg ARGS=tests/test_read_contract.py
 ARGS ?=
-
-INDEX_TESTS := $(wildcard tests/test_index_*.py)
 
 # An explicit -m replaces the addopts expression in pyproject.toml, so each
 # expression below is written in full. Targets without -m use the addopts one:
-# not index_exhaustive, slow, schema_vendors or scale.
-PG_DELTA_MARKS := (postgresql or pg_delta) and not slow and not scale and not index_exhaustive and not schema_vendors
-SLOW_MARKS := slow and not scale and not index_exhaustive and not schema_vendors
-FULL_MARKS := not scale and not index_exhaustive and not schema_vendors
-SCALE_MARKS := scale and not index_exhaustive and not schema_vendors
-REFERENCE_MARKS := index_exhaustive or not index_exhaustive
+# not reference_exhaustive, slow or schema_vendors.
+PG_DELTA_MARKS := (postgresql or pg_delta) and not slow and not reference_exhaustive and not schema_vendors
+SLOW_MARKS := slow and not reference_exhaustive and not schema_vendors
+FULL_MARKS := not reference_exhaustive and not schema_vendors
+REFERENCE_MARKS := reference_exhaustive or not reference_exhaustive
 
 # The default per-test timeout is 10 s (pyproject.toml). Targets that select
-# slow, scale, index_exhaustive or schema_vendors tests raise it.
+# slow, reference_exhaustive or schema_vendors tests raise it.
 LONG := --timeout=300
 
 # Tier 3, in the order test-release runs it.
-RELEASE_PARTS := test-slow test-postgres test-scale test-scale-postgres \
-	test-index-reference test-schema-vendors test-random
+RELEASE_PARTS := test-slow test-postgres test-reference test-schema-vendors test-random
 
 # A disposable PostgreSQL 16 with the credentials CI uses.
 PG_CONTAINER := rebac-test-pg
@@ -78,17 +74,10 @@ test-slow:
 test-postgres: require-postgres
 	$(PYTEST) $(PG) -n $(PG_WORKERS) --dist worksteal -m '$(FULL_MARKS)' $(LONG) --durations=25 $(ARGS)
 
-# Time, statement and plan budgets: alone, one test at a time.
-test-scale:
-	$(PYTEST) -p no:xdist -m '$(SCALE_MARKS)' $(LONG) --durations=10 $(ARGS)
-
-test-scale-postgres: require-postgres
-	$(PYTEST) $(PG) -p no:xdist -m '$(SCALE_MARKS)' $(LONG) --durations=10 $(ARGS)
-
 # Every test in the reference module, including the exhaustive shards. loadfile
 # would put the entire sweep on one worker; load distributes shards.
-test-index-reference:
-	$(PYTEST) tests/test_index_reference.py -m '$(REFERENCE_MARKS)' -n auto --dist load $(LONG) --durations=25 $(ARGS)
+test-reference:
+	$(PYTEST) tests/test_reference_model.py -m '$(REFERENCE_MARKS)' -n auto --dist load $(LONG) --durations=25 $(ARGS)
 
 # Docker PostgreSQL 16 / MySQL 8 contracts. Container start-up counts toward
 # each test's timeout.
@@ -111,13 +100,6 @@ test-release:
 	done; \
 	printf '\ntest-release:\n%b' "$$summary"; \
 	exit $$status
-
-# Focused runs, not a tier: the index modules with the default selection.
-test-index:
-	$(PYTEST) -n auto --dist worksteal --durations=25 $(INDEX_TESTS) $(ARGS)
-
-test-index-postgres: require-postgres
-	$(PYTEST) $(PG) -n $(PG_WORKERS) --dist worksteal --durations=25 $(INDEX_TESTS) $(ARGS)
 
 # Data lives in memory (tmpfs) and is gone once the container stops. Status goes
 # to stderr and only the export line to stdout, so `eval "$(make -s pg-up)"`

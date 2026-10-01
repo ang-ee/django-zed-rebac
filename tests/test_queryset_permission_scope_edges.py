@@ -231,7 +231,7 @@ def test_scope_binds_application_clock_not_database_clock(storage, monkeypatch):
 
     from django.utils import timezone
 
-    from rebac.index import time as index_time
+    from rebac import clock
 
     src = """
     use expiration
@@ -244,7 +244,7 @@ def test_scope_binds_application_clock_not_database_clock(storage, monkeypatch):
     # The database clock stays near the real present throughout the test.
     instant = timezone.now() + timedelta(days=100)
     deadline = instant + timedelta(hours=1)
-    monkeypatch.setattr(index_time, "index_now", lambda: instant)
+    monkeypatch.setattr(clock, "application_now", lambda: instant)
     with _schema(src, storage) as active:
         with sudo(reason="application clock regression"):
             post = Post.objects.create(title="expires by the app clock")

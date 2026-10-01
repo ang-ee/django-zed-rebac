@@ -73,22 +73,21 @@ rebac = ["py.typed"]
 DJANGO_SETTINGS_MODULE = "tests.settings"
 python_files = ["test_*.py"]
 testpaths = ["tests"]
-addopts = "-p no:randomly -m 'not index_exhaustive and not slow and not schema_vendors and not scale'"
+addopts = "-p no:randomly -m 'not reference_exhaustive and not slow and not schema_vendors'"
 markers = [
     "slow: opt-in expensive tests, excluded from the default suite",
-    "index_exhaustive: opt-in complete permission-index reference expression and tuple-presence sweep",
-    "index_shard: independently schedulable shard of the exhaustive permission-index reference sweep",
-    "postgresql: permission-index transaction and concurrency cases requiring PostgreSQL",
+    "reference_exhaustive: opt-in complete reference expression and tuple-presence sweep",
+    "reference_shard: independently schedulable shard of the exhaustive reference sweep",
+    "postgresql: transaction and concurrency cases requiring PostgreSQL",
     "pg_delta: runs on every vendor, and PostgreSQL may disagree; selected by make test-pg",
     "schema_vendors: opt-in Docker PostgreSQL/MySQL storage, schema owner and upgrade contracts",
-    "scale: time, statement and query-plan budgets; run alone, never beside parallel workers",
 ]
 pythonpath = ["."]
 # A hung test (e.g. a lock-ordering deadlock) must fail loudly, not stall the run.
 # pytest-timeout fails a test after 10 s, fixtures included, and prints every
 # thread's stack. Tier 1 budgets 2 s per test, so a test that reaches 10 s is
-# marked `slow`. The Makefile targets that select `slow`, `scale`,
-# `index_exhaustive` or `schema_vendors` pass `--timeout=300`. faulthandler dumps
+# marked `slow`. The Makefile targets that select `slow`,
+# `reference_exhaustive` or `schema_vendors` pass `--timeout=300`. faulthandler dumps
 # every thread's stack after 120 s: an early warning in those 300 s runs, and the
 # only report from a test blocked in C code that the timeout signal cannot stop.
 faulthandler_timeout = 120

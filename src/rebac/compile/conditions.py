@@ -15,7 +15,7 @@ from typing import Any, cast
 
 from django.db.models import Q
 
-from rebac.index import conditions
+from rebac.compile import formulas as conditions
 from rebac.models import active_relationship_model
 from rebac.schema.ast import PermArrow, PermBinOp, PermExpr, PermRef, Relation, Schema
 
@@ -114,7 +114,7 @@ class CaveatVerdicts:
             cast(Any, active_relationship_model().objects.using(using))
             .filter(selected)
             .exclude(caveat_name="")
-            .index_projection()
+            .wire_projection()
             .order_by()
             .values_list("caveat_name", "caveat_context", "caveat_key")
             .distinct()

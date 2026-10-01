@@ -3,7 +3,7 @@
 import django.db.models.deletion
 from django.db import migrations, models
 
-import rebac.index.time
+import rebac.clock
 
 
 def create_global_state(apps, schema_editor):
@@ -69,7 +69,7 @@ class Migration(migrations.Migration):
                         auto_created=True, primary_key=True, serialize=False, verbose_name="ID"
                     ),
                 ),
-                ("expires_at", models.DateTimeField(default=rebac.index.time.time_max)),
+                ("expires_at", models.DateTimeField(default=rebac.clock.time_max)),
                 ("condition", models.JSONField(null=True)),
                 ("condition_key", models.CharField(default="", max_length=64)),
                 ("resource_type", models.CharField(max_length=64)),
@@ -129,7 +129,7 @@ class Migration(migrations.Migration):
                         auto_created=True, primary_key=True, serialize=False, verbose_name="ID"
                     ),
                 ),
-                ("expires_at", models.DateTimeField(default=rebac.index.time.time_max)),
+                ("expires_at", models.DateTimeField(default=rebac.clock.time_max)),
                 ("condition", models.JSONField(null=True)),
                 ("condition_key", models.CharField(default="", max_length=64)),
                 ("resource_type", models.CharField(max_length=64)),
@@ -201,7 +201,7 @@ class Migration(migrations.Migration):
                         auto_created=True, primary_key=True, serialize=False, verbose_name="ID"
                     ),
                 ),
-                ("expires_at", models.DateTimeField(default=rebac.index.time.time_max)),
+                ("expires_at", models.DateTimeField(default=rebac.clock.time_max)),
                 ("condition", models.JSONField(null=True)),
                 ("condition_key", models.CharField(default="", max_length=64)),
                 ("member_type", models.CharField(max_length=64)),

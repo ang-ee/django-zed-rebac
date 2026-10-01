@@ -20,11 +20,9 @@ class SchemaSnapshot(NamedTuple):
     generation: int
     invalidation_generation: int
     revision: str | None = None
-    index_revision: str | None = None
     using: str | None = None
     baseline: Schema | None = None
     overrides: tuple[Any, ...] = ()
-    index_program: str = ""
 
 
 class _ConnectionSchemas:

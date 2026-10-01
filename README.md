@@ -14,7 +14,7 @@
 
 The backend interface is designed around one Python API:
 
-- **`LocalBackend`** — pure Django, with a derived permission index. It stores monotone sets and evaluates named intersections and subtractions at read time; SQL size is bounded by a static schema plan. Supported writes maintain the index synchronously in the source transaction, including watched fields written through proxies or inherited models. One global lock per database alias serializes index-affecting writes. Context-aware enumeration matches candidates in SQL and evaluates distinct caveat formulas in Python. See [the index design and limits](./docs/ARCHITECTURE.md#permission-index--the-localbackend-read-path).
+- **`LocalBackend`** — pure Django. A permission is compiled to a query over your own tables and the relationship table and evaluated when it is read: field-, attribute- and const-backed relations come from the model columns, stored relations from tuples. The library stores no row per application row, there is no build step, and a write is visible to the next read. Recursive permissions are unrolled to `REBAC_DEPTH_LIMIT` levels. Caveats are decided in Python and bound into the statement. See [the design and its limits](./docs/ARCHITECTURE.md#compiled-permissions--the-localbackend-read-path).
 - **`SpiceDBBackend`** — planned adapter for the official [`authzed`](https://pypi.org/project/authzed/) Python client. The class exists today as a clear stub, but `REBAC_BACKEND = "spicedb"` is not a supported runtime path yet.
 
 Add the mixin to your model and `Post.objects.all()` returns only what the user can read. Add `Model.objects.with_actor(actor)` for explicit actor scoping in Celery tasks, GraphQL resolvers, management commands, and other non-HTTP entrypoints — `actor` can be a Django `User`, a registered `Agent`, an `agents/grant` (agent-acting-on-behalf-of-user, shipped by your `agents` app), or anything `@rebac_subject`-registered. Typed shorthands `as_user(user)` and `as_agent(agent, on_behalf_of=user)` cover the common cases. The default Django actor labels are `auth/user` and `auth/group`; include their definitions in your application schema (automatic base-schema emission is planned). `agents/agent`, `agents/grant`, `auth/apikey`, and other subject types live in your own apps.
@@ -79,15 +79,16 @@ class Post(RebacMixin, models.Model):
 ```
 
 ```bash
-python manage.py migrate              # creates source and permission-index tables
-python manage.py rebac sync           # loads permissions.zed and builds the index
+python manage.py migrate              # creates the library's tables
+python manage.py rebac sync           # loads permissions.zed into the schema tables
 ```
 
-An unbuilt index reports an E013 setup warning and permission reads fail closed
-until sync/rebuild completes. Write aliases for backing models and relationships
-must match; separate read replicas are allowed. After a database flush the next
-maintenance owner recreates the lock row, but schema/fixture data still needs
-sync/rebuild before serving. See the [upgrade notes](./CHANGELOG.md#0230--2026-09-29).
+Until the first `sync` publishes a policy, permission reads are closed. Nothing
+else has to be built, and fixture loads or bulk writes need no command
+afterwards. Write aliases for the models a permission reads and for
+relationships must match; separate read replicas are allowed. After a database
+flush, run `rebac sync` again before serving. See the
+[upgrade notes](./CHANGELOG.md#unreleased).
 
 ```python
 # blog/views.py
@@ -110,7 +111,7 @@ That's the end-to-end flow. The same `Post.objects.with_actor(...)` pattern work
 | Problem | Existing options | What `django-zed-rebac` does |
 |---|---|---|
 | Per-object permissions in Django | `django-guardian` (per-object ACL via GenericFK; no JOIN propagation; no graph traversal) | True REBAC graph; SpiceDB-compatible; manager-level queryset scoping; cross-relation propagation. |
-| Run SpiceDB-style permissions locally without infrastructure | None — SpiceDB itself is a Go binary that needs Postgres + a sidecar | `LocalBackend`: pure-Django permission index derived from relationships and declared backings. Same API surface the planned `SpiceDBBackend` will use. |
+| Run SpiceDB-style permissions locally without infrastructure | None — SpiceDB itself is a Go binary that needs Postgres + a sidecar | `LocalBackend`: pure Django; permissions are compiled to queries over relationships and declared backings. Same API surface the planned `SpiceDBBackend` will use. |
 | AI-agent authorization | Cedar (no graph traversal); Casbin (in-memory post-filter); Polar/Oso (deprecated 2023) | Consumer-defined grant objects and permission expressions can combine delegation and capability conditions. The engine evaluates those explicit relationships; resolving an agent or grant subject does not confer the user's permissions. |
 | Permission scoping outside HTTP | Manual `if user.has_perm(...)` everywhere | `Model.objects.with_actor(actor)` works in Celery tasks, cron, management commands, plain Python, and MCP servers. The actor is generic: Django `User`, `Agent`, `agents/grant`, `auth/apikey`, or any registered subject. |
 | Strict-by-default (no silent leaks) | `django-guardian` returns all rows when nothing scopes; easy to forget | Querysets without an actor raise `MissingActorError` rather than returning everything. Bypass requires an explicit `reason`; block-scoped `sudo()` is logged. |
@@ -149,7 +150,7 @@ verification of its ORM integration.
 
 Versioning follows SemVer while the project is below 1.0: minor releases may add public API and tighten alpha contracts; patch releases are reserved for compatible fixes.
 
-Database support: PostgreSQL 13+ (production target), MySQL 8+ (opt-in vendor suite), SQLite (test/dev only). CI runs SQLite and PostgreSQL; the MySQL suite is a release gate. The `Relationship` indexes ship in `0001_initial.py`, and the permission-index tables in `0007_permission_index.py`. After upgrading, run `rebac sync` or `rebac index rebuild` before serving; reads fail closed until the index is ready. See [upgrade notes](./CHANGELOG.md#0230--2026-09-29) for backing-model transactions and unsupported write paths.
+Database support: PostgreSQL 13+ (production target), MySQL 8+ (opt-in vendor suite), SQLite (test/dev only). CI runs SQLite and PostgreSQL; the MySQL suite is a release gate. The `Relationship` indexes ship in `0001_initial.py`. After upgrading, run `migrate`; no other command is needed. Behaviour on PostgreSQL tables of tens of millions of rows has not been verified yet. See [upgrade notes](./CHANGELOG.md#unreleased) for the removed commands, checks and settings and for the recursion bound.
 
 ## Comparison
 
@@ -181,7 +182,7 @@ Database support: PostgreSQL 13+ (production target), MySQL 8+ (opt-in vendor su
 │              │                          │                        │
 │   ┌──────────▼──────────┐   ┌───────────▼───────────┐           │
 │   │  LocalBackend       │   │  SpiceDBBackend        │           │
-│   │  permission index +│   │  planned authzed       │           │
+│   │  compiled queries + │   │  planned authzed       │           │
 │   │  cel-python caveats │   │  adapter               │           │
 │   └─────────────────────┘   └────────────────────────┘           │
 └──────────────────────────────────────────────────────────────────┘
@@ -206,7 +207,8 @@ This is an **alpha** package. The architecture is settled (see [docs/ARCHITECTUR
 - **0.2** — Alpha hardening: schema-level built-in actors, action-scoped queryset reads, split `sudo()` / `system_context()`, and efficient schema cache invalidation.
 - **0.3-0.9** — shipped middleware, registry storage mode, evaluator/Zookie scopes, Strawberry adapter, field-level read gates, REBAC-safe relation loading, Strawberry-Django optimizer, field-backed structural relations, and LocalBackend hardening.
 - **0.11** — FastMCP `rebac_mcp_tool` adapter ([proposal 0004](./docs/proposals/0004-mcp-tool-integration.md)).
-- **0.23** — permission index, synchronous maintenance, rebuild/verify commands, full subject expansion, and PostgreSQL CI.
+- **0.23–0.24** — full subject expansion, reference and differential test suites, PostgreSQL CI, write gates for backed edges.
+- **Unreleased** — permissions compiled to queries over the application's own tables ([proposal 0015](./docs/proposals/0015-permissions-compiled-to-queries.md)): no derived tables, no build step. The trial on a large PostgreSQL database is pending.
 - **Next** — `SpiceDBBackend` adapter.
 - **1.0** — Stable release with full docs and CI matrix green.
 

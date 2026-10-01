@@ -2,56 +2,57 @@
 
 **Target version:** a green-field re-implementation of `LocalBackend`
 evaluation; candidate shape for 1.0.
-**Status:** draft 3 (2026-10-01), revised after a design review and after
-first measurements on a consumer database. The decision gates at the end are
-open. An experimental compiler and test-only shadow hook now exist beside
-the index; production reads and write maintenance have not switched.
-**Supersedes, if accepted:** proposals 0009 and 0014, and the maintenance
-half of 0012. Proposals 0011 and 0013 are narrowed, not superseded (§ 10).
+**Status:** implemented on the branch `feat/0015-compiled-permissions`
+(2026-10-02), pending the trial on a consumer database. `LocalBackend` reads
+from the compiler; maintenance, the index tables, their commands, checks and
+settings are removed. The implemented behaviour is specified in
+`docs/ARCHITECTURE.md` § Compiled permissions; where this text and the source
+differ, the source is the truth.
+**Supersedes:** proposals 0009 and 0014, and the maintenance half of 0012.
+Proposals 0011 and 0013 are narrowed, not superseded (§ 10): their gate
+questions stay open and their expected failures stay pinned.
 
 ## What changed since draft 1
 
-### Implementation direction after the second review
+### Implemented state
 
-The owner authorized the isolated implementation and prefers clean breaking
-changes over compatibility shims. Build and validate the compiler beside the
-index first. G1 remains a hard stop before switching reads or deleting state.
-Keep the live main checkout and deployment untouched. Full caveats belong in
-the implementation; keep the existing authorization gates, including 5d,
-while their separate policy decision remains open. Remove obsolete index
-commands and private imports at cutover rather than retaining no-op shims.
+The design below is implemented in `src/rebac/compile/`, `src/rebac/watch.py`
+and the write owners. Migration `0008` adds `caveat_key`; migration `0009`
+drops the index tables. The sections that follow are the design as it was
+reviewed and are kept as written. The implementation settled these points:
 
-The refinements below are part of the prototype contract. Authorization must
-remain sound before performance optimizations are accepted.
+- **Actor-side recursion (§ 5, § 8).** The stored sets that hold the actor
+  (nested groups, roles held in tuples) are decided before the statement: the
+  operation follows the tuple table from the actor to a fixed point, exact at
+  any depth, binds the sets as id lists, and a statement that authorizes
+  witnesses the decision in its own snapshot. A set that admits a
+  column-backed set, or an actor in more than 256 sets, keeps the closure
+  inside the statement, unrolled to `REBAC_DEPTH_LIMIT` with a convergence
+  test.
+- **Structural recursion (§ 8).** Stored-relation and backed-path recursion
+  are closures with a convergence test: exact when one more hop reaches
+  nothing new, data cycles included; past the bound a point check raises. A
+  self foreign key is a chain of joins with no convergence test. Permissions
+  that recurse through each other are nested to the bound, counted in
+  relations followed, with no convergence test either: a closure for them is
+  open work, pinned as an expected failure.
+- **Facts about fixed objects (§ 5).** A queryset scope decides them in one
+  statement, folds them as constants and witnesses each used decision inside
+  the scope statement. Other operations evaluate them inline.
+- **Refused recursion (§ 8).** A component is refused when a permission of
+  it is reached through the right-hand side of `-` inside the component, or
+  when one expression uses the component more than once (`rebac.E016`).
+- **The clock (§ 7)** is the application's, one parameter per statement.
+- **Caveats (§ 6).** Distinct instances in reach are decided in Python from
+  one query per operation; there is no condition limit, and
+  `REBAC_INDEX_CONDITION_LIMIT` and `rebac.E017` are removed with
+  `REBAC_INDEX_LOOKUP_LIMIT` and `rebac.E019`.
+- **Statements are kept** per policy revision, permission, actor shape and
+  the actor's decided sets (gate G4): Django's own SQL, with the actor id,
+  the clock and the resource id as parameters.
 
-The prototype is not yet a completed implementation of this contract.
-Structural recursion at a bound of 16 executes the 12-hop folder fixture on
-SQLite and PostgreSQL; the real folder dataset still needs measurement.
-Exact actor-side closure remains unresolved: a membership cycle
-whose last base grant is revoked still appears depth-uncertain to the
-bounded compiler, while the index proves denial. That shadow failure is a
-cutover blocker, not an accepted change to the test expectation. The
-large-table sparse/no-access UNION measurements are also still pending.
-
-Prototype validation on this branch:
-
-- The normal verification chain passes: lint, format, strict mypy, pyright,
-  3,288 fast SQLite tests and 173 PostgreSQL delta tests. Migration drift
-  checks pass. Tier 3 was not run.
-- The complete fast SQLite shadow run has 3,235 passing tests and 43
-  failures: 19 depth exceptions, four bounded-result differences, 16 query
-  construction timeouts, two SQLite expression-limit errors, and two
-  existing index SQL-budget assertions affected by the comparison hook.
-  The depth exceptions include unresolved role cycles as well as the
-  proposed structural-depth contract change; they are not all expected.
-  Two of those exceptions, caused by alias-only permission cycles, were
-  subsequently fixed and verified by focused shadow tests. The complete
-  shadow run has not been repeated after that fix; the other failure groups
-  remain open. No blanket exception or accepted-failure list makes it green.
-- A 12-hop self-FK fixture at bound 16 establishes that the supported flat
-  shape executes on both databases. Other positive recursive shapes still
-  produce excessive ORM expression expansion. Those failures block G2;
-  increasing the default bound does not fix them.
+Open: gate G1 (plans on the consumer database, under trial) and gate G5
+(§ 13, the gates). Tier 3 was not run.
 
 A review found seven gaps. Each is resolved in the section named:
 

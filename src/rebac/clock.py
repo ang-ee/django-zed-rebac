@@ -4,7 +4,6 @@ from datetime import UTC, datetime
 from typing import TYPE_CHECKING
 
 from django.conf import settings
-from django.db.models import Expression, Q
 from django.utils import timezone
 
 if TYPE_CHECKING:
@@ -32,11 +31,6 @@ def __getattr__(name: str) -> datetime:
     raise AttributeError(name)
 
 
-def index_now() -> datetime:
+def application_now() -> datetime:
     """Application clock, bound as SQL parameters; never the database clock."""
     return timezone.now()
-
-
-def active_q(now: datetime | Expression, prefix: str = "") -> Q:
-    """An expiry predicate, optionally on a joined row."""
-    return Q(**{prefix + "expires_at__gt": now})

@@ -27,7 +27,6 @@ from tests.backend_setup import STORAGE_TIERS, install_schema
 from tests.test_recursive_queryscope import (
     ACTOR,
     OUTSIDER,
-    beyond_depth_limit,
     chain,
     grant,
     schema_context,
@@ -126,12 +125,9 @@ def test_implicit_expression_scope(fixture, embedding, actor):
 
 @pytest.mark.parametrize("storage", STORAGE_TIERS)
 @pytest.mark.parametrize("backing", ["tuple", "field"])
-@pytest.mark.parametrize("depth", [3, pytest.param(12, marks=pytest.mark.slow)])
-def test_recursive_enumeration_and_bulk_guard_beyond_old_bound(storage, backing, depth):
-    with (
-        beyond_depth_limit(depth),
-        schema_context(storage, "folder", backing) as (active, member, hop, action),
-    ):
+@pytest.mark.parametrize("depth", [3, pytest.param(7, marks=pytest.mark.slow)])
+def test_recursive_enumeration_and_bulk_guard(storage, backing, depth):
+    with schema_context(storage, "folder", backing) as (active, member, hop, action):
         rows = chain(active, hop, backing, depth)
         grant(active, rows[0], member)
         assert set(

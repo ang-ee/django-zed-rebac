@@ -1,4 +1,4 @@
-"""Nested tuple writes preserve the enclosing owner's old-state frontier."""
+"""Tuple and schema writes nested inside another write commit or roll back with it."""
 
 from contextlib import contextmanager
 
@@ -14,18 +14,21 @@ from rebac import (
     RelationshipTuple,
     SubjectRef,
     backend,
+    schema_changes,
     sudo,
     to_subject_ref,
 )
 from rebac.backends import reset_backend
-from rebac.errors import SchemaError
-from rebac.index.maintain import IndexMaintenance
-from rebac.models import Relationship, SchemaOverride, SchemaPermission
+from rebac.models import (
+    Relationship,
+    SchemaDefinition,
+    SchemaOverride,
+    SchemaPermission,
+    SchemaRelation,
+)
 from rebac.schema import parse_zed
 from rebac.types import RelationshipFilter
 from tests.backend_setup import install_schema
-from tests.index_harness import assert_no_drift
-from tests.test_index_maintenance import persisted  # noqa: F401 - persisted schema fixture
 from tests.testapp.models import BackingEntry, BackingRound
 
 SCHEMA = """
@@ -70,11 +73,40 @@ def fixture_rows():
         second = BackingRound.objects.create()
         user = get_user_model().objects.create_user(username="nested responder")
         entry = BackingEntry.objects.create(round=first, responder=user)
-    return first, second, entry, to_subject_ref(user)
+    responder = to_subject_ref(user)
+    assert reads_round(responder, first)
+    assert not reads_round(responder, second)
+    return first, second, entry, responder
+
+
+def reads_round(subject, round_):
+    return backend().has_access(
+        subject=subject, action="read", resource=ObjectRef("test/backinground", str(round_.pk))
+    )
+
+
+@pytest.fixture
+def persisted(db):
+    """A stored policy with one grant; returns its ``read`` permission row."""
+    reset_backend()
+    with schema_changes():
+        SchemaDefinition.objects.create(resource_type="auth/user")
+        definition = SchemaDefinition.objects.create(resource_type="test/policy")
+        SchemaRelation.objects.create(
+            definition=definition, name="viewer", allowed_subjects=[{"type": "auth/user"}]
+        )
+        permission = SchemaPermission.objects.create(
+            definition=definition, name="read", expression="viewer"
+        )
+        SchemaPermission.objects.create(definition=definition, name="dependent", expression="read")
+    backend().write_relationships(
+        [RelationshipTuple(ObjectRef("test/policy", "one"), "viewer", ALICE)]
+    )
+    return permission
 
 
 @pytest.mark.parametrize("event", ["pre_save", "pre_delete"])
-def test_nested_tuple_write_preserves_old_backing_frontier(event):
+def test_nested_tuple_write_does_not_hide_outer_backing_change(event):
     first, second, entry, responder = fixture_rows()
 
     def nested_write(**kwargs):
@@ -93,11 +125,11 @@ def test_nested_tuple_write_preserves_old_backing_frontier(event):
     assert not backend().has_access(
         subject=responder, action="read", resource=ObjectRef("test/backinground", str(first.pk))
     )
+    assert reads_round(responder, second) is (event == "pre_save")
     assert backend().has_access(subject=CAROL, action="read", resource=ObjectRef("blog/post", "1"))
-    assert_no_drift()
 
 
-def test_relationship_signal_orm_delete_keeps_index_in_sync():
+def test_relationship_signal_orm_delete_revokes_access():
     backend().write_relationships([RelationshipTuple(ObjectRef("blog/post", "2"), "viewer", DAVE)])
 
     def revoke(sender, instance, created, **kwargs):
@@ -111,12 +143,11 @@ def test_relationship_signal_orm_delete_keeps_index_in_sync():
     assert not backend().has_access(
         subject=DAVE, action="read", resource=ObjectRef("blog/post", "2")
     )
-    assert_no_drift()
 
 
 @pytest.mark.parametrize("event", ["pre_save", "post_save", "pre_delete", "post_delete"])
 @pytest.mark.parametrize("kind", ["grant", "revoke"])
-def test_nested_tuple_write_in_each_model_signal_preserves_both_frontiers(event, kind):
+def test_nested_tuple_write_in_each_model_signal_applies_both_changes(event, kind):
     first, second, entry, responder = fixture_rows()
     target = ObjectRef("blog/post", "signal")
     if kind == "revoke":
@@ -157,10 +188,10 @@ def test_nested_tuple_write_in_each_model_signal_preserves_both_frontiers(event,
     assert not backend().has_access(
         subject=responder, action="read", resource=ObjectRef("test/backinground", str(first.pk))
     )
+    assert reads_round(responder, second) is event.endswith("save")
     assert backend().has_access(
         subject=CAROL if kind == "grant" else DAVE, action="read", resource=target
     ) is (kind == "grant")
-    assert_no_drift()
 
 
 @pytest.mark.parametrize("event", ["pre_save", "post_save"])
@@ -190,7 +221,7 @@ def test_caught_nested_savepoint_exception_preserves_outer_write(event):
     assert not backend().has_access(
         subject=responder, action="read", resource=ObjectRef("test/backinground", str(first.pk))
     )
-    assert_no_drift()
+    assert reads_round(responder, second)
 
 
 def test_savepoint_rollback_then_second_nested_tuple_write():
@@ -219,10 +250,10 @@ def test_savepoint_rollback_then_second_nested_tuple_write():
     assert not backend().has_access(
         subject=responder, action="read", resource=ObjectRef("test/backinground", str(first.pk))
     )
-    assert_no_drift()
+    assert reads_round(responder, second)
 
 
-def test_outer_owner_rollback_reverts_nested_tuple_and_source_write():
+def test_outer_rollback_reverts_nested_tuple_and_source_write():
     first, second, entry, responder = fixture_rows()
 
     class Rollback(Exception):
@@ -244,7 +275,7 @@ def test_outer_owner_rollback_reverts_nested_tuple_and_source_write():
     assert backend().has_access(
         subject=responder, action="read", resource=ObjectRef("test/backinground", str(first.pk))
     )
-    assert_no_drift()
+    assert not reads_round(responder, second)
 
 
 def test_third_party_tracked_user_pre_save_tuple_write_inside_atomic():
@@ -286,10 +317,13 @@ def test_third_party_tracked_user_pre_save_tuple_write_inside_atomic():
     assert backend().has_access(
         subject=CAROL, action="read", resource=ObjectRef("blog/post", "tracked")
     )
-    assert_no_drift()
 
 
-def test_tuple_writes_in_schema_override_post_save_handler(persisted):  # noqa: F811
+def test_tuple_writes_in_schema_override_post_save_handler(persisted):
+    assert backend().has_access(
+        subject=ALICE, action="read", resource=ObjectRef("test/policy", "one")
+    )
+
     def nested_write(sender, instance, created, **kwargs):
         backend().write_relationships(
             [RelationshipTuple(ObjectRef("test/policy", "two"), "viewer", DAVE)]
@@ -312,25 +346,26 @@ def test_tuple_writes_in_schema_override_post_save_handler(persisted):  # noqa: 
     assert backend().has_access(
         subject=DAVE, action="read", resource=ObjectRef("test/policy", "two")
     )
-    assert_no_drift()
 
 
 @pytest.mark.pg_delta
-@pytest.mark.timeout(20)
-def test_revoke_after_nested_schema_publish_fails_closed_until_owner_finishes(persisted):  # noqa: F811
+def test_revoke_after_nested_schema_publish_is_denied_inside_and_after_the_transaction(persisted):
     resource = ObjectRef("test/policy", "one")
-    with IndexMaintenance(using="default"):
+    assert backend().has_access(subject=ALICE, action="read", resource=resource)
+    with transaction.atomic():
         SchemaPermission.objects.filter(pk=persisted.pk).update(expression="viewer")
         zookie = backend().delete_relationships(
             RelationshipFilter(resource_type="test/policy", resource_id="one")
         )
-        with pytest.raises(SchemaError, match=r"rebac\.E013"):
-            backend().check_access(
+        assert (
+            not backend()
+            .check_access(
                 subject=ALICE,
                 action="read",
                 resource=resource,
                 consistency=Consistency.AT_LEAST_AS_FRESH,
                 at_zookie=zookie,
             )
+            .allowed
+        )
     assert not backend().has_access(subject=ALICE, action="read", resource=resource)
-    assert_no_drift()

@@ -1,17 +1,18 @@
 """Relationship garbage collection follows both sides of Django identity."""
 
-from contextlib import nullcontext
-from unittest.mock import MagicMock, patch
+from unittest.mock import patch
 
 import pytest
+from django.db import connections
+from django.test.utils import CaptureQueriesContext
 
 from rebac import RelationshipTuple, SubjectRef, backend, sudo, write_relationships
 from rebac.backends import reset_backend
-from rebac.models import active_relationship_model
+from rebac.models import Relationship, active_relationship_model
 from rebac.schema import parse_zed
 from rebac.signals import _rebac_cascade_resource
 from rebac.types import ObjectRef
-from tests.backend_setup import install_schema
+from tests.backend_setup import install_schema, sqlite_alias
 from tests.testapp.models import Folder, Post
 
 SCHEMA_TEXT = """
@@ -24,26 +25,49 @@ definition blog/post {
 """
 
 
-def test_delete_cleanup_uses_signal_database_alias(settings):
+@pytest.fixture
+def replica(db, django_db_blocker, tmp_path):
+    """A second database alias holding the relationship table."""
+    alias = "replica"
+    target = sqlite_alias(alias, tmp_path / "replica.sqlite3")
+    connections[alias] = target
+    try:
+        with django_db_blocker.unblock():
+            with target.schema_editor() as editor:
+                editor.create_model(Relationship)
+            yield alias
+    finally:
+        target.close()
+        del connections[alias]
+
+
+def test_delete_cleanup_uses_signal_database_alias(settings, replica):
     settings.REBAC_LOCAL_BACKEND_STORAGE = "denormalized"
     target = Post(pk=7, title="Target")
-    relationship_model = MagicMock()
+    named = {
+        "resource_type": "blog/post",
+        "resource_id": "7",
+        "relation": "viewer",
+        "subject_type": "blog/folder",
+        "subject_id": "1",
+    }
+    for alias in ("default", replica):
+        Relationship.objects.using(alias).bulk_create([Relationship(**named)])
 
     with (
-        patch("rebac.models.active_relationship_model", return_value=relationship_model),
-        patch("rebac.signals.router.allow_migrate_model", return_value=True),
-        patch("rebac.signals._finish_signal"),
         patch("rebac.backends.local.mark_relationships_changed") as invalidated,
-        patch("rebac.index.maintain.tuple_owner", return_value=nullcontext(MagicMock())) as owner,
+        CaptureQueriesContext(connections["default"]) as elsewhere,
+        CaptureQueriesContext(connections[replica]) as queries,
     ):
-        _rebac_cascade_resource(sender=Post, instance=target, using="replica")
+        _rebac_cascade_resource(sender=Post, instance=target, using=replica)
 
-    owner.assert_called_once_with("replica")
-    # The delete joins the Collector's transaction on the signal's alias; the
-    # handler opens none of its own, then drops cached decisions.
-    relationship_model.objects.using.assert_called_once_with("replica")
-    relationship_model.objects.using.return_value.filter.return_value.delete.assert_called_once_with()
-    invalidated.assert_called_once_with()
+    # The delete runs in a transaction on the signal's alias and touches no
+    # other database, then drops cached decisions.
+    assert not elsewhere.captured_queries
+    assert any(query["sql"].startswith("DELETE") for query in queries.captured_queries)
+    assert not Relationship.objects.using(replica).filter(**named).exists()
+    assert Relationship.objects.using("default").filter(**named).exists()
+    invalidated.assert_called()
 
 
 @pytest.mark.django_db

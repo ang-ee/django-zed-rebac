@@ -1,9 +1,9 @@
-"""Draft 3's measured recursion shape, kept separate from the index oracle."""
+"""Recursion shapes and three-state results, checked through the public reads."""
 
 import pytest
 from django.db.models import F, Value
 
-from rebac import ObjectRef, RelationshipTuple, SubjectRef, sudo
+from rebac import ObjectRef, PermissionDepthExceeded, RelationshipTuple, SubjectRef, sudo
 from rebac.compile import At, Bound, Compiler
 from rebac.compile.read import check
 from rebac.models.generation import SchemaGeneration
@@ -140,3 +140,36 @@ def test_structural_folder_recursion_uses_sound_lower_and_upper_bounds(hops):
         .filter(complete.holds(("blog/folder", "read"), scope, Bound.LOWER))
         .exists()
     )
+
+
+@pytest.mark.xfail(
+    strict=True,
+    raises=PermissionDepthExceeded,
+    reason="proposal 0015 follow-up: permissions that recurse through each other are unrolled "
+    "to the depth bound without a closure, so a data cycle through them does not converge",
+)
+def test_denied_check_through_a_cycle_of_mutually_recursive_permissions_is_decided():
+    local = install_schema("""
+        definition auth/user {}
+        definition test/folder {
+            relation viewer: auth/user
+            relation project: test/project
+            permission view = viewer + project->access
+        }
+        definition test/project {
+            relation member: auth/user
+            relation folder: test/folder
+            permission access = member + folder->view
+        }
+    """)
+    folder, project = ObjectRef("test/folder", "f"), ObjectRef("test/project", "p")
+    local.write_relationships(
+        [
+            RelationshipTuple(folder, "project", SubjectRef.of("test/project", "p")),
+            RelationshipTuple(project, "folder", SubjectRef.of("test/folder", "f")),
+        ]
+    )
+    alice = SubjectRef.of("auth/user", "alice")
+    assert not local.check_access(subject=alice, action="view", resource=folder).allowed
+    local.write_relationships([RelationshipTuple(project, "member", alice)])
+    assert local.check_access(subject=alice, action="view", resource=folder).allowed

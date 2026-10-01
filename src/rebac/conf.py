@@ -21,10 +21,6 @@ _DEFAULTS: dict[str, Any] = {
     "REBAC_SPICEDB_AUTO_WRITE_SCHEMA": True,
     "REBAC_SCHEMA_DIR": None,  # resolves to <cwd>/rebac at use site
     "REBAC_DEPTH_LIMIT": 8,
-    # Maximum normalized logical contribution, rather than a per-row limit.
-    # Type/range validation belongs to the E017 system check, never import time.
-    "REBAC_INDEX_CONDITION_LIMIT": 256,
-    "REBAC_INDEX_LOOKUP_LIMIT": 64,
     "REBAC_DEFAULT_CONSISTENCY": "minimize_latency",
     "REBAC_CACHE_ALIAS": "default",
     "REBAC_LOOKUP_CACHE_TTL": 60,

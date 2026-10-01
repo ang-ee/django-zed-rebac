@@ -1,4 +1,4 @@
-"""Execute compiled LocalBackend predicates without a derived permission index.
+"""Execute compiled LocalBackend predicates.
 
 A statement is compiled once per policy, permission and actor shape, and kept
 as Django's own SQL with placeholders for the actor's id (the accepted
@@ -14,20 +14,22 @@ from collections import OrderedDict
 from collections.abc import Callable, Iterable, Iterator, Mapping
 from dataclasses import dataclass, field
 from datetime import datetime
+from functools import partial
 from threading import RLock
 from typing import TYPE_CHECKING, Any, cast
 
+from django.core.exceptions import EmptyResultSet
 from django.db import connections, models
 from django.db.models import Exists, Expression, F, Q, Value
 from django.db.models.lookups import Exact, GreaterThanOrEqual, LessThan
 from django.utils import timezone
 
 from rebac._id import model_identity_fields, resource_id_attr
+from rebac.codec import identity_codec
 from rebac.composition import TaggedComposition, compose_tagged, split_stale_overrides
 from rebac.conf import app_settings
 from rebac.errors import PermissionDepthExceeded, SchemaError
 from rebac.field_backing import resolve_attribute_backing, resolve_field_backing
-from rebac.index.codec import identity_codec
 from rebac.models import active_relationship_model
 from rebac.models.generation import SchemaGeneration
 from rebac.resources import (
@@ -45,7 +47,9 @@ from . import At, Bound, Compiler, predicate
 from .conditions import CaveatVerdicts
 from .evaluate import named_subjects, residual
 from .predicate import (
+    ActorSets,
     Fact,
+    Support,
     _and,
     _Compiled,
     _not,
@@ -65,6 +69,9 @@ if TYPE_CHECKING:
 _MANUAL_REVISION = object()
 _RESOURCE_WIRE = object()
 _LIMIT = 512
+# An actor in more stored sets than this keeps their membership inside the
+# statement, as a closure over the tuple table.
+_SET_LIMIT = 256
 _lock = RLock()
 
 
@@ -230,6 +237,8 @@ class _Operation:
     context: Mapping[str, Any] | None
     shape: tuple[Any, ...]
     _verdicts: dict[Key, CaveatVerdicts] = field(default_factory=dict)
+    _roots: dict[int, Key] = field(default_factory=dict)
+    _sets: dict[int, ActorSets | None] = field(default_factory=dict)
 
     @classmethod
     def begin(
@@ -263,7 +272,102 @@ class _Operation:
             found = self._verdicts[key] = CaveatVerdicts.prepare(
                 self.policy.schema, key, context=self.context, using=self.using
             )
+            self._roots[id(found)] = key
         return found
+
+    def sets(self, verdicts: CaveatVerdicts) -> ActorSets | None:
+        """The stored sets in reach of the verdicts' permission that hold the actor."""
+        token = id(verdicts)
+        if token not in self._sets:
+            self._sets[token] = self._decide_sets(self._roots[token], verdicts)
+        return self._sets[token]
+
+    def _decide_sets(self, key: Key, verdicts: CaveatVerdicts) -> ActorSets | None:
+        """Follow the tuple table from the actor until no new set appears.
+
+        One statement per level of nesting, and one more that finds nothing.
+        The result is exact, data cycles included: there is no depth bound.
+        """
+        program = self.policy.program
+        keys = program.stored_sets & program.reachable(key)
+        if not keys:
+            return None
+        compiler = Compiler(
+            self.policy.schema,
+            self.actor,
+            self.using,
+            tagged=self.policy.tagged,
+            verdicts=verdicts,
+            program=program,
+        )
+        schema = compiler.schema
+        conditional = any(
+            allowed.with_caveat
+            for type_, name in keys
+            if (definition := schema.get_definition(type_)) is not None
+            for relation in definition.relations
+            if relation.name == name
+            for allowed in relation.allowed_subjects
+        )
+        tuples = compiler._tuples()
+        decided: dict[Bound, dict[Key, frozenset[str]]] = {}
+        support: list[Support] = []
+        for bound in (Bound.LOWER, Bound.UPPER):
+            if bound is Bound.UPPER and not conditional:
+                decided[bound] = decided[Bound.LOWER]
+                break
+            members: dict[Key, set[str]] = {}
+            while True:
+                step = compiler.sets_step(keys, members, bound)
+                if is_false(step):
+                    break
+                rows = tuples.filter(step)
+                within = compiler.sets_within(members)
+                if not is_false(within):
+                    rows = rows.exclude(within)
+                fresh = list(
+                    rows.order_by()
+                    .values_list(
+                        "resource_type",
+                        "resource_id",
+                        "relation",
+                        "subject_type",
+                        "subject_id",
+                        "subject_relation",
+                        "caveat_name",
+                        "caveat_key",
+                    )
+                    .distinct()
+                )
+                if not fresh:
+                    break
+                for type_, resource_id, name, s_type, s_id, s_relation, caveat, digest in fresh:
+                    ids = members.setdefault((type_, name), set())
+                    if resource_id in ids:
+                        continue
+                    ids.add(resource_id)
+                    if bound is Bound.LOWER:
+                        own = (
+                            s_type == self.actor.subject_type
+                            and s_id == self.actor.subject_id
+                            and s_relation == self.actor.optional_relation
+                        )
+                        support.append(
+                            Support(
+                                (type_, name),
+                                resource_id,
+                                s_type,
+                                s_id,
+                                s_relation,
+                                caveat,
+                                digest,
+                                own,
+                            )
+                        )
+                if sum(len(ids) for ids in members.values()) > _SET_LIMIT:
+                    return None
+            decided[bound] = {found: frozenset(ids) for found, ids in members.items()}
+        return ActorSets(keys, decided[Bound.LOWER], decided[Bound.UPPER], tuple(support))
 
     def compiler(
         self,
@@ -281,6 +385,7 @@ class _Operation:
             program=self.policy.program,
             parametric=parametric,
             facts=facts,
+            sets=self.sets(verdicts),
         )
 
     def gate(self, *, parametric: bool = True) -> models.QuerySet[Any]:
@@ -296,7 +401,8 @@ class _Operation:
         # A statement can be kept when nothing in it varies but the actor's
         # id and the clock: that is, when it carries no caveat verdict list.
         keep = verdicts.empty
-        full = (*self.shape, *key)
+        sets = self.sets(verdicts)
+        full = (*self.shape, sets.digest if sets is not None else None, *key)
         if keep:
             with _lock:
                 kept = _statements.get(full)
@@ -309,8 +415,14 @@ class _Operation:
             compiled = built
         else:
             rows, every = built if isinstance(built, tuple) else (built, False)
-            sql, params = _Compiled(rows).as_sql(None, connections[self.using])
-            compiled = _Kept(sql, params, every)
+            try:
+                sql, params = _Compiled(rows).as_sql(None, connections[self.using])
+            except EmptyResultSet:
+                # No row can satisfy it: an unpublished policy, or a
+                # condition Django proves empty.
+                compiled = False
+            else:
+                compiled = _Kept(sql, params, every)
         if keep:
             with _lock:
                 _statements[full] = compiled
@@ -319,7 +431,7 @@ class _Operation:
         return compiled
 
     def bound(self, params: Iterable[Any], resource_id: str | None = None) -> list[Any]:
-        result = []
+        result: list[Any] = []
         for param in bind(params, self.actor, connections[self.using]):
             if param is _MANUAL_REVISION:
                 result.append(self.backend._manual_schema_revision())
@@ -338,7 +450,7 @@ class _Operation:
         names: dict[str, Fact] = {}
         for number, fact in enumerate(const_facts(self.policy.schema, self.policy.program, key)):
             compiled = self.statement(
-                ("fact", fact), verdicts, lambda fact=fact: self._fact_rows(fact, verdicts)
+                ("fact", fact), verdicts, partial(self._fact_rows, fact, verdicts)
             )
             if isinstance(compiled, bool):
                 decided[fact] = compiled
@@ -404,6 +516,13 @@ def _point(operation: _Operation, key: Key, resource_id: str, which: str) -> boo
         if is_false(condition):
             return False
         rows = operation.gate()
+        if which == "lower":
+            # Only this statement authorizes, so it re-reads what was decided.
+            witness = compiler.sets_witness()
+            if is_false(witness):
+                return False
+            if not is_true(witness):
+                rows = rows.filter(witness)
         return (rows if is_true(condition) else rows.filter(condition)).values("pk")
 
     compiled = operation.statement(("point", key, which), verdicts, build)
@@ -430,7 +549,13 @@ def _point_result(
     # CONDITIONAL, or a depth error.
     if _point(operation, key, resource.resource_id, "lower"):
         return True, True, False, operation.policy
-    recursive = bool(operation.policy.program.reachable(key) & operation.policy.program.recursive)
+    program = operation.policy.program
+    sets = operation.sets(operation.verdicts(key))
+    # A stored set that was decided is exact: it leaves no depth to probe.
+    recursive = bool(
+        (program.reachable(key) & program.recursive)
+        - (sets.keys if sets is not None else frozenset())
+    )
     # The bounds differ only where a caveat or a recursion is in reach.
     if lower_only or not (recursive or not operation.verdicts(key).empty):
         return False, False, False, operation.policy
@@ -532,7 +657,9 @@ def _scope_statement(operation: _Operation, model: type[models.Model], key: Key)
         predicate = compiler.holds(key, _model_at(model), Bound.LOWER)
         if is_false(predicate):
             return False
-        witness = operation.witness(compiler.used_facts, decided, verdicts)
+        witness = _and(
+            operation.witness(compiler.used_facts, decided, verdicts), compiler.sets_witness()
+        )
         if is_false(witness):
             return False
         gate = operation.gate()
@@ -576,8 +703,8 @@ class _Scope(Expression):
     def get_source_expressions(self) -> list[Any]:
         return [self.lhs]
 
-    def set_source_expressions(self, expressions: Any) -> None:
-        [self.lhs] = expressions
+    def set_source_expressions(self, exprs: Any) -> None:
+        [self.lhs] = exprs
 
     @schema_operation
     def as_sql(self, compiler: Any, connection: Any) -> tuple[str, tuple[Any, ...]]:
@@ -625,7 +752,7 @@ def _named_parts(
     only name an existing row, so a field backing adds ids only when its
     target model keeps no rows.
     """
-    rows = cast(Any, active_relationship_model().objects.using(using)).index_projection()
+    rows = cast(Any, active_relationship_model().objects.using(using)).wire_projection()
     for type_column, id_column in (
         ("resource_type", "resource_id"),
         ("subject_type", "subject_id"),
@@ -721,7 +848,7 @@ def _accessible_branches(
     key = self.resource_type, self.action
     verdicts = operation.verdicts(key)
     compiler = operation.compiler(verdicts, parametric=False)
-    gate = Q(Exists(operation.gate(parametric=False)))
+    gate = _and(Q(Exists(operation.gate(parametric=False))), compiler.sets_witness())
     branches: list[tuple[models.QuerySet[Any], Callable[[Any], str | None]]] = []
 
     model = model_for_resource_type(self.resource_type)
