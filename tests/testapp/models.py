@@ -372,6 +372,9 @@ class TextIdentityFolder(RebacMixin, models.Model):
     public_id = models.CharField(max_length=64, unique=True)
     name = models.CharField(max_length=100)
     author = models.ForeignKey(settings.AUTH_USER_MODEL, on_delete=models.CASCADE)
+    parent = models.ForeignKey(
+        "self", null=True, blank=True, on_delete=models.CASCADE, related_name="children"
+    )
 
     class Meta:
         app_label = "testapp"

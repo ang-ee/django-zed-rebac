@@ -8,7 +8,7 @@ from graphlib import CycleError, TopologicalSorter
 from typing import TYPE_CHECKING, Any
 
 from django.core.exceptions import FieldDoesNotExist, FieldError, ValidationError
-from django.db import DEFAULT_DB_ALIAS, models
+from django.db import DEFAULT_DB_ALIAS, connections, models
 from django.db.models import Q, QuerySet, Value
 from django.db.models.expressions import BaseExpression, Col, ColPairs, Combinable
 from django.db.models.functions import Coalesce
@@ -94,6 +94,22 @@ class ResolvedFieldBacking(_SourceFilters):
         )
         return self.field.target_field is target_identity
 
+    def keeps_target(self, using: str) -> bool:
+        """Whether a stored reference to a target proves that the target's row exists.
+
+        A foreign key column that stores the target's identity is read without
+        the target's table, so only the database's constraint stands behind
+        it.  Every other path that ends in a foreign key, forward or reverse,
+        is read from the target's own rows.
+        """
+
+        field = self.field
+        if isinstance(field, (models.ForeignKey, models.OneToOneField)):
+            if not self.targets_identity_directly():
+                return True
+            return foreign_key_kept(field, using)
+        return isinstance(field, (models.ManyToOneRel, models.OneToOneRel))
+
     def target_values_path(self) -> str:
         if (
             "__" not in self.path
@@ -122,6 +138,13 @@ class ResolvedFieldBacking(_SourceFilters):
         if target_ids is not None:
             predicate &= Q(**self.target_in_filter(target_ids))
         return rows.filter(predicate)
+
+
+def foreign_key_kept(field: models.ForeignKey[Any, Any], using: str) -> bool:
+    """Whether the database refuses a value of the column that names no row."""
+
+    constrained: bool = field.db_constraint  # type: ignore[attr-defined]
+    return constrained and connections[using].features.supports_foreign_keys
 
 
 def _proposed_forward_relationships(

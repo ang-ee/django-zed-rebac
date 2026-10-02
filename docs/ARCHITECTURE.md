@@ -1743,10 +1743,22 @@ first:
    or the ancestor chain described above.
 4. **Witness.** A decided set is a lower bound. The scope statement re-reads
    it in its own snapshot: each listed row still holds the permission (the
-   permission's own predicate, evaluated on the listed keys only), and in a
-   hierarchy each row below a seed still hangs under a row of the set. When a
-   witness fails the scope selects nothing; the next operation decides
+   permission's own predicate, evaluated on the listed keys only). A
+   hierarchy is kept by level: the seeds still hold `base`, and each row of a
+   level still hangs under a row of the level above it. A chain of parents
+   therefore loses a level at each step and ends at a seed, so rows that have
+   closed into a cycle, or have moved deeper than they were found, fail the
+   witness; a row moved under another row of the level above passes it. When
+   a witness fails the scope selects nothing; the next operation decides
    afresh.
+5. **References the database keeps.** A witness reads the rows that exist. A
+   key is therefore bound as `column IN (keys)` only where a stored reference
+   proves its row: a foreign key column under a database constraint, or a
+   path read from the target's own rows. Behind a foreign key without a
+   constraint (`db_constraint=False`, or a database that enforces none) the
+   keys are read through the target's rows, and a hierarchy over such a
+   parent column is decided by the permission's own predicate, not followed
+   from its seeds.
 
 Decided rows are used by queryset scopes and by what is built on them
 (`accessible()` without a context, bulk guards, the backed-edge gate over

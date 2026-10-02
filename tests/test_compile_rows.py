@@ -1,13 +1,14 @@
 """Small sets of target rows: decided before a scope statement, witnessed inside it."""
 
 import pytest
+from django.contrib.auth import get_user_model
 from django.db import connection
 from django.test.utils import CaptureQueriesContext
 
 from rebac import ObjectRef, RelationshipTuple, SubjectRef, sudo, to_object_ref
 from rebac.compile import read
 from rebac.testing import install_schema
-from tests.testapp.models import Folder, Post
+from tests.testapp.models import Folder, Post, TextIdentityFolder
 
 pytestmark = pytest.mark.django_db
 
@@ -117,6 +118,149 @@ def test_a_row_moved_out_of_a_decided_hierarchy_is_not_read_through(tree, monkey
     # The next operation decides afresh.
     assert visible(Post) == {posts["child"].pk}
     assert visible(Folder) == {folders["child"].pk}
+
+
+@pytest.mark.parametrize("model", [Folder, Post])
+def test_rows_closed_into_a_cycle_after_the_decision_are_not_read_through(tree, monkeypatch, model):
+    _local, folders, posts, _grant = tree
+    with sudo(reason="test.fixture"):
+        deep = Folder.objects.create(name="deep", parent=folders["leaf"])
+        Post.objects.create(title="deep", folder=deep)
+
+    def close():
+        # leaf and deep now hang under each other, and under no granted folder.
+        Folder._base_manager.filter(pk=folders["leaf"].pk).update(parent=deep)
+
+    still = {folders["child"].pk} if model is Folder else {posts["child"].pk}
+    done = after_deciding(monkeypatch, ("blog/folder", "read"), close)
+    assert visible(model) <= still
+    assert done
+    assert visible(model) == still
+
+
+def test_a_row_moved_deeper_after_the_decision_stays_within_the_depth_limit(
+    tree, monkeypatch, settings
+):
+    _local, folders, _posts, _grant = tree
+    settings.REBAC_DEPTH_LIMIT = 1
+    with sudo(reason="test.fixture"):
+        twin = Folder.objects.create(name="twin", parent=folders["child"])
+
+    def deepen():
+        Folder._base_manager.filter(pk=twin.pk).update(parent=folders["leaf"])
+
+    within = {folders["child"].pk, folders["leaf"].pk}
+    done = after_deciding(monkeypatch, ("blog/folder", "read"), deepen)
+    assert visible(Folder) <= within
+    assert done
+    assert visible(Folder) == within
+
+
+def test_a_row_moved_under_another_row_of_the_level_above_is_still_read(tree, monkeypatch):
+    local, folders, _posts, _grant = tree
+    local.write_relationships([RelationshipTuple(to_object_ref(folders["other"]), "viewer", ALICE)])
+
+    def move():
+        Folder._base_manager.filter(pk=folders["leaf"].pk).update(parent=folders["other"])
+
+    done = after_deciding(monkeypatch, ("blog/folder", "read"), move)
+    # leaf still hangs one level under a folder that holds the grant.
+    assert visible(Folder) == {folders["child"].pk, folders["other"].pk, folders["leaf"].pk}
+    assert done
+
+
+def test_the_witness_of_a_hierarchy_names_each_level(tree):
+    _local, folders, _posts, _grant = tree
+    with sudo(reason="test.fixture"):
+        Folder.objects.create(name="deep", parent=folders["leaf"])
+    with CaptureQueriesContext(connection) as queries:
+        visible(Folder)
+    scope = queries[-1]["sql"]
+    # One clause for the seeds and one per level below them: a row is read
+    # only while it hangs under a row of the level above its own.
+    assert scope.count('"parent_id" IN (') == 2
+    assert f'"parent_id" IN ({folders["child"].pk})' in scope
+    assert f'"parent_id" IN ({folders["leaf"].pk})' in scope
+
+
+NAMED = """
+definition auth/user {}
+definition blog/textidentityfolder {
+    relation parent: blog/textidentityfolder // rebac:field=parent
+    relation viewer: auth/user
+    permission read = viewer + parent->read
+}
+"""
+
+
+def test_an_identity_that_moved_to_another_row_is_not_read_through(monkeypatch):
+    # The levels are kept by key and the decision is used by identity.
+    local = install_schema(NAMED)
+    author = get_user_model().objects.create(username="author")
+    with sudo(reason="test.fixture"):
+        seed = TextIdentityFolder.objects.create(public_id="seed", name="seed", author=author)
+        leaf = TextIdentityFolder.objects.create(
+            public_id="leaf", name="leaf", author=author, parent=seed
+        )
+        other = TextIdentityFolder.objects.create(public_id="other", name="other", author=author)
+    local.write_relationships([RelationshipTuple(to_object_ref(seed), "viewer", ALICE)])
+    assert visible(TextIdentityFolder) == {seed.pk, leaf.pk}
+
+    def rename():
+        rows = TextIdentityFolder._base_manager
+        rows.filter(pk=leaf.pk).update(public_id="renamed")
+        rows.filter(pk=other.pk).update(public_id="leaf")
+
+    done = after_deciding(monkeypatch, ("blog/textidentityfolder", "read"), rename)
+    # ``other`` now answers to the identity that was decided for ``leaf``.
+    assert visible(TextIdentityFolder) <= {seed.pk, leaf.pk}
+    assert done
+    assert visible(TextIdentityFolder) == {seed.pk, leaf.pk}
+
+
+def unconstrained(monkeypatch, model, name):
+    """Treat the foreign key as one the database does not constrain."""
+    monkeypatch.setattr(model._meta.get_field(name), "db_constraint", False)
+
+
+def test_keys_behind_an_unconstrained_reference_are_read_from_the_target_rows(tree, monkeypatch):
+    _local, folders, posts, _grant = tree
+    unconstrained(monkeypatch, Post, "folder")
+
+    def remove():
+        # The row goes and the post keeps naming it: nothing constrains the column.
+        Folder._base_manager.filter(pk=folders["leaf"].pk)._raw_delete(connection.alias)
+
+    done = after_deciding(monkeypatch, ("blog/folder", "read"), remove)
+    try:
+        with CaptureQueriesContext(connection) as queries:
+            assert visible(Post) == {posts["child"].pk}
+        assert done
+        assert (
+            f'"folder_id" IN ({folders["child"].pk}, {folders["leaf"].pk})'
+            not in (queries[-1]["sql"])
+        )
+    finally:
+        Post._base_manager.filter(pk=posts["leaf"].pk)._raw_delete(connection.alias)
+
+
+def test_a_hierarchy_over_an_unconstrained_parent_is_not_followed_from_its_seeds(tree, monkeypatch):
+    _local, folders, posts, _grant = tree
+    unconstrained(monkeypatch, Folder, "parent")
+    assert visible(Folder) == {folders["child"].pk, folders["leaf"].pk}
+
+    def remove():
+        Folder._base_manager.filter(pk=folders["child"].pk)._raw_delete(connection.alias)
+
+    done = after_deciding(monkeypatch, ("blog/folder", "read"), remove)
+    try:
+        # leaf names a parent that is gone: it inherits nothing.
+        assert visible(Folder) == set()
+        assert done
+        assert visible(Folder) == set()
+    finally:
+        Post._base_manager.filter(pk=posts["child"].pk)._raw_delete(connection.alias)
+        Folder._base_manager.filter(pk=folders["leaf"].pk).update(parent=None)
 
 
 def test_point_checks_do_not_decide_sets(tree):

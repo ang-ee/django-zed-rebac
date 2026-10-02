@@ -15,6 +15,7 @@ from collections.abc import Callable, Iterable, Iterator, Mapping, Sequence
 from dataclasses import dataclass, field
 from datetime import datetime
 from functools import partial
+from itertools import pairwise
 from threading import RLock
 from typing import TYPE_CHECKING, Any, cast
 
@@ -298,8 +299,10 @@ class _Rows:
     ``_ROW_LIMIT`` stays inline.
 
     Every decision is a lower bound.  The statement that uses it re-reads it
-    in its own snapshot (``witness``): each listed row still holds the node,
-    so nothing is granted through a row that has left the set.
+    in its own snapshot (``witness``): each listed row that exists still holds
+    the node, so nothing is granted through a row that has left the set.  A
+    row that is gone is left to the place that binds the keys: a key is bound
+    directly only through a reference that proves its row (``keeps_target``).
     """
 
     def __init__(self, operation: _Operation, verdicts: CaveatVerdicts) -> None:
@@ -381,34 +384,50 @@ class _Rows:
         if len(seeds) > _ROW_LIMIT:
             return None
         known = dict(seeds)
-        frontier = [target for _identity, target in seeds]
+        # The rows by level, as the values a child's parent column names them by.
+        levels = [[target for _identity, target in seeds]]
         for _ in range(app_settings.REBAC_DEPTH_LIMIT):
-            if not frontier:
+            if not levels[-1]:
                 break
             children = list(
-                source.filter(**{f"{chain.parent}__in": frontier})
+                source.filter(**{f"{chain.parent}__in": levels[-1]})
                 .exclude(**{f"{chain.identity}__in": list(known)})
                 .values_list(chain.identity, chain.target)[: _ROW_LIMIT + 1 - len(known)]
             )
             if len(known) + len(children) > _ROW_LIMIT:
                 return None
             known.update(children)
-            frontier = [target for _identity, target in children]
+            levels.append([target for _identity, target in children])
         if not known:
             return _Decision((), _and(), uses)
-        held = [identity for identity, _target in seeds]
-        derived = [identity for identity in known if identity not in set(held)]
-        # The seeds still hold the base, and every other row still hangs under
-        # a row of the set: by induction each row still inherits.
+        # The seeds still hold the base and every row of a level still hangs
+        # under a row of the level above.  A chain of parents then loses a
+        # level at each step and ends at a seed: rows that have closed into a
+        # cycle, or that have moved deeper than they were found, fail it.
+        # The parent column is constrained, so the row a child names exists.
         parts = [
-            ~Q(Exists(source.filter(**{f"{chain.identity}__in": held}).filter(_not(chain.base))))
+            ~Q(Exists(source.filter(**{f"{chain.target}__in": levels[0]}).filter(_not(chain.base))))
         ]
-        if derived:
+        parts.extend(
+            ~Q(
+                Exists(
+                    source.filter(**{f"{chain.target}__in": level}).exclude(
+                        **{f"{chain.parent}__in": above}
+                    )
+                )
+            )
+            for above, level in pairwise(levels)
+            if level
+        )
+        if not chain.keyed:
+            # The levels are kept by the parent column's values and the
+            # decision is used by identity: a listed identity is still a row
+            # of the levels.
             parts.append(
                 ~Q(
                     Exists(
-                        source.filter(**{f"{chain.identity}__in": derived}).exclude(
-                            **{f"{chain.parent}__in": list(known.values())}
+                        source.filter(**{f"{chain.identity}__in": list(known)}).exclude(
+                            **{f"{chain.target}__in": list(known.values())}
                         )
                     )
                 )

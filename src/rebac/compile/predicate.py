@@ -40,6 +40,7 @@ from ..field_backing import (
     ResolvedAttributeBacking,
     ResolvedConstBacking,
     ResolvedFieldBacking,
+    foreign_key_kept,
     resolve_attribute_backing,
     resolve_const_backing,
     resolve_field_backing,
@@ -174,6 +175,8 @@ class SelfChain:
     target: str
     parent: str
     base: Q
+    #: The parent column names its row by the identity itself.
+    keyed: bool
 
 
 # ---------- Constants and two-valued connectives ----------
@@ -963,10 +966,21 @@ class Compiler:
         if parts_of is None:
             return None
         definition, base, resolved, model, identity, field = parts_of
+        parent = cast("models.ForeignKey[Any, Any]", resolved.field)
+        if not foreign_key_kept(parent, self.using):
+            # A child may name a parent that is gone: only the parent's own
+            # row shows that the child still inherits.
+            return None
         row_at = At(key[0], F(identity), field, True)
         base_row = _or(*self._arms(definition, base, row_at, Bound.LOWER, {key: 1}, True))
-        parent = cast("models.ForeignKey[Any, Any]", resolved.field)
-        return SelfChain(model, identity, parent.target_field.name, parent.attname, base_row)
+        return SelfChain(
+            model,
+            identity,
+            parent.target_field.name,
+            parent.attname,
+            base_row,
+            parent.target_field is field,
+        )
 
     def _decided(
         self,
@@ -1543,8 +1557,22 @@ class Compiler:
             return _FALSE
         if subjects is True:
             source_q = Q(**{f"{target_path}__isnull": False})
-        elif isinstance(subjects, Decided):
+        elif isinstance(subjects, Decided) and resolved.keeps_target(self.using):
             source_q = Q(**{f"{target_path}__in": list(subjects)})
+        elif isinstance(subjects, Decided):
+            # Nothing constrains the reference: a decided key counts only
+            # while its row is there.
+            identity = resolved.target_id_attr
+            rows = resolved.target_model._base_manager.using(self.using)
+            source_q = Q(
+                **{
+                    f"{target_path}__in": _Compiled(
+                        rows.filter(**{f"{identity}__in": list(subjects)})
+                        .order_by()
+                        .values(identity)
+                    )
+                }
+            )
         elif name is None:
             source_q = Q(
                 **{target_path: self._native(resolved.target_model, resolved.target_id_attr)}
