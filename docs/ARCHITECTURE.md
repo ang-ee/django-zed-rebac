@@ -423,6 +423,7 @@ from rebac import (
     Backend, LocalBackend, SpiceDBBackend,
     CheckResult, Consistency, Zookie,
     ObjectRef, SubjectRef, RelationshipTuple,
+    CheckItem,                          # one item of check_bulk_permissions()
 
     # Errors
     PermissionDenied, MissingActorError, CaveatUnsupportedError,
@@ -1204,6 +1205,20 @@ class Backend(ABC):
     def has_access(self, *, subject, action, resource, context=None) -> bool:
         """Boolean shorthand. CONDITIONAL collapses to False."""
 
+    def check_bulk_permissions(
+        self,
+        items: Iterable[CheckItem],     # CheckItem(subject, action, resource, context=None)
+        *,
+        consistency: Consistency | None = None,
+        at_zookie: Zookie | None = None,
+    ) -> list[CheckResult]:
+        """One three-state result per item, in the order given: what
+           check_access() answers for that item. Mirrors SpiceDB's
+           CheckBulkPermissions. An error that check_access() would raise
+           for an item is raised by the call. The base implementation asks
+           item by item; a backend overrides it to share work between
+           items."""
+
     def accessible(
         self, *,
         subject:        SubjectRef,
@@ -1712,8 +1727,13 @@ Inside an evaluator scope (a request under `ActorMiddleware`, an explicit
 `evaluator_scope()`) the decision is kept per actor, context and stored sets
 in reach, until a tuple is written in the process or the scope ends. A kept
 decision can be stale when another process changes a membership; the witness
-then selects nothing, so staleness denies and never grants. Outside a scope
-every operation decides afresh.
+then selects nothing, so staleness denies and never grants. The depth probe
+of a check carries the same witness: sets that are no longer the actor's are
+a change for the residual evaluator to answer afresh, not a depth to report
+as `PermissionDepthExceeded`. Outside a scope every operation decides afresh.
+
+Several actors of one shape can be decided together
+(see [Bulk checks](#bulk-checks)).
 
 A set that admits a column-backed set (`org/team#staff` over a foreign key)
 is not a stored set, and an actor found in more than 256 sets is not
@@ -1924,9 +1944,10 @@ needs one is not in its lower bound.
 | Operation | Implementation |
 |---|---|
 | `check_access()` | The actor's stored sets, when one is in reach. Then the lower bound at the resource id, selected from the fenced generation row: one statement, which alone can answer `HAS`. When it does not hold and neither a caveat nor a recursion is in reach, the answer is `NO`. Otherwise the upper bound is a second statement: when it fails, `NO`. Otherwise, when a recursion is in reach, a third statement probes whether the uncertainty is depth, and the residual evaluator names what is undecided. |
+| `check_bulk_permissions()` | The answers of `check_access()`, with the work shared: see [Bulk checks](#bulk-checks). |
 | Queryset scope (`queryset_filter()`) | `Model.filter(holds(key, At(type, identity column, identity field, row=True), LOWER))`, decided when the statement that embeds it is compiled, after the small row sets in its reach (see [Decided rows](#decided-rows)). |
 | `accessible()` | The lower bound over each part of the type's universe: the model's rows, the ids that tuples name at either end, constant targets, attribute containers, and field-backed targets whose model stores no rows. Wildcard and empty ids are excluded and the result is deduplicated. |
-| `lookup_subjects()` | Candidates are the subjects that tuples, backed columns and constants name on a path from the one resource; each is tested by its own point check, so the cost grows with the number of candidates. |
+| `lookup_subjects()` | Candidates are the subjects that tuples, backed columns and constants name on a path from the one resource; each is tested by its own point check, so the cost grows with the number of candidates. To ask about subjects already in hand, use `check_bulk_permissions()`. |
 | Model-level check (empty resource id) | A row-independent grant, or any accessible identity of the type. |
 | `grants_all()` | The lower bound at the empty id: only a row-independent arm can hold there. |
 | Backed-edge write gate | `write` on the affected declaring rows. More than four ids that are rows of the type's model are tested by one scoped statement per 500 ids; the others by the lower bound, one by one. |
@@ -1949,6 +1970,41 @@ A type whose model is unmanaged has no table the library reads without being
 asked to: its objects are the ones that tuples, constants and backings name,
 as for a type with no model. A backing that names a column of an unmanaged
 model still reads it.
+
+##### Bulk checks
+
+"Which of these fifty users may read this thread" is fifty checks that
+differ in the actor only. Asked one by one, each decides its actor's stored
+sets and runs its own statement. `check_bulk_permissions()` answers them
+with a number of statements that does not grow with the number of items, up
+to a chunk of 50:
+
+1. **Shared preparation.** The policy is read once. Items with the same
+   permission and context share one set of caveat verdicts.
+2. **Stored sets, together.** The actors of a chunk that have the same shape
+   are expanded together: one statement selects the tuples that name any of
+   them, and one statement per level of nesting selects the tuples that name
+   the sets found, until a level finds no new set. Each actor's sets are
+   then followed in memory from the actor itself through those tuples, so
+   an actor's set is one that a chain of selected tuples leads to from that
+   actor, and the tuple that first put it there is its support. The result
+   is what the actor's own expansion would find, and it is witnessed the
+   same way.
+3. **Bounds, together.** The lower bound of each item is the statement
+   `check_access()` would run, and the lower bounds of a chunk are the
+   columns of one statement over the generation row. Each column carries its
+   own fence and witness. Items the lower bound does not grant, and that
+   have a caveat or a recursion in reach, get their upper bound the same
+   way, and those still undecided their depth probe: three statements at
+   most. A statement is cut once its text passes about 256 KB, so a
+   permission whose statement at one object is long (a recursion over
+   tuples) shares a statement between fewer items. The residual evaluator
+   then runs per undecided item, as in `check_access()`.
+4. **The rest.** An item with an empty resource id, or an unknown type or
+   action, is answered by `check_access()`.
+
+The decided sets are kept in the evaluator scope like those of a single
+check; the call opens a scope when none is open.
 
 #### Writes
 

@@ -62,6 +62,7 @@ from .errors import (
 from .evaluator import PermissionEvaluator, current_evaluator, evaluator_scope
 from .preflight import check_new
 from .types import (
+    CheckItem,
     CheckResult,
     Consistency,
     FieldDenyMode,
@@ -141,6 +142,7 @@ __all__ = [
     "ObjectRef",
     "SubjectRef",
     "CheckResult",
+    "CheckItem",
     "PermissionResult",
     "FieldDenyMode",
     "Consistency",

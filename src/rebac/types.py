@@ -6,6 +6,7 @@ configuration swap.
 
 from __future__ import annotations
 
+from collections.abc import Mapping
 from dataclasses import dataclass, field
 from enum import StrEnum
 from typing import Any, Literal
@@ -103,6 +104,19 @@ class CheckResult:
     @classmethod
     def conditional(cls, missing: tuple[str, ...], reason: str | None = None) -> CheckResult:
         return cls(False, PermissionResult.CONDITIONAL_PERMISSION, tuple(missing), reason)
+
+
+@dataclass(frozen=True, slots=True)
+class CheckItem:
+    """One item of ``Backend.check_bulk_permissions``: ``subject`` asks ``action`` on ``resource``.
+
+    Mirrors ``authzed.api.v1.CheckBulkPermissionsRequestItem``.
+    """
+
+    subject: SubjectRef
+    action: str
+    resource: ObjectRef
+    context: Mapping[str, Any] | None = None
 
 
 class Consistency(StrEnum):

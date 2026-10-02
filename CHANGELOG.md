@@ -133,12 +133,24 @@ rules and the names exported by `rebac` are unchanged. The specification is
   `make test-scale-postgres` are removed. There is no scale suite at the
   moment.
 
+### Added (bulk checks)
+
+- `Backend.check_bulk_permissions(items)` and `rebac.CheckItem`, after
+  SpiceDB's `CheckBulkPermissions`: one `CheckResult` per item, the answers
+  of `check_access()`. `LocalBackend` decides the stored sets of the actors
+  together and the bounds of up to 50 items by one statement, so asking
+  which of many users hold a permission on one resource no longer costs
+  statements per user. Any other backend gets the item-by-item default.
+
 ### Fixed
 
 - A `values()` / `values_list()` projection that names only computed values
   (annotations) is no longer refused as if it projected every gated field.
   The guard still refuses a computed value whose expression reads a gated
   column.
+- A check whose actor's stored sets were changed by another process during
+  an evaluator scope answers from current data. It raised
+  `PermissionDepthExceeded` when a recursion was in reach of the permission.
 - `Meta.rebac_resource_type` and the other `rebac_*` options are on
   `_meta` when Django sends `class_prepared`. They were stored after the
   class was built, so a receiver of that signal saw a model without them.

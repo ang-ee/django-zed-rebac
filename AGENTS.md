@@ -89,8 +89,8 @@ not a code change**.
   equivalent (e.g., a "list all permissions for this user across all resource
   types" RPC SpiceDB doesn't expose).
 - **Do** mirror `authzed.api.v1` method names in the Python `Backend` ABC
-  (snake_case wrappers around `CheckPermission`, `LookupResources`,
-  `LookupSubjects`, `WriteRelationships`, `WriteSchema`,
+  (snake_case wrappers around `CheckPermission`, `CheckBulkPermissions`,
+  `LookupResources`, `LookupSubjects`, `WriteRelationships`, `WriteSchema`,
   `ExpandPermissionTree`).
 - **Do** emit `use typechecking` at the top of every generated `.zed` file
   (catches mutually-exclusive-type intersections at WriteSchema time).
@@ -462,7 +462,7 @@ from rebac import (
     require_permission, rebac_resource, rebac_subject,
     Backend, LocalBackend, SpiceDBBackend, backend,
     CheckResult, Consistency, Zookie, PermissionResult,
-    ObjectRef, SubjectRef, RelationshipTuple, ActorLike,
+    ObjectRef, SubjectRef, RelationshipTuple, ActorLike, CheckItem,
     PermissionDenied, MissingActorError, CaveatUnsupportedError,
     PermissionDepthExceeded, NoActorResolvedError, SchemaError,
     current_actor, set_current_actor, actor_context,

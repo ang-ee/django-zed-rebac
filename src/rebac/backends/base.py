@@ -10,6 +10,7 @@ from django.db import models
 
 from ..schema.ast import Schema
 from ..types import (
+    CheckItem,
     CheckResult,
     Consistency,
     ObjectRef,
@@ -65,6 +66,31 @@ class Backend(ABC):
             consistency=consistency,
             at_zookie=at_zookie,
         ).allowed
+
+    def check_bulk_permissions(
+        self,
+        items: Iterable[CheckItem],
+        *,
+        consistency: Consistency | None = None,
+        at_zookie: Zookie | None = None,
+    ) -> list[CheckResult]:
+        """One result per item, in order: what ``check_access`` answers for it.
+
+        Mirrors ``CheckBulkPermissions``. An error ``check_access`` would
+        raise for an item is raised by the call. A backend overrides this to
+        share work between the items.
+        """
+        return [
+            self.check_access(
+                subject=item.subject,
+                action=item.action,
+                resource=item.resource,
+                context=dict(item.context) if item.context is not None else None,
+                consistency=consistency,
+                at_zookie=at_zookie,
+            )
+            for item in items
+        ]
 
     @abstractmethod
     def accessible(

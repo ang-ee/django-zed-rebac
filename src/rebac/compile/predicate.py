@@ -679,9 +679,22 @@ class Compiler:
         return _not_null(at.ref) & Q(In(at.ref, ids))
 
     def sets_step(
-        self, keys: Collection[Key], members: Mapping[Key, Collection[str]], bound: Bound
+        self,
+        keys: Collection[Key],
+        members: Mapping[Key, Collection[str]],
+        bound: Bound,
+        *,
+        own: Q | None = None,
+        direct: bool = True,
     ) -> Q:
-        """The tuples that put the actor, or a set that holds it, into a set of ``keys``."""
+        """The tuples that put the actor, or a set that holds it, into a set of ``keys``.
+
+        ``own`` selects the actor's id in place of this actor's: the ids of
+        several actors of this actor's shape.  Without ``direct`` only the
+        tuples that name a member set are selected, not those that name the
+        actor.
+        """
+        named = Q(subject_id=self._wire()) if own is None else own
         step = _FALSE
         for type_, name in sorted(keys):
             definition = self.schema.get_definition(type_)
@@ -696,19 +709,25 @@ class Compiler:
             for allowed in relation.allowed_subjects:
                 if allowed.relation and not self._is_relation(allowed.type, allowed.relation):
                     continue
-                own = self.shape.type == allowed.type and self.shape.relation == allowed.relation
+                itself = (
+                    direct
+                    and self.shape.type == allowed.type
+                    and self.shape.relation == allowed.relation
+                )
                 if allowed.wildcard:
-                    member = _truth(self.shape.type == allowed.type and not self.shape.relation)
+                    member = _truth(
+                        direct and self.shape.type == allowed.type and not self.shape.relation
+                    )
                 elif allowed.relation:
                     inside = sorted(members.get((allowed.type, allowed.relation), ()))
                     member = _or(
                         Q(subject_id__in=inside) if inside else _FALSE,
-                        _and(_truth(own), Q(subject_id=self._wire())),
+                        _and(_truth(itself), named),
                     )
                 else:
                     member = _and(
-                        _truth(own and (not allowed.id or self.shape.named_id == allowed.id)),
-                        Q(subject_id=self._wire()),
+                        _truth(itself and (not allowed.id or self.shape.named_id == allowed.id)),
+                        named,
                     )
                 admitted = _or(admitted, _and(self._shape_q(allowed), member))
             step = _or(

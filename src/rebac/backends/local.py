@@ -42,6 +42,7 @@ from ..schema.walker import (
     subject_allowed_by_relation as _subject_allowed_by_relation,
 )
 from ..types import (
+    CheckItem,
     CheckResult,
     Consistency,
     ObjectRef,
@@ -556,6 +557,21 @@ class LocalBackend(Backend):
             actor=subject,
             context=context,
             using=active_relationship_model().objects.db,
+        )
+
+    def check_bulk_permissions(
+        self,
+        items: Iterable[CheckItem],
+        *,
+        consistency: Consistency | None = None,
+        at_zookie: Zookie | None = None,
+    ) -> list[CheckResult]:
+        self._validate_consistency(consistency, at_zookie)
+        from ..compile.read import check_many
+        from ..models import active_relationship_model
+
+        return check_many(
+            backend=self, items=list(items), using=active_relationship_model().objects.db
         )
 
     @_schema_operation

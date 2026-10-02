@@ -19,7 +19,7 @@ from rebac.field_backing import (
 )
 from rebac.resources import model_for_resource_type, model_resource_type, stores_rows
 from rebac.schema.ast import ConstBinding
-from rebac.types import ObjectRef, RelationshipTuple, SubjectRef
+from rebac.types import CheckItem, CheckResult, ObjectRef, RelationshipTuple, SubjectRef
 from tests.reference_model import ReferenceModel
 from tests.reference_oracle import WalkerOracle
 
@@ -148,6 +148,7 @@ def assert_reads_match(
         reference.resources.update(universe)
         oracle = WalkerOracle()
         stack.enter_context(patch.object(oracle, "schema", return_value=schema))
+        answered: list[tuple[CheckItem, CheckResult]] = []
         for resource in resources:
             for subject in subjects:
                 for action in actions:
@@ -181,6 +182,7 @@ def assert_reads_match(
                             if resource.resource_type in undecided:
                                 continue
                             raise
+                        answered.append((CheckItem(subject, action, resource, context), actual))
                         details = (resource, subject, action, context)
                         assert (actual.result, actual.conditional_on) == (
                             expected.result,
@@ -195,6 +197,16 @@ def assert_reads_match(
                             actual,
                             walked,
                         )
+        # The same checks asked together answer the same.
+        together = read.check_many(
+            backend=active, items=[item for item, _answer in answered], using=using
+        )
+        for (item, alone), bulk in zip(answered, together, strict=True):
+            assert (bulk.result, bulk.conditional_on) == (alone.result, alone.conditional_on), (
+                item,
+                bulk,
+                alone,
+            )
 
 
 def assert_subjects_match(*, resources, actions, subject_types, now=None, using="default") -> None:
