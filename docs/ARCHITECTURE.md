@@ -1,6 +1,6 @@
 # `django-zed-rebac` — Architecture
 
-> Status: **alpha implementation guide** — specifies the release after 0.24.2 (permissions compiled to queries).
+> Status: **alpha implementation guide** — specifies 0.25.0 (permissions compiled to queries).
 > Last updated: 2026-10-02
 > Audience: Django integrators evaluating fit, contributors, framework authors building on top.
 >
@@ -3268,7 +3268,7 @@ stable across patch releases. `rebac._internal.*` is private.
 | **0.11.x — async ORM scoping** | Verified the async ORM surface inherits scoping via Django's `sync_to_async` wrappers; closed the two bypasses (`aiterator()`, `aggregate()`/`aaggregate()`) that summarised/streamed rows outside the actor's scope. See Open questions § 3. |
 | **0.19.0–0.22.x — retained features** | Filtered constants and generic paths; shared per-revision schema snapshots; policy-model write owners; scoped queryset embedding; metadata-derived versions and test isolation. |
 | **0.23.0–0.24.2 — retained features** | Complete subject expansion in `lookup_subjects()`; the reference and differential suites; PostgreSQL CI and the tiered test suite; backed-edge write gates (invariant 5d); declared base managers; `rebac.schema_changes()`. |
-| **After 0.24.2 — compiled permissions** | [Compiled permissions](#compiled-permissions--the-localbackend-read-path) are the single persisted `LocalBackend` read path ([proposal 0015](./proposals/0015-permissions-compiled-to-queries.md)): a permission is a query over the application's tables and the tuple table, the library stores no row per application row, recursion is unrolled to `REBAC_DEPTH_LIMIT`, gated queryset writes follow the key rule, and policy writes serialize on the generation row. Implemented; the trial on a consumer database at scale is pending. |
+| **0.25.0 — compiled permissions** | [Compiled permissions](#compiled-permissions--the-localbackend-read-path) are the single persisted `LocalBackend` read path ([proposal 0015](./proposals/0015-permissions-compiled-to-queries.md)): a permission is a query over the application's tables and the tuple table, the library stores no row per application row, recursion is unrolled to `REBAC_DEPTH_LIMIT`, gated queryset writes follow the key rule, and policy writes serialize on the generation row. Implemented; the trial on a consumer database at scale is pending. |
 | **Next — SpiceDB conformance suite** | [SpiceDB conformance suite](#spicedb-conformance-suite-planned): generated cases checked against a pinned `spicedb serve-testing` in dev (`-m spicedb`) and CI; test-side projector for backings; deliberate divergences listed and pinned. The in-process oracle then stops copying the walker. |
 | **Then — `SpiceDBBackend`** | `authzed-py` adapter; `WriteSchema` auto-push; the conformance suite becomes its cross-backend contract tests; SpiceDB Zookie translation; the projector grows from the test-side prototype. |
 | **1.0.0 — Stable release** | Full docs, CI matrix green, stable audit/logging contracts, `select_related` compiler hook (or carved to 1.1). |
