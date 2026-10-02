@@ -361,33 +361,51 @@ class _Rows:
             return None
         operation = self.operation
         compiler = operation.compiler(self.verdicts, parametric=False, rows=self)
+        # The decision is read now, by its own statements.  Its witness is
+        # read later, inside the statement that uses it, so it is compiled
+        # with that statement's parameters: the same predicate at that
+        # statement's instant, where a grant may have expired since.
+        witness = operation.compiler(self.verdicts, rows=self)
         gate = Q(Exists(operation.gate(parametric=False)))
         source = model._base_manager.using(operation.using).order_by()
         chain = compiler.self_chain(key)
         if chain is not None:
-            return self._closure(chain, source, gate, frozenset(compiler.used_rows))
+            later = witness.self_chain(key)
+            assert later is not None
+            uses = frozenset(compiler.used_rows | witness.used_rows)
+            return self._closure(chain, later.base, source, gate, uses)
         identity = resource_id_attr(model)
         member = compiler.holds(key, _model_at(model), Bound.LOWER)
-        uses = frozenset(compiler.used_rows)
         if is_true(member):
             return None
         if is_false(member):
-            return _Decision((), _and(), uses)
+            return _Decision((), _and(), frozenset(compiler.used_rows))
         ids = tuple(
             source.filter(gate).filter(member).values_list(identity, flat=True)[: _ROW_LIMIT + 1]
         )
         if len(ids) > _ROW_LIMIT:
             return None
         if not ids:
-            return _Decision((), _and(), uses)
-        left = source.filter(**{f"{identity}__in": ids}).filter(_not(member))
+            return _Decision((), _and(), frozenset(compiler.used_rows))
+        held = witness.holds(key, _model_at(model), Bound.LOWER)
+        uses = frozenset(compiler.used_rows | witness.used_rows)
+        left = source.filter(**{f"{identity}__in": ids}).filter(_not(held))
         return _Decision(ids, ~Q(Exists(left)), uses)
 
     def _closure(
-        self, chain: SelfChain, source: models.QuerySet[Any], gate: Q, uses: frozenset[Key]
+        self,
+        chain: SelfChain,
+        base_later: Q,
+        source: models.QuerySet[Any],
+        gate: Q,
+        uses: frozenset[Key],
     ) -> _Decision | None:
         """A hierarchy followed from its seeds: the rows that hold the base,
-        then their children, level by level to the depth limit."""
+        then their children, level by level to the depth limit.
+
+        ``base_later`` is the base as the statement that uses the decision
+        reads it.
+        """
         if is_true(chain.base):
             return None
         if is_false(chain.base):
@@ -422,7 +440,7 @@ class _Rows:
         # cycle, or that have moved deeper than they were found, fail it.
         # The parent column is constrained, so the row a child names exists.
         parts = [
-            ~Q(Exists(source.filter(**{f"{chain.target}__in": levels[0]}).filter(_not(chain.base))))
+            ~Q(Exists(source.filter(**{f"{chain.target}__in": levels[0]}).filter(_not(base_later))))
         ]
         parts.extend(
             ~Q(

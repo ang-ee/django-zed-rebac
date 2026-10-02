@@ -97,18 +97,16 @@ class ResolvedFieldBacking(_SourceFilters):
     def keeps_target(self, using: str) -> bool:
         """Whether a stored reference to a target proves that the target's row exists.
 
-        A foreign key column that stores the target's identity is read without
-        the target's table, so only the database's constraint stands behind
-        it.  Every other path that ends in a foreign key, forward or reverse,
-        is read from the target's own rows.
+        Only a forward foreign key that the database constrains does.  Django
+        reads a column of the target from the nearest table that holds its
+        value and leaves the others unjoined, so no other path is taken to
+        read the target's row.
         """
 
         field = self.field
-        if isinstance(field, (models.ForeignKey, models.OneToOneField)):
-            if not self.targets_identity_directly():
-                return True
-            return foreign_key_kept(field, using)
-        return isinstance(field, (models.ManyToOneRel, models.OneToOneRel))
+        return isinstance(field, (models.ForeignKey, models.OneToOneField)) and foreign_key_kept(
+            field, using
+        )
 
     def target_values_path(self) -> str:
         if (
@@ -141,10 +139,16 @@ class ResolvedFieldBacking(_SourceFilters):
 
 
 def foreign_key_kept(field: models.ForeignKey[Any, Any], using: str) -> bool:
-    """Whether the database refuses a value of the column that names no row."""
+    """Whether a value of the column proves a row of the model it names.
 
-    constrained: bool = field.db_constraint  # type: ignore[attr-defined]
-    return constrained and connections[using].features.supports_foreign_keys
+    The database must constrain the column, and the links of a multi-table
+    model to its parents: its row is its own and its parents' together.
+    """
+
+    if not connections[using].features.supports_foreign_keys:
+        return False
+    links = [field, *(link for link in field.related_model._meta.parents.values() if link)]
+    return all(link.db_constraint for link in links)  # type: ignore[attr-defined]
 
 
 def _proposed_forward_relationships(

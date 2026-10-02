@@ -1768,16 +1768,20 @@ first:
    level still hangs under a row of the level above it. A chain of parents
    therefore loses a level at each step and ends at a seed, so rows that have
    closed into a cycle, or have moved deeper than they were found, fail the
-   witness; a row moved under another row of the level above passes it. When
-   a witness fails the scope selects nothing; the next operation decides
-   afresh.
+   witness; a row moved under another row of the level above passes it. The
+   witness is compiled with the parameters of the statement that carries it,
+   so it is read at that statement's instant: a grant that expired after the
+   decision fails it. When a witness fails the scope selects nothing; the
+   next operation decides afresh.
 5. **References the database keeps.** A witness reads the rows that exist. A
    key is therefore bound as `column IN (keys)` only where a stored reference
-   proves its row: a foreign key column under a database constraint, or a
-   path read from the target's own rows. Behind a foreign key without a
-   constraint (`db_constraint=False`, or a database that enforces none) the
-   keys are read through the target's rows, and a hierarchy over such a
-   parent column is decided by the permission's own predicate, not followed
+   proves its row: a path that ends in a forward foreign key under a database
+   constraint, whose target, if it is a multi-table model, is linked to its
+   parents under constraints too. Every other path (a foreign key with
+   `db_constraint=False`, a database that enforces none, a reverse or
+   many-to-many path, which Django may read without the target's table) reads
+   the keys through the target's rows. A hierarchy over a parent column that
+   is not kept is decided by the permission's own predicate, not followed
    from its seeds.
 
 Decided rows are used by queryset scopes and by what is built on them

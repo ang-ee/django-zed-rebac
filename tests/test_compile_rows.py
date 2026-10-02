@@ -1,14 +1,25 @@
 """Small sets of target rows: decided before a scope statement, witnessed inside it."""
 
+from datetime import timedelta
+
 import pytest
 from django.contrib.auth import get_user_model
 from django.db import connection
 from django.test.utils import CaptureQueriesContext
+from django.utils import timezone
 
 from rebac import ObjectRef, RelationshipTuple, SubjectRef, sudo, to_object_ref
 from rebac.compile import read
+from rebac.field_backing import resolve_field_backing
+from rebac.schema import parse_zed
 from rebac.testing import install_schema
-from tests.testapp.models import Folder, Post, TextIdentityFolder
+from tests.testapp.models import (
+    Folder,
+    NativeParentLinkedChild,
+    NativeParentLinkedResource,
+    Post,
+    TextIdentityFolder,
+)
 
 pytestmark = pytest.mark.django_db
 
@@ -216,6 +227,109 @@ def test_an_identity_that_moved_to_another_row_is_not_read_through(monkeypatch):
     assert visible(TextIdentityFolder) <= {seed.pk, leaf.pk}
     assert done
     assert visible(TextIdentityFolder) == {seed.pk, leaf.pk}
+
+
+EXPIRING = {
+    "hierarchy": """
+        use expiration
+        definition auth/user {}
+        definition blog/folder {
+            relation parent: blog/folder // rebac:field=parent
+            relation viewer: auth/user with expiration
+            permission read = viewer + parent->read
+        }
+        definition blog/post {
+            relation folder: blog/folder // rebac:field=folder
+            permission read = folder->read
+        }
+    """,
+    "arrow": """
+        use expiration
+        definition auth/user {}
+        definition blog/folder {
+            relation viewer: auth/user with expiration
+            permission read = viewer
+        }
+        definition blog/post {
+            relation folder: blog/folder // rebac:field=folder
+            permission read = folder->read
+        }
+    """,
+}
+
+
+@pytest.mark.parametrize("shape", sorted(EXPIRING))
+def test_a_grant_that_expires_after_the_decision_is_not_read_through(monkeypatch, shape):
+    clock = {"now": timezone.now()}
+    monkeypatch.setattr(timezone, "now", lambda: clock["now"])
+    local = install_schema(EXPIRING[shape])
+    with sudo(reason="test.fixture"):
+        root = Folder.objects.create(name="root")
+        child = Folder.objects.create(name="child", parent=root)
+        post = Post.objects.create(title="post", folder=child)
+    expiry = clock["now"] + timedelta(minutes=1)
+    local.write_relationships(
+        [RelationshipTuple(to_object_ref(child), "viewer", ALICE, expires_at=expiry)]
+    )
+    assert visible(Post) == {post.pk}
+
+    def tick():
+        clock["now"] = expiry + timedelta(seconds=1)
+
+    done = after_deciding(monkeypatch, ("blog/folder", "read"), tick)
+    # The witness is read at the statement's instant, not at the decision's.
+    assert visible(Post) == set()
+    assert done
+    assert visible(Post) == set()
+
+
+BACKED = """
+definition auth/user {}
+definition blog/folder {
+    relation parent: blog/folder // rebac:field=parent
+    relation child: blog/folder // rebac:field=children
+    relation viewer: auth/user
+    permission read = viewer + parent->read
+}
+definition blog/post {
+    relation folder: blog/folder // rebac:field=folder
+    permission read = folder->read
+}
+definition test/nativeparentlinkedresource {}
+definition test/nativeparentlinkedchild {
+    relation viewer: auth/user
+    permission read = viewer
+}
+definition test/nativeparentlinkedrecord {
+    relation child: test/nativeparentlinkedchild // rebac:field=child
+    permission read = child->read
+}
+"""
+
+
+def backing(schema, type_, name):
+    definition = schema.get_definition(type_)
+    relation = next(r for r in definition.relations if r.name == name)
+    return resolve_field_backing(definition, relation)
+
+
+def test_only_a_constrained_forward_foreign_key_proves_its_target(monkeypatch):
+    schema = parse_zed(BACKED)
+    forward = backing(schema, "blog/post", "folder")
+    assert forward.keeps_target("default")
+    # Django may read a reverse path without the target's table.
+    assert not backing(schema, "blog/folder", "child").keeps_target("default")
+    # A multi-table row is its own and its parent's: both links must be kept.
+    record = backing(schema, "test/nativeparentlinkedrecord", "child")
+    assert record.keeps_target("default")
+    link = NativeParentLinkedChild._meta.parents[NativeParentLinkedResource]
+    monkeypatch.setattr(link, "db_constraint", False)
+    assert not record.keeps_target("default")
+    unconstrained(monkeypatch, Post, "folder")
+    assert not forward.keeps_target("default")
+    monkeypatch.undo()
+    monkeypatch.setattr(connection.features, "supports_foreign_keys", False)
+    assert not forward.keeps_target("default")
 
 
 def unconstrained(monkeypatch, model, name):
