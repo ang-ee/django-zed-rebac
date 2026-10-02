@@ -14,7 +14,7 @@ from __future__ import annotations
 
 import re
 from collections import Counter
-from collections.abc import AsyncIterator, Collection, Iterable
+from collections.abc import AsyncIterator, Collection, Iterable, Iterator
 from typing import Any, Self, TypeVar, cast
 
 from asgiref.sync import sync_to_async
@@ -182,6 +182,31 @@ def _expression_columns(
     if callable(sources):
         for source in cast(Iterable[Any], sources()):
             yield from _expression_columns(source, _inner_aliases)
+
+
+def _operands(query: Query) -> Iterator[Query]:
+    """Every operand of a set combination, nested combinations included."""
+    for operand in query.combined_queries:
+        yield operand
+        yield from _operands(operand)
+
+
+def _gated_projection(
+    model: type[models.Model], raw_fields: Iterable[Any] | None, computed: dict[str, Any]
+) -> set[str]:
+    """The gated fields of ``model`` that a projection names or a computed value reads."""
+    gated = gated_read_fields(model)
+    if not gated:
+        return set()
+    projected = projection_field_names(model, raw_fields)
+    requested = set(gated & projected) if projected is not None else set()
+    for expression in computed.values():
+        requested.update(
+            column.target.name
+            for column in _expression_columns(expression)
+            if _column_on_model_lineage(column, model) and column.target.name in gated
+        )
+    return requested
 
 
 def _column_on_model_lineage(column: Col, model: type[models.Model]) -> bool:
@@ -800,26 +825,29 @@ class RebacQuerySet(models.QuerySet[_M]):
             return
         if runtime_field_deny_mode(self._effective_field_mode()) == "allow":
             return
-        projected = projection_field_names(self.model, getattr(self, "_fields", None))
-        gated = gated_read_fields(self.model)
-        if not gated:
-            return
-        requested: set[str] = set()
-        if projected is not None:
-            requested.update(gated & projected)
-        for expression in selected.values():
-            requested.update(
-                column.target.name
-                for column in _expression_columns(expression)
-                if _column_on_model_lineage(column, self.model) and column.target.name in gated
+        fields = getattr(self, "_fields", None)
+        # A set combination returns the columns of every operand, and each
+        # operand selects its own: the root's are only those of the first.
+        projections: list[tuple[type[models.Model], Any, dict[str, Any]]] = [
+            (self.model, fields, selected)
+        ]
+        for operand in _operands(query):
+            own = (
+                fields
+                if operand.default_cols
+                else (*operand.values_select, *operand.annotation_select)
             )
-        if requested:
-            names = ", ".join(f"read__{name}" for name in sorted(requested))
-            raise PermissionDenied(
-                f"Cannot project gated field(s) {names} on {self.model.__name__}: "
-                "field read enforcement requires model-instance materialisation "
-                "or a projection that omits gated fields."
-            )
+            if operand.model is not None:
+                projections.append((operand.model, own, dict(operand.annotation_select)))
+        for model, raw_fields, computed in projections:
+            requested = _gated_projection(model, raw_fields, computed)
+            if requested:
+                names = ", ".join(f"read__{name}" for name in sorted(requested))
+                raise PermissionDenied(
+                    f"Cannot project gated field(s) {names} on {model.__name__}: "
+                    "field read enforcement requires model-instance materialisation "
+                    "or a projection that omits gated fields."
+                )
 
     def _guard_projected_related_reads(self, expressions: dict[str, Any], *, query: Query) -> None:
         if not self._rebac_select_related_guards:

@@ -150,6 +150,9 @@ rules and the names exported by `rebac` are unchanged. The specification is
   (annotations) is no longer refused as if it projected every gated field.
   The guard still refuses a computed value whose expression reads a gated
   column.
+- The projection guard reads every operand of a `union()`,
+  `intersection()` or `difference()`. It read only the first, so a gated
+  field projected by a later operand was returned unredacted.
 - A check whose actor's stored sets were changed by another process during
   an evaluator scope answers from current data. It raised
   `PermissionDepthExceeded` when a recursion was in reach of the permission.

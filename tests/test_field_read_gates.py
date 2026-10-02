@@ -371,6 +371,39 @@ def test_projection_of_only_a_computed_value_that_reads_a_gated_field_fails_clos
 
 
 @override_settings(REBAC_FIELD_READ_MODE="redact")
+@pytest.mark.parametrize("combine", ["union", "union_all", "intersection", "difference"])
+def test_every_operand_of_a_set_combination_is_guarded(alice, bob, combine):
+    from tests.testapp.models import Post
+
+    post = _post(title="operand secret")
+    _grant(post.pk, bob, "owner")
+    _grant(post.pk, alice, "viewer")
+    rows = Post.objects.as_user(alice)
+
+    def combined(left, right):
+        if combine == "union_all":
+            return left.union(right, all=True)
+        return getattr(left, combine)(right)
+
+    public = rows.annotate(marker=Value("public")).values("marker")
+    copied = rows.annotate(marker=F("title")).values("marker")
+    # A combination returns the columns of each operand, not of the first.
+    for left, right in ((public, copied), (copied, public)):
+        with pytest.raises(PermissionDenied) as excinfo:
+            list(combined(left, right))
+        assert "read__title" in str(excinfo.value)
+    for left, right in (("body", "title"), ("title", "body")):
+        with pytest.raises(PermissionDenied):
+            list(combined(rows.values_list(left), rows.values_list(right)))
+    with pytest.raises(PermissionDenied):
+        list(combined(public, combined(public, copied)))
+    # Operands that read no gated field combine as before.
+    other = rows.annotate(marker=Value("other")).values("marker")
+    assert {row["marker"] for row in public.union(other)} == {"public", "other"}
+    assert list(rows.values_list("body").union(rows.values_list("body"))) == [("",)]
+
+
+@override_settings(REBAC_FIELD_READ_MODE="redact")
 def test_aggregate_cannot_return_a_gated_field(alice):
     from tests.testapp.models import Post
 

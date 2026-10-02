@@ -54,6 +54,19 @@ reviewed and are kept as written. The implementation settled these points:
 Open: gate G1 (plans on the consumer database, under trial) and gate G5
 (§ 13, the gates). Tier 3 was not run.
 
+Gate G1, the trial so far. A consumer database on PostgreSQL 17 (15.7 million
+rows in the tables the policy reads, depth limit 16) was read at commit
+`2c1763f`: a page for an administrator took 5 to 8 ms, a page for a sparse
+actor 50 to 99 ms in 15 to 25 statements, a denied check on a deep folder
+108 ms, and provisioning 12 s where the permission index had not finished in
+76 minutes. Rows and counts matched across three rounds. Two things keep the
+gate open. The commits after `2c1763f` (the witness of a decided hierarchy,
+the per-statement row budget, bulk checks) have not been measured there. And
+the trial had no actor between sparse and administrator: one that holds some
+thousands of rows, or belongs to a hundred sets, has been measured only on a
+synthetic PostgreSQL 16 data set of 123,000 and 369,000 rows
+(`docs/ARCHITECTURE.md` § Known limits).
+
 A review found seven gaps. Each is resolved in the section named:
 
 | Finding | Resolution |

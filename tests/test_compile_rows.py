@@ -5,13 +5,13 @@ from datetime import timedelta
 
 import pytest
 from django.contrib.auth import get_user_model
-from django.db import connection
-from django.test.utils import CaptureQueriesContext
+from django.db import connection, models
+from django.test.utils import CaptureQueriesContext, isolate_apps
 from django.utils import timezone
 
 from rebac import ObjectRef, RelationshipTuple, SubjectRef, sudo, to_object_ref
 from rebac.compile import read
-from rebac.field_backing import resolve_field_backing
+from rebac.field_backing import foreign_key_kept, resolve_field_backing
 from rebac.schema import parse_zed
 from rebac.testing import install_schema
 from tests.testapp.models import (
@@ -451,6 +451,59 @@ def test_a_held_row_that_no_child_can_name_keeps_the_hierarchy(monkeypatch):
     assert visible(CodedFolder) == set()
     assert done
     assert visible(CodedFolder) == {nameless.pk, top.pk}
+
+
+@isolate_apps("tests.testapp")
+def test_a_reference_is_kept_only_when_every_ancestor_link_is(monkeypatch):
+    class Base(models.Model):
+        class Meta:
+            app_label = "testapp"
+
+    class Middle(Base):
+        class Meta:
+            app_label = "testapp"
+
+    class Leaf(Middle):
+        class Meta:
+            app_label = "testapp"
+
+    class LeafProxy(Leaf):
+        class Meta:
+            app_label = "testapp"
+            proxy = True
+
+    class Carrier(models.Model):
+        leaf = models.ForeignKey(Leaf, on_delete=models.CASCADE)
+        proxy = models.ForeignKey(LeafProxy, on_delete=models.CASCADE, related_name="+")
+
+        class Meta:
+            app_label = "testapp"
+
+    fields = [Carrier._meta.get_field("leaf"), Carrier._meta.get_field("proxy")]
+    assert all(foreign_key_kept(field, "default") for field in fields)
+    # A leaf's row is its own, its parent's and its grandparent's together.
+    for child, parent in ((Leaf, Middle), (Middle, Base)):
+        with monkeypatch.context() as patched:
+            patched.setattr(child._meta.parents[parent], "db_constraint", False)
+            assert not any(foreign_key_kept(field, "default") for field in fields)
+    assert all(foreign_key_kept(field, "default") for field in fields)
+
+
+def test_rows_that_share_an_identity_are_all_kept_in_a_hierarchy(monkeypatch):
+    # Nothing makes an identity attribute unique: two rows can answer to one.
+    monkeypatch.setattr(Folder._meta, "rebac_id_attr", "name", raising=False)
+    local = install_schema(SCHEMA)
+    with sudo(reason="test.fixture"):
+        first = Folder.objects.create(name="seed")
+        second = Folder.objects.create(name="seed")
+        under = Folder.objects.create(name="under", parent=second)
+        Folder.objects.create(name="other")
+    local.write_relationships(
+        [RelationshipTuple(ObjectRef("blog/folder", "seed"), "viewer", ALICE)]
+    )
+    assert visible(Folder) == {first.pk, second.pk, under.pk}
+    monkeypatch.setattr(read, "_ROW_LIMIT", 0)
+    assert visible(Folder) == {first.pk, second.pk, under.pk}
 
 
 def unconstrained(monkeypatch, model, name):

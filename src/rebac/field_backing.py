@@ -152,18 +152,29 @@ class ResolvedFieldBacking(_SourceFilters):
 def foreign_key_kept(field: models.ForeignKey[Any, Any], using: str) -> bool:
     """Whether a value of the column proves a row of the model it names.
 
-    The database must constrain the column, and the links of a multi-table
-    model to its parents: its row is its own and its parents' together.  A
+    The database must constrain the column, and every link of a multi-table
+    model to an ancestor: its row is its own and its ancestors' together.  A
     constraint is taken to exist only on a table Django manages.
     """
 
     if not connections[using].features.supports_foreign_keys:
         return False
-    links = [field, *(link for link in field.related_model._meta.parents.values() if link)]
     return all(
         link.db_constraint and link.model._meta.managed  # type: ignore[attr-defined]
-        for link in links
+        for link in (field, *_parent_links(field.related_model))
     )
+
+
+def _parent_links(model: type[models.Model]) -> Iterator[models.Field[Any, Any]]:
+    """The links from a model's table to the tables of all its ancestors.
+
+    A proxy has no link to the model it stands for; that model's own links
+    are followed all the same.
+    """
+    for parent, link in model._meta.parents.items():
+        if link is not None:
+            yield link
+        yield from _parent_links(parent)
 
 
 def _proposed_forward_relationships(
