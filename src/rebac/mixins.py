@@ -137,9 +137,14 @@ class RebacObjectMeta(type):
         **kwargs: Any,
     ) -> type:
         captured = _capture_rebac_meta(attrs)
+        mcs._carry_rebac_meta(attrs, captured)
         new_cls = super().__new__(mcs, name, bases, attrs, **kwargs)
         mcs._store_rebac_meta(new_cls, captured)
         return new_cls
+
+    @staticmethod
+    def _carry_rebac_meta(attrs: dict[str, Any], captured: dict[str, Any]) -> None:
+        """Hand the captured options to the class while it is being built."""
 
     @staticmethod
     def _store_rebac_meta(target_cls: type, captured: dict[str, Any]) -> None:
@@ -153,9 +158,9 @@ class RebacModelBase(RebacObjectMeta, ModelBase):
     """Custom metaclass that strips ZED-specific Meta attrs before Django sees them.
 
     Inherits ``RebacObjectMeta`` for the capture logic and overrides
-    ``_store_rebac_meta`` to stash values onto ``._meta`` so callers can still
+    ``_carry_rebac_meta`` to stash values onto ``._meta`` so callers can still
     read them as ``<Model>._meta.rebac_resource_type`` (signals, manager,
-    resources.py).
+    resources.py), ``class_prepared`` receivers included.
 
     MRO: RebacModelBase → RebacObjectMeta → ModelBase → type.
     ``super().__new__()`` in ``RebacObjectMeta`` chains through
@@ -207,9 +212,28 @@ class RebacModelBase(RebacObjectMeta, ModelBase):
         return new_cls
 
     @staticmethod
+    def _carry_rebac_meta(attrs: dict[str, Any], captured: dict[str, Any]) -> None:
+        attrs["_rebac_options"] = _CapturedOptions(captured)
+
+    @staticmethod
     def _store_rebac_meta(target_cls: type[models.Model], captured: dict[str, Any]) -> None:
-        for key, value in captured.items():
-            setattr(target_cls._meta, key, value)
+        """Nothing to store: ``_CapturedOptions`` put them on ``_meta`` already."""
+
+
+class _CapturedOptions:
+    """Puts the captured ``rebac_*`` options on ``_meta`` as Django builds the class.
+
+    Django adds an attribute that has ``contribute_to_class`` after ``_meta``
+    exists and before it sends ``class_prepared``, so a receiver of that
+    signal reads the options like any other caller.
+    """
+
+    def __init__(self, captured: dict[str, Any]) -> None:
+        self.captured = captured
+
+    def contribute_to_class(self, cls: type[models.Model], name: str) -> None:
+        for key, value in self.captured.items():
+            setattr(cls._meta, key, value)
 
 
 @dataclass

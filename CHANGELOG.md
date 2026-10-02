@@ -139,6 +139,9 @@ rules and the names exported by `rebac` are unchanged. The specification is
   (annotations) is no longer refused as if it projected every gated field.
   The guard still refuses a computed value whose expression reads a gated
   column.
+- `Meta.rebac_resource_type` and the other `rebac_*` options are on
+  `_meta` when Django sends `class_prepared`. They were stored after the
+  class was built, so a receiver of that signal saw a model without them.
 
 ### Unchanged
 

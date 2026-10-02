@@ -548,7 +548,8 @@ written_at_xid)` are wire-compatible with `authzed.api.v1.Relationship`.
 Django's `Options` rejects unknown Meta attrs. The mixin uses a custom
 `RebacModelBase` metaclass that strips `rebac_resource_type` /
 `rebac_default_action` from Meta before delegating to `ModelBase`, then
-restores them on `_meta` post-construction. Don't add new captured names
+puts them on `_meta` while Django builds the class, before it sends
+`class_prepared`. Don't add new captured names
 without extending the metaclass.
 
 ### Don't ship a non-deterministic build
