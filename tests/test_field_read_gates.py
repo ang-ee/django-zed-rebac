@@ -13,6 +13,7 @@ from typing import Any, cast
 import pytest
 from django.db import connection
 from django.db.models import Count, F, Min, Value
+from django.db.models.expressions import RawSQL
 from django.db.models.functions import Upper
 from django.test import override_settings
 from django.test.utils import CaptureQueriesContext
@@ -368,6 +369,32 @@ def test_projection_of_only_a_computed_value_that_reads_a_gated_field_fails_clos
     with pytest.raises(PermissionDenied) as excinfo:
         list(rows.values_list("shouted", flat=True))
     assert "read__title" in str(excinfo.value)
+
+
+@override_settings(REBAC_FIELD_READ_MODE="redact")
+def test_selected_literal_sql_counts_as_reading_every_gated_field(alice, bob):
+    from tests.testapp.models import Post
+
+    post = _post(title="literal secret")
+    _grant(post.pk, bob, "owner")
+    _grant(post.pk, alice, "viewer")
+    column = f'"{Post._meta.db_table}"."title"'
+    rows = Post.objects.as_user(alice)
+    # What hand-written SQL reads cannot be told from the expression.
+    for attempt in (
+        lambda: list(rows.annotate(t=RawSQL(column, [])).values_list("t", flat=True)),
+        lambda: list(rows.extra(select={"t": column}).values_list("t", flat=True)),
+        lambda: [row.t for row in rows.annotate(t=RawSQL(column, []))],
+        lambda: [row.t for row in rows.extra(select={"t": column})],
+        lambda: list(rows.annotate(t=Upper(RawSQL(column, []))).values("t")),
+    ):
+        with pytest.raises(PermissionDenied) as excinfo:
+            attempt()
+        assert "read__title" in str(excinfo.value)
+    # An annotation that is defined but not selected reads nothing.
+    assert list(rows.annotate(t=RawSQL(column, [])).values_list("pk", flat=True)) == [post.pk]
+    with sudo(reason="test.literal"):
+        assert [row.t for row in Post.objects.annotate(t=RawSQL(column, []))] == ["literal secret"]
 
 
 @override_settings(REBAC_FIELD_READ_MODE="redact")

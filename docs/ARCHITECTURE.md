@@ -1791,7 +1791,10 @@ first:
    the keys through the target's rows. A hierarchy over a parent column that
    is not kept is decided by the permission's own predicate, not followed
    from its seeds; that predicate tests every row's ancestors, so such a
-   hierarchy is slower to decide.
+   hierarchy is slower to decide. Django creates its constraints deferred,
+   so the proof holds for committed rows: a row the reader's own transaction
+   wrote and has not committed can still name a row that is gone, in a
+   transaction that will fail at commit.
 
 Decided rows are used by queryset scopes and by what is built on them
 (`accessible()` without a context, bulk guards, the backed-edge gate over
@@ -2017,7 +2020,9 @@ to a chunk of 50:
    action, is answered by `check_access()`.
 
 The decided sets are kept in the evaluator scope like those of a single
-check; the call opens a scope when none is open.
+check; the call opens a scope when none is open. A membership that another
+process changes during the call makes the witness of the items it affects
+fail for the rest of the call: they answer `NO`, as in any evaluator scope.
 
 #### Writes
 
@@ -2147,7 +2152,9 @@ of its own.
   raises `REBAC_DEPTH_LIMIT` and pays for it in every recursive statement.
 - SQLite, supported for tests, refuses a statement whose expression tree is
   deeper than 1,000; the tuple- and path-backed recursive shapes of the test
-  schema reach that at a limit of about 20.
+  schema reach that at a limit of about 20, and an actor in more stored sets
+  than are decided reaches it at a limit of 8 where two kinds of set nest,
+  because the sets are then compiled inline.
 - Query plans on PostgreSQL tables of tens of millions of rows have not been
   verified. A trial at that scale is in progress, and this document makes no
   claim about its result.
@@ -2461,6 +2468,14 @@ protected column raise `PermissionDenied`: scalar SQL results cannot carry
 instance-level redaction. The same guard rejects projections of protected
 `rebac_select_related()` paths, even through aliases or an explicitly sudoed
 root. `.for_write()` retains its explicit bypass of root field redaction.
+A `values()` / `values_list()` projection is refused for the protected
+fields it names; one that names only computed values names none. A set
+combination (`union()`, `intersection()`, `difference()`) returns the columns
+of each operand, so every operand is read, nested combinations included.
+Selected SQL that was written by hand (`extra(select=...)`, `RawSQL`, a
+function with a caller-supplied template) can read any column, so it counts
+as reading every protected field of the model, for model instances as for
+projections.
 The guard attributes a column to a queryset's projection only when it is read
 from that queryset's own row: directly, or through `OuterRef` from a nested
 query. A column a nested query reads from its own tables belongs to that

@@ -153,6 +153,13 @@ rules and the names exported by `rebac` are unchanged. The specification is
 - The projection guard reads every operand of a `union()`,
   `intersection()` or `difference()`. It read only the first, so a gated
   field projected by a later operand was returned unredacted.
+- Selected SQL written by hand (`extra(select=...)`, a `RawSQL` annotation,
+  a function with a caller-supplied template) counts as reading every gated
+  field of the model and is refused under an actor, for model instances as
+  for projections. An annotation of literal SQL on a model with gated
+  fields, read as model instances, was returned as written; code that relies
+  on that reads under `sudo(reason=...)` or names the columns through ORM
+  expressions.
 - A check whose actor's stored sets were changed by another process during
   an evaluator scope answers from current data. It raised
   `PermissionDepthExceeded` when a recursion was in reach of the permission.

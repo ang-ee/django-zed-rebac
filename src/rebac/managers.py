@@ -192,12 +192,22 @@ def _operands(query: Query) -> Iterator[Query]:
 
 
 def _gated_projection(
-    model: type[models.Model], raw_fields: Iterable[Any] | None, computed: dict[str, Any]
+    model: type[models.Model],
+    raw_fields: Iterable[Any] | None,
+    computed: dict[str, Any],
+    literal: bool,
 ) -> set[str]:
-    """The gated fields of ``model`` that a projection names or a computed value reads."""
+    """The gated fields of ``model`` that a projection names or a computed value reads.
+
+    Selected SQL that was written by hand (``literal``: ``extra(select=...)``,
+    or a computed value that splices SQL in) can read any column, so it
+    counts as reading every gated field.
+    """
     gated = gated_read_fields(model)
     if not gated:
         return set()
+    if literal or any(_has_opaque_write_expression(value) for value in computed.values()):
+        return set(gated)
     projected = projection_field_names(model, raw_fields)
     requested = set(gated & projected) if projected is not None else set()
     for expression in computed.values():
@@ -828,8 +838,8 @@ class RebacQuerySet(models.QuerySet[_M]):
         fields = getattr(self, "_fields", None)
         # A set combination returns the columns of every operand, and each
         # operand selects its own: the root's are only those of the first.
-        projections: list[tuple[type[models.Model], Any, dict[str, Any]]] = [
-            (self.model, fields, selected)
+        projections: list[tuple[type[models.Model], Any, dict[str, Any], bool]] = [
+            (self.model, fields, selected, bool(query.extra_select))
         ]
         for operand in _operands(query):
             own = (
@@ -838,9 +848,16 @@ class RebacQuerySet(models.QuerySet[_M]):
                 else (*operand.values_select, *operand.annotation_select)
             )
             if operand.model is not None:
-                projections.append((operand.model, own, dict(operand.annotation_select)))
-        for model, raw_fields, computed in projections:
-            requested = _gated_projection(model, raw_fields, computed)
+                projections.append(
+                    (
+                        operand.model,
+                        own,
+                        dict(operand.annotation_select),
+                        bool(operand.extra_select),
+                    )
+                )
+        for model, raw_fields, computed, literal in projections:
+            requested = _gated_projection(model, raw_fields, computed, literal)
             if requested:
                 names = ", ".join(f"read__{name}" for name in sorted(requested))
                 raise PermissionDenied(
