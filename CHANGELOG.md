@@ -151,8 +151,14 @@ rules and the names exported by `rebac` are unchanged. The specification is
   The guard still refuses a computed value whose expression reads a gated
   column.
 - The projection guard reads every operand of a `union()`,
-  `intersection()` or `difference()`. It read only the first, so a gated
-  field projected by a later operand was returned unredacted.
+  `intersection()` or `difference()`, as Django will select from it. It read
+  only the first, so a gated field projected by a later operand was returned
+  unredacted; and an operand that loads other fields than the root (another
+  model, `only()`, `defer()`) put a gated value into a field of the root's
+  instances that nothing redacts.
+- A gated field of a joined model is refused in a projection
+  (`values("folder__name")`, `annotate(n=F("folder__name"))`), like one of
+  the queryset's own model. It was returned.
 - Selected SQL written by hand (`extra(select=...)`, a `RawSQL` annotation,
   a function with a caller-supplied template) counts as reading every gated
   field of the model and is refused under an actor, for model instances as

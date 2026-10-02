@@ -12,7 +12,7 @@ from typing import Any, cast
 
 import pytest
 from django.db import connection
-from django.db.models import Count, F, Min, Value
+from django.db.models import Count, F, FilteredRelation, Min, Value
 from django.db.models.expressions import RawSQL
 from django.db.models.functions import Upper
 from django.test import override_settings
@@ -97,6 +97,29 @@ definition blog/post {
     permission write = owner + editor
     permission write__title = owner
     permission read__body = owner
+}
+"""
+
+
+FOLDER_GATE_SCHEMA_TEXT = """
+definition auth/user {}
+
+definition blog/folder {
+    relation owner: auth/user
+    relation viewer: auth/user
+    permission read = owner + viewer
+    permission write = owner
+    permission read__name = owner
+}
+
+definition blog/post {
+    relation owner: auth/user
+    relation editor: auth/user
+    relation viewer: auth/user
+
+    permission read = owner + editor + viewer
+    permission write = owner + editor
+    permission read__title = owner
 }
 """
 
@@ -369,6 +392,109 @@ def test_projection_of_only_a_computed_value_that_reads_a_gated_field_fails_clos
     with pytest.raises(PermissionDenied) as excinfo:
         list(rows.values_list("shouted", flat=True))
     assert "read__title" in str(excinfo.value)
+
+
+@pytest.fixture
+def folder_gates(alice, bob):
+    """A post alice may read in a folder alice may read; ``title`` and ``name`` are gated."""
+    from tests.testapp.models import Folder, Post
+
+    reset_backend()
+    install_schema(backend(), parse_zed(FOLDER_GATE_SCHEMA_TEXT))
+    with sudo(reason="test.fixture"):
+        folder = Folder.objects.create(name="folder secret")
+        post = Post.objects.create(title="post secret", folder=folder)
+    _grant_ref("blog/folder", str(folder.pk), bob, "owner")
+    _grant_ref("blog/folder", str(folder.pk), alice, "viewer")
+    _grant(post.pk, bob, "owner")
+    _grant(post.pk, alice, "viewer")
+    return folder, post
+
+
+@override_settings(REBAC_FIELD_READ_MODE="redact")
+def test_an_operand_that_loads_other_columns_than_the_root_is_guarded(alice, folder_gates):
+    from tests.testapp.models import Folder, Post
+
+    _folder, post = folder_gates
+    rows = Post.objects.as_user(alice)
+    folders = Folder.objects.as_user(alice)
+    # Rows of an operand become instances of the root's model column by
+    # column: ``title`` would arrive as ``body``, which nothing redacts.
+    for combined in (
+        lambda: rows.only("id", "body").union(rows.only("id", "title")),
+        lambda: rows.defer("title").union(rows.defer("body")),
+        lambda: rows.only("id", "body").union(folders.only("id", "name")),
+        lambda: rows.only("id", "body").union(
+            rows.only("id", "body").union(rows.only("id", "title"))
+        ),
+    ):
+        with pytest.raises(PermissionDenied):
+            list(combined())
+    # Operands that load what the root loads are redacted as its rows are.
+    same = list(rows.union(rows))
+    assert [(row.pk, row.title) for row in same] == [(post.pk, None)]
+    assert [row.body for row in rows.only("id", "body").union(rows.only("id", "body"))] == [""]
+
+
+@override_settings(REBAC_FIELD_READ_MODE="redact")
+def test_a_gated_column_of_a_joined_model_is_guarded(alice, folder_gates):
+    from tests.testapp.models import Folder, Post
+
+    folder, _post_row = folder_gates
+    rows = Post.objects.as_user(alice)
+    for attempt in (
+        lambda: list(rows.values_list("folder__name", flat=True)),
+        lambda: list(rows.annotate(n=F("folder__name")).values_list("n", flat=True)),
+        lambda: [row.n for row in rows.annotate(n=F("folder__name"))],
+        lambda: list(rows.annotate(f=FilteredRelation("folder")).values_list("f__name")),
+        lambda: list(Folder.objects.as_user(alice).values_list("parent__name", flat=True)),
+        lambda: list(
+            rows.values_list("body").union(Folder.objects.as_user(alice).values_list("name"))
+        ),
+    ):
+        with pytest.raises(PermissionDenied) as excinfo:
+            attempt()
+        assert "read__name on Folder" in str(excinfo.value)
+    # A column of the joined model that has no gate is read as before.
+    assert list(rows.values_list("folder__kind", "folder_id")) == [("", folder.pk)]
+    assert [row.kind for row in rows.annotate(kind=F("folder__kind"))] == [""]
+
+
+@override_settings(REBAC_FIELD_READ_MODE="redact")
+def test_an_annotation_an_operand_does_not_select_is_not_refused(alice, bob):
+    from tests.testapp.models import Post
+
+    post = _post(title="hidden annotation")
+    _grant(post.pk, bob, "owner")
+    _grant(post.pk, alice, "viewer")
+    rows = Post.objects.as_user(alice).annotate(copied=F("title"))
+    # The combination selects ``pk`` alone, in each operand.
+    assert list(rows.union(rows).values_list("pk", flat=True)) == [post.pk]
+    with pytest.raises(PermissionDenied):
+        list(rows.union(rows).values_list("copied", flat=True))
+
+
+@pytest.mark.xfail(
+    strict=True,
+    reason=(
+        "proposal 0013: Django compiles the operands of a combination itself, so a root "
+        "that is not a rebac queryset never applies the scope of a rebac operand"
+    ),
+)
+@override_settings(REBAC_FIELD_READ_MODE="redact")
+def test_a_plain_root_keeps_the_scope_of_a_rebac_operand(alice, bob):
+    from tests.testapp.models import BackingStage, Post
+
+    post = _post(title="scoped title")
+    _grant(post.pk, bob, "owner")
+    _grant(post.pk, alice, "viewer")
+    _post(title="not alice's row")
+    scoped = Post.objects.as_user(alice).values_list("body")
+    with sudo(reason="test.fixture"):
+        BackingStage.objects.create(hidden=None)
+    combined = list(BackingStage.objects.values_list("hidden").union(scoped, all=True))
+    # One stage and the one post alice may read.
+    assert len(combined) == 2
 
 
 @override_settings(REBAC_FIELD_READ_MODE="redact")

@@ -1783,8 +1783,8 @@ first:
    key is therefore bound as `column IN (keys)` only where a stored reference
    proves its row: a path that ends in a forward foreign key, on which every
    forward foreign key is under a database constraint in a table Django
-   manages, and whose target, if it is a multi-table model, is linked to its
-   parents the same way. Every other path (a foreign key with
+   manages, and whose target, if it is a multi-table model, is linked to
+   every ancestor the same way. Every other path (a foreign key with
    `db_constraint=False`, an unmanaged table, a database that enforces no
    constraint, a path that ends in a reverse relation or crosses a
    many-to-many one, which Django may read without the target's table) reads
@@ -2468,14 +2468,22 @@ protected column raise `PermissionDenied`: scalar SQL results cannot carry
 instance-level redaction. The same guard rejects projections of protected
 `rebac_select_related()` paths, even through aliases or an explicitly sudoed
 root. `.for_write()` retains its explicit bypass of root field redaction.
-A `values()` / `values_list()` projection is refused for the protected
-fields it names; one that names only computed values names none. A set
-combination (`union()`, `intersection()`, `difference()`) returns the columns
-of each operand, so every operand is read, nested combinations included.
-Selected SQL that was written by hand (`extra(select=...)`, `RawSQL`, a
-function with a caller-supplied template) can read any column, so it counts
-as reading every protected field of the model, for model instances as for
-projections.
+The guard reads what a query selects: its columns and its computed values.
+A column is protected by the model it is read from, so a projection is
+refused for a protected field of the queryset's own model and for one of a
+model it joins (`values("folder__name")`, `annotate(n=F("folder__name"))`);
+one that selects only computed values that read no protected column is not
+refused. A set combination (`union()`, `intersection()`, `difference()`)
+returns the columns of each operand, so every operand is read as Django will
+select from it, nested combinations included: an operand without a projection
+of its own takes the combination's. Where the combination returns model
+instances, an operand's rows become instances of the root's model column by
+column, so an operand over another model, or one that loads other fields
+than the root (`only()`, `defer()`), is refused for the protected fields it
+loads. Selected SQL that was written by hand (`extra(select=...)`, `RawSQL`,
+a function with a caller-supplied template) can read any column, so on a
+model with protected fields it counts as reading every one of them, for
+model instances as for projections.
 The guard attributes a column to a queryset's projection only when it is read
 from that queryset's own row: directly, or through `OuterRef` from a nested
 query. A column a nested query reads from its own tables belongs to that
@@ -2490,8 +2498,15 @@ The `NOT EXISTS` Django builds for an `exclude()` across a to-many relation
 of the outer statement, like the join a `filter()` across the same relation
 adds, and it is not scoped on its own. A queryset the caller passes inside
 that exclude (`rel__in=Model.objects...`) keeps its own scope.
-These guards inspect Django column expressions; raw SQL and arbitrary custom
-SQL expressions remain outside that inspection boundary.
+These guards inspect Django column expressions. Outside that boundary remain:
+hand-written SQL that is selected on a model with no protected field of its
+own, or that is used in a filter or an ordering; a custom expression whose
+class carries its own SQL template; and a subquery over a model's
+`_base_manager`, which is unscoped like every read through that manager and,
+unlike `sudo`, writes no audit row. A set combination whose root is not a
+rebac queryset does not apply the scope of a rebac operand at all, rows or
+fields: Django compiles the operands itself. That case is pinned as an
+expected failure for proposal 0013.
 
 The engine computes visibility per row, not with a blanket `.defer()`. For each
 declared `read__<field>`, it asks the backend for

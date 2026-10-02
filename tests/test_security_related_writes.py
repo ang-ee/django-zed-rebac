@@ -1108,7 +1108,9 @@ def test_subquery_joining_a_gated_model_is_refused_on_write():
     source = Subquery(
         Folder.objects.with_actor(EDITOR).filter(pk=OuterRef("folder_id")).values("posts__body")[:1]
     )
-    with pytest.raises(PermissionDenied, match="subquery"):
+    # The subquery answers for its own projection: it selects a gated column
+    # of the model it joins, and is refused before the write gate reads it.
+    with pytest.raises(PermissionDenied, match="read__body on Post"):
         Post.objects.with_actor(EDITOR).filter(pk=post.pk).update(title=source)
     with sudo(reason="test.verify"):
         assert Post.objects.get(pk=post.pk).title == "public"

@@ -184,39 +184,58 @@ def _expression_columns(
             yield from _expression_columns(source, _inner_aliases)
 
 
-def _operands(query: Query) -> Iterator[Query]:
-    """Every operand of a set combination, nested combinations included."""
-    for operand in query.combined_queries:
-        yield operand
-        yield from _operands(operand)
+def _selections(query: Query) -> Iterator[Query]:
+    """A query and every operand of its set combinations, as Django selects from them.
 
-
-def _gated_projection(
-    model: type[models.Model],
-    raw_fields: Iterable[Any] | None,
-    computed: dict[str, Any],
-    literal: bool,
-) -> set[str]:
-    """The gated fields of ``model`` that a projection names or a computed value reads.
-
-    Selected SQL that was written by hand (``literal``: ``extra(select=...)``,
-    or a computed value that splices SQL in) can read any column, so it
-    counts as reading every gated field.
+    A combination returns the columns of each operand.  An operand without a
+    projection of its own is given the combination's when it is compiled
+    (``SQLCompiler._get_combinator_part_sql``); the same is done here.
     """
-    gated = gated_read_fields(model)
-    if not gated:
-        return set()
-    if literal or any(_has_opaque_write_expression(value) for value in computed.values()):
-        return set(gated)
-    projected = projection_field_names(model, raw_fields)
-    requested = set(gated & projected) if projected is not None else set()
-    for expression in computed.values():
-        requested.update(
-            column.target.name
-            for column in _expression_columns(expression)
-            if _column_on_model_lineage(column, model) and column.target.name in gated
-        )
-    return requested
+    yield query
+    selected = query.selected
+    for operand in query.combined_queries:
+        if selected is not None and operand.selected is None:
+            operand = operand.clone()
+            operand.set_values(selected)
+        yield from _selections(operand)
+
+
+def _selected_gated(query: Query, computed: dict[str, Any]) -> dict[type[models.Model], set[str]]:
+    """The gated fields that the columns and computed values of one query read, by model.
+
+    A column is gated by the model it is read from, the query's own or one it
+    joins.  Selected SQL that was written by hand (``extra(select=...)``, a
+    computed value that splices SQL in) can read any column, so it counts as
+    reading every gated field of the query's model.
+    """
+    model = query.model
+    assert model is not None
+    own = gated_read_fields(model)
+    found: dict[type[models.Model], set[str]] = {}
+    if own and (
+        query.extra_select or any(_has_opaque_write_expression(v) for v in computed.values())
+    ):
+        found[model] = set(own)
+    for expression in (*query.select, *computed.values()):
+        for column in _expression_columns(expression):
+            name = column.target.name
+            if name in own and _column_on_model_lineage(column, model):
+                found.setdefault(model, set()).add(name)
+            elif name in gated_read_fields(column.target.model):
+                found.setdefault(column.target.model, set()).add(name)
+    return found
+
+
+def _loaded_fields(query: Query) -> frozenset[str]:
+    """The fields of its model that a query returning model rows loads."""
+    model = query.model
+    assert model is not None
+    names, defer = query.deferred_loading
+    local = projection_field_names(model, [n for n in names if "__" not in n]) if names else None
+    every = frozenset(field.name for field in model._meta.concrete_fields)
+    if defer:
+        return every - (local or frozenset())
+    return (local or frozenset()) | {model._meta.pk.name}
 
 
 def _column_on_model_lineage(column: Col, model: type[models.Model]) -> bool:
@@ -835,30 +854,26 @@ class RebacQuerySet(models.QuerySet[_M]):
             return
         if runtime_field_deny_mode(self._effective_field_mode()) == "allow":
             return
-        fields = getattr(self, "_fields", None)
-        # A set combination returns the columns of every operand, and each
-        # operand selects its own: the root's are only those of the first.
-        projections: list[tuple[type[models.Model], Any, dict[str, Any], bool]] = [
-            (self.model, fields, selected, bool(query.extra_select))
-        ]
-        for operand in _operands(query):
-            own = (
-                fields
-                if operand.default_cols
-                else (*operand.values_select, *operand.annotation_select)
-            )
-            if operand.model is not None:
-                projections.append(
-                    (
-                        operand.model,
-                        own,
-                        dict(operand.annotation_select),
-                        bool(operand.extra_select),
-                    )
+        for part in _selections(query):
+            if part.model is None:
+                continue
+            found = _selected_gated(part, selected if part is query else part.annotation_select)
+            if (
+                part is not query
+                and query.selected is None
+                and part.selected is None
+                and not (
+                    part.model._meta.concrete_model is self.model._meta.concrete_model
+                    and part.deferred_loading == query.deferred_loading
                 )
-        for model, raw_fields, computed, literal in projections:
-            requested = _gated_projection(model, raw_fields, computed, literal)
-            if requested:
+            ):
+                # Rows of this operand become instances of the root's model
+                # column by column: a gated field it loads can land in a
+                # field the root does not redact.
+                loaded = gated_read_fields(part.model) & _loaded_fields(part)
+                if loaded:
+                    found.setdefault(part.model, set()).update(loaded)
+            for model, requested in found.items():
                 names = ", ".join(f"read__{name}" for name in sorted(requested))
                 raise PermissionDenied(
                     f"Cannot project gated field(s) {names} on {model.__name__}: "
