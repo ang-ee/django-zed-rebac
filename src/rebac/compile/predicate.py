@@ -1082,7 +1082,12 @@ class Compiler:
                     for hops in range(1, self.depth_limit + 1)
                 ),
             ]
-            inherits = Q(Exists(source.filter(**{f"{target}__in": chain}).filter(base_row)))
+            # The lookup is spelled out: where the key is itself a relation
+            # (the parent link of a multi-table child), Django's ``__in`` on
+            # the field name converts every list entry as a plain value and
+            # refuses an expression.
+            ancestors = Q(In(F(target), chain))
+            inherits = Q(Exists(source.filter(ancestors).filter(base_row)))
             if bound is Bound.UPPER and depth_possible:
                 deep_path = "__".join([resolved.path] * (self.depth_limit + 1))
                 inherits = inherits | Q(**{f"{deep_path}__isnull": False})

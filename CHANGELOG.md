@@ -3,6 +3,18 @@
 All notable changes to `django-zed-rebac` are tracked here. The project is in
 pre-1.0; breaking changes within a minor version are explicitly called out.
 
+## [0.25.1] — 2026-10-02
+
+### Fixed
+
+- A permission that inherits through a self foreign key (`p = base +
+  parent->p`) on a multi-table child model raised `TypeError: Field 'id'
+  expected a number but got ResolvedOuterRef(...)` before any SQL ran, for
+  every check and scope that reached it. The key of such a model is its
+  parent link, a relation field, and Django's `__in` lookup on a relation
+  field converts each list entry as a plain value. The ancestor chain is now
+  compared through an explicit `In` lookup, which accepts expressions.
+
 ## [0.25.0] — 2026-10-02
 
 `LocalBackend` compiles permissions to queries over the application's own
