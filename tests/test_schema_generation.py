@@ -761,3 +761,39 @@ def test_shared_snapshots_retain_only_latest_revision(synced, writes):
         assert len(local._schema_snapshots) == 1
     latest = next(iter(local._schema_snapshots.values()))
     assert latest.generation != old.generation
+
+
+def _gate_title():
+    """Protect ``title`` with a stored ``read__title``: the projection guard has work."""
+    SchemaPermission.objects.create(
+        definition=SchemaDefinition.objects.get(resource_type="blog/post"),
+        name="read__title",
+        expression="owner",
+    )
+    backend().schema()  # Warm the snapshot of the new revision.
+
+
+def test_the_projection_guard_reads_the_schema_once(synced, settings):
+    settings.REBAC_FIELD_READ_MODE = "redact"
+    _gate_title()
+    rows = Post.objects.with_actor(ACTOR)
+
+    def reads(queryset):
+        with CaptureQueriesContext(connection) as queries:
+            list(queryset)
+        return _generation_reads(queries)
+
+    # The guard reads one schema, however many columns it looks at.
+    narrow = reads(rows.values_list("pk"))
+    assert reads(rows.values_list("pk", "body", "folder_id")) == narrow
+    assert reads(rows.values("pk", "body", "folder_id")) == narrow
+
+
+@pytest.mark.parametrize("atomic", [False, True])
+def test_a_gated_write_reads_the_policy_revision_once(synced, atomic):
+    from rebac.watch import gate_policy
+
+    with transaction.atomic() if atomic else nullcontext():
+        with CaptureQueriesContext(connection) as queries:
+            assert gate_policy("default") is not None
+    assert _generation_reads(queries) == 1

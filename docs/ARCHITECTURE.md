@@ -1060,7 +1060,7 @@ All settings prefixed `REBAC_`. No nested dict. Read via the public `app_setting
 | `REBAC_TYPE_PREFIX` | `""` | `str` | Optional prefix for all generated resource types (multi-tenant SaaS). |
 | `REBAC_SUPERUSER_BYPASS` | `True` | `bool` | If `True`, active superusers short-circuit `has_perm`; `ActorMiddleware` opens `sudo("superuser-bypass")` only when the resolver returns that user's own subject. Each elevated request emits a `KIND_SUDO_BYPASS` audit row. Suppressed when `REBAC_ALLOW_SUDO = False`. Strict tenants set this to `False`. |
 | `REBAC_LINT_BARE_PREFETCH` | `True` | `bool` | Toggle for `rebac.W003` — the structural warning that an RBAC-bound model has an FK / O2O / M2M to another RBAC-bound model (a bare-string `select_related` / `prefetch_related` can load unguarded related rows). Enabled by default so the risky shape is visible; use `rebac_select_related()` / `rebac_prefetch_related()` or the Strawberry-Django optimizer for protected paths. |
-| `REBAC_EVALUATOR_CACHE_SIZE` | `10000` | `int` | Max entries across the per-scope evaluator's check and accessible caches. |
+| `REBAC_EVALUATOR_CACHE_SIZE` | `10000` | `int` | Max entries across the per-scope evaluator's check and accessible caches, and, separately, max actors' stored-set decisions it keeps (least recently used dropped first). |
 | `REBAC_ZOOKIE_TRANSPORT` | `"none"` | `"none"` \| `"header"` \| `"session"` | Optional cross-request transport for the current Zookie. |
 | `REBAC_ZOOKIE_HEADER_NAME` | `"X-Rebac-Zookie"` | `str` | Header name used when `REBAC_ZOOKIE_TRANSPORT = "header"`. |
 | `REBAC_ZOOKIE_SESSION_KEY` | `"_rebac_zookie"` | `str` | Session key used when `REBAC_ZOOKIE_TRANSPORT = "session"`. |
@@ -1725,7 +1725,9 @@ it first:
 
 Inside an evaluator scope (a request under `ActorMiddleware`, an explicit
 `evaluator_scope()`) the decision is kept per actor, context and stored sets
-in reach, until a tuple is written in the process or the scope ends. A kept
+in reach, until a tuple is written in the process or the scope ends, for up
+to `REBAC_EVALUATOR_CACHE_SIZE` actors, the least recently used dropped
+first. A kept
 decision can be stale when another process changes a membership; the witness
 then selects nothing, so staleness denies and never grants. The depth probe
 of a check carries the same witness: sets that are no longer the actor's are
@@ -2020,7 +2022,9 @@ to a chunk of 50:
    action, is answered by `check_access()`.
 
 The decided sets are kept in the evaluator scope like those of a single
-check; the call opens a scope when none is open. A membership that another
+check; the call opens a scope when none is open. Each item of a chunk is
+answered with the decision made for its chunk, whatever the scope still keeps
+by the time its statements are built. A membership that another
 process changes during the call makes the witness of the items it affects
 fail for the rest of the call: they answer `NO`, as in any evaluator scope.
 

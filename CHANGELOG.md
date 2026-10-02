@@ -3,6 +3,24 @@
 All notable changes to `django-zed-rebac` are tracked here. The project is in
 pre-1.0; breaking changes within a minor version are explicitly called out.
 
+## [0.25.3] — 2026-10-02
+
+### Fixed
+
+- A bulk check no longer decides an actor's stored sets twice. The
+  evaluator scope dropped every kept decision when it reached 512 entries,
+  including those just made for the chunk being answered, and each was then
+  decided again alone: 24 expansion statements instead of 12 for 600 items.
+  Each item is now answered with the decision made for its chunk, and the
+  scope keeps up to `REBAC_EVALUATOR_CACHE_SIZE` decisions, least recently
+  used dropped first.
+- The projection guard runs once per evaluation of a queryset: reading a
+  result already fetched (`list(qs)` asks for the length, then iterates)
+  does not run it again. It reads the schema once, not once per selected
+  column.
+- A gated write reads the policy revision once, not twice, when the schema
+  lives on the written alias.
+
 ## [0.25.2] — 2026-10-02
 
 ### Fixed

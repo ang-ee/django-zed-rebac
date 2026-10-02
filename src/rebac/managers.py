@@ -864,6 +864,7 @@ class RebacQuerySet(models.QuerySet[_M]):
     def _effective_field_mode(self) -> FieldDenyMode:
         return effective_field_deny_mode(self._rebac_field_deny)
 
+    @schema_operation
     def _guard_projected_field_reads(
         self,
         actor: SubjectRef | None,
@@ -965,10 +966,13 @@ class RebacQuerySet(models.QuerySet[_M]):
         )
 
     def _fetch_all(self) -> None:
-        if self._result_cache is None:
+        fetching = self._result_cache is None
+        if fetching:
             self._apply_scope_in_place()
         actor, sudo = self._resolve_effective_actor()
-        self._guard_projected_field_reads(actor, sudo)
+        if fetching:
+            # Rows already held were guarded by the evaluation that read them.
+            self._guard_projected_field_reads(actor, sudo)
         super()._fetch_all()
         if self._result_cache is not None and not self._rebac_visibility_applied:
             if actor is not None and not sudo:

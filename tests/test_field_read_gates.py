@@ -994,3 +994,26 @@ def test_actor_scoped_subquery_projecting_a_gated_column_fails_closed(alice, bob
         leak = Subquery(Post.objects.as_user(alice).filter(pk=OuterRef("pk")).values("title")[:1])
         list(Post.objects.as_user(alice).annotate(x=leak).values("x"))
     assert "read__title" in str(excinfo.value)
+
+
+@override_settings(REBAC_FIELD_READ_MODE="redact")
+def test_the_projection_guard_runs_once_per_evaluation(alice, monkeypatch):
+    from rebac.managers import RebacQuerySet
+    from tests.testapp.models import Post
+
+    post = _post(title="guarded once")
+    _grant(post.pk, alice, "viewer")
+    calls = []
+    guard = RebacQuerySet._guard_projected_field_reads
+
+    def counting(self, *args, **kwargs):
+        calls.append(self)
+        return guard(self, *args, **kwargs)
+
+    monkeypatch.setattr(RebacQuerySet, "_guard_projected_field_reads", counting)
+    rows = Post.objects.as_user(alice)
+    # ``list()`` asks for the length, then iterates; both read the one result.
+    assert [row.pk for row in list(rows)] == [post.pk]
+    assert len(rows) == 1
+    assert rows
+    assert len(calls) == 1

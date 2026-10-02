@@ -246,26 +246,26 @@ def reset() -> None:
         _policies.clear()
 
 
-def installed(using: str, backend: LocalBackend) -> bool:
-    """Whether a policy is installed on the alias, so that there are writes to gate.
+def published_revision(using: str, backend: LocalBackend) -> str | None:
+    """The policy revision published on the alias, if any, so that there are writes to gate.
 
     Before the first ``sync`` there is none: a write proceeds and reads stay
     closed.  While migrations run, the library's own tables can be missing or
     lack a column; the revision cannot be read then, and the answer is the
     same.  Inside a transaction the read has its own savepoint, so a failure
-    leaves the caller's transaction usable.
+    leaves the caller's transaction usable.  A manual schema is always
+    published.
     """
     from .models.generation import SchemaGeneration
 
     if backend._schema_is_manual:
-        return True
+        return backend._manual_schema_revision()
     guard = transaction.atomic(using=using) if connections[using].in_atomic_block else nullcontext()
     try:
         with guard:
-            revision = SchemaGeneration.objects.revision(using)
+            return SchemaGeneration.objects.revision(using)
     except DatabaseError:
-        return False
-    return bool(revision)
+        return None
 
 
 def gate_policy(using: str, backend: LocalBackend | None = None) -> GatePolicy | None:
@@ -281,10 +281,18 @@ def gate_policy(using: str, backend: LocalBackend | None = None) -> GatePolicy |
         held = _open.get()
         if using in held:
             return held[using]
+    from .models import SchemaDefinition
+
     active = backend if backend is not None else active_backend()
-    if not isinstance(active, LocalBackend) or not installed(using, active):
+    if not isinstance(active, LocalBackend):
         return None
-    schema = active.schema()
+    revision = published_revision(using, active)
+    if not revision:
+        return None
+    # Where the schema lives on the written alias, the revision just read is
+    # the one to load it at: one read per gated write.
+    stored = not active._schema_is_manual and using == SchemaDefinition.objects.db
+    schema = active._schema_snapshot(revision if stored else None).schema
     with _lock:
         kept = _policies.get(id(schema))
         if kept is not None and kept[0] is schema:
