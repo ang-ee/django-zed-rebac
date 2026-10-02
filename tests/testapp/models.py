@@ -296,6 +296,29 @@ class NativeParentLinkedRecord(RebacMixin, models.Model):
         rebac_resource_type = "test/nativeparentlinkedrecord"
 
 
+class NativeParentLinkedBranch(NativeParentLinkedResource):
+    """A multi-table child whose key is its parent link, in a hierarchy of its own."""
+
+    parent = models.ForeignKey(
+        "self", null=True, blank=True, on_delete=models.CASCADE, related_name="children"
+    )
+
+    class Meta:
+        app_label = "testapp"
+        rebac_resource_type = "test/nativeparentlinkedbranch"
+        rebac_id_attr = "pk"
+
+
+class NativeParentLinkedNote(RebacMixin, models.Model):
+    branch = models.ForeignKey(
+        NativeParentLinkedBranch, on_delete=models.CASCADE, related_name="notes"
+    )
+
+    class Meta:
+        app_label = "testapp"
+        rebac_resource_type = "test/nativeparentlinkednote"
+
+
 class BackingDocument(RebacMixin, models.Model):
     owner = models.ForeignKey(settings.AUTH_USER_MODEL, on_delete=models.CASCADE)
     bindings = GenericRelation("BackingBinding", related_query_name="document")
