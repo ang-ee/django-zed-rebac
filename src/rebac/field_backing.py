@@ -97,16 +97,27 @@ class ResolvedFieldBacking(_SourceFilters):
     def keeps_target(self, using: str) -> bool:
         """Whether a stored reference to a target proves that the target's row exists.
 
-        Only a forward foreign key that the database constrains does.  Django
-        reads a column of the target from the nearest table that holds its
-        value and leaves the others unjoined, so no other path is taken to
-        read the target's row.
+        Django reads a column of the target from the nearest table that holds
+        its value and leaves the others unjoined, so the path proves the row
+        only when it ends in a forward foreign key and the database keeps
+        every forward foreign key on it.  A reverse foreign key on the way is
+        read from the table that holds it; a many-to-many hop is not relied
+        on.
         """
 
-        field = self.field
-        return isinstance(field, (models.ForeignKey, models.OneToOneField)) and foreign_key_kept(
-            field, using
-        )
+        if not isinstance(self.field, (models.ForeignKey, models.OneToOneField)):
+            return False
+        kept = True
+
+        def hop(_model: type[models.Model], field: ModelField, _prefix: str) -> None:
+            nonlocal kept
+            if isinstance(field, (models.ForeignKey, models.OneToOneField)):
+                kept = kept and foreign_key_kept(field, using)
+            elif not isinstance(field, (models.ManyToOneRel, models.OneToOneRel)):
+                kept = False
+
+        _relation_path(self.source_model, self.path, visit=hop)
+        return kept
 
     def target_values_path(self) -> str:
         if (
@@ -142,13 +153,17 @@ def foreign_key_kept(field: models.ForeignKey[Any, Any], using: str) -> bool:
     """Whether a value of the column proves a row of the model it names.
 
     The database must constrain the column, and the links of a multi-table
-    model to its parents: its row is its own and its parents' together.
+    model to its parents: its row is its own and its parents' together.  A
+    constraint is taken to exist only on a table Django manages.
     """
 
     if not connections[using].features.supports_foreign_keys:
         return False
     links = [field, *(link for link in field.related_model._meta.parents.values() if link)]
-    return all(link.db_constraint for link in links)  # type: ignore[attr-defined]
+    return all(
+        link.db_constraint and link.model._meta.managed  # type: ignore[attr-defined]
+        for link in links
+    )
 
 
 def _proposed_forward_relationships(

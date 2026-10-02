@@ -1750,17 +1750,23 @@ first:
 
 1. **Arrow targets.** For an arrow over a field- or attribute-backed
    relation, the rows of the target model on which the actor holds the target
-   permission are selected by their own statement, limited to 501 rows. Up to
-   500 rows, the arrow is compiled as `column IN (keys)`. The target's
-   statement is compiled the same way, so its own arrows are lists too.
+   permission are selected by their own statement. When they fit in what
+   the statement may still bind, the arrow is compiled as `column IN (keys)`.
+   The target's statement is compiled the same way, so its own arrows are
+   lists too.
 2. **Hierarchies.** For `p = base + parent->p` over a self foreign key, the
    rows that hold `base` are selected, then their children by the parent
    column, level by level to `REBAC_DEPTH_LIMIT` or until a level is empty:
    the same rows as the inline form, reached from the seeds instead of from
    every row. A scope over the hierarchy's own model uses the set as well.
-3. **Fallback.** A set over 500 rows, a target every row of which holds the
-   permission, and a node that is being decided stay inline, as the subquery
-   or the ancestor chain described above.
+3. **Fallback.** One statement binds at most 5,000 decided rows, over all
+   its sets, in the order it asks for them; a decision reads one row more
+   than is left and stops. A set that does not fit, a target every row of
+   which holds the permission, and a node that is being decided stay inline,
+   as the subquery or the ancestor chain described above. So does an arrow
+   back into a recursion that is being unrolled: a decided set is the rows
+   that hold the permission with the whole depth limit to spend, and inside
+   its own recursion part of that depth is spent already.
 4. **Witness.** A decided set is a lower bound. The scope statement re-reads
    it in its own snapshot: each listed row still holds the permission (the
    permission's own predicate, evaluated on the listed keys only). A
@@ -1775,14 +1781,17 @@ first:
    next operation decides afresh.
 5. **References the database keeps.** A witness reads the rows that exist. A
    key is therefore bound as `column IN (keys)` only where a stored reference
-   proves its row: a path that ends in a forward foreign key under a database
-   constraint, whose target, if it is a multi-table model, is linked to its
-   parents under constraints too. Every other path (a foreign key with
-   `db_constraint=False`, a database that enforces none, a reverse or
-   many-to-many path, which Django may read without the target's table) reads
+   proves its row: a path that ends in a forward foreign key, on which every
+   forward foreign key is under a database constraint in a table Django
+   manages, and whose target, if it is a multi-table model, is linked to its
+   parents the same way. Every other path (a foreign key with
+   `db_constraint=False`, an unmanaged table, a database that enforces no
+   constraint, a path that ends in a reverse relation or crosses a
+   many-to-many one, which Django may read without the target's table) reads
    the keys through the target's rows. A hierarchy over a parent column that
    is not kept is decided by the permission's own predicate, not followed
-   from its seeds.
+   from its seeds; that predicate tests every row's ancestors, so such a
+   hierarchy is slower to decide.
 
 Decided rows are used by queryset scopes and by what is built on them
 (`accessible()` without a context, bulk guards, the backed-edge gate over
@@ -2000,7 +2009,7 @@ to a chunk of 50:
    own fence and witness. Items the lower bound does not grant, and that
    have a caveat or a recursion in reach, get their upper bound the same
    way, and those still undecided their depth probe: three statements at
-   most. A statement is cut once its text passes about 256 KB, so a
+   most. A statement is cut once its text passes about 64 KB, so a
    permission whose statement at one object is long (a recursion over
    tuples) shares a statement between fewer items. The residual evaluator
    then runs per undecided item, as in `check_access()`.
@@ -2119,6 +2128,20 @@ of its own.
   of the accessible subtree, not the size of the tables.
 - Permissions that recurse through each other are unrolled without a
   convergence test (see [Recursion](#recursion)).
+- Past the 5,000 rows a statement may bind, a hierarchy is compiled inline
+  and tested for every row: on a PostgreSQL 16 table of 123,000 rows, a page
+  for an actor that holds 4,100 of them took 55 ms decided and 700 ms inline.
+  An arrow's subquery is the cheaper form for a few hundred rows (9 ms
+  against 30 ms at 600) and the dearer one for more (172 ms against 61 ms at
+  2,000). These are measurements of one synthetic data set; the limit has
+  not been tuned on production data.
+- Each stored set an actor belongs to costs every scope statement a list
+  entry and a witness subquery: an actor in 250 sets paid about 100 ms a
+  page on that data set, most of it compiling, where an actor in 10 paid 16.
+- A hierarchy whose parent column names its row by a nullable column
+  (`to_field`) never gives a row without a value in that column its own
+  base in the inline form, while a point check does: a scope past the row
+  limit omits such a row.
 - Statement size follows the unfolded permission, times the depth limit for
   a recursive node. A deployment whose chains are deeper than the default
   raises `REBAC_DEPTH_LIMIT` and pays for it in every recursive statement.

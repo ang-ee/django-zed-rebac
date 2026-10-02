@@ -1008,9 +1008,19 @@ class Compiler:
         identity: str,
         bound: Bound,
         depth_possible: bool,
+        visits: Mapping[Key, int] | None = None,
     ) -> tuple[Any, ...] | None:
-        """The rows decided for ``key``, when it is a lower bound over its own model's rows."""
+        """The rows decided for ``key``, when it is a lower bound over its own model's rows.
+
+        A decision is the rows that hold ``key`` with the whole depth to
+        spend.  Inside the key's own component (``visits``) part of the depth
+        is spent already, so the set is not used there.
+        """
         if self.rows is None or bound is not Bound.LOWER or not depth_possible:
+            return None
+        if visits is not None and any(
+            visits.get(member) for member in self.program.components.get(key, ())
+        ):
             return None
         if model_for_resource_type(key[0]) is not model or resource_id_attr(model) != identity:
             return None
@@ -1530,7 +1540,9 @@ class Compiler:
         _, field = model_identity_fields(model, identity)
         itself = bool(relation_name and own and self.shape.relation == relation_name)
         if not itself:
-            decided = self._decided((allowed_type, name), model, identity, bound, depth_possible)
+            decided = self._decided(
+                (allowed_type, name), model, identity, bound, depth_possible, visits
+            )
             if decided is not None:
                 return Decided(decided) if decided else False
         member = self._holds(

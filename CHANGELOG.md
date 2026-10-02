@@ -113,9 +113,10 @@ rules and the names exported by `rebac` are unchanged. The specification is
   an actor in more than 256 sets, keep the membership inside the statement.
 - A scope decides the small sets of rows behind its arrows first (the
   folders a file's scope reaches, the messages a part's scope reaches) and
-  binds them as key lists, up to 500 rows each; a hierarchy over a self
-  foreign key is followed from its seeds, level by level. The scope statement
-  re-reads every decided set in its own snapshot. Larger sets stay inline.
+  binds them as key lists, up to 5,000 rows a statement; a hierarchy over a
+  self foreign key is followed from its seeds, level by level. The scope
+  statement re-reads every decided set in its own snapshot and at its own
+  instant. Sets that do not fit stay inline.
 - A point check looks its one object up by key instead of building the set of
   every qualifying row.
 - A caveated read decides the distinct caveat instances of the relations in
@@ -138,7 +139,8 @@ rules and the names exported by `rebac` are unchanged. The specification is
 - `Backend.check_bulk_permissions(items)` and `rebac.CheckItem`, after
   SpiceDB's `CheckBulkPermissions`: one `CheckResult` per item, the answers
   of `check_access()`. `LocalBackend` decides the stored sets of the actors
-  together and the bounds of up to 50 items by one statement, so asking
+  together and the bounds of up to 50 items by one statement (cut at about
+  64 KB of text), so asking
   which of many users hold a permission on one resource no longer costs
   statements per user. Any other backend gets the item-by-item default.
 

@@ -160,7 +160,9 @@ def crowd(local, count):
     return names
 
 
-def test_statements_do_not_grow_with_the_number_of_actors(office):
+def test_statements_do_not_grow_with_the_number_of_actors(office, monkeypatch):
+    # Without the cut by size, which the next test covers.
+    monkeypatch.setattr(read, "_BULK_SQL", 10**9)
     names = crowd(office, 50)
     counts = []
     for size in (5, 50):
@@ -179,6 +181,7 @@ def test_a_statement_of_bounds_is_cut_by_its_size(office, monkeypatch):
     names = crowd(office, 20)
     # ``read`` recurses over folders: its statement at one object is long.
     items = [CheckItem(user(name), "read", DOC) for name in names]
+    monkeypatch.setattr(read, "_BULK_SQL", 10**9)
     with CaptureQueriesContext(connection) as whole:
         answers = office.check_bulk_permissions(items)
     assert [bool(answer) for answer in answers] == [n % 2 == 0 for n in range(20)]

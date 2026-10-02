@@ -75,12 +75,13 @@ _LIMIT = 512
 # An actor in more stored sets than this keeps their membership inside the
 # statement, as a closure over the tuple table.
 _SET_LIMIT = 256
-# A set of target rows larger than this stays a subquery of the statement.
-_ROW_LIMIT = 500
+# The rows one statement may bind from the sets decided for it.  A set that
+# does not fit in what is left stays a subquery of the statement.
+_ROW_LIMIT = 5000
 # Items of a bulk check decided together, and the SQL text one statement of
 # their bounds may reach before it is cut.
 _BULK = 50
-_BULK_SQL = 256_000
+_BULK_SQL = 64_000
 # What is read of a tuple that puts an actor, or a set, into a stored set.
 _EDGE = (
     "resource_type",
@@ -311,8 +312,9 @@ class _Rows:
     subquery whose size the planner cannot know, and a hierarchy is tested
     for every row of its table.  When the set behind an arrow is small it is
     decided first, by its own statement, and bound into the scope as a list
-    of keys, which the planner can drive an index from.  A set larger than
-    ``_ROW_LIMIT`` stays inline.
+    of keys, which the planner can drive an index from.  One statement binds
+    at most ``_ROW_LIMIT`` rows over all its sets; a set that does not fit in
+    what is left stays inline.
 
     Every decision is a lower bound.  The statement that uses it re-reads it
     in its own snapshot (``witness``): each listed row that exists still holds
@@ -327,6 +329,11 @@ class _Rows:
         self.asked = 0
         self._found: dict[Key, _Decision | None] = {}
         self._pending: set[Key] = set()
+
+    @property
+    def room(self) -> int:
+        """The rows the operation's statement may still bind."""
+        return _ROW_LIMIT - sum(len(found.ids) for found in self._found.values() if found)
 
     def rows(self, key: Key) -> tuple[Any, ...] | None:
         self.asked += 1
@@ -380,10 +387,9 @@ class _Rows:
             return None
         if is_false(member):
             return _Decision((), _and(), frozenset(compiler.used_rows))
-        ids = tuple(
-            source.filter(gate).filter(member).values_list(identity, flat=True)[: _ROW_LIMIT + 1]
-        )
-        if len(ids) > _ROW_LIMIT:
+        room = self.room
+        ids = tuple(source.filter(gate).filter(member).values_list(identity, flat=True)[: room + 1])
+        if len(ids) > room:
             return None
         if not ids:
             return _Decision((), _and(), frozenset(compiler.used_rows))
@@ -410,28 +416,33 @@ class _Rows:
             return None
         if is_false(chain.base):
             return _Decision((), _and(), uses)
+        room = self.room
         seeds = list(
             source.filter(gate)
             .filter(chain.base)
-            .values_list(chain.identity, chain.target)[: _ROW_LIMIT + 1]
+            .values_list(chain.identity, chain.target)[: room + 1]
         )
-        if len(seeds) > _ROW_LIMIT:
+        if len(seeds) > room:
             return None
         known = dict(seeds)
-        # The rows by level, as the values a child's parent column names them by.
-        levels = [[target for _identity, target in seeds]]
+        # The rows by level: each its identity and the value a child's parent
+        # column names it by.  A row without that value has no children.
+        levels = [seeds]
         for _ in range(app_settings.REBAC_DEPTH_LIMIT):
-            if not levels[-1]:
+            above = _keys(levels[-1])
+            if not above:
                 break
             children = list(
-                source.filter(**{f"{chain.parent}__in": levels[-1]})
+                source.filter(**{f"{chain.parent}__in": above})
                 .exclude(**{f"{chain.identity}__in": list(known)})
-                .values_list(chain.identity, chain.target)[: _ROW_LIMIT + 1 - len(known)]
+                .values_list(chain.identity, chain.target)[: room + 1 - len(known)]
             )
-            if len(known) + len(children) > _ROW_LIMIT:
+            if len(known) + len(children) > room:
                 return None
+            if not children:
+                break
             known.update(children)
-            levels.append([target for _identity, target in children])
+            levels.append(children)
         if not known:
             return _Decision((), _and(), uses)
         # The seeds still hold the base and every row of a level still hangs
@@ -439,34 +450,42 @@ class _Rows:
         # level at each step and ends at a seed: rows that have closed into a
         # cycle, or that have moved deeper than they were found, fail it.
         # The parent column is constrained, so the row a child names exists.
-        parts = [
-            ~Q(Exists(source.filter(**{f"{chain.target}__in": levels[0]}).filter(_not(base_later))))
-        ]
-        parts.extend(
-            ~Q(
-                Exists(
-                    source.filter(**{f"{chain.target}__in": level}).exclude(
-                        **{f"{chain.parent}__in": above}
-                    )
-                )
-            )
-            for above, level in pairwise(levels)
-            if level
-        )
-        if not chain.keyed:
-            # The levels are kept by the parent column's values and the
-            # decision is used by identity: a listed identity is still a row
-            # of the levels.
+        named = f"{chain.identity}__in"
+        parts = [~Q(Exists(source.filter(**{named: _ids(levels[0])}).filter(_not(base_later))))]
+        for above_level, level in pairwise(levels):
+            above = _keys(above_level)
             parts.append(
                 ~Q(
                     Exists(
-                        source.filter(**{f"{chain.identity}__in": list(known)}).exclude(
-                            **{f"{chain.target}__in": list(known.values())}
+                        source.filter(**{named: _ids(level)}).exclude(
+                            **{f"{chain.parent}__in": above}
                         )
                     )
                 )
             )
+            if not chain.keyed:
+                # The parent column names a row by another column than the
+                # identity: the row a child names is still the one found.
+                parts.append(
+                    ~Q(
+                        Exists(
+                            source.filter(**{f"{chain.target}__in": above}).exclude(
+                                **{named: _ids(above_level)}
+                            )
+                        )
+                    )
+                )
         return _Decision(tuple(known), _and(*parts), uses)
+
+
+def _ids(level: Sequence[tuple[Any, Any]]) -> list[Any]:
+    """The identities of the rows of one level of a hierarchy."""
+    return [identity for identity, _key in level]
+
+
+def _keys(level: Sequence[tuple[Any, Any]]) -> list[Any]:
+    """The values a child's parent column names the rows of one level by."""
+    return [key for _identity, key in level if key is not None]
 
 
 @dataclass(frozen=True)

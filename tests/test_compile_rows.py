@@ -1,5 +1,6 @@
 """Small sets of target rows: decided before a scope statement, witnessed inside it."""
 
+import re
 from datetime import timedelta
 
 import pytest
@@ -14,6 +15,7 @@ from rebac.field_backing import resolve_field_backing
 from rebac.schema import parse_zed
 from rebac.testing import install_schema
 from tests.testapp.models import (
+    CodedFolder,
     Folder,
     NativeParentLinkedChild,
     NativeParentLinkedResource,
@@ -82,6 +84,37 @@ def test_a_set_over_the_limit_stays_inside_the_statement(tree, monkeypatch):
     assert f"IN ({folders['child'].pk}, {folders['leaf'].pk})" not in queries[-1]["sql"]
 
 
+TWO_ARROWS = """
+definition auth/user {}
+definition blog/folder {
+    relation parent: blog/folder // rebac:field=parent
+    relation viewer: auth/user
+    permission read = viewer + parent->read
+    permission open = viewer
+}
+definition blog/post {
+    relation folder: blog/folder // rebac:field=folder
+    permission read = folder->read + folder->open
+}
+"""
+
+
+def test_the_row_limit_is_what_one_statement_may_bind(tree, monkeypatch):
+    _local, _folders, posts, grant = tree
+    local = install_schema(TWO_ARROWS)
+    local.write_relationships([grant])
+    held = {posts["child"].pk, posts["leaf"].pk}
+    bound = []
+    for limit in (3, 2):
+        monkeypatch.setattr(read, "_ROW_LIMIT", limit)
+        with CaptureQueriesContext(connection) as queries:
+            assert visible(Post) == held
+        bound.append(len(re.findall(r'"folder_id" IN \(\d', queries[-1]["sql"])))
+    # Two folders hold ``read`` and one holds ``open``: three rows fit in
+    # three, and with two the second set stays a subquery.
+    assert bound == [2, 1]
+
+
 def test_a_decided_set_follows_the_depth_limit(tree, settings):
     _local, folders, _posts, _grant = tree
     settings.REBAC_DEPTH_LIMIT = 0
@@ -144,7 +177,8 @@ def test_rows_closed_into_a_cycle_after_the_decision_are_not_read_through(tree, 
 
     still = {folders["child"].pk} if model is Folder else {posts["child"].pk}
     done = after_deciding(monkeypatch, ("blog/folder", "read"), close)
-    assert visible(model) <= still
+    # The witness fails, so the statement selects nothing.
+    assert visible(model) == set()
     assert done
     assert visible(model) == still
 
@@ -162,7 +196,7 @@ def test_a_row_moved_deeper_after_the_decision_stays_within_the_depth_limit(
 
     within = {folders["child"].pk, folders["leaf"].pk}
     done = after_deciding(monkeypatch, ("blog/folder", "read"), deepen)
-    assert visible(Folder) <= within
+    assert visible(Folder) == set()
     assert done
     assert visible(Folder) == within
 
@@ -224,7 +258,7 @@ def test_an_identity_that_moved_to_another_row_is_not_read_through(monkeypatch):
 
     done = after_deciding(monkeypatch, ("blog/textidentityfolder", "read"), rename)
     # ``other`` now answers to the identity that was decided for ``leaf``.
-    assert visible(TextIdentityFolder) <= {seed.pk, leaf.pk}
+    assert visible(TextIdentityFolder) == set()
     assert done
     assert visible(TextIdentityFolder) == {seed.pk, leaf.pk}
 
@@ -293,6 +327,8 @@ definition blog/folder {
 }
 definition blog/post {
     relation folder: blog/folder // rebac:field=folder
+    relation top: blog/folder // rebac:field=folder__parent
+    relation shelf: blog/folder // rebac:field=collections
     permission read = folder->read
 }
 definition test/nativeparentlinkedresource {}
@@ -328,8 +364,93 @@ def test_only_a_constrained_forward_foreign_key_proves_its_target(monkeypatch):
     unconstrained(monkeypatch, Post, "folder")
     assert not forward.keeps_target("default")
     monkeypatch.undo()
+    # A constraint is taken to exist only on a table Django manages.
+    monkeypatch.setattr(Post._meta, "managed", False)
+    assert not forward.keeps_target("default")
+    monkeypatch.undo()
     monkeypatch.setattr(connection.features, "supports_foreign_keys", False)
     assert not forward.keeps_target("default")
+    monkeypatch.undo()
+    # Every forward key on a longer path must be kept, not only the last.
+    longer = backing(schema, "blog/post", "top")
+    assert longer.keeps_target("default")
+    unconstrained(monkeypatch, Post, "folder")
+    assert not longer.keeps_target("default")
+    monkeypatch.undo()
+    assert not backing(schema, "blog/post", "shelf").keeps_target("default")
+
+
+BANNED = """
+definition auth/user {}
+definition blog/folder {
+    relation parent: blog/folder // rebac:field=parent
+    relation viewer: auth/user
+    relation banned: auth/user
+    permission read = (viewer + parent->read) - banned
+}
+definition blog/post {
+    relation folder: blog/folder // rebac:field=folder
+    permission read = folder->read
+}
+"""
+
+
+@pytest.mark.parametrize("model", [Folder, Post])
+def test_a_decided_set_is_not_used_inside_its_own_recursion(settings, monkeypatch, model):
+    # The exclusion keeps ``read`` out of the self-foreign-key form: its rows
+    # are decided by the predicate, to the depth limit.  Bound at the
+    # permission's own ``parent->read`` they would add a level to that limit.
+    settings.REBAC_DEPTH_LIMIT = 1
+    local = install_schema(BANNED)
+    with sudo(reason="test.fixture"):
+        chain = [Folder.objects.create(name="root")]
+        for name in ("a", "b", "c"):
+            chain.append(Folder.objects.create(name=name, parent=chain[-1]))
+        posts = [Post.objects.create(title=folder.name, folder=folder) for folder in chain]
+    local.write_relationships([RelationshipTuple(to_object_ref(chain[0]), "viewer", ALICE)])
+    rows = chain if model is Folder else posts
+    within = {row.pk for row in rows[:2]}
+    assert visible(model) == within
+    monkeypatch.setattr(read, "_ROW_LIMIT", 0)
+    # Every set inside the statement: the same rows.
+    assert visible(model) == within
+
+
+CODED = """
+definition auth/user {}
+definition blog/codedfolder {
+    relation parent: blog/codedfolder // rebac:field=parent
+    relation viewer: auth/user
+    permission read = viewer + parent->read
+}
+"""
+
+
+def test_a_held_row_that_no_child_can_name_keeps_the_hierarchy(monkeypatch):
+    local = install_schema(CODED)
+    with sudo(reason="test.fixture"):
+        nameless = CodedFolder.objects.create(code=None)
+        top = CodedFolder.objects.create(code="top")
+        under = CodedFolder.objects.create(code="under", parent=top)
+        other = CodedFolder.objects.create(code="other")
+    local.write_relationships(
+        [RelationshipTuple(to_object_ref(row), "viewer", ALICE) for row in (nameless, top)]
+    )
+    # The parent column names a row by ``code``; ``nameless`` has none.
+    assert visible(CodedFolder) == {nameless.pk, top.pk, under.pk}
+
+    def swap():
+        rows = CodedFolder._base_manager
+        rows.filter(pk=under.pk).update(parent=None)
+        rows.filter(pk=top.pk).update(code="was-top")
+        rows.filter(pk=other.pk).update(code="top")
+        rows.filter(pk=under.pk).update(parent_id="top")
+
+    done = after_deciding(monkeypatch, ("blog/codedfolder", "read"), swap)
+    # ``under`` now hangs under the row that took the name, which holds nothing.
+    assert visible(CodedFolder) == set()
+    assert done
+    assert visible(CodedFolder) == {nameless.pk, top.pk}
 
 
 def unconstrained(monkeypatch, model, name):
