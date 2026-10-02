@@ -1,7 +1,7 @@
 # `django-zed-rebac` — Architecture
 
-> Status: **alpha implementation guide** — specifies 0.23.0 (the permission index).
-> Last updated: 2026-09-29
+> Status: **alpha implementation guide** — specifies 0.25.0 (permissions compiled to queries).
+> Last updated: 2026-10-02
 > Audience: Django integrators evaluating fit, contributors, framework authors building on top.
 >
 > Companion docs:
@@ -17,7 +17,7 @@ Core capabilities:
 
 - **The SpiceDB schema language**, hand-authored as `.zed` files shipped per package. Loaded into DB tables on install/upgrade with `noupdate=True` semantics that preserve admin edits.
 - **A pluggable backend boundary:**
-  - `LocalBackend` — pure Django. Permissions are read from a derived permission index that the library keeps current in the same transaction as every source write. Zero infrastructure; query size independent of graph depth.
+  - `LocalBackend` — pure Django. A permission is compiled to a query over the application's own tables and the relationship table, so the library stores no row per application row and a write is visible to the next read. Zero infrastructure; no build step.
   - `SpiceDBBackend` — roadmap adapter for the official [`authzed`](https://pypi.org/project/authzed/) Python client. The class is present as a clear stub, not a supported runtime backend yet.
 - **A `RebacMixin` model mixin** that, by inclusion, replaces `Manager.objects` with a permission-aware variant. Every read scopes to the effective user; every write checks before SQL is issued.
 - **Three storage tiers, three editors:**
@@ -110,8 +110,8 @@ class Post(RebacMixin, models.Model):
 ### 4. Sync and use
 
 ```bash
-python manage.py migrate              # creates source and permission-index tables
-python manage.py rebac sync           # loads permissions.zed and builds the index
+python manage.py migrate              # creates the library's tables
+python manage.py rebac sync           # loads permissions.zed into the schema tables
 ```
 
 ```python
@@ -141,7 +141,7 @@ The same flow works in DRF, Celery tasks, GraphQL resolvers, management commands
 | **Subject** | Who is acting. A typed reference: `subject_type:subject_id`. | `auth/user:42`, `agents/agent:claude_v3` |
 | **Resource** | What is being acted upon. A typed reference. | `blog/post:99` |
 | **Relation** | A typed link from a subject to a resource. Usually rows in the `Relationship` table; field-backed relations are sourced from a Django FK and const-backed relations resolve to one fixed object id. | `blog/post:99 #owner @ auth/user:42` |
-| **Permission** | A computed expression over relations. Defined by the schema, never written by applications; `LocalBackend` keeps a derived, rebuildable index of its holders (see [Permission index](#permission-index--the-localbackend-read-path)). | `permission read = owner + viewer` |
+| **Permission** | A computed expression over relations. Defined by the schema, never written by applications; `LocalBackend` compiles it to a query when it is read (see [Compiled permissions](#compiled-permissions--the-localbackend-read-path)). | `permission read = owner + viewer` |
 | **Caveat** | A CEL expression evaluated at check time against runtime context. | `permission read = viewer with ip_in_cidr` |
 
 Two built-in actor terms, `anonymous` and `authenticated`, may appear
@@ -189,14 +189,11 @@ must not become an allow when its missing context is omitted.
 │  Store:  Relationship, plus field-backed structural relations    │
 │  Loader: written transactionally                                │
 │  Editor: application code + admins                              │
-├─ Derived: PERMISSION INDEX (LocalBackend) ─────────────────────┤
-│  Source: Tiers 1–3 plus backed application columns              │
-│  Store:  rebac_membership, rebac_grant                          │
-│  Loader: maintained by the write owners, same transaction;      │
-│          `rebac index rebuild` recomputes from the sources      │
-│  Editor: none — library-owned cache                             │
 └────────────────────────────────────────────────────────────────┘
 ```
+
+No tier is copied. `LocalBackend` reads Tier 3 and the backed application
+columns when a permission statement runs, under the policy of Tiers 1 and 2.
 
 **Critical invariant:** Tier 1 is the only place new relation types and permission expressions can introduce graph shape. Tier 2 may tighten / loosen / disable / additively extend, but a relation referenced by an override must already exist in some package's `permissions.zed`. This protects against the "admin invents `auditor` relation, no code writes `auditor` rows, every read returns nothing in production" failure mode.
 
@@ -217,12 +214,13 @@ parser stores it on `Relation.backing`; `rebac sync` persists it on
 `SchemaRelation.backing`; `rebac build-zed` omits it from the generated SpiceDB
 schema.
 
-`LocalBackend` derives the relation's edges from the Django column through the
-model's `_base_manager`, so application default managers cannot move the
-authorization boundary (a base manager the model declares itself must return
-every row; see [What gets installed](#what-gets-installed)), and writes to that
-column maintain the permission index
-(see [Maintenance](#maintenance-and-transaction-ownership)). Tuple
+`LocalBackend` reads the relation's edges from the Django column, through the
+model's `_base_manager`, in the statement that evaluates the permission, so
+application default managers cannot move the authorization boundary (a base
+manager the model declares itself must return every row; see
+[What gets installed](#what-gets-installed)). The column is the only copy of
+the fact: a write to it is visible to the next read, and it is gated as
+described under [Writes](#writes). Tuple
 writes/deletes targeting the backed relation raise `SchemaError` with the
 actionable Django field to update instead.
 
@@ -235,8 +233,8 @@ tuple-backed. The native AST codec owns parsing and schema persistence.
 
 The schema validator rejects backed relations with multiple subject types,
 subject sets, wildcards, specific ids, caveats, or expiration. `rebac.E009`
-validates every Django path, lookup, and target model. Index derivation and
-maintenance share these resolved owners.
+validates every Django path, lookup, and target model. The compiler and the
+write gates share these resolved backings.
 
 An edge change requires `write` on every affected resource row whose declared
 backing watches the changed column or through table, provided that resource
@@ -246,13 +244,14 @@ model, scalar predicate columns, nested field paths whose source is another
 model, and both mirror rows of a symmetrical self-M2M. `RebacMixin` deletes
 are not gated; the collector's CASCADE and SET_NULL rows are gated under the
 ambient actor, not the actor pinned on the deleted row; instance-level
-through-model writes are neither gated nor maintained, so `rebac index verify`
-reports them as drift (all three: proposal 0011). The gate finds source rows through the unchanged
+through-model writes are not gated (all three: proposal 0011). Reads see
+all of these writes when they commit; what is open is their authorization.
+The gate finds source rows through the unchanged
 prefix of each affected path, before mutation and under the carrying or ambient
-actor. Bulk owners snapshot watched columns per model, resolve changed FK
-targets and reverse sources once per watched field, and check the union of
-affected IDs with one scoped permission query per declaring resource type.
-Through-table source capture materializes the source FK values of changed
+actor. Queryset owners read the stored watched columns per model, resolve
+changed FK targets and reverse sources once per watched field, and check the
+union of affected IDs per declaring resource type.
+A through-table gate takes the source FK values of the changed
 rows, then queries only declaring rows at the path prefix before the M2M hop.
 Using the full path would compare target PKs to source PKs and miss edges when
 the two sequences differ.
@@ -260,26 +259,26 @@ Instance sudo does not carry through a related manager. A denied
 declaring resource is audited after the failed owner transaction unwinds.
 Tracked models can be backing sources even when their own saves have no
 resource write gate. A backing type without a permission literally named
-`write`, including resource types that name it `edit` or `update`, is maintained
-without an actor gate; consumers protect those columns with Django permissions
-(proposal 0011). Attribute-backed changes check both the old and proposed
+`write`, including resource types that name it `edit` or `update`, has no
+actor gate on its backing columns; consumers protect those columns with
+Django permissions (proposal 0011). Attribute-backed changes check both the old and proposed
 virtual container IDs when the container key changes.
 
 Dynamic attribute containers are named by the canonical Python spelling of the
 column value (`ResolvedAttributeBacking.container_id_of`); a non-canonical id
-such as `"01"` for integer `1` names no container. Derivation reads attribute
-columns in SQL, which follows the column's database collation, while the
-walker compares Python strings exactly. Give attribute columns a deterministic,
-case-sensitive collation (MySQL's default `*_ci` collations are not) so the
-index and the oracle agree. Dynamic attribute fields need a canonical
+such as `"01"` for integer `1` names no container. A statement compares
+attribute columns in SQL, which follows the column's database collation, while
+the write gates and the Python evaluators compare strings exactly. Give attribute
+columns a deterministic, case-sensitive collation (MySQL's default `*_ci`
+collations are not) so the two agree. Dynamic attribute fields need a canonical
 integer, text or UUID codec (`rebac.E014`). Boolean, Date and Decimal dynamic
-containers are refused in 0.23.0; a fixed `resource`/`value` anchor does not
+containers are refused; a fixed `resource`/`value` anchor does not
 encode its attribute value as an identity and remains supported. `rebac.W009`
 warns, best-effort, about case-insensitive attribute collations.
 
 #### Backings are `LocalBackend`-only until the projector ships
 
-Every backing kind below is derived into the index by `LocalBackend` and omitted from
+Every backing kind below is read from its columns by `LocalBackend` and omitted from
 the exported `.zed`, so with `REBAC_BACKEND = "spicedb"` these relations hold
 no edges until the roadmap's library-owned projector materializes them as
 ordinary tuples. This is the one place the "backend swap is a configuration
@@ -336,20 +335,23 @@ field and filtered-constant checks; conversion belongs to the shared identity
 helper.
 
 Only source rows matching the filters carry the edge, including under exclusion
-and through arrows. Filter columns are watched fields: updating them maintains
-the index without tuple writes. Filtered constants never produce type-level
-index rows. Native `.zed` rendering retains the JSON directive
+and through arrows. Filter columns are watched fields: updating one changes
+the edge with no tuple write, and the update is gated as a backed-edge write.
+Native `.zed` rendering retains the JSON directive
 deterministically; SpiceDB export continues to omit backing metadata.
 
 For **unfiltered** constants, resolution is fixed-target rather than per-row,
 which has two consequences in
 `LocalBackend`:
 
-- **One type-level index row, not one per resource.** Because the target object
-  is the same for every row, the index stores the grant once with
-  scope `(resource_type, "*", "$type")`, distinct from wildcard subject terms.
-  New rows need no per-resource grant for this constant. Scopes include the
-  type-level grant arm; a named subtraction site applies any resource-specific ban at read time.
+- **One decision per statement, not one per resource.** Because the target
+  object is the same for every row, a queryset scope decides the arrow over
+  the constant once, before its statement is compiled, and witnesses the
+  decision inside the statement (see
+  [Facts about fixed objects](#facts-about-fixed-objects)). Nothing is stored
+  per resource, so new rows need nothing written for this constant. A
+  resource-specific ban (`- banned`) is evaluated per row in the same
+  statement.
 - **SpiceDB projection is one tuple per source row.** Unlike field-backing's
   one-tuple-per-FK, a `SpiceDBBackend` projector must materialize the synthetic
   edge for every row of the source type (or model it as a `parent`/`platform`
@@ -381,9 +383,10 @@ which has two consequences in
 │  ┌─────────▼──────────┐    ┌──────────▼──────────────┐          │
 │  │  LocalBackend      │    │  SpiceDBBackend          │          │
 │  │  ─────────────     │    │  ──────────────          │          │
-│  │  permission index  │    │  planned authzed adapter │          │
-│  │  + cel-python for  │    │  roadmap implementation  │          │
-│  │  caveated checks   │    │                          │          │
+│  │  permissions       │    │  planned authzed adapter │          │
+│  │  compiled to SQL   │    │  roadmap implementation  │          │
+│  │  + cel-python for  │    │                          │          │
+│  │  caveats           │    │                          │          │
 │  └────────────────────┘    └──────────────────────────┘          │
 │                                                                   │
 └──────────────────────────────────────────────────────────────────┘
@@ -411,7 +414,7 @@ which has two consequences in
 from rebac import (
     # Mixin and managers
     RebacMixin, RebacTrackedMixin, RebacManager, RebacQuerySet,
-    TrackedManager, TrackedQuerySet,    # unscoped, index-maintaining; the base for a declared base manager
+    TrackedManager, TrackedQuerySet,    # unscoped; own gated writes; the base for a declared base manager
 
     # Decorators
     require_permission, rebac_resource,
@@ -420,6 +423,7 @@ from rebac import (
     Backend, LocalBackend, SpiceDBBackend,
     CheckResult, Consistency, Zookie,
     ObjectRef, SubjectRef, RelationshipTuple,
+    CheckItem,                          # one item of check_bulk_permissions()
 
     # Errors
     PermissionDenied, MissingActorError, CaveatUnsupportedError,
@@ -440,7 +444,7 @@ from rebac import (
     # Convenience helpers
     write_relationships, delete_relationships, delete_relationship, backend,
 
-    # One index rebuild for a block of stored-schema writes
+    # One transaction and one validation for a block of stored-schema writes
     schema_changes,
 
     # Preflight against not-yet-persisted resources (0.4+)
@@ -465,22 +469,21 @@ from rebac.testing import install_schema   # test helper: make a schema and back
 supported way for a dependent project's tests to run against a schema of
 their own. It installs `schema` (a parsed `Schema` or `.zed` text) as a manual
 schema on `backend` (a new `LocalBackend` by default), makes that instance the
-one `rebac.backend()` returns in this process, rebuilds the permission index on
-`using` so it matches the rows already stored, and returns the backend.
+one `rebac.backend()` returns in this process, makes sure the
+`SchemaGeneration` row exists on `using` (the relationship write alias by
+default), and returns the backend. It builds nothing: permissions on `using`
+are decided from the rows already stored.
 `rebac.backends.reset_backend()` undoes it; call it in teardown.
 
 `rebac.schema_changes(using=None)` groups writes to stored schema rows
-(`SchemaDefinition`, `SchemaRelation`, `SchemaPermission`, `SchemaOverride`).
-Each such write owns a maintenance pass and rebuilds the index for the types it
-affects and every type that depends on them, so a provisioning step that
-deletes many rows one by one walks the same source tables once per row. Inside
-the block the writes join one pass and one rebuild runs at exit. The block is
-one transaction on `using` (the relationship write alias by default) and holds
-the index lock until it exits; an exception rolls the writes back. A
-relationship write made after a schema change in the block is covered by that
-rebuild; made before any schema change it is maintained on its own, so change
-the schema first. Blocks nest. It applies to the stored schema of
-`LocalBackend`; it is not a way to suspend maintenance, and there is none.
+(`SchemaDefinition`, `SchemaRelation`, `SchemaPermission`, `SchemaCaveat`,
+`SchemaOverride`). Each such write on its own locks the policy, publishes a
+revision and validates the composed policy. Inside the block the writes share
+one transaction on `using` (the relationship write alias by default) and the
+policy lock is held until the block exits; the composed policy is validated
+once, at the exit of the outermost block, and an exception rolls the writes
+back. Blocks nest: an inner one joins the outer one. It applies to the stored
+schema of `LocalBackend`.
 
 `rebac.memberships` owns direct `member`-tuple creation, exact (caveat-aware)
 revocation and enumeration for any container type. `rebac.roles` composes it
@@ -598,7 +601,7 @@ engine changes:
 |---|---|
 | **Type-union inclusion** | Fixed compile-time hierarchy. Add the narrower role's `:<id>#member` to the wider role's type union: `relation member: auth/user \| storage/role:object_admin#member`. The narrower-role members flow through to every role declaring this union entry. Best for universal-admin (`platform/role:admin#member`). |
 | **Per-resource permission composition** | Per-resource viewer/editor/admin tiers. Each resource declares `permission read = viewer + editor + admin` so granting `object_admin` lights up read/write/delete automatically. Most explicit; grep-able. Default choice for CRUD-shape roles. |
-| **Runtime-editable `includes` + `effective_member`** | Hierarchy editable at runtime without a schema PR. Roles declare `relation includes: <namespace>/role` + `permission effective_member = member + includes->effective_member`; resources hold a direct role object and arrow to `effective_member`. `rebac.roles.imply(parent=..., child=...)` writes the direct child-role tuple. LocalBackend materializes this reachability during maintenance. |
+| **Runtime-editable `includes` + `effective_member`** | Hierarchy editable at runtime without a schema PR. Roles declare `relation includes: <namespace>/role` + `permission effective_member = member + includes->effective_member`; resources hold a direct role object and arrow to `effective_member`. `rebac.roles.imply(parent=..., child=...)` writes the direct child-role tuple. `LocalBackend` follows the inclusion chain when the permission is read, up to `REBAC_DEPTH_LIMIT` levels (see [Recursion](#recursion)). |
 
 Relationship subjects may name only relations, as required by SpiceDB's
 [subject relation contract](https://authzed.com/docs/spicedb/concepts/schema#subject-relations);
@@ -669,9 +672,10 @@ flows through it.
 
 ## Models
 
-Source models hold relationships, the schema baseline, provenance and overrides.
-Registry, audit and schema-generation models support those surfaces. The seven
-internal index tables are listed under [Tables](#tables).
+The models hold relationships, the schema baseline, provenance and overrides.
+Registry, audit and schema-generation models support those surfaces. The
+library has no table that holds a row per application row; the full list is
+under [Tables](#tables).
 
 ### `Relationship` — Tier 3, the core REBAC store
 
@@ -686,6 +690,7 @@ class Relationship(models.Model):
     optional_subject_relation = models.CharField(max_length=64, blank=True)
     caveat_name               = models.CharField(max_length=64, blank=True)
     caveat_context            = models.JSONField(null=True, blank=True)
+    caveat_key                = models.CharField(max_length=64, blank=True, editable=False)
     expires_at                = models.DateTimeField(null=True, blank=True, db_index=True)
     written_at_xid            = models.BigIntegerField(db_index=True)
 
@@ -710,7 +715,9 @@ class Relationship(models.Model):
         ]
 ```
 
-**Frozen contract.** The shape mirrors `authzed.api.v1.Relationship` exactly. Renames are breaking. Indexes are critical (permission-index derivation reads them on every relationship write and rebuild) and ship in the initial migration — never as a documentation step.
+**Frozen contract.** The shape mirrors `authzed.api.v1.Relationship` exactly. Renames are breaking. Indexes are critical (every permission statement that reads tuples uses them) and ship in the initial migration — never as a documentation step.
+
+**`caveat_key`.** A library-owned digest of the caveat name and the pinned context, empty for a tuple without a caveat. It is not part of the wire shape. Every supported write path writes it with the tuple, and statements select caveated tuples by it (see [Caveats](#caveats)).
 
 **Swappability.** Projects that need to extend the model (audit FKs, multi-tenant prefix, etc.) declare a custom subclass and point `REBAC_RELATIONSHIP_MODEL = "myapp.MyRelationship"`. The plugin uses [`swapper`](https://pypi.org/project/swapper/) to keep migrations correct across this swap. Default behaviour: `swapper` returns the built-in `rebac.Relationship`.
 
@@ -772,8 +779,7 @@ registered Django model; unknown types and missing rows are omitted.
 
 - Index density: with integer FKs the hot `(resource_fk, relation)` index
   fits ~500+ entries per Postgres leaf page vs ~40 in denormalized form.
-  Permission-index derivation reuses these indexes heavily, so the gain
-  compounds in rebuilds and write maintenance.
+  Every permission statement that reads tuples uses these indexes.
 - FK cascade: when a Django row backed by `RebacMixin` is deleted, the
   `post_delete` signal handler drops the matching `RebacResource` row,
   and the FK CASCADE on `RelationshipRegistry` sweeps every tuple that
@@ -929,36 +935,37 @@ override deadlines expire the composed snapshot.
 Schema reads use the alias selected by the `SchemaDefinition` router; component
 and override reads stay on that alias. No schema queries run at startup.
 An operation pin is checked before querying the revision. Outside an evaluator,
-a new operation observes the revision and `index_revision` together; a cold
-load checks the witness again to avoid publishing a schema spanning a commit.
-The pin stores both witnesses. Retry exhaustion uses one uncached load checked
-against the paired witness before and after; a changing fallback fails closed.
+a new operation reads the revision; a cold load reads it again after loading,
+to avoid publishing a schema spanning a commit. The pin stores the revision.
+Retry exhaustion uses one uncached load checked against the revision before
+and after; a changing fallback fails closed.
 Within a scope, repeated pinned schema reads and eligible decision-cache hits
 issue no queries. There is no revision SELECT on each cache lookup.
 
 The five policy models (definitions, relations, permissions, caveats and
 overrides) own writes through their shared model/queryset, including base-manager
-and reverse-relation bulk writes. They acquire the maintenance lock before
-policy reads or writes, rebuild affected definitions and dependents, then
-publish `SchemaGeneration.revision` and matching `index_revision` in the same
-transaction. `SchemaGeneration.objects.advance(using=...)` publishes the token;
-callers must arrange maintenance before publishing readiness. A deletion
+and reverse-relation bulk writes. An owner locks the `SchemaGeneration` row
+before policy reads or writes, creating it when absent, publishes a fresh
+`SchemaGeneration.revision` in the same transaction
+(`SchemaGeneration.objects.advance(using=...)`), and validates the composed
+policy once when the outermost owner exits (see [Writes](#writes)). A deletion
 receiver covers cascades originating outside these owners. Conflict-ignoring
 and upserting policy bulk creates are refused. Raw SQL policy writes bypass
-these guarantees and require sync/rebuild before serving reads.
+the lock, the validation and the revision: a process keeps its cached policy
+until a supported policy write or `rebac sync` publishes a revision.
 
 Revision tokens are fresh identities, not rollback-reusable counters. Their
 visibility follows database isolation, and they never enter deterministic
-schema output. Same-process schema writes evict shared snapshots. Missing
-witness rows are repaired by supported schema writes or sync/rebuild without
-restarting the backend; there is no sticky degraded mode. Permission reads
-against a missing, unmigrated or mismatched index fail closed with
-`SchemaError` / `rebac.E013`. Apply migrations and run `rebac sync` or
-`rebac index rebuild` before serving. Migration `0005` does not seed the
-revision row; `0007` seeds only the maintenance lock.
+schema output. Same-process schema writes evict shared snapshots. A missing
+generation row is created by the next supported policy write or sync without
+restarting the backend; there is no sticky degraded mode. Before any policy
+is published the revision is empty, every permission statement is fenced out
+and reads are closed (see
+[Kept statements and the policy fence](#kept-statements-and-the-policy-fence)).
+Apply migrations and run `rebac sync` before serving. Migration `0009`
+creates the generation row with an empty revision.
 
-Every explicit sync publishes a fresh revision. If the index is unready, even
-an unchanged sync rebuilds everything before setting `index_revision`.
+Every explicit sync publishes a fresh revision, an unchanged sync included.
 `sync --check` is read-only.
 
 Evaluator invalidation clears schema pins, including on subscription emissions;
@@ -966,7 +973,7 @@ an unchanged revision can reuse the shared parsed tree. Connection observers
 clear pins around writes and transaction boundaries, including rollback.
 Manual transaction management retains operation pins only. Permission decisions
 remain uncached inside transactions. Backing rows are never stored in schema
-snapshots; supported writes maintain their index representation.
+snapshots; a statement reads them when it runs.
 
 Decision-cache policy retains the 0.18.2 exclusions: resource types reachable
 from field or attribute backings are not cacheable. Expiring relationships
@@ -979,9 +986,8 @@ cannot independently observe another process's commit.
 
 The connection observer sees Django cursor writes, not arbitrary DB-API calls
 or side effects hidden inside SELECT expressions. Such escape hatches require
-an explicit evaluator invalidation boundary, and any bypassed source/index
-maintenance additionally requires rebuild. Invalidation alone cannot repair
-derived rows.
+an explicit evaluator invalidation boundary for the per-request decision
+cache. Statements themselves read the rows as they are and need none.
 
 An override is active while `expires_at` is null or strictly later than the
 evaluation time. The composed schema refreshes at the earliest active deadline,
@@ -1039,10 +1045,8 @@ All settings prefixed `REBAC_`. No nested dict. Read via the public `app_setting
 | `REBAC_SPICEDB_TLS` | `True` | `bool` | Roadmap setting for TLS behavior in the future SpiceDB adapter. |
 | `REBAC_SPICEDB_AUTO_WRITE_SCHEMA` | `True` | `bool` | Roadmap setting for future schema auto-push. |
 | `REBAC_SCHEMA_DIR` | `BASE_DIR / "rebac"` | `Path` \| `str` | Where `build-zed` writes `effective.zed`. |
-| `REBAC_DEPTH_LIMIT` | `8` | `int` | Hard cap on the permission walker (`check_new`). Does not bound permission-index reads or derivation, which terminate on cycles by fixpoint. |
-| `REBAC_TRACKED_MODELS` | `[]` | `list[str]` | Third-party backing models (`"app_label.ModelName"`); explicit-sender save/delete receivers. User and Group are automatically tracked. |
-| `REBAC_INDEX_CONDITION_LIMIT` | `256` | `int` | Maximum caveat instances in a normalized logical contribution per `(scope, node, holder, site)`. Exceeding it raises `SchemaError` and rolls back the write. |
-| `REBAC_INDEX_LOOKUP_LIMIT` | `64` | `int` | Maximum static read-plan lookups for a permission. `rebac.E019` rejects larger plans during checks. |
+| `REBAC_DEPTH_LIMIT` | `8` | `int` | Number of levels to which a recursive permission is unrolled in a compiled statement, and the cap on the permission walker (`check_new`). Within the bound a point check answers; one that cannot be decided within it raises `PermissionDepthExceeded`; a queryset scope includes only rows provable within it. Choose it to cover the deepest recursive chain in the data; statement size grows linearly with it. See [Recursion](#recursion). |
+| `REBAC_TRACKED_MODELS` | `[]` | `list[str]` | Third-party backing models (`"app_label.ModelName"`), gated by explicit-sender receivers. User and Group are automatically tracked. |
 | `REBAC_DEFAULT_CONSISTENCY` | `"minimize_latency"` | `str` | Default `Consistency` for checks. |
 | `REBAC_CACHE_ALIAS` | `"default"` | `str` | Django cache backend name for `accessible()` cache. |
 | `REBAC_LOOKUP_CACHE_TTL` | `60` (s) | `int` | TTL for `accessible()` cache. Invalidated on relationship writes for the matching `(subject, action, resource_type)`. |
@@ -1070,7 +1074,6 @@ backend resolution when a non-local backend is selected, so invalid backend
 configuration is reported as checks rather than crashing `manage.py check`.
 `rebac.W001` recognizes the shipped auth backend and its subclasses by class
 identity, including the two public import paths.
-`rebac.E017` requires a positive integer condition limit (booleans are invalid).
 Production-only checks (`--deploy`) include `rebac.W101` for
 `REBAC_SPICEDB_TLS = False`.
 
@@ -1113,18 +1116,15 @@ System checks (in `rebac/checks.py`):
 | `rebac.E006` | Error | `REBAC_LOCAL_BACKEND_STORAGE` is `"denormalized"` or `"registry"`. |
 | `rebac.E007` | Error | `REBAC_ZOOKIE_TRANSPORT` is `"none"`, `"header"`, or `"session"`. |
 | `rebac.E008` | Error | `REBAC_FIELD_READ_MODE` is not one of `"allow"`, `"redact"`, `"omit"`, or `"raise"`. |
-| `rebac.E009` | Error | A field-, attribute- or const-backed relation cannot be resolved: missing Django model, identity field, relation path, attribute or filter lookup; a path that ends on a different model than the declared subject type; or a const-backed relation whose target type has no schema definition. |
-| `rebac.E010` | Error | Const-backed arrows form a schema evaluation cycle. The existing const-arrow validation remains unchanged in 0.23.0, including for preflight; the index's support for positive data cycles does not relax this schema restriction. |
+| `rebac.E009` | Error | A field-, attribute- or const-backed relation cannot be resolved: missing Django model, identity field, relation path, attribute or filter lookup; a path that ends on a different model than the declared subject type; or a const-backed relation whose target type has no schema definition. A read whose permission reaches such a relation raises `SchemaError` citing this ID; permissions that do not reach it are still decided. |
+| `rebac.E010` | Error | Const-backed arrows form a schema evaluation cycle. The const-arrow validation also bounds the proposed-object preflight; the compiler's support for positive data cycles does not relax this schema restriction. |
 | `rebac.E011` | Error | `Meta.rebac_subject_relation` names a relation the model's effective schema definition does not declare. |
-| `rebac.E013` | Warning (database; historical ID retained) | The permission index is not built for the current schema revision (`SchemaGeneration.index_revision` differs from the revision), or was derived by a different program (`index_program` differs from the compiled program's digest). Allows migrations and fresh test databases to reach `rebac sync` or `rebac index rebuild`; permission reads still fail closed. |
-| `rebac.E014` | Error | A resource identity field, field-backed target identity or dynamic attribute container column has no canonical wire/column codec (supported: integer/auto, char/text/slug, UUID). Custom encoded field conversions that SQL cannot reproduce are refused. Fixed Boolean attribute anchors do not require a Boolean codec. |
-| `rebac.E015` | Error | A scoped or backing model's **write** alias differs from the relationship write alias, so its writes cannot maintain the index in the same transaction. Separate read replicas are allowed. |
-| `rebac.E016` | Error | A named intersection or subtraction site is on a recursive dependency cycle, including a self-loop, or a generated node name exceeds 64 characters. Prints the cycle or offending node and any introducing override. |
-| `rebac.E017` | Error | `REBAC_INDEX_CONDITION_LIMIT` is not a positive integer, or is a boolean. |
-| `rebac.E018` | Error | A backing-path model is neither `RebacMixin`, `RebacTrackedMixin`, nor explicitly tracked. Auto-created throughs with an owned/tracked endpoint and configured User/Group models are tracked automatically. Invalid `REBAC_TRACKED_MODELS` labels are errors too. |
-| `rebac.E019` | Error | A permission's static read plan exceeds `REBAC_INDEX_LOOKUP_LIMIT`, or the limit is not a positive integer. The diagnostic prints the plan. |
+| `rebac.E014` | Error (database) | The identity of a resource model, a field-backed target or a dynamic attribute container column cannot be compared with stored tuples: it has no canonical wire/column codec (supported: integer/auto, char/text/slug, UUID). Custom encoded field conversions that SQL cannot reproduce are refused. Fixed Boolean attribute anchors do not require a Boolean codec. |
+| `rebac.E015` | Error (database) | A scoped or backing model's **write** alias differs from the relationship write alias. Models a permission reads must share the relationship database alias, because one statement joins them. Separate read replicas are allowed. |
+| `rebac.E016` | Error (database) | A recursive component of the policy is refused by the compiler: a permission of the component is reached through the right-hand side of `-` inside the component, or one expression uses permissions of the component more than once. See [Recursion](#recursion). |
+| `rebac.E018` | Error | A model on a permission backing path is neither `RebacMixin`, `RebacTrackedMixin`, nor explicitly tracked, so writes to it would not be gated (database check). Auto-created throughs with an owned/tracked endpoint and configured User/Group models are tracked automatically. Invalid `REBAC_TRACKED_MODELS` labels are errors too. |
 | `rebac.E021` | Error | The schema declares a caveat but `cel-python` (the `caveats` extra) is not installed, so caveat bodies cannot be validated or evaluated. |
-| `rebac.E023` | Error | A `RebacMixin` / `RebacTrackedMixin` model's declared base manager returns a queryset that is not a `TrackedQuerySet`, or one that filters rows. The library reads source rows and maintains the index through the base manager. (`E020` and `E022` are reserved by proposals 0011 and 0013.) |
+| `rebac.E023` | Error | A `RebacMixin` / `RebacTrackedMixin` model's declared base manager returns a queryset that is not a `TrackedQuerySet`, or one that filters rows. The library reads a model's rows and owns its gated writes through the base manager. (`E020` and `E022` are reserved by proposals 0011 and 0013.) |
 | `rebac.W001` | Warning | `rebac.backends.RebacBackend` not in `AUTHENTICATION_BACKENDS`. |
 | `rebac.W002` | Warning | A model with `Meta.rebac_resource_type` is missing `RebacMixin`. |
 | `rebac.W003` | Warning | An RBAC-bound relation exists where bare `select_related("rel")` / `prefetch_related("rel")` can be unsafe outside the REBAC helpers or Strawberry-Django optimizer. |
@@ -1135,6 +1135,10 @@ System checks (in `rebac/checks.py`):
 | `rebac.W009` | Warning | A text attribute-backed column declares a case-insensitive collation (`*_ci`, or the MySQL default), so SQL scoping and Python checks could disagree on container ids. Best-effort detection. |
 | `rebac.W010` | Warning | A stored override references a relation or permission removed from the current baseline; that override is ignored until updated or deleted. |
 | `rebac.W101` | Warning (`--deploy`) | `REBAC_SPICEDB_TLS = False` in production. |
+
+`rebac.E014`, `rebac.E015`, `rebac.E016` and the backing-path form of
+`rebac.E018` read the stored schema, so they run only as database checks:
+`manage.py check --database <alias>`, and the checks `migrate` runs.
 
 Users silence individual checks via Django's `SILENCED_SYSTEM_CHECKS = ["rebac.W001"]`.
 
@@ -1200,6 +1204,20 @@ class Backend(ABC):
 
     def has_access(self, *, subject, action, resource, context=None) -> bool:
         """Boolean shorthand. CONDITIONAL collapses to False."""
+
+    def check_bulk_permissions(
+        self,
+        items: Iterable[CheckItem],     # CheckItem(subject, action, resource, context=None)
+        *,
+        consistency: Consistency | None = None,
+        at_zookie: Zookie | None = None,
+    ) -> list[CheckResult]:
+        """One three-state result per item, in the order given: what
+           check_access() answers for that item. Mirrors SpiceDB's
+           CheckBulkPermissions. An error that check_access() would raise
+           for an item is raised by the call. The base implementation asks
+           item by item; a backend overrides it to share work between
+           items."""
 
     def accessible(
         self, *,
@@ -1299,14 +1317,15 @@ overlay::
         raise PermissionDenied(result.reason)
 
 Arrow hops walk into the (real) target via the active backend's
-``check_access`` (answered by the permission index), so all post-hop evaluation reuses the canonical
+``check_access`` (answered by the compiled predicate), so all post-hop evaluation reuses the canonical
 semantics — caveat-conditional outcomes propagate as
 ``CONDITIONAL_PERMISSION`` with the union of missing caveat
 parameters. The dispatch (operator precedence, sub-permission cycle
 detection, ``anonymous`` / ``authenticated`` built-ins, tri-state
 combinators, ``REBAC_DEPTH_LIMIT``) uses ``rebac.schema.walker``. Persisted
-checks, including caveated checks, use the index; the former LocalBackend
-walker is retained only as a frozen test oracle.
+checks, including caveated checks, use the compiler; a frozen copy of an
+earlier scalar walker (`tests/reference_oracle.py`) serves only as a test
+oracle.
 
 Unfiltered const-backed relations are injected into the virtual overlay from the
 schema. If a new `blog/post` declares `relation admin: platform/role //
@@ -1488,372 +1507,660 @@ wrapped model's resource type, ID attribute and subject relation.
 User/Group/anonymous types, or decorators generate identity. Already canonical
 `ObjectRef` and `SubjectRef` values retain their wire types unchanged.
 
-### Permission index — the LocalBackend read path
+### Compiled permissions — the LocalBackend read path
 
-Every persisted LocalBackend read uses one derived index: checks, scopes,
-`accessible()`, `lookup_subjects()`, field gates and bulk guards. Relationships
-and declared backings remain the source of truth. The index is rebuildable and
-maintained in the source transaction. The walker remains for `check_new` and
-the frozen test oracle. No alternative scope compiler is installed.
+`LocalBackend` answers every persisted read from one compiler: checks,
+queryset scopes, `accessible()`, `lookup_subjects()`, field gates and bulk
+guards. A permission is compiled to a Django `Q` predicate over the
+application's own tables and the relationship table, and the database
+evaluates it when the statement runs. Field-, attribute- and const-backed
+relations are read from the model columns; stored relations are read from
+tuples. Nothing is built, rebuilt or verified: a model write or a tuple write
+is visible to the next read. The schema walker (`rebac.schema.walker`) remains
+for `check_new`, which evaluates a row that does not exist yet.
 
-#### Stored sets and terms
+The implementation is the package `rebac.compile`: `program` (the dependency
+graph of a policy), `predicate` (the compiler), `conditions` and `formulas`
+(caveats), `read` (the operations) and `evaluate` (what an undecided check
+still needs). `rebac.watch` holds the map of the columns a policy reads, for
+the write gates.
 
-The index stores monotone sets only: union, arrows, recursion and backings.
-Each intersection or subtraction is a named *site*, held by reference in a
-grant row. No set operation is expanded into per-actor rows. Reads evaluate
-sites against the current index. This follows the approved Leopard design.
+#### Tables
 
-| Model / table | Fields | Keys and indexes |
-|---|---|---|
-| `IndexTerm` / `rebac_term` | `type`, `object_id`, `relation` | Unique triple. |
-| `IndexEdge` / `rebac_edge` | `resource`, `resource_type`, `relation`, `subject`, `target`, `source`, `expires_at`, condition/key | Unique `(resource, relation, subject, source, condition_key)`; latest expiry retained. |
-| `IndexMember` / `rebac_membership` | `member`, `member_type`, `set`, `expires_at`, condition/key, `pass_id`, `round` | Unique `(member, set, condition_key)`; indexes `(set, member)`, `(pass_id, round)`. |
-| `IndexCover` / `rebac_grant` | `scope`, `resource_type`, `node`, `holder`, `site` (Char 64, default `""`), `expires_at`, condition/key, `pass_id`, `round` | Unique `(scope, node, holder, site, condition_key)`; indexes `(resource_type, node, site, holder)`, `(scope, node)`, `(holder, site, node)`, `(pass_id, round)`. |
-| `IndexWork` / `rebac_index_work` | `pass_id`, `kind`, `term`, `node`, `phase` | Materialized old/new states and region; indexes include `(pass_id, phase, kind)`. |
-| `IndexState` / `rebac_index_state` | `key` | One global lock row per alias. |
-| `SchemaGeneration` | `index_revision`, `index_program` | Readiness witnesses: the policy revision the index was derived for, and the digest of the program that derived it. |
+The library stores no row per application row. Its tables are:
 
-Every index foreign key to `IndexTerm` retains its database constraint and
-uses `on_delete=DO_NOTHING`. The library deletes dependent rows before terms.
-Public `QuerySet.delete()` takes Django's fast path on these internal tables.
-
-A plain grant row (`site=""`) grants to its holder and the holder's members.
-A site grant row delegates to the named site. The site is evaluated at the
-object being checked when the row's holder is its own scope (a site used as an
-arm, and type-level rows), and at the holder otherwise (an arrow target or a
-constant target). A type-level holder of another type never occurs: arrows and
-constants instantiate it at their concrete target.
-Reserved terms include `(T,"*","")` for a wildcard,
-`("$authenticated","*","")`, the distinct anonymous class term, and
-`(T,"*","$type")` for a type-level scope. Literal `"*"` resource IDs are
-rejected on writes. Wildcards match concrete actors of their type, never
-subject-set actors; authenticated matches any resolved nonempty actor except
-the anonymous singleton. Unknown actors can match wildcard memberships.
-
-Expiry is the latest across alternative paths of the earliest expiry along
-each path. `TIME_MAX` means never. A row is active when `expires_at > now`,
-where `now` is bound at statement execution. The sentinels support aware and
-naive datetimes according to `USE_TZ`. Relationship expirations must lie
-strictly between them. No graph re-derivation is needed when time passes.
-
-The index gives every row of a resource model a term, so that enumeration
-lists a row that holds a permission only through a type-level grant; the
-vacuum keeps the object terms of every defined type for the same reason. It reads
-those rows only when Django manages the model's table. An unmanaged model may
-be the anchor of a type whose objects exist only in relationships, such as a
-role, and have no table at all: the objects of its type are the ones that
-relationships, constants and backings name, as for a type with no model. A
-backing that names a column of an unmanaged model still reads it.
-
-Both relationship storage modes use the same index on the relationship write
-alias. `rebac.E015` refuses cross-alias backings. Identity codecs support
-integer, text and UUID fields, including vendor-specific limits and canonical
-spelling; unsupported fields raise `rebac.E014`.
-
-#### Program and read plan
-
-The immutable program contains every relation and permission, plus internal
-mono operand nodes and named sites. Internal nodes are named by content:
-`<permission>.<digest>`, where the digest covers the node's operands or lowered
-expression and the override that contributed it. A name never changes meaning
-when an override is added or removed. Operands of a site are always nodes; a
-nested site is wrapped in a mono node. Compile-time lowering runs to a fixpoint:
-`X - nil = X`; `X & nil = nil & X = nil - X = nil`. A site with a deadline
-is never lowered: a tighten to `nil` means "deny until the deadline". A
-permission with only nil arms is nil.
-
-The program is compiled from the baseline and every override row, expired rows
-included, so it does not depend on the clock. Its digest is published with the
-index as `SchemaGeneration.index_program`. Its watched-model map covers identities, backing paths,
-filters, through rows and inherited fields. The program stores SCC strata and
-the declared userset relations.
-
-Override composition is `((baseline ∪ extends) − disables) & tightens`.
-The composition module keeps each contributing override's deadline on its
-tagged arm or operand, and the plain `compose()` derives from that same
-implementation. Extend and loosen rows limit the expiry of the arm they add.
-A disable or tighten site becomes the identity at its deadline. Recaveat
-changes the caveat definition read at query time, so projection retains
-recaveatable leaves.
-
-For node `N`, `held_sites(N)` lists named sites that can occur among its
-holders through monotone edges. The static plan size is
-`lookups(N) = 1 + Σ[lookups(left(s)) + lookups(right(s))]` over those sites.
-`rebac.E016` rejects a site on a recursive SCC, including a self-loop,
-and names the cycle and introducing override. The cycle graph contains
-derivation dependencies only: references, arrows and site operands. A
-relation's subject sets are not dependencies, because grants hold them by
-reference. `rebac.E019` rejects a permission whose plan exceeds
-`REBAC_INDEX_LOOKUP_LIMIT` (default 64), printing the plan.
-
-Both checks run as system checks for declared schemas, and in the policy write
-owners for every schema or override write, `sync` included. A refused program
-raises `SchemaError` and rolls the write back, so a read never discovers one.
-A runtime `disable` or `tighten` on a recursive permission puts a site on the
-cycle and is refused the same way.
-
-#### Derivation
-
-Each rule is a set-based queryset streamed through `stream_create`:
-
-| Rule | Rows for mono node N at resource type T |
+| Models | Content |
 |---|---|
-| Relation r | Each edge `(R,r,subject)` yields `(R,N,subject,"")`. |
-| Reference M | Copy M at the same scope, retaining holder and site. |
-| Arrow `via->p` | For each edge `(R,via,t)`, copy p's rows at t, taking the earlier edge/row expiry and conjunction of conditions. Follow t's object even when the edge subject has a userset suffix. Type-level target rows apply to each edge of the target type: each type-level row, and there are few, is applied with one indexed query over the arrow's edges to targets of its type. Instantiate a type-level site holder at t. |
-| Builtin and unfiltered constant | Produce one type-level row with a reserved holder, or target rows at type level. |
-| Site s as an arm | For each scope with any left-operand row, emit `(R,N,R,s)` with the latest expiry of those rows and no condition. A type-level left row emits `(T*,N,T*,s)`. |
+| `SchemaDefinition`, `SchemaRelation`, `SchemaPermission`, `SchemaCaveat` | The schema baseline (Tier 1). |
+| `PackageManagedRecord` | Provenance of the baseline rows. |
+| `SchemaOverride` | Runtime overrides (Tier 2). |
+| `Relationship`; `RelationshipRegistry` with `RebacResource` | Stored tuples (Tier 3). Both shapes have tables; the active storage mode decides which one holds the tuples. |
+| `SchemaGeneration` | One row (`pk=1`) with one column, `revision`: the published policy revision. An empty value means that no policy is published. |
+| `PermissionAuditEvent` | Audit events. |
 
-A concrete row is stored even when a type-level row implies it, so a
-rebuild and incremental maintenance produce identical rows. Recursive strata
-use insert-only semi-naive rounds
-with `(pass_id, round)`: later rounds join the preceding delta. Data cycles
-terminate at a finite fixpoint without `REBAC_DEPTH_LIMIT`.
+#### The predicate
 
-Membership closure covers declared userset relations, including wildcard
-and subject-set members. Grants hold a userset term by reference, so a
-membership write never rewrites the grants of the set's consumers. A relation
-has grant rows when a node references it: a permission that names it, an arrow
-that targets it, or a site that takes it as an operand. A write to such a
-relation re-derives its rows and their derivation dependents. A relation no
-node references has no grant rows and is read from the closure.
+The compiler has one entry point, `Compiler.holds(key, at, bound)`. `key` is
+`(resource_type, name)`: a relation or a permission. `at` says where the
+object is in the statement being built. `bound` is `LOWER` or `UPPER`
+(see [Bounds](#bounds)). The result is a `Q` whose value is never `NULL`.
 
-A fully pinned caveat is evaluated at derivation when the result is definite
-and no recaveat override targets that caveat: a true result stores the row
-without a condition, a false result stores no row. Split ORs of distinct
-`IN (subquery)` branches into separate queries. Stored conditions contain
-only `and`/`or` formulas over caveat instances. Python handles only rows
-that carry formulas. The normalized logical contribution is bounded by
-`REBAC_INDEX_CONDITION_LIMIT`; exceeding it raises `SchemaError` and
-rolls the write back. Index writes use Django `bulk_create` and run inside
-the owner's `atomic(savepoint=False)`, without a savepoint per batch.
-No raw SQL, trigger, database function or undocumented ORM API is used,
-with one deliberate exception: the queryset-scope plan cache (0.23.1) keeps the
-SQL that Django compiles for a plan, through `Query.get_compiler()`, and embeds
-it in the outer statement from a custom expression. The SQL is Django's own; no
-statement is written by hand.
-
-The exception stays because no public-API design comes close. Embedding a
-queryset makes Django clone and re-resolve every expression node of it
-(`Query.resolve_expression`), and for a plan that is about 70% of compile time.
-Measured on an eleven-lookup plan: reusing the built plan and compiling it
-each time takes 18.5 ms; a compact actor set stored in the index, 17.4 ms;
-matching the actor with a join instead of subqueries, 18.8 ms. Even a
-placeholder actor set, which is incorrect, only reaches 10.9 ms. The cached
-SQL takes about 1 ms.
-
-The same exception covers one fragment on the write side (proposal 0014,
-step 1, first part): the identity conversion's guard. `codec.to_wire()` and
-`codec.to_column()` wrap an expression in a validity check that reads it about
-ten times and depends only on the identity field, the direction and the
-connection. Django compiles that guard once around a placeholder; each use
-compiles its own expression once and takes the placeholder's positions. The
-guard was rebuilt, re-resolved and recompiled at every use, 186 times for one
-model save in the maintenance test schema, which was about 60% of the Python
-time of a pass: 110 to 120 ms per save became 50 to 60 ms on SQLite, with the
-same 102 statements. `tests/test_index_codec_cache.py` pins the cached SQL and
-parameters equal to the uncached ones for integer, text and UUID identities,
-on SQLite and PostgreSQL.
-
-#### Reads
-
-One `member(node, x, actor, polarity)` compiler tests whether the actor
-satisfies the node at object expression `x`. A queryset scope passes the
-row's encoded identity and a constant actor. A point check passes two
-constant terms. `lookup_subjects()` passes a constant resource and an
-`OuterRef` candidate subject. The compiled predicate is one `EXISTS` per
-node, where `T*` is the type-level scope of the node's type:
+An object is an identity expression, never "a row of its model":
 
 ```
-member(N,x) = EXISTS g IN grants:
-    g.node = N AND g.scope IN (x, T*) AND active AND condition allowed by polarity
-    AND (  (g.site = "" AND g.holder IN H(actor, polarity))
-        OR, for each site s in held_sites(N):
-             g.site = s AND type(g.holder) = type(s)
-             AND sat(s, CASE WHEN g.holder = g.scope THEN x ELSE g.holder END) )
-
-sat(s,y) = member(left(s),y) AND member(right(s),y)      for &
-         = member(left(s),y) AND NOT member(right(s),y)  for -
+At(resource_type, ref, key, row)
+  ref   an expression in the current query: a column, an OuterRef, a value
+  key   the model field ref is a value of; None when ref is a wire id
+  row   True when the current query's own row is the object
 ```
 
-Each site compiles once, so SQL size is bounded by the plan: at most
-`a + b·k` for `k` lookups.
+A queryset scope evaluates the predicate at the model's identity column with
+`row=True`. A point check evaluates it at a wire id bound as a parameter, so
+an object that exists only in tuples takes part in grants and in exclusions
+without a model row. Membership of such a statement constant is an `EXISTS`
+with an equality on the key, so the database looks up one row or one
+resource's tuples instead of building the set of every qualifying object.
 
-A queryset scope tests each row's term against one uncorrelated subquery: the
-terms of the type that the actor holds the node on. The SQL of that subquery
-depends only on the program, the node and the shape of the actor (its type and
-relation, whether its id is empty, whether it is the anonymous singleton), so
-the library compiles it once per process for each of those keys, in a bounded
-cache of 128 plans. The actor's id, the clock and the manual-schema revision
-are parameters, prepared when the statement that embeds the plan compiles; the
-readiness fence runs when it executes. The queries nest, and an object is a column of one
-enclosing query; the compiler numbers the queries from the outside in and
-renders an object for the level that references it.
+A model column is never converted. Where a tuple column meets a model column,
+the tuple column is converted with `identity_codec(...).to_column()` inside
+the tuple subquery; a wire id that is not a canonical identity of that model
+becomes `NULL` and matches nothing. A foreign key with `to_field`, or a model
+with `Meta.rebac_id_attr`, is joined through the field it refers to. Two
+tuple columns are compared as text. Identity codecs support integer, text and
+UUID fields; `rebac.E014` reports a field whose identity cannot be compared
+with stored tuples.
 
-`H(actor, polarity)` contains the actor's own term; the wildcard term of its
-type when the actor has no relation suffix, empty and `*` ids included; the
-memberships found from both terms, definite in a positive position and
-possible in a negative one; `$authenticated` unless the actor is the anonymous
-singleton or has an empty id; and the anonymous class term for that singleton
-only. Under the right side of subtraction, use every active row and possible
-membership; in a positive position, use unconditional rows and definite
-membership. A nested subtraction reverses polarity again. A deadline on a
-disable or tighten site makes the site the identity from that instant on,
-decided when the statement executes.
+Each construct reads exactly one kind of source:
 
-Subqueries are correlated only through `EXISTS` against the object or holder
-expression. Multi-valued joins keep related constraints in one
-`filter(Q(...) & Q(...))`, or use `Exists`/`OuterRef`. SQL size is
-independent of data and of data depth, with or without `context`.
+| Construct | Source | Predicate |
+|---|---|---|
+| Stored relation | tuples | The object is the resource of a live tuple of the relation whose subject admits the actor. |
+| Field-backed relation | model columns | The backing path, with its filters in the same `filter()`, reaches a subject row that admits the actor. |
+| Attribute-backed relation | the subject model | The object is the container named by a column value of a subject row that admits the actor. A fixed `resource`/`value` binding owns that one container; other ids of the type are read from tuples. |
+| Const-backed relation | none | The fixed target admits the actor. Filters are tested on the object's row. |
+| Arrow `via->p` | as `via` | The same test, where "admits the actor" is "the actor holds `p` on the subject". The arrow follows the subject's object, whatever relation suffix a declared subject shape carries. |
+| `authenticated`, `anonymous` | none | A constant decided from the actor. |
+| `+` | | The union of the operands at the same object. |
+| `&` | | `AND`. |
+| `-` | | `left AND NOT right`, with `right` compiled at the opposite bound. |
 
-A check answers from two predicates: `HAS` when the definite one holds, `NO`
-when the possible one fails. Otherwise it reads, in one statement, the rows of
-the read plan that the actor can match, and evaluates the same recursion in
-Python, returning the three check states.
+A tuple is live when it has no expiry or, on a relation declared `with
+expiration`, when `expires_at` is later than the statement's clock. Its
+subject shape and caveat name must match one declared allowed-subject
+alternative. Its subject admits the actor when the subject is:
 
-A conditional result reports the parameters it still needs. A node holds
-through alternative paths; a path is a row's condition, then the membership
-that makes the actor a holder or the site the row holds. A path that cannot
-hold needs nothing, and neither does a path that needs everything a shorter
-one needs. A conditional site needs what its conditional operands need. The
-set does not depend on the order of arms, rows or tuples, and is within the
-set the walker reports: the walker also reports what failing paths and
-unneeded alternatives would need, in an order-dependent way.
+- the actor itself, for an actor without a relation suffix;
+- the wildcard of the actor's type, when the relation declares it and the
+  actor has no relation suffix;
+- a subject set `T:s#rel`, when the actor holds `rel` on `T:s` or is that
+  subject set itself.
 
-`accessible()` returns scope identities. Subject enumeration draws candidates
-from the holders of the node's rows and of the left operand of each held
-site, recursively, expands them through possible memberships, filters them
-with `member()`, then sorts by wire reference. Class holders (`authenticated`,
-`anonymous`) contribute no candidates, as in the walker; a stored wildcard
-subject is returned as `type:*`. Enumeration admits only definite results. A
-model-level check (empty resource id) is `member(N, T*)` or any accessible
-row; `T*` also stands for a resource that has no term yet.
+The third case is the arrow mechanism applied to a relation. Where the set
+is a stored relation, the sets that hold the actor are decided before the
+statement (see [The actor's stored sets](#the-actors-stored-sets)); otherwise
+the membership is compiled inline.
 
-A statement cannot evaluate a caveat. For a read with `context`, the formulas
-on the rows of the read plan are decided before the statement is built and
-named to it in one parameter, so the statement is the same whatever the number
-of caveat instances. A row is definite when its formula holds and possible
-unless its formula fails; a formula written after the preparation counts as
-possible only.
+The compiler reads model rows through `_base_manager` and applies no
+application filter, so soft-deleted rows are read like any other.
 
-Every read statement requires the index to be published for the current
-policy revision and derived by the program the statement was compiled with.
-A statement that carries verdicts prepared from a pinned schema also requires
-that schema's revision and closes at its earliest override deadline. A
-mismatch raises `rebac.E013` for an immediate read and yields no rows for a
-lazy queryset evaluated later. Pending lazy querysets see committed index
-changes at evaluation time; already populated Django result caches retain
-their normal behavior.
+Override composition is `((baseline ∪ extends) − disables) & tightens`. The
+composition module keeps each contributing override's deadline on its tagged
+arm or operand, and the plain `compose()` derives from that same
+implementation. The policy is compiled from the baseline and every extend,
+loosen, disable and tighten row, expired rows included, and the statement
+evaluates the deadline: an extended or loosened arm is `arm AND now <
+deadline`; a disabled or tightened site is the identity from its deadline on.
+A recaveat override replaces a CEL expression, which SQL cannot select, so
+the expression in force is chosen when the policy is prepared and the
+statement is fenced to the interval in which that choice holds.
 
-#### Maintenance and commands
+#### Bounds
 
-Tuple owners, resource/tracked mixin owners, and queryset write owners wrap
-the source write and maintenance in one transaction on its write alias.
-`Relationship` and `RelationshipRegistry` queryset deletes are tuple-owned:
-they capture each matching tuple before deletion and update the index in the
-same transaction. Queryset `update()` on relationship rows is refused because
-it can change a tuple's wire identity or policy without a matching tuple
-write owner; use `delete_relationships()` and `write_relationships()`.
-Their `bulk_create()`, including conflict updates, is tuple-owned as well: it
-captures existing matching tuple identities before SQL and derives the new
-state before returning. A batch of 500 tuples or more (`BULK_REBUILD_ROWS`)
-rebuilds the whole index inside the same owner instead of deriving
-incrementally: region expansion is bounded by a write's neighbourhood and
-pathological for a seed, while a full rebuild is the pass `rebac index
-rebuild` runs and the scale budgets bound. Conflict updates must target the tuple unique constraint
-and update only `caveat_context`, `expires_at`, or `written_at_xid`; a primary-key
-upsert or tuple-identity move is refused with `ValueError`.
-`write_relationships()` runs under one tuple owner, interns registry references
-in bulk, and saves rows without a second owner or savepoint per tuple. Model
-save signals still run for each row, so consumer signal writes remain visible
-at the outer Zookie; repeated tuple identities take the last supplied metadata.
-It raises `NotImplementedError` for an unsupported write operation, not an
-authorization denial.
-Instance saves and deletes follow the same tuple owner, capturing the old
-tuple before mutation and deriving the new state after mutation. A nested
-tuple write derives its effects before returning its Zookie, even inside an
-open model owner. It leaves the outer owner's captured work intact for a final
-derivation after the source write. Only the outer owner consumes work, vacuums
-terms, or rebuilds a changed schema. This extra derivation is the cost of
-read-your-writes correctness within a transaction. A nested pass sees the
-accumulated outer work but re-derives only rows whose inputs changed.
-Plain third-party tracked models use explicit-sender signals; their callers
-must use `atomic()` or `ATOMIC_REQUESTS`. In autocommit, the receiver
-logs and warns under decision D2. `rebac.E018` rejects unowned,
-untracked backing paths. Explicit-sender cascade and M2M receivers cover
-writes without an owner; no sender-free receiver is installed.
+Every predicate is compiled as a lower bound or an upper bound of the true
+set. A lower bound leaves out what SQL cannot decide: a tuple whose caveat is
+undecided, a chain longer than the depth bound. An upper bound keeps it.
+Negation swaps the bounds: in `left - right`, `right` is compiled at the
+bound opposite to that of `left`. **Only a lower bound authorizes.** An
+approximation therefore never grants, on either side of an exclusion.
 
-An index exists to be maintained once a policy is installed on the alias.
-Before the first `sync`, a source write proceeds without a pass, the index
-stays unpublished and reads stay closed. The same holds while migrations
-run and the library's own tables are missing or lack a column: a write that
-cannot read the readiness witness is not a write to maintain. `sync` then
-builds the whole index.
+Where neither a caveat nor a recursion is in reach of a permission, the two
+bounds select the same objects.
 
-A pass reads and derives only the resource types its region contains. It
-reads no whole source table, model table or index table, so its cost does not
-depend on the size of the index or of the schema. A full rebuild does.
+#### Statement shape
 
-Each pass locks `IndexState("global")` before source reads, captures old
-identities durably in `IndexWork`, and applies the source write. Projection
-compares the seed scopes' new edges with their old rows and writes only added,
-removed or changed edge payloads. Every captured set is then derived, including
-one with no changed edge; grant strata with no changed input do no work. Old and new backing paths still determine
-the seed scopes; no dependent closure is computed up front.
+- **A disjunction over a row is one `id IN (UNION of id sets)`.** Each arm is
+  a queryset of the model's identities and the arms are united, so no `OR` is
+  left above a subquery of the row's model. At an identity that is not a row
+  (a tuple column, a parameter) the arms are joined with `OR`.
+- **A negated disjunction is a conjunction of `NOT EXISTS`**, one per arm.
+  `NOT IN` is never emitted.
+- **Membership is two-valued.** An `IN` arm is `ref IS NOT NULL AND ref IN
+  (…)`, and the id set excludes `NULL`.
+- **An arm over a multi-valued path is its own subquery.** A path or filter
+  that crosses a reverse or many-to-many relation never shares its join with
+  another arm. An arm over a single-valued path is inlined into the caller's
+  filter when the object is the row. Within one backing, the path and its
+  filters stay in one `filter()` call, hence one join.
+- **A conjunct that nests a subquery goes last.** SQLite measures an
+  expression's depth through its subqueries, and a chain of `AND` is
+  left-deep.
 
-If a captured set loses an edge or an edge payload changes, membership
-maintenance closes the seed sets over their former containers before deleting
-and deriving the whole region to a fixpoint. For additions only, it compares
-each wave's membership rows and follows changed sets through containing edges,
-including sets already processed. Grants hold sets by reference, so membership
-changes do not re-derive consumers' grants. Grant nodes run one stratum at a
-time in dependency order. A node's region contains scopes whose own edges it
-reads changed, whose same-scope input rows changed, or whose arrow target rows
-changed, including type-level rows. A via relation seeds its arrow directly
-from changed edges even if the via relation stores no grant rows. Each stratum's
-rows are addressed by exact (type, node) pairs, read, deleted, derived, then
-compared by holder, site, expiry and condition. A removed row propagates as a
-change. Before a recursive stratum is cleared, its region closes over incoming
-arrows within that strongly connected component; semi-naive rounds then derive
-its least fixpoint.
-The comparison is bounded by the region. Identical grant and membership rows
-in a re-derived region are still rewritten; staging those rows separately
-would permit a later keyed diff.
+No raw SQL, trigger, database function or hand-written statement is used,
+with two deliberate exceptions, in both of which the SQL is Django's own:
 
-An edge belongs to its source; no rule reads the edges that point at an
-object, so writing a row does not re-derive the other rows that share its
-target. A write to a relation no node reads as edges yields an empty grant
-region unless another input changes; captured sets still receive membership
-maintenance.
-Schema owners rebuild
-affected definitions and dependents and publish `index_revision` only
-after success. A missing lock row after flush is repaired in the owner.
-Work rows and unused snapshot terms are cleared at pass end. The index
-logger records phases, strata, nodes and rules with rows in, rows out,
-Python rows and elapsed seconds.
+1. **Compiled id sets and kept statements.** An uncorrelated id set is
+   compiled by Django once, through the queryset's own `Query.as_sql()`, and
+   embedded as text by a custom expression. Django resolves an embedded
+   queryset again inside every enclosing `filter()`, which makes the cost of
+   building a nested statement grow with its depth times its size; an
+   uncorrelated set refers to no outer query, so its own compiler produces
+   the same SQL the nested resolution would. A whole statement is kept the
+   same way (see [Kept statements and the policy fence](#kept-statements-and-the-policy-fence)).
+2. **The identity conversion's guard.** `codec.to_wire()` and
+   `codec.to_column()` wrap an expression in a validity check that reads it
+   about ten times and depends only on the identity field, the direction and
+   the connection. Django compiles that guard once around a placeholder; each
+   use compiles its own expression once and takes the placeholder's
+   positions. `tests/test_codec_cache.py` pins the cached SQL and parameters
+   equal to the uncached ones for integer, text and UUID identities.
 
-`rebac index rebuild [--type T ...] [--database ALIAS]` is idempotent
-under the same lock and vacuums unused terms in dependency order.
-`rebac index verify` re-derives in a rolled-back transaction and compares
-a streaming sorted merge of full row payloads: term identities, site,
-expiry and condition, excluding surrogate IDs and bookkeeping. Drift
-produces a nonzero exit status. Raw fixtures and unsupported bulk writes
-require rebuild.
+#### Facts about fixed objects
+
+An arrow over a const-backed relation (`admin->member` on a fixed role) is
+evaluated at a fixed object, so its value does not depend on the row. A
+queryset scope decides such a fact when its statement first asks for it:
+
+1. The fact is probed by its own small statement, at the bound the statement
+   needs. A union asks for its constant arms first and stops at the first
+   one that holds, and a lower bound asks for an upper one only under an
+   exclusion, so a statement decides few of the facts in reach of its
+   permission. A fact about a stored set (membership of the admin role held
+   in tuples) is answered from the actor's stored sets and needs no probe.
+2. The scope statement is compiled with each decision folded in as a
+   constant. For a member of the admin role the arm is true, and a union
+   that contains it needs no predicate over the rows; for everyone else the
+   arm disappears, and with it the text it would repeat in every nested
+   permission.
+3. Each decision used is witnessed inside the scope statement: the fact's own
+   predicate, or its negation for a decision that was false, is a condition
+   of the statement. A decision that does not hold when the statement runs
+   yields no rows.
+
+A kept scope statement is keyed by the facts it asked for and their values,
+in the order it asked. The order is learned from the first build and
+replayed afterwards, so a kept statement costs its probes and nothing else.
+
+A fact whose target lies in a recursive component that is being unrolled is
+evaluated inline instead. Point checks and the other operations evaluate the
+same sub-expression inline, as an uncorrelated predicate. Recursion over a
+stored relation at one fixed object follows the relation's tuples from that
+object (the roles a role includes), a lookup by resource per level, and
+names the base once.
+
+#### The actor's stored sets
+
+A relation used as a subject set (`auth/group#member`, a role's `member`) is
+a *stored set* when it has no backing and every subject set it admits is a
+stored set too. Whether the actor belongs to such a set depends on tuples
+alone, and on the actor, not on the resource. An operation therefore decides
+it first:
+
+1. **Expansion.** Starting from the actor, the operation reads the tuples
+   that put the actor, or a set already found, into a stored set in reach of
+   the permission, and repeats until a read finds no new set: one statement
+   per level of nesting and one that finds nothing. Each tuple must be live,
+   match a declared subject shape and, for the bound being decided, carry an
+   admitted caveat. The result is the fixed point, so it is exact, data
+   cycles included; `REBAC_DEPTH_LIMIT` does not apply to it. With a caveat
+   declared on a set in reach the expansion runs once per bound.
+2. **Binding.** The statement tests membership in a stored set as `id IN
+   (list)`. A constant target (`admin->member` on a stored role) folds to
+   true or false without a probe. An actor in no set compiles the arm away.
+3. **Witness.** A statement that authorizes (the lower bound of a check, a
+   scope, an enumeration) re-reads the decision in its own snapshot: every
+   set of the lower bound still has the tuple that put it there, so no grant
+   rests on a membership that is gone; and no live tuple puts the actor into
+   a set outside the upper bound, so no exclusion misses a membership that
+   has appeared. When either fails the statement selects nothing.
+
+Inside an evaluator scope (a request under `ActorMiddleware`, an explicit
+`evaluator_scope()`) the decision is kept per actor, context and stored sets
+in reach, until a tuple is written in the process or the scope ends. A kept
+decision can be stale when another process changes a membership; the witness
+then selects nothing, so staleness denies and never grants. The depth probe
+of a check carries the same witness: sets that are no longer the actor's are
+a change for the residual evaluator to answer afresh, not a depth to report
+as `PermissionDepthExceeded`. Outside a scope every operation decides afresh.
+
+Several actors of one shape can be decided together
+(see [Bulk checks](#bulk-checks)).
+
+A set that admits a column-backed set (`org/team#staff` over a foreign key)
+is not a stored set, and an actor found in more than 256 sets is not
+decided: membership is then compiled inline, as the closure described under
+[Recursion](#recursion).
+
+#### Decided rows
+
+A scope reaches other tables through arrows: a file through its folder, a
+part through its message and that message's thread. Compiled inline, each
+arrow is a subquery whose size the planner cannot know, and a hierarchy is
+tested for every row of its table. A scope therefore decides the small sets
+first:
+
+1. **Arrow targets.** For an arrow over a field- or attribute-backed
+   relation, the rows of the target model on which the actor holds the target
+   permission are selected by their own statement. When they fit in what
+   the statement may still bind, the arrow is compiled as `column IN (keys)`.
+   The target's statement is compiled the same way, so its own arrows are
+   lists too.
+2. **Hierarchies.** For `p = base + parent->p` over a self foreign key, the
+   rows that hold `base` are selected, then their children by the parent
+   column, level by level to `REBAC_DEPTH_LIMIT` or until a level is empty:
+   the same rows as the inline form, reached from the seeds instead of from
+   every row. A scope over the hierarchy's own model uses the set as well.
+3. **Fallback.** One statement binds at most 5,000 decided rows, over all
+   its sets, in the order it asks for them; a decision reads one row more
+   than is left and stops. A set that does not fit, a target every row of
+   which holds the permission, and a node that is being decided stay inline,
+   as the subquery or the ancestor chain described above. So does an arrow
+   back into a recursion that is being unrolled: a decided set is the rows
+   that hold the permission with the whole depth limit to spend, and inside
+   its own recursion part of that depth is spent already.
+4. **Witness.** A decided set is a lower bound. The scope statement re-reads
+   it in its own snapshot: each listed row still holds the permission (the
+   permission's own predicate, evaluated on the listed keys only). A
+   hierarchy is kept by level: the seeds still hold `base`, and each row of a
+   level still hangs under a row of the level above it. A chain of parents
+   therefore loses a level at each step and ends at a seed, so rows that have
+   closed into a cycle, or have moved deeper than they were found, fail the
+   witness; a row moved under another row of the level above passes it. The
+   witness is compiled with the parameters of the statement that carries it,
+   so it is read at that statement's instant: a grant that expired after the
+   decision fails it. When a witness fails the scope selects nothing; the
+   next operation decides afresh.
+5. **References the database keeps.** A witness reads the rows that exist. A
+   key is therefore bound as `column IN (keys)` only where a stored reference
+   proves its row: a path that ends in a forward foreign key, on which every
+   forward foreign key is under a database constraint in a table Django
+   manages, and whose target, if it is a multi-table model, is linked to
+   every ancestor the same way. Every other path (a foreign key with
+   `db_constraint=False`, an unmanaged table, a database that enforces no
+   constraint, a path that ends in a reverse relation or crosses a
+   many-to-many one, which Django may read without the target's table) reads
+   the keys through the target's rows. A hierarchy over a parent column that
+   is not kept is decided by the permission's own predicate, not followed
+   from its seeds; that predicate tests every row's ancestors, so such a
+   hierarchy is slower to decide. Django creates its constraints deferred,
+   so the proof holds for committed rows: a row the reader's own transaction
+   wrote and has not committed can still name a row that is gone, in a
+   transaction that will fail at commit.
+
+Decided rows are used by queryset scopes and by what is built on them
+(`accessible()` without a context, bulk guards, the backed-edge gate over
+more than four rows). A point check stays one statement at its one object.
+A statement that carries decided keys is compiled for that operation and is
+not kept. Nothing is kept between operations: the sets depend on model rows,
+which change without the library seeing it.
+
+A union is compiled constants first (an arrow over a const-backed relation,
+`authenticated`), and stops at the first arm that holds outright, so an
+administrator's scope decides nothing.
+
+#### Kept statements and the policy fence
+
+A statement is compiled once and kept as Django's SQL with placeholders. The
+key of a kept statement is the policy (database alias, revision, baseline and
+override rows), the operation and permission, the shape of the actor, the
+database vendor, `REBAC_DEPTH_LIMIT`, the active relationship model, the
+stored sets decided for the actor and, for a scope, the model and the
+decisions of its facts. Actors that belong to the same sets share their
+statements. The shape of the actor is
+its type and relation suffix, whether its id is a canonical identity of its
+model, whether the schema names its id (an allowed subject with an id, a
+constant target), and whether it is authenticated or the anonymous singleton.
+The actor's id, the clock, the resource id of a point check and the revision
+of a manual schema are parameters bound when the statement runs.
+
+Two bounded caches per process hold the prepared policies and the statements,
+512 entries each, least recently used evicted first. A statement that
+carries caveat verdicts is compiled at each use. A policy that has a recaveat
+override with a deadline is prepared at each use.
+
+Every statement carries the policy fence: it selects from the
+`SchemaGeneration` row and requires the revision it was compiled for. A scope
+predicate also records the revision at which the queryset was built. After a
+policy change, a statement compiled for the earlier revision selects no rows
+and a point check in flight answers `NO`; the next operation reads the new
+policy. Before any policy is published the fence matches nothing and reads
+are closed. A manual schema (`set_schema()`, `rebac.testing.install_schema()`)
+has a digest of the schema as its revision, and the generation row must
+exist.
+
+#### The clock
+
+The clock is the application's: `django.utils.timezone.now()`, read through
+`rebac.clock.application_now()`, never the database's. It is one parameter per
+statement, so a fact that appears under both polarities is read at one
+instant. Tuple expiry and override deadlines compare with it when the
+statement runs; nothing is re-evaluated when time passes.
+
+#### Recursion
+
+A node is recursive when it lies on a cycle of the policy's dependency graph
+that traverses a relationship: a self-arrow (`parent->read`), a nested group
+(`relation member: auth/user | auth/group#member`), a role that includes
+roles. Recursion is unrolled to `REBAC_DEPTH_LIMIT` levels (default 8): the
+bound counts the relations followed since the recursive component was
+entered, whichever of its permissions they pass through. Stored sets decided
+for the actor are exact and are not unrolled.
+
+A cycle of permissions that refer to each other at the same object, without
+an arrow or a subject set, is not recursion in this sense. It is resolved
+from the schema as its least fixed point and consumes no depth.
+
+| Recursive shape | Statement | Upper bound adds |
+|---|---|---|
+| A relation whose subject set is itself (nested groups), when it is not decided as a stored set | The sets that hold the actor directly, then the sets that contain them, level by level. The closure starts from the actor, so it is the actor's own. | One more hop reaches a set outside the closure. |
+| `p = base + parent->p` over a self foreign key | The row inherits when it, or one of its nearest `REBAC_DEPTH_LIMIT` ancestors, holds `base`: a chain of joins on the parent column, with `base` tested once against all of them. Arrows of `base` to a like-named permission of another type (`drive->read`) are not recursive arms. | The row has more than `REBAC_DEPTH_LIMIT` ancestors. |
+| `p = base + parent->p` over another backed path to the same model (reverse, many-to-many, filtered) | The rows that hold `base`, then the rows whose path reaches the level below. | One more hop reaches a row outside the closure. |
+| `p = base + parent->p` over a stored relation | The resources of the edges whose subject holds `base`, then the resources of the edges above them. | One more hop reaches an object outside the closure. |
+| Any other shape (a cycle through several types, a recursive arm that carries an override) | The body nested in itself. | Every object reached past the bound. |
+
+The contract:
+
+- **A lower bound holds only what is provable within the bound.** A queryset
+  scope and `accessible()` include a row only when a chain of at most
+  `REBAC_DEPTH_LIMIT` hops grants it. They never raise for depth.
+- **A point check never answers by truncation.** When the lower bound does
+  not hold and the upper bound holds only because the bound was reached, the
+  check raises `PermissionDepthExceeded`. It never answers `NO` for a chain
+  it did not follow to its end, and never `HAS`.
+- **A closure that converges is exact.** For the three closure shapes, when
+  one more hop reaches nothing new the closure is complete, data cycles
+  included, and the upper bound equals the lower one: the check answers
+  `HAS` or `NO`.
+- **A self foreign key has no convergence test.** A row with more than
+  `REBAC_DEPTH_LIMIT` ancestors, which includes every row on a cycle of the
+  parent column, is granted when an ancestor within the bound holds `base`;
+  otherwise a point check on it raises.
+- **Permissions that recurse through each other have none either.**
+  `folder#view = viewer + project->access` with `project#access = member +
+  folder->view` is the nested shape. Over a data cycle a check that is not
+  granted within the bound raises instead of answering `NO`
+  (`tests/test_compile_regressions.py` pins it as an expected failure).
+
+A recursive component is refused in two cases:
+
+1. a permission of the component is reached through the right-hand side of
+   `-` inside the component: `read = viewer - parent->read`, `read = viewer -
+   read`;
+2. one expression uses permissions of the component more than once:
+   `read = parent->read + parent->read`, or two arrows that both lead back
+   into the component.
+
+Intersecting a recursive permission with something outside the component, or
+excluding something outside it, is accepted: `read = (viewer + parent->read)
+- banned` and `read = parent->read & member` compile. A `tighten` override on
+a recursive permission is therefore accepted. A `disable` or `extend`
+override that puts the recursive arrow on an excluded side is refused when it
+is written.
+
+A refused component raises `SchemaError`, whose message ends with
+`(rebac.E016)`: when a permission is evaluated, and at the exit of the policy
+write that would publish it (see [Writes](#writes)), so a policy written
+through the owners never holds one. `rebac.E016` reports it as a system
+check. `rebac.compile.program.program_errors(schema)` returns the same
+diagnosis for a parsed schema.
+
+Statement size grows linearly with `REBAC_DEPTH_LIMIT`. Measured on the scope
+statement of the test schema's recursive folder permission, on SQLite:
+
+| Shape | SQL per level | Limit at which SQLite refuses the statement |
+|---|---|---|
+| Stored relation | 2.5 KB | 21 |
+| Filtered backed path | 3.6 KB | 19 |
+| Self foreign key | under 0.1 KB | none up to 32 |
+
+SQLite refuses with `Expression tree is too large (maximum depth 1000)`. The
+figures are measurements of one schema, not bounds.
+
+#### Caveats
+
+A backed relation carries no caveat, so conditions exist only on tuples. A
+statement cannot evaluate CEL. When a caveated relation is in reach of the
+permission being evaluated, through references, arrows and subject sets, the
+operation reads the distinct caveat instances of those relations in one
+query: name, pinned context and `caveat_key`. It decides each instance in
+Python against the pinned and the supplied context, and binds the decided
+keys into the statement:
+
+- a tuple is in a **lower** bound when it has no caveat or its key was
+  decided true;
+- a tuple is in an **upper** bound unless its key was decided false.
+
+A tuple written after the preparation, with a key that was not decided,
+counts in an upper bound only. There is no cap on the number of distinct
+instances. A permission with no caveated relation in reach runs no such
+query.
+
+`caveat_key` is a digest of the caveat name and the pinned context, written
+with the tuple by every supported write path: instance saves, raw fixture
+saves, `write_relationships()` and `bulk_create()`. Reads use the stored key
+with the stored context and never recompute it, because a database can
+render a stored JSON number differently from the text that was written.
+
+Sets decide caveats as point checks do, so `accessible(context=…)` agrees
+with `check_access(context=…)`. Enumeration and scopes return definite
+results only. A queryset scope has no request context: a tuple whose caveat
+needs one is not in its lower bound.
+
+#### Operations
+
+| Operation | Implementation |
+|---|---|
+| `check_access()` | The actor's stored sets, when one is in reach. Then the lower bound at the resource id, selected from the fenced generation row: one statement, which alone can answer `HAS`. When it does not hold and neither a caveat nor a recursion is in reach, the answer is `NO`. Otherwise the upper bound is a second statement: when it fails, `NO`. Otherwise, when a recursion is in reach, a third statement probes whether the uncertainty is depth, and the residual evaluator names what is undecided. |
+| `check_bulk_permissions()` | The answers of `check_access()`, with the work shared: see [Bulk checks](#bulk-checks). |
+| Queryset scope (`queryset_filter()`) | `Model.filter(holds(key, At(type, identity column, identity field, row=True), LOWER))`, decided when the statement that embeds it is compiled, after the small row sets in its reach (see [Decided rows](#decided-rows)). |
+| `accessible()` | The lower bound over each part of the type's universe: the model's rows, the ids that tuples name at either end, constant targets, attribute containers, and field-backed targets whose model stores no rows. Wildcard and empty ids are excluded and the result is deduplicated. |
+| `lookup_subjects()` | Candidates are the subjects that tuples, backed columns and constants name on a path from the one resource; each is tested by its own point check, so the cost grows with the number of candidates. To ask about subjects already in hand, use `check_bulk_permissions()`. |
+| Model-level check (empty resource id) | A row-independent grant, or any accessible identity of the type. |
+| `grants_all()` | The lower bound at the empty id: only a row-independent arm can hold there. |
+| Backed-edge write gate | `write` on the affected declaring rows. More than four ids that are rows of the type's model are tested by one scoped statement per 500 ids; the others by the lower bound, one by one. |
+| Bulk write guard | Every resource id of the statement must be in `accessible()` for the action. |
+| Field read gate `read__<field>` | `accessible()` for that permission. |
+| `check_new()` | The walker over the candidate's proposed relations; an arrow into an existing object is answered by `check_access()`. |
+
+The residual evaluator (`rebac.compile.evaluate`) never authorizes. It runs
+only after SQL reported "lower bound false, upper bound true", reads the
+tuples and columns on the paths of that one object, and reduces the
+expression to the caveat instances and depth cuts that can still change the
+answer. If a depth cut is among them the check raises
+`PermissionDepthExceeded`; otherwise it returns
+`CONDITIONAL_PERMISSION(missing=[...])` with the parameters still needed. The
+set does not depend on the order of arms, rows or tuples. When nothing is
+left undecided the answer is `NO`: a change observed between the statements
+cannot become an allow.
+
+A type whose model is unmanaged has no table the library reads without being
+asked to: its objects are the ones that tuples, constants and backings name,
+as for a type with no model. A backing that names a column of an unmanaged
+model still reads it.
+
+##### Bulk checks
+
+"Which of these fifty users may read this thread" is fifty checks that
+differ in the actor only. Asked one by one, each decides its actor's stored
+sets and runs its own statement. `check_bulk_permissions()` answers them
+with a number of statements that does not grow with the number of items, up
+to a chunk of 50:
+
+1. **Shared preparation.** The policy is read once. Items with the same
+   permission and context share one set of caveat verdicts.
+2. **Stored sets, together.** The actors of a chunk that have the same shape
+   are expanded together: one statement selects the tuples that name any of
+   them, and one statement per level of nesting selects the tuples that name
+   the sets found, until a level finds no new set. Each actor's sets are
+   then followed in memory from the actor itself through those tuples, so
+   an actor's set is one that a chain of selected tuples leads to from that
+   actor, and the tuple that first put it there is its support. The result
+   is what the actor's own expansion would find, and it is witnessed the
+   same way.
+3. **Bounds, together.** The lower bound of each item is the statement
+   `check_access()` would run, and the lower bounds of a chunk are the
+   columns of one statement over the generation row. Each column carries its
+   own fence and witness. Items the lower bound does not grant, and that
+   have a caveat or a recursion in reach, get their upper bound the same
+   way, and those still undecided their depth probe: three statements at
+   most. A statement is cut once its text passes about 64 KB, so a
+   permission whose statement at one object is long (a recursion over
+   tuples) shares a statement between fewer items. The residual evaluator
+   then runs per undecided item, as in `check_access()`.
+4. **The rest.** An item with an empty resource id, or an unknown type or
+   action, is answered by `check_access()`.
+
+The decided sets are kept in the evaluator scope like those of a single
+check; the call opens a scope when none is open. A membership that another
+process changes during the call makes the witness of the items it affects
+fail for the rest of the call: they answer `NO`, as in any evaluator scope.
+
+#### Writes
+
+A write changes the application's columns or the tuple table and nothing
+else. The write gates keep the rules of the
+[CRUD enforcement matrix](#crud-enforcement-matrix) and of invariant 5d
+(a change to a backed edge requires `write` on every affected row of the
+declaring type), with the same entry points: `save_base` and `delete` on the
+mixins, the scoped and tracked querysets, the injected base manager, the
+related-manager wrappers and the explicit-sender receivers.
+
+- **The watch map.** `rebac.watch.watched_for(schema)` resolves, from model
+  metadata alone, the models and columns that the schema's backings read:
+  identities, backing paths, filters, through rows and inherited fields.
+  `gate_policy(using)` returns the installed schema with its watch map, or
+  `None` before a policy is published on the alias and while the library's
+  tables are missing or incomplete during migrations; a write is then not
+  gated as a backed edge, and reads are closed.
+- **One transaction.** `rebac.watch.model_write(model=, using=, names=)` is
+  the transaction an owned write runs in. It yields whether the installed
+  policy reads a column the write can change.
+- **Inserts** are authorized by `check_new` per candidate, including
+  `proposed_relationships()`; a query over existing rows cannot authorize a
+  row that is not there.
+- **Stored values under a row lock.** A gate on a column the policy reads
+  compares the stored value with the proposed one and checks `write` on the
+  declaring rows of the old and the new edge. It reads the stored value with
+  `SELECT … FOR UPDATE` when the database supports it and a transaction is
+  open, which is the case in every owned write.
+- **The key rule for queryset writes.** A queryset `update()` of a column
+  the policy reads, and a tracked queryset `delete()` on a model the policy
+  reads, select the primary keys of the statement's rows, gate exactly those
+  rows from their stored values, and write exactly those rows by key, 5,000
+  keys per statement. A row that starts matching the caller's filter in
+  between is neither gated nor written. A denied row denies the whole
+  statement.
+- **Tuple writes.** `write_relationships()` validates every tuple against
+  the effective schema and saves the rows in one transaction; model save
+  signals run for each row. `delete_relationships()` and queryset deletes on
+  the relationship models delete in one transaction. Queryset `update()` on
+  relationship rows raises `NotImplementedError`, because it can change a
+  tuple's identity without a tuple write; use `delete_relationships()` and
+  `write_relationships()`. `bulk_create()` with `update_conflicts=True` must
+  target the tuple unique constraint and update only `caveat_context`,
+  `expires_at` or `written_at_xid`; anything else raises `ValueError`.
+- **Deleted objects.** When a resource or subject row is deleted, the
+  explicit-sender `post_delete` receiver removes the tuples that name it at
+  either end, so a reused identity does not inherit a grant.
+- **Third-party models** listed in `REBAC_TRACKED_MODELS`, and the configured
+  User and Group models, are gated on instance saves by an explicit-sender
+  `pre_save` receiver. Their deletes and their queryset `update()`,
+  `bulk_create()` and `bulk_update()` are not gated. The library opens no
+  transaction around their saves; the gate locks the row only when the
+  caller is in one.
+
+**Policy writes.** The five policy models (definitions, relations,
+permissions, caveats and overrides), `rebac sync` and
+`rebac.schema_changes()` serialize on the `SchemaGeneration` row: the owner
+locks it, creating it when absent, before it reads or writes policy rows.
+Each write publishes a fresh revision. When the outermost owner exits, the
+composed policy is validated once under that lock, so two changes that are
+each valid cannot combine into a refused one; a refusal raises `SchemaError`
+and rolls the transaction back. A policy that was already refused when the
+owner started is being repaired and is not validated again. Whether the
+policy's backings resolve against the current models is a system check
+(`rebac.E009`), not a condition of writing a row, so a stored policy can be
+repaired while it disagrees with the models.
+
+**What a gate does not lock.** A gate locks the rows it decides on. It does
+not lock the tuples or the other rows its decision reads, and writers of
+different rows share no lock. A grant revoked concurrently is not serialized
+with a write that was authorized before the revocation committed. An
+application that needs a stronger order uses a stronger transaction protocol
+of its own.
+
+#### What a consumer must know
+
+- **There is no build step.** `migrate` and `rebac sync` are the whole
+  setup. Fixture loads, raw SQL, bulk writes and data migrations need no
+  command afterwards: reads see the rows as they are. A write that bypasses
+  the owners is not gated, which is a question of authorization, not of
+  freshness.
+- **Choose `REBAC_DEPTH_LIMIT` to cover the deepest recursive chain in the
+  data.** A scope silently omits a row whose grant lies past the bound; a
+  point check on it raises `PermissionDepthExceeded`. Raising the limit adds
+  one level of SQL to every recursive statement.
+- **An unresolvable backing fails the reads that reach it.** A field,
+  attribute or const backing that does not resolve against the models raises
+  `SchemaError` citing `rebac.E009` from every read whose permission reaches
+  the relation. Permissions that do not reach it are still decided.
+- **`rebac.E014`**: every identity that a statement compares with stored
+  tuples needs an integer, text or UUID field without a custom conversion.
+- **`rebac.E015`**: the models a permission reads must share the
+  relationship database alias, because one statement joins them.
+- **`rebac.E016`**: the shape of recursion (see [Recursion](#recursion)).
+- **`rebac.E018`**: a model on a backing path needs a write owner
+  (`RebacMixin`, `RebacTrackedMixin`, or an entry in `REBAC_TRACKED_MODELS`),
+  so that writes to it are gated.
 
 #### Known limits
 
-Reads containing sites grow with the static read plan, bounded by E019.
-Sites on recursive cycles are refused by E016, for declared schemas and for
-runtime overrides alike; the walker evaluated those per object, so a
-`disable` or `tighten` on a recursive permission that 0.22 accepted is now
-refused when written. An arrow into a node with type-level rows materializes
-one row per edge for each type-level row. The index has no depth limit: where
-the walker raises `PermissionDepthExceeded`, the index terminates and
-answers. Broad graph fan-out may still make maintenance expensive, and the
-0.23.0 lock is global per alias. SQLite, supported for tests, must allow a
-deeply nested statement: SQLite 3.45, the system library of Ubuntu 24.04, has
-a fixed parser stack and refuses a read plan of nine lookups with `parser
-stack overflow`; SQLite 3.46.1 accepts it.
+- An operation whose permission reaches a stored set costs the expansion
+  statements before its own, once per evaluator scope; outside a scope, at
+  every operation.
+- A scope costs one statement per decided arrow target in its reach, and one
+  per level of a decided hierarchy, at every operation. They are index
+  lookups for a sparse actor; their number follows the schema and the depth
+  of the accessible subtree, not the size of the tables.
+- Permissions that recurse through each other are unrolled without a
+  convergence test (see [Recursion](#recursion)).
+- Past the 5,000 rows a statement may bind, a hierarchy is compiled inline
+  and tested for every row: on a PostgreSQL 16 table of 123,000 rows, a page
+  for an actor that holds 4,100 of them took 55 ms decided and 700 ms inline.
+  An arrow's subquery is the cheaper form for a few hundred rows (9 ms
+  against 30 ms at 600) and the dearer one for more (172 ms against 61 ms at
+  2,000). These are measurements of one synthetic data set; the limit has
+  not been tuned on production data.
+- Each stored set an actor belongs to costs every scope statement a list
+  entry and a witness subquery: an actor in 250 sets paid about 100 ms a
+  page on that data set, most of it compiling, where an actor in 10 paid 16.
+- A hierarchy whose parent column names its row by a nullable column
+  (`to_field`) never gives a row without a value in that column its own
+  base in the inline form, while a point check does: a scope past the row
+  limit omits such a row.
+- Statement size follows the unfolded permission, times the depth limit for
+  a recursive node. A deployment whose chains are deeper than the default
+  raises `REBAC_DEPTH_LIMIT` and pays for it in every recursive statement.
+- SQLite, supported for tests, refuses a statement whose expression tree is
+  deeper than 1,000; the tuple- and path-backed recursive shapes of the test
+  schema reach that at a limit of about 20, and an actor in more stored sets
+  than are decided reaches it at a limit of 8 where two kinds of set nest,
+  because the sets are then compiled inline.
+- Query plans on PostgreSQL tables of tens of millions of rows have not been
+  verified. A trial at that scale is in progress, and this document makes no
+  claim about its result.
+- Third-party tracked models are gated on instance saves only.
+- The gates inspect the ORM call, not the SQL (invariant 5d); the cases
+  pinned for proposals 0011 and 0013 remain open.
 
 ### Schema introspection
 
@@ -1872,7 +2179,7 @@ nodes.
 `rebac.schema.accessible_is_exact(schema)` and
 `live_backed_resource_types(schema)` remain public with their 0.18.2 schema-only
 behavior. The former reports the absence of builtin-actor and caveat constructs;
-it does not add a recursion restriction or certify index readiness. The latter
+it does not add a recursion restriction or certify that the policy compiles. The latter
 conservatively propagates live-backing dependencies to resource types, including
 through arrows, const targets and subject sets, for decision-cache exclusion.
 Field and attribute backings seed that closure; constants and builtin actors
@@ -1891,7 +2198,7 @@ The headline feature. By inclusion, every model operation is gated against the e
 ### What gets installed
 
 1. `objects = RebacManager.from_queryset(RebacQuerySet)()` replaces the default manager.
-2. `_default_manager` points at it; the base manager is an **owning, unscoped** manager. When the model declares none, the metaclass injects `_rebac_base = TrackedManager()` and names it in `base_manager_name`, even when consumers declare their own `Meta`. A model that declares `Meta.base_manager_name` keeps its manager, and so does a model whose parent model declares one: every parent model is read in base order, not only the first as in Django's own fallback, so listing `RebacMixin` first does not discard a base manager declared by an abstract parent. `base_manager_name = "_rebac_base"` on the model opts back into the injected one. A declared base manager must be built over a `TrackedQuerySet` subclass (`models.Manager.from_queryset(...)`); class creation raises `ImproperlyConfigured` otherwise, the scoped `RebacManager` included. It may add methods and refuse writes (an append-only queryset), but it must return every row: the library projects edges and captures old state through `_base_manager`, so a base manager that filters rows would leave their edges out of a rebuild and stale after a write. `rebac.E023` reports a declared base manager whose `get_queryset()` returns another queryset class or carries a filter. The base manager never applies actor scope to reads. Its writes maintain the index, and those that change a backed FK edge (reverse-FK `add(bulk=True)`, `update` of a watched FK) run the backed-edge gate of invariant 5d; an `update` of a watched scalar column through the base manager is not gated (proposal 0013), and collector `SET_NULL` rows are gated under the ambient actor only (proposal 0011).
+2. `_default_manager` points at it; the base manager is an **owning, unscoped** manager. When the model declares none, the metaclass injects `_rebac_base = TrackedManager()` and names it in `base_manager_name`, even when consumers declare their own `Meta`. A model that declares `Meta.base_manager_name` keeps its manager, and so does a model whose parent model declares one: every parent model is read in base order, not only the first as in Django's own fallback, so listing `RebacMixin` first does not discard a base manager declared by an abstract parent. `base_manager_name = "_rebac_base"` on the model opts back into the injected one. A declared base manager must be built over a `TrackedQuerySet` subclass (`models.Manager.from_queryset(...)`); class creation raises `ImproperlyConfigured` otherwise, the scoped `RebacManager` included. It may add methods and refuse writes (an append-only queryset), but it must return every row: permission statements read a model's rows, and the write gates read their stored values, through `_base_manager`, so a base manager that filters rows would hide those rows from both. `rebac.E023` reports a declared base manager whose `get_queryset()` returns another queryset class or carries a filter. The base manager never applies actor scope to reads. Its writes that change a backed FK edge (reverse-FK `add(bulk=True)`, `update` of a watched FK) run the backed-edge gate of invariant 5d; an `update` of a watched scalar column through the base manager is not gated (proposal 0013), and collector `SET_NULL` rows are gated under the ambient actor only (proposal 0011).
 3. `save_base` owner — create/write and field gates before consumer `pre_save` receivers.
 4. `delete` owner — root gate and a deletion ContextVar carrying the root actor/bypass for collector children; explicit-sender `pre_delete` gates those children only. Owners batch identity tuple cleanup.
 5. Queryset materialisation hooks (`_fetch_all()` and iterators) stamp the resolved actor onto every loaded instance. `from_db()` snapshots original field values for write checks.
@@ -2046,14 +2353,14 @@ tracked model's callable attribute named `actor` does not become an actor scope.
 
 | Operation | Permission checked | Where |
 |---|---|---|
-| `Model.objects.all()` / `.filter(...)` / `.get()` / `.count()` / `.exists()` | `read` (or `Meta.rebac_default_action`; override per chain with `.with_action(action)`) | The queryset injects the backend's lazy permission predicate (the permission-index scope for `LocalBackend`), falling back to `resource_id__in=<accessible(actor, action, type)>` for backends without one. |
+| `Model.objects.all()` / `.filter(...)` / `.get()` / `.count()` / `.exists()` | `read` (or `Meta.rebac_default_action`; override per chain with `.with_action(action)`) | The queryset injects the backend's lazy permission predicate (the compiled scope for `LocalBackend`), falling back to `resource_id__in=<accessible(actor, action, type)>` for backends without one. |
 | `Model.objects.create(**fields)` | `create` on the proposed row's forward relations | Constructs the instance and delegates to `insert()`. |
 | `Model.objects.insert(obj)` | `create` on the proposed row's forward relations | Pins queryset scope on the prepared instance; the `save_base` `check_new` gate authorizes the insert. |
 | `Model.objects.bulk_create(rows)` | `create` on each proposed row's forward relations | Every candidate is preflighted before Django issues insert SQL. |
 | `instance.save()` (loaded/non-adding instance) | `write` on the row | `RebacMixin.save_base`, before consumer `pre_save`. |
 | `instance.save()` (new instance) | `create` on the proposed row's forward relations | `save_base` projects the constructed candidate into `check_new`. |
 | `instance.delete()` | `delete` on the row | `RebacMixin.delete`; explicit-sender `pre_delete` checks collector children. |
-| `Model.objects.update(**kwargs)` | `write` on each affected row and every resource row whose backed FK edge changes | Manager intersects the queryset PK set with the actor's `write` scope; raises if any in-scope row is excluded. A backed FK update checks old and proposed source rows before SQL; expressions whose proposed FK cannot be resolved are refused. When the update touches watched fields, the permission index is maintained set-based in the same transaction. |
+| `Model.objects.update(**kwargs)` | `write` on each affected row and every resource row whose backed FK edge changes | Manager intersects the queryset PK set with the actor's `write` scope; raises if any in-scope row is excluded. A backed FK update checks old and proposed source rows before SQL; expressions whose proposed FK cannot be resolved are refused. When the update touches a column the policy reads, the statement's primary keys are selected, those rows are gated, and exactly those rows are written by key (see [Writes](#writes)). |
 | `Model.objects.delete()` | `delete` on each row | Same pattern. |
 
 For an automatically created M2M through table, a `RebacMixin` owner needs
@@ -2063,15 +2370,16 @@ resource type that owns an affected backed edge, including reverse-manager and
 symmetrical self-M2M calls. The related manager preflights the changed pairs once
 outside Django's own atomic block so denial audit survives that rollback.
 Its `set()` wrapper accepts Django's positional and `objs=` keyword forms.
-The `m2m_changed` receiver maintains the index, while queryset writes through
+The `m2m_changed` receiver gates related-manager writes the wrapper has not
+already gated, and queryset writes through
 the auto-created through model's `objects` manager (`bulk_create`, `update`,
-queryset `delete`) are tracked and gated; the related-manager wrapper exempts
+queryset `delete`) are gated; the related-manager wrapper exempts
 only the exact pairs it already gated, as inserts or deletes, so rows a
 consumer `m2m_changed` handler writes during the call are gated on their own.
-Instance-level through writes are neither gated nor maintained (proposal
+Instance-level through writes are not gated (proposal
 0011); writes through the through model's `_base_manager`, and a
 related-manager call from a multi-table child of the declaring model, are
-not gated (proposal 0013). Through captures use the changed FK pairs and
+not gated (proposal 0013). Through gates use the changed FK pairs and
 their source rows rather than the whole through table.
 The carrying actor wins over ambient context; instance sudo does not propagate
 to the related manager. Without an actor, strict mode raises `MissingActorError`
@@ -2084,16 +2392,16 @@ explicitly bypassed.
 Tracked-model `bulk_create(update_conflicts=True)` refuses updates to watched
 backing columns because the insert candidate cannot identify the old edge of a conflicting
 row; checked saves or explicit sudo are required.
-`RebacMixin._base_manager` remains an unscoped infrastructure write path and
-maintains the index. A reverse FK `add(bulk=True)` passes a related model value
+`RebacMixin._base_manager` remains an unscoped infrastructure write path.
+A reverse FK `add(bulk=True)` passes a related model value
 through that manager and is gated on the declaring resource before SQL, under
 the ambient actor: the actor pinned on the related manager's instance, the
 moved row's own `write`, and a block `sudo` over a pinned actor are not yet
 honoured there (proposal 0011).
 
-A `bulk_update` of a watched column is gated per statement. The owner freezes
-the rows a statement writes, before its SQL, under a per-statement tag in the
-work table, and resolves each row's value from the `Case` in Python: every arm
+A `bulk_update` of a watched column is gated per statement. The owner selects
+the primary keys of the rows a statement writes, before its SQL, writes
+exactly those rows, and resolves each row's value from the `Case` in Python: every arm
 must be `When(pk=<literal>, then=Value(...))` with no default, the shape
 Django emits, so an arm with another condition, an expression result or a
 default is refused. An authorized update of more rows than `batch_size` is
@@ -2160,6 +2468,30 @@ protected column raise `PermissionDenied`: scalar SQL results cannot carry
 instance-level redaction. The same guard rejects projections of protected
 `rebac_select_related()` paths, even through aliases or an explicitly sudoed
 root. `.for_write()` retains its explicit bypass of root field redaction.
+The guard reads what a query selects: its columns and its computed values.
+A column is protected by the model it is read from, so a projection is
+refused for a protected field of the queryset's own model and for one of a
+model it joins (`values("folder__name")`, `annotate(n=F("folder__name"))`);
+one that selects only computed values that read no protected column is not
+refused. A set combination (`union()`, `intersection()`, `difference()`)
+runs its operands and returns the columns of each, so every operand is read
+as Django will select from it, nested combinations included: an operand
+without a projection of its own takes the combination's, and one with a
+projection keeps it whatever the combination is asked for afterwards. Where
+the combination returns model instances, an operand's rows become instances
+of the first operand's model column by column, and a protected value can
+land in a field that is not redacted. The library works out no column
+layout: when a model involved has a protected field, or `select_related()`
+is used, such a combination is refused unless every operand loads every
+field of the one model, without `only()`, `defer()` or `select_related()`.
+Combine `values()` projections instead.
+
+Selected SQL that was written by hand (`extra(select=...)`, `RawSQL`, a
+function with a caller-supplied template) can read any column, so it cannot
+be checked against a field gate. Under field read enforcement it is selected
+under `sudo(reason=...)` / `system_context(...)` only: under an actor it is
+refused on any model, for model instances as for projections. SQL that is
+defined and not selected reads nothing and is not refused.
 The guard attributes a column to a queryset's projection only when it is read
 from that queryset's own row: directly, or through `OuterRef` from a nested
 query. A column a nested query reads from its own tables belongs to that
@@ -2174,8 +2506,18 @@ The `NOT EXISTS` Django builds for an `exclude()` across a to-many relation
 of the outer statement, like the join a `filter()` across the same relation
 adds, and it is not scoped on its own. A queryset the caller passes inside
 that exclude (`rel__in=Model.objects...`) keeps its own scope.
-These guards inspect Django column expressions; raw SQL and arbitrary custom
-SQL expressions remain outside that inspection boundary.
+These guards inspect Django column expressions. Outside that boundary remain:
+hand-written SQL in a filter or an ordering; a custom expression whose class
+carries its own SQL template; and a subquery over a model's `_base_manager`,
+which is unscoped like every read through that manager and, unlike `sudo`,
+writes no audit row. Two cases are pinned as expected failures for proposal
+0013, which reads the statement's own query. A set combination whose root is
+not a rebac queryset does not apply the scope of a rebac operand at all, rows
+or fields: Django compiles the operands itself. And a column read through a
+join is protected by the model that owns the column, so a protected field
+that a joined multi-table child inherits from its parent's table
+(`values("child__name")`) is returned: the guard does not know which model
+the join came through.
 
 The engine computes visibility per row, not with a blanket `.defer()`. For each
 declared `read__<field>`, it asks the backend for
@@ -2325,9 +2667,9 @@ edge. LocalBackend has no historical relationship versions and rejects
 need a backend that implements them. Database routing and transaction isolation
 must make the required writes visible on the reading connection.
 The returned token is at least the highest xid allocated by any tuple write
-nested in the call. Inside an open model owner, a nested tuple write derives
-its index effects before returning, so a read in the same transaction at that
-token sees them. An ambient LocalBackend token only advances; a later outer
+nested in the call. A read in the same transaction sees a nested tuple write
+as soon as it returns, because the statement reads the tuple table itself.
+An ambient LocalBackend token only advances; a later outer
 helper cannot replace a nested helper's higher token with a lower one.
 Backends validate `Zookie.backend` matches their
 own `kind` and raise on mismatch — a SpiceDB token handed to LocalBackend
@@ -2584,17 +2926,16 @@ python manage.py rebac explain blog/post.read     # print compiled expression
 python manage.py rebac grant storage/role:viewer auth/user:42  # idempotent member grant; --caveat NAME --caveat-context JSON
 python manage.py rebac revoke storage/role:viewer auth/user:42 # print deleted count; --caveat NAME; --strict fails on 0
 python manage.py rebac relationships --resource storage/role:viewer # tuple listing; --subject TYPE:ID[#rel] --relation NAME --limit N
-python manage.py rebac index rebuild [--type T ...]   # derive the permission index from its sources
-python manage.py rebac index verify  [--type T ...]   # CI / periodic: diff against a rolled-back rebuild; non-zero on drift
 ```
 
 `rebac explain` renders the effective permission expression after active
 `SchemaOverride` rows have been composed with the baseline.
 
-`index rebuild` and `index verify` are specified under
-[Index commands](#commands). Run `rebuild` after any write that
-bypasses the index owners: raw SQL, data migrations over historical models,
-`loaddata` with `raw=True`, or bulk queryset writes to tracked third-party models.
+No command builds, rebuilds or verifies anything derived: `sync` writes the
+stored schema rows and publishes a policy revision, and permissions are
+evaluated from the application's rows when they are read. Raw SQL, data
+migrations over historical models, `loaddata` and bulk queryset writes need
+no command afterwards.
 
 `grant` and `revoke` route `<namespace>/role` containers through `rebac.roles`
 and other containers through `rebac.memberships`. Both keep the helpers' ambient
@@ -2629,12 +2970,16 @@ For each AppConfig that declares rebac_schema:
   4. Detect orphans: PackageManagedRecord with no matching .zed fragment.
      Reported as warnings; deletion requires --force-overwrite.
   5. Validate cross-package references.
-  6. Recompile in-memory expression tree.
-  7. Rebuild the permission index for the definitions whose effective
-     expressions changed and their dependents (all definitions on a fresh
-     database), and set `SchemaGeneration.index_revision`, in the same
-     transaction as the schema writes.
+  6. Publish a fresh `SchemaGeneration.revision`, in the same transaction as
+     the schema writes, and reset the in-process backend.
+  7. Validate the composed policy (baseline and overrides) once, under the
+     policy lock; a refused policy raises `SchemaError` and rolls the sync
+     back.
 ```
+
+The whole sync is one policy write: it locks the `SchemaGeneration` row
+before it reads or writes a schema row and holds the lock until it commits.
+It writes the stored schema rows and nothing else.
 
 **There is no implicit "first install" path that bypasses `no_update`.** A clean DB has no `PackageManagedRecord` rows, so case 5c applies naturally and no overwrite is needed. This avoids Odoo's [bug #1023615](https://bugs.launchpad.net/openobject-server/+bug/1023615) class of upgrade footguns.
 
@@ -2667,8 +3012,10 @@ CI determinism test: run `rebac build-zed` twice in a tmpdir, byte-diff. Failure
 | Adding `expires_at` later (back-port to existing relationships) | `expires_at` is nullable; existing rows get `NULL`. No data migration needed. |
 | Multi-tenant prefix added later (`REBAC_TYPE_PREFIX`) | Automatic relationship retyping is not implemented. Plan a data migration before changing stored type identities. |
 | Package upgrade silently overwrites admin schema edits | `no_update=True` on `PackageManagedRecord`. Conflict surfaced as warning + audit event. Force-overwrite is explicit. |
-| Upgrade adds the permission-index tables to a populated database | The migration creates empty tables and leaves `index_revision` unset. Entry readiness checks raise `SchemaError` (`rebac.E013`) until `rebac sync` or `rebac index rebuild` runs. The setup system check is a warning so migrations can finish. An index becoming unready after scope construction is fenced out by the permission statement. |
-| Legacy database objects on upgrade or reversal | Fresh installs create no REBAC triggers/functions. `0005` creates the revision table without seeding row 1; its `RunPython(noop, uninstall, atomic=False)` cleans up legacy objects on reversal. `0006` retains forward cleanup and schema-owner model options. `0007` seeds only `IndexState("global")`; sync/rebuild publishes readiness. |
+| Upgrade of a populated relationship table (`0008`) | `0008` adds `caveat_key` to `Relationship` and `RelationshipRegistry` with an empty default, then fills it for existing rows in primary-key order, 1,000 rows per batch, through the ORM. Its reverse drops the column. |
+| Upgrade from a release that kept derived tables (`0007` → `0009`) | `0007` creates the tables `IndexTerm`, `IndexEdge`, `IndexMember`, `IndexCover`, `IndexWork` and `IndexState` and the columns `SchemaGeneration.index_revision` and `index_program`; `0009` drops them, referencing tables first, and creates the `SchemaGeneration` row with an empty revision when it is absent. Nothing reads those tables, so no data is carried over and no command runs after `migrate`. A fresh install runs both migrations and ends with the same tables. |
+| Database without a published policy | The generation row exists with an empty revision. Every permission statement is fenced out and reads are closed until `rebac sync` publishes a revision. |
+| Legacy database objects on upgrade or reversal | Fresh installs create no REBAC triggers/functions. `0005` creates the revision table without seeding row 1; its `RunPython(noop, uninstall, atomic=False)` cleans up legacy objects on reversal. `0006` retains forward cleanup and schema-owner model options. |
 
 ---
 
@@ -2704,7 +3051,7 @@ Odoo 19's `ir.rule` / `ir.model.access` / `env.su` / `with_user` system covers m
 
 **Odoo behaviour:** rule evaluations toggle `active_test=False` per call because rules must consider archived rows too. The discipline is informal — every ORM caller has to remember to flip it for permission contexts and back for normal reads. Easy to miss; bugs surface as "I have `delete` on this row but the admin UI says it doesn't exist".
 
-**Our behaviour:** archived/inactive rows are visible to permission evaluation by default. Soft-delete is orthogonal to permission scope. If you want to hide archived rows from a list endpoint, filter at the queryset level (`Post.objects.with_actor(u).filter(archived=False)`) — but the permission walk over `Relationship` does not exclude them.
+**Our behaviour:** archived/inactive rows are visible to permission evaluation by default. Soft-delete is orthogonal to permission scope. If you want to hide archived rows from a list endpoint, filter at the queryset level (`Post.objects.with_actor(u).filter(archived=False)`) — but permission evaluation does not exclude them: the compiler reads model rows through `_base_manager`.
 
 **Why:** an admin with `delete` on a soft-deleted resource needs to be able to un-archive it. If the permission layer hides it from them, the admin's only recourse is to bypass the layer entirely (sudo / direct SQL) — which is exactly the failure mode we're trying to prevent. Make the policy explicit: archived ≠ inaccessible.
 
@@ -2719,8 +3066,8 @@ These four are highest-impact. The full Odoo 19 research note (with file/line ci
 Three layers of tests define the project target:
 
 1. **Unit tests** (`pytest`): pure-Python, no database. Schema parsing, expression compilation, codename mapping, build determinism.
-2. **Integration tests** (`pytest-django`, `@pytest.mark.django_db`): SQLite and PostgreSQL. `RebacMixin` end-to-end, manager scoping, index semantics and maintenance, signal handlers.
-3. **SpiceDB conformance tests** (`-m spicedb`, planned right after 0.23.0): generated schemas and data evaluated by a real SpiceDB and by `LocalBackend`, answers compared. See [SpiceDB conformance suite](#spicedb-conformance-suite-planned). They do not need `SpiceDBBackend`. They drive SpiceDB directly and become the cross-backend contract tests once that backend lands.
+2. **Integration tests** (`pytest-django`, `@pytest.mark.django_db`): SQLite and PostgreSQL. `RebacMixin` end-to-end, manager scoping, compiled-permission semantics, write gates, signal handlers.
+3. **SpiceDB conformance tests** (`-m spicedb`, planned): generated schemas and data evaluated by a real SpiceDB and by `LocalBackend`, answers compared. See [SpiceDB conformance suite](#spicedb-conformance-suite-planned). They do not need `SpiceDBBackend`. They drive SpiceDB directly and become the cross-backend contract tests once that backend lands.
 
 The supported matrix is declared once, in `pyproject.toml` (`requires-python`,
 the Django pin) and `.github/workflows/ci.yml`; at the time of writing that is
@@ -2740,14 +3087,14 @@ blocker like any other.
 |---|---|---|---|
 | **1. Fast** — `make check` | Every change, every push and pull request. The only gate for merging and for publishing a tag. | Ruff lint and format, strict mypy, Pyright, then the SQLite suite without `slow`, in parallel with work stealing, stopping at the first failure. | 1 minute on a developer machine, 5 minutes in CI. |
 | **2. PostgreSQL delta** — `make test-pg` | Every push and pull request, as a job beside tier 1. Locally when a change touches SQL generation, transactions, locking or migrations. | Only the tests marked `postgresql` or `pg_delta`, on PostgreSQL 16. | 3 minutes. |
-| **3. Release** — `make test-release` | Nightly on `main` and on demand before a release. Never inside a fix loop. | `slow` on SQLite; the whole suite including `slow` on PostgreSQL; `scale` alone on both; the full `index_exhaustive` sweep; the `schema_vendors` PostgreSQL/MySQL contracts; a randomized parallel run with seed 137; the SpiceDB conformance suite once it lands. | About 12 minutes on an 18-core machine; independent parallel jobs in CI, where the sweep is the longest. |
+| **3. Release** — `make test-release` | Nightly on `main` and on demand before a release. Never inside a fix loop. | `slow` on SQLite; the whole suite including `slow` on PostgreSQL; the full `reference_exhaustive` sweep; the `schema_vendors` PostgreSQL/MySQL contracts; a randomized parallel run with seed 137; the SpiceDB conformance suite once it lands. There is no scale suite at the moment. | No measured budget at the moment; independent parallel jobs in CI, where the sweep is the longest. |
 
 Rules that keep the tiers honest:
 
 - **Tier 1 has a per-test budget.** A test that takes more than 2 seconds on
   a developer machine is marked `slow`. A 10-second per-test timeout in tier
   1 turns a test that outgrew the budget into a failure, not a slower loop.
-  The targets that select `slow`, `scale`, `index_exhaustive` or
+  The targets that select `slow`, `reference_exhaustive` or
   `schema_vendors` raise the timeout to 300 seconds.
 - **A `slow` matrix leaves a representative behind.** When a parametrized
   test is heavy because of depth, corpus size or the number of combinations,
@@ -2756,7 +3103,7 @@ Rules that keep the tiers honest:
 - **`postgresql` means "requires PostgreSQL"; `pg_delta` means "runs
   everywhere, and PostgreSQL may disagree".** `pg_delta` holds tests that
   branch on the vendor, at least one test for each area that emits SQL
-  (recursive scopes, index reads, maintenance, schema write owners,
+  (recursive scopes, compiled reads, write gates, schema write owners,
   migrations), and every test that has ever failed on PostgreSQL while passing
   on SQLite. A PostgreSQL-only failure found in tier 3 adds that test to
   `pg_delta` in the same change that fixes it.
@@ -2765,14 +3112,16 @@ Rules that keep the tiers honest:
   for something that did not run.
 - **Parallel scheduling is by test, not by file** (`--dist worksteal`). No
   test may rely on sharing a worker with its module.
-- **Budgets are measured alone.** `scale` holds time, statement and query-plan
-  budgets and never runs beside parallel workers.
+- **There is no scale suite at the moment.** No test holds time, statement or
+  query-plan budgets for large tables. A suite that does runs alone, never
+  beside parallel workers, because they distort such budgets.
 - **Publishing does not wait for tier 3.** A tag publishes once tier 1 is
   green on it. Tier 3 is consulted before tagging; its nightly result on
   `main` is the release evidence.
 
-Default `pytest` deselects `slow`, `index_exhaustive`, `schema_vendors` and
-`scale`. `make test` runs the tier 1 selection serially, for debugging only.
+Default `pytest` deselects `slow`, `reference_exhaustive` and
+`schema_vendors`. `make test` runs the tier 1 selection serially, for
+debugging only.
 
 Tiers 1 and 2 are the two parallel jobs of `.github/workflows/ci.yml`, on
 every push to `main`, every version tag and every pull request:
@@ -2788,53 +3137,48 @@ disposable PostgreSQL 16 container for tier 2 and the PostgreSQL parts of tier
 it. The commands are listed in
 [CONTRIBUTING.md § Commands](../CONTRIBUTING.md#commands).
 
-### Permission index suites
+### Reference and semantics suites
 
 The coverage matrix is the completion criterion; merely having a generator
 does not cover it.
 
-The scale suite runs alone: `make test-scale` and `make test-scale-postgres`.
-The full reference sweep uses
-`index_exhaustive` and its schedulable cases also carry `index_shard`.
-`make test-index-reference` overrides the marker filter and runs every reference
-shard, distributed by test rather than by file. `make test-postgres` runs
-the whole suite, `slow` included, on PostgreSQL. `make test-schema-vendors`
-opts into disposable PostgreSQL/MySQL contracts; MySQL 8 is covered only
-there. All of these are tier 3. `make test-index` and
-`make test-index-postgres` run the index modules with the default selection on
-SQLite and on PostgreSQL; they are focused runs, not tiers. Drivers,
-environment and release gates are in
+The full reference sweep uses `reference_exhaustive`, and its schedulable
+cases also carry `reference_shard`. `make test-reference` overrides the
+marker filter and runs every reference shard, distributed by test rather
+than by file. `make test-postgres` runs the whole suite, `slow` included, on
+PostgreSQL. `make test-schema-vendors` opts into disposable PostgreSQL/MySQL
+contracts; MySQL 8 is covered only there. All of these are tier 3. There is
+no scale suite at the moment. Drivers, environment and release gates are in
 [CONTRIBUTING.md](../CONTRIBUTING.md).
 
-| Suite | Required cases and assertions |
-|---|---|
-| Pure reference gate | The opt-in `index_exhaustive` sweep exhausts every expression through four leaves over two relations, an arrow, builtins and a type-level constant; up to three users, two nested groups including a wildcard member, two resources, three instants, and no/partial/full caveat context. Expression cases use 32 shards per shape/universe/instant/context; direct-tuple powersets use 16. The default gate retains all named counterexamples, all one/two-leaf expressions and deterministic samples of larger trees. The reference computes each actor's set membership directly. |
-| Differential semantics | Compare `rebac.index.read` directly with both the frozen walker and the pure reference. Depth 0–50; recursive schemas and data cycles; nested/wildcard groups; non-recursive intersection/subtraction; type-level constants with concrete bans; field paths (multi-hop, reverse, M2M, MTI, filtered), dynamic/fixed attributes and constants; expiring tuples/overrides and recaveats; caveats in every operator position with all three check states; missing sets equal the reference's canonical residual set and are a subset of the walker's; subject-set actors, anonymous and empty IDs; both relationship storage modes. |
-| Enumeration and embedding | Scope rows equal definite per-row results; `Subquery`, `Exists`, `__in`, `Prefetch`, field gates and bulk guards remain scoped. Complete `lookup_subjects` agrees with the reference, with explicit assertions for D4 differences from the old incomplete enumeration. Preserve public context arguments, model-level and model-less reads. |
-| Maintenance | Every owner/signal path; mixin/plain re-parenting, subtree deletion, watched-field update, bulk_update without duplicate passes, M2M add/remove/clear/set, collector SET_NULL/CASCADE, override create/delete/deadline, sync including unchanged-sync-after-migrate readiness, conditional deny memberships and aliases. Verify reports zero drift after each supported write. Unsupported writes drift and rebuild repairs them. Payload corruption (not just natural-key changes) is detected. |
-| Transactions and concurrency | Deterministic PostgreSQL tests: concurrent revoke/link insertion, initial lock-row lifecycle, outer/savepoint rollback, maintenance failure after mutation, schema-read races. Source and index roll back together for owned transactions; D2's plain-model autocommit warning/error behavior is pinned separately. |
-| Structural | For static plan size `k`, SQL length is at most `a + b·k` for fixed `a` and `b`; the same plan has identical SQL size at data depths 1 and 50. Verify held sites, lookup counts and nil lowering. Ordinary writes touch no unaffected rows; a write to a userset relation no node references changes zero grant rows, and no membership write changes a grant that holds the set. Fresh SQLite/PostgreSQL migrations install no REBAC trigger/function. No library raw SQL, triggers, database functions or undocumented ORM internals exist outside migration `0005`'s legacy uninstall routine. |
-| Scale | Rebuild at resource scales 1, 2 and 4: statements, index rows and elapsed time grow at most linearly. With resources fixed and users multiplied by four, grant rows remain constant and statements rise by at most 1.5×. Enforce a rebuild statement budget and no per-batch savepoint. Record `python_rows`, rows per table and the five largest schema read plans. |
-| PostgreSQL plans | `QuerySet.explain()` on fresh, unanalyzed tables shows index conditions for read lookups. |
-| Vendors | SQLite and PostgreSQL CI; an opt-in MySQL 8 suite must pass before release, including streamed same-table writes, unsigned integer codec bounds, timezone/sentinel behavior and full payload comparisons. |
+| Suite | Modules | Required cases and assertions |
+|---|---|---|
+| Pure reference gate | `tests/test_reference_model.py`, over `tests/reference_model.py` | The opt-in `reference_exhaustive` sweep exhausts every expression through four leaves over two relations, an arrow, builtins and a constant; up to three users, two nested groups including a wildcard member, two resources, three instants, and no/partial/full caveat context. Expression cases use 32 shards per shape/universe/instant/context; direct-tuple powersets use 16. The default gate retains all named counterexamples, all one/two-leaf expressions and deterministic samples of larger trees. The reference computes each actor's set membership directly; it uses no compiler code, no ORM and no walker. |
+| Differential semantics | `tests/test_compile_semantics.py`, `tests/test_read_contract.py`, with `tests/reference_harness.py` and `tests/reference_oracle.py` | Compare the compiled reads with the source facts, the frozen walker and the pure reference. Recursive schemas within and past `REBAC_DEPTH_LIMIT`, and data cycles; nested and wildcard groups; intersection and subtraction; constants with concrete bans; field paths (multi-hop, reverse, M2M, MTI, filtered), dynamic and fixed attributes; expiring tuples, override deadlines and recaveats; caveats in every operator position with all three check states; missing sets equal the reference's canonical residual set and are a subset of the walker's; subject-set actors, anonymous and empty ids; both relationship storage modes. |
+| Compiler | `tests/test_compile_*.py` | The dependency graph and what it refuses (`rebac.E016`); tuple-only objects under grants and exclusions; bounds under caveats and depth on both sides of `-` and `&`; a point check past the bound raises; a scope built before a policy change closes after it; a kept statement sees a caveat instance written after it was compiled; `caveat_key` on every tuple write path and in migration `0008`. |
+| Enumeration and embedding | `tests/test_read_contract.py` | Scope rows equal definite per-row results; `Subquery`, `Exists`, `__in`, `Prefetch`, field gates and bulk guards remain scoped. `lookup_subjects` agrees with the reference. Public context arguments, model-level and model-less reads keep their meaning. |
+| Write effects | `tests/test_write_effects.py`, `tests/test_write_propagation*.py` | After every owner and signal path the next read reports the written state: mixin and plain re-parenting, subtree deletion, watched-field update, `bulk_update` in many batches, M2M add/remove/clear/set, collector SET_NULL/CASCADE, override create/delete/deadline, schema updates, tuple write owners. Writes outside the owners are read as stored, with no command run. A rolled-back write leaves reads as they were. Writes before the first sync, and while the library's tables are not migrated, proceed, and reads stay closed. |
+| Watch map and identities | `tests/test_watch.py`, `tests/test_codec.py`, `tests/test_codec_cache.py` | The watched columns of every backing kind, resolved from metadata without reading rows; canonical identity conversion for integer, text and UUID fields, with an invalid wire id matching nothing; the cached conversion guard equal to the uncached one. |
+| Policy checks | `tests/test_policy_checks.py` | System checks for settings, schemas and models, and what the library refuses as a policy. |
+| Transactions and concurrency | `tests/test_write_effects.py`, `tests/test_compile_read.py` | Deterministic PostgreSQL tests: concurrent revoke and link insertion, concurrent tuple writes. Outer and savepoint rollback. A policy revision that changes while a lazy scope is compiled cannot replace the policy the scope was built for. |
+| Structural | `tests/test_scope_depth.py` and others | The scope statement of a recursive permission has the same size and parse depth whatever the depth of the data. Fresh SQLite/PostgreSQL migrations install no REBAC trigger or function, and end with no table that holds a row per application row. No library raw SQL, triggers or database functions exist outside migration `0005`'s legacy uninstall routine; the two documented exceptions embed SQL that Django compiled. |
+| Vendors | `schema_vendors` | SQLite and PostgreSQL CI; an opt-in MySQL 8 suite must pass before release, including the schema write owners, the upgrade path and identity codec bounds for unsigned integers. |
+| Security pins | `tests/test_security_*.py` | The gates' rules, unchanged. The strict expected failures for proposals 0011 and 0013 stay pinned. |
 
 Data cycles that exceed the frozen walker's dispatch limit use the pure
 reference's finite-path least fixpoint; ordinary acyclic cases must agree with
-the walker. The harness must never compare production `check_access` with the
-walker while production itself still delegates there.
+the walker.
 
-Record rebuild time, statements, rows per table and `python_rows` at scales
-1, 2 and 4, the fixed-resource users ×4 case, grant rows changed by a
-membership write, and the five largest read plans with SQL lengths.
-Measurements are results to collect, not assumed bounds.
+Statement counts and compile time per scope, and statement size as a function
+of `REBAC_DEPTH_LIMIT`, are results to collect, not assumed bounds.
 
 ### SpiceDB conformance suite (planned)
 
-The 0.23.0 differential oracle compares the index with the library's own
-walker, so it proves the index reproduces current behaviour, not that current
-behaviour is right. Invariant 1 makes SpiceDB the contract, so the next step
-tests against SpiceDB itself. **Planned for the release after 0.23.0; not part
-of the 0.23.0 build.**
+The differential oracle compares the compiled reads with the library's own
+frozen walker and reference model, so it proves that they agree with the
+library's reading of the semantics, not that this reading is SpiceDB's.
+Invariant 1 makes SpiceDB the contract, so the next step tests against
+SpiceDB itself. **Planned; not part of the current build.**
 
 - **Server.** A pinned `authzed/spicedb:<exact tag>` image started with
   `serve-testing`, an in-memory server where each distinct bearer token gets an
@@ -2854,8 +3198,8 @@ of the 0.23.0 build.**
 - **Translation.** The generated schema is written with
   `render_zed(include_backing=False)`, plus `use expiration` when relations
   expire. Field, attribute and constant backings are projected into ordinary
-  tuples by a test-side projector that reads the same rows the index derives
-  from; it is the prototype of the roadmap projector for `SpiceDBBackend`.
+  tuples by a test-side projector that reads the same rows the compiler
+  reads; it is the prototype of the roadmap projector for `SpiceDBBackend`.
   `anonymous` and `authenticated` become synthetic wildcard relations over the
   generated subject types, with one tuple per resource, which is exact for
   generated data. Expirations are generated well in the past or future so both
@@ -2867,16 +3211,21 @@ of the 0.23.0 build.**
     `accessible()` and `lookup_subjects()`. Conditional results must be absent
     on our side, per the unconditional-enumeration contract.
   - Shapes: recursion, nesting, `&`, `-`, wildcards, caveats and expiration,
-    at depths up to the server's limit.
+    at depths within both the server's limit and `REBAC_DEPTH_LIMIT`.
 - **Deliberate divergences** are listed here and nowhere else, and each has a
   test pinning our side:
-  - data cycles (SpiceDB fails at its dispatch limit; the index returns the
-    least fixpoint);
-  - `rebac.E016`: LocalBackend 0.23.0 rejects `&` or `-` on any recursive
-    dependency cycle, including self-loops. Monotone intersections and
-    recursion through the left of subtraction are deferred to 0.24; negative
-    cycles (recursion through the right of subtraction) stay forbidden
-    permanently. Tests pin the rejection and the non-recursive wrapper pattern;
+  - the depth bound: a set is a lower bound at `REBAC_DEPTH_LIMIT`, and a
+    point check that cannot be decided within it raises
+    `PermissionDepthExceeded` (SpiceDB fails at its own dispatch limit);
+  - data cycles: a closure over tuples, a backed path or nested sets that
+    converges within the bound answers exactly, where SpiceDB fails at its
+    dispatch limit; a row on a cycle of a self foreign key is too deep in an
+    upper bound;
+  - `rebac.E016`: `LocalBackend` refuses a recursive component in which a
+    permission of the component is reached through the right-hand side of
+    `-`, or in which one expression uses permissions of the component more
+    than once. Intersection with, and exclusion of, something outside the
+    component is accepted. Tests pin the refusal;
   - expiring schema overrides (compared as two effective schemas, before and
     after the deadline);
   - `check_new` (no SpiceDB equivalent).
@@ -2918,9 +3267,10 @@ stable across patch releases. `rebac._internal.*` is private.
 | **0.11.0 — MCP adapter** | `rebac.mcp.rebac_mcp_tool` decorator for FastMCP; actor resolution from request metadata (`REBAC_MCP_ACTOR_RESOLVER`); capability/resource gating; create-shaped actions via `create_relations`; sync, async, and streaming (async-generator) tool bodies. See [proposal 0004](./proposals/0004-mcp-tool-integration.md). |
 | **0.11.x — async ORM scoping** | Verified the async ORM surface inherits scoping via Django's `sync_to_async` wrappers; closed the two bypasses (`aiterator()`, `aggregate()`/`aaggregate()`) that summarised/streamed rows outside the actor's scope. See Open questions § 3. |
 | **0.19.0–0.22.x — retained features** | Filtered constants and generic paths; shared per-revision schema snapshots; policy-model write owners; scoped queryset embedding; metadata-derived versions and test isolation. |
-| **0.23.0 — permission index** | [Permission index](#permission-index--the-localbackend-read-path) ships as the single persisted `LocalBackend` read path: six internal tables of monotone sets and named sites, read-plan-bounded SQL, synchronous maintenance with a per-alias global lock, `rebac index rebuild`/`verify`, complete subject expansion, checks E013–E019, differential/reference suites, and PostgreSQL CI. |
-| **After 0.23.0 — SpiceDB conformance suite** | [SpiceDB conformance suite](#spicedb-conformance-suite-planned): generated cases checked against a pinned `spicedb serve-testing` in dev (`-m spicedb`) and CI; test-side projector for backings; deliberate divergences listed and pinned. The in-process oracle then stops copying the walker. |
-| **Next — `SpiceDBBackend`** | `authzed-py` adapter; `WriteSchema` auto-push; the conformance suite becomes its cross-backend contract tests; SpiceDB Zookie translation; the projector grows from the test-side prototype. |
+| **0.23.0–0.24.2 — retained features** | Complete subject expansion in `lookup_subjects()`; the reference and differential suites; PostgreSQL CI and the tiered test suite; backed-edge write gates (invariant 5d); declared base managers; `rebac.schema_changes()`. |
+| **0.25.0 — compiled permissions** | [Compiled permissions](#compiled-permissions--the-localbackend-read-path) are the single persisted `LocalBackend` read path ([proposal 0015](./proposals/0015-permissions-compiled-to-queries.md)): a permission is a query over the application's tables and the tuple table, the library stores no row per application row, recursion is unrolled to `REBAC_DEPTH_LIMIT`, gated queryset writes follow the key rule, and policy writes serialize on the generation row. Implemented; the trial on a consumer database at scale is pending. |
+| **Next — SpiceDB conformance suite** | [SpiceDB conformance suite](#spicedb-conformance-suite-planned): generated cases checked against a pinned `spicedb serve-testing` in dev (`-m spicedb`) and CI; test-side projector for backings; deliberate divergences listed and pinned. The in-process oracle then stops copying the walker. |
+| **Then — `SpiceDBBackend`** | `authzed-py` adapter; `WriteSchema` auto-push; the conformance suite becomes its cross-backend contract tests; SpiceDB Zookie translation; the projector grows from the test-side prototype. |
 | **1.0.0 — Stable release** | Full docs, CI matrix green, stable audit/logging contracts, `select_related` compiler hook (or carved to 1.1). |
 | **1.x** | `select_related` SQL compiler; bulk operations; `Meta.protected_fields` (descriptor-based field gating / true `"raise"` mode complementing [`read__<field>`](#field-level-read-gates-readfield)); PostgreSQL RLS defense-in-depth track. |
 
@@ -2928,7 +3278,7 @@ stable across patch releases. `rebac._internal.*` is private.
 
 ## Open questions
 
-1. **Relationship table partitioning at scale.** Above ~100M rows, index derivation and `rebac_grant` itself can slow even with the indexes shipped. Worth designing a `(resource_type)` LIST partition scheme? **Lean: yes, post-1.0**, document the threshold and shipped migration helper.
+1. **Relationship table partitioning at scale.** Above ~100M rows, statements that read tuples can slow even with the indexes shipped. Worth designing a `(resource_type)` LIST partition scheme? **Lean: yes, post-1.0**, document the threshold and shipped migration helper.
 
 2. **Swappable User dependency.** `auth/user` is hardcoded as a subject type label. Projects with `AUTH_USER_MODEL` aliases (`accounts.User`) need... what? Lean: a `REBAC_USER_TYPE` setting (default `"auth/user"`), plus `to_subject_ref()` consults `settings.AUTH_USER_MODEL` to decide. Settle in 0.1.
 
@@ -2942,26 +3292,25 @@ stable across patch releases. `rebac._internal.*` is private.
 
 7. **Web admin for the override layer.** v1.0 ships a Django admin form. A standalone admin SPA (separate optional package, `django-zed-rebac-admin`) could be more usable. Defer — gather user feedback first.
 
-8. **Multi-database relationship resolution.** Index tables, relationship rows,
-scoped models and backing-path models must share the operation's database alias;
-`rebac.E015` rejects cross-database routing that prevents transactional
-maintenance. Querysets carry their alias into index reads; write owners use
-their write alias and actual backend throughout maintenance. The public
+8. **Multi-database relationship resolution.** Relationship rows, scoped
+models and backing-path models must share the operation's database alias,
+because one statement joins them; `rebac.E015` rejects cross-database routing.
+Querysets carry their alias into compiled reads; write owners use their write
+alias throughout a gated write. The public
 `check_access()` / `accessible()` signatures remain alias-free and use backend
 routing. Candidate projection uses the write alias. Arbitrary cross-database
 authorization remains unsupported; explicit alias handling is not a distributed
 transaction or permission join.
 
+9. **Query plans at scale.** Compiled statements have not been verified on PostgreSQL tables of tens of millions of rows. A trial on a consumer database is in progress ([proposal 0015](./proposals/0015-permissions-compiled-to-queries.md), gate G1). The shape under test is the one of [Statement shape](#statement-shape): a disjunction as a union of id sets.
 
-9. **Read cost across shared sub-permissions.** *Resolved (0.23.0)* by the [permission index](#permission-index--the-localbackend-read-path): scopes compile a schema-bounded read plan over monotone sets.
+10. **Recursion deeper than the bound.** `REBAC_DEPTH_LIMIT` is the only mechanism: a deployment with deeper chains raises it and pays one level of SQL per unit. A closure table for one recursive relation, or a recursive common table expression, would remove the bound (proposal 0015 § 8); neither is planned, and a recursive CTE needs SQL the project does not write by hand.
 
-10. **Index maintenance lock granularity.** 0.23.0 uses one global `IndexState` lock per database alias, acquired before source reads. Per-type locks remain an open question after contention measurements and a proof covering schema writes, vacuum and old/new dependency discovery.
+11. **The write gates.** With nothing to maintain after a write, the gates are the only reason to intercept writes. Two positions are open (proposal 0015 § 13): keep invariant 5d and finish proposal 0011 on top of the compiled predicate, or narrow the rule to the row that holds the changed column, which would let the tracked mixin, `REBAC_TRACKED_MODELS` and the Python emulation of ORM expressions go. The second is a policy change and the owner's decision, with `tests/test_security_*.py` as the bar.
 
-11. **Write fan-out budget.** Maintenance is synchronous and unbounded, and reports rows touched through the `rebac.index` log. A write that re-parents a large subtree rewrites every descendant's rows in its transaction. Lean: no budget until a deployment measures one; a budget must fail the write, never defer maintenance.
+12. **Ordering of grant changes and gated writes.** A gate locks the rows it decides on, not the tuples or parent rows its decision reads. Whether the library should offer a stronger ordering than the database's isolation level gives is open; lean: no, document the contract.
 
-12. **Holder interning.** Resolved in 0.23.0: `IndexTerm` interns `(type, object_id, relation)`, and index rows carry foreign keys. Vacuum runs under the maintenance lock.
-
-13. **Intersection and subtraction storage.** *Resolved (0.23.0):* named sites hold set operands by reference; reads evaluate them without materializing actors. E016 still refuses a site on a recursive cycle.
+13. **Budgets.** There is no scale suite at the moment. Statement counts per save, SQL size and compile time per scope are quantities to measure before budgets are set.
 
 ---
 

@@ -100,11 +100,20 @@ class PermissionEvaluator:
     supported for tests.
     """
 
-    __slots__ = ("_accessible_cache", "_check_cache", "_max_size", "_schema_scope")
+    __slots__ = (
+        "_accessible_cache",
+        "_actor_sets",
+        "_check_cache",
+        "_max_size",
+        "_schema_scope",
+    )
 
     def __init__(self, *, max_size: int = 10_000) -> None:
         self._check_cache: OrderedDict[tuple[Any, ...], CheckResult] = OrderedDict()
         self._accessible_cache: OrderedDict[tuple[Any, ...], tuple[str, ...]] = OrderedDict()
+        # The stored sets decided for an actor (``rebac.compile.read``). Every
+        # statement that authorizes re-reads them, so a stale entry denies.
+        self._actor_sets: dict[tuple[Any, ...], Any] = {}
         self._max_size = max_size
         self._schema_scope = SchemaScope()
 
@@ -214,6 +223,7 @@ class PermissionEvaluator:
         """
         self._check_cache.clear()
         self._accessible_cache.clear()
+        self._actor_sets.clear()
         self._schema_scope.clear()
 
     # ----- introspection (for tests + debugging) -----

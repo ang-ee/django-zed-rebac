@@ -272,38 +272,38 @@ def test_tracked_delete_cannot_remove_backed_ban(how):
             BackingEntry.objects.filter(pk=entry.pk).delete()
     assert BackingEntry.objects.filter(pk=entry.pk).exists()
     assert not backend().has_access(subject=actor, action="read", resource=resource)
-    from tests.index_harness import assert_no_drift
-
-    assert_no_drift()
 
 
 @pytest.mark.pg_delta
-def test_authorized_bulk_update_of_backed_fk_updates_index():
+def test_authorized_bulk_update_of_backed_fk_grants_read_through_edge():
     install_schema(backend(), parse_zed(REVERSE_FK_SCHEMA))
     with sudo(reason="test.fixture"):
         post = Post.objects.create(title="owned")
         folder = Folder.objects.create(name="owned")
     _grant("blog/post", post.pk, "owner", EDITOR)
+    _grant("blog/post", post.pk, "owner", READER)
     _grant("blog/folder", folder.pk, "owner", EDITOR)
+    resource = ObjectRef("blog/folder", str(folder.pk))
+    assert not backend().has_access(subject=READER, action="read", resource=resource)
     post = Post.objects.with_actor(EDITOR).get(pk=post.pk)
     post.folder = folder
     assert Post.objects.with_actor(EDITOR).bulk_update([post], ["folder"]) == 1
-    assert backend().has_access(
-        subject=EDITOR, action="read", resource=ObjectRef("blog/folder", str(folder.pk))
-    )
-    from tests.index_harness import assert_no_drift
-
-    assert_no_drift()
+    assert Post._base_manager.get(pk=post.pk).folder_id == folder.pk
+    assert backend().has_access(subject=READER, action="read", resource=resource)
+    assert backend().has_access(subject=EDITOR, action="read", resource=resource)
 
 
 @pytest.mark.parametrize("direction", ["forward", "reverse"])
-def test_authorized_m2m_backing_add_updates_index(direction):
+def test_authorized_m2m_backing_add_grants_read_through_edge(direction):
     install_schema(backend(), parse_zed(REVERSE_M2M_SCHEMA))
     with sudo(reason="test.fixture"):
         post = Post.objects.create(title="owned")
         folder = Folder.objects.create(name="owned")
     _grant("blog/post", post.pk, "owner", EDITOR)
+    _grant("blog/post", post.pk, "owner", READER)
     _grant("blog/folder", folder.pk, "owner", EDITOR)
+    resource = ObjectRef("blog/folder", str(folder.pk))
+    assert not backend().has_access(subject=READER, action="read", resource=resource)
     post = Post.objects.with_actor(EDITOR).get(pk=post.pk)
     folder = Folder.objects.with_actor(EDITOR).get(pk=folder.pk)
     if direction == "forward":
@@ -311,15 +311,11 @@ def test_authorized_m2m_backing_add_updates_index(direction):
     else:
         folder.collected_posts.add(post)
     assert Post.collections.through.objects.count() == 1
-    from tests.index_harness import assert_no_drift
-
-    assert_no_drift()
+    assert backend().has_access(subject=READER, action="read", resource=resource)
 
 
-@pytest.mark.parametrize("existing", [5, pytest.param(40, marks=pytest.mark.slow)])
-def test_one_m2m_add_captures_changed_pair_not_whole_through_table(monkeypatch, existing):
-    from rebac.index.maintain import IndexMaintenance
-    from tests.index_harness import assert_no_drift
+def test_one_m2m_add_gates_changed_pair_not_whole_through_table(monkeypatch):
+    import rebac.signals as signals
 
     install_schema(
         backend(),
@@ -340,23 +336,39 @@ def test_one_m2m_add_captures_changed_pair_not_whole_through_table(monkeypatch, 
     )
     with sudo(reason="fixture"):
         folder = Folder.objects.create(name="shared")
-        posts = Post.objects.bulk_create([Post(title=f"p{i}") for i in range(existing)])
+        other = Folder.objects.create(name="other")
+        posts = Post.objects.bulk_create([Post(title=f"p{i}") for i in range(42)])
     _grant("blog/folder", folder.pk, "owner", EDITOR)
-    _grant("blog/post", posts[0].pk, "owner", EDITOR)
-    sizes = []
-    finish = IndexMaintenance.finish
+    through = Post.collections.through
+    checked = []
+    original = signals._check_edge_writes
 
-    def spy(self, *, nested=False):
-        sizes.append((self.work(phase="old").count(), self.work(phase="new").count()))
-        return finish(self, nested=nested)
+    def spy(actor, resource_type, ids, *, bulk=False):
+        checked.append((actor, resource_type, set(ids)))
+        return original(actor, resource_type, ids, bulk=bulk)
 
-    monkeypatch.setattr(IndexMaintenance, "finish", spy)
-    row = Post.objects.with_actor(EDITOR).get(pk=posts[0].pk)
-    with CaptureQueriesContext(connection) as queries, transaction.atomic():
-        row.collections.add(folder)
-    assert sizes and all(old < 20 and new < 20 for old, new in sizes)
-    assert len(queries) < 250
-    assert_no_drift()
+    monkeypatch.setattr(signals, "_check_edge_writes", spy)
+
+    def add(post, linked):
+        """One add by its owner while ``linked`` posts of other owners share the folder."""
+        _grant("blog/post", post.pk, "owner", EDITOR)
+        with sudo(reason="fixture"):
+            through.objects.bulk_create(
+                [through(post_id=post.pk, folder_id=other.pk)]
+                + [through(post_id=row.pk, folder_id=folder.pk) for row in linked]
+            )
+        row = Post.objects.with_actor(EDITOR).get(pk=post.pk)
+        checked.clear()
+        with CaptureQueriesContext(connection) as queries, transaction.atomic():
+            row.collections.add(folder)
+        assert checked == [(EDITOR, "blog/post", {str(post.pk)})]
+        assert through.objects.filter(post_id=post.pk, folder_id=folder.pk).exists()
+        return len(queries)
+
+    few = add(posts[0], posts[2:4])
+    many = add(posts[1], posts[4:])
+    assert few == many
+    assert through.objects.filter(folder_id=folder.pk).count() == 42
 
 
 def test_reverse_clear_of_directed_self_m2m_checks_followers():
@@ -385,13 +397,16 @@ def test_reverse_clear_of_directed_self_m2m_checks_followers():
 
 
 @pytest.mark.parametrize("authorized", [False, True])
-def test_direct_through_bulk_create_checks_and_maintains_backing(authorized):
+def test_direct_through_bulk_create_checks_write_before_granting_read(authorized):
     install_schema(backend(), parse_zed(REVERSE_M2M_SCHEMA))
     with sudo(reason="test.fixture"):
         post = Post.objects.create(title="owned")
         folder = Folder.objects.create(name="target")
+    observer = SubjectRef.of("auth/user", "observer")
     _grant("blog/post", post.pk, "owner", EDITOR)
+    _grant("blog/post", post.pk, "owner", observer)
     _grant("blog/folder", folder.pk, "owner", EDITOR if authorized else READER)
+    resource = ObjectRef("blog/folder", str(folder.pk))
     through = Post.collections.through
     with actor_context(EDITOR):
         if authorized:
@@ -400,36 +415,15 @@ def test_direct_through_bulk_create_checks_and_maintains_backing(authorized):
             with pytest.raises(PermissionDenied):
                 through.objects.bulk_create([through(post_id=post.pk, folder_id=folder.pk)])
     assert through.objects.exists() is authorized
-    from tests.index_harness import assert_no_drift
+    # The post's owners read the folder only through the stored edge.
+    assert backend().has_access(subject=observer, action="read", resource=resource) is authorized
+    assert backend().has_access(subject=EDITOR, action="read", resource=resource) is authorized
 
-    assert_no_drift()
 
-
-@pytest.mark.parametrize("count", [3, pytest.param(30, marks=pytest.mark.slow)])
-def test_direct_through_bulk_gate_batches_changed_rows(monkeypatch, count):
+def test_direct_through_bulk_gate_batches_changed_rows(monkeypatch):
     import rebac.signals as signals
 
     install_schema(backend(), parse_zed(REVERSE_M2M_SCHEMA))
-    with sudo(reason="test.fixture"):
-        folder = Folder.objects.create(name="target")
-        posts = Post.objects.bulk_create([Post(title=f"owned {i}") for i in range(count)])
-    write_relationships(
-        [
-            RelationshipTuple(
-                resource=ObjectRef("blog/folder", str(folder.pk)),
-                relation="owner",
-                subject=EDITOR,
-            ),
-            *[
-                RelationshipTuple(
-                    resource=ObjectRef("blog/post", str(post.pk)),
-                    relation="owner",
-                    subject=EDITOR,
-                )
-                for post in posts
-            ],
-        ]
-    )
     checked = []
     original = signals._check_edge_writes
 
@@ -439,15 +433,42 @@ def test_direct_through_bulk_gate_batches_changed_rows(monkeypatch, count):
 
     monkeypatch.setattr(signals, "_check_edge_writes", spy)
     through = Post.collections.through
-    rows = [through(post_id=post.pk, folder_id=folder.pk) for post in posts]
-    with actor_context(EDITOR), CaptureQueriesContext(connection) as queries:
-        through.objects.bulk_create(rows)
-    assert {type_ for type_, _ in checked} == {"blog/post", "blog/folder"}
-    assert len(checked) == 2
-    assert len(queries) < 250
-    from tests.index_harness import assert_no_drift
 
-    assert_no_drift()
+    def link(count):
+        """One bulk create of ``count`` through rows into a new folder, by their owner."""
+        with sudo(reason="test.fixture"):
+            folder = Folder.objects.create(name="target")
+            posts = Post.objects.bulk_create([Post(title=f"owned {i}") for i in range(count)])
+        write_relationships(
+            [
+                RelationshipTuple(
+                    resource=ObjectRef("blog/folder", str(folder.pk)),
+                    relation="owner",
+                    subject=EDITOR,
+                ),
+                *[
+                    RelationshipTuple(
+                        resource=ObjectRef("blog/post", str(post.pk)),
+                        relation="owner",
+                        subject=EDITOR,
+                    )
+                    for post in posts
+                ],
+            ]
+        )
+        rows = [through(post_id=post.pk, folder_id=folder.pk) for post in posts]
+        checked.clear()
+        with actor_context(EDITOR), CaptureQueriesContext(connection) as queries:
+            through.objects.bulk_create(rows)
+        assert sorted(checked, key=lambda check: check[0]) == [
+            ("blog/folder", {str(folder.pk)}),
+            ("blog/post", {str(post.pk) for post in posts}),
+        ]
+        assert through.objects.filter(folder_id=folder.pk).count() == count
+        return len(queries)
+
+    # Both sizes are above the handful of ids that a gate checks one by one.
+    assert link(6) == link(30)
 
 
 @pytest.mark.parametrize("operation", ["update", "bulk_update", "bulk_create"])
@@ -801,7 +822,7 @@ def test_m2m_set_accepts_objs_keyword_under_actor(world):
 # ---------- relationship rows ----------
 
 
-def test_relationship_queryset_delete_revokes_index_grant(world):
+def test_relationship_queryset_delete_revokes_grant(world):
     _, posts = world
     resource = ObjectRef("blog/post", str(posts[0].pk))
     assert backend().check_access(subject=READER, action="read", resource=resource).allowed
@@ -814,7 +835,7 @@ def test_relationship_queryset_delete_revokes_index_grant(world):
     assert not Post.objects.with_actor(READER).filter(pk=posts[0].pk).exists()
 
 
-def test_relationship_instance_delete_revokes_index_grant(world):
+def test_relationship_instance_delete_revokes_grant(world):
     _, posts = world
     resource = ObjectRef("blog/post", str(posts[0].pk))
     assert backend().has_access(subject=READER, action="read", resource=resource)
@@ -825,7 +846,7 @@ def test_relationship_instance_delete_revokes_index_grant(world):
     assert not backend().has_access(subject=READER, action="read", resource=resource)
 
 
-def test_relationship_bulk_upsert_rederives_expired_grant(world):
+def test_relationship_bulk_upsert_expires_grant(world):
     _, posts = world
     resource = ObjectRef("blog/post", str(posts[0].pk))
     assert backend().has_access(subject=READER, action="read", resource=resource)
@@ -853,15 +874,11 @@ def test_relationship_bulk_upsert_rederives_expired_grant(world):
         ],
     )
     assert not backend().has_access(subject=READER, action="read", resource=resource)
-    from tests.index_harness import assert_no_drift
-
-    assert_no_drift()
 
 
 @pytest.mark.parametrize("storage", ["denormalized", "registry"])
 def test_relationship_pk_upsert_cannot_move_tuple_or_leave_old_grant(storage):
     from rebac.models import active_relationship_model
-    from tests.index_harness import assert_no_drift
 
     with override_settings(REBAC_LOCAL_BACKEND_STORAGE=storage):
         reset_backend()
@@ -903,7 +920,6 @@ def test_relationship_pk_upsert_cannot_move_tuple_or_leave_old_grant(storage):
         assert not backend().has_access(
             subject=READER, action="read", resource=ObjectRef("blog/post", "71")
         )
-        assert_no_drift()
     reset_backend()
 
 
@@ -928,7 +944,7 @@ def test_write_relationships_batch_uses_constant_savepoints(storage):
 
 
 @pytest.mark.parametrize("method", ["save", "update_or_create"])
-def test_relationship_instance_update_rederives_old_and_new_subject(world, method):
+def test_relationship_instance_update_moves_grant_to_new_subject(world, method):
     _, posts = world
     resource = ObjectRef("blog/post", str(posts[0].pk))
     kwargs = {"resource_type": "blog/post", "resource_id": str(posts[0].pk), "relation": "viewer"}
@@ -949,7 +965,7 @@ def test_relationship_queryset_update_uses_unsupported_operation_error(world):
         Relationship.objects.update(subject_id="other")
 
 
-def test_relationship_delete_captures_on_write_alias(world, tmp_path, django_db_blocker):
+def test_relationship_delete_runs_on_write_alias(world, tmp_path, django_db_blocker):
     from unittest.mock import patch
 
     from django.db import connections, router
@@ -1092,7 +1108,9 @@ def test_subquery_joining_a_gated_model_is_refused_on_write():
     source = Subquery(
         Folder.objects.with_actor(EDITOR).filter(pk=OuterRef("folder_id")).values("posts__body")[:1]
     )
-    with pytest.raises(PermissionDenied, match="subquery"):
+    # The subquery answers for its own projection: it selects a gated column
+    # of the model it joins, and is refused before the write gate reads it.
+    with pytest.raises(PermissionDenied, match="read__body on Post"):
         Post.objects.with_actor(EDITOR).filter(pk=post.pk).update(title=source)
     with sudo(reason="test.verify"):
         assert Post.objects.get(pk=post.pk).title == "public"

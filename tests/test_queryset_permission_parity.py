@@ -29,7 +29,7 @@ from rebac import (
 from rebac.backends import reset_backend
 from rebac.models import active_relationship_model
 from rebac.schema import parse_zed
-from tests.backend_setup import STORAGE_TIERS, atomic_source_write, install_schema, rebuild_backend
+from tests.backend_setup import STORAGE_TIERS, atomic_source_write, ensure_policy, install_schema
 from tests.testapp.models import AuthoredPost, Folder, Post
 
 pytestmark = pytest.mark.django_db(transaction=True)
@@ -459,10 +459,12 @@ def test_field_owner_sql_cost_is_independent_of_visible_row_count(active, corpus
             )
         large_cost = measure(1 + corpus)
     assert large_cost == small_cost
-    assert large_cost[0] == 2  # One aggregate and one bounded page.
-    # A fixed plan of three lookups, independent of the number of visible IDs.
-    # The count changes only with the compiler.
-    assert large_cost[1] == 109
+    # One aggregate and one bounded page; the evaluator scope keeps the
+    # actor's stored sets from the warm-up read.
+    assert large_cost[0] == 2
+    # A fixed statement, independent of the number of visible IDs. The count
+    # changes only with the compiler.
+    assert large_cost[1] == 93
 
 
 def test_stored_arrow_resolves_virtual_targets_without_row_multiplication(active):
@@ -606,7 +608,7 @@ def test_queryset_ignores_stale_tuples_outside_declared_subject_shapes(active):
             subject_id=subject.subject_id,
             optional_subject_relation=subject.optional_relation,
         )
-    rebuild_backend(active)
+    ensure_policy(active)
     _assert_post_visibility(
         active,
         Post.objects.with_actor(ALICE),

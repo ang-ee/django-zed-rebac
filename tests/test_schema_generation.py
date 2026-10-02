@@ -95,8 +95,8 @@ def _write_permission(expression, pk, *, using=connection):
 
 
 @pytest.mark.parametrize("atomic", [False, True])
-@pytest.mark.parametrize("surface, warm_cost", [("check", 2), ("queryset", 2), ("new", 1)])
-def test_schema_query_budget(synced, monkeypatch, atomic, surface, warm_cost):
+@pytest.mark.parametrize("surface", ["check", "queryset", "new"])
+def test_schema_query_budget(synced, monkeypatch, atomic, surface):
     _, resource = synced
     local = LocalBackend()
     monkeypatch.setattr("rebac.backends._backend", local)
@@ -118,15 +118,19 @@ def test_schema_query_budget(synced, monkeypatch, atomic, surface, warm_cost):
     with transaction.atomic() if atomic else nullcontext():
         with CaptureQueriesContext(connection) as cold:
             evaluate()
-        # Five component reads plus one stability read on the first load.
-        assert len(cold) == warm_cost + 6
-        assert _loads(cold) == 1
         with CaptureQueriesContext(connection) as warm:
+            evaluate()
+        # Five component reads plus one stability read on the first load.
+        assert len(cold) == len(warm) + 6
+        assert _loads(cold) == 1
+        with CaptureQueriesContext(connection) as repeated:
             for _ in range(10):
                 evaluate()
-        assert len(warm) == warm_cost * 10
-        assert _loads(warm) == 0
-        assert _generation_reads(warm) == 10
+        assert len(repeated) == len(warm) * 10
+        assert _loads(repeated) == 0
+        # Every evaluation validates the stored revision; none reuses an earlier read.
+        assert _generation_reads(warm) >= 1
+        assert _generation_reads(repeated) == _generation_reads(warm) * 10
 
 
 @pytest.mark.parametrize("atomic", [False, True])
@@ -186,24 +190,48 @@ def test_evaluator_revalidates_once_per_transaction_boundary(synced):
             assert _generation_reads(queries) == 1
 
 
-@pytest.mark.parametrize("scoped", [False, True])
-def test_absent_witness_fails_closed_until_rebuilt(synced, scoped):
-    from rebac import SchemaError
-    from tests.backend_setup import rebuild_backend
-
-    local, resource = synced
-    SchemaGeneration.objects.all().delete()
+def _unpublish(local, state):
+    if state == "absent":
+        SchemaGeneration.objects.all().delete()
+    else:
+        # The row a migration or a policy lock creates before the first policy write.
+        SchemaGeneration.objects.filter(pk=1).update(revision="")
     local.mark_schema_stale()
-    with evaluator_scope() if scoped else nullcontext() as evaluator:
-        with pytest.raises(SchemaError, match="E013"):
-            if evaluator is None:
-                _check(local, resource)
-            else:
-                evaluator.check(local, subject=ACTOR, action="write", resource=resource)
-        if evaluator is not None:
+
+
+@pytest.mark.parametrize("state", ["absent", "empty"])
+@pytest.mark.parametrize("surface", ["check", "evaluator", "queryset"])
+def test_unpublished_revision_fails_closed(synced, surface, state):
+    local, resource = synced
+    _unpublish(local, state)
+    assert SchemaGeneration.objects.revision("default") is None
+    if surface == "check":
+        assert not _check(local, resource)
+    elif surface == "queryset":
+        assert not Post.objects.with_actor(ACTOR).with_action("write").exists()
+    else:
+        with evaluator_scope() as evaluator:
+            assert not evaluator.check(
+                local, subject=ACTOR, action="write", resource=resource
+            ).allowed
             assert evaluator.stats()["check_entries"] == 0
-    rebuild_backend(local)
+
+
+@pytest.mark.parametrize("state", ["absent", "empty"])
+@pytest.mark.parametrize("publish", ["sync", "schema write", "advance"])
+def test_reads_stay_closed_until_a_policy_is_published(synced, publish, state):
+    local, resource = synced
+    _unpublish(local, state)
+    assert not Post.objects.with_actor(ACTOR).with_action("write").exists()
+    if publish == "sync":
+        call_command("rebac", "sync", stdout=StringIO())
+    elif publish == "schema write":
+        _write_permission("owner", _permission().pk)
+    else:
+        SchemaGeneration.objects.advance(using="default")
+    assert SchemaGeneration.objects.revision("default") is not None
     assert _check(local, resource)
+    assert Post.objects.with_actor(ACTOR).with_action("write").exists()
 
 
 def test_revision_reads_can_run_concurrently(synced):
@@ -230,33 +258,27 @@ def test_revision_reads_can_run_concurrently(synced):
         assert all(future.result() for future in futures)
 
 
-def test_revision_races_have_a_bounded_retry_budget(synced, monkeypatch):
-    _, resource = synced
+def _racing_backend(monkeypatch, observe):
+    """A backend whose own revision reads return ``observe(read number, stored revision)``."""
     local = LocalBackend()
-    reads = []
+    reads, loads = [], []
+    revision = SchemaGeneration.objects.revision
 
-    witness = SchemaGeneration.objects.witness
-
-    def changing_revision(using):
+    def racing_revision(using):
         reads.append(using)
-        current = witness(using)
-        # Three racing before/after pairs, then a stable paired fallback.
-        if (len(reads) - 1) % 8 < 6:
-            return current._replace(revision=str(len(reads)))
-        return current
+        return observe(len(reads), revision(using))
 
     load_snapshot = local._load_schema_snapshot
 
     def racing_snapshot():
-        # Interleave this reader's witness observations only. Writes and other
-        # backends must continue to use their real publication witnesses.
+        # Interleave this reader's revision observations only. Writes and other
+        # backends must continue to read the published revision.
         with monkeypatch.context() as reader_patch:
-            reader_patch.setattr(SchemaGeneration.objects, "witness", changing_revision)
+            reader_patch.setattr(SchemaGeneration.objects, "revision", racing_revision)
             return load_snapshot()
 
     monkeypatch.setattr(local, "_load_schema_snapshot", racing_snapshot)
     load = local._load_schema_from_db
-    loads = []
 
     def count_load(using, **kwargs):
         if kwargs.get("overrides") is not None:
@@ -265,12 +287,19 @@ def test_revision_races_have_a_bounded_retry_budget(synced, monkeypatch):
         return load(using)
 
     monkeypatch.setattr(local, "_load_schema_from_db", count_load)
-    snapshot = local._schema_snapshot()
-    assert (snapshot.revision, snapshot.index_revision, snapshot.index_program) == witness(
-        "default"
+    return local, reads, loads
+
+
+def test_revision_races_have_a_bounded_retry_budget(synced, monkeypatch):
+    _, resource = synced
+    # Three racing before/after pairs, then a stable paired fallback.
+    local, reads, loads = _racing_backend(
+        monkeypatch, lambda read, stored: str(read) if (read - 1) % 8 < 6 else stored
     )
+    snapshot = local._schema_snapshot()
+    assert snapshot.revision == _revision()
     assert snapshot.generation == -1
-    assert len(reads) == 8  # Six racing reads plus the two fallback witnesses.
+    assert len(reads) == 8  # Six racing reads plus the two fallback reads.
     assert len(loads) == 4  # Three attempts, then one uncached fallback.
     assert local._schema_loads == local._schema_snapshots == {}
     with evaluator_scope() as evaluator:
@@ -281,35 +310,31 @@ def test_revision_races_have_a_bounded_retry_budget(synced, monkeypatch):
     assert local._schema_snapshots == local._schema_facts_memo == {}
 
 
+def test_policy_changing_throughout_a_load_fails_closed(synced, monkeypatch):
+    from rebac import SchemaError
+
+    _, resource = synced
+    local, reads, loads = _racing_backend(monkeypatch, lambda read, stored: str(read))
+    with pytest.raises(SchemaError, match="changed throughout loading"):
+        local._schema_snapshot()
+    assert len(reads) == 8  # Three before/after pairs, then the fallback pair.
+    assert len(loads) == 4
+    assert local._schema_loads == local._schema_snapshots == {}
+    with evaluator_scope() as evaluator:
+        with pytest.raises(SchemaError, match="changed throughout loading"):
+            evaluator.check(local, subject=ACTOR, action="write", resource=resource)
+        assert evaluator.stats()["check_entries"] == 0
+    monkeypatch.setattr("rebac.backends._backend", local)
+    with pytest.raises(SchemaError, match="changed throughout loading"):
+        list(Post.objects.with_actor(ACTOR).with_action("write"))
+    assert local._schema_snapshots == local._schema_facts_memo == {}
+
+
 def test_generation_model_is_private():
     import rebac.models
 
     assert not hasattr(rebac.models, "SchemaGeneration")
     assert SchemaGeneration._meta.default_permissions == ()
-
-
-def test_uncached_fallback_retains_mismatched_index_witness(synced, monkeypatch):
-    from unittest.mock import Mock
-
-    from rebac.errors import SchemaError
-    from rebac.index import read
-
-    local = LocalBackend()
-    current = SchemaGeneration.objects.witness("default")
-    revision, stale = current.revision, "stale-index"
-    pairs = Mock(
-        side_effect=[current._replace(revision=str(n), index_revision=stale) for n in range(6)]
-        + [current._replace(index_revision=stale)] * 2
-    )
-    monkeypatch.setattr(SchemaGeneration.objects, "witness", pairs)
-    with read.using_backend(local):
-        snapshot = local._schema_snapshot()
-        assert snapshot.generation == -1
-        assert (snapshot.revision, snapshot.index_revision) == (revision, stale)
-        with pytest.raises(SchemaError, match=r"rebac\.E013"):
-            read.ensure_ready(using="default")
-    assert pairs.call_count == 8  # Readiness consumes the pinned pair, with no ninth SELECT.
-    assert local._schema_snapshots == local._schema_facts_memo == {}
 
 
 @pytest.mark.parametrize("external", [False, True])
@@ -563,12 +588,13 @@ def test_generation_migration_reverses_without_changing_schema(synced):
         assert "rebac_schemageneration" not in connection.introspection.table_names()
         assert list(SchemaPermission.objects.order_by("pk").values()) == before
     finally:
-        call_command("migrate", "rebac", "0007", verbosity=0)
+        call_command("migrate", "rebac", verbosity=0)
     assert list(SchemaPermission.objects.order_by("pk").values()) == before
-    from tests.backend_setup import rebuild_backend
-
-    rebuild_backend(local)
-    assert _revision() != revision
+    # The recreated table holds no published revision: reads stay closed until a sync.
+    assert SchemaGeneration.objects.revision("default") is None
+    assert not Post.objects.with_actor(ACTOR).with_action("write").exists()
+    call_command("rebac", "sync", stdout=StringIO())
+    assert _revision() not in ("", revision)
     assert _check(local, resource)
     _write_permission("viewer", _permission().pk)
     assert not _check(local, resource)
@@ -662,13 +688,21 @@ def test_schema_and_override_cache_follow_routed_database(synced, tmp_path, djan
                 local.write_relationships([RelationshipTuple(resource, "owner", ACTOR)])
                 assert _check(local, resource)
                 # Both the override's target and all schema components must
-                # come from the same routed alias as the index and source tuples.
+                # come from the same routed alias as the source tuples.
                 override.expression = "nil"
                 override.save(using=alias)
                 assert not _check(local, resource)
                 with CaptureQueriesContext(target) as queries:
                     assert not _check(local, resource)
-                assert len(queries) == 2
+                # The routed alias validates its own revision and serves the cached schema.
+                assert _generation_reads(queries) == 1
+                assert _loads(queries) == 0
+                override.expression = "owner"
+                override.save(using=alias)
+                with CaptureQueriesContext(target) as queries:
+                    assert _check(local, resource)
+                assert _generation_reads(queries) == 2
+                assert _loads(queries) == 1
                 SchemaGeneration.objects.using(alias).all().delete()
                 assert local._read_schema_revision(target) is None
             assert _check(local, resource)

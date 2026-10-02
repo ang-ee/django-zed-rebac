@@ -372,11 +372,32 @@ class TextIdentityFolder(RebacMixin, models.Model):
     public_id = models.CharField(max_length=64, unique=True)
     name = models.CharField(max_length=100)
     author = models.ForeignKey(settings.AUTH_USER_MODEL, on_delete=models.CASCADE)
+    parent = models.ForeignKey(
+        "self", null=True, blank=True, on_delete=models.CASCADE, related_name="children"
+    )
 
     class Meta:
         app_label = "testapp"
         rebac_resource_type = "blog/textidentityfolder"
         rebac_id_attr = "public_id"
+
+
+class CodedFolder(RebacMixin, models.Model):
+    """A hierarchy whose parent column names a row by a nullable unique column."""
+
+    code = models.CharField(max_length=20, null=True, unique=True)
+    parent = models.ForeignKey(
+        "self",
+        to_field="code",
+        null=True,
+        blank=True,
+        on_delete=models.CASCADE,
+        related_name="children",
+    )
+
+    class Meta:
+        app_label = "testapp"
+        rebac_resource_type = "blog/codedfolder"
 
 
 class TextIdentityPost(RebacMixin, models.Model):

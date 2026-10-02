@@ -1,6 +1,6 @@
-"""Internal database witness for the effective-schema cache."""
+"""The revision of the stored policy: its cache witness and its write lock."""
 
-from typing import ClassVar, NamedTuple
+from typing import ClassVar
 from uuid import uuid4
 
 from django.db import connections, models, transaction
@@ -17,41 +17,24 @@ def schema_write_atomic(using: str) -> Atomic:
     )
 
 
-class Witness(NamedTuple):
-    """What the index on an alias was derived for, read in one statement."""
-
-    revision: str
-    index_revision: str | None
-    index_program: str
-
-
 class SchemaGenerationManager(models.Manager["SchemaGeneration"]):
-    def witness(self, using: str) -> Witness | None:
-        """Read the policy and index publication witnesses together."""
-        row = (
-            self.using(using)
-            .filter(pk=1)
-            .values_list("revision", "index_revision", "index_program")
-            .first()
-        )
-        return Witness(*row) if row is not None else None
+    def revision(self, using: str) -> str | None:
+        """The published policy revision; ``None`` before the first policy write."""
+        found = self.using(using).filter(pk=1).values_list("revision", flat=True).first()
+        return found or None
 
-    def revision_pair(self, using: str) -> tuple[str, str | None] | None:
-        """The policy revision and the revision the index was derived for."""
-        witness = self.witness(using)
-        return (witness.revision, witness.index_revision) if witness is not None else None
+    def lock(self, using: str) -> None:
+        """Serialize policy writers on the one generation row, creating it if absent.
 
-    def ready_q(self) -> models.Q:
-        """Predicate for a published, nonempty schema generation."""
-        return models.Q(pk=1, index_revision=models.F("revision")) & ~models.Q(revision="")
-
-    def publish_index(self, using: str, *, program: str) -> int:
-        """Publish the locked policy revision and the program that derived the index."""
-        return (
-            self.using(using)
-            .filter(pk=1)
-            .update(index_revision=models.F("revision"), index_program=program)
-        )
+        The caller is inside a transaction.  A row created here has an empty
+        revision, which reads treat as no published policy.
+        """
+        rows = self.using(using)
+        if connections[using].features.has_select_for_update:
+            rows = rows.select_for_update()
+        if rows.filter(pk=1).first() is None:
+            self.using(using).get_or_create(pk=1, defaults={"revision": ""})
+            rows.filter(pk=1).first()
 
     def advance(self, *, using: str) -> None:
         """Publish policy writes atomically, using a fresh, rollback-safe identity."""
@@ -72,8 +55,6 @@ class SchemaGeneration(models.Model):
     objects: ClassVar[SchemaGenerationManager] = SchemaGenerationManager()  # pyright: ignore[reportIncompatibleVariableOverride]
     id = models.PositiveSmallIntegerField(primary_key=True, default=1, editable=False)
     revision = models.CharField(max_length=32, editable=False)
-    index_revision = models.CharField(max_length=32, null=True, editable=False)
-    index_program = models.CharField(max_length=32, default="", editable=False)
 
     class Meta:
         app_label = "rebac"

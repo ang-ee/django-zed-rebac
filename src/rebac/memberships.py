@@ -73,7 +73,6 @@ def revoke(
     caveat_name: str = "",
 ) -> int:
     """Revoke exactly one direct membership tuple, including its caveat name."""
-    from .index.maintain import tuple_owner
     from .models import active_relationship_model
     from .relationships import delete_relationship
 
@@ -87,7 +86,7 @@ def revoke(
         caveat_name=caveat_name,
     )
     alias = router.db_for_write(relationship_model)
-    with tuple_owner(alias, tuples=(tuple_,)):
+    with transaction.atomic(using=alias):
         exists = (
             relationship_model.objects.using(alias)
             .filter(

@@ -1,23 +1,22 @@
 """Deleted canonical Django subjects cannot leave reusable grants behind."""
 
 from collections.abc import Callable
-from contextlib import nullcontext
-from unittest.mock import MagicMock, patch
+from unittest.mock import patch
 
 import pytest
 from django.contrib.auth import get_user_model
 from django.contrib.auth.models import Group
-from django.db import models
-from django.test.utils import isolate_apps
+from django.db import connections, models
+from django.test.utils import CaptureQueriesContext, isolate_apps
 
 from rebac import RelationshipTuple, backend, rebac_subject, sudo, write_relationships
 from rebac.actors import _subject_registry, to_subject_ref
 from rebac.backends import reset_backend
-from rebac.models import active_relationship_model
+from rebac.models import Relationship, active_relationship_model
 from rebac.schema import parse_zed
 from rebac.signals import _rebac_cascade_resource
 from rebac.types import ObjectRef
-from tests.backend_setup import install_schema
+from tests.backend_setup import install_schema, sqlite_alias
 from tests.testapp.models import Folder, Post
 
 SCHEMA_TEXT = """
@@ -103,26 +102,51 @@ def test_deleting_model_subject_removes_only_its_relationships(
     ).exists()
 
 
-def test_subject_cleanup_uses_signal_database_alias(settings) -> None:
+def _viewer_row(subject_type: str, subject_id: str) -> dict[str, str]:
+    return {
+        "resource_type": "blog/post",
+        "resource_id": "1",
+        "relation": "viewer",
+        "subject_type": subject_type,
+        "subject_id": subject_id,
+    }
+
+
+@pytest.fixture
+def replica(db, django_db_blocker, tmp_path):
+    """A second database alias holding the relationship table."""
+    alias = "replica"
+    target = sqlite_alias(alias, tmp_path / "replica.sqlite3")
+    connections[alias] = target
+    try:
+        with django_db_blocker.unblock():
+            with target.schema_editor() as editor:
+                editor.create_model(Relationship)
+            yield alias
+    finally:
+        target.close()
+        del connections[alias]
+
+
+def test_subject_cleanup_uses_signal_database_alias(settings, replica) -> None:
     settings.REBAC_LOCAL_BACKEND_STORAGE = "denormalized"
-    user = MagicMock(spec=get_user_model())
-    user.pk = 7
-    user.is_authenticated = True
-    relationship_model = MagicMock()
+    user = get_user_model()(pk=7, username="deleted")
+    named = _viewer_row("auth/user", "7")
+    for alias in ("default", replica):
+        Relationship.objects.using(alias).bulk_create([Relationship(**named)])
 
     with (
-        patch("rebac.models.active_relationship_model", return_value=relationship_model),
-        patch("rebac.signals.router.allow_migrate_model", return_value=True),
-        patch("rebac.signals._finish_signal"),
         patch("rebac.backends.local.mark_relationships_changed") as invalidated,
-        patch("rebac.index.maintain.tuple_owner", return_value=nullcontext(MagicMock())) as owner,
+        CaptureQueriesContext(connections["default"]) as elsewhere,
+        CaptureQueriesContext(connections[replica]) as queries,
     ):
-        _rebac_cascade_resource(sender=get_user_model(), instance=user, using="replica")
+        _rebac_cascade_resource(sender=get_user_model(), instance=user, using=replica)
 
-    owner.assert_called_once_with("replica")
-    relationship_model.objects.using.assert_called_once_with("replica")
-    relationship_model.objects.using.return_value.filter.return_value.delete.assert_called_once_with()
-    invalidated.assert_called_once_with()
+    assert not elsewhere.captured_queries
+    assert any(query["sql"].startswith("DELETE") for query in queries.captured_queries)
+    assert not Relationship.objects.using(replica).filter(**named).exists()
+    assert Relationship.objects.using("default").filter(**named).exists()
+    invalidated.assert_called()
 
 
 @isolate_apps("tests")
@@ -142,6 +166,7 @@ def test_unrelated_model_delete_skips_subject_resolution() -> None:
     relationship_model.assert_not_called()
 
 
+@pytest.mark.django_db
 @isolate_apps("tests")
 def test_registered_model_subject_delete_still_uses_canonical_resolver(settings) -> None:
     settings.REBAC_LOCAL_BACKEND_STORAGE = "denormalized"
@@ -154,18 +179,19 @@ def test_registered_model_subject_delete_still_uses_canonical_resolver(settings)
             app_label = "tests"
 
     instance = Device(pk=1, serial="sensor-1")
-    relationship_model = MagicMock()
+    deleted = _viewer_row("auth/device", "sensor-1")
+    surviving = _viewer_row("auth/device", "sensor-2")
+    by_primary_key = _viewer_row("auth/device", "1")
+    Relationship.objects.bulk_create(
+        [Relationship(**row) for row in (deleted, surviving, by_primary_key)]
+    )
     try:
-        with (
-            patch("rebac.signals.to_subject_ref", wraps=to_subject_ref) as resolve_subject,
-            patch("rebac.models.active_relationship_model", return_value=relationship_model),
-            patch("rebac.signals.router.allow_migrate_model", return_value=True),
-            patch("rebac.backends.local.mark_relationships_changed"),
-            patch("rebac.index.maintain.tuple_owner", return_value=nullcontext(MagicMock())),
-        ):
+        with patch("rebac.signals.to_subject_ref", wraps=to_subject_ref) as resolve_subject:
             _rebac_cascade_resource(sender=Device, instance=instance)
     finally:
         _subject_registry.pop(Device, None)
 
     resolve_subject.assert_called_once_with(instance)
-    relationship_model.objects.using.return_value.filter.return_value.delete.assert_called_once_with()
+    assert not Relationship.objects.filter(**deleted).exists()
+    assert Relationship.objects.filter(**surviving).exists()
+    assert Relationship.objects.filter(**by_primary_key).exists()

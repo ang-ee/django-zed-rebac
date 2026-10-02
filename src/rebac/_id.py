@@ -112,7 +112,7 @@ def model_identity_filter(
     model: type[models.Model], attr: str, wire_id: str, *, using: str = DEFAULT_DB_ALIAS
 ) -> Q:
     """Convert a wire identity once; malformed scalar values select no row."""
-    from .index.codec import identity_codec
+    from .codec import identity_codec
 
     if not identity_codec(model, attr).is_canonical(wire_id, using=using):
         return Q(pk__in=[])

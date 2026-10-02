@@ -14,7 +14,7 @@ unified check API; src/rebac/consistency.py):
 * A read with ``Consistency.AT_LEAST_AS_FRESH`` and that token observes every effect
   of the write that returned it, and may observe newer ones: the token is a freshness
   floor, never a cutoff. LocalBackend reads the state visible on its connection, so
-  the effects must already be in the permission index when the read runs.
+  a read sees each effect from the moment its row is written.
 * Writes nested inside a write are effects of it. The token is therefore not lower
   than the ``written_at_xid`` of any tuple written while the write ran, and the
   ambient token of a ``zookie_scope`` never moves backwards.
@@ -51,7 +51,6 @@ from rebac import (
     zookie_scope,
 )
 from rebac.consistency import effective_consistency
-from rebac.index.maintain import current_pass
 from rebac.middleware import ActorMiddleware
 from rebac.models import active_relationship_model
 from rebac.schema import parse_zed
@@ -163,9 +162,8 @@ def test_post_save_write_is_read_at_its_zookie_inside_the_save(local):
     def persist_owner(sender, instance, created, **kwargs):
         ref = to_object_ref(instance)
         token = local.write_relationships([RelationshipTuple(ref, "owner", ALICE)])
-        # The tuple is stored and visible on this connection; RebacMixin.save_base's
-        # owner (src/rebac/mixins.py:654) is still open around this handler.
-        assert current_pass("default") is not None
+        # The tuple is stored and visible on this connection while the save is still
+        # inside its own transaction.
         assert active_relationship_model().objects.filter(relation="owner").exists()
         assert int(token.token) >= high_watermark()
         observed["alice"] = seen(local, token, ALICE, ref)

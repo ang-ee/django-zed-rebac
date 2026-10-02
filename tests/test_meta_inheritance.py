@@ -1,9 +1,11 @@
 """A model with no ``Meta`` of its own takes its parent's Django options, as in Django."""
 
 from django.db import models
+from django.db.models.signals import class_prepared
 from django.test.utils import isolate_apps
 
 from rebac import RebacManager, RebacMixin, RebacTrackedMixin, TrackedQuerySet
+from rebac.resources import model_resource_type
 
 
 def _options(model):
@@ -114,3 +116,37 @@ def test_child_without_meta_keeps_a_parents_manager_names():
     assert Row._meta.base_manager_name == "everything"
     assert Row._meta.default_manager_name == "everything"
     assert Row._default_manager.name == "everything"
+
+
+@isolate_apps("tests.testapp")
+def test_rebac_options_are_on_meta_when_the_class_is_prepared():
+    seen = {}
+
+    def prepared(sender, **kwargs):
+        seen[sender.__name__] = (
+            model_resource_type(sender),
+            getattr(sender._meta, "rebac_id_attr", None),
+        )
+
+    class_prepared.connect(prepared)
+    try:
+
+        class Shelf(RebacMixin, models.Model):
+            slug = models.CharField(max_length=50, unique=True)
+
+            class Meta:
+                app_label = "testapp"
+                rebac_resource_type = "test/shelf"
+                rebac_id_attr = "slug"
+
+        class Plain(RebacMixin, models.Model):
+            class Meta:
+                app_label = "testapp"
+
+    finally:
+        class_prepared.disconnect(prepared)
+
+    # A receiver decides from the options what to bind to the model.
+    assert seen == {"Shelf": ("test/shelf", "slug"), "Plain": (None, None)}
+    assert Shelf._meta.rebac_resource_type == "test/shelf"
+    assert not hasattr(Shelf, "_rebac_options")

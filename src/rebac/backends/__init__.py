@@ -38,6 +38,11 @@ def reset_backend() -> None:
     """Test ergonomics: discard the cached backend so the next `backend()` rebuilds."""
     global _backend
     _backend = None
+    from .. import watch
+    from ..compile import read
+
+    read.reset()
+    watch.reset()
 
 
 __all__ = ["Backend", "LocalBackend", "RebacBackend", "SpiceDBBackend", "backend", "reset_backend"]

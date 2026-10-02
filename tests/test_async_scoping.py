@@ -38,7 +38,7 @@ from rebac import (
 )
 from rebac.backends import reset_backend
 from rebac.schema import parse_zed
-from tests.backend_setup import atomic_source_write, install_schema, rebuild_backend
+from tests.backend_setup import atomic_source_write, install_schema
 
 SCHEMA_TEXT = """
 definition auth/user {}
@@ -104,7 +104,6 @@ def test_aiterator_enforces_field_gates_from_persisted_schema(shape) -> None:
     # The normal fixture uses set_schema(), which never needs a database read
     # and would hide an unsafe schema refresh on the async event-loop thread.
     reset_backend()
-    rebuild_backend(backend())
     post = _post("private title")
     qs = Post.objects.with_actor(SubjectRef.of("auth/user", "alice")).on_field_deny("redact")
     assert qs.get(pk=post.pk).title is None

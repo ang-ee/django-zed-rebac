@@ -208,7 +208,7 @@ def test_mysql_unsigned_identity_ranges(vendor_connection, field_name, high):
     from django.test.utils import isolate_apps
 
     from rebac._id import model_identity_filter
-    from rebac.index.codec import identity_codec
+    from rebac.codec import identity_codec
 
     db = vendor_connection
     with isolate_apps():
@@ -217,7 +217,7 @@ def test_mysql_unsigned_identity_ranges(vendor_connection, field_name, high):
             identity = getattr(models, field_name)(unique=True)
 
             class Meta:
-                app_label = "index_vendor"
+                app_label = "codec_vendor"
 
         codec = identity_codec(UnsignedIdentity, "identity")
         assert db.ops.integer_field_range(field_name) == (0, high)

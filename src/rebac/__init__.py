@@ -19,7 +19,7 @@ from typing import TYPE_CHECKING, Any
 try:
     __version__ = version("django-zed-rebac")
 except PackageNotFoundError:
-    __version__ = "0.24.2"
+    __version__ = "0.25.0"
 
 default_app_config = "rebac.apps.RebacConfig"
 
@@ -62,6 +62,7 @@ from .errors import (
 from .evaluator import PermissionEvaluator, current_evaluator, evaluator_scope
 from .preflight import check_new
 from .types import (
+    CheckItem,
     CheckResult,
     Consistency,
     FieldDenyMode,
@@ -141,6 +142,7 @@ __all__ = [
     "ObjectRef",
     "SubjectRef",
     "CheckResult",
+    "CheckItem",
     "PermissionResult",
     "FieldDenyMode",
     "Consistency",

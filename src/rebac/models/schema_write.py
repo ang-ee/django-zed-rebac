@@ -4,115 +4,94 @@ from __future__ import annotations
 
 from collections.abc import Collection, Iterable, Iterator
 from contextlib import contextmanager
+from contextvars import ContextVar
 from typing import TYPE_CHECKING, Any, cast
 
 from django.db import models, router
 from django.db.models.base import ModelBase
 
+from ..errors import SchemaError
 from .generation import SchemaGeneration, schema_write_atomic
 
 if TYPE_CHECKING:
-    from ..index.maintain import IndexMaintenance
     from .overrides import SchemaOverride
+
+_owners: ContextVar[frozenset[str]] = ContextVar("rebac_schema_owners", default=frozenset())
+
+
+def _stored_policy_errors(using: str) -> list[str] | None:
+    """What refuses the stored policy; ``None`` when it cannot be read as one.
+
+    Only the policy's own rules are checked: its structure and the shape of
+    its recursion.  Whether its backings resolve against the current models
+    is a system check (``rebac.E009``), not a condition of writing a row, so a
+    stored policy can be repaired while it disagrees with the models.
+    """
+    from ..backends.local import LocalBackend
+    from ..compile.program import CompileProgram
+    from ..composition import compose_tagged, split_stale_overrides
+
+    try:
+        loaded = LocalBackend()._load_schema_from_db(using)
+    except SchemaError:
+        return None
+    baseline = getattr(loaded, "baseline", loaded[0])
+    overrides, _stale = split_stale_overrides(baseline, list(getattr(loaded, "overrides", ())))
+    try:
+        CompileProgram.build(compose_tagged(baseline, overrides).schema)
+    except SchemaError as exc:
+        return [str(exc)]
+    return []
 
 
 @contextmanager
-def schema_index_write(using: str) -> Iterator[IndexMaintenance]:
-    """Acquire the index lock before any policy read or write."""
-    from ..index.maintain import IndexMaintenance
+def schema_index_write(using: str) -> Iterator[None]:
+    """One transaction that owns policy writes on ``using``.
 
-    with IndexMaintenance(using=using) as maintenance, schema_write_atomic(using):
-        yield maintenance
+    Policy writers serialize on the generation row.  When the outermost owner
+    exits, the composed policy is validated under that lock, so two changes
+    that are each valid cannot combine into a refused one.  A policy that was
+    already refused when the owner started is being repaired and is not
+    validated again.
+    """
+    if using in _owners.get():
+        with schema_write_atomic(using):
+            yield
+        return
+    with schema_write_atomic(using):
+        SchemaGeneration.objects.lock(using)
+        before = SchemaGeneration.objects.revision(using)
+        sound = _stored_policy_errors(using) == []
+        token = _owners.set(_owners.get() | {using})
+        try:
+            yield
+        finally:
+            _owners.reset(token)
+        if sound and SchemaGeneration.objects.revision(using) != before:
+            errors = _stored_policy_errors(using)
+            if errors is None:
+                # Raise the reader's own account of what is wrong.
+                from ..backends.local import LocalBackend
+
+                LocalBackend()._load_schema_from_db(using)
+            elif errors:
+                raise SchemaError("; ".join(errors))
 
 
 @contextmanager
 def schema_changes(using: str | None = None) -> Iterator[None]:
-    """Group stored-schema writes so the permission index is rebuilt once, when the block exits.
-
-    A write to a schema row (definition, relation, permission, override) owns
-    a maintenance pass of its own and rebuilds the index for the types it
-    affects, and every type that depends on them, when it finishes. Deleting
-    thirteen relations one by one walks those types thirteen times. Inside
-    this block the writes join one pass, and one rebuild runs at exit.
+    """Group stored-schema writes into one transaction and one validation.
 
     The block is one transaction on ``using`` (the relationship write alias by
-    default) and holds the index lock until it exits; an exception rolls the
-    writes back and leaves the index as it was. A relationship write made
-    after a schema change in the block is covered by that rebuild. Made before
-    any schema change, it is maintained on its own as usual, so change the
-    schema first. Blocks nest: an inner one joins the outer one.
+    default) and holds the policy lock until it exits; an exception rolls the
+    writes back.  The composed policy is validated once, when the block exits.
+    Blocks nest: an inner one joins the outer one.
     """
     from . import active_relationship_model
 
     alias = using or router.db_for_write(active_relationship_model())
     with schema_index_write(alias):
         yield
-
-
-def _affected_types(rows: models.QuerySet[Any]) -> set[str] | None:
-    from .overrides import SchemaOverride
-    from .schema import SchemaDefinition, SchemaPermission, SchemaRelation
-
-    # Class keys also cover proxy subclasses without relying on model names.
-    type_paths = {
-        SchemaDefinition: "resource_type",
-        SchemaRelation: "definition__resource_type",
-        SchemaPermission: "definition__resource_type",
-    }
-    for model, path in type_paths.items():
-        if issubclass(rows.model, model):
-            return set(rows.values_list(path, flat=True))
-    if issubclass(rows.model, SchemaOverride):
-        result: set[str] = set()
-        for override in rows.select_related("target_ct"):
-            target = override.target_ct.model_class()
-            target_path = next(
-                (
-                    path
-                    for model, path in type_paths.items()
-                    if target is not None and issubclass(target, model)
-                ),
-                None,
-            )
-            if target_path is None or target is None:
-                return None  # Recaveat changes can reach any definition.
-            result.update(
-                target._base_manager.using(rows.db)
-                .filter(pk=override.target_pk)
-                .values_list(target_path, flat=True)
-            )
-        return result
-    return None
-
-
-def _publish(maintenance: IndexMaintenance, types: set[str] | None) -> None:
-    from ..index.maintain import dependent_types
-
-    # Union the OLD dependency closure before losing a removed definition or
-    # arrow. finish() adds the new program's closure before deriving.
-    if types is not None and not maintenance.schema_all:
-        maintenance.schema_types.update(types)
-        program = maintenance.program
-        if program is not None:
-            maintenance.schema_types.update(dependent_types(program, types))
-    else:
-        maintenance.schema_all = True
-        maintenance.schema_types.clear()
-    maintenance.changed(schema=True)
-
-
-def _old_program(maintenance: IndexMaintenance) -> None:
-    if maintenance.schema_initial:
-        return
-    generation = SchemaGeneration.objects.revision_pair(maintenance.using)
-    if generation is not None:
-        if generation[1] != generation[0] and not maintenance.schema_changed:
-            maintenance.schema_all = True
-            maintenance.schema_types.clear()
-        maintenance.load_program()
-    else:
-        # Keep the empty pre-sync state until the enclosing owner finishes.
-        maintenance.schema_initial = True
 
 
 def _validate_override_rows(using: str, rows: Iterable[SchemaOverride]) -> None:
@@ -127,12 +106,10 @@ def _validate_override_rows(using: str, rows: Iterable[SchemaOverride]) -> None:
 class SchemaQuerySet[T: models.Model](models.QuerySet[T]):
     def update(self, **kwargs: Any) -> int:
         self._for_write = True
-        with schema_index_write(self.db) as maintenance:
-            _old_program(maintenance)
+        with schema_index_write(self.db):
             # Policy metadata is schema-sized. Pin PKs before UPDATE changes
             # the caller's predicate (e.g. renaming a definition).
             pks = tuple(self.order_by().values_list("pk", flat=True))
-            affected = _affected_types(self)
             count = super().update(**kwargs)
             if count:
                 from .overrides import SchemaOverride
@@ -146,11 +123,6 @@ class SchemaQuerySet[T: models.Model](models.QuerySet[T]):
 
                     reset_backend()
                 SchemaGeneration.objects.advance(using=self.db)
-                _publish(maintenance, affected)
-                _publish(
-                    maintenance,
-                    _affected_types(self.model._base_manager.using(self.db).filter(pk__in=pks)),
-                )
             return count
 
     def bulk_create(
@@ -165,8 +137,7 @@ class SchemaQuerySet[T: models.Model](models.QuerySet[T]):
         if ignore_conflicts or update_conflicts:
             raise ValueError("Schema bulk_create does not support conflict handling.")
         self._for_write = True
-        with schema_index_write(self.db) as maintenance:
-            _old_program(maintenance)
+        with schema_index_write(self.db):
             rows = super().bulk_create(
                 objs, batch_size, ignore_conflicts, update_conflicts, update_fields, unique_fields
             )
@@ -178,30 +149,19 @@ class SchemaQuerySet[T: models.Model](models.QuerySet[T]):
                 for row in rows:
                     cast("SchemaRow", row)._write_effects(created=True)
                 SchemaGeneration.objects.advance(using=self.db)
-                _publish(
-                    maintenance,
-                    _affected_types(
-                        self.model._base_manager.using(self.db).filter(
-                            pk__in=[row.pk for row in rows]
-                        )
-                    ),
-                )
             return rows
 
     def bulk_update(
         self, objs: Iterable[T], fields: Iterable[str], batch_size: int | None = None
     ) -> int:
         self._for_write = True
-        # update() captures and publishes each batch; the outer pass derives
-        # once, after every batch's source statement has completed.
+        # update() publishes each batch; the outer owner validates once.
         with schema_index_write(self.db):
             return super().bulk_update(objs, fields, batch_size=batch_size)
 
     def delete(self) -> tuple[int, dict[str, int]]:
         self._for_write = True
-        with schema_index_write(self.db) as maintenance:
-            _old_program(maintenance)
-            affected = _affected_types(self)
+        with schema_index_write(self.db):
             from .overrides import SchemaOverride
 
             audit_rows = []
@@ -223,7 +183,6 @@ class SchemaQuerySet[T: models.Model](models.QuerySet[T]):
                 row._write_effects(deleted=True)
             if result[0]:
                 SchemaGeneration.objects.advance(using=self.db)
-                _publish(maintenance, affected)
             return result
 
 
@@ -246,9 +205,7 @@ class SchemaRow(models.Model):
         update_fields: Iterable[str] | None = None,
     ) -> None:
         alias = using or router.db_for_write(type(self), instance=self)
-        with schema_index_write(alias) as maintenance:
-            _old_program(maintenance)
-            affected = _affected_types(type(self)._base_manager.using(alias).filter(pk=self.pk))
+        with schema_index_write(alias):
             adding = self._state.adding
             super().save_base(raw, force_insert, force_update, alias, update_fields)
             if not raw:
@@ -258,22 +215,14 @@ class SchemaRow(models.Model):
                     _validate_override_rows(alias, [self])
                 self._write_effects(created=adding)
             SchemaGeneration.objects.advance(using=alias)
-            _publish(maintenance, affected)
-            _publish(
-                maintenance,
-                _affected_types(type(self)._base_manager.using(alias).filter(pk=self.pk)),
-            )
 
     def delete(
         self, using: str | None = None, keep_parents: bool = False
     ) -> tuple[int, dict[str, int]]:
         alias = using or router.db_for_write(type(self), instance=self)
-        with schema_index_write(alias) as maintenance:
-            _old_program(maintenance)
-            affected = _affected_types(type(self)._base_manager.using(alias).filter(pk=self.pk))
+        with schema_index_write(alias):
             result = super().delete(using=alias, keep_parents=keep_parents)
             if result[0]:
                 self._write_effects(deleted=True)
                 SchemaGeneration.objects.advance(using=alias)
-                _publish(maintenance, affected)
             return result

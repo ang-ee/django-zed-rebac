@@ -59,12 +59,14 @@ class Post(RebacMixin, models.Model):
 
 ```bash
 python manage.py migrate
-python manage.py rebac sync       # parses permissions.zed and builds the permission index
+python manage.py rebac sync       # parses permissions.zed into the stored schema
 ```
 
-LocalBackend reads fail closed with `SchemaError` / `rebac.E013` until sync or
-`rebac index rebuild` has built the index for the current schema revision.
-`Post.objects.with_actor(request.user).all()` now returns only posts the user is `owner` of. Granting access:
+Until the first `sync` publishes a policy, LocalBackend reads are closed: a
+scoped queryset returns no rows and a check answers `NO`. There is no other
+setup step and nothing to build: permissions are evaluated from your tables
+when they are read.
+`Post.objects.with_actor(request.user).all()` returns only posts the user is `owner` of. Granting access:
 
 ```python
 from rebac import ObjectRef, RelationshipTuple, SubjectRef, write_relationships
@@ -140,8 +142,9 @@ definition blog/post {
 }
 ```
 
-For `LocalBackend`, `post#folder` is projected from `Post.folder` into the
-permission index instead of an application-owned `Relationship` row.
+For `LocalBackend`, `post#folder` is read from the `Post.folder` column when
+a permission is evaluated. There is no `Relationship` row for it and nothing
+is copied: the column is the only copy of the fact.
 Tuple writes/deletes for that relation
 raise `SchemaError`; update the Django field instead. Field-backed relations
 must point at exactly one concrete resource type: no subject sets, wildcards,
@@ -160,18 +163,23 @@ relation member: auth/user // rebac:field={"path":"membership__user","filters":{
 The target predicate and filters share one Django join. An active editor's
 membership row cannot accidentally authorize a different user's inactive row.
 Filter values are JSON scalars; Django validates the complete lookup paths.
-Both direct checks and lazy queryset scopes read the maintained index.
-Supported queryset and M2M owners update it synchronously; plain-model bulk
-writes require the rebuild described below.
+Both direct checks and lazy queryset scopes read these columns in the
+statement that evaluates the permission, so every write to them is visible to
+the next read: instance saves, queryset and M2M writes, bulk writes and
+fixtures alike.
 
-**Transactions for backing-path writes (0.23.0).** The permission index is
-maintained in the source write's transaction. `RebacMixin` and `RebacTrackedMixin` write owners open that transaction,
-including their unscoped base-manager bulk paths. First-party non-resource
-models on backing paths should inherit `RebacTrackedMixin`. Third-party models
-must be listed in `REBAC_TRACKED_MODELS = ["app_label.ModelName"]`; configured
-User and Group are automatically tracked. Unowned/untracked paths fail the
-`rebac.E018` check. For tracked third-party models, wrap saves in
-`transaction.atomic(using=...)` or enable `ATOMIC_REQUESTS` for the write alias:
+**Write owners for backing-path models.** A write to a column a backing reads
+changes who can read what, so it is gated (ARCHITECTURE.md § Writes).
+`RebacMixin` and `RebacTrackedMixin` write owners run the gate and the write in
+one transaction, including their unscoped base-manager bulk paths. First-party
+non-resource models on backing paths should inherit `RebacTrackedMixin`.
+Third-party models must be listed in
+`REBAC_TRACKED_MODELS = ["app_label.ModelName"]`; configured User and Group are
+automatically tracked. Unowned/untracked paths fail the `rebac.E018` check. A
+tracked third-party model is gated on instance saves by a `pre_save` receiver.
+The library opens no transaction for it; wrap the save in
+`transaction.atomic(using=...)` or enable `ATOMIC_REQUESTS` for the write alias
+so that the gate reads the stored row under a lock:
 
 ```python
 from django.db import transaction
@@ -181,16 +189,14 @@ with transaction.atomic(using="default"):
     membership.save(using="default", update_fields=["active"])
 ```
 
-Outside a transaction, a plain model's `post_save` runs after its source write
-has committed. The receiver logs an error and emits a runtime warning, then
-continues index maintenance; a failure can leave drift. Tracked third-party `update`, `bulk_create` and `bulk_update` emit no
-save signals and require `rebac index rebuild` afterward, even inside an
-atomic block. Historical migration models, raw fixtures and direct SQL writes
-also require rebuild. Use `rebac index verify` to detect drift.
+Tracked third-party `update`, `bulk_create` and `bulk_update` emit no save
+signals and are not gated. Historical migration models, raw fixtures and
+direct SQL writes are not gated either. None of them needs a command
+afterwards: reads see the rows as they are.
 
-Create/write gates now run in `save_base`, before consumer `pre_save` receivers.
+Create/write gates run in `save_base`, before consumer `pre_save` receivers.
 Preparation needed before the create check belongs in `save()` or
-`proposed_relationships` (breaking change in 0.23.0).
+`proposed_relationships`.
 
 Before inserting a new model, the Django `create()`, `save()`, and
 `bulk_create()` gates project only the field-backed relations that `create`
@@ -245,7 +251,7 @@ fields and needs a separate parent write decision.
 
 Source and target identities must have a canonical SQL wire/column codec:
 integer/auto, char/text/slug, or UUID fields. Custom encoded fields whose Python
-conversion cannot be reproduced in SQL are refused with `rebac.E014` in 0.23.0;
+conversion cannot be reproduced in SQL are refused with `rebac.E014`;
 use a supported scalar identity field. Properties without an ORM field and
 composite identities are unsupported.
 Loaded instances must expose a nonempty identity; model reference resolution
@@ -272,14 +278,14 @@ definition platform/role {
 Without `resource`/`value`, the column value is the container ID. With both,
 the declared comparison applies only to that fixed container; other IDs on
 the same relation retain stored tuples. Tuple writes/deletes against the live
-container are rejected. The subject column is the source; supported writes
-maintain the index in the same transaction. Attribute filters apply to the
-subject model. Unsupported writes require rebuild as described above.
+container are rejected. The subject column is the source: a statement reads it
+when the permission is evaluated. Attribute filters apply to the subject
+model.
 
 Two rules keep every read path in agreement. A dynamic container is named by
 the column value's canonical Python spelling only (`"1"` is integer container
 `1`; `"01"` is nothing). Text attribute columns need a deterministic,
-case-sensitive collation, because index projection compares columns in SQL
+case-sensitive collation, because a statement compares columns in SQL
 while canonical wire identities preserve exact spelling; see ARCHITECTURE.md § Field-backed
 structural relations.
 
@@ -434,12 +440,24 @@ The build emits `use typechecking` automatically — that catches *type* errors 
 
 ## Patterns by scenario
 
-### Set operations and read plans (`rebac.E016`, `rebac.E019`)
+### Set operations in recursion (`rebac.E016`)
 
-In LocalBackend 0.23.0, recursive permissions may combine union and arrows.
-An intersection or exclusion on a recursive cycle, including a self-loop,
-raises `rebac.E016` and reports the cycle. Keep `&` and `-` in a separate,
-non-recursive wrapper:
+A recursive permission may combine union, arrows, intersection and exclusion.
+`LocalBackend` refuses a recursive component in two cases only:
+
+- a permission of the component is on the excluded (right-hand) side of `-`
+  inside the component: `read = viewer - parent->read`;
+- one expression uses permissions of the component more than once:
+  `read = parent->read + parent->read`.
+
+Intersection with, and exclusion of, something outside the component is
+accepted: `read = (viewer + parent->read) - blocked` and
+`read = parent->read & member` both compile. A refused schema raises
+`SchemaError` (the message ends with `(rebac.E016)`) when it is synced or
+evaluated, and `manage.py check --database <alias>` reports `rebac.E016`.
+
+Where the policy allows it, keep the recursive permission a plain union and
+put `&` and `-` in a separate wrapper:
 
 ```zed
 definition drive/folder {
@@ -453,23 +471,19 @@ definition drive/folder {
 ```
 
 Here `blocked` applies at the folder being read. An ancestor's ban does not
-automatically propagate, because the arrow follows `inherited`. If bans must
-propagate, model that policy explicitly; do not change the recursive arrow to
-`parent->read`, which puts subtraction back on the cycle. A recursive union
-may depend on a non-recursive permission containing set operations, provided
-there is no dependency back to the recursive permission.
+propagate, because the arrow follows `inherited`. If bans must propagate along
+the chain, write `permission read = (viewer + parent->read) - blocked`: an
+ancestor's ban then removes what is inherited through that ancestor. A
+recursive union of the form `base + parent->same` compiles to the flat forms
+of ARCHITECTURE.md § Recursion; a set operation inside the recursive
+permission is compiled by nesting the whole body in itself, level by level.
 
-This is a documented LocalBackend restriction for 0.23.0. Monotone set
-operations in recursion are deferred to 0.24; negative cycles (recursion
-through the right side of `-`) remain permanently unsupported. Data cycles in
-union/arrow graphs terminate at the index's least fixpoint.
+A runtime `tighten` override on a recursive permission is accepted. A
+`disable` or `extend` override that would put the recursive arrow on an
+excluded side is refused when it is written.
 
-Each non-recursive `&` or `-` becomes a named set checked from the index
-when a read runs. A permission's SQL size depends on its static read plan,
-not on graph depth or user count. `rebac.E019` reports a plan exceeding
-`REBAC_INDEX_LOOKUP_LIMIT` (default 64); simplify the expression or split
-it into smaller permissions if the check fires. `nil` operands are folded
-before the plan is counted.
+A permission's SQL size follows its expression, times `REBAC_DEPTH_LIMIT` for
+a recursive part. It does not depend on the number of users or rows.
 
 ### Users and groups
 
@@ -582,16 +596,19 @@ definition storage/file {
 ```
 
 The arrow `parent->read` means the parent's `read` permission contributes here.
-`LocalBackend` reads the permission index with a SQL shape independent of tree
-depth; `REBAC_DEPTH_LIMIT` does not bound those reads. Persisted checks, including
-caveated checks, no longer raise `PermissionDepthExceeded`. Only the preflight
-walker in `check_new` keeps that bound (default 8). Deep trees can cost write
-time and storage: re-parenting a subtree maintains affected descendants in the
-same transaction under the per-alias global maintenance lock.
+`LocalBackend` unrolls the recursion to `REBAC_DEPTH_LIMIT` levels (default 8)
+in the statement it compiles. A queryset scope includes a row only when a
+grant lies within that many hops. A check on a chain it cannot decide within
+the bound raises `PermissionDepthExceeded`; it never answers `NO` for a chain
+it did not follow to its end. Set `REBAC_DEPTH_LIMIT` to cover the deepest
+chain in your data: each level adds SQL to every statement that reads the
+recursive permission (ARCHITECTURE.md § Recursion). The preflight walker in
+`check_new` has the same bound. Re-parenting a subtree is one row write:
+nothing is stored per descendant.
 
 **Multi-hop arrows are not supported.** You cannot write `parent->parent->read`. The pattern above works because `read` itself recurses through `parent->read` — that's how multi-hop traversal is expressed in SpiceDB.
 
-**Cycles in data.** SpiceDB doesn't reject `folder:A#parent @ folder:A`. Its dispatcher hits the depth limit. `LocalBackend`'s index terminates on the cycle and grants what the cycle's members reach, so the two backends can disagree. Validate at the application layer:
+**Cycles in data.** SpiceDB doesn't reject `folder:A#parent @ folder:A`. Its dispatcher hits the depth limit. `LocalBackend` answers exactly for a cycle in stored `parent` tuples and grants what the cycle's members reach. For a field-backed `parent` (a self foreign key), a row on a cycle is granted when a grant lies within `REBAC_DEPTH_LIMIT` hops, and a check that finds none raises `PermissionDepthExceeded`. The two backends can disagree. Validate at the application layer:
 
 ```python
 def assign_parent(self, new_parent):
@@ -1133,8 +1150,8 @@ automated check currently enforces this rule.
 relation viewer: auth/user:* | auth/group#member
 ```
 
-Wildcard membership propagates through subject sets in the LocalBackend
-index. Every permission that reaches this relation can therefore become public
+Wildcard membership propagates through subject sets in `LocalBackend`.
+Every permission that reaches this relation can therefore become public
 to concrete actors of the wildcard's type. Keep such relations restricted to
 read-shaped permissions, including their transitive dependents. A wildcard
 does not match a subject-set actor.
@@ -1148,8 +1165,11 @@ folder:A#parent @ folder:B
 folder:B#parent @ folder:A   // ← cycle
 ```
 
-The LocalBackend index terminates at the finite-path least fixpoint for these
-positive cycles. SpiceDB can fail at its dispatch depth limit. Validate tree
+For these positive cycles in stored tuples, LocalBackend's closure converges
+and answers exactly. On a cycle of a self foreign key a row has more ancestors
+than any bound: grants within `REBAC_DEPTH_LIMIT` hold, and a check that finds
+none raises `PermissionDepthExceeded`. SpiceDB can fail at its dispatch depth
+limit. Validate tree
 constraints at the application layer when cycles are invalid for your data
 (see [§ Hierarchical resources](#hierarchical-resources-folders--files)).
 

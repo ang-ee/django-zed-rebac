@@ -53,7 +53,7 @@ def test_migrate_can_upgrade_legacy_backing_with_system_checks_enabled(settings)
         with pytest.raises((OperationalError, ProgrammingError)):
             backend().schema()
 
-        call_command("migrate", "rebac", "0007", skip_checks=False, verbosity=0, stdout=output)
+        call_command("migrate", "rebac", skip_checks=False, verbosity=0, stdout=output)
 
         row = SchemaRelation.objects.get(pk=row.pk)
         assert row.backing == {"kind": "fk", "path": "folder"}
@@ -63,7 +63,7 @@ def test_migrate_can_upgrade_legacy_backing_with_system_checks_enabled(settings)
         with pytest.raises(SchemaError, match="backing"):
             row.save(update_fields=["backing"])
     finally:
-        call_command("migrate", "rebac", "0007", skip_checks=True, verbosity=0, stdout=output)
+        call_command("migrate", "rebac", skip_checks=True, verbosity=0, stdout=output)
         reset_backend()
 
 

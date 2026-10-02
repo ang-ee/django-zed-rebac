@@ -1,4 +1,4 @@
-"""Production-shaped intersections have SQL bounded by their read plans."""
+"""Production-shaped intersections: a scope agrees with point checks and is fixed by the policy."""
 
 from contextlib import contextmanager
 
@@ -7,12 +7,19 @@ from django.db import connection, models
 from django.test import override_settings
 from django.test.utils import isolate_apps
 
-from rebac import RebacMixin, RelationshipTuple, SubjectRef, backend, sudo, to_object_ref
+from rebac import (
+    PermissionDepthExceeded,
+    RebacMixin,
+    RelationshipTuple,
+    SubjectRef,
+    backend,
+    sudo,
+    to_object_ref,
+)
 from rebac.backends import reset_backend
-from rebac.index.program import program_for
+from rebac.conf import app_settings
 from rebac.schema import parse_zed
 from tests.backend_setup import STORAGE_TIERS, install_schema
-from tests.index_harness import assert_no_drift
 
 pytestmark = pytest.mark.django_db(transaction=True)
 
@@ -20,10 +27,11 @@ pytestmark = pytest.mark.django_db(transaction=True)
 @contextmanager
 def binding_graph(db, monkeypatch, storage):
     """The same graph can run on SQLite and the opt-in vendor connections."""
+    import rebac.compile.predicate
+    import rebac.compile.read
     import rebac.field_backing
-    import rebac.index.program
-    import rebac.index.read
     import rebac.resources
+    import rebac.watch
 
     with (
         isolate_apps("tests.testapp"),
@@ -61,27 +69,31 @@ def binding_graph(db, monkeypatch, storage):
             task=fk(target),
             project=fk(types["scope/project"]),
         )
+        # Isolated classes are absent from the process-global app registry
+        # that resolves a resource or subject type to its model.
         original = rebac.field_backing.model_for_resource_type
-        monkeypatch.setattr(
+        for module in (
             rebac.field_backing,
-            "model_for_resource_type",
-            lambda name: types.get(name) or original(name),
-        )
-        for module in (rebac.resources, rebac.index.program, rebac.index.read):
+            rebac.resources,
+            rebac.watch,
+            rebac.compile.predicate,
+            rebac.compile.read,
+        ):
             monkeypatch.setattr(
                 module, "model_for_resource_type", lambda name: types.get(name) or original(name)
             )
         original_subject = rebac.field_backing.model_for_subject_type
-        monkeypatch.setattr(
+        for module in (
             rebac.field_backing,
-            "model_for_subject_type",
-            lambda name: (types[name], "pk") if name in types else original_subject(name),
-        )
-        monkeypatch.setattr(
-            rebac.index.program,
-            "model_for_subject_type",
-            rebac.field_backing.model_for_subject_type,
-        )
+            rebac.watch,
+            rebac.compile.predicate,
+            rebac.compile.read,
+        ):
+            monkeypatch.setattr(
+                module,
+                "model_for_subject_type",
+                lambda name: (types[name], "pk") if name in types else original_subject(name),
+            )
         schema = """
         definition auth/user {}
         definition scope/group { relation member: auth/user }
@@ -120,11 +132,8 @@ def binding_graph(db, monkeypatch, storage):
         reset_backend()
         active = backend()
         install_schema(active, parse_zed(schema))
-        # Watch publication must retain these isolated classes, which cannot
-        # be resolved by the process-global Django app registry.
-        from rebac.index.program import program_for
-
-        watched = program_for(active, using=db.alias).watched
+        # The write gates must resolve the watched columns to these isolated classes.
+        watched = rebac.watch.gate_policy(db.alias, active).watched
         assert watched[binding._meta.label_lower].model is binding
         try:
             yield active, types, binding
@@ -138,15 +147,19 @@ def binding_graph(db, monkeypatch, storage):
 def exercise_binding_scope(db, monkeypatch, storage):
     with binding_graph(db, monkeypatch, storage) as (active, types, binding):
         actors = [SubjectRef.of("auth/user", name) for name in ("both", "left", "right", "neither")]
+        actions = ("left", "right", "read", "exclude", "shared")
 
         def create(name, **fields):
             with sudo(reason="additive scope fixture"):
                 return types[f"scope/{name}"]._base_manager.using(db.alias).create(**fields)
 
         root = create("page")
-        page = root
+        pages = [root]
         for _ in range(12):
-            page = create("page", parent=page)
+            pages.append(create("page", parent=pages[-1]))
+        # A page inherits from REBAC_DEPTH_LIMIT ancestors at most: the root's
+        # grant still reaches ``near``, and ``far`` lies past the bound.
+        near, far = pages[app_settings.REBAC_DEPTH_LIMIT], pages[-1]
         vault = create("vault")
         target = create("stage5")
         leaf = target
@@ -154,12 +167,13 @@ def exercise_binding_scope(db, monkeypatch, storage):
             target = create(name, parent=target)
         task = target
         rows = [
-            create("binding", page=page, task=task),
+            create("binding", page=near, task=task),
             create("binding", vault=vault, project=task.parent),
-            create("binding", page=page),
+            create("binding", page=near),
             create("binding", task=task),
             create("binding"),
         ]
+        beyond = [create("binding", page=far, task=task), create("binding", page=far)]
         tuples = []
         for name, resource, members in (
             ("left", root, actors[:2]),
@@ -178,8 +192,9 @@ def exercise_binding_scope(db, monkeypatch, storage):
         active.write_relationships(tuples)
 
         sizes = {}
+        undecided = {action: set() for action in actions}
         for actor in actors:
-            for action in ("left", "right", "read", "exclude", "shared"):
+            for action in actions:
                 qs = binding.objects.using(db.alias).with_actor(actor).with_action(action).scoped()
                 probes = []
 
@@ -189,27 +204,55 @@ def exercise_binding_scope(db, monkeypatch, storage):
 
                 with db.execute_wrapper(record):
                     sql, params = qs.query.get_compiler(using=db.alias).as_sql()
-                assert probes == []  # SQL compilation must perform no graph reads.
+                # Compilation decides the actor's sets and the small row sets
+                # behind arrows; it reads, and writes nothing.
+                assert all(probe_sql.lstrip().startswith("SELECT") for probe_sql, _ in probes)
                 sizes[action] = (len(sql), len(params))
-                expected = {
-                    row.pk
-                    for row in rows
-                    if active.check_access(
-                        subject=actor, action=action, resource=to_object_ref(row)
-                    ).allowed
-                }
+                expected = set()
+                for position, row in enumerate([*rows, *beyond]):
+                    try:
+                        allowed = active.check_access(
+                            subject=actor, action=action, resource=to_object_ref(row)
+                        ).allowed
+                    except PermissionDepthExceeded:
+                        # The page's grant, if any, lies past the bound: no point answer.
+                        assert row in beyond
+                        undecided[action].add((actor.subject_id, position - len(rows)))
+                    else:
+                        if allowed:
+                            expected.add(row.pk)
+                # A scope keeps only rows provable within the bound.
                 assert set(qs.values_list("pk", flat=True)) == expected
+                if action == "left":
+                    held = {rows[0].pk, rows[2].pk} if actor in actors[:2] else set()
+                    assert expected == held | ({rows[1].pk} if actor == actors[0] else set())
                 if action == "read":
                     assert expected == ({rows[0].pk, rows[1].pk} if actor == actors[0] else set())
-        plan = program_for(active, using=db.alias)
-        for action, (length, parameters) in sizes.items():
-            lookups = plan.lookups(("scope/binding", action))
-            assert length <= 1024 + 4096 * lookups
-            assert parameters <= 128 * lookups
-        assert_no_drift(using=db.alias)
+        # Past the bound a point check raises exactly where the unreached
+        # ancestors of the far page would decide the answer.
+        everyone = {actor.subject_id for actor in actors}
+        assert undecided == {
+            "left": {(name, row) for name in everyone for row in (0, 1)},
+            "right": set(),
+            "read": {("both", 0), ("right", 0)},
+            "exclude": {("left", 0), ("neither", 0)} | {(name, 1) for name in everyone},
+            "shared": {("both", 0), ("right", 0)},
+        }
+        # A compound statement holds its operands side by side: an intersection
+        # or an exclusion of recursive unions does not multiply them.
+        operands = {
+            "read": ("left", "right"),
+            "exclude": ("left", "right"),
+            # ``project->read`` is an arm of ``right``.
+            "shared": ("left", "right", "right"),
+        }
+        for action, parts in operands.items():
+            length, parameters = sizes[action]
+            assert length <= sum(sizes[part][0] for part in parts)
+            assert parameters <= sum(sizes[part][1] for part in parts)
 
 
-# Intrinsically slow: 27 maintained writes over an eight-model production-shaped graph.
+# Intrinsically slow: an eight-model production-shaped graph checked row by row.
 @pytest.mark.slow
 @pytest.mark.parametrize("storage", ["denormalized", "registry"])
 def test_recursive_intersection_is_additive(monkeypatch, storage):

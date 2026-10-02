@@ -7,12 +7,12 @@ from statistics import median
 from time import perf_counter
 
 import pytest
+from django.db import connection
+from django.test.utils import CaptureQueriesContext
 
-from rebac import SubjectRef, backend
-from rebac.index import read
-from rebac.index.program import program_for
-from rebac.models.generation import SchemaGeneration
-from rebac.schema import parse_zed
+from rebac import ObjectRef, SubjectRef
+from rebac.compile import read
+from rebac.testing import install_schema
 from tests.testapp.models import Post
 
 SCHEMA = """
@@ -29,23 +29,15 @@ definition blog/post {
     permission read = p5 + authenticated
 }
 """
+ROWS = 200
 
 
 @pytest.mark.django_db
 def test_benchmark_scope() -> None:
-    active = backend()
-    active.set_schema(parse_zed(SCHEMA))
-    revision = active._manual_schema_revision()
-    program = program_for(active, using="default")
-    SchemaGeneration.objects.update_or_create(
-        pk=1,
-        defaults={
-            "revision": revision,
-            "index_revision": revision,
-            "index_program": program.digest,
-        },
-    )
+    active = install_schema(SCHEMA)
+    Post._base_manager.bulk_create([Post(title=f"post {number}") for number in range(ROWS)])
     actor = SubjectRef.of("auth/user", "alice")
+    resource = ObjectRef("blog/post", str(Post._base_manager.values_list("pk", flat=True)[0]))
 
     def measure(fn, repetitions=11):
         times = []
@@ -56,27 +48,34 @@ def test_benchmark_scope() -> None:
             times.append((perf_counter() - started) * 1000)
         return round(median(times), 3), result
 
+    def statements(fn):
+        with CaptureQueriesContext(connection) as queries:
+            fn()
+        return len(queries)
+
+    def scoped_sql(subject):
+        return Post.objects.with_actor(subject).scoped().query.sql_with_params()
+
+    def rows():
+        return list(Post.objects.with_actor(actor).scoped())
+
+    def check():
+        return active.check_access(subject=actor, action="read", resource=resource)
+
     build_ms, predicate = measure(
-        lambda: read.scope_q(Post, action="read", actor=actor, using="default")
+        lambda: read.scope_q(
+            backend=active, model=Post, action="read", actor=actor, using="default"
+        )
     )
     compile_ms, _ = measure(lambda: Post._base_manager.filter(predicate).query.sql_with_params())
-    scoped_ms, scoped = measure(
-        lambda: Post.objects.with_actor(actor).scoped().query.sql_with_params()
-    )
+    scoped_ms, scoped = measure(lambda: scoped_sql(actor))
     sql, params = scoped
-    new_actor_ms, _ = measure(
-        lambda: (
-            Post.objects.with_actor(SubjectRef.of("auth/user", "bob"))
-            .scoped()
-            .query.sql_with_params()
-        ),
-        repetitions=1,
-    )
-    read._scope_cache.clear()
-    cold_ms, _ = measure(
-        lambda: Post.objects.with_actor(actor).scoped().query.sql_with_params(),
-        repetitions=1,
-    )
+    new_actor_ms, _ = measure(lambda: scoped_sql(SubjectRef.of("auth/user", "bob")), repetitions=1)
+    read.reset()
+    cold_ms, _ = measure(lambda: scoped_sql(actor), repetitions=1)
+    rows_ms, found = measure(rows)
+    check_ms, decision = measure(check)
+    assert len(found) == ROWS and decision.allowed
     print(
         "SCOPE_BENCH "
         + json.dumps(
@@ -89,6 +88,10 @@ def test_benchmark_scope() -> None:
                 "sql_chars": len(sql),
                 "params": len(params),
                 "exists": sql.upper().count("EXISTS"),
+                "rows_ms": rows_ms,
+                "rows_statements": statements(rows),
+                "check_ms": check_ms,
+                "check_statements": statements(check),
             },
             sort_keys=True,
         )

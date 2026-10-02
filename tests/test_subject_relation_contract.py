@@ -127,12 +127,11 @@ def test_invalid_ast_cannot_write_or_authorize_permission_subject_tuple(
     with pytest.raises(ValueError, match="cannot reference permissions"):
         local.write_relationships([invalid])
 
-    from rebac.index.read import scope_q, using_backend
+    from rebac.compile.read import scope_q
 
-    with using_backend(local):
-        assert not Post._base_manager.filter(
-            scope_q(Post, action="read", actor=user, using="default")
-        ).exists()
+    assert not Post._base_manager.filter(
+        scope_q(backend=local, model=Post, action="read", actor=user, using="default")
+    ).exists()
 
     preflight = check_new(
         subject=user,
@@ -151,9 +150,6 @@ def test_invalid_ast_cannot_write_or_authorize_permission_subject_tuple(
         subject_id="set",
         optional_subject_relation="effective_member",
     )
-    from tests.backend_setup import rebuild_backend
-
-    rebuild_backend(local)
     assert not local.has_access(
         subject=user,
         action="read",

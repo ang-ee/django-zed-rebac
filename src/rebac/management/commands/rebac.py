@@ -83,13 +83,6 @@ class Command(BaseCommand):
     def add_arguments(self, parser: Any) -> None:
         sub = parser.add_subparsers(dest="cmd", required=True)
 
-        p_index = sub.add_parser("index", help="Rebuild or verify the local permission index")
-        index_sub = p_index.add_subparsers(dest="index_cmd", required=True)
-        for operation in ("rebuild", "verify"):
-            command = index_sub.add_parser(operation)
-            command.add_argument("--type", action="append", dest="index_types", default=None)
-            command.add_argument("--database", default=None, choices=tuple(connections))
-
         p_sync = sub.add_parser("sync", help="Load permissions.zed files into Schema* tables")
         p_sync.add_argument(
             "--check", action="store_true", help="CI gate: detect drift; no writes."
@@ -151,9 +144,6 @@ class Command(BaseCommand):
         p_rels.add_argument("--limit", type=int, help="Maximum rows (default: unlimited).")
 
     def handle(self, *args: Any, **options: Any) -> None:
-        if options["cmd"] == "index":
-            self._handle_index(options)
-            return
         cmd = options["cmd"]
         if cmd == "sync":
             self._handle_sync(options)
@@ -334,56 +324,12 @@ class Command(BaseCommand):
             with schema_write_atomic(alias):
                 self._apply_schema_sources(sources, check_only=True, force=force, using=alias)
         else:
-            from ...index.maintain import IndexMaintenance
-            from ...models.generation import SchemaGeneration
-            from ...models.index import IndexState
+            from ...models.schema_write import schema_index_write
 
-            # sync is an explicit installation/repair owner for the lock row.
-            # Normal writes never create it lazily.
-            with schema_write_atomic(alias):
-                IndexState.objects.using(alias).get_or_create(key="global")
-                with IndexMaintenance(using=alias) as maintenance:
-                    generation = SchemaGeneration.objects.witness(alias)
-                    stale = generation is None or generation.index_revision != generation.revision
-                    self._apply_schema_sources(sources, check_only=False, force=force, using=alias)
-                    if not stale and not maintenance.schema_changed:
-                        # The policy rows are unchanged, but sync advanced the
-                        # revision. Publish it again without deriving a row,
-                        # unless another program derived the index, as after
-                        # an upgrade that changes derivation.
-                        assert generation is not None
-                        program = maintenance.load_program().digest
-                        if generation.index_program == program:
-                            SchemaGeneration.objects.publish_index(alias, program=program)
-                        else:
-                            stale = True
-                    if stale:
-                        maintenance.schema_all = True
-                        maintenance.schema_types.clear()
-                        maintenance.changed(schema=True)
-
-    def _handle_index(self, options: dict[str, Any]) -> None:
-        from django.db import router
-
-        from ...index.rebuild import rebuild, verify
-        from ...models import active_relationship_model
-
-        using = options.get("database") or router.db_for_write(active_relationship_model())
-        types = options.get("index_types")
-        if options["index_cmd"] == "verify":
-            drift = verify(using=using, types=types)
-            if drift:
-                for line in drift:
-                    self.stderr.write(line)
-                raise CommandError("Permission index drift detected; run `rebac index rebuild`.")
-            self.stdout.write(self.style.SUCCESS("Permission index matches its sources."))
-        else:
-            stats = rebuild(using=using, types=types)
-            self.stdout.write(
-                self.style.SUCCESS(
-                    f"Permission index rebuilt: {stats.inserted} inserted, {stats.deleted} deleted."
-                )
-            )
+            # One owner: the policy lock is held and the composed policy is
+            # validated once, when every package's rows are written.
+            with schema_index_write(alias):
+                self._apply_schema_sources(sources, check_only=False, force=force, using=alias)
 
     def _apply_schema_sources(
         self, sources: list[tuple[Any, Path, Any]], *, check_only: bool, force: bool, using: str

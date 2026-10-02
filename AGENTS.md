@@ -13,7 +13,8 @@ Guidance for coding agents (Claude Code reads this file through the
 
 `django-zed-rebac` is a **standalone, drop-in REBAC plugin for any Django 6.0
 project** (the supported matrix is pinned in `pyproject.toml`; see § Tooling). SpiceDB-compatible schema language, two interchangeable
-backends (`LocalBackend` permission index in pure Django; planned `SpiceDBBackend` over
+backends (`LocalBackend`, which compiles permissions to queries over the
+application's own tables in pure Django; planned `SpiceDBBackend` over
 `authzed-py`), strict-by-default queryset scoping, AI-agent Grant pattern,
 MCP / Celery / DRF / GraphQL adapters.
 
@@ -88,8 +89,8 @@ not a code change**.
   equivalent (e.g., a "list all permissions for this user across all resource
   types" RPC SpiceDB doesn't expose).
 - **Do** mirror `authzed.api.v1` method names in the Python `Backend` ABC
-  (snake_case wrappers around `CheckPermission`, `LookupResources`,
-  `LookupSubjects`, `WriteRelationships`, `WriteSchema`,
+  (snake_case wrappers around `CheckPermission`, `CheckBulkPermissions`,
+  `LookupResources`, `LookupSubjects`, `WriteRelationships`, `WriteSchema`,
   `ExpandPermissionTree`).
 - **Do** emit `use typechecking` at the top of every generated `.zed` file
   (catches mutually-exclusive-type intersections at WriteSchema time).
@@ -213,8 +214,9 @@ Archived/inactive rows are visible to permission evaluation by default.
 Soft-delete is orthogonal to permission scope — an admin with `delete` on an
 archived resource needs to be able to un-archive it. If callers want to hide
 archived rows, they filter at the queryset level
-(`Post.objects.with_actor(u).filter(archived=False)`); permission-index
-evaluation does not exclude them.
+(`Post.objects.with_actor(u).filter(archived=False)`); permission
+evaluation does not exclude them: the compiler reads model rows through
+`_base_manager`.
 
 - **Don't** introduce an `active_test`-style toggle (Odoo's per-call
   footgun) that flips visibility from inside the permission layer. It's a
@@ -235,16 +237,20 @@ related-manager call, a through model's `_base_manager`, a base-manager
 `update` of a watched scalar column) is pinned for proposal 0013, which gates
 from the statement's own `Query`; do not add further Python emulation of
 Django query semantics to close such a case.
-Any declaring type without a permission literally named `write` is maintained
-without an actor gate, including resource types that use `edit` or `update`;
-consumers protect those backing columns with Django permissions. Pinned as
+Any declaring type without a permission literally named `write` has no actor
+gate on its backed edges, including resource types that use `edit` or `update`;
+consumers protect those backing columns with Django permissions. Nothing is
+maintained after a write: the gate decides, then the write changes the
+application's columns and nothing else, and the next read sees it. A queryset
+write to a column the policy reads selects the statement's primary keys, gates
+those rows from their stored values (read under a row lock) and writes exactly
+those rows by key. Pinned as
 expected failures for proposal 0011: `RebacMixin` deletes, which lift another
 type's backed edges with no `write` check; the collector's CASCADE and
 SET_NULL rows, which are gated under the ambient actor rather than the actor
 pinned on the deleted row; the moved row's own `write` and the pinned actor on
 reverse-FK `add(bulk=True)`; and instance-level through-model writes
-(`create`, `save`, `get_or_create`, `delete`), which are neither gated nor
-maintained.
+(`create`, `save`, `get_or_create`, `delete`), which are not gated.
 
 ### 6. Determinism is load-bearing
 
@@ -351,12 +357,13 @@ In a fix loop:
 - run only the tests you touched or that just failed, by node id or via
   `make test-fast` (`-n auto --dist worksteal --lf --ff -x`);
 - never run a whole module that takes over 30 s inside the loop; the
-  reference sweep and scale modules are reached by node id only;
+  reference sweep module (`tests/test_reference_model.py`) is reached by node
+  id only;
 - when the loop is green, run tier 1 once (`make check`), and tier 2
   (`make test-pg`; `make pg-up` prints the `REBAC_TEST_POSTGRES_URL` for a
   disposable local PostgreSQL, `make pg-down` removes it) only if the change
   touches SQL generation, transactions, locking or migrations;
-- never run tier 3 (`make test-release`: slow, full PostgreSQL suite, scale,
+- never run tier 3 (`make test-release`: slow, full PostgreSQL suite,
   reference sweep, vendor contracts, random order) as part of a change. It
   runs nightly in `.github/workflows/release.yml`, and locally before a
   release when the user asks for it. See `docs/ARCHITECTURE.md § Test tiers`;
@@ -375,7 +382,9 @@ Per `docs/ARCHITECTURE.md § Testing`:
 - **Type-check:** `mypy --strict` AND `pyright` — both must pass on CI. Ship
   `py.typed`.
 - **Test:** `pytest` + `pytest-django` for integration; pure-Python `pytest`
-  for unit. SpiceDB conformance tests (`-m spicedb`, planned after 0.23.0)
+  for unit. The reference sweep (`-m reference_exhaustive`, tier 3) and the
+  differential suites compare the compiled reads with a reference model and a
+  frozen walker. SpiceDB conformance tests (`-m spicedb`, planned)
   run generated cases against a pinned `spicedb serve-testing` container in
   dev and CI; see ARCHITECTURE.md § SpiceDB conformance suite. SpiceDB is the
   oracle; a `LocalBackend` difference not listed there as deliberate is a bug.
@@ -421,10 +430,14 @@ access via `rebac.backend()`.
   otherwise mark `class Meta: managed = True` (default) and ship the
   standard migration.
 - Migrations must run on PostgreSQL 13+, MySQL 8+, SQLite (test only).
-  Index writes use Django ORM and streamed `bulk_create`; rows pass through
-  Python in bounded batches. No raw SQL, triggers or database functions;
-  migration `0005`'s existing legacy uninstall routine is the only raw-SQL
-  exception. CI runs SQLite and PostgreSQL; the opt-in MySQL 8 vendor suite
+  Data migrations use the Django ORM in bounded batches (`0008` fills
+  `caveat_key` 1,000 rows at a time). No raw SQL, triggers or database
+  functions, in migrations or at run time; migration `0005`'s existing legacy
+  uninstall routine is the only raw-SQL exception. One documented exception
+  covers SQL text that Django's own compiler produced: compiled id sets, kept
+  statements and the identity conversion's guard are embedded as that text
+  (ARCHITECTURE.md § Statement shape). No statement is written by hand.
+  CI runs SQLite and PostgreSQL; the opt-in MySQL 8 vendor suite
   is a release gate.
 
 ### Settings
@@ -449,7 +462,7 @@ from rebac import (
     require_permission, rebac_resource, rebac_subject,
     Backend, LocalBackend, SpiceDBBackend, backend,
     CheckResult, Consistency, Zookie, PermissionResult,
-    ObjectRef, SubjectRef, RelationshipTuple, ActorLike,
+    ObjectRef, SubjectRef, RelationshipTuple, ActorLike, CheckItem,
     PermissionDenied, MissingActorError, CaveatUnsupportedError,
     PermissionDepthExceeded, NoActorResolvedError, SchemaError,
     current_actor, set_current_actor, actor_context,
@@ -507,8 +520,10 @@ system checks.
 Django uses `_base_manager` for FK reverse caching, M2M intermediate
 handling, etc. — these break if filtering applies. Install the scoped
 manager as `objects` (`_default_manager`). RebacMixin and RebacTrackedMixin inject
-an owning, unscoped base manager through `base_manager_name`: it maintains writes
-but never filters reads or applies actor scope. This preserves the unfiltered
+an owning, unscoped base manager through `base_manager_name`: it owns the gated
+writes and stores nothing derived, and it never filters reads or applies actor
+scope. Permission statements read a model's rows, and the write gates read
+their stored values, through it. This preserves the unfiltered
 base-manager rule and covers reverse-FK bulk add and collector SET_NULL.
 A model that declares its own base manager (in its `Meta` or on any parent
 model) keeps it; nothing is injected then. That manager must be built over a
@@ -533,7 +548,8 @@ written_at_xid)` are wire-compatible with `authzed.api.v1.Relationship`.
 Django's `Options` rejects unknown Meta attrs. The mixin uses a custom
 `RebacModelBase` metaclass that strips `rebac_resource_type` /
 `rebac_default_action` from Meta before delegating to `ModelBase`, then
-restores them on `_meta` post-construction. Don't add new captured names
+puts them on `_meta` while Django builds the class, before it sends
+`class_prepared`. Don't add new captured names
 without extending the metaclass.
 
 ### Don't ship a non-deterministic build
@@ -587,9 +603,10 @@ When implementing or modifying the plugin:
      project) when the schema or sync command changed.
 
    Tier 3 is **not** part of this chain: the reference sweep
-   (`make test-index-reference`), the full PostgreSQL suite, the scale
-   budgets, `make test-schema-vendors` and, once it lands, `pytest -m spicedb`
-   run nightly and before a release (`make test-release`). Say in the report
+   (`make test-reference`), the full PostgreSQL suite,
+   `make test-schema-vendors` and, once it lands, `pytest -m spicedb`
+   run nightly and before a release (`make test-release`). There is no scale
+   suite at the moment. Say in the report
    that tier 3 was not run; don't run it to be safe.
 5. **Determinism test on every emitter touch.** See
    [§ Don't ship a non-deterministic build](#dont-ship-a-non-deterministic-build).
@@ -605,10 +622,17 @@ The spec calls out several open questions; don't re-decide them ad hoc:
 
 - **Integration at the ORM's SQL compilers** (1.0): read scope for every
   alias including `select_related`, one write gate from the statement's
-  `Query`, single storage, identity as a stored column. The plan and its
-  order of work are in `docs/ROADMAP.md § 1.0`; the design is proposal 0013.
+  `Query`, single storage. The plan and its
+  order of work are in `docs/ROADMAP.md § 1.0`; the design is proposal 0013,
+  narrowed by proposal 0015 § 10 (nothing is maintained after a write, and no
+  model column is converted, so a stored identity column is unnecessary).
   Until it lands, do not add Python emulation of Django query semantics to
   close a gating gap; pin it under proposal 0013 instead.
+- **The write gates** (proposal 0015 § 13): keep invariant 5d and finish
+  proposal 0011 on the compiled predicate, or narrow the rule to the row that
+  holds the changed column. A policy change; the owner's decision.
+- **Query plans at scale**: compiled statements on PostgreSQL tables of tens
+  of millions of rows are under trial; claim nothing about them.
 - **PostgreSQL RLS defense-in-depth track** (post-1.0).
 - **Relationship table partitioning at scale** (post-1.0).
 - **Async ORM support** (0.5+).

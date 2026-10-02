@@ -53,22 +53,6 @@ def _schema_for_checks() -> Schema | None:
 @checks.register("rebac")
 def check_backend_setting(app_configs: Any = None, **kwargs: Any) -> list[checks.CheckMessage]:
     issues: list[checks.CheckMessage] = []
-    condition_limit = app_settings.REBAC_INDEX_CONDITION_LIMIT
-    if type(condition_limit) is not int or condition_limit < 1:
-        issues.append(
-            checks.Error(
-                f"REBAC_INDEX_CONDITION_LIMIT={condition_limit!r} (expected a positive integer)",
-                id="rebac.E017",
-            )
-        )
-    lookup_limit = app_settings.REBAC_INDEX_LOOKUP_LIMIT
-    if type(lookup_limit) is not int or lookup_limit < 1:
-        issues.append(
-            checks.Error(
-                f"REBAC_INDEX_LOOKUP_LIMIT={lookup_limit!r} (expected a positive integer)",
-                id="rebac.E019",
-            )
-        )
     backend = app_settings.REBAC_BACKEND
     if backend not in ("local", "spicedb"):
         issues.append(
@@ -160,7 +144,7 @@ def check_caveat_dependency(app_configs: Any = None, **kwargs: Any) -> list[chec
     return []
 
 
-def _index_schema_for_checks(using: str) -> Schema | None:
+def _schema_on_alias(using: str) -> Schema | None:
     """Alias-specific loading, deferring checks until the schema is readable."""
     from django.db import connections
     from django.db.migrations.executor import MigrationExecutor
@@ -187,49 +171,17 @@ def _index_schema_for_checks(using: str) -> Schema | None:
             if not executor.migration_plan(targets):
                 raise
             logging.getLogger("rebac.checks").debug(
-                "Index schema checks deferred on %s until REBAC migrations are applied", using
+                "Schema checks deferred on %s until REBAC migrations are applied", using
             )
     except (DatabaseError, RuntimeError) as exc:
         logging.getLogger("rebac.checks").debug(
-            "Index schema checks skipped on %s: schema unavailable (%s)", using, exc
+            "Schema checks skipped on %s: schema unavailable (%s)", using, exc
         )
     return None
 
 
 @checks.register("rebac", checks.Tags.database)
-def check_index_ready(app_configs: Any = None, **kwargs: Any) -> list[checks.CheckMessage]:
-    """E013: never access the database unless Django explicitly requests it."""
-    if app_settings.REBAC_BACKEND != "local" or not kwargs.get("databases"):
-        return []
-    from django.db import router
-
-    from .models import active_relationship_model
-    from .models.generation import SchemaGeneration
-
-    issues: list[checks.CheckMessage] = []
-    for using in sorted(set(kwargs["databases"])):
-        if not router.allow_migrate_model(using, active_relationship_model()):
-            continue
-        try:
-            row = SchemaGeneration.objects.witness(using)
-        except (DatabaseError, RuntimeError) as exc:
-            logging.getLogger("rebac.checks").debug(
-                "Index readiness check deferred on %s: %s", using, exc
-            )
-            continue
-        if row is None or not row.revision or row.revision != row.index_revision:
-            issues.append(
-                checks.Warning(
-                    f"Permission index on database {using!r} is not built for the current schema revision.",
-                    hint=f"Run `python manage.py rebac sync` or `python manage.py rebac index rebuild --database {using}`.",
-                    id="rebac.E013",
-                )
-            )
-    return issues
-
-
-@checks.register("rebac", checks.Tags.database)
-def check_index_schema(app_configs: Any = None, **kwargs: Any) -> list[checks.CheckMessage]:
+def check_policy_models(app_configs: Any = None, **kwargs: Any) -> list[checks.CheckMessage]:
     """E014-E018; all schema I/O is opt-in via database checks."""
     if app_settings.REBAC_BACKEND != "local" or not kwargs.get("databases"):
         return []
@@ -237,10 +189,11 @@ def check_index_schema(app_configs: Any = None, **kwargs: Any) -> list[checks.Ch
     from django.db import router
 
     from ._id import resource_id_attr
-    from .index.codec import identity_codec
-    from .index.program import codec_fields, program_errors, watched_for
+    from .codec import identity_codec
+    from .compile.program import program_errors
     from .models import active_relationship_model
     from .resources import model_for_resource_type
+    from .watch import codec_fields, watched_for
 
     issues: list[checks.CheckMessage] = []
     relationship_model = active_relationship_model()
@@ -248,7 +201,7 @@ def check_index_schema(app_configs: Any = None, **kwargs: Any) -> list[checks.Ch
     for using in sorted(set(kwargs["databases"])):
         if not router.allow_migrate_model(using, relationship_model):
             continue
-        schema = _index_schema_for_checks(using)
+        schema = _schema_on_alias(using)
         if schema is None:
             continue
         watched = watched_for(schema)
@@ -268,7 +221,7 @@ def check_index_schema(app_configs: Any = None, **kwargs: Any) -> list[checks.Ch
             except SchemaError as exc:
                 issues.append(
                     checks.Error(
-                        f"{model._meta.label}.{attr}: no permission-index codec: {exc}",
+                        f"{model._meta.label}.{attr}: identity cannot be compared with stored tuples: {exc}",
                         obj=model,
                         id="rebac.E014",
                     )
@@ -287,7 +240,7 @@ def check_index_schema(app_configs: Any = None, **kwargs: Any) -> list[checks.Ch
                     checks.Error(
                         f"{model._meta.label} routes writes to {write_alias!r}; "
                         f"relationships use {relationship_alias!r}. "
-                        "Permission-index sources must share the relationship database alias.",
+                        "Models a permission reads must share the relationship database alias.",
                         obj=model,
                         id="rebac.E015",
                     )
@@ -300,8 +253,7 @@ def check_index_schema(app_configs: Any = None, **kwargs: Any) -> list[checks.Ch
                     checks.Error(
                         f"{label} is on a permission backing path but has no write owner or tracking.",
                         hint="Use RebacMixin/RebacTrackedMixin, or list the third-party model in "
-                        "REBAC_TRACKED_MODELS and save inside transaction.atomic()/ATOMIC_REQUESTS. "
-                        "Third-party signal-free bulk writes require rebuild.",
+                        "REBAC_TRACKED_MODELS, so that writes to it are gated.",
                         obj=label,
                         id="rebac.E018",
                     )
@@ -374,7 +326,7 @@ def check_field_backed_relations(
     # Schema-level const checks (no Django model needed): a const arrow's target
     # type must resolve to a definition. Keep the public E010 const-arrow
     # restriction unchanged for compatibility and bounded proposed-object
-    # preflight, even though indexed positive data cycles terminate.
+    # preflight, even though positive data cycles terminate in stored reads.
     for error in const_target_definition_errors(schema):
         issues.append(checks.Error(error, id="rebac.E009"))
     for error in const_arrow_cycle_errors(schema):
@@ -777,8 +729,8 @@ def check_declared_base_managers(
                 checks.Error(
                     f"{model._meta.label}: the declared base manager {name!r} {problem}.",
                     hint=(
-                        "The library reads a model's source rows and maintains the permission "
-                        "index through its base manager. Return an unfiltered, unscoped "
+                        "The library reads a model's source rows and gates writes to them "
+                        "through its base manager. Return an unfiltered, unscoped "
                         "TrackedQuerySet from get_queryset()."
                     ),
                     obj=model,

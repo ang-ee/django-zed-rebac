@@ -54,9 +54,9 @@ from django.utils.module_loading import import_string
 
 from .actors import actor_context, current_actor
 from .backends import backend
+from .codec import identity_codec
 from .conf import app_settings
 from .errors import PermissionDenied
-from .index.codec import identity_codec
 from .preflight import check_new
 from .resources import model_for_resource_type
 from .types import CheckResult, ObjectRef, PermissionResult, SubjectRef

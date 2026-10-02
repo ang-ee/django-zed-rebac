@@ -324,9 +324,8 @@ def unimply(*, parent: str | ObjectRef, child: str | ObjectRef) -> int:
 
     Returns the number of rows deleted (0 or 1).
     """
-    from django.db import router
+    from django.db import router, transaction
 
-    from .index.maintain import tuple_owner
     from .models import active_relationship_model
     from .relationships import delete_relationship
 
@@ -341,7 +340,7 @@ def unimply(*, parent: str | ObjectRef, child: str | ObjectRef) -> int:
     )
     # Wrap presence-check + delete: same TOCTOU as ``revoke``.
     alias = router.db_for_write(Relationship)
-    with tuple_owner(alias, tuples=(tuple_,)):
+    with transaction.atomic(using=alias):
         exists = (
             Relationship.objects.using(alias)
             .filter(

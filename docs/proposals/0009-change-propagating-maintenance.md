@@ -1,5 +1,9 @@
 # Proposal 0009: maintenance that propagates only actual changes
 
+**Status:** superseded by [proposal 0015](./0015-permissions-compiled-to-queries.md).
+It was implemented in 0.24.2; with permissions compiled to queries there is
+no maintenance pass. The text below is kept as written.
+
 ## Problem
 
 A maintenance pass computes its whole region before deriving anything. Any term

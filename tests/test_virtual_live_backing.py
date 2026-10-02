@@ -414,8 +414,8 @@ def test_live_backing_rejects_nonqueryable_subject_identity(active, target_type)
 
 @pytest.mark.parametrize("model_name", ["VirtualFolder", "VirtualPost", "SlugReference"])
 def test_virtual_encoded_identity_is_refused(model_name):
+    from rebac.codec import identity_codec
     from rebac.errors import SchemaError
-    from rebac.index.codec import identity_codec
     from tests.testapp import models
 
     with pytest.raises(SchemaError, match=r"rebac\.E014"):

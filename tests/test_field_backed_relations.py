@@ -211,12 +211,16 @@ def test_unresolved_field_backing_does_not_fall_back_to_stale_tuples(db, rows):
         subject_id="alice",
     )
 
-    from tests.backend_setup import rebuild_backend
-
-    # Unresolvable backing now fails at the index publication boundary. No
-    # stale stored tuple may be published as a substitute for that backing.
+    install_schema(backend, backend.schema())
+    alice = SubjectRef.of("auth/user", "alice")
+    # A backing that does not resolve fails every read that reaches it. The
+    # stored tuple is never read as a substitute for that backing.
     with pytest.raises(SchemaError, match="blog/post#folder"):
-        rebuild_backend(backend)
+        backend.has_access(
+            subject=alice, action="read", resource=ObjectRef("blog/post", str(visible_post.pk))
+        )
+    with pytest.raises(SchemaError, match="blog/post#folder"):
+        list(Post.objects.with_actor(alice))
 
 
 @override_settings(REBAC_USER_ID_ATTR="username")

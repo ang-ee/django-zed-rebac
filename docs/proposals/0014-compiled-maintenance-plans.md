@@ -1,5 +1,10 @@
 # Proposal 0014: maintenance statements compiled once per schema revision
 
+**Status:** superseded by [proposal 0015](./0015-permissions-compiled-to-queries.md).
+There is no maintenance statement left to compile. The identity conversion's
+guard cache from step 1 stays (`rebac.codec`). The text below is kept as
+written.
+
 ## Problem
 
 A write spends more time building ORM expressions than running SQL.

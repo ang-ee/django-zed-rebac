@@ -200,7 +200,7 @@ def check_new(
     if permission is None and relation is None:
         return CheckResult.no(reason=f"unknown action: {resource_type}#{action}")
 
-    from .index.codec import identity_codec
+    from .codec import identity_codec
     from .resources import model_for_subject_type, model_resource_type
 
     for name, candidates in rels.items():

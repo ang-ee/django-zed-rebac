@@ -3,6 +3,223 @@
 All notable changes to `django-zed-rebac` are tracked here. The project is in
 pre-1.0; breaking changes within a minor version are explicitly called out.
 
+## [0.25.0] — 2026-10-02
+
+`LocalBackend` compiles permissions to queries over the application's own
+tables and the tuple table
+([proposal 0015](./docs/proposals/0015-permissions-compiled-to-queries.md)).
+It no longer keeps a derived permission index: the library stores no row per
+application row, and nothing is built, rebuilt or verified. Authorization
+rules and the names exported by `rebac` are unchanged. The specification is
+[ARCHITECTURE.md § Compiled permissions](./docs/ARCHITECTURE.md#compiled-permissions--the-localbackend-read-path).
+
+### Breaking
+
+- **No build step.** A permission is read from the model columns and the
+  tuple table when its statement runs. Field-, attribute- and const-backed
+  relations come from the columns; stored relations from tuples. A model
+  write, a tuple write, a fixture load, a raw SQL write and a bulk write are
+  all visible to the next read with no command run. `rebac sync` only writes
+  the stored schema rows and publishes a policy revision. Until the first
+  sync, reads are closed.
+- **Recursion is bounded by `REBAC_DEPTH_LIMIT`** (default 8) on persisted
+  reads again; 0.23.0 to 0.24.2 answered at any depth. Within the bound a
+  point check answers. A point check that cannot be decided within the bound
+  raises `PermissionDepthExceeded`; it never answers `NO` by truncation and
+  never `HAS`. A queryset scope and `accessible()` include only what is
+  provable within the bound and do not raise. A closure over stored tuples, a
+  backed path or nested groups that converges within the bound is exact, data
+  cycles included. A row with more than `REBAC_DEPTH_LIMIT` ancestors on a
+  self foreign key, which includes every row on a cycle of that column, is
+  granted when an ancestor within the bound grants it; otherwise a point
+  check on it raises.
+- **`rebac.E016` has a different rule.** A recursive component is refused
+  when a permission of the component is reached through the right-hand side
+  of `-` inside the component (`read = viewer - parent->read`), or when one
+  expression uses permissions of the component more than once
+  (`read = parent->read + parent->read`). The refusal is a `SchemaError`
+  whose message ends with `(rebac.E016)`, raised when a permission is
+  evaluated and when a policy write would publish the component.
+  Intersection with, and exclusion of, something outside the component is
+  accepted, so `read = (viewer + parent->read) - banned` compiles, and so
+  does a `tighten` override on a recursive permission; 0.23.0 to 0.24.2
+  refused both.
+- **Writes are not serialized on one lock.** The per-alias lock that every
+  index-affecting write took is gone. A queryset write to a column the
+  policy reads selects the statement's primary keys, gates those rows from
+  their stored values (read under a row lock inside the write's transaction)
+  and writes exactly those rows by key: a row that starts matching the filter
+  in between is neither gated nor written. A grant revoked concurrently is
+  not serialized with a write that was authorized before the revocation
+  committed.
+
+### Removed
+
+- `manage.py rebac index rebuild` and `manage.py rebac index verify`.
+- System checks `rebac.E013` (index readiness), `rebac.E017` and
+  `rebac.E019`.
+- Settings `REBAC_INDEX_LOOKUP_LIMIT` and `REBAC_INDEX_CONDITION_LIMIT`.
+  Nothing caps the number of distinct caveat instances a read decides.
+- The tables of `IndexTerm`, `IndexEdge`, `IndexMember`, `IndexCover`,
+  `IndexWork` and `IndexState`, and the columns
+  `SchemaGeneration.index_revision` and `index_program` (migration `0009`).
+- The packages `rebac.index` and `rebac.models.index`. Three modules moved:
+  `rebac.index.codec` is `rebac.codec`, `rebac.index.time` is `rebac.clock`,
+  and `rebac.index.program.program_errors` is
+  `rebac.compile.program.program_errors(schema)`.
+- The error log and runtime warning for an autocommit save of a third-party
+  tracked model. There is no maintenance for such a save to leave behind.
+
+### Added
+
+- `rebac.compile`: the permission compiler (`program`, `predicate`,
+  `conditions`, `formulas`, `read`, `evaluate`), and `rebac.watch`: the map
+  of the columns a policy reads (`watched_for`, `gate_policy`, `model_write`).
+- `caveat_key` on `Relationship` and `RelationshipRegistry`: a digest of the
+  caveat name and pinned context, written with the tuple by instance saves,
+  raw fixture saves, `write_relationships()` and `bulk_create()`. Migration
+  `0008` adds the column and fills it for existing rows, 1,000 per batch.
+- Migration `0009` drops the index tables and columns and creates the
+  `SchemaGeneration` row (`pk=1`) when it is absent.
+- Migration `0010` gives `caveat_key` a database default, so a writer that
+  does not know the column (a historical model at an earlier migration state,
+  a raw insert) can still insert a relationship row.
+
+### Changed
+
+- Policy writes (schema rows, overrides, `rebac sync`,
+  `rebac.schema_changes()`) serialize on the `SchemaGeneration` row and
+  validate the composed policy once, when the outermost owner exits.
+- An unresolvable backing raises `SchemaError` citing `rebac.E009` from the
+  reads whose permission reaches it. Permissions that do not reach it are
+  still decided.
+- `rebac.E014` reads "identity cannot be compared with stored tuples".
+  `rebac.E015`: models a permission reads must share the relationship
+  database alias. `rebac.E018`: a model on a backing path needs a write
+  owner so that writes to it are gated.
+- `rebac.testing.install_schema(schema, backend=None, using=None)` installs
+  a manual schema and makes sure the generation row exists. It rebuilds
+  nothing.
+- `RebacTrackedMixin`, `TrackedQuerySet`, `TrackedManager` and
+  `REBAC_TRACKED_MODELS` keep their names. They own gated writes; they
+  maintain nothing.
+- Membership in stored sets (nested groups, role membership held in tuples)
+  is decided before the statement: the operation follows the tuple table
+  from the actor until no new set appears, one statement per level of
+  nesting, and binds the sets as id lists. It is exact at any nesting depth,
+  data cycles included, and a statement that authorizes re-reads the
+  decision in its own snapshot. An evaluator scope keeps the decision until a
+  tuple is written in the process. A set that admits a column-backed set, and
+  an actor in more than 256 sets, keep the membership inside the statement.
+- A scope decides the small sets of rows behind its arrows first (the
+  folders a file's scope reaches, the messages a part's scope reaches) and
+  binds them as key lists, up to 5,000 rows a statement; a hierarchy over a
+  self foreign key is followed from its seeds, level by level. The scope
+  statement re-reads every decided set in its own snapshot and at its own
+  instant. Sets that do not fit stay inline.
+- A point check looks its one object up by key instead of building the set of
+  every qualifying row.
+- A caveated read decides the distinct caveat instances of the relations in
+  its reach in Python, from one query, and binds the decided keys into the
+  statement. A permission with no caveated relation in reach runs no such
+  query.
+- Test modules: `tests/test_index_*.py` are replaced by
+  `tests/test_compile_*.py`, `tests/test_read_contract.py`,
+  `tests/test_write_effects.py`, `tests/test_write_propagation*.py`,
+  `tests/test_watch.py`, `tests/test_codec.py`, `tests/test_policy_checks.py`
+  and `tests/test_reference_model.py`. The markers `index_exhaustive` and
+  `index_shard` are `reference_exhaustive` and `reference_shard`.
+  `make test-index-reference` is `make test-reference`; `make test-index`,
+  `make test-index-postgres`, `make test-scale` and
+  `make test-scale-postgres` are removed. There is no scale suite at the
+  moment.
+
+### Added (bulk checks)
+
+- `Backend.check_bulk_permissions(items)` and `rebac.CheckItem`, after
+  SpiceDB's `CheckBulkPermissions`: one `CheckResult` per item, the answers
+  of `check_access()`. `LocalBackend` decides the stored sets of the actors
+  together and the bounds of up to 50 items by one statement (cut at about
+  64 KB of text), so asking
+  which of many users hold a permission on one resource no longer costs
+  statements per user. Any other backend gets the item-by-item default.
+
+### Fixed
+
+- A `values()` / `values_list()` projection that names only computed values
+  (annotations) is no longer refused as if it projected every gated field.
+  The guard still refuses a computed value whose expression reads a gated
+  column.
+- The projection guard reads every operand of a `union()`,
+  `intersection()` or `difference()`, as Django will select from it. It read
+  only the first, so a gated field projected by a later operand was returned
+  unredacted.
+- A combination that returns model instances is refused under field read
+  enforcement unless every operand loads every field of the one model,
+  without `only()`, `defer()` or `select_related()`, when a model involved
+  has a gated field or `select_related()` is used. An operand's rows become
+  instances of the first operand's model column by column, which put a gated
+  value into a field that nothing redacts. Combine `values()` projections
+  instead.
+- A gated field of a joined model is refused in a projection
+  (`values("folder__name")`, `annotate(n=F("folder__name"))`), like one of
+  the queryset's own model. It was returned.
+- Selected SQL written by hand (`extra(select=...)`, a `RawSQL` annotation,
+  a function with a caller-supplied template) is refused under an actor when
+  field read enforcement is on, on any model, for model instances as for
+  projections: it can read any column, so no field gate can be checked.
+  It was returned as written. Read it under `sudo(reason=...)`, or name the
+  columns through ORM expressions.
+- A check whose actor's stored sets were changed by another process during
+  an evaluator scope answers from current data. It raised
+  `PermissionDepthExceeded` when a recursion was in reach of the permission.
+- `Meta.rebac_resource_type` and the other `rebac_*` options are on
+  `_meta` when Django sends `class_prepared`. They were stored after the
+  class was built, so a receiver of that signal saw a model without them.
+
+### Unchanged
+
+- Every authorization rule: the resource `write` / `create` / `delete`
+  gates, field gates, invariant 5d and its entry points. The strict expected
+  failures for proposals 0011 and 0013 stay pinned.
+- The three-state `CheckResult`, `.zed` schemas and directives, relationship
+  storage in both shapes, and every name exported by `rebac`.
+- The statement clock is the application's (`django.utils.timezone.now()`),
+  bound as one parameter per statement.
+
+### Upgrade
+
+- Apply the migrations: `manage.py migrate`. `0008` passes every
+  relationship row through the ORM once; `0009` drops the index tables. No
+  command is needed afterwards.
+- Remove `rebac index rebuild` and `rebac index verify` from deploy scripts,
+  and any CI or periodic step that verified the index.
+- Remove `REBAC_INDEX_LOOKUP_LIMIT` and `REBAC_INDEX_CONDITION_LIMIT` from
+  settings, and `rebac.E013`, `rebac.E017` and `rebac.E019` from
+  `SILENCED_SYSTEM_CHECKS`.
+- Change `from rebac.index.program import program_errors` to
+  `from rebac.compile.program import program_errors`; it takes the parsed
+  schema alone. Change imports of `rebac.index.codec` and `rebac.index.time`
+  to `rebac.codec` and `rebac.clock`.
+- Choose `REBAC_DEPTH_LIMIT` to cover the deepest recursive chain in the
+  data (folder trees, nested groups, role inclusion). A chain deeper than the
+  limit is silently absent from scopes and raises on point checks. Each level
+  adds SQL to every statement that reads the recursive permission; SQLite
+  refuses the tuple- and path-backed recursive statements of the test schema
+  at a limit of about 20.
+- Run `manage.py check --database <alias>`: `rebac.E016` reports a stored
+  policy the compiler refuses.
+
+### Not verified
+
+- Permissions that recurse through each other (`folder#view` through
+  `project#access` and back) are unrolled to the depth bound without a
+  convergence test: over a data cycle a check that is not granted raises
+  `PermissionDepthExceeded`. Pinned as an expected failure.
+- PostgreSQL behaviour at a consumer's scale (15.7 million rows) is being
+  trialled. This entry makes no claim about query plans at that size.
+- Tier 3 (`make test-release`) was not run.
+
 ## [0.24.2] — 2026-10-01
 
 ### Changed
