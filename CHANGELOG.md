@@ -133,6 +133,13 @@ rules and the names exported by `rebac` are unchanged. The specification is
   `make test-scale-postgres` are removed. There is no scale suite at the
   moment.
 
+### Fixed
+
+- A `values()` / `values_list()` projection that names only computed values
+  (annotations) is no longer refused as if it projected every gated field.
+  The guard still refuses a computed value whose expression reads a gated
+  column.
+
 ### Unchanged
 
 - Every authorization rule: the resource `write` / `create` / `delete`

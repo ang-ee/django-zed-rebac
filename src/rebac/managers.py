@@ -806,7 +806,7 @@ class RebacQuerySet(models.QuerySet[_M]):
             return
         requested: set[str] = set()
         if projected is not None:
-            requested.update(gated if not projected else gated & projected)
+            requested.update(gated & projected)
         for expression in selected.values():
             requested.update(
                 column.target.name

@@ -12,7 +12,8 @@ from typing import Any, cast
 
 import pytest
 from django.db import connection
-from django.db.models import Count, F, Min
+from django.db.models import Count, F, Min, Value
+from django.db.models.functions import Upper
 from django.test import override_settings
 from django.test.utils import CaptureQueriesContext
 
@@ -341,6 +342,32 @@ def test_annotation_cannot_copy_a_gated_field(alice, project):
 
     with pytest.raises(PermissionDenied):
         list(qs)
+
+
+@override_settings(REBAC_FIELD_READ_MODE="redact")
+def test_projection_of_only_computed_values_names_no_gated_field(alice):
+    from tests.testapp.models import Post
+
+    post = _post(title="computed only")
+    _grant(post.pk, alice, "viewer")
+    rows = Post.objects.as_user(alice).annotate(marker=Upper(Value("x")))
+
+    # The projection names no model field, and the expression reads none.
+    assert list(rows.values_list("marker", flat=True)) == ["X"]
+    assert list(rows.values("marker")) == [{"marker": "X"}]
+
+
+@override_settings(REBAC_FIELD_READ_MODE="redact")
+def test_projection_of_only_a_computed_value_that_reads_a_gated_field_fails_closed(alice):
+    from tests.testapp.models import Post
+
+    post = _post(title="computed secret")
+    _grant(post.pk, alice, "viewer")
+    rows = Post.objects.as_user(alice).annotate(shouted=Upper("title"))
+
+    with pytest.raises(PermissionDenied) as excinfo:
+        list(rows.values_list("shouted", flat=True))
+    assert "read__title" in str(excinfo.value)
 
 
 @override_settings(REBAC_FIELD_READ_MODE="redact")
