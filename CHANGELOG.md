@@ -3,6 +3,18 @@
 All notable changes to `django-zed-rebac` are tracked here. The project is in
 pre-1.0; breaking changes within a minor version are explicitly called out.
 
+## [0.25.2] — 2026-10-02
+
+### Fixed
+
+- A many-to-many prefetch onto a rebac model under an actor was refused with
+  "Cannot select hand-written SQL" when field read enforcement is on. Django
+  selects the prefetch's join key through `extra(select=...)`, which the
+  rule added in 0.25.0 took for hand-written SQL. The join key is now
+  recognised by its structure (a foreign key column of the through model
+  that the statement joins, selected as Django writes it); any other
+  `extra()` selection is still refused under an actor.
+
 ## [0.25.1] — 2026-10-02
 
 ### Fixed

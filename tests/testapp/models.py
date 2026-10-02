@@ -59,6 +59,26 @@ class Post(RebacMixin, models.Model):
         rebac_resource_type = "blog/post"
 
 
+class PinnedPost(RebacMixin, models.Model):
+    """A many-to-many relation through a declared model."""
+
+    title = models.CharField(max_length=200)
+    folders = models.ManyToManyField(Folder, through="PostPin", related_name="pinned_posts")
+
+    class Meta:
+        app_label = "testapp"
+        rebac_resource_type = "blog/pinnedpost"
+
+
+class PostPin(models.Model):
+    post = models.ForeignKey(PinnedPost, on_delete=models.CASCADE)
+    folder = models.ForeignKey(Folder, on_delete=models.CASCADE)
+    note = models.CharField(max_length=100, blank=True, default="")
+
+    class Meta:
+        app_label = "testapp"
+
+
 class LinkedPost(RebacMixin, models.Model):
     """Symmetrical M2M fixture: one mutation creates two backed edges."""
 

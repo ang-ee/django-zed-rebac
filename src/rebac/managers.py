@@ -18,7 +18,7 @@ from collections.abc import AsyncIterator, Collection, Iterable, Iterator
 from typing import Any, Self, TypeVar, cast
 
 from asgiref.sync import sync_to_async
-from django.db import models
+from django.db import connections, models
 from django.db.models.expressions import Col, RawSQL
 from django.db.models.sql import Query
 from django.db.models.sql.where import ExtraWhere, NothingNode, WhereNode
@@ -217,6 +217,49 @@ def _selected_gated(
             elif name in gated_read_fields(column.target.model):
                 found.setdefault(column.target.model, set()).add(name)
     return found
+
+
+# The name Django's many-to-many prefetch selects its join key under, followed
+# by the column's attname (``ManyRelatedManager.get_prefetch_querysets``).
+_PREFETCH_KEY = "_prefetch_related_val_"
+
+
+def _hand_written_selection(query: Query, using: str) -> bool:
+    """Whether the query selects SQL through ``extra()`` that the guard cannot read.
+
+    One use of ``extra(select=...)`` is Django's own: a many-to-many prefetch
+    selects the column of the through table that names the row the related
+    objects belong to.  It is recognised by what it is, not by its name
+    alone: a foreign key column of a model whose table this very statement
+    joins, selected as Django writes it and under the name of that column.
+    Such an entry reads a key, like any join the ORM builds; a gated column
+    of the through model is not one.
+    """
+    quote = connections[using].ops.quote_name
+    # The foreign key columns of the models this statement joins, as Django
+    # would select them, by the name Django would select them under.
+    keys: dict[str, tuple[str, type[models.Model], str]] = {}
+    for join in query.alias_map.values():
+        relation: Any = getattr(join, "join_field", None)
+        if relation is None or join.table_alias != join.table_name:
+            continue
+        for model in (relation.related_model, relation.model):
+            if not isinstance(model, type) or not issubclass(model, models.Model):
+                continue
+            if model._meta.db_table != join.table_name:
+                continue
+            for field in model._meta.concrete_fields:
+                if field.remote_field is not None and field.column is not None:
+                    keys[f"{_PREFETCH_KEY}{field.attname}"] = (
+                        f"{quote(join.table_name)}.{quote(field.column)}",
+                        model,
+                        field.name,
+                    )
+    for name, (sql, params) in query.extra_select.items():
+        key = keys.get(name)
+        if key is None or key[0] != sql or params or key[2] in gated_read_fields(key[1]):
+            return True
+    return False
 
 
 # ``Query.deferred_loading`` of a query that loads every field of its model.
@@ -845,13 +888,14 @@ class RebacQuerySet(models.QuerySet[_M]):
             if part is not query:
                 computed = dict(part.annotation_select)
                 columns: Iterable[Any] = part.select
-                literal = bool(part.extra_select)
+                literal = _hand_written_selection(part, self.db)
             elif query.combinator:
                 # A combination runs its operands; of its own it adds only
                 # the values computed over their rows.
                 computed, columns, literal = dict(expressions or {}), (), False
             else:
-                computed, columns, literal = selected, query.select, bool(query.extra_select)
+                computed, columns = selected, query.select
+                literal = _hand_written_selection(query, self.db)
             if literal or any(_has_opaque_write_expression(v) for v in computed.values()):
                 raise PermissionDenied(
                     f"Cannot select hand-written SQL on {part.model.__name__} under an actor: "

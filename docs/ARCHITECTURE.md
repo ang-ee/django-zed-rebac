@@ -2491,7 +2491,13 @@ function with a caller-supplied template) can read any column, so it cannot
 be checked against a field gate. Under field read enforcement it is selected
 under `sudo(reason=...)` / `system_context(...)` only: under an actor it is
 refused on any model, for model instances as for projections. SQL that is
-defined and not selected reads nothing and is not refused.
+defined and not selected reads nothing and is not refused. One `extra()`
+selection is Django's own and is not refused: a many-to-many prefetch selects
+the through table's column that names the row its related objects belong to
+(`_prefetch_related_val_<attname>`). It is recognised by what it is, not by
+its name alone: a foreign key column of a model whose table the statement
+joins, selected as Django writes it, under that column's name, and not a
+gated field of the through model.
 The guard attributes a column to a queryset's projection only when it is read
 from that queryset's own row: directly, or through `OuterRef` from a nested
 query. A column a nested query reads from its own tables belongs to that
