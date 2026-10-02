@@ -18,7 +18,7 @@ from rebac import (
 from rebac.backends.base import Backend
 from rebac.compile import read
 from rebac.compile.predicate import Bound
-from rebac.evaluator import evaluator_scope
+from rebac.evaluator import PermissionEvaluator, evaluator_scope
 from rebac.testing import install_schema
 
 pytestmark = pytest.mark.django_db
@@ -377,3 +377,52 @@ def test_the_base_backend_asks_item_by_item():
         (user("ann"), "read", DOC, {"inside": True}),
         (user("bob"), "write", DOC, None),
     ]
+
+
+FLAT = """
+definition auth/user {}
+definition auth/group {
+    relation member: auth/user
+}
+definition docs/doc {
+    relation reader: auth/user | auth/group#member
+    permission read = reader
+}
+"""
+
+
+def expansions(queries):
+    """The statements that follow the tuple table from actors to their stored sets."""
+    return sum(
+        query["sql"].startswith("SELECT DISTINCT") and '"subject_relation"' in query["sql"]
+        for query in queries
+    )
+
+
+def test_a_large_call_expands_each_chunk_once():
+    local = install_schema(FLAT)
+    items = [CheckItem(user(f"u{n:04}"), "read", DOC) for n in range(600)]
+    with CaptureQueriesContext(connection) as queries:
+        answers = local.check_bulk_permissions(items)
+    assert not any(answers)
+    # One expansion for each chunk of 50: the call decides no actor twice.
+    assert expansions(queries) == 12
+
+
+def test_a_chunk_keeps_its_own_decisions_past_the_cache_size():
+    local = install_schema(FLAT)
+    local.write_relationships(
+        [
+            *(member("readers", user(f"u{n:04}")) for n in range(0, 120, 10)),
+            RelationshipTuple(DOC, "reader", members("readers")),
+        ]
+    )
+    items = [CheckItem(user(f"u{n:04}"), "read", DOC) for n in range(120)]
+    evaluator = PermissionEvaluator(max_size=30)
+    with evaluator_scope(evaluator), CaptureQueriesContext(connection) as queries:
+        answers = local.check_bulk_permissions(items)
+    assert [answer.allowed for answer in answers] == [n % 10 == 0 for n in range(120)]
+    # One expansion for each chunk, however few decisions the scope keeps.
+    assert expansions(queries) == 3
+    # The scope keeps the most recent decisions, up to its size.
+    assert len(evaluator._actor_sets) == 30

@@ -557,17 +557,17 @@ class _Operation:
         membership.  The witness of every authorizing statement then selects
         nothing, so staleness denies and never grants.
         """
-        from rebac.evaluator import current_evaluator
+        from rebac.evaluator import ABSENT, current_evaluator
 
         evaluator = current_evaluator()
         kept = self.sets_kept(key)
         if evaluator is None or kept is None:
             return self._decide_sets(key, verdicts)
-        if kept not in evaluator._actor_sets:
-            if len(evaluator._actor_sets) >= _LIMIT:
-                evaluator._actor_sets.clear()
-            evaluator._actor_sets[kept] = self._decide_sets(key, verdicts)
-        return cast("ActorSets | None", evaluator._actor_sets[kept])
+        found = evaluator._kept_sets(kept)
+        if found is ABSENT:
+            found = self._decide_sets(key, verdicts)
+            evaluator._keep_sets(kept, found)
+        return cast("ActorSets | None", found)
 
     def sets_kept(self, key: Key) -> tuple[Any, ...] | None:
         """What an evaluator scope keeps the decided sets under; ``None`` when it cannot."""
@@ -1116,15 +1116,25 @@ def _check_chunk(
 
 
 def _decide_together(asked: Sequence[tuple[_Operation, Key, str]]) -> None:
-    """Decide the stored sets of the actors that share a shape, for the evaluator scope."""
-    from rebac.evaluator import current_evaluator
+    """Decide the stored sets of the actors that share a shape, for the evaluator scope.
+
+    Each operation of the chunk holds the decision it is answered with, so
+    the chunk does not depend on what the scope still keeps when its
+    statements are built: the scope is bounded, and a chunk can be larger
+    than what it keeps.
+    """
+    from rebac.evaluator import ABSENT, current_evaluator
 
     evaluator = current_evaluator()
     assert evaluator is not None
     groups: dict[tuple[Any, ...], dict[tuple[Any, ...], tuple[_Operation, Key]]] = {}
     for operation, key, _resource_id in asked:
         kept = operation.sets_kept(key)
-        if kept is None or kept in evaluator._actor_sets:
+        if kept is None:
+            continue
+        found = evaluator._kept_sets(kept)
+        if found is not ABSENT:
+            operation._sets[id(operation.verdicts(key))] = found
             continue
         shape, _actor, keys, context, generation = kept
         if not keys:
@@ -1141,10 +1151,10 @@ def _decide_together(asked: Sequence[tuple[_Operation, Key, str]]) -> None:
         decided = _decide_sets_together(operations, key, first.verdicts(key))
         if decided is None:
             continue
-        for kept, (operation, _key) in group.items():
-            if len(evaluator._actor_sets) >= _LIMIT:
-                evaluator._actor_sets.clear()
-            evaluator._actor_sets[kept] = decided[operation.actor]
+        for kept, (operation, key) in group.items():
+            sets = decided[operation.actor]
+            evaluator._keep_sets(kept, sets)
+            operation._sets[id(operation.verdicts(key))] = sets
 
 
 def _decide_sets_together(

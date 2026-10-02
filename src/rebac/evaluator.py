@@ -113,7 +113,8 @@ class PermissionEvaluator:
         self._accessible_cache: OrderedDict[tuple[Any, ...], tuple[str, ...]] = OrderedDict()
         # The stored sets decided for an actor (``rebac.compile.read``). Every
         # statement that authorizes re-reads them, so a stale entry denies.
-        self._actor_sets: dict[tuple[Any, ...], Any] = {}
+        # Bounded by ``max_size`` on its own, least recently used first.
+        self._actor_sets: OrderedDict[tuple[Any, ...], Any] = OrderedDict()
         self._max_size = max_size
         self._schema_scope = SchemaScope()
 
@@ -245,6 +246,19 @@ class PermissionEvaluator:
         self._accessible_cache[key] = value
         self._evict_if_full()
 
+    def _kept_sets(self, key: tuple[Any, ...]) -> Any:
+        """The sets decided under ``key``, or ``ABSENT``."""
+        found = self._actor_sets.get(key, ABSENT)
+        if found is not ABSENT:
+            self._actor_sets.move_to_end(key)
+        return found
+
+    def _keep_sets(self, key: tuple[Any, ...], value: Any) -> None:
+        self._actor_sets[key] = value
+        self._actor_sets.move_to_end(key)
+        while len(self._actor_sets) > self._max_size:
+            self._actor_sets.popitem(last=False)
+
     def _evict_if_full(self) -> None:
         # Both decision caches share one budget.
         total = len(self._check_cache) + len(self._accessible_cache)
@@ -254,6 +268,11 @@ class PermissionEvaluator:
             else:
                 self._accessible_cache.popitem(last=False)
             total -= 1
+
+
+# What ``PermissionEvaluator._kept_sets`` answers for a key it does not hold;
+# ``None`` is a decision (no stored set in reach).
+ABSENT: Any = object()
 
 
 # ---------- ContextVar machinery ----------

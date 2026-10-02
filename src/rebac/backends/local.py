@@ -174,10 +174,18 @@ class LocalBackend(Backend):
         with self._schema_lock:
             return self._manual_revision
 
-    def _schema_snapshot(self) -> SchemaSnapshot:
-        return self._load_schema_snapshot()
+    def _schema_snapshot(self, known_revision: str | None = None) -> SchemaSnapshot:
+        if known_revision is None:
+            return self._load_schema_snapshot()
+        return self._load_schema_snapshot(known_revision)
 
-    def _load_schema_snapshot(self) -> SchemaSnapshot:
+    def _load_schema_snapshot(self, known_revision: str | None = None) -> SchemaSnapshot:
+        """The schema at the published revision, pinned to the scope that asks.
+
+        ``known_revision`` is a revision the caller has just read on the
+        schema's own alias: the first attempt uses it instead of reading it
+        again.
+        """
         from django.db import connections
         from django.utils import timezone
 
@@ -219,10 +227,13 @@ class LocalBackend(Backend):
         # Database I/O and waiting for another loader happen outside the process
         # lock. An evaluator validates once per scope / transaction boundary;
         # unscoped operations validate on every call.
-        for _attempt in range(3):
+        for attempt in range(3):
             with self._schema_invalidation_lock:
                 invalidation = self._schema_invalidation_generation
-            revision = SchemaGeneration.objects.revision(connection.alias)
+            if attempt == 0 and known_revision:
+                revision: str | None = known_revision
+            else:
+                revision = SchemaGeneration.objects.revision(connection.alias)
             if revision is None:
                 with self._schema_lock:
                     self._evict_schema_alias(connection.alias)
