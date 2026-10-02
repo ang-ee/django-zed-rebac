@@ -412,14 +412,15 @@ def folder_gates(alice, bob):
 
 
 @override_settings(REBAC_FIELD_READ_MODE="redact")
-def test_an_operand_that_loads_other_columns_than_the_root_is_guarded(alice, folder_gates):
+def test_a_combination_of_instances_loads_every_field_of_one_model(alice, folder_gates):
     from tests.testapp.models import Folder, Post
 
     _folder, post = folder_gates
     rows = Post.objects.as_user(alice)
     folders = Folder.objects.as_user(alice)
-    # Rows of an operand become instances of the root's model column by
-    # column: ``title`` would arrive as ``body``, which nothing redacts.
+    related = rows.rebac_select_related("folder")
+    # Rows of an operand become instances of the first operand's model column
+    # by column: ``title`` would arrive as ``body``, which nothing redacts.
     for combined in (
         lambda: rows.only("id", "body").union(rows.only("id", "title")),
         lambda: rows.defer("title").union(rows.defer("body")),
@@ -427,13 +428,21 @@ def test_an_operand_that_loads_other_columns_than_the_root_is_guarded(alice, fol
         lambda: rows.only("id", "body").union(
             rows.only("id", "body").union(rows.only("id", "title"))
         ),
+        lambda: rows.only("id", "body", "folder").annotate(extra=Value("x")).union(rows.only()),
+        lambda: rows.only("id", "body", "folder").union(rows.defer("folder__kind")),
+        lambda: related.only("id", "folder", "folder__kind").union(
+            related.only("id", "folder", "folder__name")
+        ),
+        lambda: rows.select_related("folder").union(rows.select_related("folder")),
+        # No layout is worked out: the same columns named differently are refused too.
+        lambda: rows.only("id", "body").union(rows.only("id", "body")),
     ):
-        with pytest.raises(PermissionDenied):
+        with pytest.raises(PermissionDenied) as excinfo:
             list(combined())
-    # Operands that load what the root loads are redacted as its rows are.
-    same = list(rows.union(rows))
-    assert [(row.pk, row.title) for row in same] == [(post.pk, None)]
-    assert [row.body for row in rows.only("id", "body").union(rows.only("id", "body"))] == [""]
+        assert "must load every field of one model" in str(excinfo.value)
+    # Whole rows of one model are redacted as any of its rows are.
+    for combined in (rows.union(rows), rows.union(rows, all=True), rows.intersection(rows)):
+        assert {(row.pk, row.title) for row in combined} == {(post.pk, None)}
 
 
 @override_settings(REBAC_FIELD_READ_MODE="redact")
@@ -474,6 +483,50 @@ def test_an_annotation_an_operand_does_not_select_is_not_refused(alice, bob):
         list(rows.union(rows).values_list("copied", flat=True))
 
 
+INHERITED_GATE_SCHEMA_TEXT = """
+definition auth/user {}
+
+definition test/nativeparentlinkedresource {}
+
+definition test/nativeparentlinkedchild {
+    relation owner: auth/user
+    relation viewer: auth/user
+    permission read = owner + viewer
+    permission read__name = owner
+}
+
+definition test/nativeparentlinkedrecord {
+    relation viewer: auth/user
+    permission read = viewer
+}
+"""
+
+
+@pytest.mark.xfail(
+    strict=True,
+    reason=(
+        "proposal 0013: a column read through a join is gated by the model that owns the "
+        "column; a field a multi-table child inherits belongs to its parent's table, and "
+        "the guard does not know which model the join came through"
+    ),
+)
+@override_settings(REBAC_FIELD_READ_MODE="redact")
+def test_a_gated_field_a_joined_child_inherits_is_guarded(alice, bob):
+    from tests.testapp.models import NativeParentLinkedChild, NativeParentLinkedRecord
+
+    reset_backend()
+    install_schema(backend(), parse_zed(INHERITED_GATE_SCHEMA_TEXT))
+    with sudo(reason="test.fixture"):
+        child = NativeParentLinkedChild.objects.create(name="inherited secret", owner=bob)
+        record = NativeParentLinkedRecord.objects.create(child=child)
+    _grant_ref("test/nativeparentlinkedchild", str(child.pk), bob, "owner")
+    _grant_ref("test/nativeparentlinkedchild", str(child.pk), alice, "viewer")
+    _grant_ref("test/nativeparentlinkedrecord", str(record.pk), alice, "viewer")
+    rows = NativeParentLinkedRecord.objects.as_user(alice)
+    with pytest.raises(PermissionDenied):
+        list(rows.values_list("child__name", flat=True))
+
+
 @pytest.mark.xfail(
     strict=True,
     reason=(
@@ -497,30 +550,42 @@ def test_a_plain_root_keeps_the_scope_of_a_rebac_operand(alice, bob):
     assert len(combined) == 2
 
 
-@override_settings(REBAC_FIELD_READ_MODE="redact")
-def test_selected_literal_sql_counts_as_reading_every_gated_field(alice, bob):
+@pytest.mark.parametrize("schema", [SCHEMA_TEXT, NO_READ_GATE_SCHEMA_TEXT], ids=["gated", "plain"])
+def test_hand_written_sql_is_selected_under_sudo_only(alice, bob, schema):
     from tests.testapp.models import Post
 
+    reset_backend()
+    install_schema(backend(), parse_zed(schema))
     post = _post(title="literal secret")
     _grant(post.pk, bob, "owner")
     _grant(post.pk, alice, "viewer")
     column = f'"{Post._meta.db_table}"."title"'
     rows = Post.objects.as_user(alice)
-    # What hand-written SQL reads cannot be told from the expression.
-    for attempt in (
+    attempts = (
         lambda: list(rows.annotate(t=RawSQL(column, [])).values_list("t", flat=True)),
         lambda: list(rows.extra(select={"t": column}).values_list("t", flat=True)),
         lambda: [row.t for row in rows.annotate(t=RawSQL(column, []))],
         lambda: [row.t for row in rows.extra(select={"t": column})],
         lambda: list(rows.annotate(t=Upper(RawSQL(column, []))).values("t")),
-    ):
-        with pytest.raises(PermissionDenied) as excinfo:
-            attempt()
-        assert "read__title" in str(excinfo.value)
-    # An annotation that is defined but not selected reads nothing.
-    assert list(rows.annotate(t=RawSQL(column, [])).values_list("pk", flat=True)) == [post.pk]
-    with sudo(reason="test.literal"):
-        assert [row.t for row in Post.objects.annotate(t=RawSQL(column, []))] == ["literal secret"]
+        lambda: list(
+            rows.values_list("pk").union(rows.extra(select={"t": column}).values_list("t"))
+        ),
+    )
+    with override_settings(REBAC_FIELD_READ_MODE="redact"):
+        # What hand-written SQL reads cannot be told from the expression,
+        # whichever model it is selected on.
+        for attempt in attempts:
+            with pytest.raises(PermissionDenied) as excinfo:
+                attempt()
+            assert "hand-written SQL" in str(excinfo.value)
+        # SQL that is defined but not selected reads nothing.
+        assert list(rows.annotate(t=RawSQL(column, [])).values_list("pk", flat=True)) == [post.pk]
+        with sudo(reason="test.literal"):
+            assert [row.t for row in Post.objects.annotate(t=RawSQL(column, []))] == [
+                "literal secret"
+            ]
+    # Without field read enforcement there is nothing to check it against.
+    assert attempts[0]() == ["literal secret"]
 
 
 @override_settings(REBAC_FIELD_READ_MODE="redact")
@@ -550,6 +615,10 @@ def test_every_operand_of_a_set_combination_is_guarded(alice, bob, combine):
             list(combined(rows.values_list(left), rows.values_list(right)))
     with pytest.raises(PermissionDenied):
         list(combined(public, combined(public, copied)))
+    # Operands with projections of their own keep them, whatever the
+    # combination is asked for afterwards: Django runs the operands.
+    renamed = combined(rows.values("body"), rows.values("body")).values("title")
+    assert {row["title"] for row in renamed} == (set() if combine == "difference" else {""})
     # Operands that read no gated field combine as before.
     other = rows.annotate(marker=Value("other")).values("marker")
     assert {row["marker"] for row in public.union(other)} == {"public", "other"}

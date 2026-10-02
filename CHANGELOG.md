@@ -153,19 +153,23 @@ rules and the names exported by `rebac` are unchanged. The specification is
 - The projection guard reads every operand of a `union()`,
   `intersection()` or `difference()`, as Django will select from it. It read
   only the first, so a gated field projected by a later operand was returned
-  unredacted; and an operand that loads other fields than the root (another
-  model, `only()`, `defer()`) put a gated value into a field of the root's
-  instances that nothing redacts.
+  unredacted.
+- A combination that returns model instances is refused under field read
+  enforcement unless every operand loads every field of the one model,
+  without `only()`, `defer()` or `select_related()`, when a model involved
+  has a gated field or `select_related()` is used. An operand's rows become
+  instances of the first operand's model column by column, which put a gated
+  value into a field that nothing redacts. Combine `values()` projections
+  instead.
 - A gated field of a joined model is refused in a projection
   (`values("folder__name")`, `annotate(n=F("folder__name"))`), like one of
   the queryset's own model. It was returned.
 - Selected SQL written by hand (`extra(select=...)`, a `RawSQL` annotation,
-  a function with a caller-supplied template) counts as reading every gated
-  field of the model and is refused under an actor, for model instances as
-  for projections. An annotation of literal SQL on a model with gated
-  fields, read as model instances, was returned as written; code that relies
-  on that reads under `sudo(reason=...)` or names the columns through ORM
-  expressions.
+  a function with a caller-supplied template) is refused under an actor when
+  field read enforcement is on, on any model, for model instances as for
+  projections: it can read any column, so no field gate can be checked.
+  It was returned as written. Read it under `sudo(reason=...)`, or name the
+  columns through ORM expressions.
 - A check whose actor's stored sets were changed by another process during
   an evaluator scope answers from current data. It raised
   `PermissionDepthExceeded` when a recursion was in reach of the permission.
