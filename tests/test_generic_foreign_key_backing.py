@@ -275,8 +275,20 @@ def test_an_edge_is_not_moved_under_an_actor(world):
         for columns in ({"object_id": also_mine.pk}, {"content_type": post.content_type}):
             with pytest.raises(PermissionDenied, match="Delete the edge"):
                 rows.filter(pk=moving.pk).update(**columns)
+        # The base manager, as a GenericRelation manager's add() uses it.
+        base = Attachment._base_manager.filter(pk=moving.pk)
+        for columns in (
+            {"object_id": also_mine.pk},
+            {"content_type": post.content_type, "object_id": post.object_id},
+        ):
+            with pytest.raises(PermissionDenied, match="Delete the edge"):
+                base.update(**columns)
+        assert base.update(label="base") == 1
     with sudo(reason="test.move"):
         assert Attachment.objects.filter(pk=moving.pk).update(object_id=also_mine.pk) == 1
+        assert Attachment._base_manager.filter(pk=moving.pk).update(object_id=world.mine.pk) == 1
+    # Without an actor the base manager is not asked who moves the edge.
+    assert Attachment._base_manager.filter(pk=moving.pk).update(object_id=also_mine.pk) == 1
 
 
 def test_a_tuple_cannot_be_written_to_a_generic_relation(world):

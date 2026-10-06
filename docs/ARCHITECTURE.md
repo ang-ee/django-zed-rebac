@@ -324,12 +324,12 @@ definition tags/tag_assignment {
   candidate's content type and object id become a proposed relationship of
   the relation whose type they name, and an edge to a type no relation names,
   to a model with no resource type, to a non-canonical content type or to a
-  row that is gone has no arm. Deleting needs `delete`. Under an actor, an
-  instance save or a scoped queryset update that changes the content type or
-  object id is refused: the gates check the edge as stored, so an edge is
-  deleted and created, never moved. A base-manager `update()` of the object id
-  is a scalar write the gates do not inspect (pinned for proposal 0013).
-  Tuple writes to these relations raise `SchemaError`.
+  row that is gone has no arm. Deleting needs `delete`. Under an actor (and
+  no sudo), a write that changes the content type or object id is refused,
+  whether it is an instance save, a scoped queryset update or a base-manager
+  update (a `GenericRelation` manager's `add()` re-points edges that way):
+  the gates check the edge as stored, so an edge is deleted and created,
+  never moved. Tuple writes to these relations raise `SchemaError`.
 
 #### Backings are `LocalBackend`-only until the projector ships
 

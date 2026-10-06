@@ -29,9 +29,10 @@ pre-1.0; breaking changes within a minor version are explicitly called out.
 
 ### Changed
 
-- Under an actor, an instance save or a scoped queryset update that changes
-  the content type or object id of a `GenericForeignKey` backing is refused.
-  An edge is deleted and created, never moved.
+- Under an actor, a write that changes the content type or object id of a
+  `GenericForeignKey` backing is refused: instance saves, scoped queryset
+  updates and base-manager updates (a `GenericRelation` manager's `add()`)
+  alike. An edge is deleted and created, never moved.
 
 ### Upgrade (for an app that hand-rolls checks on polymorphic edges)
 
