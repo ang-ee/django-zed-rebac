@@ -332,7 +332,9 @@ definition tags/tag_assignment {
   base manager (a `GenericRelation` manager's `add()` and `set()` re-point
   edges that way), is refused when it names either column. The refusal
   covers proxies and multi-table children of the edge model. Tuple writes to
-  these relations raise `SchemaError`.
+  these relations raise `SchemaError`. An edge whose target row is gone has
+  no arm in `delete`: it is removed under sudo, or with its target by a
+  `GenericRelation` cascade.
 - **A primary key reused** by a new row of the target model picks up the
   edges that named the deleted row, as tuples do when an identity is reused.
   Delete edges with their target (a `GenericRelation` on the target model

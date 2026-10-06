@@ -356,7 +356,7 @@ def test_a_generic_relation_manager_does_not_move_edges(world, shelves):
 
 @isolate_apps("tests.testapp")
 def test_the_refusal_covers_a_proxy_of_the_edge_model(world):
-    from rebac.watch import edge_columns, gate_policy, refuse_moving_edges
+    from rebac.watch import edge_columns, gate_policy
 
     class PinnedAttachment(Attachment):
         class Meta:
@@ -365,8 +365,35 @@ def test_the_refusal_covers_a_proxy_of_the_edge_model(world):
 
     policy = gate_policy("default")
     assert edge_columns(policy, PinnedAttachment) == edge_columns(policy, Attachment)
-    with pytest.raises(PermissionDenied, match="Delete the edge"):
-        refuse_moving_edges(policy, PinnedAttachment, ["object_id"])
+    moving = edge(world.mine)
+    other = generic_target(world.other)
+    with actor_context(ALICE):
+        # The proxy has no resource type of its own and writes the edge's row.
+        loaded = PinnedAttachment._base_manager.get(pk=moving.pk)
+        loaded.object_id = other.object_id
+        with pytest.raises(PermissionDenied, match="Delete the edge"):
+            loaded.save()
+        with pytest.raises(PermissionDenied, match="Delete the edge"):
+            PinnedAttachment._base_manager.filter(pk=moving.pk).update(object_id=other.object_id)
+    with sudo(reason="test.verify"):
+        assert Attachment.objects.get(pk=moving.pk).object_id == world.mine.pk
+
+
+def test_a_reloaded_edge_saves_without_moving(world):
+    import pickle
+
+    moving = edge(world.mine)
+    with actor_context(ALICE):
+        rows = Attachment.objects.with_actor(ALICE)
+        # A deferred column read later, and an edge carried across a pickle,
+        # have no snapshot of what was loaded: the stored row decides.
+        deferred = rows.only("label").get(pk=moving.pk)
+        assert deferred.object_id == world.mine.pk
+        deferred.label = "deferred"
+        deferred.save()
+        carried = pickle.loads(pickle.dumps(rows.get(pk=moving.pk)))
+        carried.label = "carried"
+        carried.save()
 
 
 def test_a_tuple_cannot_be_written_to_a_generic_relation(world):

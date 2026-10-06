@@ -933,6 +933,12 @@ def _gate_save(
         return
     rebac_type = model_resource_type(sender)
     if not rebac_type:
+        # An untyped proxy or child of an edge model is no resource of its
+        # own, but it writes the edge's columns.
+        if not instance._state.adding:
+            actor, unscoped = instance.effective_actor(strict=False)
+            if actor is not None and not unscoped:
+                _refuse_moving_edge(sender, instance, using=using or router.db_for_write(sender))
         return
     # Share the observer/check API's precedence: a pinned actor outranks
     # ambient sudo, while an explicit instance bypass still wins locally.
