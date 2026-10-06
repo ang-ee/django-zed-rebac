@@ -247,6 +247,8 @@ def generic_target(obj: models.Model, *, using: str | None = None) -> GenericTar
         raise ValueError(
             f"{type(obj).__name__} has no resource type: a polymorphic edge cannot name it"
         )
+    if obj.pk is None:
+        raise ValueError(f"An unsaved {type(obj).__name__} has no primary key to name")
     alias = using or obj._state.db or router.db_for_read(model)
     content_type = ContentType.objects.db_manager(alias).get_for_model(model)
     identity = _resolve_dotted(obj, resource_id_attr(model))
@@ -277,7 +279,8 @@ def _generic_field(model: type[models.Model], path: str) -> GenericForeignKey | 
     return field if isinstance(field, GenericForeignKey) else None
 
 
-# Column types that hold the same integer values, whatever their width.
+# Column types that hold the same values, whatever their width.
+_STRING_TYPES = frozenset({"CharField", "TextField", "SlugField"})
 _INTEGER_TYPES = frozenset(
     {
         "AutoField",
@@ -327,7 +330,7 @@ def _resolve_generic_backing(
         # A multi-table child's key is its parent's: compare that column.
         column = column.target_field
     kinds = {object_id.get_internal_type(), column.get_internal_type()}
-    if len(kinds) > 1 and not kinds <= _INTEGER_TYPES:
+    if len(kinds) > 1 and not (kinds <= _INTEGER_TYPES or kinds <= _STRING_TYPES):
         raise ValueError(
             f"{name} cannot back {allowed.type!r}: the object id field "
             f"{generic.fk_field!r} cannot hold the primary key of {target_model.__name__}"

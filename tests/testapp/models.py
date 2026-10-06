@@ -380,6 +380,17 @@ class Attachment(RebacMixin, models.Model):
         rebac_resource_type = "test/attachment"
 
 
+class Shelf(RebacMixin, models.Model):
+    """A target whose GenericRelation manages the attachments that name it."""
+
+    name = models.CharField(max_length=50, blank=True, default="")
+    attachments = GenericRelation(Attachment)
+
+    class Meta:
+        app_label = "testapp"
+        rebac_resource_type = "test/shelf"
+
+
 class BackingQueue(RebacMixin, models.Model):
     class Meta:
         app_label = "testapp"

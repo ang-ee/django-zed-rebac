@@ -325,11 +325,18 @@ definition tags/tag_assignment {
   the relation whose type they name, and an edge to a type no relation names,
   to a model with no resource type, to a non-canonical content type or to a
   row that is gone has no arm. Deleting needs `delete`. Under an actor (and
-  no sudo), a write that changes the content type or object id is refused,
-  whether it is an instance save, a scoped queryset update or a base-manager
-  update (a `GenericRelation` manager's `add()` re-points edges that way):
+  no sudo), a write that changes the content type or object id is refused:
   the gates check the edge as stored, so an edge is deleted and created,
-  never moved. Tuple writes to these relations raise `SchemaError`.
+  never moved. An instance save compares the two columns with the row its
+  primary key names, as stored; a queryset update, scoped or through the
+  base manager (a `GenericRelation` manager's `add()` and `set()` re-point
+  edges that way), is refused when it names either column. The refusal
+  covers proxies and multi-table children of the edge model. Tuple writes to
+  these relations raise `SchemaError`.
+- **A primary key reused** by a new row of the target model picks up the
+  edges that named the deleted row, as tuples do when an identity is reused.
+  Delete edges with their target (a `GenericRelation` on the target model
+  cascades them) when primary keys can be reused.
 
 #### Backings are `LocalBackend`-only until the projector ships
 
@@ -505,7 +512,8 @@ from rebac import (
     # Preflight against not-yet-persisted resources (0.4+)
     check_new,
 
-    # A check as the effective actor: the function form of require_permission
+    # A check as the effective actor: the function form of require_permission;
+    # an instance with a pinned actor or sudo answers as its own check_access
     check_permission,
 
     # What a polymorphic edge stores for a row, and the object it names

@@ -968,13 +968,7 @@ def _gate_save(
     # trivially "dirty"; gating create on per-field permissions makes no
     # sense (use ``permission create = ...`` for that).
     if not is_create:
-        from .watch import gate_policy, refuse_moving_edges
-
-        refuse_moving_edges(
-            gate_policy(using or router.db_for_write(sender)),
-            sender,
-            _dirty_field_names(sender=sender, instance=instance, update_fields=update_fields),
-        )
+        _refuse_moving_edge(sender, instance, using=using or router.db_for_write(sender))
         _enforce_expression_reads(
             sender=sender,
             instance=instance,
@@ -995,6 +989,39 @@ def _gate_save(
             resource=resource,
             update_fields=update_fields,
         )
+
+
+def _refuse_moving_edge(sender: type[models.Model], instance: Any, *, using: str) -> None:
+    """Refuse a save that gives a polymorphic edge another target.
+
+    The save writes the row its primary key names, so the target columns are
+    compared with that row as stored (and locked), not with what was loaded.
+    """
+    from django.db.models.expressions import BaseExpression, Combinable
+
+    from .signals import _stored
+    from .watch import edge_columns, gate_policy, raise_moving_edge
+
+    names = edge_columns(gate_policy(using), sender)
+    if not names or instance.pk is None:
+        return
+    fields = {
+        field for name in names if isinstance(field := sender._meta.get_field(name), models.Field)
+    }
+    attnames = sorted({field.attname for field in fields})
+    stored = _stored(sender, using).filter(pk=instance.pk).values(*attnames).first()
+    if stored is None:
+        return
+    changed = []
+    for field in sorted(fields, key=lambda field: field.attname):
+        value = getattr(instance, field.attname)
+        if (
+            isinstance(value, (BaseExpression, Combinable))
+            or field.to_python(value) != stored[field.attname]
+        ):
+            changed.append(field.attname)
+    if changed:
+        raise_moving_edge(sender, changed)
 
 
 def _gate_delete(

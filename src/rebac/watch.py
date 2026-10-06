@@ -176,25 +176,43 @@ def generic_columns(schema: Schema) -> Mapping[str, frozenset[str]]:
     return MappingProxyType({label: frozenset(names) for label, names in found.items()})
 
 
+def edge_columns(policy: GatePolicy | None, model: type[models.Model]) -> frozenset[str]:
+    """The GenericForeignKey backing columns a write to ``model`` can change.
+
+    Names and attnames, of the model and of every model whose table the write
+    reaches (a proxy's concrete model, a multi-table child's ancestors).
+    """
+    if policy is None:
+        return frozenset()
+    return frozenset(
+        name
+        for owner in model_lineage(model)
+        for name in policy.edges.get(owner._meta.label_lower, frozenset())
+    )
+
+
 def refuse_moving_edges(
     policy: GatePolicy | None, model: type[models.Model], names: Iterable[str]
 ) -> None:
-    """Refuse a write that changes the target of a polymorphic edge.
+    """Refuse a statement that writes the target columns of a polymorphic edge.
 
     The gates check the edge as stored; the row it would name is not checked,
-    so under an actor an edge is deleted and created, never moved.
+    so under an actor an edge is deleted and created, never moved.  A
+    statement's assigned values are not evaluated here: naming the columns
+    is enough.
     """
+    changed = sorted(edge_columns(policy, model).intersection(names))
+    if changed:
+        raise_moving_edge(model, changed)
+
+
+def raise_moving_edge(model: type[models.Model], changed: Iterable[str]) -> None:
     from .errors import PermissionDenied
 
-    if policy is None:
-        return
-    columns = policy.edges.get(model._meta.label_lower)
-    changed = sorted(columns.intersection(names)) if columns else []
-    if changed:
-        raise PermissionDenied(
-            f"Cannot change {', '.join(changed)} of {model.__name__} under an actor: an edge's "
-            "target is not moved. Delete the edge and create a new one."
-        )
+    raise PermissionDenied(
+        f"Cannot change {', '.join(changed)} of {model.__name__} under an actor: an edge's "
+        "target is not moved. Delete the edge and create a new one."
+    )
 
 
 def codec_fields(schema: Schema) -> tuple[tuple[type[models.Model], str], ...]:

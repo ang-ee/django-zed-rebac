@@ -28,14 +28,24 @@ def check_permission(
     The function form of :func:`require_permission`: an explicit ``actor``
     is asked first, then ambient sudo answers ``HAS``, then the current
     actor is asked.  With none of them, :class:`NoActorResolvedError`.
-    ``resource`` is an :class:`ObjectRef` or a model instance.
+    ``resource`` is an :class:`ObjectRef` or a model instance; for an
+    instance that carries an actor (``with_actor``, ``sudo``) and no explicit
+    ``actor``, the instance's effective actor answers, as for its own
+    ``check_access``.
     """
     from . import backend
     from .actors import to_subject_ref
+    from .mixins import RebacMixin
 
-    if actor is None and is_sudo():
+    subject: SubjectRef | None
+    if actor is None and isinstance(resource, RebacMixin):
+        subject, unscoped = resource.effective_actor(strict=False)
+        if unscoped:
+            return CheckResult.has(reason="sudo")
+    elif actor is None and is_sudo():
         return CheckResult.has(reason="sudo")
-    subject = to_subject_ref(actor) if actor is not None else current_actor()
+    else:
+        subject = to_subject_ref(actor) if actor is not None else current_actor()
     if subject is None:
         raise NoActorResolvedError(f"check_permission({action!r}) called with no actor in scope")
     ref = resource if isinstance(resource, ObjectRef) else to_object_ref(resource)

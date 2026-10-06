@@ -5,7 +5,7 @@ from types import SimpleNamespace
 import pytest
 from django.contrib.auth import get_user_model
 from django.contrib.contenttypes.models import ContentType
-from django.db import connection
+from django.db import connection, transaction
 from django.test.utils import CaptureQueriesContext, isolate_apps
 
 from rebac import (
@@ -33,6 +33,7 @@ from tests.testapp.models import (
     NativeParentLinkedChild,
     NativeParentLinkedResource,
     Post,
+    Shelf,
     SluggedPost,
 )
 
@@ -56,14 +57,20 @@ definition test/nativeparentlinkedresource {
     permission read = owner
     permission write = owner
 }
+definition test/shelf {
+    relation owner: auth/user
+    permission read = owner
+    permission write = owner
+}
 definition test/attachment {
     relation folder:   blog/folder                    // rebac:field=target
     relation post:     blog/post                      // rebac:field=target
     relation resource: test/nativeparentlinkedresource // rebac:field=target
-    permission create = ((folder->write + post->write) + resource->write)
-    permission write  = ((folder->write + post->write) + resource->write)
-    permission delete = ((folder->write + post->write) + resource->write)
-    permission read   = ((folder->read + post->read) + resource->read)
+    relation shelf:    test/shelf                     // rebac:field=target
+    permission create = (((folder->write + post->write) + resource->write) + shelf->write)
+    permission write  = (((folder->write + post->write) + resource->write) + shelf->write)
+    permission delete = (((folder->write + post->write) + resource->write) + shelf->write)
+    permission read   = (((folder->read + post->read) + resource->read) + shelf->read)
 }
 """
 ALICE = SubjectRef.of("auth/user", "alice")
@@ -175,6 +182,8 @@ def test_the_canonical_target_of_a_row(world):
         generic_target(world.stage)
     with pytest.raises(ValueError, match="GenericForeignKey"):
         folder.lookups(Attachment, "label")
+    with pytest.raises(ValueError, match="unsaved"):
+        generic_target(Folder(name="unsaved"))
 
 
 @isolate_apps("tests.testapp")
@@ -291,6 +300,75 @@ def test_an_edge_is_not_moved_under_an_actor(world):
     assert Attachment._base_manager.filter(pk=moving.pk).update(object_id=also_mine.pk) == 1
 
 
+def test_a_saved_edge_is_compared_with_its_stored_row(world):
+    with sudo(reason="test.fixture"):
+        also_mine = Folder.objects.create(name="also mine")
+    world.local.write_relationships([RelationshipTuple(to_object_ref(also_mine), "owner", ALICE)])
+    with actor_context(ALICE):
+        # Created, then saved again: nothing is loaded, nothing moves.
+        made = Attachment.objects.create(**at(world.mine))
+        made.label = "renamed"
+        made.save()
+        made.save(update_fields=["label", "object_id"])
+        [bulk] = Attachment.objects.bulk_create([Attachment(**at(world.post))])
+        bulk.save()
+        # A loaded edge given another edge's primary key writes that row.
+        mine = Attachment.objects.create(**at(also_mine))
+        donor = edge(world.shared)
+        donor.pk = mine.pk
+        with pytest.raises(PermissionDenied, match="Delete the edge"):
+            donor.save()
+    with sudo(reason="test.verify"):
+        assert Attachment.objects.get(pk=mine.pk).object_id == also_mine.pk
+
+
+@pytest.fixture
+def shelves(world):
+    with sudo(reason="test.fixture"):
+        mine, other = Shelf.objects.create(name="mine"), Shelf.objects.create(name="other")
+    world.local.write_relationships([RelationshipTuple(to_object_ref(mine), "owner", ALICE)])
+    return mine, other
+
+
+def test_a_generic_relation_manager_does_not_move_edges(world, shelves):
+    mine, other = shelves
+    with actor_context(ALICE):
+        attached = mine.attachments.create(label="on mine")
+        loaded = Attachment.objects.with_actor(ALICE).get(pk=attached.pk)
+        # The manager writes inside an atomic block without a savepoint: each
+        # refusal gets one of its own here, as a request's transaction would.
+        with pytest.raises(PermissionDenied), transaction.atomic():
+            other.attachments.create(label="on other")
+        for move in (
+            lambda: other.attachments.add(loaded),
+            lambda: other.attachments.set([loaded]),
+            lambda: other.attachments.add(loaded, bulk=False),
+        ):
+            with pytest.raises(PermissionDenied), transaction.atomic():
+                move()
+    with sudo(reason="test.verify"):
+        stored = Attachment.objects.get(pk=attached.pk)
+        assert (stored.content_type, stored.object_id) == (
+            generic_target(mine).content_type,
+            mine.pk,
+        )
+
+
+@isolate_apps("tests.testapp")
+def test_the_refusal_covers_a_proxy_of_the_edge_model(world):
+    from rebac.watch import edge_columns, gate_policy, refuse_moving_edges
+
+    class PinnedAttachment(Attachment):
+        class Meta:
+            app_label = "testapp"
+            proxy = True
+
+    policy = gate_policy("default")
+    assert edge_columns(policy, PinnedAttachment) == edge_columns(policy, Attachment)
+    with pytest.raises(PermissionDenied, match="Delete the edge"):
+        refuse_moving_edges(policy, PinnedAttachment, ["object_id"])
+
+
 def test_a_tuple_cannot_be_written_to_a_generic_relation(world):
     with pytest.raises(SchemaError, match=r"Attachment\.target"):
         world.local.write_relationships(
@@ -336,7 +414,7 @@ def test_a_scope_reads_the_edges_whose_target_is_readable(world, edges, monkeypa
     with CaptureQueriesContext(connection) as queries:
         assert list(rows.filter(**at(world.mine))) == [edges["mine"]]
     # One decision for each target type, then the edges.
-    assert len(queries) == 3 + 1
+    assert len(queries) == 4 + 1
 
 
 def test_checks_enumeration_and_subjects_agree_with_the_reference(world, edges):
@@ -411,3 +489,9 @@ def test_check_permission_answers_as_the_effective_actor(world):
         assert not check_permission("write", world.other, actor=ALICE).allowed
     with pytest.raises(NoActorResolvedError):
         check_permission("write", mine)
+    # An instance carries its own actor, as for its own check_access.
+    with actor_context(BOB):
+        pinned = Folder.objects.with_actor(ALICE).get(pk=world.mine.pk)
+        assert check_permission("write", pinned).allowed
+        assert not check_permission("write", pinned, actor=BOB).allowed
+        assert check_permission("write", pinned.sudo(reason="test.check"), actor=None).allowed

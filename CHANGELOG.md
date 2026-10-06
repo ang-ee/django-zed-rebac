@@ -25,14 +25,16 @@ pre-1.0; breaking changes within a minor version are explicitly called out.
 - `rebac.check_permission(action, resource, *, actor=None, context=None)`:
   the function form of `@require_permission`. An explicit actor is asked
   first, then ambient sudo answers `HAS`, then the current actor; with none,
-  `NoActorResolvedError`. `resource` is an `ObjectRef` or a model instance.
+  `NoActorResolvedError`. `resource` is an `ObjectRef` or a model instance; an
+  instance with a pinned actor or sudo answers as its own `check_access`.
 
 ### Changed
 
 - Under an actor, a write that changes the content type or object id of a
-  `GenericForeignKey` backing is refused: instance saves, scoped queryset
-  updates and base-manager updates (a `GenericRelation` manager's `add()`)
-  alike. An edge is deleted and created, never moved.
+  `GenericForeignKey` backing is refused: an instance save whose values
+  differ from the stored row, and a queryset update (scoped, or through the
+  base manager as a `GenericRelation` manager's `add()` and `set()` do) that
+  names either column. An edge is deleted and created, never moved.
 
 ### Upgrade (for an app that hand-rolls checks on polymorphic edges)
 
