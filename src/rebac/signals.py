@@ -620,6 +620,8 @@ def _affected_backing_ids(
             if backing is not None:
                 source = backing.source_model
                 paths = (backing.path, *backing.filters)
+                if backing.generic is not None:
+                    paths = (*paths, backing.generic.ct_field)
             elif attribute is not None:
                 source = attribute.target_model
                 paths = (attribute.field.name, *attribute.filters)

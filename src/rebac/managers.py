@@ -1278,9 +1278,12 @@ class RebacQuerySet(models.QuerySet[_M]):
             return super().bulk_update(objs, field_names, batch_size=batch_size)
 
     def _rebac_update(self, **kwargs: Any) -> int:
+        from .watch import gate_policy, refuse_moving_edges
+
         actor, sudo = self._resolve_effective_actor()
         if sudo:
             return super().update(**kwargs)
+        refuse_moving_edges(gate_policy(self.db), self.model, kwargs)
         rebac_type = model_resource_type(self.model)
         if rebac_type:
             self._guard_bulk_action(actor, "write")  # type: ignore[arg-type]
@@ -1507,10 +1510,10 @@ class TrackedQuerySet[T: models.Model](models.QuerySet[T]):
     """Owning queryset without actor scoping, also used by both base managers."""
 
     def update(self, **kwargs: Any) -> int:
-        from .actors import is_sudo
+        from .actors import current_actor, is_sudo
         from .mixins import RebacMixin
         from .signals import _edge_actor, _gate_backed_rows, audit_backed_denials
-        from .watch import by_key, model_write, statement_keys
+        from .watch import by_key, gate_policy, model_write, refuse_moving_edges, statement_keys
 
         self._for_write = True
         with (
@@ -1518,6 +1521,9 @@ class TrackedQuerySet[T: models.Model](models.QuerySet[T]):
             model_write(model=self.model, using=self.db, names=kwargs) as watched,
         ):
             related_owner = cast(Any, self)._hints.get("instance")
+            if not is_sudo() and (related_owner is not None or current_actor() is not None):
+                # A generic related manager re-points edges through here.
+                refuse_moving_edges(gate_policy(self.db), self.model, kwargs)
             related_fk_write = any(
                 isinstance(field, (models.ForeignKey, models.OneToOneField))
                 and {field.name, field.attname} & kwargs.keys()

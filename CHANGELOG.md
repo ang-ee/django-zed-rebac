@@ -3,6 +3,53 @@
 All notable changes to `django-zed-rebac` are tracked here. The project is in
 pre-1.0; breaking changes within a minor version are explicitly called out.
 
+## [0.26.0] — 2026-10-06
+
+### Added
+
+- Relations backed by a `GenericForeignKey`
+  ([proposal 0016](./docs/proposals/0016-generic-foreign-key-backings.md)).
+  A field backing may end in a `GenericForeignKey` of the declaring model;
+  the relation keeps one subject type and holds the edges whose content type
+  is that type's model. A polymorphic edge declares one relation per target
+  type and writes its `create`, `delete` and `read` over them, and the
+  existing gates and scopes apply: bulk and queryset writes, sudo and pinned
+  actors included. An edge to a type no relation names, to an untyped model,
+  to a non-canonical content type or to a row that is gone grants nothing
+  and is refused under an actor.
+- `rebac.generic_target(row)` and `rebac.GenericTarget`: the content type,
+  object id and `ObjectRef` an edge stores for a row. A proxy is its concrete
+  row; a multi-table child is its topmost ancestor with a resource type.
+  `GenericTarget.lookups(model, name)` gives the filter keywords for an edge
+  model's `GenericForeignKey`.
+- `rebac.check_permission(action, resource, *, actor=None, context=None)`:
+  the function form of `@require_permission`. An explicit actor is asked
+  first, then ambient sudo answers `HAS`, then the current actor; with none,
+  `NoActorResolvedError`. `resource` is an `ObjectRef` or a model instance; an
+  instance with a pinned actor or sudo answers as its own `check_access`.
+
+### Changed
+
+- Under an actor, a write that changes the content type or object id of a
+  `GenericForeignKey` backing is refused: an instance save whose values
+  differ from the stored row, and a queryset update (scoped, or through the
+  base manager as a `GenericRelation` manager's `add()` and `set()` do) that
+  names either column. An edge is deleted and created, never moved.
+
+### Upgrade (for an app that hand-rolls checks on polymorphic edges)
+
+1. Declare one relation per target type on the edge's definition,
+   `relation party: parties/party // rebac:field=target`, and write the edge's
+   `create`, `delete` and `read` over them. A type's model must be its own
+   canonical model and its identity its primary key (`rebac.E009`).
+2. Store targets with `rebac.generic_target(row)`; a helper that computes the
+   canonical target can be removed or kept as an alias.
+3. Remove the hand-written target checks and the `system_context` around
+   edge inserts and deletes; create and delete edges under the actor.
+4. List a record's edges with the scoped edge queryset filtered by
+   `generic_target(record).lookups(Edge, "target")`.
+5. Move an edge by deleting it and creating a new one.
+
 ## [0.25.3] — 2026-10-02
 
 ### Fixed

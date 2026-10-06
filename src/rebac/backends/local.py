@@ -902,7 +902,11 @@ class LocalBackend(Backend):
             field_backing = resolve_field_backing(definition, relation)
             if field_backing is not None:
                 model_hint = field_backing.source_model.__name__
-                field_hint = field_backing.field.name
+                field_hint = (
+                    field_backing.generic.name
+                    if field_backing.generic is not None
+                    else field_backing.field.name
+                )
         return SchemaError(
             f"relation `{relation.name}` on `{resource_type}` is field-backed; "
             f"set `{model_hint}.{field_hint}` instead"

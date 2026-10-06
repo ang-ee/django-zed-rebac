@@ -1127,6 +1127,7 @@ class Compiler:
         resolved = resolve_field_backing(definition, relation)
         if (
             resolved is None
+            or resolved.generic is not None
             or resolved.source_model is not model
             or resolved.target_model is not model
             or resolved.relation.allowed_subjects[0].relation
@@ -1591,8 +1592,12 @@ class Compiler:
         )
         if subjects is False:
             return _FALSE
+        # Whether the predicate reads the targets' own rows; otherwise a
+        # reference that nothing constrains is checked against them.
+        through_rows = True
         if subjects is True:
             source_q = Q(**{f"{target_path}__isnull": False})
+            through_rows = False
         elif isinstance(subjects, Decided) and resolved.keeps_target(self.using):
             source_q = Q(**{f"{target_path}__in": list(subjects)})
         elif isinstance(subjects, Decided):
@@ -1613,6 +1618,7 @@ class Compiler:
             source_q = Q(
                 **{target_path: self._native(resolved.target_model, resolved.target_id_attr)}
             )
+            through_rows = False
         else:
             source_q = Q(
                 **{
@@ -1621,7 +1627,9 @@ class Compiler:
                     )
                 }
             )
-        source_q = Q(**resolved.filters) & source_q
+        # A GenericForeignKey backing holds the rows of one content type.
+        generic = resolved.generic_q(self.using, exists=not through_rows)
+        source_q = Q(**resolved.filters) & generic & source_q
         # Two arms over one multi-valued path must not share its join, so
         # only a single-valued lookup may be inlined into the caller's filter.
         single = not _multi_valued(resolved.source_model, resolved.path) and not any(

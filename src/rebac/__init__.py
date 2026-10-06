@@ -19,7 +19,7 @@ from typing import TYPE_CHECKING, Any
 try:
     __version__ = version("django-zed-rebac")
 except PackageNotFoundError:
-    __version__ = "0.25.3"
+    __version__ = "0.26.0"
 
 default_app_config = "rebac.apps.RebacConfig"
 
@@ -77,7 +77,8 @@ if TYPE_CHECKING:
     from .audit import aemit as aemit_audit_event
     from .audit import emit as emit_audit_event
     from .backends import Backend, LocalBackend, SpiceDBBackend, backend
-    from .decorators import rebac_resource, require_permission
+    from .decorators import check_permission, rebac_resource, require_permission
+    from .field_backing import GenericTarget, generic_target
     from .managers import RebacManager, RebacQuerySet, TrackedManager, TrackedQuerySet
     from .mcp import default_actor_resolver, get_mcp_actor_resolver, rebac_mcp_tool
     from .mixins import RebacMixin, RebacObjectMeta, RebacTrackedMixin
@@ -109,6 +110,9 @@ _LAZY = {
     "SpiceDBBackend": ("rebac.backends", "SpiceDBBackend"),
     "backend": ("rebac.backends", "backend"),
     "require_permission": ("rebac.decorators", "require_permission"),
+    "check_permission": ("rebac.decorators", "check_permission"),
+    "generic_target": ("rebac.field_backing", "generic_target"),
+    "GenericTarget": ("rebac.field_backing", "GenericTarget"),
     "rebac_resource": ("rebac.decorators", "rebac_resource"),
     "write_relationships": ("rebac.relationships", "write_relationships"),
     "schema_changes": ("rebac.models.schema_write", "schema_changes"),
@@ -157,8 +161,12 @@ __all__ = [
     "TrackedQuerySet",
     "RebacObjectMeta",
     "RebacPermissionsMixin",
-    # decorators
+    # decorators and checks
     "require_permission",
+    "check_permission",
+    # polymorphic edges
+    "generic_target",
+    "GenericTarget",
     "rebac_resource",
     "rebac_subject",
     # mcp adapter

@@ -617,6 +617,34 @@ def assign_parent(self, new_parent):
     self.parent = new_parent
 ```
 
+### Polymorphic edges (attachments, tags, bindings)
+
+An edge model that points at any record through a `GenericForeignKey`
+declares one relation per type it may point at, each backed by the same
+`GenericForeignKey`, and writes its permissions over them. The edge then
+follows its target: attaching needs `write` on the record, listing needs
+`read` on it.
+
+```zed
+definition storage/file_attachment {
+    relation file:  storage/file  // rebac:field=file
+    relation party: parties/party // rebac:field=target
+    relation task:  projects/task // rebac:field=target
+
+    permission create = (file->read & (party->write + task->write))
+    permission delete = (party->write + task->write)
+    permission read   = (file->read & (party->read + task->read))
+}
+```
+
+- Store targets with `rebac.generic_target(row)`: a proxy is stored as its
+  concrete row and a multi-table child as its topmost typed ancestor, so the
+  relation names the ancestor's type.
+- A type with no relation has no arm, so an edge to it is refused under an
+  actor. A package that makes its records attachable contributes its
+  relation and its arms to the edge's definition.
+- An edge is not moved under an actor: delete it and create a new one.
+
 ### Time-bound access
 
 Modern SpiceDB schemas (v1.40+) support relationship expiration as a first-class feature. **Prefer this over the older "current_time as a caveat" pattern** — expiration garbage-collects automatically; caveats don't.
