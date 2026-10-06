@@ -8,7 +8,7 @@ from graphlib import CycleError, TopologicalSorter
 from typing import TYPE_CHECKING, Any
 
 from django.core.exceptions import FieldDoesNotExist, FieldError, ValidationError
-from django.db import DEFAULT_DB_ALIAS, connections, models
+from django.db import DEFAULT_DB_ALIAS, connections, models, router
 from django.db.models import Q, QuerySet, Value
 from django.db.models.expressions import BaseExpression, Col, ColPairs, Combinable
 from django.db.models.functions import Coalesce
@@ -17,7 +17,12 @@ from django.db.models.sql.constants import SINGLE
 
 from ._candidate_filters import _candidate_literal, _filter_candidate_targets, _value_is_unresolved
 from ._id import model_identity_fields, model_identity_filter, resource_id_attr
-from .resources import model_for_resource_type, model_for_subject_type, model_resource_type
+from .resources import (
+    _resolve_dotted,
+    model_for_resource_type,
+    model_for_subject_type,
+    model_resource_type,
+)
 from .schema.ast import (
     AttributeBinding,
     ConstBinding,
@@ -29,9 +34,12 @@ from .schema.ast import (
     Relation,
     Schema,
 )
-from .types import SubjectRef
+from .types import ObjectRef, SubjectRef
 
 if TYPE_CHECKING:
+    from django.contrib.contenttypes.fields import GenericForeignKey
+    from django.contrib.contenttypes.models import ContentType
+
     # ``models.Field`` is generic only in django-stubs; subscripting it at
     # runtime raises ``TypeError``. Annotations are lazy (PEP 563), so the alias
     # is needed by type checkers only.
@@ -53,6 +61,15 @@ class _SourceFilters:
 
 
 @dataclass(frozen=True, slots=True)
+class GenericColumns:
+    """The names of a GenericForeignKey and of its two columns."""
+
+    name: str
+    ct_field: str
+    fk_field: str
+
+
+@dataclass(frozen=True, slots=True)
 class ResolvedFieldBacking(_SourceFilters):
     """A forward/reverse ORM path with filters anchored on its source model."""
 
@@ -63,10 +80,33 @@ class ResolvedFieldBacking(_SourceFilters):
     target_resource_type: str
     target_id_attr: str
     path: str
+    # For a backing that ends in a GenericForeignKey: ``path`` is its object
+    # id column, which holds the target's primary key, and the content type
+    # column selects the rows of ``target_model``.
+    generic: GenericColumns | None = None
 
     @property
     def source_id_attr(self) -> str:
         return resource_id_attr(self.source_model)
+
+    def generic_q(self, using: str, *, exists: bool = True) -> Q:
+        """The rows of a GenericForeignKey backing that name a row of the target model.
+
+        ``exists`` also requires the named row to be there: nothing
+        constrains the object id, so an edge can name a row that is gone.
+        Empty for any other backing.
+        """
+        if self.generic is None:
+            return Q()
+        content_type = _content_type(self.target_model, using)
+        if content_type is None:
+            # No row can carry a content type the database does not have.
+            return Q(pk__in=[])
+        predicate = Q(**{self.generic.ct_field: content_type})
+        if exists:
+            rows = self.target_model._base_manager.using(using).order_by().values("pk")
+            predicate &= Q(**{f"{self.path}__in": rows})
+        return predicate
 
     def source_filter(self, resource_id: str, *, using: str = DEFAULT_DB_ALIAS) -> Q:
         return model_identity_filter(
@@ -120,6 +160,8 @@ class ResolvedFieldBacking(_SourceFilters):
         return kept
 
     def target_values_path(self) -> str:
+        if self.generic is not None:
+            return self.path
         if (
             "__" not in self.path
             and isinstance(self.field, (models.ForeignKey, models.OneToOneField))
@@ -139,7 +181,7 @@ class ResolvedFieldBacking(_SourceFilters):
         """Constrain the target and through-row predicates in the same SQL join."""
 
         rows = self.source_model._base_manager.db_manager(using).all()
-        predicate = Q(**self.filters)
+        predicate = Q(**self.filters) & self.generic_q(rows.db)
         if resource_id is not None:
             predicate &= self.source_filter(resource_id, using=rows.db)
         if subject is not None:
@@ -147,6 +189,163 @@ class ResolvedFieldBacking(_SourceFilters):
         if target_ids is not None:
             predicate &= Q(**self.target_in_filter(target_ids))
         return rows.filter(predicate)
+
+
+def canonical_model(model: type[models.Model]) -> type[models.Model] | None:
+    """The model a row of ``model`` is named by in a polymorphic edge, if any.
+
+    A proxy is its concrete model.  Along the chain of parent links that are
+    the primary key (a multi-table child shares its parent's key), the
+    topmost model with a resource type is the canonical one: a child and its
+    typed parent share one set of edges.  ``None`` when no model of the chain
+    has a resource type.
+    """
+    current = model._meta.concrete_model or model
+    found = current if model_resource_type(current) else None
+    while True:
+        pk = current._meta.pk
+        if not (isinstance(pk, models.OneToOneField) and pk.remote_field.parent_link):
+            return found
+        parent = pk.related_model
+        assert isinstance(parent, type)
+        current = parent._meta.concrete_model or parent
+        if model_resource_type(current):
+            found = current
+
+
+@dataclass(frozen=True, slots=True)
+class GenericTarget:
+    """What a polymorphic edge stores for a row, and the object it names."""
+
+    content_type: ContentType
+    object_id: Any
+    ref: ObjectRef
+
+    def lookups(self, model: type[models.Model], name: str) -> dict[str, Any]:
+        """Filter keywords for the edges of ``model`` whose GenericForeignKey ``name`` names it."""
+        from django.contrib.contenttypes.fields import GenericForeignKey
+
+        field = model._meta.get_field(name)
+        if not isinstance(field, GenericForeignKey):
+            raise ValueError(f"{model.__name__}.{name} is not a GenericForeignKey")
+        return {field.ct_field: self.content_type, field.fk_field: self.object_id}
+
+
+def generic_target(obj: models.Model, *, using: str | None = None) -> GenericTarget:
+    """The content type and id a polymorphic edge stores for ``obj``, and its object.
+
+    The content type is that of the row's canonical model
+    (:func:`canonical_model`): a proxy is stored as its concrete row, a
+    multi-table child as its topmost typed ancestor.  Raises ``ValueError``
+    for a row whose model chain has no resource type.
+    """
+    from django.contrib.contenttypes.models import ContentType
+
+    model = canonical_model(type(obj))
+    resource_type = model_resource_type(model) if model is not None else None
+    if model is None or resource_type is None:
+        raise ValueError(
+            f"{type(obj).__name__} has no resource type: a polymorphic edge cannot name it"
+        )
+    alias = using or obj._state.db or router.db_for_read(model)
+    content_type = ContentType.objects.db_manager(alias).get_for_model(model)
+    identity = _resolve_dotted(obj, resource_id_attr(model))
+    return GenericTarget(content_type, obj.pk, ObjectRef(resource_type, str(identity)))
+
+
+def _content_type(model: type[models.Model], using: str) -> ContentType | None:
+    """The content type of ``model`` on ``using``, read and never created."""
+    from django.contrib.contenttypes.models import ContentType
+
+    name = model._meta.model_name
+    assert name is not None
+    try:
+        return ContentType.objects.db_manager(using).get_by_natural_key(model._meta.app_label, name)
+    except ContentType.DoesNotExist:
+        return None
+
+
+def _generic_field(model: type[models.Model], path: str) -> GenericForeignKey | None:
+    from django.contrib.contenttypes.fields import GenericForeignKey
+
+    if "__" in path:
+        return None
+    try:
+        field = model._meta.get_field(path)
+    except FieldDoesNotExist:
+        return None
+    return field if isinstance(field, GenericForeignKey) else None
+
+
+# Column types that hold the same integer values, whatever their width.
+_INTEGER_TYPES = frozenset(
+    {
+        "AutoField",
+        "BigAutoField",
+        "SmallAutoField",
+        "IntegerField",
+        "BigIntegerField",
+        "SmallIntegerField",
+        "PositiveIntegerField",
+        "PositiveBigIntegerField",
+        "PositiveSmallIntegerField",
+    }
+)
+
+
+def _resolve_generic_backing(
+    definition: Definition,
+    relation: Relation,
+    source_model: type[models.Model],
+    generic: GenericForeignKey,
+    target_model: type[models.Model],
+    target_id_attr: str,
+) -> ResolvedFieldBacking:
+    """A relation over one type, read from a GenericForeignKey of the declaring model."""
+    allowed = relation.allowed_subjects[0]
+    name = f"GenericForeignKey {source_model.__name__}.{generic.name}"
+    if allowed.relation:
+        raise ValueError(f"{name} names rows; it cannot back a subject relation")
+    if allowed.wildcard:
+        raise ValueError(f"{name} names rows; it cannot admit a wildcard")
+    canonical = canonical_model(target_model)
+    if canonical is not target_model:
+        raise ValueError(
+            f"{name} cannot back {allowed.type!r}: its model is not its own canonical model, "
+            f"so edges to its rows are stored as {getattr(canonical, '__name__', None)!r}"
+        )
+    pk = target_model._meta.pk
+    assert pk is not None
+    if target_id_attr not in ("pk", pk.name, pk.attname):
+        raise ValueError(
+            f"{name} cannot back {allowed.type!r}: the object id holds a primary key, "
+            f"and the type's identity {target_id_attr!r} is not its primary key"
+        )
+    object_id = source_model._meta.get_field(generic.fk_field)
+    column: Any = pk
+    while column.is_relation:
+        # A multi-table child's key is its parent's: compare that column.
+        column = column.target_field
+    kinds = {object_id.get_internal_type(), column.get_internal_type()}
+    if len(kinds) > 1 and not kinds <= _INTEGER_TYPES:
+        raise ValueError(
+            f"{name} cannot back {allowed.type!r}: the object id field "
+            f"{generic.fk_field!r} cannot hold the primary key of {target_model.__name__}"
+        )
+    backing = relation.backing
+    assert isinstance(backing, FieldBinding)
+    # Nothing joins through a GenericForeignKey: filters name the edge's own columns.
+    _validate_const_filters(source_model, backing)
+    return ResolvedFieldBacking(
+        source_model,
+        target_model,
+        object_id,
+        relation,
+        allowed.type,
+        target_id_attr,
+        generic.fk_field,
+        GenericColumns(generic.name, generic.ct_field, generic.fk_field),
+    )
 
 
 def foreign_key_kept(field: models.ForeignKey[Any, Any], using: str) -> bool:
@@ -241,6 +440,8 @@ def _proposed_field_subjects(
 ) -> tuple[SubjectRef, ...] | None:
     """Follow scalar forward FKs without consulting related-object caches."""
 
+    if resolved.generic is not None:
+        return _proposed_generic_subjects(instance, resolved, using=using)
     relation = resolved.relation
     label = f"{model_resource_type(instance)}#{relation.name}"
     current = instance
@@ -292,6 +493,47 @@ def _proposed_field_subjects(
         )
     allowed = relation.allowed_subjects[0]
     return (SubjectRef.of(allowed.type, str(target_id), allowed.relation),)
+
+
+def _proposed_generic_subjects(
+    instance: models.Model,
+    resolved: ResolvedFieldBacking,
+    *,
+    using: str | None,
+) -> tuple[SubjectRef, ...] | None:
+    """The row a candidate edge names, when it is a row of the relation's type.
+
+    An edge to another content type, to a row that is gone, or that misses
+    the relation's filters, names nothing through this relation.
+    """
+    generic = resolved.generic
+    assert generic is not None
+    model = type(instance)
+    content_type_field = model._meta.get_field(generic.ct_field)
+    assert isinstance(content_type_field, models.ForeignKey)
+    object_id_field = resolved.field
+    assert isinstance(object_id_field, models.Field)
+    content_type_id = getattr(instance, content_type_field.attname)
+    object_id = getattr(instance, object_id_field.attname)
+    if _value_is_unresolved(content_type_field, content_type_id) or _value_is_unresolved(
+        object_id_field, object_id
+    ):
+        return None
+    if content_type_id is None or object_id is None:
+        return ()
+    alias = using or router.db_for_write(model)
+    content_type = _content_type(resolved.target_model, alias)
+    if content_type is None or content_type_field.to_python(content_type_id) != content_type.pk:
+        return ()
+    matches = _candidate_matches(model, resolved.filters, instance, using=alias)
+    if matches is not True:
+        return None if matches is None else ()
+    pk = resolved.target_model._meta.pk
+    assert pk is not None
+    key = pk.to_python(object_id)
+    if not resolved.target_model._base_manager.db_manager(alias).filter(pk=key).exists():
+        return ()
+    return (SubjectRef.of(resolved.target_resource_type, str(key)),)
 
 
 @dataclass(frozen=True, slots=True)
@@ -428,23 +670,34 @@ class ResolvedConstBacking(_SourceFilters):
 
     def matches_candidate(self, instance: models.Model, *, using: str | None = None) -> bool | None:
         """Evaluate local column values without reading a persisted source row."""
-        if not self.filters:
-            return True
-        query = Query(None)
-        for lookup in sorted(self.filters):
-            field = _const_filter_field(self.source_model, lookup)
-            value = getattr(instance, field.attname)
-            if _value_is_unresolved(field, value):
-                return None
-            root = lookup.split("__", 1)[0]
-            _query_field, scalar = model_identity_fields(self.source_model, root)
-            query.add_annotation(_candidate_literal(scalar, value), root, select=False)
-        query.add_annotation(
-            Coalesce(Q(**self.filters), False, output_field=models.BooleanField()),
-            "_rebac_const_matches",
-        )
-        result = query.get_compiler(using=using or DEFAULT_DB_ALIAS).execute_sql(SINGLE)
-        return bool(result and result[0])
+        return _candidate_matches(self.source_model, self.filters, instance, using=using)
+
+
+def _candidate_matches(
+    model: type[models.Model],
+    filters: dict[str, Any],
+    instance: models.Model,
+    *,
+    using: str | None,
+) -> bool | None:
+    """Whether a candidate's own column values meet ``filters``; ``None`` when unknown."""
+    if not filters:
+        return True
+    query = Query(None)
+    for lookup in sorted(filters):
+        field = _const_filter_field(model, lookup)
+        value = getattr(instance, field.attname)
+        if _value_is_unresolved(field, value):
+            return None
+        root = lookup.split("__", 1)[0]
+        _query_field, scalar = model_identity_fields(model, root)
+        query.add_annotation(_candidate_literal(scalar, value), root, select=False)
+    query.add_annotation(
+        Coalesce(Q(**filters), False, output_field=models.BooleanField()),
+        "_rebac_const_matches",
+    )
+    result = query.get_compiler(using=using or DEFAULT_DB_ALIAS).execute_sql(SINGLE)
+    return bool(result and result[0])
 
 
 def _const_filter_field(model: type[models.Model], lookup: str) -> models.Field[Any, Any]:
@@ -463,7 +716,9 @@ def _const_filter_field(model: type[models.Model], lookup: str) -> models.Field[
     return field
 
 
-def _validate_const_filters(model: type[models.Model], backing: ConstBinding) -> None:
+def _validate_const_filters(
+    model: type[models.Model], backing: ConstBinding | FieldBinding
+) -> None:
     if not backing.filters:
         return
     query = Query(None)
@@ -578,6 +833,11 @@ def _resolve_field_backing(definition: Definition, relation: Relation) -> Resolv
         _validate_model_identity(target_model, target_id_attr)
     except FieldDoesNotExist as exc:
         raise ValueError(f"missing identity field {exc.args[0]!r}") from exc
+    generic = _generic_field(source_model, backing.path)
+    if generic is not None:
+        return _resolve_generic_backing(
+            definition, relation, source_model, generic, target_model, target_id_attr
+        )
     actual_model, field, path = _relation_path(source_model, backing.path)
     if actual_model._meta.concrete_model is not target_model._meta.concrete_model:
         raise ValueError(

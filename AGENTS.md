@@ -459,7 +459,8 @@ update; removing from it is a breaking change requiring a major bump.
 # What's PUBLIC and semver-stable:
 from rebac import (
     RebacMixin, RebacTrackedMixin,
-    require_permission, rebac_resource, rebac_subject,
+    require_permission, check_permission, rebac_resource, rebac_subject,
+    generic_target, GenericTarget,
     Backend, LocalBackend, SpiceDBBackend, backend,
     CheckResult, Consistency, Zookie, PermissionResult,
     ObjectRef, SubjectRef, RelationshipTuple, ActorLike, CheckItem,

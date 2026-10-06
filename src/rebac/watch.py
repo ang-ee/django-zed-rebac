@@ -141,6 +141,10 @@ def watched_for(schema: Schema) -> Mapping[str, WatchSpec]:
                 watches.identity(field.source_model, field.source_id_attr, type_)
                 watches.identity(field.target_model, field.target_id_attr, type_)
                 watches.path(field.source_model, field.path, type_)
+                if field.generic is not None:
+                    # The content type is the other half of the reference.
+                    content_type = field.source_model._meta.get_field(field.generic.ct_field)
+                    watches.field(field.source_model, content_type, type_)
                 for lookup in sorted(field.filters):
                     watches.path(field.source_model, lookup, type_)
             attribute = resolve_attribute_backing(definition, relation)
@@ -155,6 +159,42 @@ def watched_for(schema: Schema) -> Mapping[str, WatchSpec]:
                 for lookup in sorted(const.filters):
                     watches.path(const.source_model, lookup, type_)
     return watches.freeze()
+
+
+def generic_columns(schema: Schema) -> Mapping[str, frozenset[str]]:
+    """The content-type and object-id columns of GenericForeignKey backings, by model."""
+    found: dict[str, set[str]] = {}
+    for definition in sorted(schema.definitions, key=lambda d: d.resource_type):
+        for relation in sorted(definition.relations, key=lambda r: r.name):
+            field = resolve_field_backing(definition, relation)
+            if field is None or field.generic is None:
+                continue
+            names = found.setdefault(field.source_model._meta.label_lower, set())
+            for name in (field.generic.ct_field, field.generic.fk_field):
+                column = field.source_model._meta.get_field(name)
+                names.update({column.name, getattr(column, "attname", column.name)})
+    return MappingProxyType({label: frozenset(names) for label, names in found.items()})
+
+
+def refuse_moving_edges(
+    policy: GatePolicy | None, model: type[models.Model], names: Iterable[str]
+) -> None:
+    """Refuse a write that changes the target of a polymorphic edge.
+
+    The gates check the edge as stored; the row it would name is not checked,
+    so under an actor an edge is deleted and created, never moved.
+    """
+    from .errors import PermissionDenied
+
+    if policy is None:
+        return
+    columns = policy.edges.get(model._meta.label_lower)
+    changed = sorted(columns.intersection(names)) if columns else []
+    if changed:
+        raise PermissionDenied(
+            f"Cannot change {', '.join(changed)} of {model.__name__} under an actor: an edge's "
+            "target is not moved. Delete the edge and create a new one."
+        )
 
 
 def codec_fields(schema: Schema) -> tuple[tuple[type[models.Model], str], ...]:
@@ -224,6 +264,9 @@ class GatePolicy:
 
     schema: Schema
     watched: Mapping[str, WatchSpec]
+    # The columns of a GenericForeignKey backing, by model label: an edge is
+    # not moved under an actor.
+    edges: Mapping[str, frozenset[str]]
 
     def has_node(self, resource_type: str, name: str) -> bool:
         definition = self.schema.get_definition(resource_type)
@@ -298,7 +341,7 @@ def gate_policy(using: str, backend: LocalBackend | None = None) -> GatePolicy |
         if kept is not None and kept[0] is schema:
             _policies.move_to_end(id(schema))
             return kept[1]
-    policy = GatePolicy(schema, watched_for(schema))
+    policy = GatePolicy(schema, watched_for(schema), generic_columns(schema))
     with _lock:
         _policies[id(schema)] = schema, policy
         while len(_policies) > 64:

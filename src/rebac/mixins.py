@@ -968,6 +968,13 @@ def _gate_save(
     # trivially "dirty"; gating create on per-field permissions makes no
     # sense (use ``permission create = ...`` for that).
     if not is_create:
+        from .watch import gate_policy, refuse_moving_edges
+
+        refuse_moving_edges(
+            gate_policy(using or router.db_for_write(sender)),
+            sender,
+            _dirty_field_names(sender=sender, instance=instance, update_fields=update_fields),
+        )
         _enforce_expression_reads(
             sender=sender,
             instance=instance,

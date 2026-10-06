@@ -11,9 +11,35 @@ from .actors import current_actor, is_sudo
 from .errors import NoActorResolvedError, PermissionDenied
 from .resources import rebac_resource as _rebac_resource_register
 from .resources import to_object_ref
-from .types import ObjectRef, SubjectRef
+from .types import CheckResult, ObjectRef, SubjectRef
 
 rebac_resource = _rebac_resource_register
+
+
+def check_permission(
+    action: str,
+    resource: Any,
+    *,
+    actor: Any = None,
+    context: dict[str, Any] | None = None,
+) -> CheckResult:
+    """Check ``action`` on ``resource`` as the effective actor.
+
+    The function form of :func:`require_permission`: an explicit ``actor``
+    is asked first, then ambient sudo answers ``HAS``, then the current
+    actor is asked.  With none of them, :class:`NoActorResolvedError`.
+    ``resource`` is an :class:`ObjectRef` or a model instance.
+    """
+    from . import backend
+    from .actors import to_subject_ref
+
+    if actor is None and is_sudo():
+        return CheckResult.has(reason="sudo")
+    subject = to_subject_ref(actor) if actor is not None else current_actor()
+    if subject is None:
+        raise NoActorResolvedError(f"check_permission({action!r}) called with no actor in scope")
+    ref = resource if isinstance(resource, ObjectRef) else to_object_ref(resource)
+    return backend().check_access(subject=subject, action=action, resource=ref, context=context)
 
 
 def require_permission(
@@ -54,7 +80,6 @@ def require_permission(
 
         @wraps(fn)
         def _wrapped(*args: Any, **kwargs: Any) -> Any:
-            from . import backend
 
             bound = fn_signature.bind(*args, **kwargs)
             bound.apply_defaults()
@@ -92,7 +117,7 @@ def require_permission(
                     "@require_permission requires either resource_type=... or resource_arg=..."
                 )
 
-            result = backend().check_access(subject=actor_ref, action=action, resource=resource)
+            result = check_permission(action, resource, actor=actor_ref)
             if not result.allowed:
                 raise PermissionDenied(f"Denied: {actor_ref} cannot {action} {resource}")
             return fn(*args, **kwargs)

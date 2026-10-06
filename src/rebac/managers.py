@@ -1278,9 +1278,12 @@ class RebacQuerySet(models.QuerySet[_M]):
             return super().bulk_update(objs, field_names, batch_size=batch_size)
 
     def _rebac_update(self, **kwargs: Any) -> int:
+        from .watch import gate_policy, refuse_moving_edges
+
         actor, sudo = self._resolve_effective_actor()
         if sudo:
             return super().update(**kwargs)
+        refuse_moving_edges(gate_policy(self.db), self.model, kwargs)
         rebac_type = model_resource_type(self.model)
         if rebac_type:
             self._guard_bulk_action(actor, "write")  # type: ignore[arg-type]

@@ -1,7 +1,10 @@
 # Proposal 0016: relations backed by a GenericForeignKey
 
-**Status:** draft, 2026-10-06. Requested by a consumer that hand-rolls the same
-check in three places.
+**Status:** implemented in 0.26.0 (2026-10-06), approved as drafted with one
+narrowing found in implementation: the target's identity must be its primary
+key (§ 3). Requested by a consumer that hand-rolls the same check in three
+places. The behaviour is specified in `docs/ARCHITECTURE.md` § Relations
+backed by a GenericForeignKey.
 
 ## Problem
 
@@ -94,10 +97,13 @@ content_type_id = <ct of T's model>
 AND object_id IN (SELECT pk FROM <T's model> WHERE holds(T#p) at the row's identity)
 ```
 
-The target's identity need not be its primary key: the subquery selects the
-primary key of the target rows that hold `p` at their identity. Nothing
-constrains `object_id`, so decided keys are always read through the target's
-rows (ARCHITECTURE § Decided rows, item 5).
+The target's identity must be its primary key: the object id stores a
+primary key, nothing joins it to another column, and every reader of a field
+backing (the residual evaluator, enumeration, the walker) reads the stored
+value as the target's identity. A relation over a type with another identity
+is refused (`rebac.E009`), as is an object id field whose type cannot hold
+the primary key. Nothing constrains `object_id`, so decided keys are always
+read through the target's rows (ARCHITECTURE § Decided rows, item 5).
 
 - A scope over the edge model is the compiled predicate, as for any resource:
   the edges of one record are

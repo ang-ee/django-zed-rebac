@@ -367,6 +367,19 @@ class BackingBinding(RebacMixin, models.Model):
         rebac_resource_type = "test/backingbinding"
 
 
+class Attachment(RebacMixin, models.Model):
+    """A polymorphic edge: its permissions follow the row its GenericForeignKey names."""
+
+    content_type = models.ForeignKey(ContentType, on_delete=models.CASCADE, related_name="+")
+    object_id = models.PositiveBigIntegerField()
+    target = GenericForeignKey("content_type", "object_id")
+    label = models.CharField(max_length=50, blank=True, default="")
+
+    class Meta:
+        app_label = "testapp"
+        rebac_resource_type = "test/attachment"
+
+
 class BackingQueue(RebacMixin, models.Model):
     class Meta:
         app_label = "testapp"

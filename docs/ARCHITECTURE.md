@@ -276,6 +276,61 @@ containers are refused; a fixed `resource`/`value` anchor does not
 encode its attribute value as an identity and remains supported. `rebac.W009`
 warns, best-effort, about case-insensitive attribute collations.
 
+#### Relations backed by a GenericForeignKey
+
+A polymorphic edge model (an attachment, a tag assignment, a binding of a
+page to any record) names its target through a `GenericForeignKey`. A field
+backing may end in a `GenericForeignKey` of the declaring model, and the
+relation keeps exactly one subject type: it holds the edge rows whose content
+type is that type's model. An edge that can point at several types declares
+one relation per type, and its permissions are expressions over them
+([proposal 0016](./proposals/0016-generic-foreign-key-backings.md)):
+
+```zed
+definition tags/tag_assignment {
+    relation tag:   tags/tag      // rebac:field=tag
+    relation party: parties/party // rebac:field=target
+    relation file:  storage/file  // rebac:field=target
+
+    permission create = (party->write + file->write)
+    permission delete = (party->write + file->write)
+    permission read   = (tag->read & (party->read + file->read))
+}
+```
+
+- **The canonical model.** A row is named by its canonical model: a proxy by
+  its concrete model, and a multi-table child, along the chain of parent links
+  that are its primary key, by its topmost ancestor with a resource type. A
+  child and its typed parent share one set of edges.
+  `rebac.generic_target(row)` returns the content type, the object id and the
+  `ObjectRef` an edge stores and names, and `GenericTarget.lookups(model,
+  name)` the filter keywords for an edge model's `GenericForeignKey`. A row
+  with no typed model in its chain raises `ValueError`.
+- **What the declaration needs** (`rebac.E009` otherwise): one subject type,
+  no subject relation, no wildcard; the type's model is its own canonical
+  model (otherwise edges, stored under its ancestor, would never match); the
+  type's identity is its primary key (the object id stores a primary key and
+  nothing joins it to another column); the object id field holds values of
+  the primary key's type (integer columns of any width match each other); and
+  filters, if any, name the edge model's own local columns.
+- **Reads.** At an edge row the relation over `T` is the content type of `T`'s
+  model and an object id among the primary keys of `T`'s rows that hold the
+  target permission. Nothing constrains the object id, so decided keys are
+  read through the target's rows, and an edge whose target row is gone names
+  nothing and grants nothing. A scope over the edge model is the compiled
+  predicate as for any resource, so the edges of one record are
+  `Edge.objects.with_actor(actor).filter(**rebac.generic_target(record).lookups(Edge, "target"))`.
+- **Writes.** Creating an edge needs `create` on the edge as proposed: the
+  candidate's content type and object id become a proposed relationship of
+  the relation whose type they name, and an edge to a type no relation names,
+  to a model with no resource type, to a non-canonical content type or to a
+  row that is gone has no arm. Deleting needs `delete`. Under an actor, an
+  instance save or a scoped queryset update that changes the content type or
+  object id is refused: the gates check the edge as stored, so an edge is
+  deleted and created, never moved. A base-manager `update()` of the object id
+  is a scalar write the gates do not inspect (pinned for proposal 0013).
+  Tuple writes to these relations raise `SchemaError`.
+
 #### Backings are `LocalBackend`-only until the projector ships
 
 Every backing kind below is read from its columns by `LocalBackend` and omitted from
@@ -449,6 +504,12 @@ from rebac import (
 
     # Preflight against not-yet-persisted resources (0.4+)
     check_new,
+
+    # A check as the effective actor: the function form of require_permission
+    check_permission,
+
+    # What a polymorphic edge stores for a row, and the object it names
+    generic_target, GenericTarget,
 
     # Composable resolvers (0.3.1+)
     chain_resolvers, bearer_token,
