@@ -181,10 +181,49 @@ def _nested_queries(expression: Any) -> Iterator[Query]:
 
 class _Readable(models.Case):
     """A gated column as one actor may read it: its value where the actor holds
-    ``read__<field>``, ``NULL`` elsewhere (``RebacQuerySet.readable``)."""
+    ``read__<field>``, ``NULL`` elsewhere (``RebacQuerySet.readable``).
+
+    The guards trust it only as built.  When it is first resolved its cases
+    are rebuilt from the model, field and readers it was made with, so a change
+    made to them before reaches no statement, and the query it is resolved
+    into must be of that model and resource type.
+    """
 
     rebac_actor: SubjectRef
     rebac_field: str
+    rebac_model: type[models.Model]
+    rebac_readers: models.Exists
+    rebac_resolved = False
+
+    def resolve_expression(
+        self,
+        query: Any = None,
+        allow_joins: bool = True,
+        reuse: Any = None,
+        summarize: bool = False,
+        for_save: bool = False,
+    ) -> Any:
+        if self.rebac_resolved:
+            return super().resolve_expression(query, allow_joins, reuse, summarize, for_save)
+        model = getattr(query, "model", None)
+        if (
+            model is None
+            or model._meta.concrete_model is not self.rebac_model._meta.concrete_model
+            or model_resource_type(model) != model_resource_type(self.rebac_model)
+        ):
+            used_in = model.__name__ if model is not None else "an expression"
+            raise ValueError(
+                f"readable({self.rebac_field!r}) of {self.rebac_model.__name__} is used in "
+                f"a query of {used_in}: build it from a queryset of that model."
+            )
+        built = self.copy()
+        built.cases = [models.When(self.rebac_readers, then=models.F(self.rebac_field))]
+        built.default = models.Value(None)
+        resolved = super(_Readable, built).resolve_expression(
+            query, allow_joins, reuse, summarize, for_save
+        )
+        resolved.rebac_resolved = True
+        return resolved
 
 
 def _emit_bypass_audit(reason: str) -> None:
@@ -318,9 +357,13 @@ def _expression_columns(
         if expression.alias not in _inner_aliases:
             yield expression
         return
-    if reader is not None and isinstance(expression, _Readable):
-        if expression.rebac_actor == reader:
-            return
+    if (
+        reader is not None
+        and isinstance(expression, _Readable)
+        and expression.rebac_resolved
+        and expression.rebac_actor == reader
+    ):
+        return
     if isinstance(expression, Query):
         statement_part = getattr(expression, "_rebac_statement_part", False) and not hasattr(
             expression, "_rebac_state"
@@ -698,15 +741,21 @@ class RebacQuerySet(models.QuerySet[_M]):
         """A gated field as this queryset's actor may read it.
 
         The column on rows where the actor holds ``read__<field>`` and ``NULL``
-        elsewhere: the value redaction shows.  The field read guards accept it
-        for this actor in a filter, an ordering, a grouping or a selection.
-        Under a bypass, or for a field the model does not gate, it is the
-        column itself.
+        elsewhere: the value redaction shows (a conditional permission counts
+        as not held).  The field read guards accept it for this actor in a
+        filter, an ordering, a grouping or a selection of a query of this
+        model.  Under a bypass, or for a field the model's type does not gate,
+        it is the column itself.
         """
         model_field = self.model._meta.get_field(field)
-        if not getattr(model_field, "concrete", False) or model_field.name != field:
+        if (
+            not getattr(model_field, "concrete", False)
+            or model_field.is_relation
+            or model_field.name != field
+        ):
             raise ValueError(
-                f"readable() names a concrete field of {self.model.__name__}: {field!r}"
+                f"readable() names a concrete field of {self.model.__name__} that is not "
+                f"a relation: {field!r}"
             )
         output_field = cast("models.Field[Any, Any]", model_field).clone()
         output_field.null = True
@@ -719,15 +768,16 @@ class RebacQuerySet(models.QuerySet[_M]):
             .with_action(f"read__{field}")
             .scoped_for_aggregate()
         )
+        mask = models.Exists(readers.filter(pk=models.OuterRef("pk")))
         readable = _Readable(
-            models.When(
-                models.Exists(readers.filter(pk=models.OuterRef("pk"))), then=models.F(field)
-            ),
+            models.When(mask, then=models.F(field)),
             default=models.Value(None),
             output_field=output_field,
         )
         readable.rebac_actor = actor
         readable.rebac_field = field
+        readable.rebac_model = self.model
+        readable.rebac_readers = mask
         return readable
 
     def scoped(self) -> RebacQuerySet[_M]:

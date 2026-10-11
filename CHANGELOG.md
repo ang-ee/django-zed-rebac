@@ -10,9 +10,11 @@ pre-1.0; breaking changes within a minor version are explicitly called out.
 - `RebacQuerySet.readable(field)` (also on the manager): a gated field as the
   queryset's actor may read it, the column where the actor holds
   `read__<field>` and `NULL` elsewhere. The field read guards accept it in a
-  filter, an ordering, a grouping or a selection for that actor, so a query
-  that needs a gated field under an actor whose access depends on the row
-  uses it instead of the column.
+  filter, an ordering, a grouping or a selection for that actor in a query
+  of the same model, so a query that needs a gated field under an actor
+  whose access depends on the row uses it instead of the column. Used in a
+  query of another model it raises `ValueError`; it names a field that is not
+  a relation.
 
 ### Fixed
 

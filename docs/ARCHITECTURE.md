@@ -2621,31 +2621,44 @@ on, as resolved into the enclosing statement, whether its scope is applied
 there or was applied earlier (`scoped()`, or an evaluation that was
 refused), with the actor its scope was applied with. A column of the
 enclosing row it refers to (`OuterRef`) is the enclosing query's to answer
-for. It is checked once, when the statement that holds it is checked (sharing
-that check's schema read), or else when it is compiled, so its ordering
-counts as Django compiles it: an `__in` lookup and `Exists()` clear the
-ordering of an unsliced query.
+for. It is checked once: when the statement that holds it is checked, sharing
+that check's schema read, if it sits in that statement's clauses or
+selection; else when it is compiled (an aggregate's expression, an update's
+value, a statement of a model that is not a rebac resource). Its ordering
+counts as Django compiles it: an `__in` lookup clears the ordering of an
+unsliced query, and `Exists()` clears it always.
 
 The decision is per query, not per row. An actor whose permission on the
 field depends on the row is refused, even when every row the query returns
 would show the field, and filters on it under `sudo(reason=...)` or on
 another column. An actor whose permission holds on every row of the type is
 not refused here or in a selection (`values("title")`), because no row hides
-the value from it. To filter, order, group or select on such a field
-otherwise, use `queryset.readable("title")`: the column on rows where the
-queryset's actor holds `read__title` and `NULL` elsewhere, which is the
-value redaction shows. The guards accept it for that actor, in a clause or a
-selection (`alias(t=qs.readable("title")).filter(t__startswith="a")`,
-`order_by(qs.readable("title"))`, `values(t=qs.readable("title"))`); used in a
-queryset of another actor it counts as the column and is refused there. It
-names a concrete field of the queryset's own model. Such a permission is one that holds at the empty id
+the value from it. Such a permission is one that holds at the empty id
 (`grants_all()`) and has no exclusion, in its expression or in a permission
 it names on the same type (an exclusion inside an arrow's target is
 evaluated on that object): an administrator role reached through a constant
 relation qualifies; `(owner + admin->member) - blocked` does not, since a
 `blocked` tuple can take the field away from one row. The rule is
 conservative: any such exclusion, even one whose right-hand side cannot
-depend on the row, decides the field row by row. Hand-written SQL in a filter or an ordering (`extra(where=...,
+depend on the row, decides the field row by row.
+
+To filter, order, group or select on a gated field otherwise, use
+`queryset.readable("title")`: the column on rows where the queryset's actor
+holds `read__title` and `NULL` elsewhere, which is the value redaction shows
+(a conditional permission counts as not held, as redaction treats it by
+default). The guards accept it for that actor in a clause or a selection of
+a query of the same model and resource type
+(`alias(t=qs.readable("title")).filter(t__startswith="a")`,
+`order_by(qs.readable("title"))`, `values(t=qs.readable("title"))`). In a
+query of another actor it counts as the column and is refused; in a query of
+another model, a proxy with its own type, or a multi-table parent or child,
+resolving it raises `ValueError`. The guards trust it as built: its cases
+are rebuilt from its model, field and actor when it is first resolved. It
+names a concrete field of the queryset's own model that is not a relation
+and is gated by the model's own type; under a bypass, or for a field the
+type does not gate, it is the column.
+
+Hand-written SQL in a filter or an ordering (`extra(where=...,
 order_by=...)`, `RawSQL`) is refused under an actor on any model, as it is in
 a selection.
 

@@ -487,3 +487,67 @@ def test_the_readable_value_of_an_ungated_field_or_a_bypass_is_the_column(people
     assert isinstance(Post.objects.sudo(reason="test.bypass").readable("title"), ExpressionWrapper)
     with pytest.raises(ValueError, match="concrete field"):
         listed.readable("collections")
+    with pytest.raises(ValueError, match="not a relation"):
+        listed.readable("folder")
+
+
+@override_settings(REBAC_FIELD_READ_MODE="redact")
+def test_the_readable_value_is_trusted_only_as_built(people, rows):
+    from django.contrib.auth import get_user_model
+
+    listed = Post.objects.as_user(people["alice"])
+    # Changed before use: rebuilt when resolved, so the change reaches nothing.
+    title = listed.readable("title")
+    title.default = F("title")
+    title.cases[0].condition = Q(title__startswith="secret")
+    assert list(listed.alias(t=title).filter(t__startswith="secret")) == []
+    # Another model's query: the same column name would be another column.
+    with pytest.raises(ValueError, match="used in a query of Folder"):
+        list(Folder.objects.as_user(people["alice"]).annotate(t=listed.readable("title")))
+    with pytest.raises(ValueError, match="used in a query of"):
+        get_user_model().objects.annotate(t=listed.readable("title"))
+
+
+def _users_with_secret_posts(alice):
+    from django.contrib.auth import get_user_model
+
+    # The outer statement is no rebac queryset: its subquery is checked when compiled.
+    posts = Post.objects.as_user(alice).filter(title__startswith="secret")
+    return get_user_model().objects.filter(Exists(posts))
+
+
+@override_settings(REBAC_FIELD_READ_MODE="redact")
+@pytest.mark.parametrize(
+    "outer",
+    [
+        "a plain model",
+        "a plain model counted",
+        "a plain model printed",
+        "a base manager",
+        "a bypass update",
+        "a bypass aggregate",
+    ],
+)
+def test_a_subquery_is_checked_under_any_outer_statement(people, rows, outer):
+    from django.db.models import Count
+
+    alice = people["alice"]
+    secret = Exists(
+        Post.objects.as_user(alice).filter(pk=OuterRef("pk"), title__startswith="secret")
+    )
+    run = {
+        "a plain model": lambda: list(_users_with_secret_posts(alice)),
+        "a plain model counted": lambda: _users_with_secret_posts(alice).count(),
+        "a plain model printed": lambda: str(_users_with_secret_posts(alice).query),
+        "a base manager": lambda: list(Post._base_manager.filter(secret)),
+        "a bypass update": lambda: (
+            Post.objects.sudo(reason="test.outer").filter(secret).update(body="found")
+        ),
+        "a bypass aggregate": lambda: Post.objects.sudo(reason="test.outer").aggregate(
+            n=Count("pk", filter=Q(secret))
+        ),
+    }[outer]
+    with pytest.raises(PermissionDenied, match="read__title"):
+        run()
+    with sudo(reason="test.verify"):
+        assert not Post.objects.filter(body="found").exists()

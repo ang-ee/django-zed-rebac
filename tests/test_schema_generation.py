@@ -76,10 +76,11 @@ def _generation_reads(queries):
 
 
 @pytest.mark.parametrize("scoped", [False, True], ids=["lazy", "scoped"])
-def test_a_subquery_is_checked_with_its_statement(synced, settings, scoped):
-    """An actor-scoped subquery is checked with the statement that holds it,
-    in that check's schema operation, and compiling the statement does not
-    check it again: field read enforcement adds no revision read."""
+def test_a_subquery_check_adds_no_revision_read(synced, settings, scoped):
+    """An actor-scoped subquery in a statement's clauses is checked in the
+    statement's own check, sharing its schema read, and is not checked again
+    when the statement is compiled: field read enforcement adds no revision
+    read to it (whether it is refused is tested in test_field_filter_gates)."""
     from django.db.models import Exists, OuterRef
 
     def build():
