@@ -3,6 +3,61 @@
 All notable changes to `django-zed-rebac` are tracked here. The project is in
 pre-1.0; breaking changes within a minor version are explicitly called out.
 
+## [Unreleased]
+
+### Fixed
+
+- Field read gates: a filter, exclusion, grouping, ordering or
+  `distinct(*fields)` on a `read__<field>`-gated column revealed the hidden
+  value under `"redact"` and `"omit"` (issue #40): the database matched,
+  grouped and sorted on the real value before redaction ran, so the rows
+  returned, their count and their order told the caller what the field held.
+  Under an actor such a query is now refused with `PermissionDenied`, on the
+  queryset's own model, on joined models (including the `NOT EXISTS` of an
+  `exclude()` across a to-many relation) and in every operand of a set
+  combination: on iteration, `get()`, `count()`, `exists()`, `aggregate()`,
+  `explain()`, subqueries, and before `update()` and `delete()` select their
+  rows. The ordering is read as Django's compiler emits it and kept where
+  Django keeps it: the model's default ordering counts, an ordering by a
+  relation counts as the related model's default, and a sliced count or
+  aggregate keeps its ordering. `count()` and `exists()` now also check what
+  the query selects. An actor whose permission on the field holds on every
+  row of the type (an administrator role) is not refused, in a clause or in
+  a selection. Hand-written SQL in a filter or an ordering is refused under
+  an actor, as in a selection.
+- Field read gates: a queryset used as a subquery escaped the guard when its
+  scope had been applied before it was embedded (`scoped()`, or an
+  evaluation that was refused), and a queryset given to a lookup
+  (`pk__in=queryset`, `body__in=queryset.values("title")`) always did, so it
+  could select a gated column for the outer statement to compare or return.
+  Every actor-scoped subquery is now checked for what it selects, filters,
+  groups and orders on.
+- `grants_all()` held for a permission with an exclusion on the row, such as
+  `(owner + admin->member) - blocked`, because the empty id names no
+  `blocked` tuple. Field redaction then showed the field on a row the actor
+  was blocked on. It now does not hold for such a permission; the field is
+  decided row by row.
+
+### Upgrade
+
+- A query that filters, groups or orders on a gated field under an actor
+  whose permission on that field depends on the row now raises, as do
+  `count()` and `exists()` over a projection of such a field. Filter on
+  another column, or run it under `sudo(reason=...)` where the caller is
+  entitled to the field. A model whose `Meta.ordering` names a gated field
+  can no longer be listed, or used as a subquery, by such an actor without
+  an `order_by()` on another column or an empty `order_by()`; a related
+  manager's `set()` over such a model is refused too. Unique validation of a
+  model form (`validate_unique()`, a `UniqueConstraint`) or a
+  `ModelChoiceField(to_field_name=...)` on a gated field raises
+  `PermissionDenied` from `is_valid()` under such an actor rather than a
+  validation error.
+- Hand-written SQL in a filter or an ordering (`extra(where=...)`,
+  `extra(order_by=...)` naming a table column, `RawSQL`) is refused under an
+  actor whenever field read enforcement is on, on every model, including
+  models that declare no `read__` permission. Run it under
+  `sudo(reason=...)`.
+
 ## [0.26.0] — 2026-10-06
 
 ### Added

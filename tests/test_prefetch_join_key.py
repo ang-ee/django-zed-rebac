@@ -147,4 +147,5 @@ def test_a_gated_column_of_the_through_model_is_not_a_join_key(shelf, monkeypatc
     )
     with pytest.raises(PermissionDenied) as excinfo:
         list(rows)
-    assert "hand-written SQL" in str(excinfo.value)
+    # The prefetch filters on that column and selects it: refused either way.
+    assert "PostPin" in str(excinfo.value)

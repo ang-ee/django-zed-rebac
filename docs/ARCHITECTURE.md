@@ -2038,7 +2038,7 @@ needs one is not in its lower bound.
 | `accessible()` | The lower bound over each part of the type's universe: the model's rows, the ids that tuples name at either end, constant targets, attribute containers, and field-backed targets whose model stores no rows. Wildcard and empty ids are excluded and the result is deduplicated. |
 | `lookup_subjects()` | Candidates are the subjects that tuples, backed columns and constants name on a path from the one resource; each is tested by its own point check, so the cost grows with the number of candidates. To ask about subjects already in hand, use `check_bulk_permissions()`. |
 | Model-level check (empty resource id) | A row-independent grant, or any accessible identity of the type. |
-| `grants_all()` | The lower bound at the empty id: only a row-independent arm can hold there. |
+| `grants_all()` | The lower bound at the empty id: only a row-independent arm can hold there. False for a permission with an exclusion on the row (in its expression or one it names on the same type): a row-specific fact can take it from one row. |
 | Backed-edge write gate | `write` on the affected declaring rows. More than four ids that are rows of the type's model are tested by one scoped statement per 500 ids; the others by the lower bound, one by one. |
 | Bulk write guard | Every resource id of the statement must be in `accessible()` for the action. |
 | Field read gate `read__<field>` | `accessible()` for that permission. |
@@ -2587,9 +2587,55 @@ The `NOT EXISTS` Django builds for an `exclude()` across a to-many relation
 of the outer statement, like the join a `filter()` across the same relation
 adds, and it is not scoped on its own. A queryset the caller passes inside
 that exclude (`rel__in=Model.objects...`) keeps its own scope.
+
+A protected value can also be learned without selecting it: the database
+applies a filter, an exclusion, a grouping and an ordering to the real value,
+before redaction runs on the rows it returns, so the rows matched, their
+number and their order reveal it, and `__lt` / `__gt` narrow it down. The
+guard therefore also reads what a query filters, groups, orders and
+deduplicates on: its `where` clause (`filter()`, `exclude()`, `get()`, the
+conditions of a `FilteredRelation`, and the `NOT EXISTS` of an `exclude()`
+across a to-many relation, which is part of the query as described above),
+its explicit `GROUP BY`, its ordering as Django's compiler emits it
+(`order_by()`, `latest()`, the model's default ordering when the query has
+none, and an ordering by a relation, which is the related model's default
+ordering), and `distinct(*fields)`, on the queryset's own model, on every
+model it joins and in every operand of a set combination. Under `"redact"`,
+`"omit"` or `"raise"`, a query that reads a protected column in any of these
+is refused with `PermissionDenied`: on iteration, `get()`, `count()`,
+`exists()`, `aggregate()` and `explain()`, which also check what the query
+selects (a count of distinct or grouped values reads them), and before a
+queryset `update()` or `delete()` selects its rows. The ordering counts as
+Django treats it: an existence test, an update and a delete drop it, a count
+and an aggregate keep it on a sliced or `distinct(*fields)` query only, and a
+grouped query drops a model's default ordering. `order_by()` with no
+arguments clears a default ordering.
+
+A queryset used as a subquery (`Subquery()`, `Exists()`, a lookup such as
+`pk__in=queryset`) is checked for what it selects, filters, groups and orders
+on, as resolved into the enclosing statement, whether its scope is applied
+there or was applied earlier (`scoped()`, or an evaluation that was refused).
+Its ordering is checked as written, though Django may clear it later (an
+`__in` lookup or `Exists()` of an unsliced query).
+
+The decision is per query, not per row. An actor whose permission on the
+field depends on the row is refused, even when every row the query returns
+would show the field, and filters on it under `sudo(reason=...)` or on
+another column. An actor whose permission holds on every row of the type is
+not refused here or in a selection (`values("title")`), because no row hides
+the value from it. Such a permission is one that holds at the empty id
+(`grants_all()`) and has no exclusion on the row: an administrator role
+reached through a constant relation qualifies; `(owner + admin->member) -
+blocked` does not, since a `blocked` tuple can take the field away from one
+row. Hand-written SQL in a filter or an ordering (`extra(where=...,
+order_by=...)`, `RawSQL`) is refused under an actor on any model, as it is in
+a selection.
+
 These guards inspect Django column expressions. Outside that boundary remain:
-hand-written SQL in a filter or an ordering; a custom expression whose class
-carries its own SQL template; and a subquery over a model's `_base_manager`,
+a custom expression whose class carries its own SQL template;
+`.for_write()` and `on_field_deny("allow")`, which keep their explicit bypass
+of field redaction, also as a subquery, where they let the enclosing query
+filter on what they select; and a subquery over a model's `_base_manager`,
 which is unscoped like every read through that manager and, unlike `sudo`,
 writes no audit row. Two cases are pinned as expected failures for proposal
 0013, which reads the statement's own query. A set combination whose root is
@@ -2609,9 +2655,10 @@ in that set has the field redacted. This preserves cases where Alice may read
 
 Projection querysets that would return gated fields directly, such as
 `.values("salary")`, `.values_list("salary", flat=True)`, or bare `.values()`,
-fail closed under `"redact"` / `"omit"` / `"raise"`. The safe options are to
-materialise model instances and let the field-visibility pass run, or project
-only fields that have no declared `read__<field>` gate.
+fail closed under `"redact"` / `"omit"` / `"raise"`, unless the actor's
+permission on the field holds on every row of the type (see above). The safe
+options are to materialise model instances and let the field-visibility pass
+run, or project only fields that have no declared `read__<field>` gate.
 
 Single-instance callers can use `instance.with_actor(actor).denied_read_fields()`
 for a pure decision or `instance.redacted(mode="redact")` for an eager in-place
