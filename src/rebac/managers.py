@@ -72,11 +72,23 @@ class _RebacQuery(Query):
         self._rebac_statement_part = True
 
     def as_sql(self, compiler: Any, connection: Any) -> Any:
+        # Compiled before the statement that holds it was checked (its
+        # queryset is not a rebac one, or no check ran): checked now.
+        _check_subquery(self)
         reason = self._rebac_pending_bypass_audit
         if reason is not None:
             _emit_bypass_audit(reason)
         return super().as_sql(compiler, connection)
 
+    # A resolved actor-scoped subquery carries what checking it needs, and
+    # is checked once: with the statement that holds it, when that statement
+    # is checked (sharing its schema read), else when it is compiled.  Django
+    # resolves it again while compiling the enclosing statement (a lookup's
+    # left-hand side); that changes nothing the check read.
+    _rebac_check: tuple[RebacQuerySet[Any], SubjectRef | None] | None = None
+    _rebac_checked = False
+
+    @schema_operation
     def resolve_expression(self, *args: Any, **kwargs: Any) -> Self:
         if self._rebac_statement_part and not hasattr(self, "_rebac_state"):
             return cast(Self, super().resolve_expression(*args, **kwargs))
@@ -110,11 +122,13 @@ class _RebacQuery(Query):
                         "_rebac_scope_applied": True,
                         "_rebac_scope_decision": (actor, bypass),
                     }
+                    # The combination's own check reads every operand.
+                    part._rebac_checked = True
                 resolved_parts(part)
 
         resolved_parts(clone)
         resolved = cast(Self, Query.resolve_expression(clone, *args, **kwargs))
-        if not bypass:
+        if not bypass and not self._rebac_checked:
             # This subquery carries its own scope decision, so it answers for
             # what it selects, filters and orders on, whether its scope was
             # applied here or earlier (scoped(), or an evaluation that was
@@ -122,10 +136,55 @@ class _RebacQuery(Query):
             # statement, as Django compiles it; the columns of the outer row it
             # refers to are the outer query's to answer for.
             cast(Any, queryset)._fields = tuple(clone.values_select) or None
-            queryset._guard_projected_field_reads(actor, False, query=resolved)
+            resolved._rebac_check = (queryset, actor)
         if pending is not None:
             resolved._rebac_pending_bypass_audit = pending
         return resolved
+
+
+def _check_subquery(query: Query) -> None:
+    """Check an actor-scoped subquery once, as resolved into its statement."""
+    pending = getattr(query, "_rebac_check", None)
+    if pending is None or getattr(query, "_rebac_checked", False):
+        return
+    queryset, actor = pending
+    queryset._guard_projected_field_reads(actor, False, query=query)
+    cast(Any, query)._rebac_checked = True
+
+
+def _nested_queries(expression: Any) -> Iterator[Query]:
+    """The queries nested anywhere in an expression, or in a query's clauses."""
+    if isinstance(expression, Query):
+        group_by = expression.group_by if isinstance(expression.group_by, tuple) else ()
+        conditions = [
+            getattr(getattr(join, "filtered_relation", None), "resolved_condition", None)
+            for join in expression.alias_map.values()
+        ]
+        parts: Iterable[Any] = (
+            expression.where,
+            *expression.annotations.values(),
+            *expression.select,
+            *expression.order_by,
+            *group_by,
+            *conditions,
+            *expression.combined_queries,
+        )
+    else:
+        sources = getattr(expression, "get_source_expressions", None)
+        parts = cast(Iterable[Any], sources()) if callable(sources) else ()
+    for part in parts:
+        if isinstance(part, Query):
+            yield part
+        if part is not None:
+            yield from _nested_queries(part)
+
+
+class _Readable(models.Case):
+    """A gated column as one actor may read it: its value where the actor holds
+    ``read__<field>``, ``NULL`` elsewhere (``RebacQuerySet.readable``)."""
+
+    rebac_actor: SubjectRef
+    rebac_field: str
 
 
 def _emit_bypass_audit(reason: str) -> None:
@@ -239,7 +298,10 @@ def _compiled_ordering(query: Query, using: str) -> list[Any]:
 
 
 def _expression_columns(
-    expression: Any, _inner_aliases: frozenset[str] = frozenset()
+    expression: Any,
+    _inner_aliases: frozenset[str] = frozenset(),
+    *,
+    reader: SubjectRef | None = None,
 ) -> Iterable[Col]:
     """Columns of the enclosing row that a resolved ORM expression reads.
 
@@ -249,19 +311,23 @@ def _expression_columns(
     column resolved against an alias of a nested query is not attributed to it.
     A statement part Django builds for the query itself (the ``NOT EXISTS`` of
     an ``exclude()`` across a to-many relation) has no scope of its own: its
-    columns are the enclosing query's, like a join.
+    columns are the enclosing query's, like a join.  A ``readable()`` value
+    built for ``reader`` reads only what that actor may read.
     """
     if isinstance(expression, Col):
         if expression.alias not in _inner_aliases:
             yield expression
         return
+    if reader is not None and isinstance(expression, _Readable):
+        if expression.rebac_actor == reader:
+            return
     if isinstance(expression, Query):
-        part = getattr(expression, "_rebac_statement_part", False) and not hasattr(
+        statement_part = getattr(expression, "_rebac_statement_part", False) and not hasattr(
             expression, "_rebac_state"
         )
         inner = (
             _inner_aliases
-            if part and not _inner_aliases
+            if statement_part and not _inner_aliases
             else _inner_aliases | frozenset(expression.alias_map)
         )
         for part in (
@@ -271,12 +337,12 @@ def _expression_columns(
             *expression.select,
             *expression.combined_queries,
         ):
-            yield from _expression_columns(part, inner)
+            yield from _expression_columns(part, inner, reader=reader)
         return
     sources = getattr(expression, "get_source_expressions", None)
     if callable(sources):
         for source in cast(Iterable[Any], sources()):
-            yield from _expression_columns(source, _inner_aliases)
+            yield from _expression_columns(source, _inner_aliases, reader=reader)
 
 
 def _selections(query: Query) -> Iterator[Query]:
@@ -296,19 +362,24 @@ def _selections(query: Query) -> Iterator[Query]:
 
 
 def _selected_gated(
-    model: type[models.Model], expressions: Iterable[Any], query: Query | None = None
+    model: type[models.Model],
+    expressions: Iterable[Any],
+    query: Query | None = None,
+    *,
+    reader: SubjectRef | None = None,
 ) -> dict[type[models.Model], set[str]]:
     """The gated fields that selected columns and computed values read, by model.
 
     A column is gated by the model it is read from: the query's own, or one
     the query joins.  A column of the query that encloses ``query`` (an
-    ``OuterRef``) is that query's to answer for.
+    ``OuterRef``) is that query's to answer for, and a ``readable()`` value
+    built for ``reader`` reads nothing that actor may not read.
     """
     own = gated_read_fields(model)
     outer = frozenset(query.external_aliases) if query is not None else frozenset()
     found: dict[type[models.Model], set[str]] = {}
     for expression in expressions:
-        for column in _expression_columns(expression, outer):
+        for column in _expression_columns(expression, outer, reader=reader):
             name = column.target.name
             if name in own and _column_on_model_lineage(column, model):
                 found.setdefault(model, set()).add(name)
@@ -549,6 +620,7 @@ class RebacQuerySet(models.QuerySet[_M]):
             self._iterable_class = ValuesIterable
         self._query = value
 
+    @schema_operation
     def resolve_expression(self, *args: Any, **kwargs: Any) -> Query:
         clone = self._clone()
         # Resolution builds an expression; the bypass is exercised, and
@@ -621,6 +693,42 @@ class RebacQuerySet(models.QuerySet[_M]):
         ``on_field_deny("allow")`` named for that intent.
         """
         return self.on_field_deny("allow")
+
+    def readable(self, field: str) -> models.Expression:
+        """A gated field as this queryset's actor may read it.
+
+        The column on rows where the actor holds ``read__<field>`` and ``NULL``
+        elsewhere: the value redaction shows.  The field read guards accept it
+        for this actor in a filter, an ordering, a grouping or a selection.
+        Under a bypass, or for a field the model does not gate, it is the
+        column itself.
+        """
+        model_field = self.model._meta.get_field(field)
+        if not getattr(model_field, "concrete", False) or model_field.name != field:
+            raise ValueError(
+                f"readable() names a concrete field of {self.model.__name__}: {field!r}"
+            )
+        output_field = cast("models.Field[Any, Any]", model_field).clone()
+        output_field.null = True
+        actor, bypass = self.effective_actor(strict=True)
+        if bypass or actor is None or field not in gated_read_fields(self.model):
+            return models.ExpressionWrapper(models.F(field), output_field=output_field)
+        readers = (
+            type(self)(model=self.model, using=self.db)
+            .with_actor(actor)
+            .with_action(f"read__{field}")
+            .scoped_for_aggregate()
+        )
+        readable = _Readable(
+            models.When(
+                models.Exists(readers.filter(pk=models.OuterRef("pk"))), then=models.F(field)
+            ),
+            default=models.Value(None),
+            output_field=output_field,
+        )
+        readable.rebac_actor = actor
+        readable.rebac_field = field
+        return readable
 
     def scoped(self) -> RebacQuerySet[_M]:
         """Return an eagerly scoped clone, including for SQL subquery consumers.
@@ -1035,7 +1143,9 @@ class RebacQuerySet(models.QuerySet[_M]):
                         "select_related(). Combine values() projections instead."
                     )
             for model, requested in sorted(
-                _selected_gated(part.model, (*columns, *computed.values()), query).items(),
+                _selected_gated(
+                    part.model, (*columns, *computed.values()), query, reader=actor
+                ).items(),
                 key=lambda item: item[0]._meta.label_lower,
             ):
                 hidden = _hidden_from(actor, model, requested)
@@ -1059,11 +1169,16 @@ class RebacQuerySet(models.QuerySet[_M]):
     ) -> None:
         """Refuse a query that filters, groups, orders or deduplicates on a gated column.
 
+        First, every actor-scoped subquery the statement holds is checked, in
+        this check's schema operation, whatever this query's own actor.
+
         The database applies the clause to the real value before redaction
         runs on the rows, so the rows matched, their number and their order
         reveal it.  An actor whose permission on the field does not depend on
         the row reads it everywhere and is not refused.
         """
+        for nested in _nested_queries(self.query if query is None else query):
+            _check_subquery(nested)
         if actor is None or sudo:
             return
         if runtime_field_deny_mode(self._effective_field_mode()) == "allow":
@@ -1079,7 +1194,7 @@ class RebacQuerySet(models.QuerySet[_M]):
                 "under sudo(reason=...), or filter through ORM expressions."
             )
         for model, requested in sorted(
-            _selected_gated(query.model, expressions, query).items(),
+            _selected_gated(query.model, expressions, query, reader=actor).items(),
             key=lambda item: item[0]._meta.label_lower,
         ):
             hidden = _hidden_from(actor, model, requested)
@@ -1676,6 +1791,9 @@ class RebacManager(models.Manager.from_queryset(RebacQuerySet)):  # type: ignore
 
     def for_write(self) -> RebacQuerySet[Any]:
         return self.get_queryset().for_write()
+
+    def readable(self, field: str) -> models.Expression:
+        return self.get_queryset().readable(field)
 
     def rebac_select_related(self, *fields: Any) -> RebacQuerySet[Any]:
         return self.get_queryset().rebac_select_related(*fields)

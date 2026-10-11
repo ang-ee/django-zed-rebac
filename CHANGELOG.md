@@ -5,6 +5,15 @@ pre-1.0; breaking changes within a minor version are explicitly called out.
 
 ## [Unreleased]
 
+### Added
+
+- `RebacQuerySet.readable(field)` (also on the manager): a gated field as the
+  queryset's actor may read it, the column where the actor holds
+  `read__<field>` and `NULL` elsewhere. The field read guards accept it in a
+  filter, an ordering, a grouping or a selection for that actor, so a query
+  that needs a gated field under an actor whose access depends on the row
+  uses it instead of the column.
+
 ### Fixed
 
 - Field read gates: a filter, exclusion, grouping, ordering or
@@ -47,8 +56,9 @@ pre-1.0; breaking changes within a minor version are explicitly called out.
   `count()` and `exists()` over distinct, grouped or combined values of
   such a field. Filter on
   another column, or run it under `sudo(reason=...)` where the caller is
-  entitled to the field. A model whose `Meta.ordering` names a gated field
-  can no longer be listed, or used as a subquery, by such an actor without
+  entitled to the field, or use `queryset.readable(field)`, which is the
+  value redaction shows. A model whose `Meta.ordering` names a gated field
+  can no longer be listed, or used as a sliced subquery, by such an actor without
   an `order_by()` on another column or an empty `order_by()`; a related
   manager's `set()` over such a model is refused too. Unique validation of a
   model form (`validate_unique()`, a `UniqueConstraint`) or a

@@ -75,6 +75,31 @@ def _generation_reads(queries):
     return sum(query["sql"].startswith('SELECT "rebac_schemageneration".') for query in queries)
 
 
+@pytest.mark.parametrize("scoped", [False, True], ids=["lazy", "scoped"])
+def test_a_subquery_is_checked_with_its_statement(synced, settings, scoped):
+    """An actor-scoped subquery is checked with the statement that holds it,
+    in that check's schema operation, and compiling the statement does not
+    check it again: field read enforcement adds no revision read."""
+    from django.db.models import Exists, OuterRef
+
+    def build():
+        folders = Folder.objects.with_actor(ACTOR)
+        folders = folders.scoped() if scoped else folders
+        return Post.objects.with_actor(ACTOR).filter(Exists(folders.filter(pk=OuterRef("folder"))))
+
+    reads = {}
+    for mode in ("allow", "redact"):
+        settings.REBAC_FIELD_READ_MODE = mode
+        list(build())
+        with CaptureQueriesContext(connection) as built:
+            outer = build()
+        with CaptureQueriesContext(connection) as ran:
+            list(outer)
+        reads[mode] = (_generation_reads(built), _generation_reads(ran))
+    # The guard of the listing itself reads the revision once under redaction.
+    assert reads["redact"] == (reads["allow"][0], reads["allow"][1] + 1)
+
+
 def _permission():
     return SchemaPermission.objects.get(definition__resource_type="blog/post", name="write")
 

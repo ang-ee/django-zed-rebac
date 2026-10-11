@@ -2302,6 +2302,7 @@ class RebacManager:
     def with_action(self, action: str) -> RebacQuerySet: ...           # override read-scope action
     def on_field_deny(self, mode: FieldDenyMode) -> RebacQuerySet: ... # allow/redact/omit/raise
     def for_write(self) -> RebacQuerySet: ...                          # write-target: row scope kept, field redaction off
+    def readable(self, field: str) -> Expression: ...                  # a gated column as the actor may read it
     def rebac_select_related(self, *fields) -> RebacQuerySet: ...      # guarded to-one joins
     def rebac_prefetch_related(self, *lookups) -> RebacQuerySet: ...   # scoped protected prefetches
 
@@ -2317,6 +2318,7 @@ class RebacQuerySet:
     def with_action(self, action: str) -> Self: ...                    # override read-scope action
     def on_field_deny(self, mode: FieldDenyMode) -> Self: ...          # override field-read deny mode
     def for_write(self) -> Self: ...                                   # write-target: row scope kept, field redaction off
+    def readable(self, field: str) -> Expression: ...                  # a gated column as the actor may read it
     def rebac_select_related(self, *fields) -> Self: ...               # select_related + related read guard
     def rebac_prefetch_related(self, *lookups) -> Self: ...            # prefetch_related + scoped targets
     def sudo(self, *, reason: str) -> Self: ...                         # gated by REBAC_ALLOW_SUDO
@@ -2343,6 +2345,7 @@ The three actor verbs are sugar over the same primitive:
 | `with_action(action)` | Pins the permission used for read-side queryset scoping instead of `read` / `Meta.rebac_default_action`. | Alternate read views such as `credential_lookup`, `list_admin`, or capability-specific resolver scopes. |
 | `on_field_deny(mode)` | Pins the field-read deny mode for `read__<field>` gates instead of the global setting. | Projection-sensitive paths that want `"omit"` while the global default stays `"allow"` or `"redact"`. |
 | `for_write()` | `on_field_deny("allow")` named for intent: keeps actor row scope but turns off `read__<field>` redaction so a load-then-mutate target carries every column. | Resolving an update/delete target while `REBAC_FIELD_READ_MODE` is `"redact"`/`"omit"`, where a redacted column must not be hidden from the row being written. |
+| `readable(field)` | An expression worth the column on rows where the queryset's actor holds `read__<field>` and `NULL` elsewhere, the value redaction shows. The column itself under a bypass, or when the model gates no such field. | Filtering, ordering, grouping or selecting a gated field under an actor whose access depends on the row, which the field read guards refuse on the column itself. |
 | `rebac_select_related(*fields)` | Applies Django `select_related` and batch-checks selected REBAC-bound related rows before serialization. | To-one relation optimization when an unreadable related object should fail the field/query instead of leaking. |
 | `rebac_prefetch_related(*lookups)` | Applies Django `prefetch_related`, rewriting bare protected lookups to `Prefetch(queryset=Related.objects.with_actor(actor))`. | Reverse, M2M, and to-many loading where protected children should be scoped rather than loaded via `_base_manager`. |
 
@@ -2618,15 +2621,24 @@ on, as resolved into the enclosing statement, whether its scope is applied
 there or was applied earlier (`scoped()`, or an evaluation that was
 refused), with the actor its scope was applied with. A column of the
 enclosing row it refers to (`OuterRef`) is the enclosing query's to answer
-for. Its ordering is checked as written, though an `__in` lookup clears the
-ordering of an unsliced query later; `Exists()` clears it before.
+for. It is checked once, when the statement that holds it is checked (sharing
+that check's schema read), or else when it is compiled, so its ordering
+counts as Django compiles it: an `__in` lookup and `Exists()` clear the
+ordering of an unsliced query.
 
 The decision is per query, not per row. An actor whose permission on the
 field depends on the row is refused, even when every row the query returns
 would show the field, and filters on it under `sudo(reason=...)` or on
 another column. An actor whose permission holds on every row of the type is
 not refused here or in a selection (`values("title")`), because no row hides
-the value from it. Such a permission is one that holds at the empty id
+the value from it. To filter, order, group or select on such a field
+otherwise, use `queryset.readable("title")`: the column on rows where the
+queryset's actor holds `read__title` and `NULL` elsewhere, which is the
+value redaction shows. The guards accept it for that actor, in a clause or a
+selection (`alias(t=qs.readable("title")).filter(t__startswith="a")`,
+`order_by(qs.readable("title"))`, `values(t=qs.readable("title"))`); used in a
+queryset of another actor it counts as the column and is refused there. It
+names a concrete field of the queryset's own model. Such a permission is one that holds at the empty id
 (`grants_all()`) and has no exclusion, in its expression or in a permission
 it names on the same type (an exclusion inside an arrow's target is
 evaluated on that object): an administrator role reached through a constant

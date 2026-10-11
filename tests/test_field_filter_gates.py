@@ -248,8 +248,12 @@ def test_the_default_ordering_counts(people, rows, monkeypatch):
     listed = Post.objects.as_user(people["alice"])
     with pytest.raises(PermissionDenied):
         list(listed)
+    # As a subquery, the ordering counts as Django compiles it: an __in lookup
+    # clears an unsliced one and keeps a sliced one.
+    outer = Post.objects.as_user(people["bob"])
+    assert outer.filter(pk__in=listed).count() == 2
     with pytest.raises(PermissionDenied):
-        Post.objects.as_user(people["bob"]).filter(pk__in=listed).count()
+        outer.filter(pk__in=listed.values("pk")[:1]).count()
     assert len(list(listed.order_by("pk"))) == 2
     # order_by() clears the default; a grouped query drops it, as Django does.
     assert len(list(listed.order_by())) == 2
@@ -446,3 +450,40 @@ def test_an_update_reads_its_explicit_ordering(people, rows, monkeypatch):
     # A model's default ordering is not part of an UPDATE.
     monkeypatch.setattr(Post._meta, "ordering", ["title"])
     assert edited.filter(body="").update(body="default") == 2
+
+
+@override_settings(REBAC_FIELD_READ_MODE="redact")
+def test_the_readable_value_is_what_redaction_shows(people, rows):
+    _folder, own, hidden = rows
+    listed = Post.objects.as_user(people["alice"])
+    title = listed.readable("title")
+    # Filtered, ordered, counted and selected: the hidden title is NULL.
+    assert list(listed.alias(t=title).filter(t__startswith="secret")) == []
+    assert [post.pk for post in listed.alias(t=title).filter(t="alpha memo")] == [own.pk]
+    assert listed.alias(t=title).filter(t__isnull=True).count() == 1
+    ordered = listed.order_by(listed.readable("title").asc(nulls_last=True), "pk")
+    assert [post.pk for post in ordered] == [own.pk, hidden.pk]
+    assert dict(listed.annotate(t=title).values_list("pk", "t")) == {
+        own.pk: "alpha memo",
+        hidden.pk: None,
+    }
+    # Built for alice, it is the column in bob's query.
+    with pytest.raises(PermissionDenied):
+        list(Post.objects.as_user(people["bob"]).alias(t=title).filter(t="alpha memo"))
+    # An actor who reads every title reads every value.
+    admin = Post.objects.as_user(people["carol"])
+    assert sorted(admin.annotate(t=admin.readable("title")).values_list("t", flat=True)) == [
+        "alpha memo",
+        "secret plan",
+    ]
+
+
+@override_settings(REBAC_FIELD_READ_MODE="redact")
+def test_the_readable_value_of_an_ungated_field_or_a_bypass_is_the_column(people, rows):
+    from django.db.models import ExpressionWrapper
+
+    listed = Post.objects.as_user(people["alice"])
+    assert isinstance(listed.readable("body"), ExpressionWrapper)
+    assert isinstance(Post.objects.sudo(reason="test.bypass").readable("title"), ExpressionWrapper)
+    with pytest.raises(ValueError, match="concrete field"):
+        listed.readable("collections")
