@@ -91,7 +91,10 @@ class _RebacQuery(Query):
         # Building an expression runs no query, so it must write no audit row
         # (annotations are built at import time, during app initialisation).
         queryset._apply_scope_in_place(audit=False)
-        actor, bypass = queryset.effective_actor(strict=True)
+        # The decision the scope was applied with, here or earlier: a queryset
+        # evaluated under actor_context() may be embedded after it has closed.
+        decision = queryset._rebac_scope_decision
+        actor, bypass = decision if decision is not None else queryset.effective_actor(strict=True)
         pending = queryset._bypass_audit_reason() if applied_here and bypass else None
 
         # A set combination has one actor policy, owned by its root queryset.
@@ -102,7 +105,11 @@ class _RebacQuery(Query):
         def resolved_parts(query: Query) -> None:
             for part in query.combined_queries:
                 if isinstance(part, _RebacQuery):
-                    part._rebac_state = {**state, "_rebac_scope_applied": True}
+                    part._rebac_state = {
+                        **state,
+                        "_rebac_scope_applied": True,
+                        "_rebac_scope_decision": (actor, bypass),
+                    }
                 resolved_parts(part)
 
         resolved_parts(clone)
@@ -111,9 +118,9 @@ class _RebacQuery(Query):
             # This subquery carries its own scope decision, so it answers for
             # what it selects, filters and orders on, whether its scope was
             # applied here or earlier (scoped(), or an evaluation that was
-            # refused); the outer guard attributes only columns of the outer
-            # row to the outer query. It is checked as resolved into the
-            # enclosing statement, as Django compiles it.
+            # refused). It is checked as resolved into the enclosing
+            # statement, as Django compiles it; the columns of the outer row it
+            # refers to are the outer query's to answer for.
             cast(Any, queryset)._fields = tuple(clone.values_select) or None
             queryset._guard_projected_field_reads(actor, False, query=resolved)
         if pending is not None:
@@ -289,17 +296,19 @@ def _selections(query: Query) -> Iterator[Query]:
 
 
 def _selected_gated(
-    model: type[models.Model], expressions: Iterable[Any]
+    model: type[models.Model], expressions: Iterable[Any], query: Query | None = None
 ) -> dict[type[models.Model], set[str]]:
     """The gated fields that selected columns and computed values read, by model.
 
     A column is gated by the model it is read from: the query's own, or one
-    the query joins.
+    the query joins.  A column of the query that encloses ``query`` (an
+    ``OuterRef``) is that query's to answer for.
     """
     own = gated_read_fields(model)
+    outer = frozenset(query.external_aliases) if query is not None else frozenset()
     found: dict[type[models.Model], set[str]] = {}
     for expression in expressions:
-        for column in _expression_columns(expression):
+        for column in _expression_columns(expression, outer):
             name = column.target.name
             if name in own and _column_on_model_lineage(column, model):
                 found.setdefault(model, set()).add(name)
@@ -494,6 +503,7 @@ class RebacQuerySet(models.QuerySet[_M]):
         state["_rebac_internal_bypass"] = False
         state["_rebac_ambient_bypass"] = False
         state["_rebac_scope_applied"] = False
+        state["_rebac_scope_decision"] = None
         state["_rebac_eager_scope"] = False
         state["_rebac_visibility_applied"] = False
         state["_prefetch_done"] = False
@@ -648,6 +658,7 @@ class RebacQuerySet(models.QuerySet[_M]):
         # preserve the caller's scalar/tuple/model iterable contract.
         self._query = _without_query_scope(self.query)
         self._rebac_scope_applied = False
+        self._rebac_scope_decision = None
 
     def _refresh_scope(self) -> None:
         self._reset_scope()
@@ -797,6 +808,8 @@ class RebacQuerySet(models.QuerySet[_M]):
         return result
 
     _rebac_scope_applied: bool = False
+    # ``(actor, bypass)`` as the scope was applied.
+    _rebac_scope_decision: tuple[SubjectRef | None, bool] | None = None
 
     def _apply_scope_in_place(self, *, audit: bool = True) -> None:
         """Inject ``<id_attr>__in=<accessible>`` onto the query's WHERE clause.
@@ -821,6 +834,7 @@ class RebacQuerySet(models.QuerySet[_M]):
             return
         actor, sudo = self._resolve_effective_actor(audit=audit)
         self._rebac_scope_applied = True
+        self._rebac_scope_decision = (actor, sudo)
         if sudo:
             return
         self._scope_query(self.query, actor)
@@ -914,6 +928,7 @@ class RebacQuerySet(models.QuerySet[_M]):
         clone._rebac_eager_scope = self._rebac_eager_scope
         clone._rebac_aggregate_scope = self._rebac_aggregate_scope
         clone._rebac_scope_applied = self._rebac_scope_applied
+        clone._rebac_scope_decision = self._rebac_scope_decision
         if not self._rebac_eager_scope:
             clone._reset_scope()
         return clone
@@ -1020,7 +1035,7 @@ class RebacQuerySet(models.QuerySet[_M]):
                         "select_related(). Combine values() projections instead."
                     )
             for model, requested in sorted(
-                _selected_gated(part.model, (*columns, *computed.values())).items(),
+                _selected_gated(part.model, (*columns, *computed.values()), query).items(),
                 key=lambda item: item[0]._meta.label_lower,
             ):
                 hidden = _hidden_from(actor, model, requested)
@@ -1064,7 +1079,7 @@ class RebacQuerySet(models.QuerySet[_M]):
                 "under sudo(reason=...), or filter through ORM expressions."
             )
         for model, requested in sorted(
-            _selected_gated(query.model, expressions).items(),
+            _selected_gated(query.model, expressions, query).items(),
             key=lambda item: item[0]._meta.label_lower,
         ):
             hidden = _hidden_from(actor, model, requested)
@@ -1216,17 +1231,27 @@ class RebacQuerySet(models.QuerySet[_M]):
         if self._result_cache is not None:
             return len(self._result_cache)
         self._apply_scope_in_place()
-        # Checked as iteration is: a count of distinct or grouped values
-        # reads them.  Django keeps the ordering of a sliced query.
-        self._guard_projected_field_reads(*self._resolve_effective_actor(), clears_ordering=False)
+        # Django keeps the ordering of a sliced query.
+        self._guard_counted_reads(*self._resolve_effective_actor(), clears_ordering=False)
         return super().count()
 
     def exists(self) -> bool:
         if self._result_cache is not None:
             return bool(self._result_cache)
         self._apply_scope_in_place()
-        self._guard_projected_field_reads(*self._resolve_effective_actor(), clears_ordering=True)
+        self._guard_counted_reads(*self._resolve_effective_actor(), clears_ordering=True)
         return super().exists()
+
+    def _guard_counted_reads(
+        self, actor: SubjectRef | None, sudo: bool, *, clears_ordering: bool
+    ) -> None:
+        """A count or an existence test reads what the query filters on, and the
+        selected values only when its rows are distinct, grouped or combined."""
+        query = self.query
+        if query.distinct or query.group_by is not None or query.combinator:
+            self._guard_projected_field_reads(actor, sudo, clears_ordering=clears_ordering)
+        else:
+            self._guard_clause_field_reads(actor, sudo, clears_ordering=clears_ordering)
 
     def aggregate(self, *args: Any, **kwargs: Any) -> dict[str, Any]:
         """Aggregate over the actor's scope, not the whole table.
@@ -1400,7 +1425,7 @@ class RebacQuerySet(models.QuerySet[_M]):
             if bypass:
                 return self._rebac_update(**kwargs)
             # Before any row is selected: a refusal must not depend on a match.
-            self._guard_clause_field_reads(actor, bypass, clears_ordering=True)
+            self._guard_clause_field_reads(actor, bypass, query=self._update_query())
             # The statement changes a column the policy reads: the gate
             # decides on its rows, and exactly those rows are written.
             keys = statement_keys(self._system_capture(reason="rebac.write.rows"))
@@ -1426,6 +1451,14 @@ class RebacQuerySet(models.QuerySet[_M]):
         ):
             return super().bulk_update(objs, field_names, batch_size=batch_size)
 
+    def _update_query(self) -> Query:
+        """The query an ``UPDATE`` reads: an explicit ordering stays (MySQL emits
+        it, so the order of the writes, and which one fails a unique constraint
+        first, follows it); a model's default ordering does not."""
+        query = self.query.clone()
+        query.default_ordering = False
+        return query
+
     def _rebac_update(self, **kwargs: Any) -> int:
         from .watch import gate_policy, refuse_moving_edges
 
@@ -1433,7 +1466,7 @@ class RebacQuerySet(models.QuerySet[_M]):
         if sudo:
             return super().update(**kwargs)
         refuse_moving_edges(gate_policy(self.db), self.model, kwargs)
-        self._guard_clause_field_reads(actor, sudo, clears_ordering=True)
+        self._guard_clause_field_reads(actor, sudo, query=self._update_query())
         rebac_type = model_resource_type(self.model)
         if rebac_type:
             self._guard_bulk_action(actor, "write")  # type: ignore[arg-type]

@@ -21,7 +21,8 @@ pre-1.0; breaking changes within a minor version are explicitly called out.
   Django keeps it: the model's default ordering counts, an ordering by a
   relation counts as the related model's default, and a sliced count or
   aggregate keeps its ordering. `count()` and `exists()` now also check what
-  the query selects. An actor whose permission on the field holds on every
+  the query selects when its rows are distinct, grouped or combined. An
+  actor whose permission on the field holds on every
   row of the type (an administrator role) is not refused, in a clause or in
   a selection. Hand-written SQL in a filter or an ordering is refused under
   an actor, as in a selection.
@@ -36,13 +37,15 @@ pre-1.0; breaking changes within a minor version are explicitly called out.
   `(owner + admin->member) - blocked`, because the empty id names no
   `blocked` tuple. Field redaction then showed the field on a row the actor
   was blocked on. It now does not hold for such a permission; the field is
-  decided row by row.
+  decided row by row. Any exclusion in the permission does this, even one
+  whose right-hand side cannot depend on the row.
 
 ### Upgrade
 
 - A query that filters, groups or orders on a gated field under an actor
   whose permission on that field depends on the row now raises, as do
-  `count()` and `exists()` over a projection of such a field. Filter on
+  `count()` and `exists()` over distinct, grouped or combined values of
+  such a field. Filter on
   another column, or run it under `sudo(reason=...)` where the caller is
   entitled to the field. A model whose `Meta.ordering` names a gated field
   can no longer be listed, or used as a subquery, by such an actor without

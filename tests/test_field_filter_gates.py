@@ -19,7 +19,15 @@ from django.db.models.expressions import RawSQL
 from django.db.models.functions import Abs, Lower
 from django.test import override_settings
 
-from rebac import ObjectRef, PermissionDenied, RelationshipTuple, backend, sudo, to_subject_ref
+from rebac import (
+    ObjectRef,
+    PermissionDenied,
+    RelationshipTuple,
+    actor_context,
+    backend,
+    sudo,
+    to_subject_ref,
+)
 from rebac.backends import reset_backend
 from rebac.schema import parse_zed
 from tests.backend_setup import install_schema
@@ -371,3 +379,70 @@ def test_an_exclusion_on_the_row_is_not_every_row(people, rows):
     assert {post.pk: post.title for post in admin} == {own.pk: "alpha memo", hidden.pk: None}
     with pytest.raises(PermissionDenied):
         list(admin.filter(title="secret plan"))
+
+
+@override_settings(REBAC_FIELD_READ_MODE="redact")
+def test_a_subquery_does_not_answer_for_the_outer_row(people, rows):
+    """An OuterRef column is the enclosing query's: its own guard decides it."""
+    alice = people["alice"]
+
+    def matching():
+        return Exists(
+            Folder.objects.as_user(alice).filter(pk=OuterRef("folder"), kind=OuterRef("title"))
+        )
+
+    def selected():
+        return Subquery(
+            Folder.objects.as_user(alice)
+            .filter(pk=OuterRef("folder"))
+            .annotate(o=OuterRef("title"))
+            .values("o")[:1]
+        )
+
+    bypass = Post.objects.sudo(reason="test.outer")
+    assert bypass.filter(~matching()).count() == 2
+    assert sorted(bypass.annotate(t=selected()).values_list("t", flat=True)) == [
+        "alpha memo",
+        "secret plan",
+    ]
+    # carol reads every title; alice's subquery compares the outer row's only.
+    assert Post.objects.as_user(people["carol"]).filter(~matching()).count() == 2
+    # Under alice the outer query reads the title she may not filter on.
+    with pytest.raises(PermissionDenied):
+        Post.objects.as_user(alice).filter(~matching()).count()
+
+
+@override_settings(REBAC_FIELD_READ_MODE="redact")
+def test_a_scoped_queryset_keeps_the_actor_it_was_scoped_with(people, rows):
+    with actor_context(to_subject_ref(people["alice"])):
+        evaluated = Post.objects.filter(body="")
+        assert len(list(evaluated)) == 2
+        refused = Post.objects.filter(title__startswith="secret")
+        with pytest.raises(PermissionDenied):
+            list(refused)
+    # Embedded after the context closed: alice's scope and alice's gates.
+    bypass = Post.objects.sudo(reason="test.outer")
+    assert bypass.filter(Exists(evaluated)).count() == 2
+    with pytest.raises(PermissionDenied):
+        bypass.filter(Exists(refused)).count()
+
+
+@override_settings(REBAC_FIELD_READ_MODE="redact")
+def test_a_count_reads_the_selection_only_of_distinct_or_grouped_rows(people, rows):
+    listed = Post.objects.as_user(people["alice"])
+    assert listed.values("title").count() == 2
+    assert listed.values_list("title").exists()
+    with pytest.raises(PermissionDenied):
+        listed.values("title").distinct().count()
+    with pytest.raises(PermissionDenied):
+        listed.values("title").union(listed.values("title")).count()
+
+
+@override_settings(REBAC_FIELD_READ_MODE="redact")
+def test_an_update_reads_its_explicit_ordering(people, rows, monkeypatch):
+    edited = Post.objects.as_user(people["bob"])
+    with pytest.raises(PermissionDenied, match="Cannot filter or order by gated field"):
+        edited.order_by("title").update(body="ordered")
+    # A model's default ordering is not part of an UPDATE.
+    monkeypatch.setattr(Post._meta, "ordering", ["title"])
+    assert edited.filter(body="").update(body="default") == 2

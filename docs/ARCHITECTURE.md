@@ -2603,20 +2603,23 @@ ordering), and `distinct(*fields)`, on the queryset's own model, on every
 model it joins and in every operand of a set combination. Under `"redact"`,
 `"omit"` or `"raise"`, a query that reads a protected column in any of these
 is refused with `PermissionDenied`: on iteration, `get()`, `count()`,
-`exists()`, `aggregate()` and `explain()`, which also check what the query
-selects (a count of distinct or grouped values reads them), and before a
-queryset `update()` or `delete()` selects its rows. The ordering counts as
-Django treats it: an existence test, an update and a delete drop it, a count
-and an aggregate keep it on a sliced or `distinct(*fields)` query only, and a
-grouped query drops a model's default ordering. `order_by()` with no
-arguments clears a default ordering.
+`exists()`, `aggregate()` and `explain()`, and before a queryset `update()` or
+`delete()` selects its rows. `count()` and `exists()` also check what the
+query selects when its rows are distinct, grouped or combined, since the
+count then depends on the values. The ordering counts as Django treats it: an
+existence test and a delete drop it, an update keeps an explicit ordering
+(MySQL emits it), a count and an aggregate keep it on a sliced or
+`distinct(*fields)` query only, and a grouped query drops a model's default
+ordering. `order_by()` with no arguments clears a default ordering.
 
 A queryset used as a subquery (`Subquery()`, `Exists()`, a lookup such as
 `pk__in=queryset`) is checked for what it selects, filters, groups and orders
 on, as resolved into the enclosing statement, whether its scope is applied
-there or was applied earlier (`scoped()`, or an evaluation that was refused).
-Its ordering is checked as written, though Django may clear it later (an
-`__in` lookup or `Exists()` of an unsliced query).
+there or was applied earlier (`scoped()`, or an evaluation that was
+refused), with the actor its scope was applied with. A column of the
+enclosing row it refers to (`OuterRef`) is the enclosing query's to answer
+for. Its ordering is checked as written, though an `__in` lookup clears the
+ordering of an unsliced query later; `Exists()` clears it before.
 
 The decision is per query, not per row. An actor whose permission on the
 field depends on the row is refused, even when every row the query returns
@@ -2624,10 +2627,13 @@ would show the field, and filters on it under `sudo(reason=...)` or on
 another column. An actor whose permission holds on every row of the type is
 not refused here or in a selection (`values("title")`), because no row hides
 the value from it. Such a permission is one that holds at the empty id
-(`grants_all()`) and has no exclusion on the row: an administrator role
-reached through a constant relation qualifies; `(owner + admin->member) -
-blocked` does not, since a `blocked` tuple can take the field away from one
-row. Hand-written SQL in a filter or an ordering (`extra(where=...,
+(`grants_all()`) and has no exclusion, in its expression or in a permission
+it names on the same type (an exclusion inside an arrow's target is
+evaluated on that object): an administrator role reached through a constant
+relation qualifies; `(owner + admin->member) - blocked` does not, since a
+`blocked` tuple can take the field away from one row. The rule is
+conservative: any such exclusion, even one whose right-hand side cannot
+depend on the row, decides the field row by row. Hand-written SQL in a filter or an ordering (`extra(where=...,
 order_by=...)`, `RawSQL`) is refused under an actor on any model, as it is in
 a selection.
 
