@@ -1442,8 +1442,9 @@ write database alias `using`. Field-backed relations remain library projections;
 the hook declares other relations the row will carry once persisted, while
 other post-insert facts remain unknown to the candidate gate. Omitted tuple
 relations retain `check_new`'s empty/no-row semantics. `_check_new_model`
-merges these contributions for `save()`, `create()`, `insert(obj)`, and each
-`bulk_create()` candidate. Unknown relation names and field-backed or const-backed
+merges these contributions for `save()`, `create()`, `insert(obj)`, each
+`bulk_create()` candidate, and `check_access("create")` on an unsaved
+instance. Unknown relation names and field-backed or const-backed
 entries raise `SchemaError`, even when unreferenced or empty. Valid unreferenced
 relations are ignored without iterating or resolving their subjects; referenced
 model instances use `to_subject_ref` and accept any subject form the schema
@@ -1570,7 +1571,14 @@ Model identity resolution rejects `None` and empty strings before constructing
 an object reference. Empty resource IDs are model-level backend-check sentinels,
 asking for any accessible row or a row-independent grant; they are not the
 identities of saved rows. Proposed-row create checks use `check_new()` with
-the candidate's relationship overlay.
+the candidate's relationship overlay, and so does
+`instance.check_access("create")` on an unsaved instance: it asks about that
+candidate, not about any row. Every other action on an unsaved instance keeps
+the model-level sentinel, which answers for any row of the type: a
+constructed instance can carry a stored row's primary key (`Model(pk=x)`, a
+deserialized object) and assert relations through `proposed_relationships()`,
+so its relations decide only its creation. `check_permission()` names a
+stored row; it does not ask about a candidate.
 Object and subject resolution read Django metadata through the instance, so
 lazy wrappers such as `AuthenticationMiddleware`'s `request.user` retain the
 wrapped model's resource type, ID attribute and subject relation.
@@ -2437,6 +2445,7 @@ tracked model's callable attribute named `actor` does not become an actor scope.
 | `Model.objects.bulk_create(rows)` | `create` on each proposed row's forward relations | Every candidate is preflighted before Django issues insert SQL. |
 | `instance.save()` (loaded/non-adding instance) | `write` on the row | `RebacMixin.save_base`, before consumer `pre_save`. |
 | `instance.save()` (new instance) | `create` on the proposed row's forward relations | `save_base` projects the constructed candidate into `check_new`. |
+| `instance.check_access("create")` / `has_access("create")` (new instance) | `create` on the proposed row's forward relations | The same projection into `check_new`, on the instance as it is now: without a caveat context it is the decision the save gate makes on the same alias, so a caller can check before validating or saving. What `save()` prepares later (an override, Django's refresh of a related object saved after it was assigned) is not seen. A context the caller supplies is used, though `save()` supplies none; a `consistency` the backend refuses is refused, and the candidate's reads take none. It can answer `CONDITIONAL_PERMISSION`, and raises what the projection raises (an invalid field value, an unavailable related row, `SchemaError` or another error from `proposed_relationships()`), as the save gate would. Any other action on a new instance asks the model-level sentinel; a loaded instance is checked as the row it is. |
 | `instance.delete()` | `delete` on the row | `RebacMixin.delete`; explicit-sender `pre_delete` checks collector children. |
 | `Model.objects.update(**kwargs)` | `write` on each affected row and every resource row whose backed FK edge changes | Manager intersects the queryset PK set with the actor's `write` scope; raises if any in-scope row is excluded. A backed FK update checks old and proposed source rows before SQL; expressions whose proposed FK cannot be resolved are refused. When the update touches a column the policy reads, the statement's primary keys are selected, those rows are gated, and exactly those rows are written by key (see [Writes](#writes)). |
 | `Model.objects.delete()` | `delete` on each row | Same pattern. |

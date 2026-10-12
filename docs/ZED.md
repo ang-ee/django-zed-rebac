@@ -196,7 +196,8 @@ afterwards: reads see the rows as they are.
 
 Create/write gates run in `save_base`, before consumer `pre_save` receivers.
 Preparation needed before the create check belongs in `save()` or
-`proposed_relationships`.
+`proposed_relationships`; `instance.check_access("create")` called before
+`save()` sees the second only.
 
 Before inserting a new model, the Django `create()`, `save()`, and
 `bulk_create()` gates project only the field-backed relations that `create`
@@ -225,7 +226,8 @@ A hook that resolves subjects must use the supplied write database alias
 `using`. Unknown relation names or field-backed or const-backed entries raise
 `SchemaError`; valid relations that `create` does not depend on are ignored
 without resolving or querying their subjects. `save()`, `create()`, `insert(obj)`,
-and each `bulk_create()` candidate share this hook. For example, a model that
+each `bulk_create()` candidate, and `instance.check_access("create")` on an
+unsaved instance share this hook. For example, a model that
 writes a `contributor` tuple for the creating actor after save can propose
 `{"contributor": [actor]}` for `relation contributor: auth/user`. The hook is
 trusted self-assertion: contributing a fact the row does not actually carry

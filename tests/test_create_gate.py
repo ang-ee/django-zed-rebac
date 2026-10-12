@@ -31,6 +31,7 @@ from rebac import (
     backend,
     sudo,
     to_object_ref,
+    to_subject_ref,
 )
 from rebac.actors import anonymous_actor
 from rebac.backends import reset_backend
@@ -2033,3 +2034,124 @@ def candidate_string_identities(monkeypatch):
 
     monkeypatch.setattr(VirtualFolder._meta, "rebac_id_attr", "name")
     monkeypatch.setattr(VirtualPost._meta, "rebac_id_attr", "pk")
+
+
+@pytest.mark.django_db
+def test_an_unsaved_instance_answers_as_save_will(parent_create_backend) -> None:
+    from tests.testapp.models import Folder, Post
+
+    actor = _user("allowed")
+    folder = _owned_folder(parent_create_backend, actor)
+    with sudo(reason="test.parent-create.fixture"):
+        other = Folder.objects.create(name="not theirs")
+    mine = Post(title="candidate", folder=folder).with_actor(actor)
+    theirs = Post(title="candidate", folder=other).with_actor(actor)
+    # The candidate's folder decides, not whether the actor can reach any post.
+    assert mine.check_access("create").allowed
+    assert mine.has_access("create")
+    assert not theirs.has_access("create")
+    mine.save()
+    with pytest.raises(PermissionDenied):
+        theirs.save()
+
+
+@pytest.mark.django_db
+def test_an_unsaved_instance_counts_its_proposed_relationships(
+    parent_create_backend, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from tests.testapp.models import Post
+
+    actor = _user("allowed")
+    folder = _owned_folder(parent_create_backend, actor)
+    install_schema(parent_create_backend, parse_zed(PROPOSED_RELATIONSHIPS_SCHEMA))
+    monkeypatch.setattr(
+        Post,
+        "proposed_relationships",
+        lambda self, *, using=None: {"contributor": [actor]} if self.body == "mine" else {},
+    )
+    assert Post(title="t", folder=folder, body="mine").with_actor(actor).has_access("create")
+    assert not Post(title="t", folder=folder, body="").with_actor(actor).has_access("create")
+
+
+@pytest.mark.django_db
+def test_an_unsaved_instance_decides_only_its_creation(
+    parent_create_backend, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A constructed instance can carry a stored row's pk and assert relations:
+    they decide its creation, never another action on that row."""
+    from tests.testapp.models import Post
+
+    victim = to_subject_ref(_django_user("victim"))
+    attacker = to_subject_ref(_django_user("attacker"))
+    install_schema(
+        parent_create_backend,
+        parse_zed(
+            PARENT_CREATE_SCHEMA.replace(
+                "    permission create = folder->write\n",
+                "    relation owner: auth/user\n"
+                "    permission create = folder->write\n"
+                "    permission delete = owner\n",
+            )
+        ),
+    )
+    folder = _owned_folder(parent_create_backend, victim)
+    with sudo(reason="test.parent-create.fixture"):
+        stored = Post.objects.create(title="theirs", folder=folder)
+    parent_create_backend.write_relationships(
+        [RelationshipTuple(ObjectRef("blog/post", str(stored.pk)), "owner", victim)]
+    )
+    monkeypatch.setattr(
+        Post, "proposed_relationships", lambda self, *, using=None: {"owner": [attacker]}
+    )
+    stub = Post(pk=stored.pk, title="theirs", folder=folder).with_actor(attacker)
+    assert stub._state.adding
+    assert not stub.has_access("delete")
+
+
+@pytest.mark.django_db
+def test_an_unsaved_create_check_reads_through_the_write_alias(
+    parent_create_backend, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from rebac import mixins
+    from tests.testapp.models import Post
+
+    actor = _user("allowed")
+    folder = _owned_folder(parent_create_backend, actor)
+    candidate = Post(title="candidate", folder=folder).with_actor(actor)
+    aliases = []
+    original = mixins._check_new_model
+
+    def check_new_model(instance, **kwargs):
+        aliases.append(kwargs["using"])
+        return original(instance, **kwargs)
+
+    monkeypatch.setattr(mixins, "_check_new_model", check_new_model)
+    # Reads are routed to a database that does not exist: the candidate is
+    # resolved on the write alias, as the save gate resolves it.
+    with override_settings(DATABASE_ROUTERS=[CreateWriteRouter()]):
+        assert candidate.has_access("create")
+    assert aliases == ["default"]
+
+
+@pytest.mark.django_db
+def test_an_unsaved_create_check_passes_its_context_and_refuses_a_snapshot(
+    parent_create_backend, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from rebac import Consistency, preflight
+    from tests.testapp.models import Post
+
+    actor = _user("allowed")
+    folder = _owned_folder(parent_create_backend, actor)
+    candidate = Post(title="candidate", folder=folder).with_actor(actor)
+    seen = []
+    original = preflight.check_new
+
+    def check_new(**kwargs):
+        seen.append(kwargs.get("context"))
+        return original(**kwargs)
+
+    monkeypatch.setattr(preflight, "check_new", check_new)
+    assert candidate.check_access("create", context={"ip": "10.0.0.1"}).allowed
+    assert seen == [{"ip": "10.0.0.1"}]
+    with pytest.raises(ValueError, match="exact historical snapshots"):
+        candidate.check_access("create", consistency=Consistency.AT_EXACT_SNAPSHOT)

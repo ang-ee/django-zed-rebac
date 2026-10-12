@@ -5,6 +5,20 @@ pre-1.0; breaking changes within a minor version are explicitly called out.
 
 ## [Unreleased]
 
+### Changed
+
+- `instance.check_access("create")` and `has_access("create")` on an
+  unsaved instance evaluate that candidate through `check_new()`, with the
+  relations its fields and `proposed_relationships()` give it, as `save()`
+  does. They answered whether the actor could reach any row of the type, so
+  `create = folder->write` denied an actor who may write the candidate's
+  folder and would be allowed to save it. A caller can now check a create
+  before validating the instance (`full_clean()`). The answer can be
+  `CONDITIONAL_PERMISSION`, and the check raises what `save()` raises for
+  the candidate (an invalid field value, an unavailable related row,
+  `SchemaError` or another error from `proposed_relationships()`): clean the
+  fields first. Other actions on an unsaved instance are unchanged.
+
 ### Added
 
 - `RebacQuerySet.readable(field)` (also on the manager): a gated field as the
@@ -52,6 +66,12 @@ pre-1.0; breaking changes within a minor version are explicitly called out.
   whose right-hand side cannot depend on the row.
 
 ### Upgrade
+
+- `Model(...).has_access("create")` used as a model-level "may this actor
+  create any row?" probe now asks about that empty candidate. Ask the model
+  level explicitly: `user.has_perm("app.add_model")` through `RebacBackend`,
+  or `backend().check_access(subject=..., action="create",
+  resource=ObjectRef(resource_type, ""))`.
 
 - A query that filters, groups or orders on a gated field under an actor
   whose permission on that field depends on the row now raises, as do

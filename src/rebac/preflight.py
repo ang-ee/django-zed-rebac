@@ -76,6 +76,7 @@ def _check_new_model(
     subject: SubjectRef,
     using: str | None = None,
     backend: Backend | None = None,
+    context: dict[str, object] | None = None,
 ) -> CheckResult:
     """Evaluate one constructed Django candidate through :func:`check_new`."""
 
@@ -98,6 +99,7 @@ def _check_new_model(
             action="create",
             resource_type=resource_type,
             backend=active_backend,
+            context=context,
         )
     relationships: dict[str, tuple[SubjectRef, ...] | None] = {}
     if definition is not None:
@@ -131,6 +133,7 @@ def _check_new_model(
         resource_type=resource_type,
         relationships=relationships,
         backend=active_backend,
+        context=context,
     )
 
 
