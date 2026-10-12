@@ -326,6 +326,45 @@ class RebacTrackedMixin(models.Model, metaclass=RebacModelBase):
             _gate_backed_field_change(type(self), self, alias, update_fields)
             super().save_base(raw, force_insert, force_update, alias, update_fields)
 
+    def check_save(
+        self, *, using: str | None = None, update_fields: Iterable[str] | None = None
+    ) -> CheckResult:
+        """The verdict the save gates would reach for ``save()``, without saving.
+
+        The gates ``save()`` runs run here, on the same alias and with the
+        same ``update_fields`` (rewritten as ``save()`` rewrites them for a
+        redacted instance), inside a transaction that is rolled back.
+        Nothing is written and no denial is audited.  ``HAS_PERMISSION``
+        when the save would pass the gates, ``NO_PERMISSION`` with the
+        denial's reason otherwise.  What ``save()`` raises besides a denial
+        (no actor in strict mode, an invalid value, ``update_fields`` on a
+        new instance) is raised here.
+        """
+        from .errors import PermissionDenied
+        from .signals import _gate_backed_field_change
+        from .watch import model_write
+
+        alias = using or router.db_for_write(type(self), instance=self)
+        if self._state.adding and update_fields is not None:
+            raise ValueError("A new instance is inserted: update_fields does not apply.")
+        if isinstance(self, RebacMixin) and not self._state.adding and update_fields is None:
+            redacted = frozenset(getattr(self, "_rebac_redacted_fields", frozenset()) or ())
+            if redacted:
+                update_fields = self._rebac_update_fields_excluding(redacted)
+        names = list(update_fields) if update_fields is not None else None
+        token = _checking_save.set(True)
+        try:
+            with model_write(model=type(self), using=alias, names=names):
+                _gate_save(type(self), self, using=alias, update_fields=names)
+                _gate_backed_field_change(type(self), self, alias, names)
+                raise _SaveChecked
+        except _SaveChecked:
+            return CheckResult.has(reason="the save gates pass")
+        except PermissionDenied as denied:
+            return CheckResult.no(reason=str(denied))
+        finally:
+            _checking_save.reset(token)
+
     def delete(
         self, using: str | None = None, keep_parents: bool = False
     ) -> tuple[int, dict[str, int]]:
@@ -915,6 +954,15 @@ class RebacMixin(RebacTrackedMixin):
         return str(getattr(self, attr))
 
 
+# Set while ``check_save`` runs the save gates: a denial there is an answer,
+# not an attempt, and is not audited.
+_checking_save: ContextVar[bool] = ContextVar("rebac_checking_save", default=False)
+
+
+class _SaveChecked(Exception):
+    """Raised to roll back ``check_save``'s transaction once the gates passed."""
+
+
 def _maybe_audit_denial(*, actor: SubjectRef | None, action: str, resource: ObjectRef) -> None:
     """Emit a denial audit row when REBAC_AUDIT_DENIALS is enabled.
 
@@ -926,7 +974,7 @@ def _maybe_audit_denial(*, actor: SubjectRef | None, action: str, resource: Obje
     happen). The reason text carries the ``denied:`` prefix so consumers
     can distinguish denial from successful writes when querying the trail.
     """
-    if not app_settings.REBAC_AUDIT_DENIALS:
+    if not app_settings.REBAC_AUDIT_DENIALS or _checking_save.get():
         return
     from .audit import emit as emit_audit
     from .models import PermissionAuditEvent
