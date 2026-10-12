@@ -864,7 +864,9 @@ class RebacQuerySet(models.QuerySet[_M]):
         return self._rebac_sudo_reason
 
     def _audit_bypass_once(self) -> None:
-        if self._rebac_sudo_audited:
+        from .audit import save_check
+
+        if self._rebac_sudo_audited or save_check.get() is not None:
             return
         reason = self._bypass_audit_reason()
         if reason is None:

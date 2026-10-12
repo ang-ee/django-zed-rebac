@@ -38,12 +38,32 @@ import atexit
 import logging
 from collections.abc import Callable
 from concurrent.futures import ThreadPoolExecutor
+from contextvars import ContextVar
 from typing import Any
 
 from asgiref.sync import sync_to_async
 from django.db import transaction
 
 from .types import SubjectRef
+
+
+class SaveCheck:
+    """A running ``check_save``: the instance it checks, the denial its own
+    save met, and the other instances saved meanwhile (their state is restored
+    after the rollback)."""
+
+    __slots__ = ("denied", "saved", "target")
+
+    def __init__(self, target: Any) -> None:
+        self.target = target
+        self.denied: Exception | None = None
+        self.saved: list[tuple[Any, Any, bool, str | None]] = []
+
+
+# Set while ``check_save`` runs ``save()``.  Everything it does is rolled
+# back, so a bypass taken meanwhile is neither audited nor marked audited
+# (the real save audits it), and no denial is audited.
+save_check: ContextVar[SaveCheck | None] = ContextVar("rebac_save_check", default=None)
 
 logger = logging.getLogger(__name__)
 

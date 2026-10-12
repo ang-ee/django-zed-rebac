@@ -222,3 +222,91 @@ def test_the_actor_is_resolved_as_the_save_resolves_it(world):
     unpinned.title = "a new title"
     with pytest.raises(MissingActorError):
         unpinned.check_save()
+
+
+def test_a_check_from_within_its_own_save_does_not_recurse(world, monkeypatch):
+    _alice, bob, _carol, _mine, _theirs, post = world
+    original = Post.save
+
+    def save(self, *args, **kwargs):
+        if not self.check_save().allowed:
+            raise PermissionDenied("refused by the override")
+        original(self, *args, **kwargs)
+
+    monkeypatch.setattr(Post, "save", save)
+    retitled = _loaded(bob, post)
+    retitled.title = "a new title"
+    assert not _agree(retitled)
+    edited = _loaded(bob, post)
+    edited.body = "an edit"
+    assert _agree(edited)
+
+
+def test_what_the_override_saves_and_changes_is_restored(world, monkeypatch):
+    alice, _bob, _carol, _mine, _theirs, _post = world
+    original = Post.save
+
+    def save(self, *args, **kwargs):
+        if self.folder_id is None:
+            with sudo(reason="test.override"):
+                self.folder = Folder.objects.create(name="made by the override")
+            _grant("blog/folder", self.folder.pk, "owner", alice)
+        original(self, *args, **kwargs)
+
+    monkeypatch.setattr(Post, "save", save)
+    candidate = Post(title="new").with_actor(to_subject_ref(alice))
+    assert candidate.check_save().allowed
+    # The folder the override made was rolled back; the post is as it was.
+    assert candidate.folder_id is None
+    assert candidate._state.adding
+    candidate.save()
+    assert Folder._base_manager.filter(pk=candidate.folder_id).exists()
+
+
+def test_a_bypass_taken_inside_the_check_is_audited_by_the_save(world, monkeypatch):
+    alice, _bob, _carol, _mine, _theirs, post = world
+    original = Post.save
+
+    def save(self, *args, **kwargs):
+        self.folder.save()
+        original(self, *args, **kwargs)
+
+    monkeypatch.setattr(Post, "save", save)
+    edited = _loaded(alice, post)
+    edited.body = "an edit"
+    edited.folder = edited.folder.sudo(reason="test.folder")
+    rows = PermissionAuditEvent.objects.filter(reason="test.folder")
+    assert edited.check_save().allowed
+    assert rows.count() == 0
+    edited.save()
+    assert rows.count() == 1
+
+
+def test_a_swallowed_denial_still_answers_no(world, monkeypatch):
+    _alice, bob, _carol, _mine, _theirs, post = world
+    original = Post.save
+
+    def save(self, *args, **kwargs):
+        try:
+            original(self, *args, **kwargs)
+        except Exception:
+            pass
+
+    monkeypatch.setattr(Post, "save", save)
+    retitled = _loaded(bob, post)
+    retitled.title = "a new title"
+    assert not retitled.check_save().allowed
+
+
+def test_no_denial_is_emitted_during_the_check(world, settings, monkeypatch):
+    from rebac import audit
+
+    _alice, bob, _carol, _mine, _theirs, post = world
+    settings.REBAC_AUDIT_DENIALS = True
+    emitted = []
+    original = audit.emit
+    monkeypatch.setattr(audit, "emit", lambda *a, **k: emitted.append(k) or original(*a, **k))
+    retitled = _loaded(bob, post)
+    retitled.title = "a new title"
+    assert not retitled.check_save().allowed
+    assert not [k for k in emitted if str(k.get("reason", "")).startswith("denied:")]
