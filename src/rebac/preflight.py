@@ -76,7 +76,6 @@ def _check_new_model(
     subject: SubjectRef,
     using: str | None = None,
     backend: Backend | None = None,
-    action: str = "create",
     context: dict[str, object] | None = None,
 ) -> CheckResult:
     """Evaluate one constructed Django candidate through :func:`check_new`."""
@@ -97,14 +96,14 @@ def _check_new_model(
         # Preserve check_new's backend-specific fail-closed diagnostic.
         return check_new(
             subject=subject,
-            action=action,
+            action="create",
             resource_type=resource_type,
             backend=active_backend,
             context=context,
         )
     relationships: dict[str, tuple[SubjectRef, ...] | None] = {}
     if definition is not None:
-        required_relations = relation_dependencies(schema, resource_type, action)
+        required_relations = relation_dependencies(schema, resource_type, "create")
         relationships = _proposed_forward_relationships(
             instance,
             definition,
@@ -130,7 +129,7 @@ def _check_new_model(
             relationships[name] = tuple(to_subject_ref(candidate) for candidate in proposed[name])
     return check_new(
         subject=subject,
-        action=action,
+        action="create",
         resource_type=resource_type,
         relationships=relationships,
         backend=active_backend,

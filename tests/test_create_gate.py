@@ -2106,3 +2106,52 @@ def test_an_unsaved_instance_decides_only_its_creation(
     stub = Post(pk=stored.pk, title="theirs", folder=folder).with_actor(attacker)
     assert stub._state.adding
     assert not stub.has_access("delete")
+
+
+@pytest.mark.django_db
+def test_an_unsaved_create_check_reads_through_the_write_alias(
+    parent_create_backend, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from rebac import mixins
+    from tests.testapp.models import Post
+
+    actor = _user("allowed")
+    folder = _owned_folder(parent_create_backend, actor)
+    candidate = Post(title="candidate", folder=folder).with_actor(actor)
+    aliases = []
+    original = mixins._check_new_model
+
+    def check_new_model(instance, **kwargs):
+        aliases.append(kwargs["using"])
+        return original(instance, **kwargs)
+
+    monkeypatch.setattr(mixins, "_check_new_model", check_new_model)
+    # Reads are routed to a database that does not exist: the candidate is
+    # resolved on the write alias, as the save gate resolves it.
+    with override_settings(DATABASE_ROUTERS=[CreateWriteRouter()]):
+        assert candidate.has_access("create")
+    assert aliases == ["default"]
+
+
+@pytest.mark.django_db
+def test_an_unsaved_create_check_passes_its_context_and_refuses_a_snapshot(
+    parent_create_backend, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from rebac import Consistency, preflight
+    from tests.testapp.models import Post
+
+    actor = _user("allowed")
+    folder = _owned_folder(parent_create_backend, actor)
+    candidate = Post(title="candidate", folder=folder).with_actor(actor)
+    seen = []
+    original = preflight.check_new
+
+    def check_new(**kwargs):
+        seen.append(kwargs.get("context"))
+        return original(**kwargs)
+
+    monkeypatch.setattr(preflight, "check_new", check_new)
+    assert candidate.check_access("create", context={"ip": "10.0.0.1"}).allowed
+    assert seen == [{"ip": "10.0.0.1"}]
+    with pytest.raises(ValueError, match="exact historical snapshots"):
+        candidate.check_access("create", consistency=Consistency.AT_EXACT_SNAPSHOT)

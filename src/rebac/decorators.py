@@ -31,7 +31,8 @@ def check_permission(
     ``resource`` is an :class:`ObjectRef` or a model instance; for an
     instance that carries an actor (``with_actor``, ``sudo``) and no explicit
     ``actor``, the instance's effective actor answers, as for its own
-    ``check_access``.
+    ``check_access``.  ``resource`` names a stored row: to ask whether an
+    unsaved instance may be created, use ``instance.check_access("create")``.
     """
     from . import backend
     from .actors import to_subject_ref

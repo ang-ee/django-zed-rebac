@@ -196,7 +196,8 @@ afterwards: reads see the rows as they are.
 
 Create/write gates run in `save_base`, before consumer `pre_save` receivers.
 Preparation needed before the create check belongs in `save()` or
-`proposed_relationships`.
+`proposed_relationships`; `instance.check_access("create")` called before
+`save()` sees the second only.
 
 Before inserting a new model, the Django `create()`, `save()`, and
 `bulk_create()` gates project only the field-backed relations that `create`

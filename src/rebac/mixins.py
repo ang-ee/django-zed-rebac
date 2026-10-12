@@ -421,7 +421,8 @@ class RebacMixin(RebacTrackedMixin):
     ) -> Mapping[str, Iterable[SubjectRef | models.Model]]:
         """Relations this row will carry once persisted that are not derivable
         from its fields, keyed by relation name; consulted by the create gate
-        before insert, and by ``check_access("create")`` on an unsaved instance. The complementary owner for field-backed relations is
+        before insert, and by ``check_access("create")`` on an unsaved
+        instance. The complementary owner for field-backed relations is
         ``rebac.field_backing._proposed_forward_relationships``; field-backed
         and const-backed relations belong to the library and must not be
         returned here. Use the supplied write database alias ``using`` when
@@ -656,10 +657,14 @@ class RebacMixin(RebacTrackedMixin):
           3. Unscoped/bypass resolution → ``HAS_PERMISSION``.
           4. ``create`` on an unsaved instance asks about the candidate:
              ``check_new`` over the relations its fields and
-             ``proposed_relationships()`` give it, the evaluator ``save()``
-             uses.  Any other action on an unsaved instance asks the
-             model-level sentinel: its pk may be a stored row's, and its
-             asserted relations decide only its creation.
+             ``proposed_relationships()`` give it, the evaluator of the save
+             gate, on the instance as it is now (what a ``save()`` override
+             prepares later is not seen).  It raises what that evaluation
+             raises: an invalid field value, an unavailable related row,
+             the hook's own errors.  Any other action on an unsaved instance
+             asks the model-level sentinel, which answers for any row of
+             the type: its pk may be a stored row's, and its asserted
+             relations decide only its creation.
           5. Otherwise dispatch to the backend.
         """
         from .backends import backend
@@ -677,6 +682,11 @@ class RebacMixin(RebacTrackedMixin):
 
         if self._state.adding and action == "create":
             # The candidate save() would insert, not "may the actor create any row?".
+            # A consistency the backend refuses is refused here too; the
+            # candidate's own reads take none.
+            validate = getattr(backend(), "_validate_consistency", None)
+            if consistency is not None and callable(validate):
+                validate(consistency, None)
             return _check_new_model(
                 self,
                 subject=actor,
@@ -702,7 +712,11 @@ class RebacMixin(RebacTrackedMixin):
         context: dict[str, Any] | None = None,
         consistency: Consistency | None = None,
     ) -> bool:
-        """Boolean shorthand. ``CONDITIONAL_PERMISSION`` collapses to ``False``."""
+        """Boolean shorthand. ``CONDITIONAL_PERMISSION`` collapses to ``False``.
+
+        Errors are not collapsed: ``create`` on an unsaved instance raises what
+        its candidate check raises (see :meth:`check_access`).
+        """
         return self.check_access(action, context=context, consistency=consistency).allowed
 
     # ----- Field read gates -----
