@@ -3,17 +3,20 @@
 All notable changes to `django-zed-rebac` are tracked here. The project is in
 pre-1.0; breaking changes within a minor version are explicitly called out.
 
-## [Unreleased]
+## [0.27.1] — 2026-10-12
 
 ### Added
 
 - `instance.check_save(using=None, update_fields=None)` on `RebacMixin` and
-  `RebacTrackedMixin` instances: the verdict the save gates would reach for
-  `save()` with the same arguments (the create candidate check, or `write`
-  with `write__<field>` on changed fields, moving edges, expression reads,
-  redacted writes and the backed-edge gate), without saving and without a
-  denial audit row. `HAS_PERMISSION` or `NO_PERMISSION` with the denial's
-  reason; other errors raise as `save()` raises them. A caller that
+  `RebacTrackedMixin` instances: the verdict the save gates reach for
+  `save()` with the same arguments, without writing and without a denial
+  audit row. It runs `save()` itself (the model's override, Django's
+  preparation, the gates: the create candidate check, or `write` with
+  `write__<field>` on changed fields, moving edges, expression reads,
+  redacted writes and the backed-edge gate) inside a transaction it rolls
+  back, and stops before Django writes. `HAS_PERMISSION` or `NO_PERMISSION`
+  with the denial's reason; other errors raise as `save()` raises them. An
+  override's effects outside the database run. A caller that
   validates with more access than the actor (unique checks under
   `system_context`) asks it first, so validation never answers for a write
   the gates would refuse.

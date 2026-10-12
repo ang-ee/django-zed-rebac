@@ -22,7 +22,7 @@ from dataclasses import field as dataclass_field
 from typing import TYPE_CHECKING, Any, ClassVar, Self, cast
 
 from django.core.exceptions import ImproperlyConfigured
-from django.db import models, router
+from django.db import models, router, transaction
 from django.db.models.base import ModelBase
 from django.db.models.options import DEFAULT_NAMES
 
@@ -324,46 +324,47 @@ class RebacTrackedMixin(models.Model, metaclass=RebacModelBase):
             from .signals import _gate_backed_field_change
 
             _gate_backed_field_change(type(self), self, alias, update_fields)
+            if _checking_save.get() is self:
+                # check_save(): the gates passed; Django would write now.
+                raise _SaveChecked
             super().save_base(raw, force_insert, force_update, alias, update_fields)
 
     def check_save(
         self, *, using: str | None = None, update_fields: Iterable[str] | None = None
     ) -> CheckResult:
-        """The verdict the save gates would reach for ``save()``, without saving.
+        """The verdict the save gates reach for ``save()``, without writing.
 
-        The gates ``save()`` runs run here, on the same alias and with the
-        same ``update_fields`` (rewritten as ``save()`` rewrites them for a
-        redacted instance), inside a transaction that is rolled back.
-        Nothing is written and no denial is audited.  ``HAS_PERMISSION``
-        when the save would pass the gates, ``NO_PERMISSION`` with the
-        denial's reason otherwise.  What ``save()`` raises besides a denial
-        (no actor in strict mode, an invalid value, ``update_fields`` on a
-        new instance) is raised here.
+        ``save()`` itself runs, with these arguments: the model's override,
+        Django's preparation (a deferred instance's loaded fields, the key of
+        a related object saved after it was assigned, the checks on
+        ``update_fields``) and the gates, inside a transaction that is rolled
+        back.  It stops where Django would send ``pre_save`` and write.  No
+        denial is audited.  ``HAS_PERMISSION`` when the save passes the gates
+        (or writes nothing, as with empty ``update_fields``), ``NO_PERMISSION``
+        with the denial's reason otherwise; anything else ``save()`` raises
+        is raised.  An override's effects outside the database run as they
+        would in ``save()``.
         """
         from .errors import PermissionDenied
-        from .signals import _gate_backed_field_change
-        from .watch import model_write
 
+        if isinstance(self, RebacMixin) and model_resource_type(self):
+            # A check takes the instance's bypass, and audits it, outside the
+            # work it rolls back: the save that follows must not audit it again.
+            self.effective_actor(strict=True)
         alias = using or router.db_for_write(type(self), instance=self)
-        if self._state.adding and update_fields is not None:
-            raise ValueError("A new instance is inserted: update_fields does not apply.")
-        if isinstance(self, RebacMixin) and not self._state.adding and update_fields is None:
-            redacted = frozenset(getattr(self, "_rebac_redacted_fields", frozenset()) or ())
-            if redacted:
-                update_fields = self._rebac_update_fields_excluding(redacted)
-        names = list(update_fields) if update_fields is not None else None
-        token = _checking_save.set(True)
+        token = _checking_save.set(self)
         try:
-            with model_write(model=type(self), using=alias, names=names):
-                _gate_save(type(self), self, using=alias, update_fields=names)
-                _gate_backed_field_change(type(self), self, alias, names)
-                raise _SaveChecked
-        except _SaveChecked:
-            return CheckResult.has(reason="the save gates pass")
+            with transaction.atomic(using=alias):
+                try:
+                    self.save(using=using, update_fields=update_fields)
+                except _SaveChecked:
+                    pass
+                transaction.set_rollback(True, using=alias)
         except PermissionDenied as denied:
             return CheckResult.no(reason=str(denied))
         finally:
             _checking_save.reset(token)
+        return CheckResult.has(reason="the save gates pass")
 
     def delete(
         self, using: str | None = None, keep_parents: bool = False
@@ -417,6 +418,8 @@ class RebacMixin(RebacTrackedMixin):
       - ``instance.is_sudo()`` / ``instance.actor()`` — introspection.
       - ``instance.check_access(action)`` — three-state ``CheckResult``.
       - ``instance.has_access(action)`` — boolean shorthand.
+      - ``instance.check_save(using=..., update_fields=...)`` — the verdict
+        the save gates reach for ``save()``, without writing.
 
     Pickle / cross-process posture:
       ``__getstate__`` strips ``_rebac_actor``, ``_rebac_sudo_reason``, and
@@ -954,9 +957,10 @@ class RebacMixin(RebacTrackedMixin):
         return str(getattr(self, attr))
 
 
-# Set while ``check_save`` runs the save gates: a denial there is an answer,
-# not an attempt, and is not audited.
-_checking_save: ContextVar[bool] = ContextVar("rebac_checking_save", default=False)
+# The instance ``check_save`` runs ``save()`` for: its save stops before the
+# write, and a denial while it runs is an answer, not an attempt, so it is
+# not audited.
+_checking_save: ContextVar[Any] = ContextVar("rebac_checking_save", default=None)
 
 
 class _SaveChecked(Exception):
@@ -974,7 +978,7 @@ def _maybe_audit_denial(*, actor: SubjectRef | None, action: str, resource: Obje
     happen). The reason text carries the ``denied:`` prefix so consumers
     can distinguish denial from successful writes when querying the trail.
     """
-    if not app_settings.REBAC_AUDIT_DENIALS or _checking_save.get():
+    if not app_settings.REBAC_AUDIT_DENIALS or _checking_save.get() is not None:
         return
     from .audit import emit as emit_audit
     from .models import PermissionAuditEvent
