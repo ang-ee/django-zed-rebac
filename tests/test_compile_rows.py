@@ -561,3 +561,359 @@ def test_point_checks_do_not_decide_sets(tree):
     assert not local.check_access(
         subject=ALICE, action="read", resource=ObjectRef("blog/folder", str(folders["root"].pk))
     ).allowed
+
+
+# ---------- Kept within an evaluator scope (proposal 0017) ----------
+
+BOB = SubjectRef.of("auth/user", "bob")
+
+
+def _folder_reads(queries):
+    """The decisions over folders: statements whose root table is the folder table."""
+    return [q for q in queries if q["sql"].startswith('SELECT "testapp_folder".')]
+
+
+def _confirmations(queries):
+    return [
+        q
+        for q in queries
+        if q["sql"].startswith("SELECT EXISTS")
+        or ('FROM "rebac_schemageneration"' in q["sql"] and "held0" in q["sql"])
+    ]
+
+
+def _listed(sql_queries):
+    return [q["sql"] for q in sql_queries if q["sql"].startswith('SELECT "testapp_post".')]
+
+
+def test_a_scope_binds_the_rows_it_decided_again(tree):
+    from rebac import evaluator_scope
+
+    _local, _folders, posts, _grant = tree
+    expected = {posts["child"].pk, posts["leaf"].pk}
+    with evaluator_scope():
+        with CaptureQueriesContext(connection) as first:
+            assert visible(Post) == expected
+        with CaptureQueriesContext(connection) as second:
+            assert visible(Post) == expected
+    assert _folder_reads(first)
+    # The second statement decides nothing: one statement confirms the kept rows.
+    assert _folder_reads(second) == []
+    assert len(_confirmations(second)) == 1
+    assert _listed(second) == _listed(first)
+
+
+def test_nothing_is_kept_outside_a_scope(tree):
+    _local, _folders, _posts, _grant = tree
+    with CaptureQueriesContext(connection) as first:
+        visible(Post)
+    with CaptureQueriesContext(connection) as second:
+        visible(Post)
+    assert len(_folder_reads(second)) == len(_folder_reads(first)) > 0
+    assert _confirmations(second) == []
+
+
+def test_a_write_the_scope_sees_drops_the_kept_rows(tree):
+    from rebac import evaluator_scope
+
+    _local, folders, posts, _grant = tree
+    with evaluator_scope():
+        assert visible(Post) == {posts["child"].pk, posts["leaf"].pk}
+        with sudo(reason="test.move"):
+            Folder.objects.filter(pk=folders["other"].pk).update(parent=folders["child"])
+        with CaptureQueriesContext(connection) as after:
+            assert visible(Post) == {posts["child"].pk, posts["leaf"].pk, posts["other"].pk}
+    assert _folder_reads(after)
+    assert _confirmations(after) == []
+
+
+def _unseen(change):
+    """Run ``change`` where the scope cannot see it, as another process would."""
+    observers = [
+        wrapper
+        for wrapper in connection.execute_wrappers
+        if type(getattr(wrapper, "__self__", None)).__name__ == "_ConnectionSchemas"
+    ]
+    for wrapper in observers:
+        connection.execute_wrappers.remove(wrapper)
+    try:
+        with sudo(reason="test.unseen"):
+            change()
+    finally:
+        connection.execute_wrappers[0:0] = observers
+
+
+def test_a_kept_set_that_no_longer_holds_is_decided_afresh(tree):
+    from rebac import evaluator_scope
+
+    _local, folders, posts, _grant = tree
+    with evaluator_scope():
+        assert visible(Post) == {posts["child"].pk, posts["leaf"].pk}
+        _unseen(
+            lambda: Folder._base_manager.filter(pk=folders["leaf"].pk).update(
+                parent=folders["other"]
+            )
+        )
+        with CaptureQueriesContext(connection) as after:
+            # The confirmation fails, the scope drops its rows, the statement
+            # decides afresh: not an empty answer for the rest of the scope.
+            assert visible(Post) == {posts["child"].pk}
+        assert len(_confirmations(after)) == 1
+        assert _folder_reads(after)
+        assert visible(Folder) == {folders["child"].pk}
+
+
+def test_a_row_the_scope_cannot_see_appear_waits_for_the_scope(tree):
+    from rebac import evaluator_scope
+
+    _local, folders, posts, _grant = tree
+    with evaluator_scope():
+        assert visible(Post) == {posts["child"].pk, posts["leaf"].pk}
+        _unseen(
+            lambda: Folder._base_manager.filter(pk=folders["other"].pk).update(
+                parent=folders["child"]
+            )
+        )
+        # A kept set is a lower bound: the newly readable row stays hidden.
+        assert visible(Post) == {posts["child"].pk, posts["leaf"].pk}
+    assert visible(Post) == {posts["child"].pk, posts["leaf"].pk, posts["other"].pk}
+
+
+def test_kept_rows_are_the_actors_own(tree):
+    from rebac import evaluator_scope
+
+    local, folders, posts, _grant = tree
+    local.write_relationships([RelationshipTuple(to_object_ref(folders["other"]), "viewer", BOB)])
+    alice = {posts["child"].pk, posts["leaf"].pk}
+    with evaluator_scope():
+        assert visible(Post) == alice
+        assert set(Post.objects.with_actor(BOB).values_list("pk", flat=True)) == {posts["other"].pk}
+        assert visible(Post) == alice
+
+
+def test_rows_are_kept_inside_a_request_transaction(tree):
+    from django.db import transaction
+
+    from rebac import evaluator_scope
+
+    _local, _folders, posts, _grant = tree
+    expected = {posts["child"].pk, posts["leaf"].pk}
+    with evaluator_scope(), transaction.atomic():
+        assert visible(Post) == expected
+        with CaptureQueriesContext(connection) as second:
+            assert visible(Post) == expected
+        assert _folder_reads(second) == []
+        with transaction.atomic():
+            # A savepoint is a statement the scope sees: the rows are dropped.
+            with CaptureQueriesContext(connection) as nested:
+                assert visible(Post) == expected
+        assert _folder_reads(nested)
+
+
+def test_a_fully_consistent_read_decides_afresh(tree):
+    from rebac import Consistency, evaluator_scope
+
+    local, _folders, _posts, _grant = tree
+    with evaluator_scope():
+        local.accessible(subject=ALICE, action="read", resource_type="blog/post")
+        with CaptureQueriesContext(connection) as latest:
+            local.accessible(
+                subject=ALICE,
+                action="read",
+                resource_type="blog/post",
+                consistency=Consistency.FULLY_CONSISTENT,
+            )
+        with CaptureQueriesContext(connection) as kept:
+            local.accessible(subject=ALICE, action="read", resource_type="blog/post")
+    assert _folder_reads(latest) and _confirmations(latest) == []
+    assert _folder_reads(kept) == [] and len(_confirmations(kept)) == 1
+
+
+def test_kept_rows_are_bounded_by_the_evaluator_cache_size(tree, settings):
+    from rebac import evaluator_scope
+
+    _local, _folders, posts, _grant = tree
+    expected = {posts["child"].pk, posts["leaf"].pk}
+    # The hierarchy holds two keys: a budget of one keeps nothing.
+    settings.REBAC_EVALUATOR_CACHE_SIZE = 1
+    with evaluator_scope():
+        assert visible(Post) == expected
+        with CaptureQueriesContext(connection) as second:
+            assert visible(Post) == expected
+    assert _folder_reads(second)
+    assert _confirmations(second) == []
+
+
+def _unseen_tuples(monkeypatch, change):
+    """Write tuples as another process would: unseen, no generation bump here."""
+    from rebac.backends import local as local_backend
+
+    generation = local_backend._relationship_generation
+    _unseen(change)
+    monkeypatch.setattr(local_backend, "_relationship_generation", generation)
+
+
+SHARED_SCHEMA = """
+definition auth/user {}
+definition blog/folder {
+    relation parent: blog/folder // rebac:field=parent
+    relation viewer: auth/user
+    permission open = viewer
+    permission nested = parent->open
+}
+definition blog/post {
+    relation folder: blog/folder // rebac:field=folder
+    permission read = folder->open + folder->nested
+}
+"""
+
+
+def test_a_kept_set_is_reused_only_with_the_very_sets_it_rests_on(monkeypatch, settings):
+    """``nested`` was decided through ``open``; ``open`` is evicted, its grant
+    revoked unseen, and decided again: ``nested`` must not be reused beside
+    the new ``open``, or its witness would check the old folders."""
+    from rebac import evaluator_scope
+
+    local = install_schema(SHARED_SCHEMA)
+    with sudo(reason="test.fixture"):
+        b1 = Folder.objects.create(name="b1")
+        b2 = Folder.objects.create(name="b2")
+        a1 = Folder.objects.create(name="a1", parent=b1)
+        p1 = Post.objects.create(title="p1", folder=a1)
+        p2 = Post.objects.create(title="p2", folder=b2)
+    grants = [RelationshipTuple(to_object_ref(folder), "viewer", ALICE) for folder in (b1, b2)]
+    local.write_relationships(grants)
+    settings.REBAC_EVALUATOR_CACHE_SIZE = 2
+    with evaluator_scope():
+        assert visible(Post) == {p1.pk, p2.pk}
+        _unseen_tuples(monkeypatch, lambda: local.delete_relationship(grants[0]))
+        assert visible(Post) == {p2.pk}
+    assert visible(Post) == {p2.pk}
+
+
+GATE_SCHEMA = """
+definition auth/user {}
+definition blog/folder {
+    relation editor: auth/user
+    relation parent: blog/folder // rebac:field=parent
+    permission write = editor + parent->write
+    permission read = write
+}
+definition blog/post {
+    relation folder: blog/folder // rebac:field=folder
+    relation shelf: blog/folder // rebac:field=collections
+    permission write = folder->write
+    permission read = write
+}
+"""
+
+
+def test_a_write_gate_does_not_bind_kept_rows(monkeypatch):
+    from rebac import actor_context, evaluator_scope
+
+    local = install_schema(GATE_SCHEMA)
+    with sudo(reason="test.fixture"):
+        box = Folder.objects.create(name="box")
+        g1 = Folder.objects.create(name="g1")
+        g2 = Folder.objects.create(name="g2")
+        posts = [Post.objects.create(title=f"p{n}", folder=g2) for n in range(5)]
+    local.write_relationships(
+        [RelationshipTuple(to_object_ref(folder), "editor", ALICE) for folder in (box, g1)]
+    )
+    with evaluator_scope(), actor_context(ALICE):
+        # A read keeps the folders alice may write: box and g1.
+        assert (
+            set(local.accessible(subject=ALICE, action="write", resource_type="blog/post")) == set()
+        )
+        _unseen_tuples(
+            monkeypatch,
+            lambda: local.write_relationships(
+                [RelationshipTuple(to_object_ref(g2), "editor", ALICE)]
+            ),
+        )
+        # The gate decides afresh: g2 is alice's now, so are its posts.
+        Folder.objects.get(pk=box.pk).collected_posts.add(*posts)
+    with sudo(reason="test.verify"):
+        assert set(box.collected_posts.values_list("pk", flat=True)) == {p.pk for p in posts}
+
+
+def test_a_statement_outside_a_transaction_drops_the_kept_rows(tree):
+    from rebac import evaluator_scope
+
+    _local, _folders, posts, _grant = tree
+    with evaluator_scope():
+        assert visible(Post) == {posts["child"].pk, posts["leaf"].pk}
+        # An insert into a model the policy does not read, in no transaction:
+        # only the statement observer can see it.
+        get_user_model().objects.create(username="unrelated")
+        with CaptureQueriesContext(connection) as after:
+            assert visible(Post) == {posts["child"].pk, posts["leaf"].pk}
+    assert _folder_reads(after)
+    assert _confirmations(after) == []
+
+
+def test_an_audited_bypass_keeps_the_kept_rows(tree):
+    from rebac import evaluator_scope
+    from rebac.models import PermissionAuditEvent
+
+    _local, _folders, posts, _grant = tree
+    expected = {posts["child"].pk, posts["leaf"].pk}
+    before = PermissionAuditEvent.objects.count()
+    with evaluator_scope():
+        assert visible(Post) == expected
+        # A bypass writes its audit row at once, on the same connection.
+        assert Folder.objects.sudo(reason="test.audited").count() == 4
+        with CaptureQueriesContext(connection) as after:
+            assert visible(Post) == expected
+    assert PermissionAuditEvent.objects.count() == before + 1
+    assert _folder_reads(after) == []
+    assert len(_confirmations(after)) == 1
+
+
+TEAM_SCHEMA = """
+definition auth/user {}
+definition work/team {
+    relation member: auth/user
+}
+definition blog/folder {
+    relation viewer: auth/user | work/team#member
+    permission read = viewer
+}
+"""
+
+
+def test_a_read_that_decides_afresh_decides_the_memberships_afresh(monkeypatch):
+    from rebac import Consistency, evaluator_scope
+
+    local = install_schema(TEAM_SCHEMA)
+    with sudo(reason="test.fixture"):
+        mine = Folder.objects.create(name="mine")
+        theirs = Folder.objects.create(name="theirs")
+    team = ObjectRef("work/team", "t")
+    local.write_relationships(
+        [
+            RelationshipTuple(to_object_ref(mine), "viewer", ALICE),
+            RelationshipTuple(
+                to_object_ref(theirs), "viewer", SubjectRef.of("work/team", "t", "member")
+            ),
+        ]
+    )
+    expected = {str(mine.pk), str(theirs.pk)}
+    with evaluator_scope():
+        assert set(local.accessible(subject=ALICE, action="read", resource_type="blog/folder")) == {
+            str(mine.pk)
+        }
+        _unseen_tuples(
+            monkeypatch,
+            lambda: local.write_relationships([RelationshipTuple(team, "member", ALICE)]),
+        )
+        latest = local.accessible(
+            subject=ALICE,
+            action="read",
+            resource_type="blog/folder",
+            consistency=Consistency.FULLY_CONSISTENT,
+        )
+        assert set(latest) == expected
+    assert (
+        set(local.accessible(subject=ALICE, action="read", resource_type="blog/folder")) == expected
+    )

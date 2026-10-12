@@ -1812,6 +1812,8 @@ then selects nothing, so staleness denies and never grants. The depth probe
 of a check carries the same witness: sets that are no longer the actor's are
 a change for the residual evaluator to answer afresh, not a depth to report
 as `PermissionDepthExceeded`. Outside a scope every operation decides afresh.
+The rows a scope decides behind its arrows are kept in a scope too (see
+[Decided rows](#decided-rows), 6).
 
 Several actors of one shape can be decided together
 (see [Bulk checks](#bulk-checks)).
@@ -1881,8 +1883,49 @@ Decided rows are used by queryset scopes and by what is built on them
 (`accessible()` without a context, bulk guards, the backed-edge gate over
 more than four rows). A point check stays one statement at its one object.
 A statement that carries decided keys is compiled for that operation and is
-not kept. Nothing is kept between operations: the sets depend on model rows,
-which change without the library seeing it.
+not kept.
+
+6. **Kept within a scope** ([proposal 0017](./proposals/0017-kept-decided-rows.md)).
+   Outside an evaluator scope nothing is kept between operations: the sets
+   depend on model rows, which change without the library seeing it. Inside
+   one (a request under `ActorMiddleware`, an explicit `evaluator_scope()`),
+   a decided set is kept per database alias, policy, actor shape, actor,
+   caveat context, tuple generation, the actor's decided memberships (their
+   witness is the statement's), permission the scope asks for, and node,
+   and a later operation of the same kind binds it instead of deciding it
+   again. A set is reused only with every set it rests on, the very sets its
+   witness was compiled against, so its witness is whole: a set decided
+   again under one of those keys, or kept again after an eviction, makes it
+   unusable. One that does not fit what the statement may still bind is
+   decided as before. Kept sets are dropped, every one of
+   them, on whatever the scope already drops its schema pins on: any
+   statement on that connection other than a plain `SELECT` (an insert,
+   update or delete by any code, raw SQL through Django, a savepoint) except
+   the library's own audit insert (a `sudo()` writes its row at once, and no
+   schema or permission reads that table), a
+   transaction boundary, a tuple written in the process, the scope's
+   `invalidate()` and its end. A write gate (the bulk write guards, the
+   backed-edge gate) decides afresh and binds no kept set. At most as many
+   sets as the evaluator's size (`REBAC_EVALUATOR_CACHE_SIZE` by default),
+   holding at most as many keys over all of them, are kept per connection,
+   the least recently used dropped first. Nothing is kept on a connection
+   under manual transaction management, or under a policy with a
+   caveat-override deadline (the clock alone changes it); a read with
+   `consistency=Consistency.FULLY_CONSISTENT` (`accessible()`,
+   `check_access()`, `check_bulk_permissions()`) decides afresh, the actor's
+   memberships included, and so does a write gate.
+   A kept set stays a lower bound and every statement that binds it carries
+   its witness, so it can hide a row and never grants one: a write the scope
+   cannot see can leave a newly readable row out until the scope ends or
+   drops its sets. It cannot see another process, a driver cursor that
+   bypasses Django, or a write on another alias than the one the sets were
+   read from (permissions read from a replica already see writes late).
+   Code that writes through such a path and reads again in the same scope
+   calls `current_evaluator().invalidate()`, as for the schema pins.
+   Before a statement that binds kept sets is used, one statement reads the
+   witness of each; when one fails, every kept set is dropped and the
+   statement is built again, deciding afresh, so a stale set does not empty
+   every later statement of the scope.
 
 A union is compiled constants first (an arrow over a const-backed relation,
 `authenticated`), and stops at the first arm that holds outright, so an

@@ -558,17 +558,21 @@ class LocalBackend(Backend):
         at_zookie: Zookie | None = None,
     ) -> CheckResult:
         self._validate_consistency(consistency, at_zookie)
-        from ..compile.read import check
+        from contextlib import nullcontext
+
+        from ..compile.read import check, deciding_afresh
         from ..models import active_relationship_model
 
-        return check(
-            backend=self,
-            resource=resource,
-            action=action,
-            actor=subject,
-            context=context,
-            using=active_relationship_model().objects.db,
-        )
+        latest = consistency == Consistency.FULLY_CONSISTENT
+        with deciding_afresh() if latest else nullcontext():
+            return check(
+                backend=self,
+                resource=resource,
+                action=action,
+                actor=subject,
+                context=context,
+                using=active_relationship_model().objects.db,
+            )
 
     def check_bulk_permissions(
         self,
@@ -578,12 +582,16 @@ class LocalBackend(Backend):
         at_zookie: Zookie | None = None,
     ) -> list[CheckResult]:
         self._validate_consistency(consistency, at_zookie)
-        from ..compile.read import check_many
+        from contextlib import nullcontext
+
+        from ..compile.read import check_many, deciding_afresh
         from ..models import active_relationship_model
 
-        return check_many(
-            backend=self, items=list(items), using=active_relationship_model().objects.db
-        )
+        latest = consistency == Consistency.FULLY_CONSISTENT
+        with deciding_afresh() if latest else nullcontext():
+            return check_many(
+                backend=self, items=list(items), using=active_relationship_model().objects.db
+            )
 
     @_schema_operation
     def queryset_filter(
@@ -611,20 +619,26 @@ class LocalBackend(Backend):
         consistency: Consistency | None = None,
         at_zookie: Zookie | None = None,
     ) -> Iterable[str]:
-        from ..compile.read import accessible_ids
+        from contextlib import nullcontext
+
+        from ..compile.read import accessible_ids, deciding_afresh
         from ..models import active_relationship_model
 
         self._validate_consistency(consistency, at_zookie)
-        return list(
-            accessible_ids(
-                backend=self,
-                resource_type=resource_type,
-                action=action,
-                actor=subject,
-                using=active_relationship_model().objects.db,
-                context=context,
+        # The latest state asked for explicitly is not read through rows an
+        # evaluator scope kept (proposal 0017).
+        latest = consistency == Consistency.FULLY_CONSISTENT
+        with deciding_afresh() if latest else nullcontext():
+            return list(
+                accessible_ids(
+                    backend=self,
+                    resource_type=resource_type,
+                    action=action,
+                    actor=subject,
+                    using=active_relationship_model().objects.db,
+                    context=context,
+                )
             )
-        )
 
     @_schema_operation
     def grants_all(

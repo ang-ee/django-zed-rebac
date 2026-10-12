@@ -3,7 +3,7 @@
 All notable changes to `django-zed-rebac` are tracked here. The project is in
 pre-1.0; breaking changes within a minor version are explicitly called out.
 
-## [Unreleased]
+## [0.27.0] — 2026-10-12
 
 ### Changed
 
@@ -20,6 +20,22 @@ pre-1.0; breaking changes within a minor version are explicitly called out.
   fields first. Other actions on an unsaved instance are unchanged.
 
 ### Added
+
+- Decided rows are kept within an evaluator scope (proposal 0017). The rows a
+  scope selects behind its arrows (a file's message part, message, thread,
+  channel; a folder's parents) were decided again by every statement; inside
+  `ActorMiddleware` or `evaluator_scope()` a later statement of the same
+  actor, context and permission now binds the kept sets after one statement
+  confirms they still hold. On a consumer's page with four statements over
+  one type, the 88 decision queries become, by count, 22 decisions and three
+  confirmations. Kept sets are lower bounds, witnessed in every statement as
+  before, and are dropped on any statement other than a plain `SELECT` the
+  scope sees on its connection, a savepoint, a transaction boundary or a
+  tuple write. The library's own audit insert (an audited `sudo()` between
+  two reads) drops neither the kept sets nor the scope's schema pins. A write the scope cannot see (another process, a driver
+  cursor, another alias) can hide a newly readable row until the scope ends;
+  call `current_evaluator().invalidate()` after one.
+  `accessible(consistency=Consistency.FULLY_CONSISTENT)` decides afresh.
 
 - `RebacQuerySet.readable(field)` (also on the manager): a gated field as the
   queryset's actor may read it, the column where the actor holds

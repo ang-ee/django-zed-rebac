@@ -12,7 +12,8 @@ from __future__ import annotations
 
 from collections import OrderedDict, deque
 from collections.abc import Callable, Hashable, Iterable, Iterator, Mapping, Sequence
-from contextlib import ExitStack
+from contextlib import ExitStack, contextmanager
+from contextvars import ContextVar
 from dataclasses import dataclass, field
 from datetime import datetime
 from functools import partial
@@ -49,7 +50,7 @@ from rebac.schema.ast import (
     PermRef,
     Schema,
 )
-from rebac.schema.cache import SchemaSnapshot, schema_operation
+from rebac.schema.cache import KeptRows, SchemaSnapshot, schema_operation
 from rebac.schema.walker import find_permission, find_relation
 from rebac.types import CheckItem, CheckResult, ObjectRef, SubjectRef
 
@@ -122,10 +123,31 @@ _fact_paths: OrderedDict[tuple[Any, ...], dict[tuple[Any, ...], Fact | None]] = 
 
 def reset() -> None:
     """Forget every kept policy and statement (settings or registries changed)."""
+    from rebac.evaluator import current_evaluator
+
     with _lock:
         _policies.clear()
         _statements.clear()
         _fact_paths.clear()
+    evaluator = current_evaluator()
+    if evaluator is not None:
+        # The decisions the open scope keeps were made under the old ones.
+        evaluator._schema_scope.clear()
+
+
+# Set while a read asks for the latest state (``Consistency.FULLY_CONSISTENT``):
+# its scopes decide afresh instead of binding rows a scope kept.
+_afresh: ContextVar[bool] = ContextVar("rebac_decide_afresh", default=False)
+
+
+@contextmanager
+def deciding_afresh() -> Iterator[None]:
+    """Scopes compiled inside decide their rows afresh (proposal 0017)."""
+    token = _afresh.set(True)
+    try:
+        yield
+    finally:
+        _afresh.reset(token)
 
 
 # ---------- The policy a statement is compiled for ----------
@@ -337,6 +359,12 @@ class _Rows:
         self.asked = 0
         self._found: dict[Key, _Decision | None] = {}
         self._pending: set[Key] = set()
+        # Decisions kept in the evaluator scope (proposal 0017), the ones this
+        # operation took from there, and the ones decided while a node in
+        # progress was compiled inline, which are not kept.
+        self._kept = operation.kept_rows(verdicts)
+        self.reused: dict[Key, _Decision] = {}
+        self._unkept: set[Key] = set()
 
     @property
     def room(self) -> int:
@@ -348,14 +376,82 @@ class _Rows:
         if key not in self._found:
             if key in self._pending:
                 # The node is being decided: its own body compiles it inline.
+                # What is decided meanwhile depends on that, so it is not kept.
+                self._unkept |= self._pending
                 return None
-            self._pending.add(key)
-            try:
-                self._found[key] = self._decide(key)
-            finally:
-                self._pending.discard(key)
+            if not self._reuse(key):
+                self._pending.add(key)
+                try:
+                    decision = self._decide(key)
+                finally:
+                    self._pending.discard(key)
+                self._found[key] = decision
+                self._keep(key, decision)
         decision = self._found[key]
         return decision.ids if decision is not None else None
+
+    def _reuse(self, key: Key) -> bool:
+        """Take ``key``'s decision kept in the scope, with every one it rests on.
+
+        A decision's witness embeds the keys of the decisions it was compiled
+        against, so it is used only with those very decisions: each one this
+        operation already holds, or finds kept, must be the same object.  A
+        decision taken afresh, or kept again after an eviction, under one of
+        those keys makes the kept decision unusable.  One compiled inline then
+        embeds no keys.  One that does not fit what the statement may still
+        bind is decided afresh.
+        """
+        if self._kept is None:
+            return False
+        store, prefix, _budget = self._kept
+        entry = store.get((*prefix, key))
+        if entry is None:
+            return False
+        closure: dict[Key, _Decision] = {key: entry[0]}
+        pending = [entry]
+        while pending:
+            _decision, depends = pending.pop()
+            for used, expected in depends.items():
+                if expected is None:
+                    continue
+                if used in closure:
+                    if closure[used] is not expected:
+                        return False
+                    continue
+                if used in self._found:
+                    if self._found[used] is not expected:
+                        return False
+                    continue
+                kept = store.get((*prefix, used))
+                if kept is None or kept[0] is not expected:
+                    return False
+                closure[used] = expected
+                pending.append(kept)
+        if sum(len(decision.ids) for decision in closure.values()) > self.room:
+            return False
+        for found, decision in closure.items():
+            store.move_to_end((*prefix, found))
+            self._found[found] = decision
+            self.reused[found] = decision
+        return True
+
+    def _keep(self, key: Key, decision: _Decision | None) -> None:
+        if self._kept is None or decision is None or key in self._unkept:
+            return
+        store, prefix, budget = self._kept
+        # The exact decisions its witness was compiled against.
+        depends = {used: self._found.get(used) for used in decision.uses}
+        name = (*prefix, key)
+        replaced = store.pop(name, None)
+        if replaced is not None:
+            store.held -= len(replaced[0].ids)
+        store[name] = (decision, depends)
+        store.held += len(decision.ids)
+        # As many decisions, and as many keys over all of them, as the
+        # evaluator's own size; the least recently used go first.
+        while store and (len(store) > budget or store.held > budget):
+            _name, (dropped, _depends) = store.popitem(last=False)
+            store.held -= len(dropped.ids)
 
     def witness(self, used: Iterable[Key]) -> Q:
         """Every decision the statement rests on, directly or through another one."""
@@ -563,13 +659,14 @@ class _Operation:
 
         A kept decision can be stale: another process may have changed a
         membership.  The witness of every authorizing statement then selects
-        nothing, so staleness denies and never grants.
+        nothing, so staleness denies and never grants.  A read that decides
+        afresh (``deciding_afresh``) decides the memberships afresh too.
         """
         from rebac.evaluator import ABSENT, current_evaluator
 
         evaluator = current_evaluator()
         kept = self.sets_kept(key)
-        if evaluator is None or kept is None:
+        if evaluator is None or kept is None or _afresh.get():
             return self._decide_sets(key, verdicts)
         found = evaluator._kept_sets(kept)
         if found is ABSENT:
@@ -675,6 +772,82 @@ class _Operation:
                     return None
             decided[bound] = {found: frozenset(ids) for found, ids in members.items()}
         return ActorSets(keys, decided[Bound.LOWER], decided[Bound.UPPER], tuple(support))
+
+    def kept_rows(self, verdicts: CaveatVerdicts) -> tuple[KeptRows, tuple[Any, ...], int] | None:
+        """Where the evaluator scope keeps decided rows, and their key prefix.
+
+        ``None`` outside a scope, under manual transaction management, and for
+        a caveat context that cannot be keyed.  The prefix holds what a
+        decision depends on besides its node: the operation's shape, the
+        actor, the context, the tuple generation, the actor's decided sets
+        (their memberships are bound into the decision's witness) and the
+        permission the scope asks for.
+        """
+        from rebac.backends import local
+        from rebac.evaluator import _ctx_key, current_evaluator
+
+        evaluator = current_evaluator()
+        if evaluator is None or _afresh.get() or self.policy.caveat_deadlines:
+            # A caveat override with a deadline changes the policy by the
+            # clock alone: nothing is kept under it, as no policy is kept.
+            return None
+        connection = connections[self.using]
+        if not (
+            connection.get_autocommit()
+            or (connection.in_atomic_block and connection.commit_on_exit)
+        ):
+            return None
+        context = _ctx_key(dict(self.context)) if self.context else ()
+        if context is None:
+            return None
+        sets = self.sets(verdicts)
+        prefix = (
+            self.shape,
+            self.actor,
+            context,
+            local._relationship_generation,
+            sets.digest if sets is not None else None,
+            self._roots[id(verdicts)],
+        )
+        return evaluator._schema_scope.rows(connection), prefix, evaluator._max_size
+
+    def confirm(self) -> bool:
+        """Whether every decision taken from the scope still holds.
+
+        One statement reads the witness of each.  When one fails, every
+        decision the scope keeps on this connection is dropped: the caller
+        builds its statement again, deciding afresh.
+        """
+        reused = [
+            (rows, decision) for rows in self._rows.values() for decision in rows.reused.values()
+        ]
+        if not reused:
+            return True
+        probes: dict[str, _Sql] = {}
+        for position, (_rows, decision) in enumerate(reused):
+            try:
+                sql, params = _Compiled(self.gate().filter(decision.witness).values("pk")).as_sql(
+                    None, connections[self.using]
+                )
+            except EmptyResultSet:
+                probes = {}
+                break
+            probes[f"held{position}"] = _Sql(sql, self.bound(params))
+        held = (
+            SchemaGeneration.objects.using(self.using)
+            .filter(pk=1)
+            .annotate(**probes)
+            .values_list(*probes)
+            .first()
+            if probes
+            else None
+        )
+        if held is not None and all(held):
+            return True
+        for rows, _decision in reused:
+            if rows._kept is not None:
+                rows._kept[0].clear()
+        return False
 
     def rows(self, verdicts: CaveatVerdicts) -> _Rows:
         """The decider of small row sets for the verdicts' permission."""
@@ -1388,6 +1561,11 @@ class _Scope(Expression):
             return "(1 = 0)", ()
         operation = _Operation.begin(self.backend, self.actor, self.using, policy=policy)
         compiled = _scope_statement(operation, self.model, (resource_type, self.action))
+        if not operation.confirm():
+            # A decision kept from an earlier statement no longer holds: the
+            # scope dropped its decisions, and this statement decides afresh.
+            operation = _Operation.begin(self.backend, self.actor, self.using, policy=policy)
+            compiled = _scope_statement(operation, self.model, (resource_type, self.action))
         if isinstance(compiled, bool):
             # ``True`` cannot occur: a statement that admits rows is a gate.
             return "(1 = 0)", ()
@@ -1667,8 +1845,31 @@ def held(
     """The ids among ``ids`` on which the actor holds the action.
 
     Ids that are rows of the type's model are tested by one scoped statement
-    per chunk; the others (no row, or not a valid identity) one by one.
+    per chunk; the others (no row, or not a valid identity) one by one.  A
+    write gate asks this: it decides afresh, never through rows a scope kept.
     """
+    with deciding_afresh():
+        return _held(
+            backend=backend,
+            resource_type=resource_type,
+            action=action,
+            actor=actor,
+            ids=ids,
+            using=using,
+            context=context,
+        )
+
+
+def _held(
+    *,
+    backend: LocalBackend,
+    resource_type: str,
+    action: str,
+    actor: SubjectRef,
+    ids: Iterable[str],
+    using: str,
+    context: Mapping[str, Any] | None,
+) -> set[str]:
     pending = set(ids)
     found: set[str] = set()
     model = model_for_resource_type(resource_type)
