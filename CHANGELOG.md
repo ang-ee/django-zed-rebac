@@ -28,9 +28,13 @@ pre-1.0; breaking changes within a minor version are explicitly called out.
   actor, context and permission now binds the kept sets after one statement
   confirms they still hold. On a consumer's page with four statements over
   one type, the 88 decision queries become, by count, 22 decisions and three
-  confirmations. Kept sets are lower bounds,
-  witnessed in every statement as before, and are dropped on any write the
-  scope sees on its connection, a transaction boundary or a tuple write.
+  confirmations. Kept sets are lower bounds, witnessed in every statement as
+  before, and are dropped on any statement other than a plain `SELECT` the
+  scope sees on its connection, a savepoint, a transaction boundary or a
+  tuple write. A write the scope cannot see (another process, a driver
+  cursor, another alias) can hide a newly readable row until the scope ends;
+  call `current_evaluator().invalidate()` after one.
+  `accessible(consistency=Consistency.FULLY_CONSISTENT)` decides afresh.
 
 - `RebacQuerySet.readable(field)` (also on the manager): a gated field as the
   queryset's actor may read it, the column where the actor holds

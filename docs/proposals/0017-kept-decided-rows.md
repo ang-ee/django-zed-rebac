@@ -206,3 +206,38 @@ request costs.
 
 After approval: ARCHITECTURE § Decided rows and § `PermissionEvaluator`,
 CHANGELOG.
+
+## Implementation notes
+
+A review of this draft against the code shaped the implementation:
+
+- **What is kept.** The decision itself (its rows, its witness and the
+  decisions it rests on), reused only together with those same kept
+  decisions: a witness embeds the keys of the decisions it was compiled
+  against, so reusing one beside a decision taken afresh could check rows
+  against stale keys. The key also holds the actor's decided sets, whose
+  memberships the witness binds, and the permission the scope asks for.
+  "Did not fit" is not kept: it depends on the room the operation had left.
+- **What drops it.** The evaluator scope's statement observer (§ 3 above is
+  superseded): any statement other than a plain `SELECT` on the connection,
+  a savepoint and its rollback, the transaction's end, a tuple write in the
+  process, `invalidate()`. It sees writes the library does not own (raw SQL
+  through Django, instance writes on a through table, third-party models,
+  `save(raw=True)`), and only the scope's own connection, so other requests
+  do not drop it. Writes on another alias are not seen; code that writes
+  outside Django calls `invalidate()`.
+- **Confirmation.** One statement reads each reused decision's witness; any
+  failure drops every kept decision on the connection and the statement is
+  built again, so a decision depending on a failed one is not reused.
+- **Not kept:** under a policy with a caveat-override deadline, for
+  `accessible(consistency=FULLY_CONSISTENT)`, on a connection under manual
+  transaction management. Write gates run inside a transaction or savepoint
+  the scope sees, so they decide afresh.
+- **Budget:** decisions and keys, each at most `REBAC_EVALUATOR_CACHE_SIZE`
+  per connection.
+- **Conflicts with stated contracts.** "The next read sees it" (AGENTS.md
+  5d, proposal 0015 § 10) now holds for writes through Django on the scope's
+  connection; a write by another process during a scope may be seen only
+  after the scope.
+- **Not measured yet:** database and Python time on PostgreSQL, and a run
+  with concurrent writers; the consumer measures its page on the release.

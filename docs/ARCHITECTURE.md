@@ -1899,13 +1899,22 @@ not kept.
    statement on that connection other than a plain `SELECT` (an insert,
    update or delete by any code, raw SQL through Django, a savepoint), a
    transaction boundary, a tuple written in the process, the scope's
-   `invalidate()` and its end. At most `REBAC_EVALUATOR_CACHE_SIZE` sets are
-   kept per connection, the least recently used dropped first. A connection
-   under manual transaction management keeps none.
+   `invalidate()` and its end. A write path opens a transaction or a
+   savepoint, which the scope sees, so a write gate decides afresh. At most
+   `REBAC_EVALUATOR_CACHE_SIZE` sets, holding at most as many keys over all
+   of them, are kept per connection, the least recently used dropped first.
+   Nothing is kept on a connection under manual transaction management,
+   under a policy with a caveat-override deadline (the clock alone changes
+   it), or for `accessible(consistency=Consistency.FULLY_CONSISTENT)`, which
+   decides afresh.
    A kept set stays a lower bound and every statement that binds it carries
    its witness, so it can hide a row and never grants one: a write the scope
-   cannot see (another process, a driver cursor that bypasses Django) can
-   leave a newly readable row out until the scope ends or drops its sets.
+   cannot see can leave a newly readable row out until the scope ends or
+   drops its sets. It cannot see another process, a driver cursor that
+   bypasses Django, or a write on another alias than the one the sets were
+   read from (permissions read from a replica already see writes late).
+   Code that writes through such a path and reads again in the same scope
+   calls `current_evaluator().invalidate()`, as for the schema pins.
    Before a statement that binds kept sets is used, one statement reads the
    witness of each; when one fails, every kept set is dropped and the
    statement is built again, deciding afresh, so a stale set does not empty

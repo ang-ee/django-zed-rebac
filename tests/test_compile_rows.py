@@ -708,3 +708,37 @@ def test_rows_are_kept_inside_a_request_transaction(tree):
             with CaptureQueriesContext(connection) as nested:
                 assert visible(Post) == expected
         assert _folder_reads(nested)
+
+
+def test_a_fully_consistent_read_decides_afresh(tree):
+    from rebac import Consistency, evaluator_scope
+
+    local, _folders, _posts, _grant = tree
+    with evaluator_scope():
+        local.accessible(subject=ALICE, action="read", resource_type="blog/post")
+        with CaptureQueriesContext(connection) as latest:
+            local.accessible(
+                subject=ALICE,
+                action="read",
+                resource_type="blog/post",
+                consistency=Consistency.FULLY_CONSISTENT,
+            )
+        with CaptureQueriesContext(connection) as kept:
+            local.accessible(subject=ALICE, action="read", resource_type="blog/post")
+    assert _folder_reads(latest) and _confirmations(latest) == []
+    assert _folder_reads(kept) == [] and len(_confirmations(kept)) == 1
+
+
+def test_kept_rows_are_bounded_by_the_evaluator_cache_size(tree, settings):
+    from rebac import evaluator_scope
+
+    _local, _folders, posts, _grant = tree
+    expected = {posts["child"].pk, posts["leaf"].pk}
+    # The hierarchy holds two keys: a budget of one keeps nothing.
+    settings.REBAC_EVALUATOR_CACHE_SIZE = 1
+    with evaluator_scope():
+        assert visible(Post) == expected
+        with CaptureQueriesContext(connection) as second:
+            assert visible(Post) == expected
+    assert _folder_reads(second)
+    assert _confirmations(second) == []

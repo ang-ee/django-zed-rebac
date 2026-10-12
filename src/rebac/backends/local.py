@@ -611,20 +611,26 @@ class LocalBackend(Backend):
         consistency: Consistency | None = None,
         at_zookie: Zookie | None = None,
     ) -> Iterable[str]:
-        from ..compile.read import accessible_ids
+        from contextlib import nullcontext
+
+        from ..compile.read import accessible_ids, deciding_afresh
         from ..models import active_relationship_model
 
         self._validate_consistency(consistency, at_zookie)
-        return list(
-            accessible_ids(
-                backend=self,
-                resource_type=resource_type,
-                action=action,
-                actor=subject,
-                using=active_relationship_model().objects.db,
-                context=context,
+        # The latest state asked for explicitly is not read through rows an
+        # evaluator scope kept (proposal 0017).
+        latest = consistency is Consistency.FULLY_CONSISTENT
+        with deciding_afresh() if latest else nullcontext():
+            return list(
+                accessible_ids(
+                    backend=self,
+                    resource_type=resource_type,
+                    action=action,
+                    actor=subject,
+                    using=active_relationship_model().objects.db,
+                    context=context,
+                )
             )
-        )
 
     @_schema_operation
     def grants_all(

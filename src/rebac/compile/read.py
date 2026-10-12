@@ -12,7 +12,8 @@ from __future__ import annotations
 
 from collections import OrderedDict, deque
 from collections.abc import Callable, Hashable, Iterable, Iterator, Mapping, Sequence
-from contextlib import ExitStack
+from contextlib import ExitStack, contextmanager
+from contextvars import ContextVar
 from dataclasses import dataclass, field
 from datetime import datetime
 from functools import partial
@@ -122,10 +123,31 @@ _fact_paths: OrderedDict[tuple[Any, ...], dict[tuple[Any, ...], Fact | None]] = 
 
 def reset() -> None:
     """Forget every kept policy and statement (settings or registries changed)."""
+    from rebac.evaluator import current_evaluator
+
     with _lock:
         _policies.clear()
         _statements.clear()
         _fact_paths.clear()
+    evaluator = current_evaluator()
+    if evaluator is not None:
+        # The decisions the open scope keeps were made under the old ones.
+        evaluator._schema_scope.clear()
+
+
+# Set while a read asks for the latest state (``Consistency.FULLY_CONSISTENT``):
+# its scopes decide afresh instead of binding rows a scope kept.
+_afresh: ContextVar[bool] = ContextVar("rebac_decide_afresh", default=False)
+
+
+@contextmanager
+def deciding_afresh() -> Iterator[None]:
+    """Scopes compiled inside decide their rows afresh (proposal 0017)."""
+    token = _afresh.set(True)
+    try:
+        yield
+    finally:
+        _afresh.reset(token)
 
 
 # ---------- The policy a statement is compiled for ----------
@@ -410,8 +432,13 @@ class _Rows:
         store, prefix = self._kept
         store[(*prefix, key)] = decision
         store.move_to_end((*prefix, key))
-        while len(store) > app_settings.REBAC_EVALUATOR_CACHE_SIZE:
-            store.popitem(last=False)
+        # As many decisions, and as many keys over all of them, as the
+        # evaluator's cache size; the least recently used go first.
+        budget = app_settings.REBAC_EVALUATOR_CACHE_SIZE
+        held = sum(len(kept.ids) for kept in store.values())
+        while store and (len(store) > budget or held > budget):
+            _key, dropped = store.popitem(last=False)
+            held -= len(dropped.ids)
 
     def witness(self, used: Iterable[Key]) -> Q:
         """Every decision the statement rests on, directly or through another one."""
@@ -748,7 +775,9 @@ class _Operation:
         from rebac.evaluator import _ctx_key, current_evaluator
 
         evaluator = current_evaluator()
-        if evaluator is None:
+        if evaluator is None or _afresh.get() or self.policy.caveat_deadlines:
+            # A caveat override with a deadline changes the policy by the
+            # clock alone: nothing is kept under it, as no policy is kept.
             return None
         connection = connections[self.using]
         if not (
