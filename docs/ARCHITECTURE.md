@@ -1812,6 +1812,8 @@ then selects nothing, so staleness denies and never grants. The depth probe
 of a check carries the same witness: sets that are no longer the actor's are
 a change for the residual evaluator to answer afresh, not a depth to report
 as `PermissionDepthExceeded`. Outside a scope every operation decides afresh.
+The rows a scope decides behind its arrows are kept in a scope too (see
+[Decided rows](#decided-rows), 6).
 
 Several actors of one shape can be decided together
 (see [Bulk checks](#bulk-checks)).
@@ -1881,8 +1883,33 @@ Decided rows are used by queryset scopes and by what is built on them
 (`accessible()` without a context, bulk guards, the backed-edge gate over
 more than four rows). A point check stays one statement at its one object.
 A statement that carries decided keys is compiled for that operation and is
-not kept. Nothing is kept between operations: the sets depend on model rows,
-which change without the library seeing it.
+not kept.
+
+6. **Kept within a scope** ([proposal 0017](./proposals/0017-kept-decided-rows.md)).
+   Outside an evaluator scope nothing is kept between operations: the sets
+   depend on model rows, which change without the library seeing it. Inside
+   one (a request under `ActorMiddleware`, an explicit `evaluator_scope()`),
+   a decided set is kept per database alias, policy, actor shape, actor,
+   caveat context, tuple generation, permission the scope asks for, and node,
+   and a later operation of the same kind binds it instead of deciding it
+   again. A set is reused only with every set it rests on, the same kept
+   sets, so its witness is whole; one that does not fit what the statement
+   may still bind is decided as before. Kept sets are dropped, every one of
+   them, on whatever the scope already drops its schema pins on: any
+   statement on that connection other than a plain `SELECT` (an insert,
+   update or delete by any code, raw SQL through Django, a savepoint), a
+   transaction boundary, a tuple written in the process, the scope's
+   `invalidate()` and its end. At most `REBAC_EVALUATOR_CACHE_SIZE` sets are
+   kept per connection, the least recently used dropped first. A connection
+   under manual transaction management keeps none.
+   A kept set stays a lower bound and every statement that binds it carries
+   its witness, so it can hide a row and never grants one: a write the scope
+   cannot see (another process, a driver cursor that bypasses Django) can
+   leave a newly readable row out until the scope ends or drops its sets.
+   Before a statement that binds kept sets is used, one statement reads the
+   witness of each; when one fails, every kept set is dropped and the
+   statement is built again, deciding afresh, so a stale set does not empty
+   every later statement of the scope.
 
 A union is compiled constants first (an arrow over a const-backed relation,
 `authenticated`), and stops at the first arm that holds outright, so an

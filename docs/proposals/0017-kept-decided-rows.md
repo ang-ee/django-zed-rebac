@@ -1,9 +1,15 @@
 # Proposal 0017: decided rows kept for a unit of work
 
-**Status:** draft for the owner's decision. Requested by a consumer whose list
+**Status:** approved and implemented. The owner's decisions (§ Decisions for
+the owner): keep decided rows within an evaluator scope; drop every kept set
+on any write the scope sees; confirm before reuse; no setting. One change in
+implementation: instead of a row generation bumped by the library's own
+writes (§ 3), kept sets are dropped by the observer the evaluator scope
+already runs for its schema pins, which sees every statement on the
+connection (any insert, update or delete, raw SQL through Django, a
+savepoint) and every transaction boundary. The behaviour is specified in
+`docs/ARCHITECTURE.md` § Decided rows, 6. Requested by a consumer whose list
 pages decide the same rows again before every statement over one type.
-Changes one deliberate rule of `docs/ARCHITECTURE.md` § Decided rows ("Nothing
-is kept between operations").
 
 ## Problem
 

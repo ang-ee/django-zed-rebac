@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from collections import OrderedDict
 from collections.abc import Callable
 from contextvars import ContextVar
 from datetime import datetime
@@ -28,6 +29,9 @@ class SchemaSnapshot(NamedTuple):
 class _ConnectionSchemas:
     def __init__(self, connection: BaseDatabaseWrapper) -> None:
         self.snapshots: WeakKeyDictionary[Any, SchemaSnapshot] = WeakKeyDictionary()
+        # The rows scopes decided on this connection (proposal 0017): dropped
+        # with the snapshots, on every write and transaction boundary.
+        self.rows: OrderedDict[Any, Any] = OrderedDict()
         self.marker: Callable[[], None] | None = None
         self.atomic = False
         self.observer = self._observe
@@ -47,6 +51,7 @@ class _ConnectionSchemas:
         # architecture contract. Invalidate before even a failed write/rollback.
         if many or not str(sql).lstrip().upper().startswith("SELECT "):
             self.snapshots.clear()
+            self.rows.clear()
         return execute(sql, params, many, context)
 
     def prepare(self, connection: BaseDatabaseWrapper) -> None:
@@ -56,6 +61,7 @@ class _ConnectionSchemas:
         )
         if atomic != self.atomic or (atomic and not pending):
             self.snapshots.clear()
+            self.rows.clear()
             self.marker = None
         self.atomic = atomic
         if atomic and self.marker is None:
@@ -79,12 +85,19 @@ class SchemaScope:
         self.users = 0
 
     def snapshots(self, connection: BaseDatabaseWrapper) -> WeakKeyDictionary[Any, SchemaSnapshot]:
+        return self._state(connection).snapshots
+
+    def rows(self, connection: BaseDatabaseWrapper) -> OrderedDict[Any, Any]:
+        """The rows decided on ``connection`` in this scope, kept as its pins are."""
+        return self._state(connection).rows
+
+    def _state(self, connection: BaseDatabaseWrapper) -> _ConnectionSchemas:
         state = self.connections.get(connection)
         if state is None:
             state = _ConnectionSchemas(connection)
             self.connections[connection] = state
         state.prepare(connection)
-        return state.snapshots
+        return state
 
     def clear(self) -> None:
         for connection, state in list(self.connections.items()):

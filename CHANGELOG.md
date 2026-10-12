@@ -21,6 +21,17 @@ pre-1.0; breaking changes within a minor version are explicitly called out.
 
 ### Added
 
+- Decided rows are kept within an evaluator scope (proposal 0017). The rows a
+  scope selects behind its arrows (a file's message part, message, thread,
+  channel; a folder's parents) were decided again by every statement; inside
+  `ActorMiddleware` or `evaluator_scope()` a later statement of the same
+  actor, context and permission now binds the kept sets after one statement
+  confirms they still hold. On a consumer's page with four statements over
+  one type, the 88 decision queries become, by count, 22 decisions and three
+  confirmations. Kept sets are lower bounds,
+  witnessed in every statement as before, and are dropped on any write the
+  scope sees on its connection, a transaction boundary or a tuple write.
+
 - `RebacQuerySet.readable(field)` (also on the manager): a gated field as the
   queryset's actor may read it, the column where the actor holds
   `read__<field>` and `NULL` elsewhere. The field read guards accept it in a

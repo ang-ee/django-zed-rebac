@@ -561,3 +561,150 @@ def test_point_checks_do_not_decide_sets(tree):
     assert not local.check_access(
         subject=ALICE, action="read", resource=ObjectRef("blog/folder", str(folders["root"].pk))
     ).allowed
+
+
+# ---------- Kept within an evaluator scope (proposal 0017) ----------
+
+BOB = SubjectRef.of("auth/user", "bob")
+
+
+def _folder_reads(queries):
+    """The decisions over folders: statements whose root table is the folder table."""
+    return [q for q in queries if q["sql"].startswith('SELECT "testapp_folder".')]
+
+
+def _confirmations(queries):
+    return [
+        q
+        for q in queries
+        if q["sql"].startswith("SELECT EXISTS")
+        or ('FROM "rebac_schemageneration"' in q["sql"] and "held0" in q["sql"])
+    ]
+
+
+def _listed(sql_queries):
+    return [q["sql"] for q in sql_queries if q["sql"].startswith('SELECT "testapp_post".')]
+
+
+def test_a_scope_binds_the_rows_it_decided_again(tree):
+    from rebac import evaluator_scope
+
+    _local, _folders, posts, _grant = tree
+    expected = {posts["child"].pk, posts["leaf"].pk}
+    with evaluator_scope():
+        with CaptureQueriesContext(connection) as first:
+            assert visible(Post) == expected
+        with CaptureQueriesContext(connection) as second:
+            assert visible(Post) == expected
+    assert _folder_reads(first)
+    # The second statement decides nothing: one statement confirms the kept rows.
+    assert _folder_reads(second) == []
+    assert len(_confirmations(second)) == 1
+    assert _listed(second) == _listed(first)
+
+
+def test_nothing_is_kept_outside_a_scope(tree):
+    _local, _folders, _posts, _grant = tree
+    with CaptureQueriesContext(connection) as first:
+        visible(Post)
+    with CaptureQueriesContext(connection) as second:
+        visible(Post)
+    assert len(_folder_reads(second)) == len(_folder_reads(first)) > 0
+    assert _confirmations(second) == []
+
+
+def test_a_write_the_scope_sees_drops_the_kept_rows(tree):
+    from rebac import evaluator_scope
+
+    _local, folders, posts, _grant = tree
+    with evaluator_scope():
+        assert visible(Post) == {posts["child"].pk, posts["leaf"].pk}
+        with sudo(reason="test.move"):
+            Folder.objects.filter(pk=folders["other"].pk).update(parent=folders["child"])
+        with CaptureQueriesContext(connection) as after:
+            assert visible(Post) == {posts["child"].pk, posts["leaf"].pk, posts["other"].pk}
+    assert _folder_reads(after)
+    assert _confirmations(after) == []
+
+
+def _unseen(change):
+    """Run ``change`` where the scope cannot see it, as another process would."""
+    observers = [
+        wrapper
+        for wrapper in connection.execute_wrappers
+        if type(getattr(wrapper, "__self__", None)).__name__ == "_ConnectionSchemas"
+    ]
+    for wrapper in observers:
+        connection.execute_wrappers.remove(wrapper)
+    try:
+        with sudo(reason="test.unseen"):
+            change()
+    finally:
+        connection.execute_wrappers[0:0] = observers
+
+
+def test_a_kept_set_that_no_longer_holds_is_decided_afresh(tree):
+    from rebac import evaluator_scope
+
+    _local, folders, posts, _grant = tree
+    with evaluator_scope():
+        assert visible(Post) == {posts["child"].pk, posts["leaf"].pk}
+        _unseen(
+            lambda: Folder._base_manager.filter(pk=folders["leaf"].pk).update(
+                parent=folders["other"]
+            )
+        )
+        with CaptureQueriesContext(connection) as after:
+            # The confirmation fails, the scope drops its rows, the statement
+            # decides afresh: not an empty answer for the rest of the scope.
+            assert visible(Post) == {posts["child"].pk}
+        assert len(_confirmations(after)) == 1
+        assert _folder_reads(after)
+        assert visible(Folder) == {folders["child"].pk}
+
+
+def test_a_row_the_scope_cannot_see_appear_waits_for_the_scope(tree):
+    from rebac import evaluator_scope
+
+    _local, folders, posts, _grant = tree
+    with evaluator_scope():
+        assert visible(Post) == {posts["child"].pk, posts["leaf"].pk}
+        _unseen(
+            lambda: Folder._base_manager.filter(pk=folders["other"].pk).update(
+                parent=folders["child"]
+            )
+        )
+        # A kept set is a lower bound: the newly readable row stays hidden.
+        assert visible(Post) == {posts["child"].pk, posts["leaf"].pk}
+    assert visible(Post) == {posts["child"].pk, posts["leaf"].pk, posts["other"].pk}
+
+
+def test_kept_rows_are_the_actors_own(tree):
+    from rebac import evaluator_scope
+
+    local, folders, posts, _grant = tree
+    local.write_relationships([RelationshipTuple(to_object_ref(folders["other"]), "viewer", BOB)])
+    alice = {posts["child"].pk, posts["leaf"].pk}
+    with evaluator_scope():
+        assert visible(Post) == alice
+        assert set(Post.objects.with_actor(BOB).values_list("pk", flat=True)) == {posts["other"].pk}
+        assert visible(Post) == alice
+
+
+def test_rows_are_kept_inside_a_request_transaction(tree):
+    from django.db import transaction
+
+    from rebac import evaluator_scope
+
+    _local, _folders, posts, _grant = tree
+    expected = {posts["child"].pk, posts["leaf"].pk}
+    with evaluator_scope(), transaction.atomic():
+        assert visible(Post) == expected
+        with CaptureQueriesContext(connection) as second:
+            assert visible(Post) == expected
+        assert _folder_reads(second) == []
+        with transaction.atomic():
+            # A savepoint is a statement the scope sees: the rows are dropped.
+            with CaptureQueriesContext(connection) as nested:
+                assert visible(Post) == expected
+        assert _folder_reads(nested)
