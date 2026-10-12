@@ -22,7 +22,7 @@ from dataclasses import field as dataclass_field
 from typing import TYPE_CHECKING, Any, ClassVar, Self, cast
 
 from django.core.exceptions import ImproperlyConfigured
-from django.db import models, router
+from django.db import models, router, transaction
 from django.db.models.base import ModelBase
 from django.db.models.options import DEFAULT_NAMES
 
@@ -311,20 +311,97 @@ class RebacTrackedMixin(models.Model, metaclass=RebacModelBase):
         using: str | None = None,
         update_fields: Iterable[str] | None = None,
     ) -> None:
+        from .audit import save_check
+        from .errors import PermissionDenied
         from .signals import audit_backed_denials
         from .watch import model_write
 
         alias = using or router.db_for_write(type(self), instance=self)
         if raw:
             return super().save_base(raw, force_insert, force_update, alias, update_fields)
-        with (
-            audit_backed_denials(),
-            model_write(model=type(self), using=alias, names=update_fields),
-        ):
-            from .signals import _gate_backed_field_change
+        check = save_check.get()
+        try:
+            with (
+                audit_backed_denials(),
+                model_write(model=type(self), using=alias, names=update_fields),
+            ):
+                from .signals import _gate_backed_field_change
 
-            _gate_backed_field_change(type(self), self, alias, update_fields)
-            super().save_base(raw, force_insert, force_update, alias, update_fields)
+                _gate_backed_field_change(type(self), self, alias, update_fields)
+                if check is not None:
+                    if check.target is self:
+                        # check_save(): the gates passed; Django would write now.
+                        raise _SaveChecked
+                    check.saved.append((self, self.pk, self._state.adding, self._state.db))
+                super().save_base(raw, force_insert, force_update, alias, update_fields)
+        except PermissionDenied as exc:
+            if check is not None and check.target is self:
+                check.denied = exc
+            raise
+
+    def check_save(
+        self, *, using: str | None = None, update_fields: Iterable[str] | None = None
+    ) -> CheckResult:
+        """The verdict the save gates reach for ``save()``, without writing.
+
+        ``save()`` itself runs, with these arguments: the model's override,
+        Django's preparation (a deferred instance's loaded fields, the key of
+        a related object saved after it was assigned, the checks on
+        ``update_fields``) and the gates, inside a transaction on the
+        instance's write alias that is rolled back.  The instance's first
+        save stops where Django would send ``pre_save`` and write.
+        ``HAS_PERMISSION`` when it passes the gates (or writes nothing, as
+        with empty ``update_fields``), ``NO_PERMISSION`` with the denial's
+        reason otherwise, even when an override swallows the denial.
+
+        Nothing is audited inside: the instance's own bypass is taken, and
+        audited, before; a bypass taken by anything else is left for the real
+        save to audit; no denial is audited.  The instance is left as it was,
+        and other model instances the override saves get back their primary
+        key and state.  An override's effects outside that transaction run as
+        they would in ``save()``.
+        """
+        from .audit import SaveCheck, save_check
+        from .errors import PermissionDenied
+
+        running = save_check.get()
+        if running is not None and running.target is self:
+            # Asked again from within its own save(): the running check decides.
+            return CheckResult.has(reason="the enclosing check decides")
+        if isinstance(self, RebacMixin):
+            # The instance's own bypass takes effect with the check, outside
+            # the work it rolls back: the save that follows does not audit it.
+            self._audit_bypass_once()
+        alias = using or router.db_for_write(type(self), instance=self)
+        # save() prepares the instance (an override, Django's related keys);
+        # the real save prepares it again, so it is left as it was.
+        kept = dict(vars(self))
+        kept_state = (self._state.adding, self._state.db, dict(self._state.fields_cache))
+        check = SaveCheck(self)
+        token = save_check.set(check)
+        try:
+            with transaction.atomic(using=alias):
+                try:
+                    self.save(using=using, update_fields=update_fields)
+                except _SaveChecked:
+                    pass
+                transaction.set_rollback(True, using=alias)
+        except PermissionDenied as denied:
+            return CheckResult.no(reason=str(denied))
+        finally:
+            save_check.reset(token)
+            for instance, pk, adding, db in reversed(check.saved):
+                instance.pk = pk
+                instance._state.adding = adding
+                instance._state.db = db
+            vars(self).clear()
+            vars(self).update(kept)
+            self._state.adding, self._state.db, cache = kept_state
+            self._state.fields_cache.clear()
+            self._state.fields_cache.update(cache)
+        if check.denied is not None:
+            return CheckResult.no(reason=str(check.denied))
+        return CheckResult.has(reason="the save gates pass")
 
     def delete(
         self, using: str | None = None, keep_parents: bool = False
@@ -378,6 +455,8 @@ class RebacMixin(RebacTrackedMixin):
       - ``instance.is_sudo()`` / ``instance.actor()`` — introspection.
       - ``instance.check_access(action)`` — three-state ``CheckResult``.
       - ``instance.has_access(action)`` — boolean shorthand.
+      - ``instance.check_save(using=..., update_fields=...)`` — the verdict
+        the save gates reach for ``save()``, without writing.
 
     Pickle / cross-process posture:
       ``__getstate__`` strips ``_rebac_actor``, ``_rebac_sudo_reason``, and
@@ -577,7 +656,12 @@ class RebacMixin(RebacTrackedMixin):
         return self
 
     def _audit_bypass_once(self) -> None:
+        from .audit import save_check
+
         if self._rebac_sudo_reason is None or self._rebac_sudo_audited:
+            return
+        if save_check.get() is not None:
+            # Inside a check everything is rolled back: the real save audits it.
             return
         from .actors import current_actor
         from .audit import emit
@@ -798,6 +882,11 @@ class RebacMixin(RebacTrackedMixin):
                 _gate_save(type(self), self, using=alias, update_fields=update_fields)
                 super().save_base(raw, force_insert, force_update, alias, update_fields)
         except PermissionDenied as exc:
+            from .audit import save_check
+
+            check = save_check.get()
+            if check is not None and check.target is self:
+                check.denied = exc
             # The gate's audit write was inside the rolled-back owner block
             # (model_write always opens one). Re-emit it after the rollback,
             # preserving any caller transaction and the exact field action.
@@ -915,6 +1004,10 @@ class RebacMixin(RebacTrackedMixin):
         return str(getattr(self, attr))
 
 
+class _SaveChecked(BaseException):
+    """Raised to roll back ``check_save``'s transaction once the gates passed."""
+
+
 def _maybe_audit_denial(*, actor: SubjectRef | None, action: str, resource: ObjectRef) -> None:
     """Emit a denial audit row when REBAC_AUDIT_DENIALS is enabled.
 
@@ -926,7 +1019,10 @@ def _maybe_audit_denial(*, actor: SubjectRef | None, action: str, resource: Obje
     happen). The reason text carries the ``denied:`` prefix so consumers
     can distinguish denial from successful writes when querying the trail.
     """
-    if not app_settings.REBAC_AUDIT_DENIALS:
+    from .audit import save_check
+
+    if not app_settings.REBAC_AUDIT_DENIALS or save_check.get() is not None:
+        # A denial inside check_save is an answer, not an attempt.
         return
     from .audit import emit as emit_audit
     from .models import PermissionAuditEvent
