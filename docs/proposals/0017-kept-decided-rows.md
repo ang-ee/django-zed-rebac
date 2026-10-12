@@ -58,6 +58,10 @@ changes.
 
 ### 1. What is kept, and under which key
 
+*Superseded in implementation: the decision is kept whole, witness
+included, and reused only with the exact decisions its witness was compiled
+against (see Implementation notes).*
+
 The decider of an operation (`_Rows` in `rebac/compile/read.py`) keeps, per
 node key, what it found: the identities (`_Decision.ids`), or a hierarchy's
 levels, or the fact that the node did not fit or holds for every row
@@ -90,6 +94,10 @@ any decision; one that does not fit what is left stays inline, as today.
 
 ### 3. What drops a kept decision
 
+*Superseded in implementation: the evaluator scope's statement observer
+drops kept decisions; there is no row generation (see Implementation
+notes).*
+
 - **A tuple write in the process:** the relationship generation changes.
 - **A model write the library owns:** a process-wide row generation, bumped
   wherever a write to a resource model, or to a column or through row the
@@ -111,6 +119,10 @@ scope ends or an owned write drops the decision. It cannot grant: a row
 that left the set fails the witness.
 
 ### 4. Confirmation
+
+*Changed in implementation: a failed confirmation drops every kept decision
+on the connection, not only the failed one, and the statement is built again
+(see Implementation notes).*
 
 Today a failed witness makes the statement select nothing, and the next
 operation decides afresh. With kept decisions the next operation would bind
@@ -212,10 +224,10 @@ CHANGELOG.
 A review of this draft against the code shaped the implementation:
 
 - **What is kept.** The decision itself (its rows, its witness and the
-  decisions it rests on), reused only together with those same kept
-  decisions: a witness embeds the keys of the decisions it was compiled
-  against, so reusing one beside a decision taken afresh could check rows
-  against stale keys. The key also holds the actor's decided sets, whose
+  exact decisions it rests on, by identity), reused only together with those
+  very decisions: a witness embeds the keys of the decisions it was compiled
+  against, so reusing one beside a decision taken afresh, or kept again
+  after an eviction, could check rows against stale keys and grant. The key also holds the actor's decided sets, whose
   memberships the witness binds, and the permission the scope asks for.
   "Did not fit" is not kept: it depends on the room the operation had left.
 - **What drops it.** The evaluator scope's statement observer (§ 3 above is
@@ -229,12 +241,13 @@ A review of this draft against the code shaped the implementation:
 - **Confirmation.** One statement reads each reused decision's witness; any
   failure drops every kept decision on the connection and the statement is
   built again, so a decision depending on a failed one is not reused.
-- **Not kept:** under a policy with a caveat-override deadline, for
-  `accessible(consistency=FULLY_CONSISTENT)`, on a connection under manual
-  transaction management. Write gates run inside a transaction or savepoint
-  the scope sees, so they decide afresh.
-- **Budget:** decisions and keys, each at most `REBAC_EVALUATOR_CACHE_SIZE`
-  per connection.
+- **Not kept or not used:** under a policy with a caveat-override
+  deadline, for reads with `consistency=FULLY_CONSISTENT`, on a connection
+  under manual transaction management, and by write gates (bulk write
+  guards, the backed-edge gate), which decide afresh: a gate can run outside
+  a transaction (a related manager's preflight under autocommit).
+- **Budget:** decisions and keys, each at most the evaluator's size per
+  connection.
 - **Conflicts with stated contracts.** "The next read sees it" (AGENTS.md
   5d, proposal 0015 § 10) now holds for writes through Django on the scope's
   connection; a write by another process during a scope may be seen only

@@ -742,3 +742,111 @@ def test_kept_rows_are_bounded_by_the_evaluator_cache_size(tree, settings):
             assert visible(Post) == expected
     assert _folder_reads(second)
     assert _confirmations(second) == []
+
+
+def _unseen_tuples(monkeypatch, change):
+    """Write tuples as another process would: unseen, no generation bump here."""
+    from rebac.backends import local as local_backend
+
+    generation = local_backend._relationship_generation
+    _unseen(change)
+    monkeypatch.setattr(local_backend, "_relationship_generation", generation)
+
+
+SHARED_SCHEMA = """
+definition auth/user {}
+definition blog/folder {
+    relation parent: blog/folder // rebac:field=parent
+    relation viewer: auth/user
+    permission open = viewer
+    permission nested = parent->open
+}
+definition blog/post {
+    relation folder: blog/folder // rebac:field=folder
+    permission read = folder->open + folder->nested
+}
+"""
+
+
+def test_a_kept_set_is_reused_only_with_the_very_sets_it_rests_on(monkeypatch, settings):
+    """``nested`` was decided through ``open``; ``open`` is evicted, its grant
+    revoked unseen, and decided again: ``nested`` must not be reused beside
+    the new ``open``, or its witness would check the old folders."""
+    from rebac import evaluator_scope
+
+    local = install_schema(SHARED_SCHEMA)
+    with sudo(reason="test.fixture"):
+        b1 = Folder.objects.create(name="b1")
+        b2 = Folder.objects.create(name="b2")
+        a1 = Folder.objects.create(name="a1", parent=b1)
+        p1 = Post.objects.create(title="p1", folder=a1)
+        p2 = Post.objects.create(title="p2", folder=b2)
+    grants = [RelationshipTuple(to_object_ref(folder), "viewer", ALICE) for folder in (b1, b2)]
+    local.write_relationships(grants)
+    settings.REBAC_EVALUATOR_CACHE_SIZE = 2
+    with evaluator_scope():
+        assert visible(Post) == {p1.pk, p2.pk}
+        _unseen_tuples(monkeypatch, lambda: local.delete_relationship(grants[0]))
+        assert visible(Post) == {p2.pk}
+    assert visible(Post) == {p2.pk}
+
+
+GATE_SCHEMA = """
+definition auth/user {}
+definition blog/folder {
+    relation editor: auth/user
+    relation parent: blog/folder // rebac:field=parent
+    permission write = editor + parent->write
+    permission read = write
+}
+definition blog/post {
+    relation folder: blog/folder // rebac:field=folder
+    relation shelf: blog/folder // rebac:field=collections
+    permission write = folder->write
+    permission read = write
+}
+"""
+
+
+def test_a_write_gate_does_not_bind_kept_rows(monkeypatch):
+    from rebac import actor_context, evaluator_scope
+
+    local = install_schema(GATE_SCHEMA)
+    with sudo(reason="test.fixture"):
+        box = Folder.objects.create(name="box")
+        g1 = Folder.objects.create(name="g1")
+        g2 = Folder.objects.create(name="g2")
+        posts = [Post.objects.create(title=f"p{n}", folder=g2) for n in range(5)]
+    local.write_relationships(
+        [RelationshipTuple(to_object_ref(folder), "editor", ALICE) for folder in (box, g1)]
+    )
+    with evaluator_scope(), actor_context(ALICE):
+        # A read keeps the folders alice may write: box and g1.
+        assert (
+            set(local.accessible(subject=ALICE, action="write", resource_type="blog/post")) == set()
+        )
+        _unseen_tuples(
+            monkeypatch,
+            lambda: local.write_relationships(
+                [RelationshipTuple(to_object_ref(g2), "editor", ALICE)]
+            ),
+        )
+        # The gate decides afresh: g2 is alice's now, so are its posts.
+        Folder.objects.get(pk=box.pk).collected_posts.add(*posts)
+    with sudo(reason="test.verify"):
+        assert set(box.collected_posts.values_list("pk", flat=True)) == {p.pk for p in posts}
+
+
+def test_a_statement_outside_a_transaction_drops_the_kept_rows(tree):
+    from rebac import evaluator_scope
+
+    _local, _folders, posts, _grant = tree
+    with evaluator_scope():
+        assert visible(Post) == {posts["child"].pk, posts["leaf"].pk}
+        # An insert into a model the policy does not read, in no transaction:
+        # only the statement observer can see it.
+        get_user_model().objects.create(username="unrelated")
+        with CaptureQueriesContext(connection) as after:
+            assert visible(Post) == {posts["child"].pk, posts["leaf"].pk}
+    assert _folder_reads(after)
+    assert _confirmations(after) == []

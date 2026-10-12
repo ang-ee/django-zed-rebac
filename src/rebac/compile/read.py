@@ -50,7 +50,7 @@ from rebac.schema.ast import (
     PermRef,
     Schema,
 )
-from rebac.schema.cache import SchemaSnapshot, schema_operation
+from rebac.schema.cache import KeptRows, SchemaSnapshot, schema_operation
 from rebac.schema.walker import find_permission, find_relation
 from rebac.types import CheckItem, CheckResult, ObjectRef, SubjectRef
 
@@ -393,31 +393,40 @@ class _Rows:
     def _reuse(self, key: Key) -> bool:
         """Take ``key``'s decision kept in the scope, with every one it rests on.
 
-        A decision's witness reads its rows through the decisions it was made
-        from, so it is used only with those same decisions.  One that does not
-        fit what the statement may still bind is decided afresh.
+        A decision's witness embeds the keys of the decisions it was compiled
+        against, so it is used only with those very decisions: each one this
+        operation already holds, or finds kept, must be the same object.  A
+        decision taken afresh, or kept again after an eviction, under one of
+        those keys makes the kept decision unusable.  One compiled inline then
+        embeds no keys.  One that does not fit what the statement may still
+        bind is decided afresh.
         """
         if self._kept is None:
             return False
-        store, prefix = self._kept
+        store, prefix, _budget = self._kept
         entry = store.get((*prefix, key))
         if entry is None:
             return False
-        closure: dict[Key, _Decision] = {key: entry}
-        pending = list(entry.uses)
+        closure: dict[Key, _Decision] = {key: entry[0]}
+        pending = [entry]
         while pending:
-            used = pending.pop()
-            if used in closure:
-                continue
-            kept = store.get((*prefix, used))
-            if kept is None:
-                return False
-            if used in self._found:
-                if self._found[used] is not kept:
+            _decision, depends = pending.pop()
+            for used, expected in depends.items():
+                if expected is None:
+                    continue
+                if used in closure:
+                    if closure[used] is not expected:
+                        return False
+                    continue
+                if used in self._found:
+                    if self._found[used] is not expected:
+                        return False
+                    continue
+                kept = store.get((*prefix, used))
+                if kept is None or kept[0] is not expected:
                     return False
-                continue
-            closure[used] = kept
-            pending.extend(kept.uses)
+                closure[used] = expected
+                pending.append(kept)
         if sum(len(decision.ids) for decision in closure.values()) > self.room:
             return False
         for found, decision in closure.items():
@@ -429,16 +438,20 @@ class _Rows:
     def _keep(self, key: Key, decision: _Decision | None) -> None:
         if self._kept is None or decision is None or key in self._unkept:
             return
-        store, prefix = self._kept
-        store[(*prefix, key)] = decision
-        store.move_to_end((*prefix, key))
+        store, prefix, budget = self._kept
+        # The exact decisions its witness was compiled against.
+        depends = {used: self._found.get(used) for used in decision.uses}
+        name = (*prefix, key)
+        replaced = store.pop(name, None)
+        if replaced is not None:
+            store.held -= len(replaced[0].ids)
+        store[name] = (decision, depends)
+        store.held += len(decision.ids)
         # As many decisions, and as many keys over all of them, as the
-        # evaluator's cache size; the least recently used go first.
-        budget = app_settings.REBAC_EVALUATOR_CACHE_SIZE
-        held = sum(len(kept.ids) for kept in store.values())
-        while store and (len(store) > budget or held > budget):
-            _key, dropped = store.popitem(last=False)
-            held -= len(dropped.ids)
+        # evaluator's own size; the least recently used go first.
+        while store and (len(store) > budget or store.held > budget):
+            _name, (dropped, _depends) = store.popitem(last=False)
+            store.held -= len(dropped.ids)
 
     def witness(self, used: Iterable[Key]) -> Q:
         """Every decision the statement rests on, directly or through another one."""
@@ -759,9 +772,7 @@ class _Operation:
             decided[bound] = {found: frozenset(ids) for found, ids in members.items()}
         return ActorSets(keys, decided[Bound.LOWER], decided[Bound.UPPER], tuple(support))
 
-    def kept_rows(
-        self, verdicts: CaveatVerdicts
-    ) -> tuple[OrderedDict[Any, Any], tuple[Any, ...]] | None:
+    def kept_rows(self, verdicts: CaveatVerdicts) -> tuple[KeptRows, tuple[Any, ...], int] | None:
         """Where the evaluator scope keeps decided rows, and their key prefix.
 
         ``None`` outside a scope, under manual transaction management, and for
@@ -797,7 +808,7 @@ class _Operation:
             sets.digest if sets is not None else None,
             self._roots[id(verdicts)],
         )
-        return evaluator._schema_scope.rows(connection), prefix
+        return evaluator._schema_scope.rows(connection), prefix, evaluator._max_size
 
     def confirm(self) -> bool:
         """Whether every decision taken from the scope still holds.
@@ -1833,8 +1844,31 @@ def held(
     """The ids among ``ids`` on which the actor holds the action.
 
     Ids that are rows of the type's model are tested by one scoped statement
-    per chunk; the others (no row, or not a valid identity) one by one.
+    per chunk; the others (no row, or not a valid identity) one by one.  A
+    write gate asks this: it decides afresh, never through rows a scope kept.
     """
+    with deciding_afresh():
+        return _held(
+            backend=backend,
+            resource_type=resource_type,
+            action=action,
+            actor=actor,
+            ids=ids,
+            using=using,
+            context=context,
+        )
+
+
+def _held(
+    *,
+    backend: LocalBackend,
+    resource_type: str,
+    action: str,
+    actor: SubjectRef,
+    ids: Iterable[str],
+    using: str,
+    context: Mapping[str, Any] | None,
+) -> set[str]:
     pending = set(ids)
     found: set[str] = set()
     model = model_for_resource_type(resource_type)

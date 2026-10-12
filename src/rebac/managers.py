@@ -1634,13 +1634,17 @@ class RebacQuerySet(models.QuerySet[_M]):
         self._guard_clause_field_reads(actor, sudo, query=self._update_query())
         rebac_type = model_resource_type(self.model)
         if rebac_type:
-            self._guard_bulk_action(actor, "write")  # type: ignore[arg-type]
-            # Per-field write gates — same all-or-nothing semantics as the
-            # resource-level write check above. For each kwarg whose field
-            # has a ``write__<f>`` permission declared, every affected row
-            # must also pass that check.
-            self._guard_bulk_field_writes(actor, kwargs)  # type: ignore[arg-type]
-            self._guard_bulk_expression_reads(actor, kwargs)  # type: ignore[arg-type]
+            from .compile.read import deciding_afresh
+
+            # A write gate decides afresh, never through rows a scope kept.
+            with deciding_afresh():
+                self._guard_bulk_action(actor, "write")  # type: ignore[arg-type]
+                # Per-field write gates — same all-or-nothing semantics as the
+                # resource-level write check above. For each kwarg whose field
+                # has a ``write__<f>`` permission declared, every affected row
+                # must also pass that check.
+                self._guard_bulk_field_writes(actor, kwargs)  # type: ignore[arg-type]
+                self._guard_bulk_expression_reads(actor, kwargs)  # type: ignore[arg-type]
         return super().update(**kwargs)
 
     def delete(self) -> tuple[int, dict[str, int]]:
@@ -1653,7 +1657,10 @@ class RebacQuerySet(models.QuerySet[_M]):
             actor, unscoped = self._resolve_effective_actor()
             self._guard_clause_field_reads(actor, unscoped, clears_ordering=True)
             if not unscoped and model_resource_type(self.model):
-                self._guard_bulk_action(actor, "delete")  # type: ignore[arg-type]
+                from .compile.read import deciding_afresh
+
+                with deciding_afresh():
+                    self._guard_bulk_action(actor, "delete")  # type: ignore[arg-type]
             with deletion_owner(self, self.db, actor, unscoped):
                 return super().delete()
 

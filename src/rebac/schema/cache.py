@@ -26,12 +26,22 @@ class SchemaSnapshot(NamedTuple):
     overrides: tuple[Any, ...] = ()
 
 
+class KeptRows(OrderedDict[Any, Any]):
+    """Decided rows a scope keeps on one connection, and how many keys they hold."""
+
+    held = 0
+
+    def clear(self) -> None:
+        super().clear()
+        self.held = 0
+
+
 class _ConnectionSchemas:
     def __init__(self, connection: BaseDatabaseWrapper) -> None:
         self.snapshots: WeakKeyDictionary[Any, SchemaSnapshot] = WeakKeyDictionary()
         # The rows scopes decided on this connection (proposal 0017): dropped
         # with the snapshots, on every write and transaction boundary.
-        self.rows: OrderedDict[Any, Any] = OrderedDict()
+        self.rows = KeptRows()
         self.marker: Callable[[], None] | None = None
         self.atomic = False
         self.observer = self._observe
@@ -87,7 +97,7 @@ class SchemaScope:
     def snapshots(self, connection: BaseDatabaseWrapper) -> WeakKeyDictionary[Any, SchemaSnapshot]:
         return self._state(connection).snapshots
 
-    def rows(self, connection: BaseDatabaseWrapper) -> OrderedDict[Any, Any]:
+    def rows(self, connection: BaseDatabaseWrapper) -> KeptRows:
         """The rows decided on ``connection`` in this scope, kept as its pins are."""
         return self._state(connection).rows
 

@@ -1892,21 +1892,24 @@ not kept.
    a decided set is kept per database alias, policy, actor shape, actor,
    caveat context, tuple generation, permission the scope asks for, and node,
    and a later operation of the same kind binds it instead of deciding it
-   again. A set is reused only with every set it rests on, the same kept
-   sets, so its witness is whole; one that does not fit what the statement
-   may still bind is decided as before. Kept sets are dropped, every one of
+   again. A set is reused only with every set it rests on, the very sets its
+   witness was compiled against, so its witness is whole: a set decided
+   again under one of those keys, or kept again after an eviction, makes it
+   unusable. One that does not fit what the statement may still bind is
+   decided as before. Kept sets are dropped, every one of
    them, on whatever the scope already drops its schema pins on: any
    statement on that connection other than a plain `SELECT` (an insert,
    update or delete by any code, raw SQL through Django, a savepoint), a
    transaction boundary, a tuple written in the process, the scope's
-   `invalidate()` and its end. A write path opens a transaction or a
-   savepoint, which the scope sees, so a write gate decides afresh. At most
-   `REBAC_EVALUATOR_CACHE_SIZE` sets, holding at most as many keys over all
-   of them, are kept per connection, the least recently used dropped first.
-   Nothing is kept on a connection under manual transaction management,
-   under a policy with a caveat-override deadline (the clock alone changes
-   it), or for `accessible(consistency=Consistency.FULLY_CONSISTENT)`, which
-   decides afresh.
+   `invalidate()` and its end. A write gate (the bulk write guards, the
+   backed-edge gate) decides afresh and binds no kept set. At most as many
+   sets as the evaluator's size (`REBAC_EVALUATOR_CACHE_SIZE` by default),
+   holding at most as many keys over all of them, are kept per connection,
+   the least recently used dropped first. Nothing is kept on a connection
+   under manual transaction management, or under a policy with a
+   caveat-override deadline (the clock alone changes it); a read with
+   `consistency=Consistency.FULLY_CONSISTENT` (`accessible()`,
+   `check_access()`, `check_bulk_permissions()`) decides afresh.
    A kept set stays a lower bound and every statement that binds it carries
    its witness, so it can hide a row and never grants one: a write the scope
    cannot see can leave a newly readable row out until the scope ends or

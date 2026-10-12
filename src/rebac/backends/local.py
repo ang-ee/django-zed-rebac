@@ -558,17 +558,21 @@ class LocalBackend(Backend):
         at_zookie: Zookie | None = None,
     ) -> CheckResult:
         self._validate_consistency(consistency, at_zookie)
-        from ..compile.read import check
+        from contextlib import nullcontext
+
+        from ..compile.read import check, deciding_afresh
         from ..models import active_relationship_model
 
-        return check(
-            backend=self,
-            resource=resource,
-            action=action,
-            actor=subject,
-            context=context,
-            using=active_relationship_model().objects.db,
-        )
+        latest = consistency is Consistency.FULLY_CONSISTENT
+        with deciding_afresh() if latest else nullcontext():
+            return check(
+                backend=self,
+                resource=resource,
+                action=action,
+                actor=subject,
+                context=context,
+                using=active_relationship_model().objects.db,
+            )
 
     def check_bulk_permissions(
         self,
@@ -578,12 +582,16 @@ class LocalBackend(Backend):
         at_zookie: Zookie | None = None,
     ) -> list[CheckResult]:
         self._validate_consistency(consistency, at_zookie)
-        from ..compile.read import check_many
+        from contextlib import nullcontext
+
+        from ..compile.read import check_many, deciding_afresh
         from ..models import active_relationship_model
 
-        return check_many(
-            backend=self, items=list(items), using=active_relationship_model().objects.db
-        )
+        latest = consistency is Consistency.FULLY_CONSISTENT
+        with deciding_afresh() if latest else nullcontext():
+            return check_many(
+                backend=self, items=list(items), using=active_relationship_model().objects.db
+            )
 
     @_schema_operation
     def queryset_filter(
