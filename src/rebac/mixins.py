@@ -654,6 +654,9 @@ class RebacMixin(RebacTrackedMixin):
              per-instance sudo → pinned actor → ambient sudo → ambient actor
              → strict-mode fallback.
           3. Unscoped/bypass resolution → ``HAS_PERMISSION``.
+          4. An unsaved instance is a candidate: ``check_new`` over the
+             relations its fields and ``proposed_relationships()`` give it,
+             the evaluator ``save()`` uses for ``create``.
           5. Otherwise dispatch to the backend.
         """
         from .backends import backend
@@ -669,12 +672,16 @@ class RebacMixin(RebacTrackedMixin):
             return CheckResult.has(reason="unscoped")
         assert actor is not None
 
-        # Empty resource_id on adding is the backend's model-level "any row?"
-        # sentinel. Persistence itself uses check_new's candidate overlay.
         if self._state.adding:
-            resource_id = ""
-        else:
-            resource_id = self._rebac_resource_id_for_checks()
+            # The candidate, not the model-level "any row?" sentinel.
+            return _check_new_model(
+                self,
+                subject=actor,
+                using=router.db_for_write(type(self), instance=self),
+                action=action,
+                context=context,
+            )
+        resource_id = self._rebac_resource_id_for_checks()
         return backend().check_access(
             subject=actor,
             action=action,

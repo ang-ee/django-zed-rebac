@@ -5,6 +5,16 @@ pre-1.0; breaking changes within a minor version are explicitly called out.
 
 ## [Unreleased]
 
+### Changed
+
+- `instance.check_access(action)` and `has_access(action)` on an unsaved
+  instance evaluate that candidate through `check_new()`, with the relations
+  its fields and `proposed_relationships()` give it, as `save()` does for
+  `create`. They answered whether the actor could reach any row of the type,
+  so `create = folder->write` denied an actor who may write the candidate's
+  folder and would be allowed to save it. A caller can now check a create
+  before validating the instance (`full_clean()`).
+
 ### Added
 
 - `RebacQuerySet.readable(field)` (also on the manager): a gated field as the

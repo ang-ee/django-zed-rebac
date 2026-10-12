@@ -2033,3 +2033,40 @@ def candidate_string_identities(monkeypatch):
 
     monkeypatch.setattr(VirtualFolder._meta, "rebac_id_attr", "name")
     monkeypatch.setattr(VirtualPost._meta, "rebac_id_attr", "pk")
+
+
+@pytest.mark.django_db
+def test_an_unsaved_instance_answers_as_save_will(parent_create_backend) -> None:
+    from tests.testapp.models import Folder, Post
+
+    actor = _user("allowed")
+    folder = _owned_folder(parent_create_backend, actor)
+    with sudo(reason="test.parent-create.fixture"):
+        other = Folder.objects.create(name="not theirs")
+    mine = Post(title="candidate", folder=folder).with_actor(actor)
+    theirs = Post(title="candidate", folder=other).with_actor(actor)
+    # The candidate's folder decides, not whether the actor can reach any post.
+    assert mine.check_access("create").allowed
+    assert mine.has_access("create")
+    assert not theirs.has_access("create")
+    mine.save()
+    with pytest.raises(PermissionDenied):
+        theirs.save()
+
+
+@pytest.mark.django_db
+def test_an_unsaved_instance_counts_its_proposed_relationships(
+    parent_create_backend, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from tests.testapp.models import Post
+
+    actor = _user("allowed")
+    folder = _owned_folder(parent_create_backend, actor)
+    install_schema(parent_create_backend, parse_zed(PROPOSED_RELATIONSHIPS_SCHEMA))
+    monkeypatch.setattr(
+        Post,
+        "proposed_relationships",
+        lambda self, *, using=None: {"contributor": [actor]} if self.body == "mine" else {},
+    )
+    assert Post(title="t", folder=folder, body="mine").with_actor(actor).has_access("create")
+    assert not Post(title="t", folder=folder, body="").with_actor(actor).has_access("create")

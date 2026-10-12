@@ -1570,7 +1570,8 @@ Model identity resolution rejects `None` and empty strings before constructing
 an object reference. Empty resource IDs are model-level backend-check sentinels,
 asking for any accessible row or a row-independent grant; they are not the
 identities of saved rows. Proposed-row create checks use `check_new()` with
-the candidate's relationship overlay.
+the candidate's relationship overlay, and so does `instance.check_access(action)`
+on an unsaved instance: it asks about that candidate, not about any row.
 Object and subject resolution read Django metadata through the instance, so
 lazy wrappers such as `AuthenticationMiddleware`'s `request.user` retain the
 wrapped model's resource type, ID attribute and subject relation.
@@ -2437,6 +2438,7 @@ tracked model's callable attribute named `actor` does not become an actor scope.
 | `Model.objects.bulk_create(rows)` | `create` on each proposed row's forward relations | Every candidate is preflighted before Django issues insert SQL. |
 | `instance.save()` (loaded/non-adding instance) | `write` on the row | `RebacMixin.save_base`, before consumer `pre_save`. |
 | `instance.save()` (new instance) | `create` on the proposed row's forward relations | `save_base` projects the constructed candidate into `check_new`. |
+| `instance.check_access(action)` / `has_access(action)` (new instance) | `action` on the proposed row's forward relations | The same projection into `check_new`, with the caller's caveat context: `check_access("create")` answers what `save()` will decide, so a caller can check before validating or saving. `consistency` applies to stored rows only. A loaded instance is checked as the row it is. |
 | `instance.delete()` | `delete` on the row | `RebacMixin.delete`; explicit-sender `pre_delete` checks collector children. |
 | `Model.objects.update(**kwargs)` | `write` on each affected row and every resource row whose backed FK edge changes | Manager intersects the queryset PK set with the actor's `write` scope; raises if any in-scope row is excluded. A backed FK update checks old and proposed source rows before SQL; expressions whose proposed FK cannot be resolved are refused. When the update touches a column the policy reads, the statement's primary keys are selected, those rows are gated, and exactly those rows are written by key (see [Writes](#writes)). |
 | `Model.objects.delete()` | `delete` on each row | Same pattern. |
