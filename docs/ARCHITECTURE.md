@@ -1890,7 +1890,8 @@ not kept.
    depend on model rows, which change without the library seeing it. Inside
    one (a request under `ActorMiddleware`, an explicit `evaluator_scope()`),
    a decided set is kept per database alias, policy, actor shape, actor,
-   caveat context, tuple generation, permission the scope asks for, and node,
+   caveat context, tuple generation, the actor's decided memberships (their
+   witness is the statement's), permission the scope asks for, and node,
    and a later operation of the same kind binds it instead of deciding it
    again. A set is reused only with every set it rests on, the very sets its
    witness was compiled against, so its witness is whole: a set decided
@@ -1911,7 +1912,8 @@ not kept.
    under manual transaction management, or under a policy with a
    caveat-override deadline (the clock alone changes it); a read with
    `consistency=Consistency.FULLY_CONSISTENT` (`accessible()`,
-   `check_access()`, `check_bulk_permissions()`) decides afresh.
+   `check_access()`, `check_bulk_permissions()`) decides afresh, the actor's
+   memberships included, and so does a write gate.
    A kept set stays a lower bound and every statement that binds it carries
    its witness, so it can hide a row and never grants one: a write the scope
    cannot see can leave a newly readable row out until the scope ends or

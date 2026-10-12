@@ -659,13 +659,14 @@ class _Operation:
 
         A kept decision can be stale: another process may have changed a
         membership.  The witness of every authorizing statement then selects
-        nothing, so staleness denies and never grants.
+        nothing, so staleness denies and never grants.  A read that decides
+        afresh (``deciding_afresh``) decides the memberships afresh too.
         """
         from rebac.evaluator import ABSENT, current_evaluator
 
         evaluator = current_evaluator()
         kept = self.sets_kept(key)
-        if evaluator is None or kept is None:
+        if evaluator is None or kept is None or _afresh.get():
             return self._decide_sets(key, verdicts)
         found = evaluator._kept_sets(kept)
         if found is ABSENT:

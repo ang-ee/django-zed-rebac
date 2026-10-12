@@ -868,3 +868,52 @@ def test_an_audited_bypass_keeps_the_kept_rows(tree):
     assert PermissionAuditEvent.objects.count() == before + 1
     assert _folder_reads(after) == []
     assert len(_confirmations(after)) == 1
+
+
+TEAM_SCHEMA = """
+definition auth/user {}
+definition work/team {
+    relation member: auth/user
+}
+definition blog/folder {
+    relation viewer: auth/user | work/team#member
+    permission read = viewer
+}
+"""
+
+
+def test_a_read_that_decides_afresh_decides_the_memberships_afresh(monkeypatch):
+    from rebac import Consistency, evaluator_scope
+
+    local = install_schema(TEAM_SCHEMA)
+    with sudo(reason="test.fixture"):
+        mine = Folder.objects.create(name="mine")
+        theirs = Folder.objects.create(name="theirs")
+    team = ObjectRef("work/team", "t")
+    local.write_relationships(
+        [
+            RelationshipTuple(to_object_ref(mine), "viewer", ALICE),
+            RelationshipTuple(
+                to_object_ref(theirs), "viewer", SubjectRef.of("work/team", "t", "member")
+            ),
+        ]
+    )
+    expected = {str(mine.pk), str(theirs.pk)}
+    with evaluator_scope():
+        assert set(local.accessible(subject=ALICE, action="read", resource_type="blog/folder")) == {
+            str(mine.pk)
+        }
+        _unseen_tuples(
+            monkeypatch,
+            lambda: local.write_relationships([RelationshipTuple(team, "member", ALICE)]),
+        )
+        latest = local.accessible(
+            subject=ALICE,
+            action="read",
+            resource_type="blog/folder",
+            consistency=Consistency.FULLY_CONSISTENT,
+        )
+        assert set(latest) == expected
+    assert (
+        set(local.accessible(subject=ALICE, action="read", resource_type="blog/folder")) == expected
+    )

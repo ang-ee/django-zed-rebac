@@ -563,7 +563,7 @@ class LocalBackend(Backend):
         from ..compile.read import check, deciding_afresh
         from ..models import active_relationship_model
 
-        latest = consistency is Consistency.FULLY_CONSISTENT
+        latest = consistency == Consistency.FULLY_CONSISTENT
         with deciding_afresh() if latest else nullcontext():
             return check(
                 backend=self,
@@ -587,7 +587,7 @@ class LocalBackend(Backend):
         from ..compile.read import check_many, deciding_afresh
         from ..models import active_relationship_model
 
-        latest = consistency is Consistency.FULLY_CONSISTENT
+        latest = consistency == Consistency.FULLY_CONSISTENT
         with deciding_afresh() if latest else nullcontext():
             return check_many(
                 backend=self, items=list(items), using=active_relationship_model().objects.db
@@ -627,7 +627,7 @@ class LocalBackend(Backend):
         self._validate_consistency(consistency, at_zookie)
         # The latest state asked for explicitly is not read through rows an
         # evaluator scope kept (proposal 0017).
-        latest = consistency is Consistency.FULLY_CONSISTENT
+        latest = consistency == Consistency.FULLY_CONSISTENT
         with deciding_afresh() if latest else nullcontext():
             return list(
                 accessible_ids(
