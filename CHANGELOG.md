@@ -31,7 +31,8 @@ pre-1.0; breaking changes within a minor version are explicitly called out.
   confirmations. Kept sets are lower bounds, witnessed in every statement as
   before, and are dropped on any statement other than a plain `SELECT` the
   scope sees on its connection, a savepoint, a transaction boundary or a
-  tuple write. A write the scope cannot see (another process, a driver
+  tuple write. The library's own audit insert (an audited `sudo()` between
+  two reads) drops neither the kept sets nor the scope's schema pins. A write the scope cannot see (another process, a driver
   cursor, another alias) can hide a newly readable row until the scope ends;
   call `current_evaluator().invalidate()` after one.
   `accessible(consistency=Consistency.FULLY_CONSISTENT)` decides afresh.

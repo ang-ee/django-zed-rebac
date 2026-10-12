@@ -850,3 +850,21 @@ def test_a_statement_outside_a_transaction_drops_the_kept_rows(tree):
             assert visible(Post) == {posts["child"].pk, posts["leaf"].pk}
     assert _folder_reads(after)
     assert _confirmations(after) == []
+
+
+def test_an_audited_bypass_keeps_the_kept_rows(tree):
+    from rebac import evaluator_scope
+    from rebac.models import PermissionAuditEvent
+
+    _local, _folders, posts, _grant = tree
+    expected = {posts["child"].pk, posts["leaf"].pk}
+    before = PermissionAuditEvent.objects.count()
+    with evaluator_scope():
+        assert visible(Post) == expected
+        # A bypass writes its audit row at once, on the same connection.
+        assert Folder.objects.sudo(reason="test.audited").count() == 4
+        with CaptureQueriesContext(connection) as after:
+            assert visible(Post) == expected
+    assert PermissionAuditEvent.objects.count() == before + 1
+    assert _folder_reads(after) == []
+    assert len(_confirmations(after)) == 1

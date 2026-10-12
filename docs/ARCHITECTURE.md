@@ -1899,7 +1899,9 @@ not kept.
    decided as before. Kept sets are dropped, every one of
    them, on whatever the scope already drops its schema pins on: any
    statement on that connection other than a plain `SELECT` (an insert,
-   update or delete by any code, raw SQL through Django, a savepoint), a
+   update or delete by any code, raw SQL through Django, a savepoint) except
+   the library's own audit insert (a `sudo()` writes its row at once, and no
+   schema or permission reads that table), a
    transaction boundary, a tuple written in the process, the scope's
    `invalidate()` and its end. A write gate (the bulk write guards, the
    backed-edge gate) decides afresh and binds no kept set. At most as many

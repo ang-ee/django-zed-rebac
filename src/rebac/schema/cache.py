@@ -26,6 +26,22 @@ class SchemaSnapshot(NamedTuple):
     overrides: tuple[Any, ...] = ()
 
 
+def _audit_insert(sql: str, context: Any) -> bool:
+    """Whether ``sql`` inserts one of the library's own audit rows.
+
+    A ``sudo()`` writes its audit row at once, on the same connection, often
+    between two reads of one page.  No schema and no permission reads that
+    table, so the insert keeps the scope's pins and decided rows.
+    """
+    from rebac.models import PermissionAuditEvent
+
+    connection = context.get("connection") if isinstance(context, dict) else None
+    if connection is None:
+        return False
+    table = connection.ops.quote_name(PermissionAuditEvent._meta.db_table)
+    return sql.lstrip().startswith(f"INSERT INTO {table} ")
+
+
 class KeptRows(OrderedDict[Any, Any]):
     """Decided rows a scope keeps on one connection, and how many keys they hold."""
 
@@ -59,7 +75,9 @@ class _ConnectionSchemas:
         # comments are conservative invalidations. Side-effectful SELECTs or
         # raw driver writes require explicit evaluator.invalidate(); see the
         # architecture contract. Invalidate before even a failed write/rollback.
-        if many or not str(sql).lstrip().upper().startswith("SELECT "):
+        if (many or not str(sql).lstrip().upper().startswith("SELECT ")) and not _audit_insert(
+            str(sql), context
+        ):
             self.snapshots.clear()
             self.rows.clear()
         return execute(sql, params, many, context)
