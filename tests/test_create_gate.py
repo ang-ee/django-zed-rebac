@@ -31,6 +31,7 @@ from rebac import (
     backend,
     sudo,
     to_object_ref,
+    to_subject_ref,
 )
 from rebac.actors import anonymous_actor
 from rebac.backends import reset_backend
@@ -2070,3 +2071,38 @@ def test_an_unsaved_instance_counts_its_proposed_relationships(
     )
     assert Post(title="t", folder=folder, body="mine").with_actor(actor).has_access("create")
     assert not Post(title="t", folder=folder, body="").with_actor(actor).has_access("create")
+
+
+@pytest.mark.django_db
+def test_an_unsaved_instance_decides_only_its_creation(
+    parent_create_backend, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A constructed instance can carry a stored row's pk and assert relations:
+    they decide its creation, never another action on that row."""
+    from tests.testapp.models import Post
+
+    victim = to_subject_ref(_django_user("victim"))
+    attacker = to_subject_ref(_django_user("attacker"))
+    install_schema(
+        parent_create_backend,
+        parse_zed(
+            PARENT_CREATE_SCHEMA.replace(
+                "    permission create = folder->write\n",
+                "    relation owner: auth/user\n"
+                "    permission create = folder->write\n"
+                "    permission delete = owner\n",
+            )
+        ),
+    )
+    folder = _owned_folder(parent_create_backend, victim)
+    with sudo(reason="test.parent-create.fixture"):
+        stored = Post.objects.create(title="theirs", folder=folder)
+    parent_create_backend.write_relationships(
+        [RelationshipTuple(ObjectRef("blog/post", str(stored.pk)), "owner", victim)]
+    )
+    monkeypatch.setattr(
+        Post, "proposed_relationships", lambda self, *, using=None: {"owner": [attacker]}
+    )
+    stub = Post(pk=stored.pk, title="theirs", folder=folder).with_actor(attacker)
+    assert stub._state.adding
+    assert not stub.has_access("delete")

@@ -7,13 +7,17 @@ pre-1.0; breaking changes within a minor version are explicitly called out.
 
 ### Changed
 
-- `instance.check_access(action)` and `has_access(action)` on an unsaved
-  instance evaluate that candidate through `check_new()`, with the relations
-  its fields and `proposed_relationships()` give it, as `save()` does for
-  `create`. They answered whether the actor could reach any row of the type,
-  so `create = folder->write` denied an actor who may write the candidate's
+- `instance.check_access("create")` and `has_access("create")` on an
+  unsaved instance evaluate that candidate through `check_new()`, with the
+  relations its fields and `proposed_relationships()` give it, as `save()`
+  does. They answered whether the actor could reach any row of the type, so
+  `create = folder->write` denied an actor who may write the candidate's
   folder and would be allowed to save it. A caller can now check a create
-  before validating the instance (`full_clean()`).
+  before validating the instance (`full_clean()`). The answer can be
+  `CONDITIONAL_PERMISSION`, and the check raises what `save()` raises for
+  the candidate (`SchemaError` from `proposed_relationships()`, an
+  unavailable related row). Other actions on an unsaved instance are
+  unchanged.
 
 ### Added
 

@@ -225,7 +225,8 @@ A hook that resolves subjects must use the supplied write database alias
 `using`. Unknown relation names or field-backed or const-backed entries raise
 `SchemaError`; valid relations that `create` does not depend on are ignored
 without resolving or querying their subjects. `save()`, `create()`, `insert(obj)`,
-and each `bulk_create()` candidate share this hook. For example, a model that
+each `bulk_create()` candidate, and `instance.check_access("create")` on an
+unsaved instance share this hook. For example, a model that
 writes a `contributor` tuple for the creating actor after save can propose
 `{"contributor": [actor]}` for `relation contributor: auth/user`. The hook is
 trusted self-assertion: contributing a fact the row does not actually carry

@@ -421,7 +421,7 @@ class RebacMixin(RebacTrackedMixin):
     ) -> Mapping[str, Iterable[SubjectRef | models.Model]]:
         """Relations this row will carry once persisted that are not derivable
         from its fields, keyed by relation name; consulted by the create gate
-        before insert. The complementary owner for field-backed relations is
+        before insert, and by ``check_access("create")`` on an unsaved instance. The complementary owner for field-backed relations is
         ``rebac.field_backing._proposed_forward_relationships``; field-backed
         and const-backed relations belong to the library and must not be
         returned here. Use the supplied write database alias ``using`` when
@@ -654,9 +654,12 @@ class RebacMixin(RebacTrackedMixin):
              per-instance sudo → pinned actor → ambient sudo → ambient actor
              → strict-mode fallback.
           3. Unscoped/bypass resolution → ``HAS_PERMISSION``.
-          4. An unsaved instance is a candidate: ``check_new`` over the
-             relations its fields and ``proposed_relationships()`` give it,
-             the evaluator ``save()`` uses for ``create``.
+          4. ``create`` on an unsaved instance asks about the candidate:
+             ``check_new`` over the relations its fields and
+             ``proposed_relationships()`` give it, the evaluator ``save()``
+             uses.  Any other action on an unsaved instance asks the
+             model-level sentinel: its pk may be a stored row's, and its
+             asserted relations decide only its creation.
           5. Otherwise dispatch to the backend.
         """
         from .backends import backend
@@ -672,16 +675,18 @@ class RebacMixin(RebacTrackedMixin):
             return CheckResult.has(reason="unscoped")
         assert actor is not None
 
-        if self._state.adding:
-            # The candidate, not the model-level "any row?" sentinel.
+        if self._state.adding and action == "create":
+            # The candidate save() would insert, not "may the actor create any row?".
             return _check_new_model(
                 self,
                 subject=actor,
                 using=router.db_for_write(type(self), instance=self),
-                action=action,
                 context=context,
             )
-        resource_id = self._rebac_resource_id_for_checks()
+        # Empty resource_id on adding is the backend's model-level "any row?"
+        # sentinel: an unsaved instance's pk and asserted relations are not
+        # evidence about a stored row.
+        resource_id = "" if self._state.adding else self._rebac_resource_id_for_checks()
         return backend().check_access(
             subject=actor,
             action=action,
