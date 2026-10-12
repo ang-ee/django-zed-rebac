@@ -2038,7 +2038,7 @@ needs one is not in its lower bound.
 | `accessible()` | The lower bound over each part of the type's universe: the model's rows, the ids that tuples name at either end, constant targets, attribute containers, and field-backed targets whose model stores no rows. Wildcard and empty ids are excluded and the result is deduplicated. |
 | `lookup_subjects()` | Candidates are the subjects that tuples, backed columns and constants name on a path from the one resource; each is tested by its own point check, so the cost grows with the number of candidates. To ask about subjects already in hand, use `check_bulk_permissions()`. |
 | Model-level check (empty resource id) | A row-independent grant, or any accessible identity of the type. |
-| `grants_all()` | The lower bound at the empty id: only a row-independent arm can hold there. |
+| `grants_all()` | The lower bound at the empty id: only a row-independent arm can hold there. False for a permission with an exclusion on the row (in its expression or one it names on the same type): a row-specific fact can take it from one row. |
 | Backed-edge write gate | `write` on the affected declaring rows. More than four ids that are rows of the type's model are tested by one scoped statement per 500 ids; the others by the lower bound, one by one. |
 | Bulk write guard | Every resource id of the statement must be in `accessible()` for the action. |
 | Field read gate `read__<field>` | `accessible()` for that permission. |
@@ -2302,6 +2302,7 @@ class RebacManager:
     def with_action(self, action: str) -> RebacQuerySet: ...           # override read-scope action
     def on_field_deny(self, mode: FieldDenyMode) -> RebacQuerySet: ... # allow/redact/omit/raise
     def for_write(self) -> RebacQuerySet: ...                          # write-target: row scope kept, field redaction off
+    def readable(self, field: str) -> Expression: ...                  # a gated column as the actor may read it
     def rebac_select_related(self, *fields) -> RebacQuerySet: ...      # guarded to-one joins
     def rebac_prefetch_related(self, *lookups) -> RebacQuerySet: ...   # scoped protected prefetches
 
@@ -2317,6 +2318,7 @@ class RebacQuerySet:
     def with_action(self, action: str) -> Self: ...                    # override read-scope action
     def on_field_deny(self, mode: FieldDenyMode) -> Self: ...          # override field-read deny mode
     def for_write(self) -> Self: ...                                   # write-target: row scope kept, field redaction off
+    def readable(self, field: str) -> Expression: ...                  # a gated column as the actor may read it
     def rebac_select_related(self, *fields) -> Self: ...               # select_related + related read guard
     def rebac_prefetch_related(self, *lookups) -> Self: ...            # prefetch_related + scoped targets
     def sudo(self, *, reason: str) -> Self: ...                         # gated by REBAC_ALLOW_SUDO
@@ -2343,6 +2345,7 @@ The three actor verbs are sugar over the same primitive:
 | `with_action(action)` | Pins the permission used for read-side queryset scoping instead of `read` / `Meta.rebac_default_action`. | Alternate read views such as `credential_lookup`, `list_admin`, or capability-specific resolver scopes. |
 | `on_field_deny(mode)` | Pins the field-read deny mode for `read__<field>` gates instead of the global setting. | Projection-sensitive paths that want `"omit"` while the global default stays `"allow"` or `"redact"`. |
 | `for_write()` | `on_field_deny("allow")` named for intent: keeps actor row scope but turns off `read__<field>` redaction so a load-then-mutate target carries every column. | Resolving an update/delete target while `REBAC_FIELD_READ_MODE` is `"redact"`/`"omit"`, where a redacted column must not be hidden from the row being written. |
+| `readable(field)` | An expression worth the column on rows where the queryset's actor holds `read__<field>` and `NULL` elsewhere, the value redaction shows. The column itself under a bypass, or when the model gates no such field. | Filtering, ordering, grouping or selecting a gated field under an actor whose access depends on the row, which the field read guards refuse on the column itself. |
 | `rebac_select_related(*fields)` | Applies Django `select_related` and batch-checks selected REBAC-bound related rows before serialization. | To-one relation optimization when an unreadable related object should fail the field/query instead of leaking. |
 | `rebac_prefetch_related(*lookups)` | Applies Django `prefetch_related`, rewriting bare protected lookups to `Prefetch(queryset=Related.objects.with_actor(actor))`. | Reverse, M2M, and to-many loading where protected children should be scoped rather than loaded via `_base_manager`. |
 
@@ -2587,9 +2590,83 @@ The `NOT EXISTS` Django builds for an `exclude()` across a to-many relation
 of the outer statement, like the join a `filter()` across the same relation
 adds, and it is not scoped on its own. A queryset the caller passes inside
 that exclude (`rel__in=Model.objects...`) keeps its own scope.
+
+A protected value can also be learned without selecting it: the database
+applies a filter, an exclusion, a grouping and an ordering to the real value,
+before redaction runs on the rows it returns, so the rows matched, their
+number and their order reveal it, and `__lt` / `__gt` narrow it down. The
+guard therefore also reads what a query filters, groups, orders and
+deduplicates on: its `where` clause (`filter()`, `exclude()`, `get()`, the
+conditions of a `FilteredRelation`, and the `NOT EXISTS` of an `exclude()`
+across a to-many relation, which is part of the query as described above),
+its explicit `GROUP BY`, its ordering as Django's compiler emits it
+(`order_by()`, `latest()`, the model's default ordering when the query has
+none, and an ordering by a relation, which is the related model's default
+ordering), and `distinct(*fields)`, on the queryset's own model, on every
+model it joins and in every operand of a set combination. Under `"redact"`,
+`"omit"` or `"raise"`, a query that reads a protected column in any of these
+is refused with `PermissionDenied`: on iteration, `get()`, `count()`,
+`exists()`, `aggregate()` and `explain()`, and before a queryset `update()` or
+`delete()` selects its rows. `count()` and `exists()` also check what the
+query selects when its rows are distinct, grouped or combined, since the
+count then depends on the values. The ordering counts as Django treats it: an
+existence test and a delete drop it, an update keeps an explicit ordering
+(MySQL emits it), a count and an aggregate keep it on a sliced or
+`distinct(*fields)` query only, and a grouped query drops a model's default
+ordering. `order_by()` with no arguments clears a default ordering.
+
+A queryset used as a subquery (`Subquery()`, `Exists()`, a lookup such as
+`pk__in=queryset`) is checked for what it selects, filters, groups and orders
+on, as resolved into the enclosing statement, whether its scope is applied
+there or was applied earlier (`scoped()`, or an evaluation that was
+refused), with the actor its scope was applied with. A column of the
+enclosing row it refers to (`OuterRef`) is the enclosing query's to answer
+for. It is checked once: when the statement that holds it is checked, sharing
+that check's schema read, if it sits in that statement's clauses or
+selection; else when it is compiled (an aggregate's expression, an update's
+value, a statement of a model that is not a rebac resource). Its ordering
+counts as Django compiles it: an `__in` lookup clears the ordering of an
+unsliced query, and `Exists()` clears it always.
+
+The decision is per query, not per row. An actor whose permission on the
+field depends on the row is refused, even when every row the query returns
+would show the field, and filters on it under `sudo(reason=...)` or on
+another column. An actor whose permission holds on every row of the type is
+not refused here or in a selection (`values("title")`), because no row hides
+the value from it. Such a permission is one that holds at the empty id
+(`grants_all()`) and has no exclusion, in its expression or in a permission
+it names on the same type (an exclusion inside an arrow's target is
+evaluated on that object): an administrator role reached through a constant
+relation qualifies; `(owner + admin->member) - blocked` does not, since a
+`blocked` tuple can take the field away from one row. The rule is
+conservative: any such exclusion, even one whose right-hand side cannot
+depend on the row, decides the field row by row.
+
+To filter, order, group or select on a gated field otherwise, use
+`queryset.readable("title")`: the column on rows where the queryset's actor
+holds `read__title` and `NULL` elsewhere, which is the value redaction shows
+(a conditional permission counts as not held, as redaction treats it by
+default). The guards accept it for that actor in a clause or a selection of
+a query of the same model and resource type
+(`alias(t=qs.readable("title")).filter(t__startswith="a")`,
+`order_by(qs.readable("title"))`, `values(t=qs.readable("title"))`). In a
+query of another actor it counts as the column and is refused; in a query of
+another model, a proxy with its own type, or a multi-table parent or child,
+resolving it raises `ValueError`. The guards trust it as built: its cases
+are rebuilt from its model, field and actor when it is first resolved. It
+names a concrete field of the queryset's own model that is not a relation
+and is gated by the model's own type; under a bypass, or for a field the
+type does not gate, it is the column.
+
+Hand-written SQL in a filter or an ordering (`extra(where=...,
+order_by=...)`, `RawSQL`) is refused under an actor on any model, as it is in
+a selection.
+
 These guards inspect Django column expressions. Outside that boundary remain:
-hand-written SQL in a filter or an ordering; a custom expression whose class
-carries its own SQL template; and a subquery over a model's `_base_manager`,
+a custom expression whose class carries its own SQL template;
+`.for_write()` and `on_field_deny("allow")`, which keep their explicit bypass
+of field redaction, also as a subquery, where they let the enclosing query
+filter on what they select; and a subquery over a model's `_base_manager`,
 which is unscoped like every read through that manager and, unlike `sudo`,
 writes no audit row. Two cases are pinned as expected failures for proposal
 0013, which reads the statement's own query. A set combination whose root is
@@ -2609,9 +2686,10 @@ in that set has the field redacted. This preserves cases where Alice may read
 
 Projection querysets that would return gated fields directly, such as
 `.values("salary")`, `.values_list("salary", flat=True)`, or bare `.values()`,
-fail closed under `"redact"` / `"omit"` / `"raise"`. The safe options are to
-materialise model instances and let the field-visibility pass run, or project
-only fields that have no declared `read__<field>` gate.
+fail closed under `"redact"` / `"omit"` / `"raise"`, unless the actor's
+permission on the field holds on every row of the type (see above). The safe
+options are to materialise model instances and let the field-visibility pass
+run, or project only fields that have no declared `read__<field>` gate.
 
 Single-instance callers can use `instance.with_actor(actor).denied_read_fields()`
 for a pure decision or `instance.redacted(mode="redact")` for an eager in-place

@@ -40,9 +40,17 @@ from rebac.resources import (
     model_resource_type,
     stores_rows,
 )
-from rebac.schema.ast import AttributeBinding, ConstBinding, FieldBinding, Schema
+from rebac.schema.ast import (
+    AttributeBinding,
+    ConstBinding,
+    FieldBinding,
+    PermBinOp,
+    PermExpr,
+    PermRef,
+    Schema,
+)
 from rebac.schema.cache import SchemaSnapshot, schema_operation
-from rebac.schema.walker import find_relation
+from rebac.schema.walker import find_permission, find_relation
 from rebac.types import CheckItem, CheckResult, ObjectRef, SubjectRef
 
 from . import At, Bound, Compiler, predicate
@@ -1597,6 +1605,15 @@ def grants_all(
     using: str,
     context: Mapping[str, Any] | None = None,
 ) -> bool:
+    """Whether the action holds on every row of the type.
+
+    It holds at the empty id, which no row-specific fact names.  That proves
+    it for every row only while such facts can only add to it: an exclusion
+    on the row itself can take it away from one row, so it never holds for all.
+    """
+    schema, _snapshot = _schema(backend)
+    if _excludes_on_the_row(schema, resource_type, action):
+        return False
     return _point_result(
         backend=backend,
         resource=ObjectRef(resource_type, ""),
@@ -1606,6 +1623,34 @@ def grants_all(
         using=using,
         lower_only=True,
     )[0]
+
+
+def _excludes_on_the_row(schema: Schema, resource_type: str, action: str) -> bool:
+    """Whether the permission, or one it names on the same type, has an exclusion.
+
+    An arrow is evaluated on another object; an exclusion there takes nothing
+    from this row that the arrow's own row-specific relation does not decide.
+    """
+    definition = schema.get_definition(resource_type)
+    if definition is None:
+        return False
+    seen: set[str] = set()
+
+    def visit(name: str) -> bool:
+        if name in seen:
+            return False
+        seen.add(name)
+        permission = find_permission(definition, name)
+        return permission is not None and excludes(permission.expression)
+
+    def excludes(expression: PermExpr) -> bool:
+        if isinstance(expression, PermBinOp):
+            return expression.op == "-" or excludes(expression.left) or excludes(expression.right)
+        if isinstance(expression, PermRef):
+            return visit(expression.name)
+        return False
+
+    return visit(action)
 
 
 @schema_operation
