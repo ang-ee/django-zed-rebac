@@ -561,3 +561,65 @@ def test_an_arrow_inside_a_nested_exclusion(world):
         set(local.accessible(subject=ALICE, action="read", resource_type="test/attachment"))
         == expected
     )
+
+
+# ---------- A point check compiles only the arms of the row's content type ----------
+
+
+def _point_statements(queries):
+    return [
+        q["sql"]
+        for q in queries
+        if 'FROM "rebac_schemageneration"' in q["sql"] and "EXISTS" in q["sql"]
+    ]
+
+
+def test_a_point_check_compiles_only_the_arm_of_its_rows_type(world):
+    local = world.local
+    attachment = edge(world.mine)
+    resource = to_object_ref(attachment)
+    with CaptureQueriesContext(connection) as queries:
+        assert local.check_access(subject=ALICE, action="read", resource=resource).allowed
+    statements = _point_statements(queries)
+    assert statements
+    # The folder arm is compiled; the post, resource and shelf chains are not.
+    assert all('"testapp_post"' not in sql for sql in statements)
+    assert all('"testapp_shelf"' not in sql for sql in statements)
+    assert any('"testapp_folder"' in sql for sql in statements)
+    # Every type answers as before.
+    for row, allowed in ((world.post, True), (world.other, False), (world.shared, True)):
+        assert (
+            local.check_access(
+                subject=ALICE, action="read", resource=to_object_ref(edge(row))
+            ).allowed
+            is allowed
+        )
+
+
+def test_a_row_whose_type_changed_after_the_read_is_denied(world, monkeypatch):
+    local = world.local
+    attachment = edge(world.post)
+    resource = to_object_ref(attachment)
+    folder_type = ContentType.objects.get_for_model(Folder)
+    # The read says folder; the row is a post: the statement's witness fails.
+    monkeypatch.setattr(read, "_row_types", lambda *_: (("content_type_id", folder_type.pk),))
+    assert not local.check_access(subject=ALICE, action="read", resource=resource).allowed
+    monkeypatch.undo()
+    assert local.check_access(subject=ALICE, action="read", resource=resource).allowed
+
+
+def test_a_bulk_check_reads_a_resources_type_once(world):
+    from rebac import CheckItem
+
+    local = world.local
+    attachment = edge(world.mine)
+    resource = to_object_ref(attachment)
+    items = [CheckItem(subject=s, action="read", resource=resource) for s in (ALICE, BOB)]
+    with CaptureQueriesContext(connection) as queries:
+        answers = local.check_bulk_permissions(items)
+    assert [a.allowed for a in answers] == [True, False]
+    reads = [
+        q for q in queries if q["sql"].startswith('SELECT "testapp_attachment"."content_type_id"')
+    ]
+    assert len(reads) == 1
+    assert all('"testapp_post"' not in q["sql"] for q in queries)

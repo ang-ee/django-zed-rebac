@@ -60,6 +60,7 @@ from .evaluate import named_subjects, residual
 from .predicate import (
     ActorSets,
     Fact,
+    PointRow,
     SelfChain,
     Support,
     _and,
@@ -863,6 +864,7 @@ class _Operation:
         *,
         parametric: bool = True,
         rows: _Rows | None = None,
+        point: PointRow | None = None,
     ) -> Compiler:
         return Compiler(
             self.policy.schema,
@@ -875,6 +877,7 @@ class _Operation:
             facts=facts,
             sets=self.sets(verdicts),
             rows=rows,
+            point=point,
         )
 
     def gate(self, *, parametric: bool = True) -> models.QuerySet[Any]:
@@ -979,19 +982,34 @@ def _model_at(model: type[models.Model]) -> At:
 # ---------- Point checks ----------
 
 
-def _point_statement(operation: _Operation, key: Key, which: str) -> _Kept | bool:
-    """One bound of ``key`` at one identity, as SQL; a bool when it needs no rows."""
+def _point_statement(
+    operation: _Operation,
+    key: Key,
+    which: str,
+    row_types: tuple[tuple[str, Any], ...] | None = None,
+) -> _Kept | bool:
+    """One bound of ``key`` at one identity, as SQL; a bool when it needs no rows.
+
+    ``row_types`` are the row's GenericForeignKey content types, when read
+    (``_row_types``): the statement is compiled and kept for them, with only
+    the arms of those types, and re-reads them.
+    """
     verdicts = operation.verdicts(key)
 
     def build() -> models.QuerySet[Any] | bool:
-        compiler = operation.compiler(verdicts)
         at = At(key[0], _Param(_RESOURCE_WIRE, models.TextField()), None, False)
+        point = PointRow(at.ref, row_types) if row_types is not None else None
+        compiler = operation.compiler(verdicts, point=point)
         if which == "depth":
             condition = compiler.depth_unknown(key, at)
         else:
             condition = compiler.holds(key, at, Bound(which))
         if is_false(condition):
             return False
+        if point is not None:
+            condition = _and(condition, compiler.point_witness(at))
+            if is_false(condition):
+                return False
         rows = operation.gate()
         if which != "upper":
             # Only the lower statement authorizes, so it re-reads what was
@@ -1004,12 +1022,67 @@ def _point_statement(operation: _Operation, key: Key, which: str) -> _Kept | boo
                 rows = rows.filter(witness)
         return (rows if is_true(condition) else rows.filter(condition)).values("pk")
 
-    return operation.statement(("point", key, which), verdicts, build)
+    return operation.statement(("point", key, which, row_types), verdicts, build)
 
 
-def _point(operation: _Operation, key: Key, resource_id: str, which: str) -> bool:
+# The GenericForeignKey content-type columns of a resource type's backed
+# relations, by policy and type.
+_generic_columns: OrderedDict[tuple[Any, ...], tuple[str, ...]] = OrderedDict()
+
+
+def _row_types(
+    operation: _Operation, resource_type: str, resource_id: str
+) -> tuple[tuple[str, Any], ...] | None:
+    """The content types a row has in the GenericForeignKey columns its type's
+    relations are backed by, read by one statement; ``None`` when the type has
+    none, or the id names no row of its model."""
+    model = model_for_resource_type(resource_type)
+    if model is None or not stores_rows(model) or not resource_id:
+        return None
+    memo = (operation.policy.key, resource_type)
+    with _lock:
+        columns = _generic_columns.get(memo)
+    if columns is None:
+        definition = operation.policy.schema.get_definition(resource_type)
+        found: set[str] = set()
+        for relation in definition.relations if definition is not None else ():
+            if not isinstance(relation.backing, FieldBinding):
+                continue
+            resolved = resolve_field_backing(definition, relation)  # type: ignore[arg-type]
+            if resolved is not None and resolved.generic is not None:
+                field = resolved.source_model._meta.get_field(resolved.generic.ct_field)
+                found.add(cast(Any, field).attname)
+        columns = tuple(sorted(found))
+        with _lock:
+            _generic_columns[memo] = columns
+            while len(_generic_columns) > _LIMIT:
+                _generic_columns.popitem(last=False)
+    if not columns:
+        return None
+    identity = resource_id_attr(model)
+    if not identity_codec(model, identity).is_canonical(resource_id, using=operation.using):
+        return None
+    _, identity_field = model_identity_fields(model, identity)
+    row = (
+        model._base_manager.using(operation.using)
+        .filter(**{identity: identity_field.to_python(resource_id)})
+        .values_list(*columns)
+        .first()
+    )
+    if row is None:
+        return None
+    return tuple(zip(columns, row, strict=True))
+
+
+def _point(
+    operation: _Operation,
+    key: Key,
+    resource_id: str,
+    which: str,
+    row_types: tuple[tuple[str, Any], ...] | None = None,
+) -> bool:
     """One bound of ``key`` at one identity, by one statement."""
-    compiled = _point_statement(operation, key, which)
+    compiled = _point_statement(operation, key, which, row_types)
     if isinstance(compiled, bool):
         return compiled and operation.gate(parametric=False).exists()
     probe = _Sql(compiled.sql, operation.bound(compiled.params, resource_id))
@@ -1026,8 +1099,13 @@ def _points(asked: Sequence[tuple[_Operation, Key, str]], which: str) -> list[bo
     statements: list[dict[str, _Sql]] = [{}]
     size = 0
     fenced: bool | None = None
+    # One read of a resource's content types serves every item on it.
+    types: dict[tuple[str, str, str], tuple[tuple[str, Any], ...] | None] = {}
     for position, (operation, key, resource_id) in enumerate(asked):
-        compiled = _point_statement(operation, key, which)
+        resource = (operation.using, key[0], resource_id)
+        if resource not in types:
+            types[resource] = _row_types(operation, key[0], resource_id)
+        compiled = _point_statement(operation, key, which, types[resource])
         if isinstance(compiled, bool):
             if compiled:
                 if fenced is None:
@@ -1074,18 +1152,19 @@ def _point_result(
 ) -> tuple[bool, bool, bool, _Policy]:
     operation = _Operation.begin(backend, actor, using, context)
     key = resource.resource_type, action
+    row_types = _row_types(operation, resource.resource_type, resource.resource_id)
     # Only LOWER may authorize, and it is one SQL statement with every fact
     # witnessed in that statement.  Subsequent probes can only return NO,
     # CONDITIONAL, or a depth error.
-    if _point(operation, key, resource.resource_id, "lower"):
+    if _point(operation, key, resource.resource_id, "lower", row_types):
         return True, True, False, operation.policy
     recursive = _recursive(operation, key)
     # The bounds differ only where a caveat or a recursion is in reach.
     if lower_only or not (recursive or not operation.verdicts(key).empty):
         return False, False, False, operation.policy
-    if not _point(operation, key, resource.resource_id, "upper"):
+    if not _point(operation, key, resource.resource_id, "upper", row_types):
         return False, False, False, operation.policy
-    deep = recursive and _point(operation, key, resource.resource_id, "depth")
+    deep = recursive and _point(operation, key, resource.resource_id, "depth", row_types)
     return False, True, deep, operation.policy
 
 

@@ -3,6 +3,20 @@
 All notable changes to `django-zed-rebac` are tracked here. The project is in
 pre-1.0; breaking changes within a minor version are explicitly called out.
 
+## [Unreleased]
+
+### Fixed
+
+- A point check (`check_access()`, `has_access()`, `check_bulk_permissions()`)
+  on a row of a polymorphic edge, a type whose relations a
+  `GenericForeignKey` backs, compiled every target type's permission into one
+  statement. With several deep target types it grew past SQLite's
+  expression-depth limit (`Expression tree is too large (maximum depth
+  1000)`), and on every database it was larger than needed. The row's
+  content types are now read first and only the arms of those types are
+  compiled; the statement re-reads them, so a row whose target changed in
+  between selects nothing.
+
 ## [0.27.2] — 2026-10-14
 
 ### Fixed
