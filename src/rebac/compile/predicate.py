@@ -40,6 +40,7 @@ from ..field_backing import (
     ResolvedAttributeBacking,
     ResolvedConstBacking,
     ResolvedFieldBacking,
+    _content_type,
     foreign_key_kept,
     resolve_attribute_backing,
     resolve_const_backing,
@@ -249,6 +250,33 @@ def _one_level_out(ref: Any) -> Any:
     moved = ref.copy()
     moved.set_source_expressions([None if part is None else _one_level_out(part) for part in parts])
     return moved
+
+
+@dataclass(frozen=True)
+class PointRow:
+    """The content types a point check's row has in its GenericForeignKey columns.
+
+    ``ref`` is the statement's reference to the row; ``types`` maps each
+    content-type column's attname to its value.  An arm backed by one of those
+    columns names a row of its own type only, so on that row the arm of any
+    other type cannot hold and is not compiled.
+    """
+
+    ref: Any
+    types: tuple[tuple[str, Any], ...]
+
+    def may_name(self, resolved: ResolvedFieldBacking, at: At, using: str) -> bool:
+        if resolved.generic is None or at.ref is not self.ref:
+            return True
+        column = resolved.source_model._meta.get_field(resolved.generic.ct_field)
+        stored = dict(self.types).get(cast(Any, column).attname, _ABSENT)
+        if stored is _ABSENT:
+            return True
+        content_type = _content_type(resolved.target_model, using)
+        return content_type is not None and content_type.pk == stored
+
+
+_ABSENT: Any = object()
 
 
 def _not_null(expr: Expression | F | OuterRef) -> Q:
@@ -476,6 +504,7 @@ class Compiler:
         facts: Mapping[Fact, bool] | None = None,
         sets: ActorSets | None = None,
         rows: DecidedRows | None = None,
+        point: PointRow | None = None,
     ) -> None:
         self.schema = tagged.schema if tagged is not None else schema
         self.actor = actor
@@ -499,6 +528,7 @@ class Compiler:
         self.sets = sets
         self.rows = rows
         self.used_rows: set[Key] = set()
+        self.point = point
         self.shape = actor_shape(self.schema, actor, using)
         self._memo: dict[tuple[Any, ...], Q] = {}
         self._own_identity = model_for_subject_type(actor.subject_type)
@@ -1597,6 +1627,9 @@ class Compiler:
         target: str | None,
         depth_possible: bool,
     ) -> Q:
+        if self.point is not None and not self.point.may_name(resolved, at, self.using):
+            # The point row names another type: this arm's chain is not built.
+            return _FALSE
         allowed = resolved.relation.allowed_subjects[0]
         if allowed.relation and not self._is_relation(allowed.type, allowed.relation):
             return _FALSE
@@ -1911,6 +1944,17 @@ class Compiler:
             **{f"{identity}__in": _Compiled(converted.order_by().values("_rebac_native_id"))}
         )
         return cast(QuerySet[Any], bridge.order_by().values(at.key.name))
+
+    def point_witness(self, at: At) -> Q:
+        """The point row still has the content types its arms were chosen by."""
+        point = self.point
+        if point is None or at.ref is not point.ref:
+            return _TRUE
+        model = model_for_resource_type(at.resource_type)
+        if model is None:
+            return _TRUE
+        rows = model._base_manager.using(self.using).filter(**dict(point.types))
+        return self._model_membership(at, rows, model, resource_id_attr(model))
 
     def _model_membership(
         self,

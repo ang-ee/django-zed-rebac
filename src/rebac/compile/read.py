@@ -60,6 +60,7 @@ from .evaluate import named_subjects, residual
 from .predicate import (
     ActorSets,
     Fact,
+    PointRow,
     SelfChain,
     Support,
     _and,
@@ -129,6 +130,7 @@ def reset() -> None:
         _policies.clear()
         _statements.clear()
         _fact_paths.clear()
+        _generic_columns.clear()
     evaluator = current_evaluator()
     if evaluator is not None:
         # The decisions the open scope keeps were made under the old ones.
@@ -863,6 +865,7 @@ class _Operation:
         *,
         parametric: bool = True,
         rows: _Rows | None = None,
+        point: PointRow | None = None,
     ) -> Compiler:
         return Compiler(
             self.policy.schema,
@@ -875,6 +878,7 @@ class _Operation:
             facts=facts,
             sets=self.sets(verdicts),
             rows=rows,
+            point=point,
         )
 
     def gate(self, *, parametric: bool = True) -> models.QuerySet[Any]:
@@ -979,19 +983,34 @@ def _model_at(model: type[models.Model]) -> At:
 # ---------- Point checks ----------
 
 
-def _point_statement(operation: _Operation, key: Key, which: str) -> _Kept | bool:
-    """One bound of ``key`` at one identity, as SQL; a bool when it needs no rows."""
+def _point_statement(
+    operation: _Operation,
+    key: Key,
+    which: str,
+    row_types: RowTypes | None = None,
+) -> _Kept | bool:
+    """One bound of ``key`` at one identity, as SQL; a bool when it needs no rows.
+
+    ``row_types`` are the row's GenericForeignKey content types, when read
+    (``_row_types``): the statement is compiled and kept for them, with only
+    the arms of those types, and re-reads them.
+    """
     verdicts = operation.verdicts(key)
 
     def build() -> models.QuerySet[Any] | bool:
-        compiler = operation.compiler(verdicts)
         at = At(key[0], _Param(_RESOURCE_WIRE, models.TextField()), None, False)
+        point = PointRow(at.ref, row_types) if row_types is not None else None
+        compiler = operation.compiler(verdicts, point=point)
         if which == "depth":
             condition = compiler.depth_unknown(key, at)
         else:
             condition = compiler.holds(key, at, Bound(which))
         if is_false(condition):
             return False
+        if point is not None:
+            condition = _and(condition, compiler.point_witness(at))
+            if is_false(condition):
+                return False
         rows = operation.gate()
         if which != "upper":
             # Only the lower statement authorizes, so it re-reads what was
@@ -1004,30 +1023,108 @@ def _point_statement(operation: _Operation, key: Key, which: str) -> _Kept | boo
                 rows = rows.filter(witness)
         return (rows if is_true(condition) else rows.filter(condition)).values("pk")
 
-    return operation.statement(("point", key, which), verdicts, build)
+    return operation.statement(("point", key, which, row_types), verdicts, build)
 
 
-def _point(operation: _Operation, key: Key, resource_id: str, which: str) -> bool:
+# A point row's content types: each content-type column's attname, with its value.
+RowTypes = tuple[tuple[str, Any], ...]
+
+# The content-type columns that prune a permission at a point row, by policy
+# and permission (``_type_columns``).
+_generic_columns: OrderedDict[tuple[Any, ...], tuple[str, ...]] = OrderedDict()
+
+
+def _type_columns(policy: _Policy, key: Key) -> tuple[str, ...]:
+    """The content-type columns of the GenericForeignKeys that back the
+    relations of ``key``'s type which ``key`` reaches; none when it reaches
+    none, and the row's types are then not read."""
+    memo = (policy.key, key)
+    with _lock:
+        columns = _generic_columns.get(memo)
+    if columns is not None:
+        return columns
+    definition = policy.schema.get_definition(key[0])
+    reached = policy.program.reachable(key)
+    found: set[str] = set()
+    for relation in definition.relations if definition is not None else ():
+        if (key[0], relation.name) not in reached or not isinstance(relation.backing, FieldBinding):
+            continue
+        resolved = resolve_field_backing(definition, relation)  # type: ignore[arg-type]
+        if resolved is not None and resolved.generic is not None:
+            field = resolved.source_model._meta.get_field(resolved.generic.ct_field)
+            found.add(cast(Any, field).attname)
+    columns = tuple(sorted(found))
+    with _lock:
+        _generic_columns[memo] = columns
+        while len(_generic_columns) > _LIMIT:
+            _generic_columns.popitem(last=False)
+    return columns
+
+
+def _row_types(
+    using: str, resource_type: str, columns: tuple[str, ...], ids: Iterable[str]
+) -> dict[str, RowTypes]:
+    """The values the rows ``ids`` name have in ``columns``, read by one
+    statement per 500 ids; an id that names no row has none."""
+    model = model_for_resource_type(resource_type)
+    if not columns or model is None or not stores_rows(model):
+        return {}
+    identity = resource_id_attr(model)
+    codec = identity_codec(model, identity)
+    _, identity_field = model_identity_fields(model, identity)
+    native = {
+        identity_field.to_python(value): value
+        for value in ids
+        if value and codec.is_canonical(value, using=using)
+    }
+    rows = model._base_manager.using(using)
+    values = list(native)
+    found: dict[str, RowTypes] = {}
+    for start in range(0, len(values), 500):
+        chunk = values[start : start + 500]
+        for value, *row in rows.filter(**{f"{identity}__in": chunk}).values_list(
+            identity, *columns
+        ):
+            found[native[value]] = tuple(zip(columns, row, strict=True))
+    return found
+
+
+def _key_types(policy: _Policy, using: str, key: Key, ids: Iterable[str]) -> dict[str, RowTypes]:
+    """The content types that prune ``key`` on the rows ``ids`` name."""
+    return _row_types(using, key[0], _type_columns(policy, key), ids)
+
+
+def _point(
+    operation: _Operation,
+    key: Key,
+    resource_id: str,
+    which: str,
+    row_types: RowTypes | None = None,
+) -> bool:
     """One bound of ``key`` at one identity, by one statement."""
-    compiled = _point_statement(operation, key, which)
+    compiled = _point_statement(operation, key, which, row_types)
     if isinstance(compiled, bool):
         return compiled and operation.gate(parametric=False).exists()
     probe = _Sql(compiled.sql, operation.bound(compiled.params, resource_id))
     return SchemaGeneration.objects.using(operation.using).filter(pk=1).filter(Q(probe)).exists()
 
 
-def _points(asked: Sequence[tuple[_Operation, Key, str]], which: str) -> list[bool]:
+def _points(
+    asked: Sequence[tuple[_Operation, Key, str]],
+    which: str,
+    types: Sequence[RowTypes | None],
+) -> list[bool]:
     """One bound of several items: each a column of one statement over the generation row.
 
     A column is the statement ``_point`` would run for the item, with its own
-    fence and witness.
+    fence and witness; ``types`` are the items' row types, in order.
     """
     answers = [False] * len(asked)
     statements: list[dict[str, _Sql]] = [{}]
     size = 0
     fenced: bool | None = None
     for position, (operation, key, resource_id) in enumerate(asked):
-        compiled = _point_statement(operation, key, which)
+        compiled = _point_statement(operation, key, which, types[position])
         if isinstance(compiled, bool):
             if compiled:
                 if fenced is None:
@@ -1071,21 +1168,27 @@ def _point_result(
     context: Mapping[str, Any] | None,
     using: str,
     lower_only: bool = False,
+    types: Mapping[str, RowTypes] | None = None,
 ) -> tuple[bool, bool, bool, _Policy]:
+    """``types`` are the row types already read for the resource's id
+    (``_key_types``); without them, they are read here."""
     operation = _Operation.begin(backend, actor, using, context)
     key = resource.resource_type, action
+    if types is None:
+        types = _key_types(operation.policy, using, key, (resource.resource_id,))
+    row_types = types.get(resource.resource_id)
     # Only LOWER may authorize, and it is one SQL statement with every fact
     # witnessed in that statement.  Subsequent probes can only return NO,
     # CONDITIONAL, or a depth error.
-    if _point(operation, key, resource.resource_id, "lower"):
+    if _point(operation, key, resource.resource_id, "lower", row_types):
         return True, True, False, operation.policy
     recursive = _recursive(operation, key)
     # The bounds differ only where a caveat or a recursion is in reach.
     if lower_only or not (recursive or not operation.verdicts(key).empty):
         return False, False, False, operation.policy
-    if not _point(operation, key, resource.resource_id, "upper"):
+    if not _point(operation, key, resource.resource_id, "upper", row_types):
         return False, False, False, operation.policy
-    deep = recursive and _point(operation, key, resource.resource_id, "depth")
+    deep = recursive and _point(operation, key, resource.resource_id, "depth", row_types)
     return False, True, deep, operation.policy
 
 
@@ -1260,7 +1363,19 @@ def _check_chunk(
                 prepared[key, context] = operation.verdicts(key)
         asked.append((operation, key, item.resource.resource_id))
     _decide_together(asked)
-    lower = _points(asked, "lower")
+    # The row types every bound of the chunk compiles with: one read per
+    # resource type and set of columns.
+    wanted: dict[tuple[str, tuple[str, ...]], set[str]] = {}
+    for _operation, key, resource_id in asked:
+        columns = _type_columns(policy, key)
+        if columns:
+            wanted.setdefault((key[0], columns), set()).add(resource_id)
+    read = {group: _row_types(using, group[0], group[1], ids) for group, ids in wanted.items()}
+    types = [
+        read.get((key[0], _type_columns(policy, key)), {}).get(resource_id)
+        for _operation, key, resource_id in asked
+    ]
+    lower = _points(asked, "lower", types)
     # The bounds differ only where a caveat or a recursion is in reach.
     open_: list[tuple[int, bool]] = []
     for position, (operation, key, _resource_id) in enumerate(asked):
@@ -1272,13 +1387,25 @@ def _check_chunk(
     upper = dict(
         zip(
             (position for position, _recursive_ in open_),
-            _points([asked[position] for position, _recursive_ in open_], "upper"),
+            _points(
+                [asked[position] for position, _recursive_ in open_],
+                "upper",
+                [types[position] for position, _recursive_ in open_],
+            ),
             strict=True,
         )
     )
     probed = [position for position, recursive in open_ if recursive and upper[position]]
     deep = dict(
-        zip(probed, _points([asked[position] for position in probed], "depth"), strict=True)
+        zip(
+            probed,
+            _points(
+                [asked[position] for position in probed],
+                "depth",
+                [types[position] for position in probed],
+            ),
+            strict=True,
+        )
     )
     return [
         _answer(
@@ -1872,6 +1999,7 @@ def _held(
 ) -> set[str]:
     pending = set(ids)
     found: set[str] = set()
+    types: Mapping[str, RowTypes] | None = None
     model = model_for_resource_type(resource_type)
     if model is not None and stores_rows(model) and context is None and len(pending) > 4:
         identity = resource_id_attr(model)
@@ -1898,6 +2026,10 @@ def _held(
             for value in present:
                 pending.discard(native[value])
             found.update(native[value] for value in allowed)
+        # The ids left name no row: they have no content types.
+        types = {}
+    if pending and types is None:
+        types = _key_types(_policy(backend), using, (resource_type, action), pending)
     for value in sorted(pending):
         if _point_result(
             backend=backend,
@@ -1907,6 +2039,7 @@ def _held(
             context=context,
             using=using,
             lower_only=True,
+            types=types,
         )[0]:
             found.add(value)
     return found
@@ -1928,15 +2061,24 @@ def lookup_subjects(
     name on a path from the resource; each is then tested by the lower bound.
     """
     schema, _snapshot = _schema(backend)
-    return [
-        candidate
-        for candidate in named_subjects(
+    candidates = list(
+        named_subjects(
             schema=schema,
             resource=resource,
             action=action,
             subject_type=subject_type,
             using=using,
         )
+    )
+    if not candidates:
+        return []
+    # One read of the resource's content types serves every candidate.
+    types = _key_types(
+        _policy(backend), using, (resource.resource_type, action), (resource.resource_id,)
+    )
+    return [
+        candidate
+        for candidate in candidates
         if _point_result(
             backend=backend,
             resource=resource,
@@ -1945,5 +2087,6 @@ def lookup_subjects(
             context=context,
             using=using,
             lower_only=True,
+            types=types,
         )[0]
     ]

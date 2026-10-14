@@ -561,3 +561,85 @@ def test_an_arrow_inside_a_nested_exclusion(world):
         set(local.accessible(subject=ALICE, action="read", resource_type="test/attachment"))
         == expected
     )
+
+
+# ---------- A point check compiles only the arms of the row's content type ----------
+
+
+def _point_statements(queries):
+    return [
+        q["sql"]
+        for q in queries
+        if 'FROM "rebac_schemageneration"' in q["sql"] and "EXISTS" in q["sql"]
+    ]
+
+
+def test_a_point_check_compiles_only_the_arm_of_its_rows_type(world):
+    local = world.local
+    attachment = edge(world.mine)
+    resource = to_object_ref(attachment)
+    with CaptureQueriesContext(connection) as queries:
+        assert local.check_access(subject=ALICE, action="read", resource=resource).allowed
+    statements = _point_statements(queries)
+    assert statements
+    # The folder arm is compiled; the post, resource and shelf chains are not.
+    assert all('"testapp_post"' not in sql for sql in statements)
+    assert all('"testapp_shelf"' not in sql for sql in statements)
+    assert any('"testapp_folder"' in sql for sql in statements)
+    # Every type answers as before.
+    for row, allowed in ((world.post, True), (world.other, False), (world.shared, True)):
+        assert (
+            local.check_access(
+                subject=ALICE, action="read", resource=to_object_ref(edge(row))
+            ).allowed
+            is allowed
+        )
+
+
+WITNESS_SCHEMA = SCHEMA.replace(
+    "    permission read   = (((folder->read + post->read) + resource->read) + shelf->read)\n",
+    "    permission read   = (((folder->read + post->read) + resource->read) + shelf->read)\n"
+    "    relation viewer: auth/user\n"
+    "    permission unread = (viewer - post->read)\n",
+)
+
+
+def test_a_row_whose_type_changed_after_the_read_is_denied(world, monkeypatch):
+    """The read says folder, the row is a post: the post arm, pruned, is what
+    takes ``unread`` away, so only the statement's witness denies."""
+    local = install_schema(WITNESS_SCHEMA)
+    resource = to_object_ref(edge(world.post))
+    local.write_relationships([RelationshipTuple(resource, "viewer", ALICE)])
+    assert not local.check_access(subject=ALICE, action="unread", resource=resource).allowed
+    folder_type = ContentType.objects.get_for_model(Folder)
+    stale = {resource.resource_id: (("content_type_id", folder_type.pk),)}
+    monkeypatch.setattr(read, "_row_types", lambda *_: stale)
+    assert not local.check_access(subject=ALICE, action="unread", resource=resource).allowed
+
+
+def test_a_permission_that_reaches_no_generic_relation_reads_no_types(world):
+    local = install_schema(WITNESS_SCHEMA)
+    resource = to_object_ref(edge(world.post))
+    local.write_relationships([RelationshipTuple(resource, "viewer", ALICE)])
+    with CaptureQueriesContext(connection) as queries:
+        assert local.check_access(subject=ALICE, action="viewer", resource=resource).allowed
+    assert not [q for q in queries if '"content_type_id"' in q["sql"]]
+
+
+def test_a_bulk_check_reads_its_resources_types_by_one_statement(world):
+    from rebac import CheckItem
+
+    local = world.local
+    rows = [edge(world.mine) for _ in range(3)]
+    items = [
+        CheckItem(subject=s, action=action, resource=to_object_ref(row))
+        for row in rows
+        for action in ("read", "write")
+        for s in (ALICE, BOB)
+    ]
+    with CaptureQueriesContext(connection) as queries:
+        answers = local.check_bulk_permissions(items)
+    assert [a.allowed for a in answers] == [True, False] * 6
+    reads = [q for q in queries if '"content_type_id" FROM "testapp_attachment"' in q["sql"]]
+    assert len(reads) == 1
+    assert all('"testapp_post"' not in q["sql"] for q in queries)
