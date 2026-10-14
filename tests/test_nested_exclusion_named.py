@@ -1,4 +1,4 @@
-"""An exclusion inside an exclusion, on the ids that stored tuples name (accessible())."""
+"""An exclusion inside an exclusion, at identities that are not rows of the type's model."""
 
 from __future__ import annotations
 
@@ -6,7 +6,7 @@ import pytest
 
 from rebac import ObjectRef, RelationshipTuple, SubjectRef, sudo
 from rebac.testing import install_schema
-from tests.testapp.models import Folder, Post
+from tests.testapp.models import Post
 
 pytestmark = pytest.mark.django_db
 
@@ -71,39 +71,55 @@ definition auth/user {}
 definition blog/folder {
     relation hidden: auth/user
     relation keeper: auth/user
-    permission withheld = hidden - keeper
+    relation x: auth/user
+    permission withheld = hidden - (keeper - x)
 }
 definition blog/post {
-    relation folder: blog/folder // rebac:field=folder
+    relation folder: blog/folder
     relation reader: auth/user
     permission read = reader - folder->withheld
 }
 """
 
 
-def test_an_exclusion_reached_through_an_arrow(db):
+def test_a_nested_exclusion_behind_a_stored_arrow(db):
+    """The folder is a stored relation: its exclusions are evaluated at the
+    folder ids that tuples name, in point checks and scopes as in accessible()."""
     local = install_schema(ARROW_SCHEMA)
     with sudo(reason="test.fixture"):
-        open_, withheld, kept = (
-            Folder.objects.create(name=n) for n in ("open", "withheld", "kept")
-        )
-        posts = {
-            f.name: Post.objects.create(title=f.name, folder=f) for f in (open_, withheld, kept)
-        }
+        posts = {name: Post.objects.create(title=name) for name in ("open", "withheld", "kept")}
+    folder = {name: ObjectRef("blog/folder", name) for name in posts}
     tuples = [
-        RelationshipTuple(ObjectRef("blog/post", str(p.pk)), "reader", ALICE)
-        for p in posts.values()
+        RelationshipTuple(ObjectRef("blog/post", str(post.pk)), "reader", ALICE)
+        for post in posts.values()
     ]
     tuples += [
-        RelationshipTuple(ObjectRef("blog/folder", str(withheld.pk)), "hidden", ALICE),
-        RelationshipTuple(ObjectRef("blog/folder", str(kept.pk)), "hidden", ALICE),
-        RelationshipTuple(ObjectRef("blog/folder", str(kept.pk)), "keeper", ALICE),
+        RelationshipTuple(ObjectRef("blog/post", str(post.pk)), "folder", _folder(folder[name]))
+        for name, post in posts.items()
+    ]
+    tuples += [
+        RelationshipTuple(folder["withheld"], "hidden", ALICE),
+        RelationshipTuple(folder["kept"], "hidden", ALICE),
+        RelationshipTuple(folder["kept"], "keeper", ALICE),
     ]
     local.write_relationships(tuples)
     expected = {str(posts["open"].pk), str(posts["kept"].pk)}
     assert (
         set(local.accessible(subject=ALICE, action="read", resource_type="blog/post")) == expected
     )
+    for post in posts.values():
+        resource = ObjectRef("blog/post", str(post.pk))
+        allowed = str(post.pk) in expected
+        assert (
+            local.check_access(subject=ALICE, action="read", resource=resource).allowed is allowed
+        )
+    assert {
+        str(pk) for pk in Post.objects.with_actor(ALICE).values_list("pk", flat=True)
+    } == expected
+
+
+def _folder(ref):
+    return SubjectRef.of(ref.resource_type, ref.resource_id)
 
 
 DEEP_SCHEMA = """

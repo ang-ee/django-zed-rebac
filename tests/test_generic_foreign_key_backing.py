@@ -522,3 +522,42 @@ def test_check_permission_answers_as_the_effective_actor(world):
         assert check_permission("write", pinned).allowed
         assert not check_permission("write", pinned, actor=BOB).allowed
         assert check_permission("write", pinned.sudo(reason="test.check"), actor=None).allowed
+
+
+NESTED_SCHEMA = SCHEMA.replace(
+    "    permission read   = (((folder->read + post->read) + resource->read) + shelf->read)\n",
+    "    relation viewer: auth/user\n"
+    "    relation blocked: auth/user\n"
+    "    permission read   = viewer - (blocked - post->withheld)\n",
+).replace(
+    "definition blog/post {\n    relation owner: auth/user\n",
+    "definition blog/post {\n    relation owner: auth/user\n    relation hidden: auth/user\n"
+    "    permission withheld = hidden\n",
+)
+
+
+def test_an_arrow_inside_a_nested_exclusion(world):
+    """An exclusion inside an exclusion, its inner arm an arrow through the
+    GenericForeignKey: evaluated at the edges that tuples name."""
+    local = install_schema(NESTED_SCHEMA)
+    unblocked, blocked, released = (edge(world.post) for _ in range(3))
+    tuples = [
+        RelationshipTuple(to_object_ref(row), "viewer", ALICE)
+        for row in (unblocked, blocked, released)
+    ]
+    tuples += [
+        RelationshipTuple(to_object_ref(row), "blocked", ALICE) for row in (blocked, released)
+    ]
+    local.write_relationships(tuples)
+    # The post's withheld lifts the block on every edge to it.
+    expected = {str(unblocked.pk)}
+    assert (
+        set(local.accessible(subject=ALICE, action="read", resource_type="test/attachment"))
+        == expected
+    )
+    local.write_relationships([RelationshipTuple(to_object_ref(world.post), "hidden", ALICE)])
+    expected = {str(row.pk) for row in (unblocked, blocked, released)}
+    assert (
+        set(local.accessible(subject=ALICE, action="read", resource_type="test/attachment"))
+        == expected
+    )
