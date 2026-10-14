@@ -3,6 +3,20 @@
 All notable changes to `django-zed-rebac` are tracked here. The project is in
 pre-1.0; breaking changes within a minor version are explicitly called out.
 
+## [Unreleased]
+
+### Fixed
+
+- `accessible()`, and the bulk write guards built on it, raised `FieldError:
+  Cannot resolve keyword 'resource_id'` for a permission with an exclusion
+  inside an exclusion (`read = (owner + reader) - conceal`, `conceal =
+  hidden - keeper`) on a type whose stored tuples name resources. On the ids
+  that tuples name, each exclusion is a subquery whose reference to the id
+  reaches out of it; the inner one reached one level too few, to the outer
+  subquery's table. It now reaches the id itself (`OuterRef(OuterRef(...))`),
+  however deep the exclusions nest. Point checks and queryset scopes were not
+  affected.
+
 ## [0.27.1] — 2026-10-12
 
 ### Added
