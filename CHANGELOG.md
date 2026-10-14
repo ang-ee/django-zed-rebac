@@ -3,7 +3,7 @@
 All notable changes to `django-zed-rebac` are tracked here. The project is in
 pre-1.0; breaking changes within a minor version are explicitly called out.
 
-## [Unreleased]
+## [0.27.3] — 2026-10-14
 
 ### Fixed
 
@@ -12,10 +12,11 @@ pre-1.0; breaking changes within a minor version are explicitly called out.
   `GenericForeignKey` backs, compiled every target type's permission into one
   statement. With several deep target types it grew past SQLite's
   expression-depth limit (`Expression tree is too large (maximum depth
-  1000)`), and on every database it was larger than needed. The row's
-  content types are now read first and only the arms of those types are
-  compiled; the statement re-reads them, so a row whose target changed in
-  between selects nothing.
+  1000)`), and on every database it was larger than needed. When the
+  permission reaches such a relation, the row's content types are now read
+  first (for a bulk check, one statement per chunk and resource type) and
+  only the arms of those types are compiled; the statement re-reads them, so
+  a row whose target changed in between selects nothing.
 
 ## [0.27.2] — 2026-10-14
 
