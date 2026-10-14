@@ -19,7 +19,18 @@ pre-1.0; breaking changes within a minor version are explicitly called out.
   primary key, checked, and written by key, 5,000 per statement; a cascade
   that reaches a row outside them checks that row as an instance delete
   does. A caller that relied on the refusal for rows it cannot read now gets
-  the count of the rows written.
+  the count of the rows written. `bulk_update()` writes through `update()`:
+  an object the actor cannot read is skipped and not counted, where the call
+  used to refuse.
+
+### Fixed
+
+- `.distinct(*fields).update()` under an actor raises `TypeError`, as
+  Django's `delete()` does. Django's UPDATE writes every matching row while
+  `DISTINCT ON` selects one per value, so on PostgreSQL the write checked one
+  row per value and wrote all of them.
+- A bulk `update()` or `delete()` on a scope with no actor (an aggregate
+  scope outside any actor) raises `MissingActorError`.
 
 ### Documentation
 

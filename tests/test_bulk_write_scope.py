@@ -10,7 +10,16 @@ from __future__ import annotations
 import pytest
 from django.contrib.auth import get_user_model
 
-from rebac import ObjectRef, PermissionDenied, RelationshipTuple, backend, sudo, to_subject_ref
+from rebac import (
+    MissingActorError,
+    ObjectRef,
+    PermissionDenied,
+    RelationshipTuple,
+    actor_context,
+    backend,
+    sudo,
+    to_subject_ref,
+)
 from rebac.backends import reset_backend
 from rebac.schema import parse_zed
 from tests.backend_setup import install_schema
@@ -151,3 +160,65 @@ def test_a_cascade_still_checks_a_hidden_child(world):
             rows.delete()
     with sudo(reason="test.verify"):
         assert Folder.objects.filter(pk__in=[mine.pk, child.pk]).count() == 2
+
+
+def test_an_ambient_actor_and_a_related_manager_are_scoped_alike(world):
+    dave, _mine, theirs, _own, hidden, _shared = world
+    with actor_context(to_subject_ref(dave)):
+        assert Post.objects.filter(body="confidential").update(body="x") == 0
+        assert theirs.posts.filter(body="confidential").update(body="x") == 0
+        assert theirs.posts.filter(body="confidential").delete() == (0, {})
+    assert _stored(hidden).body == "confidential"
+
+
+def test_bulk_update_skips_an_object_the_actor_cannot_read(world):
+    dave, _mine, _theirs, own, hidden, _shared = world
+    rows = Post.objects.as_user(dave)
+    mine = rows.get(pk=own.pk)
+    mine.body = "bulk"
+    other = Post(pk=hidden.pk, title="carol's", body="bulk")
+    assert rows.bulk_update([mine, other], ["body"]) == 1
+    assert (_stored(own).body, _stored(hidden).body) == ("bulk", "confidential")
+
+
+def test_a_denial_in_a_later_part_rolls_back_the_whole_write(world, monkeypatch):
+    import rebac.watch
+
+    dave, _mine, _theirs, own, _hidden, shared = world
+    monkeypatch.setattr(rebac.watch, "KEY_CHUNK", 1)
+    with pytest.raises(PermissionDenied):
+        Post.objects.as_user(dave).filter(body__in=["mine", "shared"]).update(body="x")
+    with pytest.raises(PermissionDenied):
+        Post.objects.as_user(dave).filter(body__in=["mine", "shared"]).delete()
+    assert (_stored(own).body, _stored(shared).body) == ("mine", "shared")
+
+
+def test_an_update_clears_the_result_cache(world):
+    dave, *_ = world
+    rows = Post.objects.as_user(dave).filter(body="mine")
+    assert [post.body for post in rows] == ["mine"]
+    assert rows.update(body="changed") == 1
+    assert list(rows) == []
+
+
+def test_a_bypass_still_writes_every_row(world):
+    _dave, _mine, _theirs, _own, hidden, _shared = world
+    assert Post.objects.sudo(reason="test.sudo").filter(body="confidential").update(body="x") == 1
+    assert _stored(hidden).body == "x"
+
+
+def test_a_scope_without_an_actor_writes_nothing(world):
+    _dave, _mine, _theirs, own, _hidden, _shared = world
+    with pytest.raises(MissingActorError):
+        Post.objects.scoped_for_aggregate().filter(body="mine").update(body="x")
+    with pytest.raises(MissingActorError):
+        Post.objects.scoped_for_aggregate().filter(body="mine").delete()
+    assert _stored(own).body == "mine"
+
+
+def test_a_distinct_on_update_is_refused_under_an_actor(world):
+    """DISTINCT ON would check one row per value; the UPDATE writes them all."""
+    dave, _mine, _theirs, own, _hidden, _shared = world
+    with pytest.raises(TypeError, match="distinct"):
+        Post.objects.as_user(dave).filter(body="mine").distinct("title").update(body="x")
+    assert _stored(own).body == "mine"

@@ -1592,12 +1592,18 @@ class RebacQuerySet(models.QuerySet[_M]):
             actor, bypass = self._resolve_effective_actor()
             if bypass or not (watched or model_resource_type(self.model)):
                 return self._rebac_update(**kwargs)
+            if self.query.distinct_fields:
+                # Django's UPDATE writes every matching row; DISTINCT ON would
+                # select one per value, so the rows checked would not be the
+                # rows written.  Django refuses it for delete() as well.
+                raise TypeError("Cannot call update() after .distinct(*fields) under an actor.")
             # Before any row is selected: a refusal must not depend on a match.
             self._guard_clause_field_reads(actor, bypass, query=self._update_query())
             # The statement acts on the rows the actor's scope admits: exactly
             # those are gated and written, by key.
-            assert actor is not None
-            keys = statement_keys(self._rows_in_scope(actor, reason="rebac.write.rows"))
+            keys = statement_keys(
+                self._rows_in_scope(self._writing_actor(actor), reason="rebac.write.rows")
+            )
             if watched:
                 for rows in by_key(self.model._base_manager.using(self.db), keys):
                     _gate_backed_rows(
@@ -1608,7 +1614,9 @@ class RebacQuerySet(models.QuerySet[_M]):
                         actor=actor,
                         bypass=bypass,
                     )
-            return sum(rows._rebac_update(**kwargs) for rows in by_key(self, keys))
+            written = sum(rows._rebac_update(**kwargs) for rows in by_key(self, keys))
+            self._result_cache = None
+            return written
 
     def bulk_update(
         self, objs: Iterable[_M], fields: Iterable[str], batch_size: int | None = None
@@ -1682,7 +1690,7 @@ class RebacQuerySet(models.QuerySet[_M]):
             # The statement acts on the rows the actor's scope admits: exactly
             # those are checked and deleted, by key.  A cascade that reaches
             # another row checks it as an instance delete does.
-            assert actor is not None
+            actor = self._writing_actor(actor)
             keys = statement_keys(self._rows_in_scope(actor, reason="rebac.delete.rows"))
             parts = list(by_key(self, keys))
             with deciding_afresh():
@@ -1835,6 +1843,16 @@ class RebacQuerySet(models.QuerySet[_M]):
         rows._rebac_eager_scope = True
         rows._scope_query(rows.query, actor)
         return rows
+
+    def _writing_actor(self, actor: SubjectRef | None) -> SubjectRef:
+        """The actor a scoped bulk write acts for; a scope with none (an
+        aggregate scope outside any actor) writes nothing and raises."""
+        if actor is None:
+            raise MissingActorError(
+                f"Bulk write on {self.model.__name__} without an actor. "
+                "Use .with_actor(actor) or .sudo(reason='...')."
+            )
+        return actor
 
     def _affected_resource_ids_for_guard(self) -> set[str]:
         """Scan the statement's rows without read-scoping the guard itself: under
