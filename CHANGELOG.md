@@ -5,6 +5,22 @@ pre-1.0; breaking changes within a minor version are explicitly called out.
 
 ## [Unreleased]
 
+### Changed
+
+- A bulk `update()` or `delete()` under an actor acts only on the rows its
+  queryset's scope admits (its action, `read` by default), the rows
+  `count()` counts. A row the actor cannot read is no longer part of the
+  statement: it is neither checked nor written. Before, a hidden row that
+  matched the filter made the call raise `PermissionDenied` ("row outside
+  actor scope") while the same call returned `0` when nothing matched, which
+  told the caller that a row they cannot read matches the filter (#42).
+  Among the rows in scope the write is still all-or-nothing: a readable row
+  the actor may not write still refuses. The rows in scope are selected by
+  primary key, checked, and written by key, 5,000 per statement; a cascade
+  that reaches a row outside them checks that row as an instance delete
+  does. A caller that relied on the refusal for rows it cannot read now gets
+  the count of the rows written.
+
 ### Documentation
 
 - `check_save()`: its verdict covers the fields the save writes. Without

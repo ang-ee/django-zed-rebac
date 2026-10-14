@@ -2091,7 +2091,7 @@ needs one is not in its lower bound.
 | Model-level check (empty resource id) | A row-independent grant, or any accessible identity of the type. |
 | `grants_all()` | The lower bound at the empty id: only a row-independent arm can hold there. False for a permission with an exclusion on the row (in its expression or one it names on the same type): a row-specific fact can take it from one row. |
 | Backed-edge write gate | `write` on the affected declaring rows. More than four ids that are rows of the type's model are tested by one scoped statement per 500 ids; the others by the lower bound, one by one. |
-| Bulk write guard | Every resource id of the statement must be in `accessible()` for the action. |
+| Bulk write guard | Every resource id of the statement must be in `accessible()` for the action. Under an actor the statement holds only the rows the queryset's scope admits (see [CRUD enforcement matrix](#crud-enforcement-matrix)). |
 | Field read gate `read__<field>` | `accessible()` for that permission. |
 | `check_new()` | The walker over the candidate's proposed relations; an arrow into an existing object is answered by `check_access()`. |
 
@@ -2178,13 +2178,14 @@ related-manager wrappers and the explicit-sender receivers.
   declaring rows of the old and the new edge. It reads the stored value with
   `SELECT … FOR UPDATE` when the database supports it and a transaction is
   open, which is the case in every owned write.
-- **The key rule for queryset writes.** A queryset `update()` of a column
-  the policy reads, and a tracked queryset `delete()` on a model the policy
-  reads, select the primary keys of the statement's rows, gate exactly those
-  rows from their stored values, and write exactly those rows by key, 5,000
-  keys per statement. A row that starts matching the caller's filter in
-  between is neither gated nor written. A denied row denies the whole
-  statement.
+- **The key rule for queryset writes.** A queryset `update()` or
+  `delete()` under an actor, and a tracked queryset `delete()` on a model the
+  policy reads, select the primary keys of the statement's rows (under an
+  actor, only the rows the queryset's scope admits), gate exactly those rows
+  (from their stored values when the write changes a column the policy
+  reads), and write exactly those rows by key, 5,000 keys per statement. A
+  row that starts matching the caller's filter in between is neither gated
+  nor written. A denied row denies the whole statement.
 - **Tuple writes.** `write_relationships()` validates every tuple against
   the effective schema and saves the rows in one transaction; model save
   signals run for each row. `delete_relationships()` and queryset deletes on
@@ -2491,8 +2492,8 @@ tracked model's callable attribute named `actor` does not become an actor scope.
 | `instance.check_access("create")` / `has_access("create")` (new instance) | `create` on the proposed row's forward relations | The same projection into `check_new`, on the instance as it is now: without a caveat context it is the decision the save gate makes on the same alias, so a caller can check before validating or saving. What `save()` prepares later (an override, Django's refresh of a related object saved after it was assigned) is not seen. A context the caller supplies is used, though `save()` supplies none; a `consistency` the backend refuses is refused, and the candidate's reads take none. It can answer `CONDITIONAL_PERMISSION`, and raises what the projection raises (an invalid field value, an unavailable related row, `SchemaError` or another error from `proposed_relationships()`), as the save gate would. Any other action on a new instance asks the model-level sentinel; a loaded instance is checked as the row it is. |
 | `instance.check_save(*, using=None, update_fields=None)` | What the instance's first save through `save()` with the same arguments meets at the gates | Runs `save()` itself (the model's override; Django's preparation: a deferred instance's loaded fields, the key of a related object saved after it was assigned, the checks on `update_fields`; the redacted rewrite; the gates: the create candidate, or `write`, `write__<field>` on changed fields, a moving edge, expression reads, redacted writes, and the backed-edge gate) inside a transaction on the write alias that it rolls back, and stops where Django would send `pre_save` and write. `HAS_PERMISSION` when that save passes the gates or writes nothing, `NO_PERMISSION` with the denial's reason otherwise, even when an override swallows the denial. Nothing is audited inside: the instance's own bypass is taken, and audited, before; another bypass is left for the real save; no denial is audited. Other model instances the override saves get back their primary key and state. Not covered: a second save of the instance in the same override, `pre_save`/`post_save` receivers, effects outside that transaction (another alias, a durable block, anything outside the database). A caller that runs validation with more access than the actor (unique checks under `system_context`) asks it first, so validation never answers for a save the gates would refuse. The verdict covers the fields the save writes: without `update_fields`, `save()` leaves the fields redacted at load out of the write, even when assigned, and the check passes without them. Such a caller excludes the fields the actor may not read from the validation (`instance.validate_unique(exclude=instance.denied_read_fields())`), or it answers for values the actor can neither read nor write. |
 | `instance.delete()` | `delete` on the row | `RebacMixin.delete`; explicit-sender `pre_delete` checks collector children. |
-| `Model.objects.update(**kwargs)` | `write` on each affected row and every resource row whose backed FK edge changes | Manager intersects the queryset PK set with the actor's `write` scope; raises if any in-scope row is excluded. A backed FK update checks old and proposed source rows before SQL; expressions whose proposed FK cannot be resolved are refused. When the update touches a column the policy reads, the statement's primary keys are selected, those rows are gated, and exactly those rows are written by key (see [Writes](#writes)). |
-| `Model.objects.delete()` | `delete` on each row | Same pattern. |
+| `Model.objects.update(**kwargs)` | `write` on each affected row and every resource row whose backed FK edge changes | Under an actor the statement acts on the rows the queryset's scope admits (its action, `read` by default), the rows `count()` counts: a row outside the scope is not part of it, is neither checked nor written, and never causes a refusal. The primary keys of the rows in scope are selected; every one must be in the actor's `write` scope, and in `write__<field>` for a gated field it sets, or the update raises; exactly those rows are written, by key (see [Writes](#writes)). A backed FK update checks old and proposed source rows before SQL; expressions whose proposed FK cannot be resolved are refused. When the update touches a column the policy reads, the selected rows are gated from their stored values. |
+| `Model.objects.delete()` | `delete` on each row | The same rows: under an actor, those the queryset's scope admits, selected by primary key. Every one must be in the actor's `delete` scope, or the delete raises; exactly those rows are deleted, by key. A cascade that reaches a row outside them checks that row as an instance delete does. |
 
 For an automatically created M2M through table, a `RebacMixin` owner needs
 `write` on its row even if the table backs no relation. When the table is
@@ -2557,7 +2558,7 @@ sudo on `raw()` emits one bypass audit row; an ambient sudo block emits its row
 at entry. A `scoped()` queryset made in that block emits its own audit row if
 its bypass is first used after the block exits.
 
-**Failure mode for writes:** *all-or-nothing*. Any denied row in a bulk write raises and rolls back. **Failure mode for reads:** denied rows are absent from the queryset; no raise. List endpoints return `[]` rather than 403 when the user has no rows.
+**Failure mode for writes:** *all-or-nothing* over the rows a write acts on. A bulk `update()` or `delete()` under an actor acts on the rows its queryset's scope admits; any of them denied raises and rolls back. A row outside the scope is not part of the write: a filter that matches only such rows writes nothing and returns `0` (`(0, {})` for `delete()`), as when nothing matches, so a refusal never depends on a row the actor cannot read. **Failure mode for reads:** denied rows are absent from the queryset; no raise. List endpoints return `[]` rather than 403 when the user has no rows.
 Write expressions, including `F()` on an instance or in `update()` and
 `bulk_update()`, may read columns before writing their result. If a source
 column has a `read__<field>` gate under the active field-read mode, every
