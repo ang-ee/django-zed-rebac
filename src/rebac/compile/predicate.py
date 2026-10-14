@@ -229,6 +229,28 @@ def _not(q: Q) -> Q:
     return ~q
 
 
+def _one_level_out(ref: Any) -> Any:
+    """``ref`` as a subquery one level deeper sees it.
+
+    A column of the enclosing query becomes an ``OuterRef``, and an
+    ``OuterRef`` already reaching out reaches one level further
+    (``OuterRef(OuterRef(...))``): an exclusion inside an exclusion nests one
+    subquery inside another.  References inside an expression are moved the
+    same way; a value is left as it is.
+    """
+    if isinstance(ref, OuterRef):
+        return OuterRef(ref)
+    if isinstance(ref, F):
+        return OuterRef(vars(ref)["name"])
+    sources = getattr(ref, "get_source_expressions", None)
+    parts: list[Any] = list(cast(Iterable[Any], sources())) if callable(sources) else []
+    if not parts:
+        return ref
+    moved = ref.copy()
+    moved.set_source_expressions([None if part is None else _one_level_out(part) for part in parts])
+    return moved
+
+
 def _not_null(expr: Expression | F | OuterRef) -> Q:
     return Q(IsNull(expr, False))
 
@@ -1443,7 +1465,7 @@ class Compiler:
         else:
             from ..models.generation import SchemaGeneration
 
-            ref = OuterRef(vars(at.ref)["name"]) if isinstance(at.ref, F) else at.ref
+            ref = _one_level_out(at.ref)
             positive = self._expression(
                 definition,
                 expr,

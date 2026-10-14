@@ -3,6 +3,23 @@
 All notable changes to `django-zed-rebac` are tracked here. The project is in
 pre-1.0; breaking changes within a minor version are explicitly called out.
 
+## [0.27.2] — 2026-10-14
+
+### Fixed
+
+- An exclusion inside an exclusion, evaluated at an identity that is not a
+  row of the type's model, raised `FieldError: Cannot resolve keyword ...`.
+  Each exclusion there is a subquery whose reference to the identity reaches
+  out of it, and the inner one reached one level too few. Every path that
+  evaluates at such an identity was affected: `accessible()` and the bulk
+  write guards built on it, on the ids that tuples name (`read = (owner +
+  reader) - conceal` with `conceal = hidden - keeper`), and point checks and
+  queryset scopes through a stored arrow or subject set (`read = reader -
+  folder->withheld` with `withheld = hidden - (keeper - x)` and a stored
+  `folder` relation), recursive tuple seeds and constant targets. The
+  reference now reaches the identity itself (`OuterRef(OuterRef(...))`),
+  however deep the exclusions nest.
+
 ## [0.27.1] — 2026-10-12
 
 ### Added
