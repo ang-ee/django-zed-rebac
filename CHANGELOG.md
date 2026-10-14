@@ -3,6 +3,18 @@
 All notable changes to `django-zed-rebac` are tracked here. The project is in
 pre-1.0; breaking changes within a minor version are explicitly called out.
 
+## [Unreleased]
+
+### Documentation
+
+- `check_save()`: its verdict covers the fields the save writes. Without
+  `update_fields`, `save()` leaves the fields redacted at load out of the
+  write, even when they were assigned, so the check passes without them. A
+  caller that validates after a passing check with more access than the
+  actor (unique or constraint checks under `system_context`) excludes the
+  fields the actor may not read (`denied_read_fields()`) from that
+  validation, or it answers for values the actor can neither read nor write.
+
 ## [0.27.3] — 2026-10-14
 
 ### Fixed

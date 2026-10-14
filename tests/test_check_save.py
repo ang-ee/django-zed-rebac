@@ -128,6 +128,35 @@ def test_a_changed_field_is_checked_as_the_save_checks_it(world):
     assert _agree(retitled, update_fields=[])
 
 
+def test_a_redacted_field_is_left_unwritten_and_named_by_denied_read_fields(world, settings):
+    """The check passes without the redacted field: a caller validating after it
+    excludes what ``denied_read_fields()`` names."""
+    settings.REBAC_FIELD_READ_MODE = "redact"
+    install_schema(
+        backend(),
+        parse_zed(
+            SCHEMA.replace(
+                "    permission write__title = owner\n",
+                "    permission write__title = owner\n    permission read__title = owner\n",
+            )
+        ),
+    )
+    _alice, bob, _carol, _mine, _theirs, post = world
+    edited = _loaded(bob, post)
+    assert edited.title is None
+    edited.title = "a title bob can neither read nor write"
+    edited.body = "an edit"
+    assert _agree(edited)
+    assert edited.denied_read_fields() == {"title"}
+    saved = _loaded(bob, post)
+    saved.title = "a title bob can neither read nor write"
+    saved.body = "an edit"
+    saved.save()
+    with sudo(reason="test.verify"):
+        stored = Post.objects.get(pk=post.pk)
+    assert (stored.title, stored.body) == ("draft", "an edit")
+
+
 def test_a_deferred_instance_is_checked_on_its_loaded_fields(world):
     _alice, bob, _carol, _mine, _theirs, post = world
     edited = _loaded(bob, post, "body")
