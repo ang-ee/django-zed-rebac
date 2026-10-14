@@ -287,18 +287,17 @@ def test_aggregate_raises_in_strict_mode_without_actor() -> None:
 
 
 @pytest.mark.django_db(transaction=True)
-def test_aupdate_denies_rows_actor_cannot_write() -> None:
+def test_aupdate_leaves_rows_actor_cannot_read() -> None:
     from tests.testapp.models import Post
 
     post = _post()
     alice, bob = _user("alice"), _user("bob")
     _grant_owner(alice, post)
 
-    async def go() -> None:
-        await Post.objects.as_user(bob).filter(pk=post.pk).aupdate(title="hijacked")
+    async def go() -> int:
+        return await Post.objects.as_user(bob).filter(pk=post.pk).aupdate(title="hijacked")
 
-    with pytest.raises(PermissionDenied):
-        asyncio.run(go())
+    assert asyncio.run(go()) == 0
     post.refresh_from_db()
     assert post.title != "hijacked"
 

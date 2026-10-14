@@ -205,23 +205,22 @@ def test_as_agent_scopes_agent_grant_on_behalf_of_user(alice, bob, post):
     assert list(Post.objects.as_agent(agent, on_behalf_of=bob).values_list("pk", flat=True)) == []
 
 
-def test_bulk_update_denies_rows_actor_cannot_read(alice, bob, post):
+def test_bulk_update_leaves_rows_actor_cannot_read(alice, bob, post):
+    """A row the actor cannot read is not part of the statement (#42)."""
     _grant_owner(alice, post)
     from tests.testapp.models import Post
 
-    with pytest.raises(PermissionDenied):
-        Post.objects.as_user(bob).filter(pk=post.pk).update(title="hijacked")
+    assert Post.objects.as_user(bob).filter(pk=post.pk).update(title="hijacked") == 0
 
     post.refresh_from_db()
     assert post.title == "hello"
 
 
-def test_bulk_delete_denies_rows_actor_cannot_read(alice, bob, post):
+def test_bulk_delete_leaves_rows_actor_cannot_read(alice, bob, post):
     _grant_owner(alice, post)
     from tests.testapp.models import Post
 
-    with pytest.raises(PermissionDenied):
-        Post.objects.as_user(bob).filter(pk=post.pk).delete()
+    assert Post.objects.as_user(bob).filter(pk=post.pk).delete() == (0, {})
 
     assert Post.objects.sudo(reason="test.check").filter(pk=post.pk).exists()
 
