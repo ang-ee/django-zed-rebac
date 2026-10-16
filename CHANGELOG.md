@@ -3,7 +3,7 @@
 All notable changes to `django-zed-rebac` are tracked here. The project is in
 pre-1.0; breaking changes within a minor version are explicitly called out.
 
-## [Unreleased]
+## [0.28.0] — 2026-10-16
 
 ### Changed
 
