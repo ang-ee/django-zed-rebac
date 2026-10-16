@@ -13,7 +13,6 @@ from django.utils import timezone
 
 from rebac import (
     MissingActorError,
-    PermissionDenied,
     RelationshipTuple,
     SubjectRef,
     backend,
@@ -177,8 +176,8 @@ def test_recursive_enumeration_and_bulk_guard(storage, backing, depth):
             list(active.accessible(subject=OUTSIDER, action=action, resource_type="blog/folder"))
             == []
         )
-        with pytest.raises(PermissionDenied, match="Bulk operations are all-or-nothing"):
-            Folder.objects.with_actor(OUTSIDER).filter(pk=overflow.pk).update(name="denied")
+        # Outside the outsider's scope, the row is not part of the statement.
+        assert Folder.objects.with_actor(OUTSIDER).filter(pk=overflow.pk).update(name="x") == 0
         assert Folder._base_manager.get(pk=overflow.pk).name == "overflow"
         assert Folder.objects.with_actor(ACTOR).filter(pk=overflow.pk).update(name="allowed") == 1
         assert Folder._base_manager.get(pk=overflow.pk).name == "allowed"

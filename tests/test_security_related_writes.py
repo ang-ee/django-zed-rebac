@@ -1161,26 +1161,20 @@ def test_refresh_from_db_keeps_redacted_field_hidden(fields):
 # ---------- bulk guard ----------
 
 
-def test_bulk_guard_denial_names_no_row_the_actor_cannot_read():
+def test_bulk_guard_never_answers_for_a_row_the_actor_cannot_read():
+    """A row the actor cannot read is not part of a bulk write (#42): it is
+    neither written nor reported, however many there are."""
     with sudo(reason="test.fixture"):
         SluggedPost.objects.create(slug="visible-row", title="old")
         SluggedPost.objects.create(slug="hidden-row", title="old")
     _grant("blog/sluggedpost", "visible-row", "owner", READER)
     assert not SluggedPost.objects.with_actor(READER).filter(slug="hidden-row").exists()
 
-    try:
-        SluggedPost.objects.with_actor(READER).update(title="new")
-    except PermissionDenied as exc:
-        message = str(exc)
-    else:
-        message = ""
-
-    assert "hidden-row" not in message
+    assert SluggedPost.objects.with_actor(READER).update(title="new") == 1
     with sudo(reason="test.fixture"):
         SluggedPost.objects.create(slug="another-hidden-row", title="old")
-    with pytest.raises(PermissionDenied) as more:
-        SluggedPost.objects.with_actor(READER).update(title="new")
-    assert str(more.value) == message
-    assert message.endswith("all-or-nothing.")
+    assert SluggedPost.objects.with_actor(READER).update(title="newer") == 1
     with sudo(reason="test.verify"):
-        assert SluggedPost.objects.get(slug="hidden-row").title == "old"
+        assert set(
+            SluggedPost.objects.exclude(slug="visible-row").values_list("title", flat=True)
+        ) == {"old"}

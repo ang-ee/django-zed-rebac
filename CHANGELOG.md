@@ -3,7 +3,34 @@
 All notable changes to `django-zed-rebac` are tracked here. The project is in
 pre-1.0; breaking changes within a minor version are explicitly called out.
 
-## [Unreleased]
+## [0.28.0] — 2026-10-16
+
+### Changed
+
+- A bulk `update()` or `delete()` under an actor acts only on the rows its
+  queryset's scope admits (its action, `read` by default), the rows
+  `count()` counts. A row the actor cannot read is no longer part of the
+  statement: it is neither checked nor written. Before, a hidden row that
+  matched the filter made the call raise `PermissionDenied` ("row outside
+  actor scope") while the same call returned `0` when nothing matched, which
+  told the caller that a row they cannot read matches the filter (#42).
+  Among the rows in scope the write is still all-or-nothing: a readable row
+  the actor may not write still refuses. The rows in scope are selected by
+  primary key, checked, and written by key, 5,000 per statement; a cascade
+  that reaches a row outside them checks that row as an instance delete
+  does. A caller that relied on the refusal for rows it cannot read now gets
+  the count of the rows written. `bulk_update()` writes through `update()`:
+  an object the actor cannot read is skipped and not counted, where the call
+  used to refuse.
+
+### Fixed
+
+- `.distinct(*fields).update()` under an actor raises `TypeError`, as
+  Django's `delete()` does. Django's UPDATE writes every matching row while
+  `DISTINCT ON` selects one per value, so on PostgreSQL the write checked one
+  row per value and wrote all of them.
+- A bulk `update()` or `delete()` on a scope with no actor (an aggregate
+  scope outside any actor) raises `MissingActorError`.
 
 ### Documentation
 
