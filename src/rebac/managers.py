@@ -1800,28 +1800,21 @@ class RebacQuerySet(models.QuerySet[_M]):
         return {str(v) for v in scan.values_list(attr, flat=True)}
 
 
-class _ModelManager(models.Manager[Any]):
-    """Retain the public managers' existing erased model parameter before queryset composition."""
+_RebacManagerBase = models.Manager.from_queryset(RebacQuerySet)
 
 
-_RebacManagerBase = _ModelManager.from_queryset(RebacQuerySet)
-
-
-class RebacManager(_RebacManagerBase):
+# django-stubs synthesizes a generic manager base; Pyright has no Django plugin.
+class RebacManager[M: models.Model](_RebacManagerBase[M]):  # pyright: ignore[reportInvalidTypeArguments]
     """Manager backed by `RebacQuerySet`.
 
     Built via ``from_queryset`` so the custom queryset methods (and any
     subclass supplied through ``RebacManager.from_queryset(...)``) are
-    copied onto the manager. The actor verbs are re-declared with
-    explicit signatures for IDE/type discoverability; the return type is
-    ``RebacQuerySet[Any]`` because the ``from_queryset`` base erases the
-    model parameter — call ``.with_actor(...)`` on a model-typed
-    queryset (e.g. ``Post.objects.all().as_user(u)``) when you need the
-    concrete row type preserved through to ``.get()``.
+    copied onto the manager. Actor verbs preserve the manager's concrete
+    model parameter through queryset chains.
     """
 
-    def get_queryset(self) -> RebacQuerySet[Any]:
-        return cast(RebacQuerySet[Any], super().get_queryset())
+    def get_queryset(self) -> RebacQuerySet[M]:
+        return cast(RebacQuerySet[M], super().get_queryset())
 
     def raw(
         self, raw_query: str, params: Any = (), translations: Any = None, using: Any = None
@@ -1832,37 +1825,37 @@ class RebacManager(_RebacManagerBase):
         raw_method = self.get_queryset().raw
         return raw_method(raw_query, params=params, translations=translations, using=using)
 
-    def with_actor(self, actor: Any) -> RebacQuerySet[Any]:
+    def with_actor(self, actor: Any) -> RebacQuerySet[M]:
         return self.get_queryset().with_actor(actor)
 
-    def as_user(self, user: Any) -> RebacQuerySet[Any]:
+    def as_user(self, user: Any) -> RebacQuerySet[M]:
         return self.get_queryset().as_user(user)
 
-    def as_agent(self, agent: Any, *, on_behalf_of: Any | None = None) -> RebacQuerySet[Any]:
+    def as_agent(self, agent: Any, *, on_behalf_of: Any | None = None) -> RebacQuerySet[M]:
         return self.get_queryset().as_agent(agent, on_behalf_of=on_behalf_of)
 
-    def with_action(self, action: str) -> RebacQuerySet[Any]:
+    def with_action(self, action: str) -> RebacQuerySet[M]:
         return self.get_queryset().with_action(action)
 
-    def on_field_deny(self, mode: FieldDenyMode) -> RebacQuerySet[Any]:
+    def on_field_deny(self, mode: FieldDenyMode) -> RebacQuerySet[M]:
         return self.get_queryset().on_field_deny(mode)
 
-    def for_write(self) -> RebacQuerySet[Any]:
+    def for_write(self) -> RebacQuerySet[M]:
         return self.get_queryset().for_write()
 
     def readable(self, field: str) -> models.Expression:
         return self.get_queryset().readable(field)
 
-    def rebac_select_related(self, *fields: Any) -> RebacQuerySet[Any]:
+    def rebac_select_related(self, *fields: Any) -> RebacQuerySet[M]:
         return self.get_queryset().rebac_select_related(*fields)
 
-    def rebac_prefetch_related(self, *lookups: Any) -> RebacQuerySet[Any]:
+    def rebac_prefetch_related(self, *lookups: Any) -> RebacQuerySet[M]:
         return self.get_queryset().rebac_prefetch_related(*lookups)
 
-    def sudo(self, *, reason: str) -> RebacQuerySet[Any]:
+    def sudo(self, *, reason: str) -> RebacQuerySet[M]:
         return self.get_queryset().sudo(reason=reason)
 
-    def system_context(self, *, reason: str) -> RebacQuerySet[Any]:
+    def system_context(self, *, reason: str) -> RebacQuerySet[M]:
         return self.get_queryset().system_context(reason=reason)
 
 
@@ -2003,8 +1996,9 @@ class TrackedQuerySet[T: models.Model](models.QuerySet[T]):
             return super().bulk_update(objs, field_names, batch_size=batch_size)
 
 
-_TrackedManagerBase = _ModelManager.from_queryset(TrackedQuerySet)
+_TrackedManagerBase = models.Manager.from_queryset(TrackedQuerySet)
 
 
-class TrackedManager(_TrackedManagerBase):
+# Keep the same model parameter on Django's generated, generic manager base.
+class TrackedManager[M: models.Model](_TrackedManagerBase[M]):  # pyright: ignore[reportInvalidTypeArguments]
     """Unfiltered manager whose writes to columns the policy reads are gated."""
