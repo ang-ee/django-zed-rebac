@@ -4,6 +4,7 @@ import pytest
 from django.core import checks
 from django.core.exceptions import ImproperlyConfigured
 from django.db import models
+from django.db.migrations.state import ModelState
 from django.test.utils import isolate_apps
 
 from rebac import (
@@ -91,6 +92,7 @@ def test_declared_base_manager_is_kept():
     assert _base(Revision) == ("system_objects", PolicyQuerySet)
     assert Revision._meta.base_manager is Revision._base_manager
     assert Revision._base_manager.name == "system_objects"
+    assert not Revision._base_manager.auto_created
     assert Revision._meta.default_manager_name == "objects"
     assert isinstance(Revision._default_manager, RebacManager)
 
@@ -205,8 +207,26 @@ def test_undeclared_base_manager_is_the_injected_one():
     for model in (Plain, Tracked, Post, Folder):
         assert _base(model) == ("_rebac_base", TrackedQuerySet)
         assert type(model._base_manager) is TrackedManager
+        assert model._base_manager.auto_created
         assert model._meta.default_manager_name == "objects"
     assert isinstance(Post._default_manager, RebacManager)
+
+
+@isolate_apps("tests.testapp")
+def test_injected_manager_provenance_preserves_native_migration_state(monkeypatch):
+    class Plain(RebacMixin, models.Model):
+        class Meta:
+            app_label = "testapp"
+            rebac_resource_type = "test/plain"
+
+    manager = Plain._base_manager
+    state = ModelState.from_model(Plain)
+    assert manager.auto_created
+    assert manager.get_queryset().__class__ is TrackedQuerySet
+    with monkeypatch.context() as prior_metadata:
+        prior_metadata.setattr(manager, "auto_created", False)
+        assert ModelState.from_model(Plain) == state
+    assert manager.auto_created
 
 
 @pytest.mark.parametrize(

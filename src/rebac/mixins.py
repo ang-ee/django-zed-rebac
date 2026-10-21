@@ -188,6 +188,7 @@ class RebacModelBase(RebacObjectMeta, ModelBase):
         if base_manager_name is None:
             base_manager_name = INJECTED_BASE_MANAGER
             attrs[INJECTED_BASE_MANAGER] = TrackedManager()
+            attrs[INJECTED_BASE_MANAGER].auto_created = True
         options["base_manager_name"] = base_manager_name
         options["default_manager_name"] = getattr(
             meta, "default_manager_name", options.get("default_manager_name", "objects")
