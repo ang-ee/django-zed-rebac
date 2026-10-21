@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import os
 import subprocess
 import sys
 from pathlib import Path
@@ -14,6 +15,33 @@ import pytest
 def test_queryset_manager_extensions_keep_native_type_checks(tmp_path: Path) -> None:
     """Custom methods stay typed without erasing ordinary Django field errors."""
 
+    app = tmp_path / "typing_app"
+    app.mkdir()
+    (app / "__init__.py").write_text("")
+    (app / "models.py").write_text(
+        dedent(
+            """\
+            from django.db import models
+            from rebac import RebacMixin
+
+            class OwnManager[M: models.Model](models.Manager[M]):
+                def label(self) -> str:
+                    return "own"
+
+            class OwnRecord(RebacMixin, models.Model):
+                objects = OwnManager()
+                title = models.CharField(max_length=50)
+            """
+        )
+    )
+    (tmp_path / "typing_settings.py").write_text(
+        'from tests.settings import *\nINSTALLED_APPS = [*INSTALLED_APPS, "typing_app"]\n'
+    )
+    config = tmp_path / "mypy.ini"
+    config.write_text(
+        "[mypy]\nplugins = mypy_django_plugin.main\n"
+        "[mypy.plugins.django-stubs]\ndjango_settings_module = typing_settings\n"
+    )
     source = tmp_path.resolve() / "manager_contract.py"
     source.write_text(
         dedent(
@@ -24,6 +52,7 @@ def test_queryset_manager_extensions_keep_native_type_checks(tmp_path: Path) -> 
 
             from rebac import RebacManager, RebacQuerySet, TrackedManager, TrackedQuerySet
             from tests.testapp.models import Post
+            from typing_app.models import OwnRecord
 
             class PostQuerySet[T: models.Model](RebacQuerySet[T]):
                 def answer(self) -> int:
@@ -66,6 +95,11 @@ def test_queryset_manager_extensions_keep_native_type_checks(tmp_path: Path) -> 
             assert_type(Post.objects.get(), Post)
             assert_type(Post.objects.get().title, str)
             assert_type(Post.objects.with_actor(None).get(), Post)
+            assert_type(OwnRecord.objects.label(), str)
+            assert_type(OwnRecord.objects.get(), OwnRecord)
+            assert_type(OwnRecord.objects.get().title, str)
+            OwnRecord.objects.with_actor(None)  # missing-own-scope
+            OwnRecord.objects.get().title = object()  # invalid-own-field
             post = Post()
             post.title = object()  # invalid-field
             Post.objects.get().title = object()  # invalid-manager-field
@@ -82,6 +116,8 @@ def test_queryset_manager_extensions_keep_native_type_checks(tmp_path: Path) -> 
             "-m",
             "mypy",
             "--strict",
+            "--config-file",
+            str(config),
             "--follow-imports=silent",
             "--show-error-codes",
             "--cache-dir",
@@ -89,6 +125,12 @@ def test_queryset_manager_extensions_keep_native_type_checks(tmp_path: Path) -> 
             str(source),
         ],
         cwd=Path(__file__).resolve().parents[1],
+        env={
+            **os.environ,
+            "PYTHONPATH": os.pathsep.join(
+                filter(None, [str(tmp_path), os.environ.get("PYTHONPATH", "")])
+            ),
+        },
         capture_output=True,
         text=True,
         check=False,
@@ -97,6 +139,8 @@ def test_queryset_manager_extensions_keep_native_type_checks(tmp_path: Path) -> 
     assert result.returncode == 1, result.stdout + result.stderr
     errors = [line for line in result.stdout.splitlines() if ": error:" in line]
     expected = {
+        "missing-own-scope": "attr-defined",
+        "invalid-own-field": "assignment",
         "invalid-field": "assignment",
         "invalid-manager-field": "assignment",
         "missing-row-field": "attr-defined",

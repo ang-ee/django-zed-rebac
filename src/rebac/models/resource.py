@@ -19,7 +19,7 @@ callers writing string kwargs see no shape change.
 from __future__ import annotations
 
 from itertools import batched
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Self
 
 from django.db import connections, models, router, transaction
 
@@ -116,7 +116,7 @@ class RebacResource(models.Model):
 
     @classmethod
     def upsert_refs_bulk(
-        cls,
+        cls: type[Self],
         pairs: list[tuple[str, str]],
         *,
         using: str | None = None,

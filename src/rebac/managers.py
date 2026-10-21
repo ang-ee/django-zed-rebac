@@ -1072,9 +1072,7 @@ class RebacQuerySet(models.QuerySet[_M]):
         query.where = WhereNode([query.where, _ScopeWhere(children=[restriction])])
 
     def _clone(self, **kwargs: Any) -> Self:
-        # ``QuerySet._clone`` is a real method django-stubs intentionally
-        # omits from the public stub surface.
-        clone: Self = super()._clone(**kwargs)  # type: ignore[misc]
+        clone: Self = super()._clone(**kwargs)
         clone._rebac_actor = self._rebac_actor
         clone._rebac_action = self._rebac_action
         clone._rebac_sudo_reason = self._rebac_sudo_reason

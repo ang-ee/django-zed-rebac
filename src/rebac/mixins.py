@@ -469,9 +469,8 @@ class RebacMixin(RebacTrackedMixin):
       blob.
     """
 
-    # Django's model metaclass replaces the abstract parent's manager; the
-    # class-level slot is intentionally more specific on resource models.
-    objects: ClassVar[RebacManager[Self]] = RebacManager()  # pyright: ignore[reportIncompatibleVariableOverride]
+    # Concrete models may supply another native manager; the default remains scoped.
+    objects: ClassVar[models.Manager[Self]] = RebacManager()  # pyright: ignore[reportIncompatibleVariableOverride]
 
     # Carried through from_db (via the queryset's `_fetch_all`) so
     # `instance.save()` re-checks against the same actor. Both this and
