@@ -688,7 +688,7 @@ class RebacQuerySet(models.QuerySet[_M]):
 
     # ----- Actor verbs -----
 
-    def with_actor(self, actor: Any) -> RebacQuerySet[_M]:
+    def with_actor(self, actor: Any) -> Self:
         """Pin a SubjectRef on the queryset. Generic verb — accepts any ActorLike."""
         ref = actor if isinstance(actor, SubjectRef) else to_subject_ref(actor)
         clone = self._clone()
@@ -700,15 +700,15 @@ class RebacQuerySet(models.QuerySet[_M]):
         clone._refresh_scope()
         return clone
 
-    def as_user(self, user: Any) -> RebacQuerySet[_M]:
+    def as_user(self, user: Any) -> Self:
         """Typed shorthand: scope to a Django User."""
         return self.with_actor(to_subject_ref(user))
 
-    def as_agent(self, agent: Any, *, on_behalf_of: Any | None = None) -> RebacQuerySet[_M]:
+    def as_agent(self, agent: Any, *, on_behalf_of: Any | None = None) -> Self:
         """Typed shorthand: scope to an agent acting via a Grant."""
         return self.with_actor(grant_subject_ref(agent, on_behalf_of))
 
-    def with_action(self, action: str) -> RebacQuerySet[_M]:
+    def with_action(self, action: str) -> Self:
         """Pin the REBAC permission used for queryset read scoping."""
         if not action:
             raise ValueError("with_action() requires a non-empty action")
@@ -717,7 +717,7 @@ class RebacQuerySet(models.QuerySet[_M]):
         clone._refresh_scope()
         return clone
 
-    def on_field_deny(self, mode: FieldDenyMode) -> RebacQuerySet[_M]:
+    def on_field_deny(self, mode: FieldDenyMode) -> Self:
         """Override ``REBAC_FIELD_READ_MODE`` for this queryset."""
         if mode == "raise":
             warn_raise_mode_degrades(stacklevel=2)
@@ -725,7 +725,7 @@ class RebacQuerySet(models.QuerySet[_M]):
         clone._rebac_field_deny = validate_field_deny_mode(mode)
         return clone
 
-    def for_write(self) -> RebacQuerySet[_M]:
+    def for_write(self) -> Self:
         """Return a write-target queryset: REBAC row scope kept, field-read
         redaction off.
 
@@ -780,7 +780,7 @@ class RebacQuerySet(models.QuerySet[_M]):
         readable.rebac_readers = mask
         return readable
 
-    def scoped(self) -> RebacQuerySet[_M]:
+    def scoped(self) -> Self:
         """Return an eagerly scoped clone, including for SQL subquery consumers.
 
         The resolved actor is pinned to the clone. Caller predicates, database,
@@ -798,7 +798,7 @@ class RebacQuerySet(models.QuerySet[_M]):
         clone._apply_scope_in_place()
         return clone
 
-    def scoped_for_aggregate(self) -> RebacQuerySet[_M]:
+    def scoped_for_aggregate(self) -> Self:
         """Eager row scope for projection, fail-closed without an actor.
 
         Instance field redaction cannot operate on aggregate/dict rows. The
@@ -823,19 +823,17 @@ class RebacQuerySet(models.QuerySet[_M]):
         if self._rebac_eager_scope:
             self._apply_scope_in_place()
 
-    def sudo(self, *, reason: str) -> RebacQuerySet[_M]:
+    def sudo(self, *, reason: str) -> Self:
         """Bypass REBAC for this queryset. Mandatory `reason`."""
         return self._bypass(reason=reason, allow_when_sudo_disabled=False, internal=False)
 
-    def system_context(self, *, reason: str) -> RebacQuerySet[_M]:
+    def system_context(self, *, reason: str) -> Self:
         return self._bypass(reason=reason, allow_when_sudo_disabled=True, internal=False)
 
-    def _system_capture(self, *, reason: str) -> RebacQuerySet[_M]:
+    def _system_capture(self, *, reason: str) -> Self:
         return self._bypass(reason=reason, allow_when_sudo_disabled=True, internal=True)
 
-    def _bypass(
-        self, *, reason: str, allow_when_sudo_disabled: bool, internal: bool
-    ) -> RebacQuerySet[_M]:
+    def _bypass(self, *, reason: str, allow_when_sudo_disabled: bool, internal: bool) -> Self:
         from .errors import SudoNotAllowedError, SudoReasonRequiredError
 
         if not allow_when_sudo_disabled and not app_settings.REBAC_ALLOW_SUDO:
@@ -882,9 +880,9 @@ class RebacQuerySet(models.QuerySet[_M]):
 
     # ----- Relation loading -----
 
-    def rebac_select_related(self, *fields: Any) -> RebacQuerySet[_M]:
+    def rebac_select_related(self, *fields: Any) -> Self:
         """``select_related`` plus a post-fetch guard for REBAC-bound targets."""
-        clone: RebacQuerySet[_M] = self.select_related(*fields)
+        clone = self.select_related(*fields)
         if fields == (None,):
             clone._rebac_select_related_guards = ()
             return clone
@@ -903,7 +901,7 @@ class RebacQuerySet(models.QuerySet[_M]):
         )
         return clone
 
-    def rebac_prefetch_related(self, *lookups: Any) -> RebacQuerySet[_M]:
+    def rebac_prefetch_related(self, *lookups: Any) -> Self:
         """``prefetch_related`` with actor-scoped querysets for protected targets."""
         if lookups == (None,):
             return self.prefetch_related(None)
@@ -1073,10 +1071,10 @@ class RebacQuerySet(models.QuerySet[_M]):
         # permission IDs with the new actor's scope.
         query.where = WhereNode([query.where, _ScopeWhere(children=[restriction])])
 
-    def _clone(self, **kwargs: Any) -> RebacQuerySet[_M]:
+    def _clone(self, **kwargs: Any) -> Self:
         # ``QuerySet._clone`` is a real method django-stubs intentionally
         # omits from the public stub surface.
-        clone: RebacQuerySet[_M] = super()._clone(**kwargs)  # type: ignore[misc]
+        clone: Self = super()._clone(**kwargs)  # type: ignore[misc]
         clone._rebac_actor = self._rebac_actor
         clone._rebac_action = self._rebac_action
         clone._rebac_sudo_reason = self._rebac_sudo_reason

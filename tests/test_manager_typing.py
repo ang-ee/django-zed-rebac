@@ -43,6 +43,22 @@ def test_queryset_manager_extensions_keep_native_type_checks(tmp_path: Path) -> 
             class TrackedPostManager(TrackedPostManagerBase[Post]):
                 pass
 
+            queryset = PostQuerySet[Post](model=Post)
+            assert_type(queryset.with_actor(None), PostQuerySet[Post])
+            assert_type(queryset.as_user(None), PostQuerySet[Post])
+            assert_type(queryset.as_agent(None), PostQuerySet[Post])
+            assert_type(queryset.with_action("read"), PostQuerySet[Post])
+            assert_type(queryset.on_field_deny("allow"), PostQuerySet[Post])
+            assert_type(queryset.for_write(), PostQuerySet[Post])
+            assert_type(queryset.scoped(), PostQuerySet[Post])
+            assert_type(queryset.scoped_for_aggregate(), PostQuerySet[Post])
+            assert_type(queryset.sudo(reason="typing"), PostQuerySet[Post])
+            assert_type(queryset.system_context(reason="typing"), PostQuerySet[Post])
+            assert_type(queryset.rebac_select_related(), PostQuerySet[Post])
+            assert_type(queryset.rebac_prefetch_related(), PostQuerySet[Post])
+            assert_type(queryset.with_actor(None).sudo(reason="typing").answer(), int)
+            assert_type(queryset.with_actor(None).get(), Post)
+            assert_type(queryset.sudo(reason="typing").get().title, str)
             assert_type(PostManager().answer(), int)
             assert_type(TrackedPostManager().label(), str)
             assert_type(PostManager().get(), Post)
@@ -115,3 +131,33 @@ def test_managers_keep_native_serialization() -> None:
         assert queryset_path is None
         assert args == ()
         assert kwargs == {}
+
+
+def test_queryset_scope_clones_keep_concrete_class() -> None:
+    """Django's clone constructor retains consumer queryset methods and its model."""
+    from rebac import RebacQuerySet, SubjectRef
+    from tests.testapp.models import Post
+
+    class PostQuerySet(RebacQuerySet[Post]):
+        def answer(self) -> int:
+            return 42
+
+    original = PostQuerySet(model=Post)
+    actor = SubjectRef("auth/user", "typing")
+    for clone in (
+        original.with_actor(actor),
+        original.as_user(actor),
+        original.with_action("read"),
+        original.on_field_deny("allow"),
+        original.for_write(),
+        original.sudo(reason="typing"),
+        original.system_context(reason="typing"),
+        original.rebac_select_related(None),
+        original.rebac_prefetch_related(None),
+    ):
+        assert type(clone) is PostQuerySet
+        assert clone is not original
+        assert clone.model is Post
+        assert clone.answer() == 42
+    assert original.actor() is None
+    assert not original.is_sudo()
