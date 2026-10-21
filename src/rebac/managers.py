@@ -1800,7 +1800,14 @@ class RebacQuerySet(models.QuerySet[_M]):
         return {str(v) for v in scan.values_list(attr, flat=True)}
 
 
-class RebacManager(models.Manager.from_queryset(RebacQuerySet)):  # type: ignore[misc]
+class _ModelManager(models.Manager[Any]):
+    """Retain the public managers' existing erased model parameter before queryset composition."""
+
+
+_RebacManagerBase = _ModelManager.from_queryset(RebacQuerySet)
+
+
+class RebacManager(_RebacManagerBase):
     """Manager backed by `RebacQuerySet`.
 
     Built via ``from_queryset`` so the custom queryset methods (and any
@@ -1814,15 +1821,7 @@ class RebacManager(models.Manager.from_queryset(RebacQuerySet)):  # type: ignore
     """
 
     def get_queryset(self) -> RebacQuerySet[Any]:
-        # `_queryset_class` / `_hints` are BaseManager internals; the dynamic
-        # `from_queryset` base erases them from pyright's view (mypy sees them
-        # via django-stubs). We know the queryset class is RebacQuerySet.
-        qs: RebacQuerySet[Any] = self._queryset_class(  # pyright: ignore[reportAttributeAccessIssue]
-            model=self.model,
-            using=self._db,
-            hints=self._hints,  # pyright: ignore[reportAttributeAccessIssue]
-        )
-        return qs
+        return cast(RebacQuerySet[Any], super().get_queryset())
 
     def raw(
         self, raw_query: str, params: Any = (), translations: Any = None, using: Any = None
@@ -1830,7 +1829,7 @@ class RebacManager(models.Manager.from_queryset(RebacQuerySet)):  # type: ignore
         _, bypass = self.get_queryset().effective_actor(strict=True)
         if not bypass:
             raise PermissionDenied("raw() cannot be actor-scoped; use sudo or system_context")
-        raw_method = super().raw
+        raw_method = self.get_queryset().raw
         return raw_method(raw_query, params=params, translations=translations, using=using)
 
     def with_actor(self, actor: Any) -> RebacQuerySet[Any]:
@@ -2004,5 +2003,8 @@ class TrackedQuerySet[T: models.Model](models.QuerySet[T]):
             return super().bulk_update(objs, field_names, batch_size=batch_size)
 
 
-class TrackedManager(models.Manager.from_queryset(TrackedQuerySet)):  # type: ignore[misc]
+_TrackedManagerBase = _ModelManager.from_queryset(TrackedQuerySet)
+
+
+class TrackedManager(_TrackedManagerBase):
     """Unfiltered manager whose writes to columns the policy reads are gated."""
