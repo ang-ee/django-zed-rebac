@@ -50,9 +50,11 @@ dev = [
     "pytest-xdist>=3.6",
     "pytest-timeout>=2.3",
     "ruff>=0.5",
-    "mypy>=1.10",
+    # Native manager inference and Django private QuerySet hooks require these
+    # reviewed owner fixes until their upstream releases include them.
+    "mypy @ git+https://github.com/ang-ee/mypy.git@f3de9feb66605dd7b86ded71fc41a71d4f5061cb",
     "pyright>=1.1.350",
-    "django-stubs[compatible-mypy]>=6.0,<6.1",
+    "django-stubs[compatible-mypy] @ git+https://github.com/ang-ee/django-stubs.git@807fdd80e5be9456e2633830a3daf768a14407b2",
     "django-stubs-ext>=6.0,<6.1",
     "strawberry-graphql-django>=0.86.0",
 ]
