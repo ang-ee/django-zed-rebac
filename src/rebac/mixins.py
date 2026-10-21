@@ -29,7 +29,7 @@ from django.db.models.options import DEFAULT_NAMES
 from ._id import resource_id_attr
 from .conf import app_settings
 from .errors import PermissionDenied
-from .field_visibility import backend_schema
+from .field_visibility import backend_schema, redacted_fields
 from .managers import RebacManager, TrackedManager, TrackedQuerySet
 from .preflight import _check_new_model
 from .resources import model_resource_type
@@ -554,7 +554,7 @@ class RebacMixin(RebacTrackedMixin):
         fields: Iterable[str] | None = None,
         from_queryset: models.QuerySet[Any] | None = None,
     ) -> None:
-        redacted = frozenset(getattr(self, "_rebac_redacted_fields", frozenset()) or frozenset())
+        redacted = redacted_fields(self)
         super().refresh_from_db(using=using, fields=fields, from_queryset=from_queryset)
         if redacted:
             from .field_visibility import mark_denied_fields
@@ -961,9 +961,7 @@ class RebacMixin(RebacTrackedMixin):
                     concrete_model,
                 )
         if not args and not self._state.adding and kwargs.get("update_fields") is None:
-            redacted = frozenset(
-                getattr(self, "_rebac_redacted_fields", frozenset()) or frozenset()
-            )
+            redacted = redacted_fields(self)
             if redacted:
                 kwargs["update_fields"] = self._rebac_update_fields_excluding(redacted)
         super().save(*args, **kwargs)
@@ -987,7 +985,7 @@ class RebacMixin(RebacTrackedMixin):
 
     def _rebac_resource_id_for_checks(self) -> str:
         attr = resource_id_attr(self)
-        redacted = frozenset(getattr(self, "_rebac_redacted_fields", frozenset()) or frozenset())
+        redacted = redacted_fields(self)
         field_names = {attr}
         try:
             field = type(self)._meta.get_field(attr)
@@ -1255,7 +1253,7 @@ def _enforce_redacted_field_writes(
     resource: ObjectRef,
     update_fields: Iterable[str] | None,
 ) -> None:
-    redacted = frozenset(getattr(instance, "_rebac_redacted_fields", frozenset()) or frozenset())
+    redacted = redacted_fields(instance)
     if not redacted or update_fields is None:
         return
     requested = set(_normalise_update_field_names(sender=sender, update_fields=update_fields))
@@ -1270,7 +1268,7 @@ def _enforce_redacted_field_writes(
 
 def _resource_id_for_existing_instance(*, sender: type[models.Model], instance: Any) -> str:
     attr = resource_id_attr(sender)
-    redacted = frozenset(getattr(instance, "_rebac_redacted_fields", frozenset()) or frozenset())
+    redacted = redacted_fields(instance)
     field_names = {attr}
     try:
         field = sender._meta.get_field(attr)

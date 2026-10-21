@@ -28,6 +28,7 @@ from rebac import (
     write_relationships,
 )
 from rebac.backends import reset_backend
+from rebac.field_visibility import mark_denied_fields, redacted_fields
 from rebac.schema import parse_zed
 from tests.backend_setup import atomic_source_write, install_schema
 from tests.testapp.models import Post
@@ -219,6 +220,24 @@ def _grant_ref(resource_type: str, resource_id: str, user: Any, relation: str) -
     )
 
 
+def test_redacted_fields_is_empty_for_an_unmarked_model():
+    from django.contrib.auth import get_user_model
+
+    assert redacted_fields(get_user_model()()) == frozenset()
+    assert redacted_fields(Post(title="visible")) == frozenset()
+
+
+def test_redacted_fields_is_an_immutable_accumulated_snapshot():
+    post = Post(title="secret", body="also secret")
+    mark_denied_fields(post, ("title",), mode="redact")
+    first = redacted_fields(post)
+    assert isinstance(first, frozenset)
+    assert first == frozenset({"title"})
+    mark_denied_fields(post, ("body",), mode="omit")
+    assert first == frozenset({"title"})
+    assert redacted_fields(post) == frozenset({"title", "body"})
+
+
 @override_settings(REBAC_FIELD_READ_MODE="redact")
 def test_redaction_is_per_row_not_a_blanket_defer(alice, bob):
     from tests.testapp.models import Post
@@ -234,9 +253,9 @@ def test_redaction_is_per_row_not_a_blanket_defer(alice, bob):
 
     assert [row.pk for row in rows] == [alice_post.pk, bob_post.pk]
     assert rows[0].title == "alice title"
-    assert getattr(rows[0], "_rebac_redacted_fields", frozenset()) == frozenset()
+    assert redacted_fields(rows[0]) == frozenset()
     assert rows[1].title is None
-    assert rows[1]._rebac_redacted_fields == frozenset({"title"})
+    assert redacted_fields(rows[1]) == frozenset({"title"})
 
 
 def test_on_field_deny_omit_overrides_global_allow_and_survives_clones(alice, bob):

@@ -2594,6 +2594,11 @@ Field enforcement is opt-in through `REBAC_FIELD_READ_MODE` or
 | `"omit"` | Same redaction computation, plus `_rebac_omitted_fields` so serializers can drop the key. |
 | `"raise"` | Accepted for forward compatibility, but currently degrades to `"redact"` and emits `rebac.W008`; descriptor-level raising stays with the 1.x `Meta.protected_fields` roadmap item. |
 
+Consumers inspect a loaded model's redaction state through
+`rebac.field_visibility.redacted_fields(instance) -> frozenset[str]`. Unmarked
+models return an empty set; the accessor does not re-evaluate permissions or
+query the database. The instance marker remains an implementation detail.
+
 With field redaction enabled, annotations, aliases, and aggregates that read a
 protected column raise `PermissionDenied`: scalar SQL results cannot carry
 instance-level redaction. The same guard rejects projections of protected
