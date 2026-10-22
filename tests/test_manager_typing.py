@@ -58,6 +58,10 @@ def test_queryset_manager_extensions_keep_native_type_checks(tmp_path: Path) -> 
                 def answer(self) -> int:
                     return 42
 
+            class OtherPostQuerySet[T: models.Model](RebacQuerySet[T]):
+                def other(self) -> str:
+                    return "other"
+
             PostManagerBase = RebacManager.from_queryset(PostQuerySet)
 
             class PostManager(PostManagerBase[Post]):
@@ -86,10 +90,27 @@ def test_queryset_manager_extensions_keep_native_type_checks(tmp_path: Path) -> 
             assert_type(queryset.rebac_select_related(), PostQuerySet[Post])
             assert_type(queryset.rebac_prefetch_related(), PostQuerySet[Post])
             assert_type(queryset.with_actor(None).sudo(reason="typing").answer(), int)
+            assert_type(queryset & queryset, PostQuerySet[Post])
+            assert_type(queryset | queryset, PostQuerySet[Post])
+            assert_type(queryset ^ queryset, PostQuerySet[Post])
+            assert_type(queryset & queryset.none(), PostQuerySet[Post])
+            assert_type(queryset.none() | queryset, PostQuerySet[Post])
+            assert_type(queryset.none() ^ queryset, PostQuerySet[Post])
+            other_queryset = OtherPostQuerySet[Post](model=Post)
+            assert_type(queryset & other_queryset, RebacQuerySet[Post])
+            assert_type(queryset | other_queryset, RebacQuerySet[Post])
+            assert_type(queryset ^ other_queryset, RebacQuerySet[Post])
+            assert_type((queryset | queryset).answer(), int)
             assert_type(queryset.with_actor(None).get(), Post)
             assert_type(queryset.sudo(reason="typing").get().title, str)
             assert_type(PostManager().answer(), int)
             assert_type(TrackedPostManager().label(), str)
+            assert_type(PostManager().get_queryset(), PostQuerySet[Post])
+            assert_type(TrackedPostManager().get_queryset(), TrackedPostQuerySet[Post])
+            assert_type(PostManager().get_queryset().with_actor(None).answer(), int)
+            assert_type(TrackedPostManager().get_queryset().label(), str)
+            assert_type(PostManager().with_actor(None), PostQuerySet[Post])
+            assert_type(PostManager().with_actor(None).answer(), int)
             assert_type(PostManager().get(), Post)
             assert_type(TrackedPostManager().get(), Post)
             assert_type(Post.objects.get(), Post)
@@ -107,6 +128,10 @@ def test_queryset_manager_extensions_keep_native_type_checks(tmp_path: Path) -> 
             TrackedPostManager().get().absent  # missing-tracked-row-field
             PostManager().absent()  # missing-scoped
             TrackedPostManager().absent()  # missing-tracked
+            PostManager().get_queryset().absent()  # missing-scoped-getter
+            TrackedPostManager().get_queryset().absent()  # missing-tracked-getter
+            (queryset | queryset).absent()  # missing-boolean-method
+            (queryset | other_queryset).answer()  # missing-mixed-boolean-method
             """
         )
     )
@@ -147,6 +172,10 @@ def test_queryset_manager_extensions_keep_native_type_checks(tmp_path: Path) -> 
         "missing-tracked-row-field": "attr-defined",
         "missing-scoped": "attr-defined",
         "missing-tracked": "attr-defined",
+        "missing-scoped-getter": "attr-defined",
+        "missing-tracked-getter": "attr-defined",
+        "missing-boolean-method": "attr-defined",
+        "missing-mixed-boolean-method": "attr-defined",
     }
     assert len(errors) == len(expected), result.stdout + result.stderr
     for marker, code in expected.items():
@@ -175,6 +204,33 @@ def test_managers_keep_native_serialization() -> None:
         assert queryset_path is None
         assert args == ()
         assert kwargs == {}
+
+
+def test_native_factory_getters_keep_queryset_class_and_model() -> None:
+    """Scoped and tracked getters use Django's configured queryset factory."""
+    from rebac import RebacManager, RebacQuerySet, TrackedManager, TrackedQuerySet
+    from tests.testapp.models import Post
+
+    class PostQuerySet(RebacQuerySet[Post]):
+        def answer(self) -> int:
+            return 42
+
+    class TrackedPostQuerySet(TrackedQuerySet[Post]):
+        def label(self) -> str:
+            return "tracked"
+
+    scoped = RebacManager.from_queryset(PostQuerySet)()
+    scoped.model = Post
+    tracked = TrackedManager.from_queryset(TrackedPostQuerySet)()
+    tracked.model = Post
+
+    scoped_rows = scoped.get_queryset()
+    tracked_rows = tracked.get_queryset()
+    assert type(scoped_rows) is PostQuerySet
+    assert type(tracked_rows) is TrackedPostQuerySet
+    assert scoped_rows.model is tracked_rows.model is Post
+    assert scoped_rows.answer() == 42
+    assert tracked_rows.label() == "tracked"
 
 
 def test_queryset_scope_clones_keep_concrete_class() -> None:

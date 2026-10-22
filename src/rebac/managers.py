@@ -15,7 +15,7 @@ from __future__ import annotations
 import re
 from collections import Counter
 from collections.abc import AsyncIterator, Collection, Iterable, Iterator
-from typing import Any, Self, TypeVar, cast
+from typing import Any, Self, TypeVar, cast, overload
 
 from asgiref.sync import sync_to_async
 from django.db import connections, models
@@ -1094,7 +1094,7 @@ class RebacQuerySet(models.QuerySet[_M]):
             raise TypeError("Boolean REBAC combinations require REBAC querysets")
         super()._merge_sanity_check(other)  # type: ignore[misc]
 
-    def _combined_scope(self, combined: RebacQuerySet[_M]) -> RebacQuerySet[_M]:
+    def _combined_scope[CombinedT: RebacQuerySet[Any]](self, combined: CombinedT) -> CombinedT:
         # Django's empty-query fast paths may return the right operand itself.
         # Preserve its result shape, but apply the left operand's actor policy
         # without mutating either original queryset.
@@ -1108,11 +1108,29 @@ class RebacQuerySet(models.QuerySet[_M]):
         clone._refresh_scope()
         return clone
 
+    @overload
+    def __and__(self, other: Self) -> Self: ...
+
+    @overload
+    def __and__(self, other: models.QuerySet[_M]) -> RebacQuerySet[_M]: ...
+
     def __and__(self, other: models.QuerySet[_M]) -> RebacQuerySet[_M]:
         return self._combined_scope(super().__and__(other))
 
+    @overload
+    def __or__(self, other: Self) -> Self: ...
+
+    @overload
+    def __or__(self, other: models.QuerySet[_M]) -> RebacQuerySet[_M]: ...
+
     def __or__(self, other: models.QuerySet[_M]) -> RebacQuerySet[_M]:
         return self._combined_scope(super().__or__(other))
+
+    @overload
+    def __xor__(self, other: Self) -> Self: ...
+
+    @overload
+    def __xor__(self, other: models.QuerySet[_M]) -> RebacQuerySet[_M]: ...
 
     def __xor__(self, other: models.QuerySet[_M]) -> RebacQuerySet[_M]:
         return self._combined_scope(super().__xor__(other))
@@ -1809,50 +1827,16 @@ class RebacManager[M: models.Model](_RebacManagerBase[M]):  # pyright: ignore[re
     model parameter through queryset chains.
     """
 
-    def get_queryset(self) -> RebacQuerySet[M]:
-        return cast(RebacQuerySet[M], super().get_queryset())
-
     def raw(
         self, raw_query: str, params: Any = (), translations: Any = None, using: Any = None
     ) -> Any:
-        _, bypass = self.get_queryset().effective_actor(strict=True)
+        queryset = self.get_queryset()
+        assert isinstance(queryset, RebacQuerySet), "RebacManager.raw requires a RebacQuerySet."
+        _, bypass = queryset.effective_actor(strict=True)
         if not bypass:
             raise PermissionDenied("raw() cannot be actor-scoped; use sudo or system_context")
-        raw_method = self.get_queryset().raw
+        raw_method = queryset.raw
         return raw_method(raw_query, params=params, translations=translations, using=using)
-
-    def with_actor(self, actor: Any) -> RebacQuerySet[M]:
-        return self.get_queryset().with_actor(actor)
-
-    def as_user(self, user: Any) -> RebacQuerySet[M]:
-        return self.get_queryset().as_user(user)
-
-    def as_agent(self, agent: Any, *, on_behalf_of: Any | None = None) -> RebacQuerySet[M]:
-        return self.get_queryset().as_agent(agent, on_behalf_of=on_behalf_of)
-
-    def with_action(self, action: str) -> RebacQuerySet[M]:
-        return self.get_queryset().with_action(action)
-
-    def on_field_deny(self, mode: FieldDenyMode) -> RebacQuerySet[M]:
-        return self.get_queryset().on_field_deny(mode)
-
-    def for_write(self) -> RebacQuerySet[M]:
-        return self.get_queryset().for_write()
-
-    def readable(self, field: str) -> models.Expression:
-        return self.get_queryset().readable(field)
-
-    def rebac_select_related(self, *fields: Any) -> RebacQuerySet[M]:
-        return self.get_queryset().rebac_select_related(*fields)
-
-    def rebac_prefetch_related(self, *lookups: Any) -> RebacQuerySet[M]:
-        return self.get_queryset().rebac_prefetch_related(*lookups)
-
-    def sudo(self, *, reason: str) -> RebacQuerySet[M]:
-        return self.get_queryset().sudo(reason=reason)
-
-    def system_context(self, *, reason: str) -> RebacQuerySet[M]:
-        return self.get_queryset().system_context(reason=reason)
 
 
 class TrackedQuerySet[T: models.Model](models.QuerySet[T]):
