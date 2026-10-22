@@ -54,6 +54,9 @@ class _RebacQuery(Query):
     """Cover expressions which copy QuerySet.query without resolving the QS."""
 
     _rebac_state: dict[str, Any]
+    # Django builds these bounded pk subqueries while combining sliced
+    # querysets. They inherit the combination's policy, not a separate actor.
+    _rebac_boolean_operand = False
 
     # The bypass reason of an embedded queryset, audited when the statement it
     # was resolved into is compiled for execution, never when it is built.
@@ -90,6 +93,8 @@ class _RebacQuery(Query):
 
     @schema_operation
     def resolve_expression(self, *args: Any, **kwargs: Any) -> Self:
+        if self._rebac_boolean_operand:
+            return cast(Self, super().resolve_expression(*args, **kwargs))
         if self._rebac_statement_part and not hasattr(self, "_rebac_state"):
             return cast(Self, super().resolve_expression(*args, **kwargs))
         clone = cast(Self, self.clone())
@@ -152,7 +157,7 @@ def _check_subquery(query: Query) -> None:
     cast(Any, query)._rebac_checked = True
 
 
-def _nested_queries(expression: Any) -> Iterator[Query]:
+def _nested_queries(expression: Any, *, boolean_operands_only: bool = False) -> Iterator[Query]:
     """The queries nested anywhere in an expression, or in a query's clauses."""
     if isinstance(expression, Query):
         group_by = expression.group_by if isinstance(expression.group_by, tuple) else ()
@@ -174,9 +179,15 @@ def _nested_queries(expression: Any) -> Iterator[Query]:
         parts = cast(Iterable[Any], sources()) if callable(sources) else ()
     for part in parts:
         if isinstance(part, Query):
+            if boolean_operands_only:
+                if isinstance(part, _RebacQuery) and part._rebac_boolean_operand:
+                    yield part
+                # An independently authored subquery owns its own actor; its
+                # contents are not operands of the enclosing combination.
+                continue
             yield part
         if part is not None:
-            yield from _nested_queries(part)
+            yield from _nested_queries(part, boolean_operands_only=boolean_operands_only)
 
 
 class _Readable(models.Case):
@@ -252,7 +263,16 @@ def _without_scope(node: WhereNode) -> WhereNode:
 
 def _without_query_scope(query: Query) -> Query:
     clone = query.clone()
+    if isinstance(clone, _RebacQuery) and clone._rebac_boolean_operand:
+        clone._rebac_check = None
+        clone._rebac_checked = False
     clone.where = _without_scope(clone.where)
+    clone.where = clone.where.replace_expressions(
+        {
+            operand: _without_query_scope(operand)
+            for operand in _nested_queries(clone.where, boolean_operands_only=True)
+        }
+    )
     clone.combined_queries = tuple(_without_query_scope(part) for part in clone.combined_queries)
     return clone
 
@@ -999,6 +1019,11 @@ class RebacQuerySet(models.QuerySet[_M]):
 
     @schema_operation
     def _scope_query(self, query: Query, actor: SubjectRef | None) -> None:
+        for operand in _nested_queries(query.where, boolean_operands_only=True):
+            self._scope_query(operand, actor)
+            if isinstance(operand, _RebacQuery):
+                operand._rebac_check = (self, actor)
+                operand._rebac_checked = False
         if query.combined_queries:
             for part in query.combined_queries:
                 self._scope_query(part, actor)
@@ -1094,11 +1119,24 @@ class RebacQuerySet(models.QuerySet[_M]):
             raise TypeError("Boolean REBAC combinations require REBAC querysets")
         super()._merge_sanity_check(other)  # type: ignore[misc]
 
-    def _combined_scope[CombinedT: RebacQuerySet[Any]](self, combined: CombinedT) -> CombinedT:
+    def _combined_scope(self, combined: models.QuerySet[_M]) -> RebacQuerySet[_M]:
         # Django's empty-query fast paths may return the right operand itself.
         # Preserve its result shape, but apply the left operand's actor policy
         # without mutating either original queryset.
-        clone = combined._clone()
+        if isinstance(combined, RebacQuerySet):
+            clone = combined._clone()
+        else:
+            # A sliced left operand makes Django combine through the unscoped
+            # base manager. Keep its SQL and row shape on the configured
+            # queryset, whose clone owns custom state and an empty result cache.
+            clone = self._clone()
+            clone._query = combined.query.chain(klass=_RebacQuery)
+            clone._iterable_class = combined._iterable_class
+            clone._fields = combined._fields
+            clone._merge_known_related_objects(combined)
+        query = clone.query
+        if isinstance(query, _RebacQuery):
+            query._rebac_boolean_operand = False
         clone._rebac_actor = self._rebac_actor
         clone._rebac_action = self._rebac_action
         clone._rebac_sudo_reason = self._rebac_sudo_reason
@@ -1106,6 +1144,16 @@ class RebacQuerySet(models.QuerySet[_M]):
         clone._rebac_aggregate_scope = self._rebac_aggregate_scope
         clone._rebac_field_deny = self._rebac_field_deny
         clone._refresh_scope()
+        return clone
+
+    def _boolean_operand(self) -> Self:
+        if self.query.can_filter():
+            return self
+        clone = self._clone()
+        clone._reset_scope()
+        query = clone.query
+        if isinstance(query, _RebacQuery):
+            query._rebac_boolean_operand = True
         return clone
 
     @overload
@@ -1124,7 +1172,9 @@ class RebacQuerySet(models.QuerySet[_M]):
     def __or__(self, other: models.QuerySet[_M]) -> RebacQuerySet[_M]: ...
 
     def __or__(self, other: models.QuerySet[_M]) -> RebacQuerySet[_M]:
-        return self._combined_scope(super().__or__(other))
+        left = self._boolean_operand()
+        right = other._boolean_operand() if isinstance(other, RebacQuerySet) else other
+        return self._combined_scope(super(RebacQuerySet, left).__or__(right))
 
     @overload
     def __xor__(self, other: Self) -> Self: ...
@@ -1133,7 +1183,9 @@ class RebacQuerySet(models.QuerySet[_M]):
     def __xor__(self, other: models.QuerySet[_M]) -> RebacQuerySet[_M]: ...
 
     def __xor__(self, other: models.QuerySet[_M]) -> RebacQuerySet[_M]:
-        return self._combined_scope(super().__xor__(other))
+        left = self._boolean_operand()
+        right = other._boolean_operand() if isinstance(other, RebacQuerySet) else other
+        return self._combined_scope(super(RebacQuerySet, left).__xor__(right))
 
     def _combinator_query(
         self, combinator: str, *other_qs: Any, all: bool = False

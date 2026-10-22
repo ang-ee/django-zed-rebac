@@ -1558,7 +1558,11 @@ never retain a stale scope predicate. Boolean and SQL set combinations retain
 the left queryset actor/action policy across all operands; rebinding replaces
 the restriction on each operand without mutating the original querysets.
 Boolean combinations require REBAC querysets so empty-query fast paths cannot
-return a plain unscoped manager. Native `resource_id_attr` and
+return a plain unscoped manager. Django's bounded primary-key subqueries for
+sliced Boolean operands inherit the combination's actor/action, including on
+rebinding; independently authored subqueries retain their own actor. A sliced
+base-manager fallback retains the configured REBAC queryset class and Django's
+result projection without reusing operand result caches. Native `resource_id_attr` and
 `subject_id_attr` are public top-level exports. A registered model uses its one
 resource identifier for both object and subject identity; legacy User/Group models
 without resource metadata retain the separate user-setting fallback.
