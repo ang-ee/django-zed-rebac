@@ -295,7 +295,7 @@ wheels = [
 [[package]]
 name = "django-stubs"
 version = "6.0.9"
-source = { git = "https://github.com/ang-ee/django-stubs.git?rev=807fdd80e5be9456e2633830a3daf768a14407b2#807fdd80e5be9456e2633830a3daf768a14407b2" }
+source = { git = "https://github.com/ang-ee/django-stubs.git?rev=c742042283a82c3248c68493c697f5f30e2fdc6a#c742042283a82c3248c68493c697f5f30e2fdc6a" }
 dependencies = [
     { name = "django" },
     { name = "django-stubs-ext" },
@@ -311,7 +311,7 @@ compatible-mypy = [
 [[package]]
 name = "django-stubs-ext"
 version = "6.0.9"
-source = { git = "https://github.com/ang-ee/django-stubs.git?subdirectory=ext&rev=807fdd80e5be9456e2633830a3daf768a14407b2#807fdd80e5be9456e2633830a3daf768a14407b2" }
+source = { git = "https://github.com/ang-ee/django-stubs.git?subdirectory=ext&rev=c742042283a82c3248c68493c697f5f30e2fdc6a#c742042283a82c3248c68493c697f5f30e2fdc6a" }
 dependencies = [
     { name = "django" },
     { name = "typing-extensions" },
@@ -365,11 +365,11 @@ requires-dist = [
     { name = "cel-python", marker = "extra == 'caveats'", specifier = ">=0.1.5" },
     { name = "channels", marker = "extra == 'strawberry'", specifier = ">=4.0" },
     { name = "django", specifier = ">=6.0,<6.1" },
-    { name = "django-stubs", extras = ["compatible-mypy"], marker = "extra == 'dev'", git = "https://github.com/ang-ee/django-stubs.git?rev=807fdd80e5be9456e2633830a3daf768a14407b2" },
+    { name = "django-stubs", extras = ["compatible-mypy"], marker = "extra == 'dev'", git = "https://github.com/ang-ee/django-stubs.git?rev=c742042283a82c3248c68493c697f5f30e2fdc6a" },
     { name = "django-stubs-ext", marker = "extra == 'dev'", specifier = ">=6.0,<6.1" },
     { name = "djangorestframework", marker = "extra == 'drf'", specifier = ">=3.14" },
     { name = "mcp", marker = "extra == 'mcp'", specifier = ">=1.27" },
-    { name = "mypy", marker = "extra == 'dev'", git = "https://github.com/ang-ee/mypy.git?rev=f3de9feb66605dd7b86ded71fc41a71d4f5061cb" },
+    { name = "mypy", marker = "extra == 'dev'", git = "https://github.com/ang-ee/mypy.git?rev=ac3de6e4c34b04728e768e07d4842f4309ff6c45" },
     { name = "pyright", marker = "extra == 'dev'", specifier = ">=1.1.350" },
     { name = "pytest", marker = "extra == 'dev'", specifier = ">=8.0" },
     { name = "pytest-django", marker = "extra == 'dev'", specifier = ">=4.8" },
@@ -684,7 +684,7 @@ wheels = [
 [[package]]
 name = "mypy"
 version = "2.1.0"
-source = { git = "https://github.com/ang-ee/mypy.git?rev=f3de9feb66605dd7b86ded71fc41a71d4f5061cb#f3de9feb66605dd7b86ded71fc41a71d4f5061cb" }
+source = { git = "https://github.com/ang-ee/mypy.git?rev=ac3de6e4c34b04728e768e07d4842f4309ff6c45#ac3de6e4c34b04728e768e07d4842f4309ff6c45" }
 dependencies = [
     { name = "ast-serialize" },
     { name = "librt", marker = "platform_python_implementation != 'PyPy'" },

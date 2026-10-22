@@ -52,9 +52,9 @@ dev = [
     "ruff>=0.5",
     # Native manager inference and Django private QuerySet hooks require these
     # reviewed owner fixes until their upstream releases include them.
-    "mypy @ git+https://github.com/ang-ee/mypy.git@f3de9feb66605dd7b86ded71fc41a71d4f5061cb",
+    "mypy @ git+https://github.com/ang-ee/mypy.git@ac3de6e4c34b04728e768e07d4842f4309ff6c45",
     "pyright>=1.1.350",
-    "django-stubs[compatible-mypy] @ git+https://github.com/ang-ee/django-stubs.git@807fdd80e5be9456e2633830a3daf768a14407b2",
+    "django-stubs[compatible-mypy] @ git+https://github.com/ang-ee/django-stubs.git@c742042283a82c3248c68493c697f5f30e2fdc6a",
     "django-stubs-ext>=6.0,<6.1",
     "strawberry-graphql-django>=0.86.0",
 ]
