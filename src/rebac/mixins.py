@@ -85,10 +85,12 @@ def _declared_base_manager(meta: Any, bases: tuple[type, ...]) -> str | None:
     Django's fallback (``Options.base_manager``) reads only the first parent
     model. Every parent is read here, in order, so listing a library mixin
     first cannot discard a base manager declared by a later parent. The
-    injected manager and Django's automatic one are not declarations.
+    injected manager and Django's automatic one are not declarations. An
+    injected name inherited through Meta does not select the fallback; only
+    an explicit declaration on this Meta opts back into it.
     """
     name = getattr(meta, "base_manager_name", None)
-    if name is not None:
+    if name is not None and (name != INJECTED_BASE_MANAGER or "base_manager_name" in vars(meta)):
         return None if name == INJECTED_BASE_MANAGER else str(name)
     for base in bases:
         if hasattr(base, "_meta"):

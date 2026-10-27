@@ -22,6 +22,7 @@ from rebac import (
 from rebac.backends import backend
 from rebac.backends.local import LocalBackend
 from rebac.checks import check_declared_base_managers
+from rebac.mixins import RebacModelBase
 from rebac.schema import parse_zed
 from rebac.testing import install_schema
 from rebac.types import RelationshipTuple, SubjectRef
@@ -156,6 +157,33 @@ def test_base_manager_declared_on_an_abstract_rebac_parent_is_kept():
     for model in (Part, Page, Chapter):
         assert _base(model) == ("system_objects", PolicyQuerySet)
     assert _base(Opted) == ("_rebac_base", TrackedQuerySet)
+
+
+@pytest.mark.parametrize("concrete_parent", [False, True])
+def test_inherited_injected_meta_does_not_hide_a_later_parents_declared_manager(concrete_parent):
+    with isolate_apps("tests.testapp"):
+
+        class Fragment(models.Model, metaclass=RebacModelBase):
+            class Meta:
+                abstract = True
+
+        class Evidence(RebacTrackedMixin):
+            system_objects = models.Manager.from_queryset(PolicyQuerySet)()
+
+            class Meta:
+                abstract = not concrete_parent
+                app_label = "testapp"
+                base_manager_name = "system_objects"
+
+        class Part(Fragment, Evidence):
+            class Meta(Fragment.Meta):
+                app_label = "testapp"
+
+        assert Fragment._meta.base_manager_name == "_rebac_base"
+        assert _base(Part) == ("system_objects", PolicyQuerySet)
+        assert not Part._base_manager.auto_created
+        with pytest.raises(TypeError, match="rows are immutable"):
+            Part._base_manager.all().update()
 
 
 @pytest.mark.parametrize("manager_class", [models.Manager, RebacManager])

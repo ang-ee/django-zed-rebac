@@ -3,6 +3,16 @@
 All notable changes to `django-zed-rebac` are tracked here. The project is in
 pre-1.0; breaking changes within a minor version are explicitly called out.
 
+## Unreleased
+
+### Fixed
+
+- A model whose `Meta` inherits the injected `_rebac_base` option now keeps a
+  base manager declared by another parent, including a concrete multi-table
+  parent. The inherited fallback no longer masks that manager's write policy.
+  Explicitly declaring `base_manager_name = "_rebac_base"` still opts into
+  the injected manager.
+
 ## [0.27.3] — 2026-10-14
 
 ### Fixed
