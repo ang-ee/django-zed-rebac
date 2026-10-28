@@ -1544,7 +1544,9 @@ system scopes and actor-less calls retain their ordinary behavior; strict
 actor-less queries still refuse. An instance bypass is honored with its own
 named validation scope. One full-clean invocation shares the save verdict,
 including when a model's save override performs validation recursively, and
-cleans up that temporary instance state on every exit.
+cleans up that temporary instance state on every outermost exit. A nested
+full-clean must preserve the pending verdict while check_save executes a
+consumer save override; it must not reset the enclosing permission decision.
 
 `rebac.proposed_forward_relationships(instance, definition, *,
 required_relations, using=None)` is the canonical candidate projection already

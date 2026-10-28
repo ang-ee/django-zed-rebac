@@ -149,7 +149,7 @@ def test_admitted_create_validates_hidden_unique_rows(validation_rows):
 def test_admitted_create_validates_native_unique_constraints(validation_rows):
     with actor_context(validation_rows.alice), pytest.raises(ValidationError) as caught:
         GuardedConstraintRow(owner=validation_rows.alice, code="taken").full_clean()
-    assert "__all__" in caught.value.message_dict
+    assert set(caught.value.message_dict) == {"code"}
 
 
 def test_unevaluable_candidate_keeps_its_own_field_errors(validation_rows):
@@ -209,3 +209,41 @@ def test_save_verdict_is_not_kept_between_validation_calls(validation_rows):
         with pytest.raises(ValidationError) as caught:
             row.full_clean()
     assert set(caught.value.message_dict) == {"email"}
+
+
+@pytest.mark.parametrize(
+    "model,duplicate,available",
+    [
+        (GuardedUniqueRow, {"email": "bob@example.com"}, {"email": "fresh@example.com"}),
+        (GuardedConstraintRow, {"code": "taken"}, {"code": "fresh"}),
+    ],
+)
+def test_nested_consumer_save_validation_preserves_outer_permission_decision(
+    validation_rows, monkeypatch, model, duplicate, available,
+):
+    """A save that calls full_clean cannot hide a duplicate from outer validation."""
+
+    native_save = model.save
+
+    def validating_save(instance, *args, **kwargs):
+        instance.full_clean()
+        return native_save(instance, *args, **kwargs)
+
+    # This test owns these probe models; the override is the consumer lifecycle
+    # check_save must execute, rather than a substitute for native validation.
+    monkeypatch.setattr(model, "save", validating_save)
+    with system_context(reason="nested validation count"):
+        before = model._base_manager.count()
+    rejected = model(owner=validation_rows.alice, **duplicate)
+    with actor_context(validation_rows.alice), pytest.raises(ValidationError):
+        rejected.full_clean()
+    assert rejected.pk is None
+    assert "_rebac_save_verdict" not in rejected.__dict__
+
+    accepted = model(owner=validation_rows.alice, **available)
+    with actor_context(validation_rows.alice):
+        accepted.full_clean()
+    assert accepted.pk is None
+    assert "_rebac_save_verdict" not in accepted.__dict__
+    with system_context(reason="nested validation count"):
+        assert model._base_manager.count() == before

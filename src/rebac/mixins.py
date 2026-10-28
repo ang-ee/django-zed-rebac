@@ -514,11 +514,14 @@ class RebacMixin(RebacTrackedMixin):
         See :meth:`constraint_check`.
         """
 
-        self.__dict__[_SAVE_VERDICT] = None
+        outermost = _SAVE_VERDICT not in self.__dict__
+        if outermost:
+            self.__dict__[_SAVE_VERDICT] = None
         try:
             super().full_clean(exclude, validate_unique, validate_constraints)
         finally:
-            self.__dict__.pop(_SAVE_VERDICT, None)
+            if outermost:
+                self.__dict__.pop(_SAVE_VERDICT, None)
 
     def validate_unique(self, exclude: Collection[str] | None = None) -> None:
         """Check field uniqueness against every row once this row's save may proceed.
@@ -593,7 +596,8 @@ class RebacMixin(RebacTrackedMixin):
         ``write__`` gate, moving edges, expression reads and redacted writes for a
         saved one. A candidate it cannot evaluate (a related row that does not
         exist, a save that refuses its values or its actor) counts as refused, so
-        its field errors stand. A clean that the checked save runs again sees no verdict yet.
+        its field errors stand. A clean that the checked save runs again preserves the pending decision
+        and leaves cross-row checks to the enclosing clean.
         """
 
         verdict = self.__dict__.get(_SAVE_VERDICT)
