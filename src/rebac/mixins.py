@@ -462,10 +462,11 @@ class RebacMixin(RebacTrackedMixin):
       - `_default_manager` points at it; `_base_manager` owns gated writes
         and remains unfiltered for Django's relationship infrastructure.
       - save_base/delete owners gate writes; explicit-sender signals cover cascades.
-      - ``from_db()`` propagates the queryset's actor onto loaded instances
-        and snapshots loaded field values into ``_rebac_loaded_values`` for
-        later dirty-field computation (per-field ``write__<f>`` enforcement;
-        see ``mixins.py``).
+      - The queryset's materialisation hooks (``_fetch_all()`` and the
+        iterators) stamp its actor onto every loaded instance; the actor is
+        not visible inside ``from_db()``. ``from_db()`` snapshots loaded
+        field values into ``_rebac_loaded_values`` for later dirty-field
+        computation (per-field ``write__<f>`` enforcement; see ``mixins.py``).
 
     Instance-level surface (Odoo PR #179148 triple, plus actor / sudo binding):
 
@@ -503,7 +504,7 @@ class RebacMixin(RebacTrackedMixin):
     # manager leaves the model unscoped; ``rebac.E024`` reports it.
     objects: ClassVar[RebacManager[Self]] = RebacManager()  # pyright: ignore[reportIncompatibleVariableOverride]
 
-    # Carried through from_db (via the queryset's `_fetch_all`) so
+    # Stamped by the queryset's `_fetch_all` / iterators (not `from_db`) so
     # `instance.save()` re-checks against the same actor. Both this and
     # `_rebac_sudo_reason` are stripped by `__getstate__` below — pickled
     # instances arrive at the receiving process with NO actor / NO sudo,
