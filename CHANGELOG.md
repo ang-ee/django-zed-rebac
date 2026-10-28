@@ -5,6 +5,15 @@ pre-1.0; breaking changes within a minor version are explicitly called out.
 
 ## Unreleased
 
+### Added
+
+- `rebac sync --prune-stale` retires stale package-owned policy, including removed
+  packages and removed permissions files, without overwriting live `no_update`
+  edits or unmanaged schema. It removes relationships naming retired types and
+  relations in the same policy transaction, preserves transferred source
+  ownership, supports `--package` and read-only `--check`, and requires explicit
+  confirmation or `--yes` before writing.
+
 ### Fixed
 
 - A queryset fetch shares one schema snapshot between projected-field guards,

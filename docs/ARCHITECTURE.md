@@ -3146,6 +3146,8 @@ python manage.py rebac sync --check               # CI gate; no writes; non-zero
 python manage.py rebac sync --force-overwrite     # destructive; bypasses no_update
                                                        # requires --yes for non-interactive
 python manage.py rebac sync --force-overwrite --package=blog
+python manage.py rebac sync --prune-stale --yes    # retire stale package-owned policy
+python manage.py rebac sync --prune-stale --check  # read-only retirement/drift gate
 
 python manage.py rebac check                      # doctor: validate without writes
 python manage.py rebac build-zed                  # emit effective.zed for SpiceDB
@@ -3206,7 +3208,36 @@ For each AppConfig that declares rebac_schema:
 
 The whole sync is one policy write: it locks the `SchemaGeneration` row
 before it reads or writes a schema row and holds the lock until it commits.
-It writes the stored schema rows and nothing else.
+Without the explicit retirement mode it writes stored schema rows only.
+
+#### Explicit retirement of package-owned policy
+
+`sync --prune-stale` extends the same sync transaction to retire package-managed
+schema fragments absent from current source. It validates every installed schema
+before writes, including when `--package` limits the selected package. It covers
+removed packages, installed packages without their former permissions file, and
+removed definitions, relations, permissions and caveats. `--package` restricts
+retirement to that package even when the package is no longer installed.
+
+The mode is independent of `--force-overwrite`: live `no_update` rows and
+unmanaged policy remain protected. Retired managed rows are removed regardless
+of `no_update`; the explicit flag authorizes retirement, not replacement of live
+edits. A definition moved to another source package keeps its live target and
+relationships. Its managed metadata transfers to the current source owner when
+that owner has not synced yet; an obsolete duplicate claim is removed. This also
+preserves `no_update` for a later ordinary sync after a scoped retirement. The
+same applies to transferred relations, permissions and caveats.
+
+When a definition or relation is retired, tuples naming that type or relation
+are deleted from both resource and subject sides through the active relationship
+model's native queryset, on the same database alias. Retirement, ordinary sync
+writes, tuple cleanup and the policy revision share the existing policy lock and
+transaction; final stored-policy validation can roll them all back.
+
+`--prune-stale` requires confirmation or `--yes`. `--check` requires neither,
+reports retirement as drift and writes nothing. Ordinary sync behavior is
+unchanged; `--force-overwrite` retains its separate overwrite and stale-child
+behavior. Use both flags only when replacing edited live policy is also intended.
 
 **There is no implicit "first install" path that bypasses `no_update`.** A clean DB has no `PackageManagedRecord` rows, so case 5c applies naturally and no overwrite is needed. This avoids Odoo's [bug #1023615](https://bugs.launchpad.net/openobject-server/+bug/1023615) class of upgrade footguns.
 
