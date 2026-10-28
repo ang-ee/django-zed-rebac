@@ -231,8 +231,24 @@ class _Conversion(Func):
                 cast_input = Replace(guarded, Value("-"), Value(""))
             # Guard the cast INPUT, including literal expressions, so no
             # optimizer can eagerly cast an invalid constant in a CASE arm.
-            expression = Cast(cast_input, self.codec.field)
+            expression = Cast(cast_input, self._column_type())
         return expression
+
+    def _column_type(self) -> models.Field[Any, Any]:
+        """The type the column side of the identity is cast to.
+
+        A text identity is cast as the plain character type of its length.
+        Django knows the cast spelling of ``CharField`` and ``TextField`` on
+        every vendor; a subclass with its own internal type (``SlugField``)
+        has none on MySQL and falls back to the column's ``db_type``,
+        ``varchar(n)``, which MySQL's ``CAST`` refuses.
+        """
+        field = self.codec.field
+        if self.codec.kind != "text":
+            return field
+        if field.max_length is None:
+            return models.TextField()
+        return models.CharField(max_length=field.max_length)
 
 
 def identity_codec(model: type[models.Model], attr: str | None = None) -> Codec:
