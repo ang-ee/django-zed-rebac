@@ -349,6 +349,24 @@ def actor_context(actor: ActorLike) -> Iterator[None]:
         _current_actor.reset(token)
 
 
+@contextmanager
+def _as_actor_only(actor: SubjectRef) -> Iterator[None]:
+    """Read as ``actor`` with no ambient bypass in effect, for the block.
+
+    The engine's own use: a validation step for a save the gates refused runs
+    Django's checks under the actor's scope alone, so an ambient ``sudo()``
+    cannot answer for rows the actor may not read. Nothing is audited: no
+    bypass takes effect.
+    """
+    actor_token = _current_actor.set(actor)
+    sudo_token = _sudo_state.set(None)
+    try:
+        yield
+    finally:
+        _sudo_state.reset(sudo_token)
+        _current_actor.reset(actor_token)
+
+
 def _install_sudo_state(reason: str | None) -> tuple[Any, dict[str, Any], SubjectRef | None]:
     """Reason-check + install the sudo ContextVar slot.
 

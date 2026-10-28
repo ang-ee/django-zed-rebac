@@ -23,10 +23,13 @@ pre-1.0; breaking changes within a minor version are explicitly called out.
   projection, formerly private), `rebac.field_visibility.redacted_fields(instance)`,
   and `Relationship.objects.referencing(identities)` in both storage modes,
   shared with the library's own deletion cleanup.
-- System check `rebac.E024`: a `RebacMixin` model whose default manager does
-  not return a `RebacQuerySet`. Django's admin, model forms, related managers
-  and `validate_unique()` read rows through `_default_manager`; a plain
-  manager there leaves those reads unscoped with no `MissingActorError`.
+- System check `rebac.E024`: a `RebacMixin` model with a resource type whose
+  default manager does not return a `RebacQuerySet`. Django's admin, model
+  forms, related managers and `validate_unique()` read rows through
+  `_default_manager`; a plain manager there leaves those reads unscoped with
+  no `MissingActorError`. **Breaking for such a model:** the check is an
+  error, so `migrate` and `check` stop until `objects` derives from
+  `RebacManager` (or the model drops `RebacMixin`).
 - `RebacManager[M]` and `TrackedManager[M]` are generic in their model;
   `RebacManager.from_queryset(...)` keeps a custom queryset's methods and type
   under mypy, and pyright sees every actor verb on `Model.objects`. A
@@ -34,13 +37,18 @@ pre-1.0; breaking changes within a minor version are explicitly called out.
 
 ### Changed
 
-- Model uniqueness and constraint validation compare other rows only after the
-  save gate admits the candidate: a denied write can no longer learn whether a
-  value it cannot read is taken. The decision is taken once per outermost
-  `full_clean()` or direct `validate_unique()` / `validate_constraints()` call
-  (a `ModelForm` makes the direct calls), and `check_save()` rehearses the
-  model's own `save()` to reach it. Which rules count as cross-row follows
-  Django's own checks; a `CheckConstraint` alone triggers no rehearsal.
+- Model uniqueness and constraint validation compare other rows with every
+  row visible only after the save gate admits the candidate: a denied write
+  can no longer learn whether a value it cannot read is taken. A refused
+  candidate is still validated, as the actor alone (its readable rows, no
+  ambient bypass, gated fields left out), so a duplicate the actor can see
+  and a `CheckConstraint` remain form errors. The decision is taken once per
+  outermost `full_clean()` or direct `validate_unique()` /
+  `validate_constraints()` call (a `ModelForm` makes the direct calls), and
+  `check_save()` rehearses the model's own `save()` to reach it; while it
+  runs, the decision is pending. The elevated step's audit row names the
+  instance's actor. Which rules count as cross-row follows Django's own
+  checks; a `CheckConstraint` alone triggers no rehearsal.
 - Development tools are a PEP 735 dependency group, not a published `dev`
   extra: `uv sync --extra caveats --extra drf --extra strawberry` (or
   `make install-dev`) installs them; the database drivers are the `postgres`

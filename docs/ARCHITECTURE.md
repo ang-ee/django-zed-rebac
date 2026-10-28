@@ -1576,27 +1576,38 @@ retain Django's validation rules and add one access decision. A rule that
 compares this row with other rows (a unique field, `unique_together`,
 `unique_for_*`, a `UniqueConstraint` or any constraint other than a
 `CheckConstraint`, a primary key only for a row being added with its key
-set, as Django itself checks) reads rows the actor may not see, so under an
-actor it runs in a named system scope, and only after `check_save()` admits
-this candidate. `check_save()` rehearses the save: the model's own `save()`
-runs inside a transaction that is rolled back, so a consumer override's
-effects outside the database happen during validation as they would during
-the save. A refused save gets no elevated duplicate-existence answer; a
-rehearsal the gates never reach (a related row that does not exist, a
+set, none whose values are all `None`, none naming an excluded field, as
+Django itself checks) reads rows the actor may not see. Under an actor it
+runs with every row visible only after `check_save()` admits this candidate,
+in a system context whose audit row names that actor. `check_save()`
+rehearses the save: the model's own `save()` runs inside a transaction that
+is rolled back, so a consumer override's effects outside the database happen
+during validation as they would during the save. When the gates refuse, or
+the rehearsal cannot reach them (a related row that does not exist, a
 `ValidationError` the consumer's `save()` raises, a `TypeError` or
-`ValueError`) counts as refused, and the field errors Django found stand.
-A loaded row excludes the fields redacted when it loaded, which its save
-leaves unwritten. The decision is taken once per outermost call, whether
-that is `full_clean()` or a direct `validate_unique()` /
-`validate_constraints()` as a `ModelForm` makes them; a consumer `save()`
-that cleans again inside the rehearsal sees the pending decision and leaves
-the cross-row checks to the enclosing call. The instance marker that carries
-the decision is removed on every outermost exit and is not pickled. The
-instance's pinned actor outranks an ambient bypass, as everywhere: an
-instance bypass (`sudo`) validates in its own named system scope; with no
-actor and no bypass the rules run as they are, and strict mode refuses the
-actor-less read. Models without resource policy and steps without a
-cross-row rule run unchanged, with no rehearsal.
+`ValueError`), the step still runs, as the actor alone: the rows the actor
+can read answer, no ambient bypass applies, and the fields a `read__<field>`
+gate protects are left out. A refused save therefore learns nothing it could
+not read, and Django's own errors (a duplicate it can see, a
+`CheckConstraint`) still stand as form errors. A loaded row also excludes
+the fields redacted when it loaded, which its save leaves unwritten. The
+decision is taken once per outermost call, whether that is `full_clean()` or
+a direct `validate_unique()` / `validate_constraints()` as a `ModelForm`
+makes them; while `check_save()` runs, and inside the rehearsal it drives,
+the decision is pending, so a consumer `save()` that cleans again never
+validates with more access than the actor, whichever call is outermost. The
+instance marker that carries the decision is removed on every outermost
+exit and is not pickled. The instance's pinned actor outranks an ambient
+bypass, as everywhere: an instance bypass (`sudo`) validates in a system
+context under its own reason; with no actor and no bypass the rules run as
+they are, and strict mode refuses the actor-less read. Models without
+resource policy and steps without a cross-row rule run unchanged, with no
+rehearsal. A `ModelForm` makes the two direct calls separately, so it pays
+two rehearsals and two audit rows per `is_valid()`; one decision per form is
+a later optimisation. Known limitation: Django's `clean_fields()` validates
+a foreign key through `_base_manager`, so a hidden row's id passes where a
+nonexistent id does not; that existence oracle predates this section and is
+not closed by it.
 
 `rebac.proposed_forward_relationships(instance, definition, *,
 required_relations, using=None)` is the canonical candidate projection already
@@ -2595,7 +2606,7 @@ tracked model's callable attribute named `actor` does not become an actor scope.
 | `instance.save()` (loaded/non-adding instance) | `write` on the row | `RebacMixin.save_base`, before consumer `pre_save`. |
 | `instance.save()` (new instance) | `create` on the proposed row's forward relations | `save_base` projects the constructed candidate into `check_new`. |
 | `instance.check_access("create")` / `has_access("create")` (new instance) | `create` on the proposed row's forward relations | The same projection into `check_new`, on the instance as it is now: without a caveat context it is the decision the save gate makes on the same alias, so a caller can check before validating or saving. What `save()` prepares later (an override, Django's refresh of a related object saved after it was assigned) is not seen. A context the caller supplies is used, though `save()` supplies none; a `consistency` the backend refuses is refused, and the candidate's reads take none. It can answer `CONDITIONAL_PERMISSION`, and raises what the projection raises (an invalid field value, an unavailable related row, `SchemaError` or another error from `proposed_relationships()`), as the save gate would. Any other action on a new instance asks the model-level sentinel; a loaded instance is checked as the row it is. |
-| `instance.check_save(*, using=None, update_fields=None)` | What the instance's first save through `save()` with the same arguments meets at the gates | Runs `save()` itself (the model's override; Django's preparation: a deferred instance's loaded fields, the key of a related object saved after it was assigned, the checks on `update_fields`; the redacted rewrite; the gates: the create candidate, or `write`, `write__<field>` on changed fields, a moving edge, expression reads, redacted writes, and the backed-edge gate) inside a transaction on the write alias that it rolls back, and stops where Django would send `pre_save` and write. `HAS_PERMISSION` when that save passes the gates or writes nothing, `NO_PERMISSION` with the denial's reason otherwise, even when an override swallows the denial. Nothing is audited inside: the instance's own bypass is taken, and audited, before; another bypass is left for the real save; no denial is audited. Other model instances the override saves get back their primary key and state. Not covered: a second save of the instance in the same override, `pre_save`/`post_save` receivers, effects outside that transaction (another alias, a durable block, anything outside the database). A caller that runs validation with more access than the actor (unique checks under `system_context`) asks it first, so validation never answers for a save the gates would refuse. The verdict covers the fields the save writes: without `update_fields`, `save()` leaves the fields redacted at load out of the write, even when assigned, and the check passes without them. Such a caller excludes the fields the actor may not read from the validation (`instance.validate_unique(exclude=instance.denied_read_fields())`), or it answers for values the actor can neither read nor write. |
+| `instance.check_save(*, using=None, update_fields=None)` | What the instance's first save through `save()` with the same arguments meets at the gates | Runs `save()` itself (the model's override; Django's preparation: a deferred instance's loaded fields, the key of a related object saved after it was assigned, the checks on `update_fields`; the redacted rewrite; the gates: the create candidate, or `write`, `write__<field>` on changed fields, a moving edge, expression reads, redacted writes, and the backed-edge gate) inside a transaction on the write alias that it rolls back, and stops where Django would send `pre_save` and write. `HAS_PERMISSION` when that save passes the gates or writes nothing, `NO_PERMISSION` with the denial's reason otherwise, even when an override swallows the denial. Nothing is audited inside: the instance's own bypass is taken, and audited, before; another bypass is left for the real save; no denial is audited. Other model instances the override saves get back their primary key and state. Not covered: a second save of the instance in the same override, `pre_save`/`post_save` receivers, effects outside that transaction (another alias, a durable block, anything outside the database). A caller that runs validation with more access than the actor (unique checks under `system_context`) asks it first, so validation never answers for a save the gates would refuse. The verdict covers the fields the save writes: without `update_fields`, `save()` leaves the fields redacted at load out of the write, even when assigned, and the check passes without them. Such a caller excludes the fields the actor may not read from the validation (`instance.validate_unique(exclude=redacted_fields(instance))`), or it answers for values the actor can neither read nor write. |
 | `instance.delete()` | `delete` on the row | `RebacMixin.delete`; explicit-sender `pre_delete` checks collector children. |
 | `Model.objects.update(**kwargs)` | `write` on each affected row and every resource row whose backed FK edge changes | Under an actor the statement acts on the rows the queryset's scope admits (its action, `read` by default), the rows `count()` counts: a row outside the scope is not part of it, is neither checked nor written, and never causes a refusal. The primary keys of the rows in scope are selected; every one must be in the actor's `write` scope, and in `write__<field>` for a gated field it sets, or the update raises; exactly those rows are written, by key (see [Writes](#writes)). A backed FK update checks old and proposed source rows before SQL; expressions whose proposed FK cannot be resolved are refused. When the update touches a column the policy reads, the selected rows are gated from their stored values. Under an actor, `.distinct(*fields).update()` raises `TypeError`, as Django's `delete()` does: the rows `DISTINCT ON` selects are not the rows the UPDATE writes. |
 | `Model.objects.delete()` | `delete` on each row | The same rows: under an actor, those the queryset's scope admits, selected by primary key. Every one must be in the actor's `delete` scope, or the delete raises; exactly those rows are deleted, by key. A cascade that reaches a row outside them checks that row as an instance delete does. |

@@ -779,8 +779,14 @@ class Command(BaseCommand):
         if not stale:
             return False
         if check_only or not (force or retire):
-            hint = "--prune-stale or --force-overwrite to delete" if not retire else "will retire"
             for record in stale:
+                owner = source_owners.get(record.external_id) if source_owners else None
+                if owner is not None:
+                    hint = f"--prune-stale transfers to {owner}"
+                elif retire:
+                    hint = "--prune-stale retires" if check_only else "will retire"
+                else:
+                    hint = "--prune-stale or --force-overwrite to delete"
                 self.stdout.write(
                     self.style.WARNING(
                         f"  ! drift: stale managed row {record.external_id} ({hint})"
@@ -864,7 +870,8 @@ class Command(BaseCommand):
             kind, _, name = external_id.partition(":")
             if kind == "definition":
                 resource_types.add(name)
-            elif kind == "relation":
+            elif kind in ("relation", "permission"):
+                # A subject relation may name a permission (``type:id#read``).
                 resource_type, _, relation = name.partition("#")
                 relations.add((resource_type, relation))
             elif kind == "caveat":
