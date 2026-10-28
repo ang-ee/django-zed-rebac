@@ -18,19 +18,26 @@ application's own tables in pure Django; planned `SpiceDBBackend` over
 `authzed-py`), strict-by-default queryset scoping, AI-agent Grant pattern,
 MCP / Celery / DRF / GraphQL adapters.
 
-**Status: pre-alpha.** Tier-1 source has landed (LocalBackend, mixin/manager,
-parser, sync command, system checks); SpiceDBBackend, caveat evaluation, and
-adapter modules are in flight per the ARCHITECTURE.md roadmap. Layout:
+**Status: alpha**, published on PyPI (DjangoVer `6.0.x`, see `CHANGELOG.md`).
+Shipped: `LocalBackend` with permissions compiled to queries, the mixin and
+managers, the parser, `rebac sync`, the system checks, the DRF, MCP and
+Strawberry adapters, the audit table. Not shipped: `SpiceDBBackend` (a stub)
+and the SpiceDB conformance suite; see `docs/ROADMAP.md`. Layout:
 
 ```
 django-zed-rebac/
 ├── README.md                 # Public pitch + quickstart + comparison
 ├── AGENTS.md                 # This file (CLAUDE.md is a symlink to it)
+├── CHANGELOG.md              # Releases; breaking changes called out
+├── CONTRIBUTING.md           # Local setup and the verification commands
+├── Makefile                  # Tier 1 / 2 / 3 targets (make check, test-pg, test-release)
 ├── docs/
-│   ├── ARCHITECTURE.md               # Implementation specification
-│   └── ZED.md                # Schema-authoring guide
+│   ├── ARCHITECTURE.md       # Implementation specification
+│   ├── ZED.md                # Schema-authoring guide
+│   ├── ROADMAP.md            # The 1.0 plan and the product roadmap
+│   └── proposals/            # Design proposals, each with a Status line
 ├── pyproject.toml
-├── src/rebac/            # Python module — see § Naming below
+├── src/rebac/                # Python module — see § Naming below
 └── tests/
 ```
 

@@ -47,10 +47,15 @@ so the storage and identity changes ride with it.
    moves; that is the progress meter. Nothing is maintained after a write, so
    this step exists for the gates alone; how far it goes follows the decision
    on the gates (proposal 0015 § 13).
-4. **The actor carrier.** `with_actor()` stores the actor on the `Query`
-   (`_hints`), so a pinned actor still outranks the ambient one and reaches
-   subqueries and prefetches; `actor_context()` and the middleware stay the
-   ambient source; `RebacMixin` keeps `check_access`, `with_actor` and `sudo`
+4. **The actor carrier.** Open. The review of proposal 0013 after 0.25.0
+   ([0013-review-engine-shape](./proposals/0013-review-engine-shape.md))
+   found that `Query._hints` does not exist and that Django builds a fresh
+   `Query` for every related manager, `save()`, cascade and default prefetch,
+   so a carrier on the `Query` alone cannot be the design. The requirement
+   stands: `with_actor()` stores the actor where the compiler can read it,
+   so a pinned actor still outranks the ambient one and reaches subqueries
+   and prefetches; `actor_context()` and the middleware stay the ambient
+   source; `RebacMixin` keeps `check_access`, `with_actor` and `sudo`
    as conveniences and becomes optional. Opt-in moves to the schema: a model
    is a resource because the `.zed` schema declares its type.
 5. **Single storage.** Drop registry mode (`RelationshipRegistry`,
@@ -92,7 +97,7 @@ drop `with_actor` from `select_related`/`prefetch_related` workarounds.
   to be set (there is no scale suite at the moment).
 - Query plans of compiled scopes on a PostgreSQL database of tens of millions
   of rows (proposal 0015, gate G1): under trial, not verified.
-- The 0.24.0 probe corpus (`scratchpad` rounds r3 to r7, folded into
+- The 0.24.0 probe corpus (folded into
   `tests/test_security_*.py`): every case denies.
 - `make test-release` green on SQLite, PostgreSQL 16 and MySQL 8.
 
@@ -105,13 +110,13 @@ drop `with_actor` from `select_related`/`prefetch_related` workarounds.
     failures for every known fail-open path, each naming its proposal.
   - Follow-ups: 1.0 above.
 
-- [x] Permissions compiled to queries (proposal 0015; unreleased).
+- [x] Permissions compiled to queries (proposal 0015; released 0.25.0, 2026-10-02).
   - Shipped surface: `rebac.compile`; no table that holds a row per
     application row and no build step; recursion unrolled to
     `REBAC_DEPTH_LIMIT`; gated queryset writes that select, gate and write
     their rows by key; policy writes serialized on the generation row;
     migrations `0008` and `0009`. It replaces the derived permission store of
-    0.23.0 with its commands, checks and settings (CHANGELOG, Unreleased).
+    0.23.0 with its commands, checks and settings (CHANGELOG 0.25.0).
   - Follow-ups: the trial on a consumer database at scale (gate G1); the
     decision on the write gates (proposal 0015 § 13); a scale suite; a
     recursion mechanism without a bound, if a deployment needs one.
@@ -155,55 +160,3 @@ drop `with_actor` from `select_related`/`prefetch_related` workarounds.
 
 - [x] Decide the LocalBackend registry-storage default: resolved by 1.0 step 5,
   single storage. Registry mode stays opt-in until then and is not promoted.
-
-## Code review follow-ups
-
-This document captures **technical-debt and best-practice follow-ups** identified during a repository review.
-
-## Priority 0 — Quality gates and CI hygiene
-
-- [x] Add a default local/CI bootstrap (`make test` or `just test`) that installs required test deps before running checks.
-  - Why: current test run fails in a fresh environment because `django` is not installed.
-  - Outcome: contributors get deterministic one-command validation.
-
-- [x] Tighten lint scope so tooling rules are intentional for generated Django migrations.
-  - Why: Ruff currently flags test migrations for import sorting and mutable class attributes; those files are framework-generated and often should be excluded from stylistic rewrites.
-  - Outcome: less noise, fewer false-positive failures, clearer signal in CI.
-
-- [x] Add a CI matrix for Python/Django versions already declared in metadata.
-  - Why: compatibility is documented broadly, but repository checks should continuously verify claims.
-  - Outcome: early detection of version-specific regressions.
-
-## Priority 1 — Packaging and repository cleanliness
-
-- [x] Remove committed `src/django_zed_rebac.egg-info/*` from source control and add ignore rules.
-  - Why: egg-info artifacts are build outputs and can drift from source of truth (`pyproject.toml`).
-  - Outcome: cleaner diffs and fewer accidental release metadata mismatches.
-
-- [x] Add `MANIFEST.in` (or explicit setuptools config) review to ensure package data is deliberate.
-  - Why: the project depends on schema/runtime files and typed marker (`py.typed`); packaging should be explicit and tested.
-  - Outcome: predictable wheels/sdists.
-
-## Priority 2 — Django best-practice hardening
-
-- [x] Add system checks validating required middleware ordering when `ActorMiddleware` is enabled.
-  - Why: docs say it must be after `AuthenticationMiddleware`; an automated check prevents subtle runtime behavior bugs.
-  - Outcome: safer integration by default.
-
-- [x] Add explicit tests for settings cache invalidation (`setting_changed`) behavior.
-  - Why: `app_settings` caches values; cache invalidation is critical to predictable tests and runtime overrides.
-  - Outcome: protects against regressions in config behavior.
-
-- [x] Replace internal parser dependency (`_Parser`) usage with a stable public parser API abstraction.
-  - Why: relying on a private symbol creates refactor risk and hidden coupling.
-  - Outcome: easier maintenance and safer parser evolution.
-
-## Priority 3 — Documentation debt reduction
-
-- [x] Add a dedicated `CONTRIBUTING.md` with required toolchain, setup steps, and canonical commands.
-  - Why: repo has strong architecture docs but contributor workflow is implicit.
-  - Outcome: faster onboarding and fewer environment-specific failures.
-
-- [x] Document lint/test policy for migrations and generated files.
-  - Why: teams need explicit guidance on when to regenerate vs manually edit migration files in tests.
-  - Outcome: consistent review expectations.

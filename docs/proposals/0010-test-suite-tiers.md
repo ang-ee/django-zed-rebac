@@ -1,5 +1,9 @@
 # Proposal 0010: a tiered test suite, with the security and coverage gaps closed
 
+**Status:** shipped in 0.24.0 (2026-10-01): `make check`, `make test-pg` and
+`make test-release`, the nightly Release workflow, and the pinned expected
+failures for proposals 0011 to 0013 (`docs/ARCHITECTURE.md § Test tiers`).
+
 ## Problem
 
 A change takes about two hours to verify, and the suite still misses real
