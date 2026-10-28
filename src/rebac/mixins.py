@@ -514,14 +514,14 @@ class RebacMixin(RebacTrackedMixin):
         See :meth:`constraint_check`.
         """
 
-        outermost = _SAVE_VERDICT not in self.__dict__
+        outermost = _SAVE_VERDICT not in vars(self)
         if outermost:
-            self.__dict__[_SAVE_VERDICT] = None
+            vars(self)[_SAVE_VERDICT] = None
         try:
             super().full_clean(exclude, validate_unique, validate_constraints)
         finally:
             if outermost:
-                self.__dict__.pop(_SAVE_VERDICT, None)
+                vars(self).pop(_SAVE_VERDICT, None)
 
     def validate_unique(self, exclude: Collection[str] | None = None) -> None:
         """Check field uniqueness against every row once this row's save may proceed.
@@ -543,9 +543,13 @@ class RebacMixin(RebacTrackedMixin):
         if (check := self.constraint_check("validate_constraints")) is not None:
             scope, unwritten = check
             with scope:
-                super().validate_constraints({*(exclude or ()), *unwritten} if unwritten else exclude)
+                super().validate_constraints(
+                    {*(exclude or ()), *unwritten} if unwritten else exclude
+                )
 
-    def constraint_check(self, step: str) -> tuple[AbstractContextManager[Any], frozenset[str]] | None:
+    def constraint_check(
+        self, step: str
+    ) -> tuple[AbstractContextManager[Any], frozenset[str]] | None:
         """Return how Django's ``step`` (``validate_unique`` or ``validate_constraints``) runs, or ``None``.
 
         Uniqueness and constraints compare this row with rows the actor may not
@@ -600,18 +604,18 @@ class RebacMixin(RebacTrackedMixin):
         and leaves cross-row checks to the enclosing clean.
         """
 
-        verdict = self.__dict__.get(_SAVE_VERDICT)
+        verdict = vars(self).get(_SAVE_VERDICT)
         if verdict is not None:
             return verdict is True
-        deciding = _SAVE_VERDICT in self.__dict__
+        deciding = _SAVE_VERDICT in vars(self)
         if deciding:
-            self.__dict__[_SAVE_VERDICT] = _SAVE_PENDING
+            vars(self)[_SAVE_VERDICT] = _SAVE_PENDING
         try:
             verdict = self.check_save().allowed
         except DjangoPermissionDenied, ObjectDoesNotExist, TypeError, ValidationError, ValueError:
             verdict = False
         if deciding:
-            self.__dict__[_SAVE_VERDICT] = verdict
+            vars(self)[_SAVE_VERDICT] = verdict
         return verdict
 
     def proposed_relationships(

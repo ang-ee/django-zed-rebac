@@ -764,9 +764,15 @@ class Command(BaseCommand):
         ):
             owner = source_owners.get(record.external_id) if source_owners is not None else None
             if owner is not None:
-                claimed = PackageManagedRecord.objects.using(using).filter(
-                    package=owner, external_id=record.external_id,
-                ).exclude(pk=record.pk).exists()
+                claimed = (
+                    PackageManagedRecord.objects.using(using)
+                    .filter(
+                        package=owner,
+                        external_id=record.external_id,
+                    )
+                    .exclude(pk=record.pk)
+                    .exists()
+                )
                 if not claimed:
                     record.package = owner
                     record.save(using=using, update_fields=["package"])

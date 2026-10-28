@@ -7,11 +7,16 @@ from unittest.mock import patch
 import pytest
 from django.utils import timezone
 
-from rebac import PermissionDenied, sudo, to_object_ref, to_subject_ref
+from rebac import (
+    PermissionDenied,
+    proposed_forward_relationships,
+    sudo,
+    to_object_ref,
+    to_subject_ref,
+)
 from rebac.backends import backend as active_backend
 from rebac.backends import reset_backend
 from rebac.checks import check_field_backed_relations
-from rebac import proposed_forward_relationships
 from rebac.preflight import _check_new_model
 from rebac.schema import Permission, PermRef, parse_zed, validate_schema
 from rebac.schema.introspection import relation_dependencies

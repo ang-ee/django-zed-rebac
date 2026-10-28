@@ -7,66 +7,23 @@ from types import SimpleNamespace
 from typing import Any
 
 import pytest
-from django.conf import settings
 from django.contrib.auth import get_user_model
 from django.core.exceptions import ValidationError
-from django.db import models
 
-from rebac import RebacMixin, actor_context, backend, current_actor, system_context
+from rebac import actor_context, backend, system_context
 from rebac.backends import reset_backend
 from rebac.errors import MissingActorError, PermissionDenied
 from rebac.models import PermissionAuditEvent
 from rebac.schema import parse_zed
 from tests.backend_setup import install_schema
+from tests.testapp.models import (
+    GuardedConstraintRow,
+    GuardedUniqueRow,
+    OwnerDefaultUniqueRow,
+    PlainValidationRow,
+)
 
-pytestmark = pytest.mark.django_db
-
-
-class GuardedUniqueRow(RebacMixin):
-    owner = models.ForeignKey(settings.AUTH_USER_MODEL, on_delete=models.CASCADE, related_name="+")
-    email = models.CharField(max_length=80, unique=True)
-    code = models.CharField(max_length=40, unique=True, null=True, blank=True)
-    title = models.CharField(max_length=40, default="row")
-
-    class Meta:
-        app_label = "testapp"
-        rebac_resource_type = "validation/unique_row"
-
-
-class OwnerDefaultUniqueRow(RebacMixin):
-    """A consumer model owns its insert default; the engine must evaluate that save."""
-
-    owner = models.ForeignKey(
-        settings.AUTH_USER_MODEL, null=True, blank=True, on_delete=models.CASCADE, related_name="+",
-    )
-    code = models.CharField(max_length=40, unique=True)
-
-    class Meta:
-        app_label = "testapp"
-        rebac_resource_type = "validation/default_row"
-
-    def save(self, *args: Any, **kwargs: Any) -> None:
-        if self._state.adding and self.owner_id is None and (actor := current_actor()) is not None:
-            self.owner_id = actor.subject_id
-        super().save(*args, **kwargs)
-
-
-class GuardedConstraintRow(RebacMixin):
-    owner = models.ForeignKey(settings.AUTH_USER_MODEL, on_delete=models.CASCADE, related_name="+")
-    code = models.CharField(max_length=40)
-
-    class Meta:
-        app_label = "testapp"
-        rebac_resource_type = "validation/constraint_row"
-        constraints = [models.UniqueConstraint(fields=("code",), name="validation_code_unique")]
-
-
-class PlainValidationRow(RebacMixin):
-    title = models.CharField(max_length=40)
-
-    class Meta:
-        app_label = "testapp"
-        rebac_resource_type = "validation/plain_row"
+pytestmark = [pytest.mark.django_db, pytest.mark.pg_delta]
 
 
 SCHEMA = """
@@ -106,6 +63,7 @@ definition validation/plain_row {
 @pytest.fixture(params=("denormalized", "registry"))
 def validation_rows(request: pytest.FixtureRequest, settings: Any) -> Iterator[SimpleNamespace]:
     settings.REBAC_LOCAL_BACKEND_STORAGE = request.param
+    settings.REBAC_FIELD_READ_MODE = "redact"
     reset_backend()
     install_schema(backend(), parse_zed(SCHEMA))
     users = get_user_model().objects
@@ -219,7 +177,11 @@ def test_save_verdict_is_not_kept_between_validation_calls(validation_rows):
     ],
 )
 def test_nested_consumer_save_validation_preserves_outer_permission_decision(
-    validation_rows, monkeypatch, model, duplicate, available,
+    validation_rows,
+    monkeypatch,
+    model,
+    duplicate,
+    available,
 ):
     """A save that calls full_clean cannot hide a duplicate from outer validation."""
 

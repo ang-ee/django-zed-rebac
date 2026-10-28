@@ -5,11 +5,21 @@ from __future__ import annotations
 import pytest
 from django.contrib.auth import get_user_model
 from django.contrib.auth.base_user import AbstractBaseUser
+from django.contrib.contenttypes.models import ContentType
 from django.db import models
 from django.test import override_settings
-from django.contrib.contenttypes.models import ContentType
 
-from rebac import RebacMixin, to_subject_ref, user_subject_type, ObjectRef, RelationshipTuple, SubjectRef, backend, model_identities, write_relationships
+from rebac import (
+    ObjectRef,
+    RebacMixin,
+    RelationshipTuple,
+    SubjectRef,
+    backend,
+    model_identities,
+    to_subject_ref,
+    user_subject_type,
+    write_relationships,
+)
 from rebac.backends import reset_backend
 from rebac.models import active_relationship_model
 from rebac.schema import parse_zed
@@ -37,7 +47,9 @@ def test_user_subject_namespace_matches_native_plain_auth_fallback(settings, pre
 
 
 @override_settings(
-    AUTH_USER_MODEL="testapp.MetadataIdentityUser", REBAC_USER_TYPE="unused/user", REBAC_TYPE_PREFIX="tenant/",
+    AUTH_USER_MODEL="testapp.MetadataIdentityUser",
+    REBAC_USER_TYPE="unused/user",
+    REBAC_TYPE_PREFIX="tenant/",
 )
 def test_user_subject_namespace_prefers_the_installed_model_identity():
     user = get_user_model()(pk=7, username="namespace")
@@ -54,23 +66,35 @@ def test_native_model_view_resolves_subject_resource_and_untyped_identities():
 
 
 @pytest.mark.django_db
+@pytest.mark.pg_delta
 @pytest.mark.parametrize("storage", ("denormalized", "registry"))
 def test_reference_query_and_cleanup_share_both_ends_without_identity_collisions(settings, storage):
     settings.REBAC_LOCAL_BACKEND_STORAGE = storage
     reset_backend()
-    install_schema(backend(), parse_zed("""
+    install_schema(
+        backend(),
+        parse_zed("""
         definition auth/user {}
         definition auth/group {}
         definition blog/post {
             relation viewer: auth/user | auth/group
         }
-    """))
-    outgoing = RelationshipTuple(ObjectRef("blog/post", "7"), "viewer", SubjectRef.of("auth/user", "11"))
-    incoming = RelationshipTuple(ObjectRef("blog/post", "99"), "viewer", SubjectRef.of("auth/user", "7"))
-    same_id_other_type = RelationshipTuple(
-        ObjectRef("blog/post", "99"), "viewer", SubjectRef.of("auth/group", "7"),
+    """),
     )
-    unrelated = RelationshipTuple(ObjectRef("blog/post", "11"), "viewer", SubjectRef.of("auth/user", "11"))
+    outgoing = RelationshipTuple(
+        ObjectRef("blog/post", "7"), "viewer", SubjectRef.of("auth/user", "11")
+    )
+    incoming = RelationshipTuple(
+        ObjectRef("blog/post", "99"), "viewer", SubjectRef.of("auth/user", "7")
+    )
+    same_id_other_type = RelationshipTuple(
+        ObjectRef("blog/post", "99"),
+        "viewer",
+        SubjectRef.of("auth/group", "7"),
+    )
+    unrelated = RelationshipTuple(
+        ObjectRef("blog/post", "11"), "viewer", SubjectRef.of("auth/user", "11")
+    )
     write_relationships((outgoing, incoming, same_id_other_type, unrelated))
     rows = active_relationship_model().objects.using("default")
     identities = (ObjectRef("blog/post", "7"), ObjectRef("auth/user", "7"))

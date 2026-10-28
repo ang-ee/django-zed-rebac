@@ -2,12 +2,14 @@
 
 from __future__ import annotations
 
+from typing import Any
+
 from django.conf import settings
 from django.contrib.contenttypes.fields import GenericForeignKey, GenericRelation
 from django.contrib.contenttypes.models import ContentType
 from django.db import models
 
-from rebac import RebacMixin, RebacTrackedMixin, TrackedQuerySet
+from rebac import RebacMixin, RebacTrackedMixin, TrackedQuerySet, current_actor
 
 from .fields import (
     ColumnlessIdentityField,
@@ -519,3 +521,54 @@ class DeclaredBasePost(RebacMixin, DeclaredBaseParent):
     class Meta:
         app_label = "testapp"
         rebac_resource_type = "test/declaredbasepost"
+
+
+class GuardedUniqueRow(RebacMixin):
+    owner = models.ForeignKey(settings.AUTH_USER_MODEL, on_delete=models.CASCADE, related_name="+")
+    email = models.CharField(max_length=80, unique=True)
+    code = models.CharField(max_length=40, unique=True, null=True, blank=True)
+    title = models.CharField(max_length=40, default="row")
+
+    class Meta:
+        app_label = "testapp"
+        rebac_resource_type = "validation/unique_row"
+
+
+class OwnerDefaultUniqueRow(RebacMixin):
+    """A consumer model owns its insert default; the engine must evaluate that save."""
+
+    owner = models.ForeignKey(
+        settings.AUTH_USER_MODEL,
+        null=True,
+        blank=True,
+        on_delete=models.CASCADE,
+        related_name="+",
+    )
+    code = models.CharField(max_length=40, unique=True)
+
+    class Meta:
+        app_label = "testapp"
+        rebac_resource_type = "validation/default_row"
+
+    def save(self, *args: Any, **kwargs: Any) -> None:
+        if self._state.adding and self.owner_id is None and (actor := current_actor()) is not None:
+            self.owner_id = actor.subject_id
+        super().save(*args, **kwargs)
+
+
+class GuardedConstraintRow(RebacMixin):
+    owner = models.ForeignKey(settings.AUTH_USER_MODEL, on_delete=models.CASCADE, related_name="+")
+    code = models.CharField(max_length=40)
+
+    class Meta:
+        app_label = "testapp"
+        rebac_resource_type = "validation/constraint_row"
+        constraints = (models.UniqueConstraint(fields=("code",), name="validation_code_unique"),)
+
+
+class PlainValidationRow(RebacMixin):
+    title = models.CharField(max_length=40)
+
+    class Meta:
+        app_label = "testapp"
+        rebac_resource_type = "validation/plain_row"

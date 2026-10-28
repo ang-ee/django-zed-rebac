@@ -78,7 +78,7 @@ if TYPE_CHECKING:
     from .audit import emit as emit_audit_event
     from .backends import Backend, LocalBackend, SpiceDBBackend, backend
     from .decorators import check_permission, rebac_resource, require_permission
-    from .field_backing import GenericTarget, generic_target
+    from .field_backing import GenericTarget, generic_target, proposed_forward_relationships
     from .managers import RebacManager, RebacQuerySet, TrackedManager, TrackedQuerySet
     from .mcp import default_actor_resolver, get_mcp_actor_resolver, rebac_mcp_tool
     from .mixins import RebacMixin, RebacObjectMeta, RebacTrackedMixin
@@ -90,7 +90,6 @@ if TYPE_CHECKING:
         resolve_subjects,
         write_relationships,
     )
-    from .field_backing import proposed_forward_relationships
     from .resources import model_identities, to_object_ref, user_subject_type
 
 

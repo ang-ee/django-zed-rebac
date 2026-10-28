@@ -11,7 +11,7 @@ from weakref import WeakSet
 
 from django.apps import apps
 from django.db import connections, models, router
-from django.db.models import Model, Q
+from django.db.models import Model
 from django.db.models.functions import Cast
 from django.db.models.signals import (
     class_prepared,
@@ -388,7 +388,11 @@ def cleanup_identities(identities: Iterable[ObjectRef], *, using: str) -> None:
 
     from .backends.local import mark_relationships_changed
     from .models import RebacResource, active_relationship_model
-    from .models.relationship import _identity_query
+    from .models.relationship import (
+        RelationshipQuerySet,
+        RelationshipRegistryQuerySet,
+        _identity_query,
+    )
 
     identities = sorted(set(identities), key=str)
     if not identities or not router.allow_migrate_model(using, active_relationship_model()):
@@ -396,7 +400,10 @@ def cleanup_identities(identities: Iterable[ObjectRef], *, using: str) -> None:
     with transaction.atomic(using=using):
         for batch in batched(identities, 200, strict=False):
             registry = _identity_query(batch, include_subjects=False)
-            rows = active_relationship_model().objects.using(using).referencing(batch)
+            rows = cast(
+                RelationshipQuerySet | RelationshipRegistryQuerySet,
+                active_relationship_model().objects.using(using),
+            ).referencing(batch)
             if app_settings.REBAC_LOCAL_BACKEND_STORAGE == "registry":
                 RebacResource.objects.using(using).filter(registry).delete()
             else:

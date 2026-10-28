@@ -261,9 +261,7 @@ def test_sync_rejects_cross_package_permission_subject_before_writing(
     assert not SchemaDefinition.objects.exists()
 
 
-def _managed_record(
-    external_id: str, target: Any, *, package: str = "tests.testapp"
-) -> None:
+def _managed_record(external_id: str, target: Any, *, package: str = "tests.testapp") -> None:
     PackageManagedRecord.objects.create(
         package=package,
         external_id=external_id,
@@ -326,8 +324,11 @@ def test_prune_stale_retires_owned_policy_and_tuples_without_overwriting_live_ed
     ]
     for index, (resource_type, relation, subject_type, subject_relation) in enumerate(tuples):
         rows.create(
-            resource_type=resource_type, resource_id=str(index), relation=relation,
-            subject_type=subject_type, subject_id="1",
+            resource_type=resource_type,
+            resource_id=str(index),
+            relation=relation,
+            subject_type=subject_type,
+            subject_id="1",
             optional_subject_relation=subject_relation,
         )
     current_source.write_text(
@@ -377,7 +378,12 @@ def test_prune_stale_package_scope_includes_removed_package_only() -> None:
         target = SchemaDefinition.objects.create(resource_type=package.replace(".", "/"))
         _managed_record(f"definition:{target.resource_type}", target, package=package)
     call_command(
-        "rebac", "sync", "--prune-stale", "--package", "removed.first", "--yes",
+        "rebac",
+        "sync",
+        "--prune-stale",
+        "--package",
+        "removed.first",
+        "--yes",
         stdout=io.StringIO(),
     )
     assert not SchemaDefinition.objects.filter(resource_type="removed/first").exists()
@@ -409,8 +415,11 @@ def test_prune_stale_transfers_live_ownership_without_overwriting_policy_or_tupl
     permission.expression = "nil"
     permission.save()
     relationship = active_relationship_model().objects.create(
-        resource_type="shared/item", resource_id="1", relation="owner",
-        subject_type="auth/user", subject_id="1",
+        resource_type="shared/item",
+        resource_id="1",
+        relation="owner",
+        subject_type="auth/user",
+        subject_id="1",
     )
     # The old source is visited first, but its transferred rows remain protected.
     (old / "permissions.zed").write_text("definition old/remaining {}\n", encoding="utf-8")
@@ -427,9 +436,13 @@ def test_prune_stale_transfers_live_ownership_without_overwriting_policy_or_tupl
     assert permission.expression == "nil"
     assert SchemaDefinition.objects.get(resource_type="shared/item").pk == definition.pk
     assert active_relationship_model().objects.filter(pk=relationship.pk).exists()
-    assert not PackageManagedRecord.objects.filter(package="old", external_id__contains="shared/").exists()
+    assert not PackageManagedRecord.objects.filter(
+        package="old", external_id__contains="shared/"
+    ).exists()
     assert PackageManagedRecord.objects.filter(
-        package="new", external_id="permission:shared/item#read", no_update=True,
+        package="new",
+        external_id="permission:shared/item#read",
+        no_update=True,
     ).exists()
 
 
@@ -449,7 +462,12 @@ def test_prune_stale_validates_unselected_sources_before_deleting(monkeypatch, t
     )
     with pytest.raises(CommandError, match="Schema validation failed"):
         call_command(
-            "rebac", "sync", "--prune-stale", "--package", "removed", "--yes",
+            "rebac",
+            "sync",
+            "--prune-stale",
+            "--package",
+            "removed",
+            "--yes",
             stdout=io.StringIO(),
         )
     assert SchemaDefinition.objects.filter(pk=stale.pk).exists()
@@ -472,8 +490,11 @@ def test_prune_stale_rolls_policy_tuple_and_revision_back_together(
     _managed_record("definition:removed/type", stale, package="removed")
     rows = active_relationship_model().objects
     relationship = rows.create(
-        resource_type="removed/type", resource_id="1", relation="member",
-        subject_type="auth/user", subject_id="1",
+        resource_type="removed/type",
+        resource_id="1",
+        relation="member",
+        subject_type="auth/user",
+        subject_id="1",
     )
     revision = SchemaGeneration.objects.get(pk=1).revision
     prune = Command._prune_package_records
