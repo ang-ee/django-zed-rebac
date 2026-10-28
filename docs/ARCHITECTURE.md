@@ -1555,6 +1555,11 @@ replace `check_new`. Callers asking about a retained snapshot own whether its
 missing reverse/tuple relations can be known; the projection does not infer
 historical facts from current rows.
 
+`rebac.user_subject_type()` reads the installed auth model's declared resource
+identity, falling back to `REBAC_USER_TYPE` with the native `REBAC_TYPE_PREFIX`.
+The user branch of `to_subject_ref()` shares this owner. It needs no fabricated
+user instance, database lookup or downstream namespace parser.
+
 `rebac.model_identities(model, instance)` returns the resource and subject
 identities owned by that Django model view. Model lifecycle receivers use the
 same resolver; callers composing a multi-table retirement may ask each existing

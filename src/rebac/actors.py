@@ -29,7 +29,7 @@ from .errors import (
     SudoNotAllowedError,
     SudoReasonRequiredError,
 )
-from .resources import model_resource_type, to_object_ref
+from .resources import model_resource_type, to_object_ref, user_subject_type
 from .types import ObjectRef, SubjectRef
 
 # ---------- ContextVar ----------
@@ -239,7 +239,7 @@ def to_subject_ref(actor: ActorLike) -> SubjectRef:
             return SubjectRef(resource, subject_relation(user_model))
         attr = subject_id_attr(user_model)
         return SubjectRef.of(
-            type_with_prefix(app_settings.REBAC_USER_TYPE),
+            user_subject_type(),
             str(getattr(actor, attr)),
         )
 

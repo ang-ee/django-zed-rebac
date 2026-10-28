@@ -14,6 +14,14 @@ if TYPE_CHECKING:
     from django.db.models import Model
 
 
+def user_subject_type() -> str:
+    """Return the installed user's canonical subject namespace without fetching a row."""
+
+    from django.contrib.auth import get_user_model
+
+    return model_resource_type(get_user_model()) or type_with_prefix(app_settings.REBAC_USER_TYPE)
+
+
 def model_identities(model: type[Model], instance: Model) -> set[ObjectRef]:
     """Return this Django model view's resource and subject identities."""
 

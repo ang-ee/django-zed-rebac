@@ -4,15 +4,45 @@ from __future__ import annotations
 
 import pytest
 from django.contrib.auth import get_user_model
+from django.contrib.auth.base_user import AbstractBaseUser
+from django.db import models
+from django.test import override_settings
 from django.contrib.contenttypes.models import ContentType
 
-from rebac import ObjectRef, RelationshipTuple, SubjectRef, backend, model_identities, write_relationships
+from rebac import RebacMixin, to_subject_ref, user_subject_type, ObjectRef, RelationshipTuple, SubjectRef, backend, model_identities, write_relationships
 from rebac.backends import reset_backend
 from rebac.models import active_relationship_model
 from rebac.schema import parse_zed
 from rebac.signals import cleanup_identities
 from tests.backend_setup import install_schema
 from tests.testapp.models import Post
+
+
+class MetadataIdentityUser(RebacMixin, AbstractBaseUser):
+    username = models.CharField(max_length=40, unique=True)
+    USERNAME_FIELD = "username"
+
+    class Meta:
+        app_label = "testapp"
+        rebac_resource_type = "members/person"
+
+
+@pytest.mark.parametrize("prefix", ("", "tenant/"))
+def test_user_subject_namespace_matches_native_plain_auth_fallback(settings, prefix):
+    settings.REBAC_USER_TYPE = "people/account"
+    settings.REBAC_TYPE_PREFIX = prefix
+    user = get_user_model()(pk=7, username="namespace")
+    assert user_subject_type() == f"{prefix}people/account"
+    assert to_subject_ref(user).subject_type == user_subject_type()
+
+
+@override_settings(
+    AUTH_USER_MODEL="testapp.MetadataIdentityUser", REBAC_USER_TYPE="unused/user", REBAC_TYPE_PREFIX="tenant/",
+)
+def test_user_subject_namespace_prefers_the_installed_model_identity():
+    user = get_user_model()(pk=7, username="namespace")
+    assert user_subject_type() == "tenant/members/person"
+    assert to_subject_ref(user).subject_type == user_subject_type()
 
 
 def test_native_model_view_resolves_subject_resource_and_untyped_identities():
