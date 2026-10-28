@@ -256,8 +256,11 @@ expected failures for proposal 0011: `RebacMixin` deletes, which lift another
 type's backed edges with no `write` check; the collector's CASCADE and
 SET_NULL rows, which are gated under the ambient actor rather than the actor
 pinned on the deleted row; the moved row's own `write` and the pinned actor on
-reverse-FK `add(bulk=True)`; and instance-level through-model writes
-(`create`, `save`, `get_or_create`, `delete`), which are not gated.
+reverse-FK `add(bulk=True)`; instance-level through-model writes
+(`create`, `save`, `get_or_create`, `delete`), which are not gated; and
+Django 6.1's database-level `on_delete` options (`DB_CASCADE`, `DB_SET_NULL`,
+`DB_SET_DEFAULT`), whose rows the collector skips, so a watched column changes
+inside the database with no gate.
 
 ### 6. Determinism is load-bearing
 
@@ -436,7 +439,7 @@ access via `rebac.backend()`.
 - Use `swapper` if `REBAC_RELATIONSHIP_MODEL` is genuinely swappable;
   otherwise mark `class Meta: managed = True` (default) and ship the
   standard migration.
-- Migrations must run on PostgreSQL 13+, MySQL 8+, SQLite (test only).
+- Migrations must run on PostgreSQL 15+, MySQL 8.4+, SQLite (test only).
   Data migrations use the Django ORM in bounded batches (`0008` fills
   `caveat_key` 1,000 rows at a time). No raw SQL, triggers or database
   functions, in migrations or at run time; migration `0005`'s existing legacy
@@ -444,7 +447,7 @@ access via `rebac.backend()`.
   covers SQL text that Django's own compiler produced: compiled id sets, kept
   statements and the identity conversion's guard are embedded as that text
   (ARCHITECTURE.md § Statement shape). No statement is written by hand.
-  CI runs SQLite and PostgreSQL; the opt-in MySQL 8 vendor suite
+  CI runs SQLite and PostgreSQL; the opt-in MySQL 8.4 vendor suite
   is a release gate.
 
 ### Settings

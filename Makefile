@@ -79,7 +79,7 @@ test-postgres: require-postgres
 test-reference:
 	$(PYTEST) tests/test_reference_model.py -m '$(REFERENCE_MARKS)' -n auto --dist load $(LONG) --durations=25 $(ARGS)
 
-# Docker PostgreSQL 16 / MySQL 8 contracts. Container start-up counts toward
+# Docker PostgreSQL 16 / MySQL 8.4 contracts. Container start-up counts toward
 # each test's timeout.
 test-schema-vendors: require-docker require-vendor-drivers
 	REBAC_TEST_SCHEMA_VENDORS=1 $(PYTEST) -m schema_vendors $(LONG) $(ARGS)

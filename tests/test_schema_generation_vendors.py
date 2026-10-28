@@ -59,7 +59,9 @@ def vendor_database(request):
         ready = (
             ["mysql", "-h127.0.0.1", "-uroot", "-pschema-test", "-e", "SELECT 1"]
             if mysql
-            else ["pg_isready", "-U", "postgres"]
+            # Over TCP: the image's init phase answers the socket with a
+            # temporary server that it stops before the real one starts.
+            else ["pg_isready", "-h", "127.0.0.1", "-U", "postgres"]
         )
         for _ in range(60):
             if _run(["docker", "exec", container, *ready]).returncode == 0:

@@ -38,7 +38,7 @@ make test-release           # every part below in sequence, then a pass/fail sum
 make test-slow              # slow, on SQLite
 make test-postgres          # the whole suite including slow, on PostgreSQL
 make test-reference         # the full reference sweep
-make test-schema-vendors    # Docker PostgreSQL 16 and MySQL 8 contracts
+make test-schema-vendors    # Docker PostgreSQL 16 and MySQL 8.4 contracts
 make test-random            # the tier 1 selection in random order, seed 137
 
 # Focused runs, not a tier
@@ -157,8 +157,8 @@ The PostgreSQL targets select `tests.settings_postgres`. The `postgresql`
 marker is a requirement label for transaction/concurrency cases, not an opt-in
 replacement for running ordinary semantic and behavioral tests on PostgreSQL.
 
-The vendor contract fixture owns ephemeral PostgreSQL 16/MySQL 8 containers and
-removes them on exit. MySQL 8 remains an opt-in release gate, including identity codecs and
+The vendor contract fixture owns ephemeral PostgreSQL 16/MySQL 8.4 containers and
+removes them on exit. MySQL 8.4 remains an opt-in release gate, including identity codecs and
 unsigned integer bounds. PostgreSQL CI does not replace this gate.
 
 Tier 3 (`make test-release`) is the `slow` tests, the whole suite on
@@ -172,7 +172,7 @@ statement counts and compile time per scope. Written assertions are not results.
 Python 3.14 and Django 6.1, in three workflows:
 
 - **CI** (`.github/workflows/ci.yml`) runs on pushes to `main`, on version
-  tags and on pull requests, as two parallel jobs. `test (3.14, 6.0)` runs
+  tags and on pull requests, as two parallel jobs. `tier 1` runs
   `make check`: tier 1, and the check branch protection requires.
   `postgres-delta` runs `make test-pg` against a `postgres:16` service
   container: tier 2.
@@ -184,7 +184,7 @@ Python 3.14 and Django 6.1, in three workflows:
   release evidence; [Commands](#commands) shows how to start and read it with
   `gh`.
 - **Publish to PyPI** runs after CI completes on a `v*` tag and publishes when
-  the `test (3.14, 6.0)` job passed. It reads that job's result, because the
+  the `tier 1` job passed. It reads that job's result, because the
   conclusion of the CI run also covers `postgres-delta`; neither tier 2 nor
   Release holds a tag back. It does not run the tests again: it verifies that
   the tag, `pyproject.toml` and the installed package agree, builds, checks

@@ -22,18 +22,20 @@ pre-1.0; breaking changes within a minor version are explicitly called out.
   manager is typed as Django's `QuerySet`, not the custom queryset; the
   manager's verbs (`with_actor`, `as_user`, ...) keep the custom type, so
   call them on the manager rather than through `get_queryset()`.
-- Django 6.1's database-level deletes (`DB_CASCADE`, `DB_SET_NULL`,
-  `DB_SET_DEFAULT`) run in the database and send no `pre_delete` /
-  `post_delete`: a tracked or resource row removed that way passes no gate
-  and no identity cleanup. Use the Python-level `on_delete` options on
-  relations the policy reads (proposal 0011).
-
-- A `None` value in a backing's `filters` means SQL NULL on every field,
-  a `JSONField` included: the stored lookup is spelled `isnull`, and the
-  candidate projection already cast it that way. Django's `=None` on a
-  `JSONField` meant the JSON scalar `null` and is deprecated in 6.1 (it
-  becomes SQL NULL in Django 2028); a backing that relied on the JSON-null
-  reading filters on the JSON value explicitly instead.
+- Django 6.1's database-level `on_delete` options (`DB_CASCADE`,
+  `DB_SET_NULL`, `DB_SET_DEFAULT`) run inside the database: the collector
+  skips those rows, so they send no `pre_delete` / `post_delete` and pass no
+  gate. A row `DB_CASCADE` removes gets no identity cleanup; a column
+  `DB_SET_NULL` or `DB_SET_DEFAULT` changes is written without the `write`
+  check of invariant 5d. Pinned as an expected failure for proposal 0011;
+  use the Python-level `on_delete` options on relations the policy reads.
+- A `None` value in a backing's `filters` compared with a whole `JSONField`
+  column means SQL NULL, as on every other field: the stored lookup is
+  spelled `isnull` (an explicit `exact` folds into it), and the candidate
+  projection already cast it that way. Django's `=None` on the column meant
+  the JSON scalar `null` and is deprecated in 6.1 (it becomes SQL NULL in
+  Django 2028); a `null` at a key inside the column (`"data__flag": null`)
+  keeps its JSON meaning.
 - The `drf` extra requires djangorestframework 3.18 (3.17 imports a helper
   Django 6.1 removed).
 

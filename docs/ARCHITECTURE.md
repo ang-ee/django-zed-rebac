@@ -2316,12 +2316,14 @@ related-manager wrappers and the explicit-sender receivers.
   per statement. A row that starts matching the caller's filter in between
   is neither gated nor written. A denied row denies the whole statement.
 - **Database-level deletes.** Django 6.1's `DB_CASCADE`, `DB_SET_NULL` and
-  `DB_SET_DEFAULT` run in the database and send no `pre_delete` /
-  `post_delete`, so the collector never sees the dependent rows: a tracked or
-  resource row removed that way passes no gate and gets no identity cleanup.
-  Relations the policy reads use the Python-level `on_delete` options; the
-  database-level ones are a gap of the same kind as the collector cases
-  pinned under proposal 0011.
+  `DB_SET_DEFAULT` run inside the database: the collector skips the dependent
+  rows, which therefore send no `pre_delete` / `post_delete` and pass no gate.
+  A resource or tracked row that `DB_CASCADE` removes gets no identity
+  cleanup; a column that `DB_SET_NULL` or `DB_SET_DEFAULT` changes is written
+  without the `write` check of invariant 5d, even when a backing reads it.
+  Pinned as an expected failure for proposal 0011
+  (`tests/test_security_proposal_0011.py`); relations the policy reads use the
+  Python-level `on_delete` options until the gate moves to the compilers.
 - **Tuple writes.** `write_relationships()` validates every tuple against
   the effective schema and saves the rows in one transaction; model save
   signals run for each row. `delete_relationships()` and queryset deletes on
@@ -3530,9 +3532,9 @@ debugging only.
 
 Tiers 1 and 2 are the two parallel jobs of `.github/workflows/ci.yml`, on
 every push to `main`, every version tag and every pull request:
-`test (3.14, 6.0)` runs `make check` and `postgres-delta` runs `make test-pg`
+`tier 1` runs `make check` and `postgres-delta` runs `make test-pg`
 against a PostgreSQL 16 service container. Publish to PyPI reads the result of
-the `test (3.14, 6.0)` job, not of the whole CI run, so a tag publishes on tier
+the `tier 1` job, not of the whole CI run, so a tag publishes on tier
 1 alone. Tier 3 is `.github/workflows/release.yml`, nightly on `main` and on
 demand, with one job per part; the reference sweep is split across six jobs by
 expression shape. `make test-release` runs the same parts locally in sequence,
@@ -3552,7 +3554,7 @@ cases also carry `reference_shard`. `make test-reference` overrides the
 marker filter and runs every reference shard, distributed by test rather
 than by file. `make test-postgres` runs the whole suite, `slow` included, on
 PostgreSQL. `make test-schema-vendors` opts into disposable PostgreSQL/MySQL
-contracts; MySQL 8 is covered only there. All of these are tier 3. There is
+contracts; MySQL 8.4 is covered only there. All of these are tier 3. There is
 no scale suite at the moment. Drivers, environment and release gates are in
 [CONTRIBUTING.md](../CONTRIBUTING.md).
 
@@ -3567,7 +3569,7 @@ no scale suite at the moment. Drivers, environment and release gates are in
 | Policy checks | `tests/test_policy_checks.py` | System checks for settings, schemas and models, and what the library refuses as a policy. |
 | Transactions and concurrency | `tests/test_write_effects.py`, `tests/test_compile_read.py` | Deterministic PostgreSQL tests: concurrent revoke and link insertion, concurrent tuple writes. Outer and savepoint rollback. A policy revision that changes while a lazy scope is compiled cannot replace the policy the scope was built for. |
 | Structural | `tests/test_scope_depth.py` and others | The scope statement of a recursive permission has the same size and parse depth whatever the depth of the data. Fresh SQLite/PostgreSQL migrations install no REBAC trigger or function, and end with no table that holds a row per application row. No library raw SQL, triggers or database functions exist outside migration `0005`'s legacy uninstall routine; the two documented exceptions embed SQL that Django compiled. |
-| Vendors | `schema_vendors` | SQLite and PostgreSQL CI; an opt-in MySQL 8 suite must pass before release, including the schema write owners, the upgrade path and identity codec bounds for unsigned integers. |
+| Vendors | `schema_vendors` | SQLite and PostgreSQL CI; an opt-in MySQL 8.4 suite must pass before release, including the schema write owners, the upgrade path and identity codec bounds for unsigned integers. |
 | Security pins | `tests/test_security_*.py` | The gates' rules, unchanged. The strict expected failures for proposals 0011 and 0013 stay pinned. |
 
 Data cycles that exceed the frozen walker's dispatch limit use the pure

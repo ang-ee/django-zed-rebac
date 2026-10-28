@@ -112,7 +112,7 @@ jobs:
         run: make test-reference ARGS="-k '$SELECT'"
 
   vendors:
-    name: vendor contracts (PostgreSQL 16, MySQL 8)
+    name: vendor contracts (PostgreSQL 16, MySQL 8.4)
     runs-on: ubuntu-latest
     timeout-minutes: 45
     steps:

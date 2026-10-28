@@ -24,6 +24,8 @@ from tests.testapp.models import (
     BackingQueue,
     BackingRound,
     BackingTask,
+    DatabaseNulledFolder,
+    DatabaseNulledPost,
     Folder,
     Post,
 )
@@ -235,6 +237,49 @@ def test_set_null_must_check_post_under_pinned_actor():
     assert not backend().has_access(subject=A, action="read", resource=resource)
     with actor_context(B), pytest.raises(PermissionDenied), transaction.atomic():
         Folder.objects.with_actor(A).get(pk=folder.pk).delete()
+    assert not backend().has_access(subject=A, action="read", resource=resource)
+
+
+DATABASE_SETNULL_SCHEMA = """
+definition auth/user {}
+definition blog/databasenulledfolder {
+    relation owner: auth/user
+    relation locked: auth/user:*
+    permission read = owner
+    permission write = owner
+    permission delete = owner
+}
+definition blog/databasenulledpost {
+    relation owner: auth/user
+    relation viewer: auth/user
+    relation folder: blog/databasenulledfolder // rebac:field=folder
+    permission read = viewer - folder->locked
+    permission write = owner
+    permission delete = owner
+}
+"""
+
+
+@pytest.mark.xfail(
+    strict=True,
+    reason="proposal 0011: DB_SET_NULL changes a watched column inside the database, past every gate",
+)
+def test_database_set_null_must_check_post_write():
+    """Django 6.1's database-level ``on_delete`` rows skip the collector, so the
+    folder's delete nulls the post's backing column with no ``write`` check on
+    the post (invariant 5d) and no signal."""
+    install_schema(backend(), parse_zed(DATABASE_SETNULL_SCHEMA))
+    with sudo(reason="fixture"):
+        folder = DatabaseNulledFolder.objects.create(name="f")
+        post = DatabaseNulledPost.objects.create(title="p", folder=folder)
+    grant("blog/databasenulledfolder", folder.pk, "owner", A)
+    grant("blog/databasenulledfolder", folder.pk, "locked", SubjectRef.of("auth/user", "*"))
+    grant("blog/databasenulledpost", post.pk, "viewer", A)
+    grant("blog/databasenulledpost", post.pk, "owner", B)
+    resource = ObjectRef("blog/databasenulledpost", str(post.pk))
+    assert not backend().has_access(subject=A, action="read", resource=resource)
+    with actor_context(A), pytest.raises(PermissionDenied), transaction.atomic():
+        DatabaseNulledFolder.objects.with_actor(A).get(pk=folder.pk).delete()
     assert not backend().has_access(subject=A, action="read", resource=resource)
 
 

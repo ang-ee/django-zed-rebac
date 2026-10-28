@@ -116,10 +116,12 @@ def test_queryset_manager_extensions_keep_native_type_checks(tmp_path: Path) -> 
             assert_type(TrackedPostManager().get(), Post)
             assert_type(Post.objects.get(), Post)
             assert_type(Post.objects.get().title, str)
+            assert_type(Post.objects.with_actor(None), RebacQuerySet[Post])
             assert_type(Post.objects.with_actor(None).get(), Post)
             assert_type(OwnRecord.objects.label(), str)
             assert_type(OwnRecord.objects.get(), OwnRecord)
             assert_type(OwnRecord.objects.get().title, str)
+            assert_type(OwnRecord.objects.with_actor(None), RebacQuerySet[OwnRecord])
             assert_type(OwnRecord.objects.with_actor(None).get(), OwnRecord)
             OwnRecord.objects.get().title = object()  # invalid-own-field
             post = Post()

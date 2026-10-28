@@ -2,7 +2,7 @@ name: CI
 
 # Tier 1 and tier 2 (docs/ARCHITECTURE.md § Test tiers) as two parallel jobs.
 # Tier 1 is the gate for merging and for publishing: Publish to PyPI reads the
-# result of the `test (3.14, 6.0)` job, not of this whole run. Tier 3 runs in
+# result of the `tier 1` job, not of this whole run. Tier 3 runs in
 # release.yml.
 
 # Pushes to lane branches don't run CI; their commits run it on main or in a
@@ -19,8 +19,8 @@ concurrency:
 
 jobs:
   test:
-    # Branch protection requires this check name.
-    name: test (3.14, 6.0)
+    # Branch protection requires this check name; the matrix is in pyproject.
+    name: tier 1
     runs-on: ubuntu-latest
     timeout-minutes: 15
     steps:

@@ -874,7 +874,7 @@ class Compiler:
         for _ in range(hops):
             closure = seed.union(
                 edges.filter(subject_id__in=_Compiled(closure)).order_by().values("resource_id")
-            ).order_by()
+            )
         return closure
 
     def _not_converged(self, edges: Any, closure: QuerySet[Any], known: Q) -> Q:
@@ -1222,7 +1222,7 @@ class Compiler:
 
         closure = seed
         for _ in range(self.depth_limit - 1):
-            closure = seed.union(reaching(closure)).order_by()
+            closure = seed.union(reaching(closure))
         inherits = reaching(closure)
         parts.append(
             self._model_membership(
@@ -1232,7 +1232,7 @@ class Compiler:
         if bound is Bound.UPPER and depth_possible:
             # One more hop that reaches a row outside the closure and its
             # inheritors means the closure has not converged.
-            known = seed.union(inherits).order_by()
+            known = seed.union(inherits)
             beyond = reaching(inherits).exclude(**{f"{identity}__in": _Compiled(known)})
             parts.append(_and(Q(Exists(beyond)), _not_null(at.ref)))
         return self._union(at, parts)
@@ -1528,7 +1528,7 @@ class Compiler:
         identity = resource_id_attr(model)
         source = model._base_manager.using(self.using)
         ids = [source.filter(part).order_by().values_list(identity, flat=True) for part in kept]
-        return _in(at.ref, ids[0].union(*ids[1:]).order_by())
+        return _in(at.ref, ids[0].union(*ids[1:]))
 
     # ---------- Relations ----------
 
@@ -1791,7 +1791,7 @@ class Compiler:
             found = every.filter(**{f"{resolved.target_id_attr}__in": list(found)})
         subjects = (every if found is True else found).filter(Q(**resolved.filters))
         if resolved.resource is not None:
-            subjects = subjects.filter(**{resolved.field.name: resolved.value})
+            subjects = subjects.filter(resolved.value_filter(resolved.value))
             derived = self._wire_equal(at, resolved.resource) & Q(Exists(subjects))
             fallback = ~self._wire_equal(at, resolved.resource)
             definition = self.schema.get_definition(at.resource_type)

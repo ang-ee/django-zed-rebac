@@ -240,8 +240,9 @@ def test_encoded_owner_corpus_is_not_enumerated_for_sparse_tuple_grants(
     assert large_cost[0] <= 16
     # A fixed statement, independent of the corpus. The count changes only
     # with the compiler.
-    # Django 6.1 compares the top-level boolean scope predicate with True (one parameter).
-    assert large_cost[1] == 38
+    # Django 6.1 compares the top-level boolean scope predicate with True (one
+    # parameter) where the backend has no native boolean type.
+    assert large_cost[1] == 37 + (not connection.features.has_native_boolean_field)
 
 
 @pytest.mark.parametrize("active", STORAGE_TIERS, indirect=True)
