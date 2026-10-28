@@ -1,5 +1,11 @@
 # Proposal 0008: live set and attribute relation backings
 
+**Status:** implemented in `LocalBackend` (0.17.0 to 0.19.0: attribute
+backings, reverse and many-to-many paths, filtered constant relations). Since
+0.25.0 ([proposal 0015](./0015-permissions-compiled-to-queries.md)) the
+compiler reads a live backing at query time; the index projection and
+maintenance this text describes no longer exist.
+
 ## Problem
 
 The original field-backed relation supported one forward foreign key. Django also

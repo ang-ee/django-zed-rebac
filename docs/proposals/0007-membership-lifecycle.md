@@ -1,6 +1,6 @@
 # Membership and identity lifecycle
 
-Status: accepted for implementation.
+**Status:** shipped in 0.17.0 (2026-09-13).
 
 ## Problem
 

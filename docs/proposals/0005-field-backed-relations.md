@@ -1,12 +1,15 @@
 # Proposal 0005 - Field-backed relations
 
-**Target version:** LocalBackend backings shipped; index integration in 0.23.0. SpiceDB projection tracks the
-`SpiceDBBackend` roadmap item.
-**Status:** Implemented for forward/reverse/M2M and filtered paths under
-`LocalBackend`; SpiceDB projection remains phase 2.
-**Scope:** One optional field on the `Relation` AST plus a comment-directive carrier in the parser;
-LocalBackend projects a backed relation from Django columns into its derived
-permission index, with write guards and schema validation. SpiceDB sync is phase 2.
+**Status:** implemented for forward, reverse, M2M and filtered paths under
+`LocalBackend`; SpiceDB projection remains phase 2 and tracks the
+`SpiceDBBackend` roadmap item. Since 0.25.0 ([proposal 0015](./0015-permissions-compiled-to-queries.md))
+a backed relation is read by the permission compiler at query time, straight
+from the Django columns; the derived permission index, its maintenance and the
+`rebac index` commands this text describes in § 3 and § 4 no longer exist. The
+declarations, the backing resolver and the write gates are as described.
+**Scope:** One optional field on the `Relation` AST plus a comment-directive
+carrier in the parser; `LocalBackend` reads a backed relation from Django
+columns, with write guards and schema validation. SpiceDB sync is phase 2.
 
 ## Why
 

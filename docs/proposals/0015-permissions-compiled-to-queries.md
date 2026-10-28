@@ -2,8 +2,9 @@
 
 **Target version:** a green-field re-implementation of `LocalBackend`
 evaluation; candidate shape for 1.0.
-**Status:** implemented on the branch `feat/0015-compiled-permissions`
-(2026-10-02), pending the trial on a consumer database. `LocalBackend` reads
+**Status:** implemented and released in 0.25.0 (2026-10-02). Open: the trial
+on a consumer database at scale (gate G1) and the decision on the write gates
+(§ 13). `LocalBackend` reads
 from the compiler; maintenance, the index tables, their commands, checks and
 settings are removed. The implemented behaviour is specified in
 `docs/ARCHITECTURE.md` § Compiled permissions; where this text and the source

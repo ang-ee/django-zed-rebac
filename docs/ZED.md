@@ -535,8 +535,7 @@ write_relationships([
 Use `rebac.memberships` when relationship tuples are the membership store.
 If membership already lives in a Django M2M, declare its path as field backing
 on the container instead. These are alternative owners for the same relation;
-do not mirror one into the other. The unused `REBAC_SYNC_DJANGO_GROUPS` setting
-has been removed.
+do not mirror one into the other.
 
 #### Public read access
 
