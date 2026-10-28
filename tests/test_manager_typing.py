@@ -1,4 +1,4 @@
-"""Native django-stubs must see both queryset-derived manager inheritance chains."""
+"""Upstream django-stubs must see both queryset-derived manager inheritance chains."""
 
 from __future__ import annotations
 
@@ -105,20 +105,23 @@ def test_queryset_manager_extensions_keep_native_type_checks(tmp_path: Path) -> 
             assert_type(queryset.sudo(reason="typing").get().title, str)
             assert_type(PostManager().answer(), int)
             assert_type(TrackedPostManager().label(), str)
-            assert_type(PostManager().get_queryset(), PostQuerySet[Post])
-            assert_type(TrackedPostManager().get_queryset(), TrackedPostQuerySet[Post])
-            assert_type(PostManager().get_queryset().with_actor(None).answer(), int)
-            assert_type(TrackedPostManager().get_queryset().label(), str)
+            # Upstream django-stubs types get_queryset() on a from_queryset
+            # manager as Django's QuerySet; the verbs on the manager itself
+            # keep the custom type (below).
+            assert_type(PostManager().get_queryset().get(), Post)
+            assert_type(TrackedPostManager().get_queryset().get(), Post)
             assert_type(PostManager().with_actor(None), PostQuerySet[Post])
             assert_type(PostManager().with_actor(None).answer(), int)
             assert_type(PostManager().get(), Post)
             assert_type(TrackedPostManager().get(), Post)
             assert_type(Post.objects.get(), Post)
             assert_type(Post.objects.get().title, str)
+            assert_type(Post.objects.with_actor(None), RebacQuerySet[Post])
             assert_type(Post.objects.with_actor(None).get(), Post)
             assert_type(OwnRecord.objects.label(), str)
             assert_type(OwnRecord.objects.get(), OwnRecord)
             assert_type(OwnRecord.objects.get().title, str)
+            assert_type(OwnRecord.objects.with_actor(None), RebacQuerySet[OwnRecord])
             assert_type(OwnRecord.objects.with_actor(None).get(), OwnRecord)
             OwnRecord.objects.get().title = object()  # invalid-own-field
             post = Post()

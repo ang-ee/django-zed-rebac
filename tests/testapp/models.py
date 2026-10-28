@@ -62,6 +62,33 @@ class Post(RebacMixin, models.Model):
         rebac_resource_type = "blog/post"
 
 
+class DatabaseNulledFolder(RebacMixin, models.Model):
+    """A target with no Python-level foreign keys, as ``fields.E323`` requires."""
+
+    name = models.CharField(max_length=100)
+
+    class Meta:
+        app_label = "testapp"
+        rebac_resource_type = "blog/databasenulledfolder"
+
+
+class DatabaseNulledPost(RebacMixin, models.Model):
+    """A watched column that Django 6.1's ``DB_SET_NULL`` changes inside the database."""
+
+    title = models.CharField(max_length=200)
+    folder = models.ForeignKey(
+        DatabaseNulledFolder,
+        null=True,
+        blank=True,
+        on_delete=models.DB_SET_NULL,
+        related_name="database_nulled_posts",
+    )
+
+    class Meta:
+        app_label = "testapp"
+        rebac_resource_type = "blog/databasenulledpost"
+
+
 class PinnedPost(RebacMixin, models.Model):
     """A many-to-many relation through a declared model."""
 

@@ -165,10 +165,15 @@ def test_candidate_non_scalar_prepared_other_fk_still_raises(folder, monkeypatch
 @pytest.mark.django_db(transaction=True)
 @pytest.mark.parametrize("path", ["metadata", "other__metadata"])
 @pytest.mark.parametrize(
-    ("suffix", "expected", "matches"), [("", None, False), ("__isnull", True, True)]
+    ("suffix", "expected", "matches"), [("", None, True), ("__isnull", True, True)]
 )
 @isolate_apps("tests.testapp")
 def test_candidate_json_none_filters_match_persisted_sql_null(path, suffix, expected, matches):
+    """A ``None`` backing filter means SQL NULL, on a JSONField too: the stored
+    lookup is spelled ``isnull`` (Django 6.1 deprecates ``=None`` as JSON null),
+    and the candidate projection casts the value the same way."""
+    from rebac.field_backing import stored_filters
+
     class JsonTarget(models.Model):
         metadata = models.JSONField(null=True)
 
@@ -189,7 +194,8 @@ def test_candidate_json_none_filters_match_persisted_sql_null(path, suffix, expe
     try:
         target = JsonTarget.objects.create(metadata={"existing": True})
         candidate = JsonCandidate(target=target, other=None, metadata=None)
-        filters = {f"{path}{suffix}": expected}
+        filters = stored_filters(JsonCandidate, [(f"{path}{suffix}", expected)])
+        assert filters == {f"{path}__isnull": True}
         projected = _filter(candidate, "target", target, filters)
         assert projected is not None
         assert projected.exists() is matches
@@ -200,3 +206,49 @@ def test_candidate_json_none_filters_match_persisted_sql_null(path, suffix, expe
         with connection.schema_editor() as editor:
             editor.delete_model(JsonCandidate)
             editor.delete_model(JsonTarget)
+
+
+@pytest.mark.django_db(transaction=True)
+@isolate_apps("tests.testapp")
+def test_json_key_none_filter_keeps_the_json_null_meaning():
+    """Only a whole ``JSONField`` column rewrites ``None`` to ``isnull``. A key
+    filter (``metadata__flag``) still means the JSON scalar ``null`` at that
+    key, an explicit ``exact`` folds into the ``isnull`` spelling, and every
+    other field keeps ``None`` as written."""
+    from rebac.field_backing import stored_filters
+
+    class KeyTarget(models.Model):
+        class Meta:
+            app_label = "testapp"
+
+    class KeyCandidate(models.Model):
+        target = models.ForeignKey(KeyTarget, on_delete=models.CASCADE, related_name="+")
+        label = models.CharField(max_length=10, null=True)
+        metadata = models.JSONField(null=True)
+
+        class Meta:
+            app_label = "testapp"
+
+    assert stored_filters(KeyCandidate, [("metadata__flag", None)]) == {"metadata__flag": None}
+    assert stored_filters(KeyCandidate, [("metadata__exact", None)]) == {"metadata__isnull": True}
+    assert stored_filters(KeyCandidate, [("label", None), ("target__pk", None)]) == {
+        "label": None,
+        "target__pk": None,
+    }
+    with connection.schema_editor() as editor:
+        editor.create_model(KeyTarget)
+        editor.create_model(KeyCandidate)
+    try:
+        target = KeyTarget.objects.create()
+        filters = stored_filters(KeyCandidate, [("metadata__flag", None)])
+        for metadata, matches in (({"flag": None}, True), ({"flag": 1}, False), (None, False)):
+            candidate = KeyCandidate(target=target, metadata=metadata)
+            projected = _filter(candidate, "target", target, filters)
+            assert projected is not None
+            assert projected.exists() is matches
+            candidate.save()
+            assert KeyCandidate.objects.filter(pk=candidate.pk, **filters).exists() is matches
+    finally:
+        with connection.schema_editor() as editor:
+            editor.delete_model(KeyCandidate)
+            editor.delete_model(KeyTarget)

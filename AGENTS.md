@@ -11,14 +11,14 @@ Guidance for coding agents (Claude Code reads this file through the
 
 ## Project overview
 
-`django-zed-rebac` is a **standalone, drop-in REBAC plugin for any Django 6.0
+`django-zed-rebac` is a **standalone, drop-in REBAC plugin for any Django 6.1
 project** (the supported matrix is pinned in `pyproject.toml`; see § Tooling). SpiceDB-compatible schema language, two interchangeable
 backends (`LocalBackend`, which compiles permissions to queries over the
 application's own tables in pure Django; planned `SpiceDBBackend` over
 `authzed-py`), strict-by-default queryset scoping, AI-agent Grant pattern,
 MCP / Celery / DRF / GraphQL adapters.
 
-**Status: alpha**, published on PyPI (DjangoVer `6.0.x`, see `CHANGELOG.md`).
+**Status: alpha**, published on PyPI (Django 6.1 line; see `CHANGELOG.md`).
 Shipped: `LocalBackend` with permissions compiled to queries, the mixin and
 managers, the parser, `rebac sync`, the system checks, the DRF, MCP and
 Strawberry adapters, the audit table. Not shipped: `SpiceDBBackend` (a stub)
@@ -256,8 +256,11 @@ expected failures for proposal 0011: `RebacMixin` deletes, which lift another
 type's backed edges with no `write` check; the collector's CASCADE and
 SET_NULL rows, which are gated under the ambient actor rather than the actor
 pinned on the deleted row; the moved row's own `write` and the pinned actor on
-reverse-FK `add(bulk=True)`; and instance-level through-model writes
-(`create`, `save`, `get_or_create`, `delete`), which are not gated.
+reverse-FK `add(bulk=True)`; instance-level through-model writes
+(`create`, `save`, `get_or_create`, `delete`), which are not gated; and
+Django 6.1's database-level `on_delete` options (`DB_CASCADE`, `DB_SET_NULL`,
+`DB_SET_DEFAULT`), whose rows the collector skips, so a watched column changes
+inside the database with no gate.
 
 ### 6. Determinism is load-bearing
 
@@ -395,7 +398,7 @@ Per `docs/ARCHITECTURE.md § Testing`:
   run generated cases against a pinned `spicedb serve-testing` container in
   dev and CI; see ARCHITECTURE.md § SpiceDB conformance suite. SpiceDB is the
   oracle; a `LocalBackend` difference not listed there as deliberate is a bug.
-- **CI matrix:** Python 3.14 × Django 6.0, with SQLite and PostgreSQL jobs, as declared in
+- **CI matrix:** Python 3.14 × Django 6.1, with SQLite and PostgreSQL jobs, as declared in
   `.github/workflows/ci.yml` and `pyproject.toml`. Broader matrices are a
   release decision, not the current contract. `ruff` targets 3.14, so
   3.14-only syntax is in play and `ruff format` emits it: an unparenthesised
@@ -436,7 +439,7 @@ access via `rebac.backend()`.
 - Use `swapper` if `REBAC_RELATIONSHIP_MODEL` is genuinely swappable;
   otherwise mark `class Meta: managed = True` (default) and ship the
   standard migration.
-- Migrations must run on PostgreSQL 13+, MySQL 8+, SQLite (test only).
+- Migrations must run on PostgreSQL 15+, MySQL 8.4+, SQLite (test only).
   Data migrations use the Django ORM in bounded batches (`0008` fills
   `caveat_key` 1,000 rows at a time). No raw SQL, triggers or database
   functions, in migrations or at run time; migration `0005`'s existing legacy
@@ -444,7 +447,7 @@ access via `rebac.backend()`.
   covers SQL text that Django's own compiler produced: compiled id sets, kept
   statements and the identity conversion's guard are embedded as that text
   (ARCHITECTURE.md § Statement shape). No statement is written by hand.
-  CI runs SQLite and PostgreSQL; the opt-in MySQL 8 vendor suite
+  CI runs SQLite and PostgreSQL; the opt-in MySQL 8.4 vendor suite
   is a release gate.
 
 ### Settings

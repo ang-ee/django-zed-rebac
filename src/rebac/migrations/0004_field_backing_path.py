@@ -19,7 +19,11 @@ from django.db import migrations
 
 def _rename_key(apps: Any, schema_editor: Any, *, old: str, new: str) -> None:
     SchemaRelation = apps.get_model("rebac", "SchemaRelation")
-    rows = SchemaRelation.objects.using(schema_editor.connection.alias).exclude(backing=None)
+    # Rows without a backing hold SQL NULL (null=True, default=None); the
+    # loop below also skips any non-dict payload.
+    rows = SchemaRelation.objects.using(schema_editor.connection.alias).exclude(
+        backing__isnull=True
+    )
     for row in rows.iterator():
         backing = row.backing
         # A missing ``kind`` is a field backing: the codec has always defaulted it.

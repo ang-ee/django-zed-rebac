@@ -52,12 +52,17 @@ class _SourceFilters:
     """Source-column predicates shared by field and constant backings."""
 
     __slots__ = ()
+    source_model: type[models.Model]
     relation: Relation
 
     @property
     def filters(self) -> dict[str, Any]:
         backing = self.relation.backing
-        return dict(backing.filters) if isinstance(backing, (FieldBinding, ConstBinding)) else {}
+        return (
+            stored_filters(self.source_model, backing.filters)
+            if isinstance(backing, (FieldBinding, ConstBinding))
+            else {}
+        )
 
 
 @dataclass(frozen=True, slots=True)
@@ -554,6 +559,10 @@ class ResolvedAttributeBacking:
     def applies_to(self, resource_id: str) -> bool:
         return self.resource is None or self.resource == resource_id
 
+    def value_filter(self, value: Any) -> Q:
+        """The attribute column compared with ``value`` (``None`` is SQL NULL)."""
+        return Q(**stored_filters(self.target_model, ((self.field.name, value),)))
+
     @staticmethod
     def container_id_of(value: Any) -> str | None:
         """Wire id of the dynamic container holding a subject with ``value``.
@@ -598,7 +607,7 @@ class ResolvedAttributeBacking:
                 value = self.value
         else:
             value = resource_id if self.resource is None else self.value
-        return Q(**self.filters) & Q(**{self.field.name: value})
+        return Q(**self.filters) & self.value_filter(value)
 
     def target_filter(self, resource_id: str | Combinable, subject: SubjectRef) -> Q:
         if subject.subject_type != self.target_resource_type or subject.optional_relation:
@@ -635,9 +644,7 @@ class ResolvedAttributeBacking:
         predicate = Q(**self.filters) & Q(**{f"{self.target_id_attr}__in": target_ids})
         rows = self.target_model._base_manager.db_manager(using).filter(predicate)
         if self.resource is not None:
-            return (
-                {self.resource} if rows.filter(**{self.field.name: self.value}).exists() else set()
-            )
+            return {self.resource} if rows.filter(self.value_filter(self.value)).exists() else set()
         values = rows.order_by().values_list(self.field.name, flat=True).distinct()
         ids = (self.container_id_of(value) for value in values)
         return {container_id for container_id in ids if container_id is not None}
@@ -733,7 +740,7 @@ def _validate_const_filters(
         _query_field, scalar = model_identity_fields(model, lookup.split("__", 1)[0])
         query.add_annotation(Value(None, output_field=scalar), lookup.split("__", 1)[0])
     try:
-        query.add_q(Q(**dict(backing.filters)))
+        query.add_q(Q(**stored_filters(model, backing.filters)))
     except (FieldError, ValueError, TypeError, ValidationError) as exc:
         raise ValueError(f"invalid constant filters on {model.__name__}: {exc}") from exc
     # Check scalar lookups AND model paths: Django accepts parent_id__name as a traversal.
@@ -784,7 +791,7 @@ def _validate_filters(model: type[models.Model], filters: tuple[tuple[str, Any],
     """Let Django resolve complete lookup paths without executing the query."""
 
     try:
-        model._base_manager.filter(Q(**dict(filters)))
+        model._base_manager.filter(Q(**stored_filters(model, filters)))
     except (FieldError, ValueError, TypeError, ValidationError) as exc:
         raise ValueError(f"invalid filters on {model.__name__}: {exc}") from exc
 
@@ -853,6 +860,43 @@ def _resolve_field_backing(definition: Definition, relation: Relation) -> Resolv
     )
 
 
+def stored_filters(model: type[models.Model], filters: Iterable[tuple[str, Any]]) -> dict[str, Any]:
+    """Backing filters as lookups on stored rows of ``model``.
+
+    A ``None`` compared with a whole ``JSONField`` column means SQL NULL, as
+    it does on every other field (the candidate side casts it the same way),
+    so it is spelled as the ``isnull`` lookup: Django's ``=None`` on the column
+    meant the JSON scalar ``null`` and is deprecated in 6.1. A ``None`` at a
+    key inside the column (``data__flag``) keeps its JSON meaning, and every
+    other lookup is stored as written.
+    """
+
+    stored: dict[str, Any] = {}
+    for lookup, value in filters:
+        column = _json_column(model, lookup) if value is None else None
+        if column is None:
+            stored[lookup] = value
+        else:
+            stored[f"{column}__isnull"] = True
+    return stored
+
+
+def _json_column(model: type[models.Model], lookup: str) -> str | None:
+    """The path of ``lookup`` when it compares a whole ``JSONField`` column."""
+
+    try:
+        _owner, field, path = _relation_path(model, lookup, lookup=True)
+    except ValueError:
+        return None  # validation reports the path
+    if not isinstance(field, models.JSONField):
+        return None
+    parts = lookup.split("__")
+    width = len(path.split("__"))
+    if parts[width:] not in ([], ["exact"]):
+        return None  # a key transform or another lookup keeps its meaning
+    return "__".join(parts[:width])
+
+
 def resolve_field_backing(
     definition: Definition, relation: Relation
 ) -> ResolvedFieldBacking | None:
@@ -900,7 +944,7 @@ def _resolve_attribute_backing(
         field,
         backing.resource,
         backing.value,
-        dict(backing.filters),
+        stored_filters(target_model, backing.filters),
     )
 
 

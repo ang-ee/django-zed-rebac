@@ -31,7 +31,7 @@ def vendor_database(request):
     mysql = vendor == "mysql"
     worker = os.environ.get("PYTEST_XDIST_WORKER", "master")
     container = f"rebac-schema-test-{os.getpid()}-{worker}-{vendor}"
-    image = "mysql:8.0" if mysql else "postgres:16"
+    image = "mysql:8.4" if mysql else "postgres:16"
     data = "/var/lib/mysql" if mysql else "/var/lib/postgresql/data"
     secret = "MYSQL_ROOT_PASSWORD=schema-test" if mysql else "POSTGRES_PASSWORD=schema-test"
     started = _run(
@@ -59,7 +59,9 @@ def vendor_database(request):
         ready = (
             ["mysql", "-h127.0.0.1", "-uroot", "-pschema-test", "-e", "SELECT 1"]
             if mysql
-            else ["pg_isready", "-U", "postgres"]
+            # Over TCP: the image's init phase answers the socket with a
+            # temporary server that it stops before the real one starts.
+            else ["pg_isready", "-h", "127.0.0.1", "-U", "postgres"]
         )
         for _ in range(60):
             if _run(["docker", "exec", container, *ready]).returncode == 0:

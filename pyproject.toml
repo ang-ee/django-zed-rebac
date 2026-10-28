@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "django-zed-rebac"
-version = "0.29.0"
+version = "0.30.0"
 description = "Drop-in REBAC engine for Django, SpiceDB-compatible, with a pure-Django LocalBackend."
 readme = "README.md"
 license = "Apache-2.0"
@@ -15,20 +15,20 @@ keywords = ["django", "rebac", "spicedb", "zanzibar", "authorization", "permissi
 classifiers = [
     "Development Status :: 3 - Alpha",
     "Framework :: Django",
-    "Framework :: Django :: 6.0",
+    "Framework :: Django :: 6.1",
     "Intended Audience :: Developers",
     "Programming Language :: Python :: 3",
     "Programming Language :: Python :: 3.14",
     "Topic :: Security",
 ]
 dependencies = [
-    "django>=6.0,<6.1",
+    "django>=6.1,<6.2",
 ]
 
 [project.optional-dependencies]
 spicedb = ["authzed>=0.13"]
 caveats = ["cel-python>=0.1.5"]
-drf = ["djangorestframework>=3.14"]
+drf = ["djangorestframework>=3.18"]  # 3.17 imports a helper Django 6.1 removed
 # FastMCP adapter (``rebac.mcp.rebac_mcp_tool``). The adapter reads the
 # request context by duck-typing and never imports the SDK, so this extra is
 # only needed to *run* an MCP server alongside the decorator.
@@ -45,9 +45,8 @@ strawberry-django = [
 ]
 
 # Development tools (PEP 735). Not published: a dependency group never
-# reaches the wheel's Requires-Dist, so the git pins below stay out of PyPI.
-# ``uv sync`` installs the ``dev`` group by default; ``make check`` also needs
-# the ``caveats`` extra (mypy imports celpy).
+# reaches the wheel's Requires-Dist. ``uv sync`` installs the ``dev`` group by
+# default; ``make check`` also needs the ``caveats`` extra (mypy imports celpy).
 [dependency-groups]
 dev = [
     "pytest>=8.0",
@@ -56,24 +55,16 @@ dev = [
     "pytest-xdist>=3.6",
     "pytest-timeout>=2.3",
     "ruff>=0.5",
-    "mypy>=1.10",
+    "mypy>=2.4",
     "pyright>=1.1.350",
-    "django-stubs[compatible-mypy]>=6.0,<6.1",
-    "django-stubs-ext>=6.0,<6.1",
+    "django-stubs[compatible-mypy]>=6.1,<6.2",
+    "django-stubs-ext>=6.1,<6.2",
     "strawberry-graphql-django>=0.86.0",
 ]
 # Database drivers for tier 2 and the vendor contracts (make test-pg,
 # make test-schema-vendors); mysqlclient builds against libmysqlclient.
 postgres = ["psycopg[binary]>=3.2,<4"]
 mysql = ["mysqlclient>=2.2"]
-
-# Native manager inference and Django's private QuerySet hooks need two
-# reviewed fixes that upstream has not released yet (branches ``rebac`` of
-# the ang-ee forks). Remove both pins, and the sources table, once a mypy
-# release and a django-stubs 6.0.x release carry them.
-[tool.uv.sources]
-mypy = { git = "https://github.com/ang-ee/mypy.git", rev = "ac3de6e4c34b04728e768e07d4842f4309ff6c45" }
-django-stubs = { git = "https://github.com/ang-ee/django-stubs.git", rev = "c742042283a82c3248c68493c697f5f30e2fdc6a" }
 
 [project.urls]
 Homepage = "https://github.com/ang-ee/django-zed-rebac"

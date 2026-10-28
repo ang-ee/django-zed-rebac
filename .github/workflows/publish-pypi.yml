@@ -38,15 +38,15 @@ jobs:
     outputs:
       conclusion: ${{ steps.job.outputs.conclusion }}
     steps:
-      - name: Read the result of test (3.14, 6.0)
+      - name: Read the result of tier 1
         id: job
         env:
           GH_TOKEN: ${{ github.token }}
           RUN_ID: ${{ github.event.workflow_run.id }}
         run: |
           conclusion="$(gh api "repos/$GITHUB_REPOSITORY/actions/runs/$RUN_ID/jobs" \
-            --jq '.jobs[] | select(.name == "test (3.14, 6.0)") | .conclusion')"
-          echo "test (3.14, 6.0): ${conclusion:-not found}"
+            --jq '.jobs[] | select(.name == "tier 1") | .conclusion')"
+          echo "tier 1: ${conclusion:-not found}"
           echo "conclusion=$conclusion" >> "$GITHUB_OUTPUT"
 
   publish:

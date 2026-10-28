@@ -309,6 +309,9 @@ class _Compiled(Expression):
         if cached is None:
             query = self.rows.query.clone()
             query.subquery = True
+            # An id set has no order; Django 6.1 applies a model's default
+            # ordering to a combined query, which an id projection cannot sort by.
+            query.clear_ordering(force=True)
             sql, params = query.as_sql(compiler, connection)
             cached = self._sql[connection.alias] = sql, tuple(params)
         return cached
@@ -1788,7 +1791,7 @@ class Compiler:
             found = every.filter(**{f"{resolved.target_id_attr}__in": list(found)})
         subjects = (every if found is True else found).filter(Q(**resolved.filters))
         if resolved.resource is not None:
-            subjects = subjects.filter(**{resolved.field.name: resolved.value})
+            subjects = subjects.filter(resolved.value_filter(resolved.value))
             derived = self._wire_equal(at, resolved.resource) & Q(Exists(subjects))
             fallback = ~self._wire_equal(at, resolved.resource)
             definition = self.schema.get_definition(at.resource_type)

@@ -99,7 +99,7 @@ drop `with_actor` from `select_related`/`prefetch_related` workarounds.
   of rows (proposal 0015, gate G1): under trial, not verified.
 - The 0.24.0 probe corpus (folded into
   `tests/test_security_*.py`): every case denies.
-- `make test-release` green on SQLite, PostgreSQL 16 and MySQL 8.
+- `make test-release` green on SQLite, PostgreSQL 16 and MySQL 8.4.
 
 ## Product roadmap
 
