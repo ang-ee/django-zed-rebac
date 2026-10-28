@@ -14,7 +14,7 @@ overrides where the captured values land.
 
 from __future__ import annotations
 
-from collections.abc import Collection, Iterable, Iterator, Mapping
+from collections.abc import Callable, Collection, Iterable, Iterator, Mapping
 from contextlib import AbstractContextManager, contextmanager, nullcontext
 from contextvars import ContextVar
 from dataclasses import dataclass
@@ -196,7 +196,6 @@ class RebacModelBase(RebacObjectMeta, ModelBase):
         if base_manager_name is None:
             base_manager_name = INJECTED_BASE_MANAGER
             attrs[INJECTED_BASE_MANAGER] = TrackedManager()
-            attrs[INJECTED_BASE_MANAGER].auto_created = True
         options["base_manager_name"] = base_manager_name
         options["default_manager_name"] = getattr(
             meta, "default_manager_name", options.get("default_manager_name", "objects")
@@ -424,7 +423,7 @@ class RebacTrackedMixin(models.Model, metaclass=RebacModelBase):
     def delete(
         self, using: str | None = None, keep_parents: bool = False
     ) -> tuple[int, dict[str, int]]:
-        from .actors import current_actor, is_sudo
+        from .actors import current_actor
         from .conf import app_settings
         from .signals import audit_backed_denials
         from .watch import model_write
@@ -487,8 +486,11 @@ class RebacMixin(RebacTrackedMixin):
       blob.
     """
 
-    # Concrete models may supply another native manager; the default remains scoped.
-    objects: ClassVar[models.Manager[Self]] = RebacManager()  # pyright: ignore[reportIncompatibleVariableOverride]
+    # Django's model metaclass replaces the abstract parent's manager; a
+    # concrete model may override ``objects`` with a ``RebacManager``
+    # subclass (``RebacManager.from_queryset(...)``). Any other default
+    # manager leaves the model unscoped; ``rebac.E024`` reports it.
+    objects: ClassVar[RebacManager[Self]] = RebacManager()  # pyright: ignore[reportIncompatibleVariableOverride]
 
     # Carried through from_db (via the queryset's `_fetch_all`) so
     # `instance.save()` re-checks against the same actor. Both this and
@@ -520,7 +522,7 @@ class RebacMixin(RebacTrackedMixin):
     ) -> None:
         """Clean as Django does; uniqueness and constraints share one access decision.
 
-        See :meth:`constraint_check`.
+        See :meth:`_rebac_validation_scope`.
         """
 
         outermost = _SAVE_VERDICT not in vars(self)
@@ -535,82 +537,126 @@ class RebacMixin(RebacTrackedMixin):
     def validate_unique(self, exclude: Collection[str] | None = None) -> None:
         """Check field uniqueness against every row once this row's save may proceed.
 
-        See :meth:`constraint_check`.
+        See :meth:`_rebac_validation_scope`.
         """
 
-        if (check := self.constraint_check("validate_unique")) is not None:
-            scope, unwritten = check
-            with scope:
-                super().validate_unique({*(exclude or ()), *unwritten} if unwritten else exclude)
+        self._rebac_validation_step("validate_unique", exclude, super().validate_unique)
 
     def validate_constraints(self, exclude: Collection[str] | None = None) -> None:
         """Check model constraints against every row once this row's save may proceed.
 
-        See :meth:`constraint_check`.
+        See :meth:`_rebac_validation_scope`.
         """
 
-        if (check := self.constraint_check("validate_constraints")) is not None:
+        self._rebac_validation_step("validate_constraints", exclude, super().validate_constraints)
+
+    def _rebac_validation_step(
+        self,
+        step: str,
+        exclude: Collection[str] | None,
+        run: Callable[[Collection[str] | None], None],
+    ) -> None:
+        """Run Django's ``step`` under this row's validation scope.
+
+        A step called on its own (a ``ModelForm`` calls ``validate_unique()``
+        and ``validate_constraints()`` directly, after ``full_clean()`` with
+        both switched off) owns its save decision exactly as ``full_clean()``
+        does, so a consumer ``save()`` that cleans again inside the rehearsal
+        sees the pending decision and leaves the cross-row checks to this
+        call. The marker is removed when the step established it.
+        """
+
+        outermost = _SAVE_VERDICT not in vars(self)
+        if outermost:
+            vars(self)[_SAVE_VERDICT] = None
+        try:
+            check = self._rebac_validation_scope(step, exclude)
+            if check is None:
+                return
             scope, unwritten = check
             with scope:
-                super().validate_constraints(
-                    {*(exclude or ()), *unwritten} if unwritten else exclude
-                )
+                run({*(exclude or ()), *unwritten} if unwritten else exclude)
+        finally:
+            if outermost:
+                vars(self).pop(_SAVE_VERDICT, None)
 
-    def constraint_check(
-        self, step: str
+    def _rebac_validation_scope(
+        self, step: str, exclude: Collection[str] | None
     ) -> tuple[AbstractContextManager[Any], frozenset[str]] | None:
-        """Return how Django's ``step`` (``validate_unique`` or ``validate_constraints``) runs, or ``None``.
+        """How Django's ``step`` (``validate_unique`` or ``validate_constraints``) runs, or ``None``.
 
-        Uniqueness and constraints compare this row with rows the actor may not
-        read, so under an actor they run in a named system context, and only when
-        this row's save would pass its REBAC gates (:meth:`_save_allowed`); otherwise
-        ``None`` skips them, and the save refuses the row. For a saved row they leave
-        out the fields the actor may not read (the second item): those were redacted
-        when it loaded, and its save leaves them unwritten. They run as they are for
-        a model without row policy, for a step with no rule that reads other rows,
-        inside a system context, and with no actor (where strict mode refuses an
-        actor-less read). An instance's own bypass (``sudo``) enters a system context.
+        A rule that compares this row with other rows reads rows the actor may
+        not see, so under an actor it runs in a named system context, and only
+        when this row's save would pass its REBAC gates
+        (:meth:`_rebac_save_allowed`); otherwise ``None`` skips the step, and
+        the save refuses the row. For a saved row the step leaves out the
+        fields redacted when it loaded (the second item): its save leaves them
+        unwritten. The step runs as it is for a model without row policy, when
+        none of its rules reads other rows, under a bypass that is already in
+        effect, and with no actor (where strict mode refuses an actor-less
+        read). The instance's own bypass (``sudo``) enters a named system
+        context; the pinned actor outranks an ambient bypass, as everywhere.
         """
 
-        if not model_resource_type(type(self)) or is_sudo() or not self._compares_other_rows(step):
+        if not model_resource_type(type(self)) or not self._rebac_compares_other_rows(
+            step, exclude
+        ):
             return nullcontext(), frozenset()
         if self.is_sudo():
             return system_context(reason=f"{self._meta.label_lower}.{step}"), frozenset()
-        actor, _unscoped = self.effective_actor()
+        actor, bypass = self.effective_actor()
         if actor is None:
+            # An ambient bypass already reads every row; no actor reads as
+            # strict mode allows.
             return nullcontext(), frozenset()
-        if not self._save_allowed():
+        del bypass
+        if not self._rebac_save_allowed():
             return None
-        unwritten = frozenset() if self._state.adding else self.denied_read_fields()
+        unwritten = frozenset() if self._state.adding else redacted_fields(self)
         return system_context(reason=f"{self._meta.label_lower}.{step}"), unwritten
 
-    def _compares_other_rows(self, step: str) -> bool:
-        """Whether Django's ``step`` has a rule that reads rows other than this one."""
+    def _rebac_compares_other_rows(self, step: str, exclude: Collection[str] | None) -> bool:
+        """Whether Django's ``step`` has a rule that reads rows other than this one.
 
-        lineage = (type(self), *self._meta.get_parent_list())
+        Derived from the checks Django itself performs: ``validate_unique``
+        runs ``_get_unique_checks`` (unique fields, ``unique_together``,
+        ``unique_for_*``), where a primary-key check is only made for a row
+        being added with its key set; ``validate_constraints`` validates every
+        constraint of the model and its parents, of which a
+        ``CheckConstraint`` reads the instance alone.
+        """
+
         if step == "validate_constraints":
-            return any(model._meta.constraints for model in lineage)
-        fields = self._meta.concrete_fields
-        return (
-            any(field.unique and not field.primary_key for field in fields)
-            or any(
-                getattr(field, option)
-                for field in fields
-                for option in ("unique_for_date", "unique_for_month", "unique_for_year")
+            return any(
+                not isinstance(constraint, models.CheckConstraint)
+                for _model, constraints in self.get_constraints()
+                for constraint in constraints
             )
-            or any(model._meta.unique_together for model in lineage)
-        )
+        # Django's own inventory of the checks validate_unique() will run;
+        # private, unchanged since 1.x, and not in django-stubs.
+        unique_checks, date_checks = cast(Any, self)._get_unique_checks(exclude=set(exclude or ()))
+        if date_checks:
+            return True
+        pk_names = {field.name for field in self._meta.pk_fields}
+        for _model, names in unique_checks:
+            if set(names) <= pk_names and not (self._state.adding and self.pk is not None):
+                continue
+            return True
+        return False
 
-    def _save_allowed(self) -> bool:
-        """Whether this row's save would pass its REBAC gates, decided once per :meth:`full_clean`.
+    def _rebac_save_allowed(self) -> bool:
+        """Whether this row's save would pass its REBAC gates, decided once per validation.
 
         REBAC's ``check_save`` runs the save itself in a transaction it rolls
-        back: the create candidate for a new row; ``write``, each changed field's
-        ``write__`` gate, moving edges, expression reads and redacted writes for a
-        saved one. A candidate it cannot evaluate (a related row that does not
-        exist, a save that refuses its values or its actor) counts as refused, so
-        its field errors stand. A clean that the checked save runs again preserves the pending decision
-        and leaves cross-row checks to the enclosing clean.
+        back: the create candidate for a new row; ``write``, each changed
+        field's ``write__`` gate, moving edges, expression reads and redacted
+        writes for a saved one. A candidate it cannot evaluate (a related row
+        that does not exist, a save that refuses its values or its actor, a
+        ``ValidationError`` the consumer's own ``save()`` raises) counts as
+        refused: the gates did not pass, so no elevated answer about other
+        rows is given, and the field errors Django found stand. A clean that
+        the checked save runs again sees the pending decision and leaves the
+        cross-row checks to the enclosing call.
         """
 
         verdict = vars(self).get(_SAVE_VERDICT)
@@ -714,6 +760,7 @@ class RebacMixin(RebacTrackedMixin):
             state.pop("_rebac_sudo_audited", None)
             state.pop("_rebac_loaded_values", None)
             state.pop("_rebac_field_deny", None)
+            state.pop(_SAVE_VERDICT, None)
         return state
 
     # ----- Actor / sudo binding -----

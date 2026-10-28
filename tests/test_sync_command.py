@@ -514,3 +514,116 @@ def test_prune_stale_rolls_policy_tuple_and_revision_back_together(
     assert PackageManagedRecord.objects.filter(package="removed").exists()
     assert rows.filter(pk=relationship.pk).exists()
     assert SchemaGeneration.objects.get(pk=1).revision == revision
+
+
+def _two_packages(tmp_path, monkeypatch, *, retired_schema):
+    current = tmp_path / "current"
+    retired = tmp_path / "retired"
+    current.mkdir()
+    retired.mkdir()
+    (current / "permissions.zed").write_text(
+        "definition auth/user {}\n"
+        "definition current/item { relation owner: auth/user permission read = owner }\n",
+        encoding="utf-8",
+    )
+    (retired / "permissions.zed").write_text(retired_schema, encoding="utf-8")
+    configs = [
+        SimpleNamespace(name="current", path=str(current)),
+        SimpleNamespace(name="retired", path=str(retired)),
+    ]
+    monkeypatch.setattr("rebac.management.commands.rebac.apps.get_app_configs", lambda: configs)
+    call_command("rebac", "sync", stdout=io.StringIO())
+    return configs
+
+
+@pytest.mark.django_db
+def test_prune_stale_refuses_a_policy_alias_that_is_not_the_relationship_write_alias(
+    monkeypatch, tmp_path
+) -> None:
+    from django.db import router
+
+    from rebac.models import active_relationship_model
+
+    configs = _two_packages(
+        tmp_path,
+        monkeypatch,
+        retired_schema="definition retired/item { relation member: auth/user }\n",
+    )
+    active_relationship_model().objects.create(
+        resource_type="retired/item",
+        resource_id="1",
+        relation="member",
+        subject_type="auth/user",
+        subject_id="1",
+    )
+    configs.pop()
+    original = router.db_for_write
+
+    def routed(model, **hints):
+        if model is active_relationship_model():
+            return "other"
+        return original(model, **hints)
+
+    monkeypatch.setattr(router, "db_for_write", routed)
+    with pytest.raises(CommandError, match=r"relationships live on 'other'"):
+        call_command("rebac", "sync", "--prune-stale", "--yes", stdout=io.StringIO())
+    assert SchemaDefinition.objects.filter(resource_type="retired/item").exists()
+    assert active_relationship_model().objects.count() == 1
+
+
+@pytest.mark.django_db
+@pytest.mark.parametrize("storage", ("denormalized", "registry"))
+def test_prune_stale_retires_caveat_tuples_and_registry_rows_and_reports_counts(
+    storage, settings, monkeypatch, tmp_path
+) -> None:
+    from rebac.models import RebacResource, active_relationship_model
+
+    settings.REBAC_LOCAL_BACKEND_STORAGE = storage
+    configs = _two_packages(
+        tmp_path,
+        monkeypatch,
+        retired_schema=(
+            "caveat retired_check(level int) { level > 0 }\n"
+            "definition retired/item { relation member: auth/user }\n"
+        ),
+    )
+    rows = active_relationship_model().objects
+    rows.create(
+        resource_type="retired/item",
+        resource_id="1",
+        relation="member",
+        subject_type="auth/user",
+        subject_id="1",
+    )
+    rows.create(
+        resource_type="current/item",
+        resource_id="2",
+        relation="owner",
+        subject_type="auth/user",
+        subject_id="1",
+        caveat_name="retired_check",
+    )
+    rows.create(
+        resource_type="current/item",
+        resource_id="3",
+        relation="owner",
+        subject_type="auth/user",
+        subject_id="1",
+    )
+    if storage == "registry":
+        assert RebacResource.objects.filter(resource_type="retired/item").exists()
+    configs.pop()
+
+    check = io.StringIO()
+    with pytest.raises(CommandError, match="drift"):
+        call_command("rebac", "sync", "--prune-stale", "--check", stdout=check)
+    assert "1 relationship(s) naming retired definition retired/item" in check.getvalue()
+    assert "1 relationship(s) naming retired caveat retired_check" in check.getvalue()
+    assert rows.count() == 3
+
+    out = io.StringIO()
+    call_command("rebac", "sync", "--prune-stale", "--yes", stdout=out)
+    assert "1 relationship(s) naming retired definition retired/item" in out.getvalue()
+    assert "1 relationship(s) naming retired caveat retired_check" in out.getvalue()
+    assert [row.resource_id for row in rows.all()] == ["3"]
+    assert not RebacResource.objects.filter(resource_type="retired/item").exists()

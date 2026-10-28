@@ -19,7 +19,7 @@ from typing import TYPE_CHECKING, Any
 try:
     __version__ = version("django-zed-rebac")
 except PackageNotFoundError:
-    __version__ = "0.28.0"
+    __version__ = "0.29.0"
 
 default_app_config = "rebac.apps.RebacConfig"
 
@@ -74,6 +74,7 @@ from .types import (
 )
 
 if TYPE_CHECKING:
+    from .actors import model_identities
     from .audit import aemit as aemit_audit_event
     from .audit import emit as emit_audit_event
     from .backends import Backend, LocalBackend, SpiceDBBackend, backend
@@ -90,7 +91,7 @@ if TYPE_CHECKING:
         resolve_subjects,
         write_relationships,
     )
-    from .resources import model_identities, to_object_ref, user_subject_type
+    from .resources import to_object_ref, user_subject_type
 
 
 _LAZY = {
@@ -120,7 +121,7 @@ _LAZY = {
     "delete_relationships": ("rebac.relationships", "delete_relationships"),
     "resolve_subjects": ("rebac.relationships", "resolve_subjects"),
     "to_object_ref": ("rebac.resources", "to_object_ref"),
-    "model_identities": ("rebac.resources", "model_identities"),
+    "model_identities": ("rebac.actors", "model_identities"),
     "user_subject_type": ("rebac.resources", "user_subject_type"),
     "proposed_forward_relationships": ("rebac.field_backing", "proposed_forward_relationships"),
     "rebac_mcp_tool": ("rebac.mcp", "rebac_mcp_tool"),

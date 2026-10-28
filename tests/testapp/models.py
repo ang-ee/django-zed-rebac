@@ -5,6 +5,7 @@ from __future__ import annotations
 from typing import Any
 
 from django.conf import settings
+from django.contrib.auth.base_user import AbstractBaseUser
 from django.contrib.contenttypes.fields import GenericForeignKey, GenericRelation
 from django.contrib.contenttypes.models import ContentType
 from django.db import models
@@ -572,3 +573,14 @@ class PlainValidationRow(RebacMixin):
     class Meta:
         app_label = "testapp"
         rebac_resource_type = "validation/plain_row"
+
+
+class MetadataIdentityUser(RebacMixin, AbstractBaseUser):
+    """A swappable user model whose resource type is its own metadata."""
+
+    username = models.CharField(max_length=40, unique=True)
+    USERNAME_FIELD = "username"
+
+    class Meta:
+        app_label = "testapp"
+        rebac_resource_type = "members/person"

@@ -186,6 +186,25 @@ def rebac_subject(*, type: str, id_attr: str = "pk") -> Callable[[type], type]:
     return _decorator
 
 
+def model_identities(model: type[Any], instance: Any) -> set[ObjectRef]:
+    """The resource and subject identities one Django model view gives ``instance``.
+
+    A model registered as a resource names the row by ``to_object_ref``; a
+    model that resolves subjects names it by ``to_subject_ref``. A multi-table
+    row has one view per model class; callers ask each view they retire.
+    """
+
+    identities: set[ObjectRef] = set()
+    if model_resource_type(model):
+        identities.add(to_object_ref(instance))
+    if model_can_resolve_subject(model):
+        try:
+            identities.add(to_subject_ref(instance).object)
+        except NoActorResolvedError:
+            pass
+    return identities
+
+
 def to_subject_ref(actor: ActorLike) -> SubjectRef:
     """Resolve `actor` to a `SubjectRef`. Raises `NoActorResolvedError`.
 

@@ -209,3 +209,118 @@ def test_nested_consumer_save_validation_preserves_outer_permission_decision(
     assert "_rebac_save_verdict" not in accepted.__dict__
     with system_context(reason="nested validation count"):
         assert model._base_manager.count() == before
+
+
+def _validating_save(model, monkeypatch):
+    """A consumer ``save()`` that cleans first, the pattern ModelForm users write."""
+    native_save = model.save
+
+    def validating_save(instance, *args, **kwargs):
+        instance.full_clean()
+        return native_save(instance, *args, **kwargs)
+
+    monkeypatch.setattr(model, "save", validating_save)
+
+
+def _row_form():
+    from django import forms
+
+    class RowForm(forms.ModelForm):
+        class Meta:
+            model = GuardedUniqueRow
+            fields = ("email", "code", "title")
+
+    return RowForm
+
+
+def test_model_form_reports_a_duplicate_when_the_admitted_save_cleans_again(
+    validation_rows, monkeypatch
+):
+    """ModelForm calls validate_unique() directly, outside full_clean(); that call
+    owns the decision, so the consumer's cleaning save() inside the rehearsal
+    defers to it instead of answering first and hiding the duplicate."""
+    _validating_save(GuardedUniqueRow, monkeypatch)
+    form_class = _row_form()
+    with actor_context(validation_rows.alice):
+        readable = form_class(
+            {"email": "alice@example.com", "code": "A2", "title": "dup"},
+            instance=GuardedUniqueRow(owner=validation_rows.alice),
+        )
+        assert not readable.is_valid()
+        assert "email" in readable.errors
+        hidden = form_class(
+            {"email": "bob@example.com", "code": "A3", "title": "dup"},
+            instance=GuardedUniqueRow(owner=validation_rows.alice),
+        )
+        assert not hidden.is_valid()
+        assert "email" in hidden.errors
+        assert "_rebac_save_verdict" not in hidden.instance.__dict__
+
+
+def test_model_form_for_a_refused_save_learns_nothing_and_the_save_refuses(
+    validation_rows, monkeypatch
+):
+    _validating_save(GuardedUniqueRow, monkeypatch)
+    form_class = _row_form()
+    with actor_context(validation_rows.alice):
+        form = form_class(
+            {"email": "bob@example.com", "code": "A4", "title": "dup"},
+            instance=GuardedUniqueRow(owner=validation_rows.bob),
+        )
+        assert form.is_valid(), form.errors
+        with pytest.raises(PermissionDenied):
+            form.save()
+
+
+def test_direct_validate_unique_owns_its_decision(validation_rows):
+    row = GuardedUniqueRow(owner=validation_rows.alice, email="alice@example.com", code="A5")
+    with actor_context(validation_rows.alice), pytest.raises(ValidationError):
+        row.validate_unique()
+    assert "_rebac_save_verdict" not in row.__dict__
+    refused = GuardedUniqueRow(owner=validation_rows.bob, email="bob@example.com", code="A6")
+    with actor_context(validation_rows.alice):
+        refused.validate_unique()
+    assert "_rebac_save_verdict" not in refused.__dict__
+
+
+def test_pinned_actor_validates_an_explicit_primary_key_without_ambient_scope(validation_rows):
+    """A row being added with its key set has a pk uniqueness check, which Django
+    runs; it is a cross-row rule and takes the instance's pinned actor."""
+    row = GuardedConstraintRow(pk=990_001, owner=validation_rows.alice, code="fresh")
+    row.with_actor(validation_rows.alice).full_clean()
+    assert row._rebac_compares_other_rows("validate_unique", {"code"})
+    saved = GuardedConstraintRow(pk=990_002, owner=validation_rows.alice, code="fresh")
+    saved._state.adding = False
+    assert not saved._rebac_compares_other_rows("validate_unique", {"code"})
+
+
+def test_a_check_constraint_alone_is_not_a_cross_row_rule():
+    from django.db import models
+    from django.db.models import Q
+    from django.test.utils import isolate_apps
+
+    from rebac import RebacMixin
+
+    with isolate_apps("tests.testapp"):
+
+        class Checked(RebacMixin, models.Model):
+            amount = models.IntegerField()
+
+            class Meta:
+                app_label = "testapp"
+                rebac_resource_type = "validation/checked"
+                constraints = (
+                    models.CheckConstraint(condition=Q(amount__gte=0), name="validation_amount"),
+                )
+
+        assert not Checked(amount=1)._rebac_compares_other_rows("validate_constraints", None)
+    assert GuardedConstraintRow(code="x")._rebac_compares_other_rows("validate_constraints", None)
+
+
+def test_the_decision_marker_is_not_pickled(validation_rows):
+    import pickle
+
+    row = GuardedUniqueRow(owner=validation_rows.alice, email="pickled@example.com")
+    row.__dict__["_rebac_save_verdict"] = True
+    copy = pickle.loads(pickle.dumps(row))
+    assert "_rebac_save_verdict" not in copy.__dict__

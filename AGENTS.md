@@ -455,26 +455,12 @@ access via `rebac.backend()`.
 Settled in `docs/ARCHITECTURE.md § Public API surface`. Adding to it requires a spec
 update; removing from it is a breaking change requiring a major bump.
 
-```python
-# What's PUBLIC and semver-stable:
-from rebac import (
-    RebacMixin, RebacTrackedMixin,
-    require_permission, check_permission, rebac_resource, rebac_subject,
-    generic_target, GenericTarget,
-    Backend, LocalBackend, SpiceDBBackend, backend,
-    CheckResult, Consistency, Zookie, PermissionResult,
-    ObjectRef, SubjectRef, RelationshipTuple, ActorLike, CheckItem,
-    PermissionDenied, MissingActorError, CaveatUnsupportedError,
-    PermissionDepthExceeded, NoActorResolvedError, SchemaError,
-    current_actor, set_current_actor, actor_context,
-    sudo, system_context,
-    to_subject_ref, grant_subject_ref, to_object_ref,
-    write_relationships, delete_relationships,
-    app_settings,
-)
-from rebac.drf import RebacPermission, RebacFilterBackend
-from rebac.mcp import rebac_mcp_tool                # 0.6+
-```
+The list lives in one place: the code block under `docs/ARCHITECTURE.md §
+Public API surface`. Everything in it is semver-stable; `rebac.drf`,
+`rebac.mcp`, `rebac.schema`, `rebac.memberships`, `rebac.roles`,
+`rebac.testing` and `rebac.field_visibility.redacted_fields` are listed there
+too. A name exported from `rebac/__init__.py` and absent from that block is a
+spec bug.
 
 `rebac.celery` is not shipped: automatic Celery propagation is planned
 (ARCHITECTURE.md § Celery); tasks use `actor_context()` / `.with_actor()`.

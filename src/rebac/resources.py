@@ -4,14 +4,11 @@ from __future__ import annotations
 
 import builtins
 from collections.abc import Callable
-from typing import TYPE_CHECKING, Any
+from typing import Any
 
 from ._id import resource_id_attr, subject_id_attr, type_with_prefix
 from .conf import app_settings
 from .types import ObjectRef
-
-if TYPE_CHECKING:
-    from django.db.models import Model
 
 
 def user_subject_type() -> str:
@@ -20,23 +17,6 @@ def user_subject_type() -> str:
     from django.contrib.auth import get_user_model
 
     return model_resource_type(get_user_model()) or type_with_prefix(app_settings.REBAC_USER_TYPE)
-
-
-def model_identities(model: type[Model], instance: Model) -> set[ObjectRef]:
-    """Return this Django model view's resource and subject identities."""
-
-    from .actors import model_can_resolve_subject, to_subject_ref
-    from .errors import NoActorResolvedError
-
-    identities: set[ObjectRef] = set()
-    if model_resource_type(model):
-        identities.add(to_object_ref(instance))
-    if model_can_resolve_subject(model):
-        try:
-            identities.add(to_subject_ref(instance).object)
-        except NoActorResolvedError:
-            pass
-    return identities
 
 
 def _resolve_dotted(obj: Any, attr_path: str) -> Any:

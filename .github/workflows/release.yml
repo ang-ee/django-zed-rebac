@@ -32,9 +32,8 @@ jobs:
         uses: astral-sh/setup-uv@v7
       - name: Install dependencies
         run: |
-          uv venv --python 3.14 --python-preference only-managed
+          uv sync --python 3.14 --managed-python --extra caveats --extra drf --extra strawberry
           uv run --no-sync python -c 'import sqlite3; print("SQLite", sqlite3.sqlite_version)'
-          uv pip install -e '.[dev,caveats,drf,strawberry]' 'django==6.0.*'
       - name: Slow tests
         run: make test-slow
 
@@ -66,9 +65,9 @@ jobs:
         uses: astral-sh/setup-uv@v7
       - name: Install dependencies and PostgreSQL driver
         run: |
-          uv venv --python 3.14 --python-preference only-managed
+          uv sync --python 3.14 --managed-python --extra caveats --extra drf --extra strawberry
           uv run --no-sync python -c 'import sqlite3; print("SQLite", sqlite3.sqlite_version)'
-          uv pip install -e '.[dev,caveats,drf,strawberry]' 'django==6.0.*' 'psycopg[binary]>=3.2,<4'
+          uv pip install 'psycopg[binary]>=3.2,<4'
       - name: Whole suite including slow
         run: make test-postgres
 
@@ -106,9 +105,8 @@ jobs:
         uses: astral-sh/setup-uv@v7
       - name: Install dependencies
         run: |
-          uv venv --python 3.14 --python-preference only-managed
+          uv sync --python 3.14 --managed-python --extra caveats --extra drf --extra strawberry
           uv run --no-sync python -c 'import sqlite3; print("SQLite", sqlite3.sqlite_version)'
-          uv pip install -e '.[dev,caveats,drf,strawberry]' 'django==6.0.*'
       - name: Reference sweep
         env:
           SELECT: ${{ matrix.select }}
@@ -131,9 +129,9 @@ jobs:
           sudo apt-get install -y --no-install-recommends libmysqlclient-dev pkg-config
       - name: Install dependencies and both drivers
         run: |
-          uv venv --python 3.14 --python-preference only-managed
+          uv sync --python 3.14 --managed-python --extra caveats --extra drf --extra strawberry
           uv run --no-sync python -c 'import sqlite3; print("SQLite", sqlite3.sqlite_version)'
-          uv pip install -e '.[dev,caveats,drf,strawberry]' 'django==6.0.*' 'psycopg[binary]>=3.2,<4' mysqlclient
+          uv pip install 'psycopg[binary]>=3.2,<4' mysqlclient
       # The fixtures start their own containers; pulling first keeps the
       # download out of each test's timeout.
       - name: Pull the database images
@@ -155,8 +153,7 @@ jobs:
         uses: astral-sh/setup-uv@v7
       - name: Install dependencies
         run: |
-          uv venv --python 3.14 --python-preference only-managed
+          uv sync --python 3.14 --managed-python --extra caveats --extra drf --extra strawberry
           uv run --no-sync python -c 'import sqlite3; print("SQLite", sqlite3.sqlite_version)'
-          uv pip install -e '.[dev,caveats,drf,strawberry]' 'django==6.0.*'
       - name: Tier 1 selection in random order
         run: make test-random

@@ -35,7 +35,7 @@ PG_CONTAINER := rebac-test-pg
 PG_IMAGE := postgres:16
 
 install-dev:
-	uv pip install -e '.[dev,caveats,drf,strawberry]'
+	uv sync --extra caveats --extra drf --extra strawberry
 
 lint:
 	uv run --no-sync ruff check src/ tests/
@@ -44,8 +44,8 @@ format-check:
 	uv run --no-sync ruff format --check src/ tests/
 
 typecheck:
-	uv run --no-sync mypy --strict src/
-	uv run --no-sync pyright src/
+	uv run --no-sync mypy --strict src/ tests/typing/
+	uv run --no-sync pyright src/ tests/typing/
 
 # Fix loop: re-run last failures first, stop at the first failure, balance work
 # across workers by test.

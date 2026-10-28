@@ -319,7 +319,7 @@ dependencies = [
 
 [[package]]
 name = "django-zed-rebac"
-version = "0.27.3"
+version = "0.29.0"
 source = { editable = "." }
 dependencies = [
     { name = "django" },
@@ -328,19 +328,6 @@ dependencies = [
 [package.optional-dependencies]
 caveats = [
     { name = "cel-python" },
-]
-dev = [
-    { name = "django-stubs", extra = ["compatible-mypy"] },
-    { name = "django-stubs-ext" },
-    { name = "mypy" },
-    { name = "pyright" },
-    { name = "pytest" },
-    { name = "pytest-django" },
-    { name = "pytest-randomly" },
-    { name = "pytest-timeout" },
-    { name = "pytest-xdist" },
-    { name = "ruff" },
-    { name = "strawberry-graphql-django" },
 ]
 drf = [
     { name = "djangorestframework" },
@@ -359,29 +346,48 @@ strawberry-django = [
     { name = "strawberry-graphql-django" },
 ]
 
+[package.dev-dependencies]
+dev = [
+    { name = "django-stubs", extra = ["compatible-mypy"] },
+    { name = "django-stubs-ext" },
+    { name = "mypy" },
+    { name = "pyright" },
+    { name = "pytest" },
+    { name = "pytest-django" },
+    { name = "pytest-randomly" },
+    { name = "pytest-timeout" },
+    { name = "pytest-xdist" },
+    { name = "ruff" },
+    { name = "strawberry-graphql-django" },
+]
+
 [package.metadata]
 requires-dist = [
     { name = "authzed", marker = "extra == 'spicedb'", specifier = ">=0.13" },
     { name = "cel-python", marker = "extra == 'caveats'", specifier = ">=0.1.5" },
     { name = "channels", marker = "extra == 'strawberry'", specifier = ">=4.0" },
     { name = "django", specifier = ">=6.0,<6.1" },
-    { name = "django-stubs", extras = ["compatible-mypy"], marker = "extra == 'dev'", git = "https://github.com/ang-ee/django-stubs.git?rev=c742042283a82c3248c68493c697f5f30e2fdc6a" },
-    { name = "django-stubs-ext", marker = "extra == 'dev'", specifier = ">=6.0,<6.1" },
     { name = "djangorestframework", marker = "extra == 'drf'", specifier = ">=3.14" },
     { name = "mcp", marker = "extra == 'mcp'", specifier = ">=1.27" },
-    { name = "mypy", marker = "extra == 'dev'", git = "https://github.com/ang-ee/mypy.git?rev=ac3de6e4c34b04728e768e07d4842f4309ff6c45" },
-    { name = "pyright", marker = "extra == 'dev'", specifier = ">=1.1.350" },
-    { name = "pytest", marker = "extra == 'dev'", specifier = ">=8.0" },
-    { name = "pytest-django", marker = "extra == 'dev'", specifier = ">=4.8" },
-    { name = "pytest-randomly", marker = "extra == 'dev'", specifier = ">=3.16" },
-    { name = "pytest-timeout", marker = "extra == 'dev'", specifier = ">=2.3" },
-    { name = "pytest-xdist", marker = "extra == 'dev'", specifier = ">=3.6" },
-    { name = "ruff", marker = "extra == 'dev'", specifier = ">=0.5" },
     { name = "strawberry-graphql", marker = "extra == 'strawberry'", specifier = ">=0.220" },
-    { name = "strawberry-graphql-django", marker = "extra == 'dev'", specifier = ">=0.86.0" },
     { name = "strawberry-graphql-django", marker = "extra == 'strawberry-django'", specifier = ">=0.86.0" },
 ]
-provides-extras = ["spicedb", "caveats", "drf", "mcp", "strawberry", "strawberry-django", "dev"]
+provides-extras = ["spicedb", "caveats", "drf", "mcp", "strawberry", "strawberry-django"]
+
+[package.metadata.requires-dev]
+dev = [
+    { name = "django-stubs", extras = ["compatible-mypy"], git = "https://github.com/ang-ee/django-stubs.git?rev=c742042283a82c3248c68493c697f5f30e2fdc6a" },
+    { name = "django-stubs-ext", specifier = ">=6.0,<6.1" },
+    { name = "mypy", git = "https://github.com/ang-ee/mypy.git?rev=ac3de6e4c34b04728e768e07d4842f4309ff6c45" },
+    { name = "pyright", specifier = ">=1.1.350" },
+    { name = "pytest", specifier = ">=8.0" },
+    { name = "pytest-django", specifier = ">=4.8" },
+    { name = "pytest-randomly", specifier = ">=3.16" },
+    { name = "pytest-timeout", specifier = ">=2.3" },
+    { name = "pytest-xdist", specifier = ">=3.6" },
+    { name = "ruff", specifier = ">=0.5" },
+    { name = "strawberry-graphql-django", specifier = ">=0.86.0" },
+]
 
 [[package]]
 name = "djangorestframework"

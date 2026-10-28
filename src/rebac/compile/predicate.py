@@ -41,6 +41,7 @@ from ..field_backing import (
     ResolvedConstBacking,
     ResolvedFieldBacking,
     _content_type,
+    _resolve_field_backing,
     foreign_key_kept,
     resolve_attribute_backing,
     resolve_const_backing,
@@ -1542,12 +1543,13 @@ class Compiler:
         # Following a relation moves to its subjects: one hop.
         visits = {**visits, _HOPS: visits.get(_HOPS, 0) + 1}
         if isinstance(relation.backing, FieldBinding):
-            resolved = resolve_field_backing(definition, relation)
-            if resolved is None:
+            try:
+                resolved = _resolve_field_backing(definition, relation)
+            except ValueError as exc:
                 raise SchemaError(
                     f"Field backing {definition.resource_type}#{relation.name} does not resolve "
-                    "against the models (rebac.E009)."
-                )
+                    f"against the models (rebac.E009): {exc}"
+                ) from exc
             return self._field_relation(resolved, at, bound, visits, target, depth_possible)
         if isinstance(relation.backing, ConstBinding):
             resolved_const = resolve_const_backing(definition, relation)

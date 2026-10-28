@@ -3,39 +3,68 @@
 All notable changes to `django-zed-rebac` are tracked here. The project is in
 pre-1.0; breaking changes within a minor version are explicitly called out.
 
-## Unreleased
-
-- Model uniqueness and constraint validation respects the save gate before
-  checking all rows, preventing duplicate-existence leaks through denied writes.
-- Public native candidate projection and model identity resolution, plus one
-  stored-relationship `.referencing()` predicate shared by both storage modes
-  and deletion cleanup. The canonical user subject type honors installed model
-  metadata and native namespace prefixes.
+## [0.29.0] — 2026-10-28
 
 ### Added
 
-- `rebac sync --prune-stale` retires stale package-owned policy, including removed
-  packages and removed permissions files, without overwriting live `no_update`
-  edits or independently selecting unmanaged schema. Retiring a managed parent
-  definition uses Django's native cascade for all its children. It removes
-  relationships naming retired types and
-  relations in the same policy transaction, preserves transferred source
-  ownership, supports `--package` and read-only `--check`, and requires explicit
-  confirmation or `--yes` before writing.
+- `rebac sync --prune-stale` retires stale package-owned policy: removed
+  packages, removed permissions files, removed definitions, relations,
+  permissions and caveats. It never overwrites live `no_update` edits and
+  never selects unmanaged schema; retiring a managed parent definition uses
+  Django's cascade for its children. It deletes the tuples naming a retired
+  definition (either end), relation (as relation or subject relation) or
+  caveat, and in registry storage the resource rows of a retired type, in the
+  same policy transaction, on the relationship write alias (a policy alias
+  that is not that alias is refused). It reports the tuples per retired
+  fragment, preserves transferred source ownership, supports `--package` and
+  read-only `--check`, and requires confirmation or `--yes` before writing.
+- Public `model_identities(model, instance)`, `user_subject_type()`,
+  `proposed_forward_relationships(...)` (the create gate's own candidate
+  projection, formerly private), `rebac.field_visibility.redacted_fields(instance)`,
+  and `Relationship.objects.referencing(identities)` in both storage modes,
+  shared with the library's own deletion cleanup.
+- System check `rebac.E024`: a `RebacMixin` model whose default manager does
+  not return a `RebacQuerySet`. Django's admin, model forms, related managers
+  and `validate_unique()` read rows through `_default_manager`; a plain
+  manager there leaves those reads unscoped with no `MissingActorError`.
+- `RebacManager[M]` and `TrackedManager[M]` are generic in their model;
+  `RebacManager.from_queryset(...)` keeps a custom queryset's methods and type
+  under mypy, and pyright sees every actor verb on `Model.objects`. A
+  consumer-shaped sample (`tests/typing/`) runs under both checkers in tier 1.
+
+### Changed
+
+- Model uniqueness and constraint validation compare other rows only after the
+  save gate admits the candidate: a denied write can no longer learn whether a
+  value it cannot read is taken. The decision is taken once per outermost
+  `full_clean()` or direct `validate_unique()` / `validate_constraints()` call
+  (a `ModelForm` makes the direct calls), and `check_save()` rehearses the
+  model's own `save()` to reach it. Which rules count as cross-row follows
+  Django's own checks; a `CheckConstraint` alone triggers no rehearsal.
+- Development tools are a PEP 735 dependency group, not a published `dev`
+  extra: `uv sync --extra caveats --extra drf --extra strawberry` (or
+  `make install-dev`) installs them. `mypy` and `django-stubs` are pinned to
+  reviewed forks under `[tool.uv.sources]` until upstream releases carry the
+  manager-inference fixes; the pins never reach the wheel.
 
 ### Fixed
 
-- A queryset fetch shares one schema snapshot between projected-field guards,
-  SQL compilation and nested prefetches. Guarded subqueries no longer read the
-  stored policy revision twice during one fetch. Independent fetches outside an
-  evaluator still validate their revision, and writes and transaction boundaries
-  invalidate the connection-local snapshot.
-
-- A model whose `Meta` inherits the injected `_rebac_base` option now keeps a
+- A model whose `Meta` inherits the injected `_rebac_base` option keeps a
   base manager declared by another parent, including a concrete multi-table
-  parent. The inherited fallback no longer masks that manager's write policy.
-  Explicitly declaring `base_manager_name = "_rebac_base"` still opts into
-  the injected manager.
+  parent; the inherited fallback no longer masks that manager's write policy.
+- A queryset fetch shares one schema snapshot between projected-field guards,
+  SQL compilation and nested prefetches; guarded subqueries no longer read
+  the stored policy revision twice during one fetch.
+- A sliced Boolean combination (`qs[:n] | other`, `^`) keeps the left
+  operand's actor, projection and queryset class, and Django's bounded
+  pk subquery for the sliced operand is not a use of that operand's own
+  actor: a sudo operand writes one bypass audit row per evaluation and none
+  once the combination is rebound, and an operand without an actor is not
+  an error. Before, the left-sliced case raised and the right-sliced case
+  kept the wrong actor.
+- `RebacManager.raw()` refuses a getter that returns a plain queryset with
+  `TypeError` instead of an `assert`.
+- The E009 error for a field backing that does not resolve names the reason.
 
 ## [0.28.0] — 2026-10-16
 

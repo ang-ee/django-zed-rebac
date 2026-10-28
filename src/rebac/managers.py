@@ -24,8 +24,8 @@ from django.db.models.sql import Query
 from django.db.models.sql.where import ExtraWhere, NothingNode, WhereNode
 
 from ._id import resource_id_attr
+from .actors import ActorLike, current_sudo_reason, grant_subject_ref, to_subject_ref
 from .actors import current_actor as _current_actor
-from .actors import current_sudo_reason, grant_subject_ref, to_subject_ref
 from .actors import is_sudo as _is_sudo_ambient
 from .conf import app_settings
 from .errors import MissingActorError, PermissionDenied
@@ -266,6 +266,7 @@ def _without_query_scope(query: Query) -> Query:
     if isinstance(clone, _RebacQuery) and clone._rebac_boolean_operand:
         clone._rebac_check = None
         clone._rebac_checked = False
+        clone._rebac_pending_bypass_audit = None
     clone.where = _without_scope(clone.where)
     clone.where = clone.where.replace_expressions(
         {
@@ -686,6 +687,13 @@ class RebacQuerySet(models.QuerySet[_M]):
     @schema_operation
     def resolve_expression(self, *args: Any, **kwargs: Any) -> Query:
         clone = self._clone()
+        query = clone.query
+        if isinstance(query, _RebacQuery) and query._rebac_boolean_operand:
+            # Django's bounded pk subquery for a sliced Boolean operand: the
+            # combination scopes and checks it (_scope_query) under the left
+            # operand's actor. Its own actor, bypass and audit do not apply,
+            # and an operand without an actor is not an error here.
+            return cast(Query, super(RebacQuerySet, clone).resolve_expression(*args, **kwargs))
         # Resolution builds an expression; the bypass is exercised, and
         # audited, when the statement it lands in is compiled for execution.
         # The query's own resolution checks what it selects, filters and
@@ -1380,6 +1388,7 @@ class RebacQuerySet(models.QuerySet[_M]):
             self._guard_selected_related_reads()
             self._rebac_visibility_applied = True
 
+    @schema_operation
     def iterator(self, *args: Any, **kwargs: Any) -> Any:
         if self._result_cache is None:
             self._apply_scope_in_place()
@@ -1943,11 +1952,60 @@ class RebacManager[M: models.Model](_RebacManagerBase[M]):  # pyright: ignore[re
     model parameter through queryset chains.
     """
 
+    # The actor verbs are declared here as well as copied from the queryset
+    # by ``from_queryset``: pyright has no Django plugin and cannot see the
+    # copies, so without these ``Post.objects.with_actor(...)`` is an
+    # attribute error for every editor user. mypy resolves a
+    # ``from_queryset`` subclass's verbs through the plugin, which keeps a
+    # custom queryset's own type; ``get_queryset`` is deliberately not
+    # declared, so that inference is Django's.
+
+    def _scoped(self) -> RebacQuerySet[M]:
+        queryset = self.get_queryset()
+        if not isinstance(queryset, RebacQuerySet):
+            raise TypeError(
+                f"{type(self).__name__}.get_queryset() returned {type(queryset).__name__}; "
+                "a RebacManager must return a RebacQuerySet."
+            )
+        return queryset
+
+    def with_actor(self, actor: ActorLike | None) -> RebacQuerySet[M]:
+        return self._scoped().with_actor(actor)
+
+    def as_user(self, user: Any) -> RebacQuerySet[M]:
+        return self._scoped().as_user(user)
+
+    def as_agent(self, agent: Any, *, on_behalf_of: Any | None = None) -> RebacQuerySet[M]:
+        return self._scoped().as_agent(agent, on_behalf_of=on_behalf_of)
+
+    def with_action(self, action: str) -> RebacQuerySet[M]:
+        return self._scoped().with_action(action)
+
+    def on_field_deny(self, mode: FieldDenyMode) -> RebacQuerySet[M]:
+        return self._scoped().on_field_deny(mode)
+
+    def for_write(self) -> RebacQuerySet[M]:
+        return self._scoped().for_write()
+
+    def readable(self, field: str) -> models.Expression:
+        return self._scoped().readable(field)
+
+    def rebac_select_related(self, *fields: Any) -> RebacQuerySet[M]:
+        return self._scoped().rebac_select_related(*fields)
+
+    def rebac_prefetch_related(self, *lookups: Any) -> RebacQuerySet[M]:
+        return self._scoped().rebac_prefetch_related(*lookups)
+
+    def sudo(self, *, reason: str) -> RebacQuerySet[M]:
+        return self._scoped().sudo(reason=reason)
+
+    def system_context(self, *, reason: str) -> RebacQuerySet[M]:
+        return self._scoped().system_context(reason=reason)
+
     def raw(
         self, raw_query: str, params: Any = (), translations: Any = None, using: Any = None
     ) -> Any:
-        queryset = self.get_queryset()
-        assert isinstance(queryset, RebacQuerySet), "RebacManager.raw requires a RebacQuerySet."
+        queryset = self._scoped()
         _, bypass = queryset.effective_actor(strict=True)
         if not bypass:
             raise PermissionDenied("raw() cannot be actor-scoped; use sudo or system_context")

@@ -22,9 +22,9 @@ def test_queryset_manager_extensions_keep_native_type_checks(tmp_path: Path) -> 
         dedent(
             """\
             from django.db import models
-            from rebac import RebacMixin
+            from rebac import RebacManager, RebacMixin
 
-            class OwnManager[M: models.Model](models.Manager[M]):
+            class OwnManager[M: models.Model](RebacManager[M]):
                 def label(self) -> str:
                     return "own"
 
@@ -119,7 +119,7 @@ def test_queryset_manager_extensions_keep_native_type_checks(tmp_path: Path) -> 
             assert_type(OwnRecord.objects.label(), str)
             assert_type(OwnRecord.objects.get(), OwnRecord)
             assert_type(OwnRecord.objects.get().title, str)
-            OwnRecord.objects.with_actor(None)  # missing-own-scope
+            assert_type(OwnRecord.objects.with_actor(None).get(), OwnRecord)
             OwnRecord.objects.get().title = object()  # invalid-own-field
             post = Post()
             post.title = object()  # invalid-field
@@ -164,7 +164,6 @@ def test_queryset_manager_extensions_keep_native_type_checks(tmp_path: Path) -> 
     assert result.returncode == 1, result.stdout + result.stderr
     errors = [line for line in result.stdout.splitlines() if ": error:" in line]
     expected = {
-        "missing-own-scope": "attr-defined",
         "invalid-own-field": "assignment",
         "invalid-field": "assignment",
         "invalid-manager-field": "assignment",

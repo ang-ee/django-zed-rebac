@@ -741,6 +741,41 @@ def check_declared_base_managers(
 
 
 @checks.register("rebac")
+def check_default_managers(app_configs: Any = None, **kwargs: Any) -> list[checks.CheckMessage]:
+    """E024: a RebacMixin model's default manager must return a RebacQuerySet."""
+    from django.apps import apps
+
+    from .managers import RebacQuerySet
+    from .mixins import RebacMixin
+
+    configs = apps.get_app_configs() if app_configs is None else app_configs
+    issues: list[checks.CheckMessage] = []
+    for config in configs:
+        for model in config.get_models():
+            if not issubclass(model, RebacMixin):
+                continue
+            rows = model._default_manager.all()
+            if isinstance(rows, RebacQuerySet):
+                continue
+            issues.append(
+                checks.Error(
+                    f"{model._meta.label}: the default manager "
+                    f"{model._meta.default_manager_name!r} returns {type(rows).__name__}, "
+                    "which is not a rebac.RebacQuerySet.",
+                    hint=(
+                        "Django's admin, model forms, related managers and validate_unique() "
+                        "read a model's rows through its default manager. Derive it from "
+                        "RebacManager (RebacManager.from_queryset(...)) so those reads are "
+                        "actor-scoped, or drop RebacMixin from a model that needs no scope."
+                    ),
+                    obj=model,
+                    id="rebac.E024",
+                )
+            )
+    return issues
+
+
+@checks.register("rebac")
 def check_stale_override_references(
     app_configs: Any = None, **kwargs: Any
 ) -> list[checks.CheckMessage]:

@@ -6,9 +6,12 @@
 - `uv` installed
 
 ```bash
-uv venv --python 3.14
-make install-dev
+make install-dev            # uv sync: the dev group and the caveats, drf, strawberry extras
 ```
+
+`make check` needs the `caveats` extra (mypy imports `celpy`). The dev
+tools are a PEP 735 dependency group, not a published extra, so the git pins
+for `mypy` and `django-stubs` in `[tool.uv.sources]` never reach the wheel.
 
 ## Commands
 

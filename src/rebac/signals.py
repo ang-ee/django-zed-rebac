@@ -22,10 +22,10 @@ from django.db.models.signals import (
 )
 from django.dispatch import receiver
 
-from .actors import model_can_resolve_subject
+from .actors import model_can_resolve_subject, model_identities
 from .conf import app_settings
 from .errors import PermissionDenied
-from .resources import model_identities, model_resource_type, to_object_ref
+from .resources import model_resource_type, to_object_ref
 from .types import ObjectRef, SubjectRef
 
 # Weak sets retain no isolated app registry after its classes disappear.
@@ -399,15 +399,16 @@ def cleanup_identities(identities: Iterable[ObjectRef], *, using: str) -> None:
         return
     with transaction.atomic(using=using):
         for batch in batched(identities, 200, strict=False):
-            registry = _identity_query(batch, include_subjects=False)
-            rows = cast(
-                RelationshipQuerySet | RelationshipRegistryQuerySet,
-                active_relationship_model().objects.using(using),
-            ).referencing(batch)
             if app_settings.REBAC_LOCAL_BACKEND_STORAGE == "registry":
-                RebacResource.objects.using(using).filter(registry).delete()
+                # A registry resource row is the identity; its tuples cascade.
+                RebacResource.objects.using(using).filter(
+                    _identity_query(batch, include_subjects=False)
+                ).delete()
             else:
-                rows.delete()
+                cast(
+                    RelationshipQuerySet | RelationshipRegistryQuerySet,
+                    active_relationship_model().objects.using(using),
+                ).referencing(batch).delete()
         mark_relationships_changed()
 
 

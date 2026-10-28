@@ -4,14 +4,11 @@ from __future__ import annotations
 
 import pytest
 from django.contrib.auth import get_user_model
-from django.contrib.auth.base_user import AbstractBaseUser
 from django.contrib.contenttypes.models import ContentType
-from django.db import models
 from django.test import override_settings
 
 from rebac import (
     ObjectRef,
-    RebacMixin,
     RelationshipTuple,
     SubjectRef,
     backend,
@@ -26,15 +23,6 @@ from rebac.schema import parse_zed
 from rebac.signals import cleanup_identities
 from tests.backend_setup import install_schema
 from tests.testapp.models import Post
-
-
-class MetadataIdentityUser(RebacMixin, AbstractBaseUser):
-    username = models.CharField(max_length=40, unique=True)
-    USERNAME_FIELD = "username"
-
-    class Meta:
-        app_label = "testapp"
-        rebac_resource_type = "members/person"
 
 
 @pytest.mark.parametrize("prefix", ("", "tenant/"))

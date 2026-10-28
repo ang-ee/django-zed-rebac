@@ -16,6 +16,7 @@ from rebac import (
 )
 from rebac.backends import LocalBackend, reset_backend
 from rebac.managers import RebacManager, RebacQuerySet
+from rebac.models import PermissionAuditEvent
 from rebac.schema import parse_zed
 from tests.backend_setup import install_schema
 from tests.testapp.models import Post, SluggedPost
@@ -299,6 +300,46 @@ def test_sliced_boolean_combination_keeps_custom_queryset_scope_and_rebinding(
     assert left.actor() == ALICE
     assert right.actor() == BOB
     assert left._result_cache is right._result_cache is None
+
+
+@pytest.mark.parametrize("operation", [operator.or_, operator.xor])
+def test_sliced_boolean_operand_bypass_is_audited_once_and_only_when_it_applies(rows, operation):
+    """Django resolves a sliced operand into a pk subquery; that resolution is
+    not a use of the operand's own bypass. The combination's bypass is audited
+    once per evaluation, and not at all once the combination is rebound."""
+    first, second, third, _ = rows
+    PermissionAuditEvent.objects.all().delete()
+    left = Post.objects.sudo(reason="left-sudo").order_by("pk")[:1]
+    right = Post.objects.with_actor(BOB).filter(title="third")
+
+    combined = operation(left, right)
+    assert list(combined.order_by("pk").values_list("pk", flat=True)) == [first.pk, third.pk]
+    bypasses = list(PermissionAuditEvent.objects.filter(kind=PermissionAuditEvent.KIND_SUDO_BYPASS))
+    assert [row.reason for row in bypasses] == ["left-sudo"]
+
+    PermissionAuditEvent.objects.all().delete()
+    # Rebound, the sliced operand is the first row BOB reads, not the first row.
+    rebound = combined.with_actor(BOB)
+    assert list(rebound.order_by("pk").values_list("pk", flat=True)) == [second.pk, third.pk]
+    assert not PermissionAuditEvent.objects.filter(
+        kind=PermissionAuditEvent.KIND_SUDO_BYPASS
+    ).exists()
+
+
+@pytest.mark.parametrize("operation", [operator.or_, operator.xor])
+def test_sliced_boolean_right_operand_without_an_actor_takes_the_left_policy(rows, operation):
+    """An operand with no actor of its own is not an error: the left operand's
+    actor governs every operand, as for an unsliced combination."""
+    left = Post.objects.with_actor(ALICE)
+    right = Post.objects.order_by("pk")[:1]
+
+    combined = operation(left, right)
+
+    readable = list(Post.objects.with_actor(ALICE).order_by("pk").values_list("pk", flat=True))
+    first_pk = Post._base_manager.order_by("pk").values_list("pk", flat=True)[0]
+    expected = readable if operation is operator.or_ else [pk for pk in readable if pk != first_pk]
+    assert list(combined.order_by("pk").values_list("pk", flat=True)) == expected
+    assert combined.actor() == ALICE
 
 
 @pytest.mark.parametrize("operation", [operator.or_, operator.xor])

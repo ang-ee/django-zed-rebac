@@ -109,7 +109,7 @@ def test_raw_rejects_a_custom_getter_without_rebac_policy() -> None:
     manager = PlainGetterManager()
     manager.model = Post
 
-    with pytest.raises(AssertionError, match=r"RebacManager\.raw requires a RebacQuerySet"):
+    with pytest.raises(TypeError, match=r"a RebacManager must return a RebacQuerySet"):
         manager.raw("SELECT 1")
 
 
