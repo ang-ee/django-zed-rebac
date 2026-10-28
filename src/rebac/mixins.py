@@ -14,19 +14,21 @@ overrides where the captured values land.
 
 from __future__ import annotations
 
-from collections.abc import Iterable, Iterator, Mapping
-from contextlib import contextmanager
+from collections.abc import Collection, Iterable, Iterator, Mapping
+from contextlib import AbstractContextManager, contextmanager, nullcontext
 from contextvars import ContextVar
 from dataclasses import dataclass
 from dataclasses import field as dataclass_field
 from typing import TYPE_CHECKING, Any, ClassVar, Self, cast
 
-from django.core.exceptions import ImproperlyConfigured
+from django.core.exceptions import ImproperlyConfigured, ObjectDoesNotExist, ValidationError
+from django.core.exceptions import PermissionDenied as DjangoPermissionDenied
 from django.db import models, router, transaction
 from django.db.models.base import ModelBase
 from django.db.models.options import DEFAULT_NAMES
 
 from ._id import resource_id_attr
+from .actors import is_sudo, system_context
 from .conf import app_settings
 from .errors import PermissionDenied
 from .field_visibility import backend_schema, redacted_fields
@@ -35,6 +37,10 @@ from .preflight import _check_new_model
 from .resources import model_resource_type
 from .schema.walker import field_gated_actions
 from .types import CheckResult, Consistency, FieldDenyMode, ObjectRef, SubjectRef
+
+_SAVE_VERDICT = "_rebac_save_verdict"
+_SAVE_PENDING = "pending"
+
 
 REBAC_META_OPTIONS = (
     "rebac_resource_type",
@@ -497,6 +503,113 @@ class RebacMixin(RebacTrackedMixin):
     class Meta(RebacTrackedMixin.Meta):
         abstract = True
 
+    def full_clean(
+        self,
+        exclude: Iterable[str] | None = None,
+        validate_unique: bool = True,
+        validate_constraints: bool = True,
+    ) -> None:
+        """Clean as Django does; uniqueness and constraints share one access decision.
+
+        See :meth:`constraint_check`.
+        """
+
+        self.__dict__[_SAVE_VERDICT] = None
+        try:
+            super().full_clean(exclude, validate_unique, validate_constraints)
+        finally:
+            self.__dict__.pop(_SAVE_VERDICT, None)
+
+    def validate_unique(self, exclude: Collection[str] | None = None) -> None:
+        """Check field uniqueness against every row once this row's save may proceed.
+
+        See :meth:`constraint_check`.
+        """
+
+        if (check := self.constraint_check("validate_unique")) is not None:
+            scope, unwritten = check
+            with scope:
+                super().validate_unique({*(exclude or ()), *unwritten} if unwritten else exclude)
+
+    def validate_constraints(self, exclude: Collection[str] | None = None) -> None:
+        """Check model constraints against every row once this row's save may proceed.
+
+        See :meth:`constraint_check`.
+        """
+
+        if (check := self.constraint_check("validate_constraints")) is not None:
+            scope, unwritten = check
+            with scope:
+                super().validate_constraints({*(exclude or ()), *unwritten} if unwritten else exclude)
+
+    def constraint_check(self, step: str) -> tuple[AbstractContextManager[Any], frozenset[str]] | None:
+        """Return how Django's ``step`` (``validate_unique`` or ``validate_constraints``) runs, or ``None``.
+
+        Uniqueness and constraints compare this row with rows the actor may not
+        read, so under an actor they run in a named system context, and only when
+        this row's save would pass its REBAC gates (:meth:`_save_allowed`); otherwise
+        ``None`` skips them, and the save refuses the row. For a saved row they leave
+        out the fields the actor may not read (the second item): those were redacted
+        when it loaded, and its save leaves them unwritten. They run as they are for
+        a model without row policy, for a step with no rule that reads other rows,
+        inside a system context, and with no actor (where strict mode refuses an
+        actor-less read). An instance's own bypass (``sudo``) enters a system context.
+        """
+
+        if not model_resource_type(type(self)) or is_sudo() or not self._compares_other_rows(step):
+            return nullcontext(), frozenset()
+        if self.is_sudo():
+            return system_context(reason=f"{self._meta.label_lower}.{step}"), frozenset()
+        actor, _unscoped = self.effective_actor()
+        if actor is None:
+            return nullcontext(), frozenset()
+        if not self._save_allowed():
+            return None
+        unwritten = frozenset() if self._state.adding else self.denied_read_fields()
+        return system_context(reason=f"{self._meta.label_lower}.{step}"), unwritten
+
+    def _compares_other_rows(self, step: str) -> bool:
+        """Whether Django's ``step`` has a rule that reads rows other than this one."""
+
+        lineage = (type(self), *self._meta.get_parent_list())
+        if step == "validate_constraints":
+            return any(model._meta.constraints for model in lineage)
+        fields = self._meta.concrete_fields
+        return (
+            any(field.unique and not field.primary_key for field in fields)
+            or any(
+                getattr(field, option)
+                for field in fields
+                for option in ("unique_for_date", "unique_for_month", "unique_for_year")
+            )
+            or any(model._meta.unique_together for model in lineage)
+        )
+
+    def _save_allowed(self) -> bool:
+        """Whether this row's save would pass its REBAC gates, decided once per :meth:`full_clean`.
+
+        REBAC's ``check_save`` runs the save itself in a transaction it rolls
+        back: the create candidate for a new row; ``write``, each changed field's
+        ``write__`` gate, moving edges, expression reads and redacted writes for a
+        saved one. A candidate it cannot evaluate (a related row that does not
+        exist, a save that refuses its values or its actor) counts as refused, so
+        its field errors stand. A clean that the checked save runs again sees no verdict yet.
+        """
+
+        verdict = self.__dict__.get(_SAVE_VERDICT)
+        if verdict is not None:
+            return verdict is True
+        deciding = _SAVE_VERDICT in self.__dict__
+        if deciding:
+            self.__dict__[_SAVE_VERDICT] = _SAVE_PENDING
+        try:
+            verdict = self.check_save().allowed
+        except DjangoPermissionDenied, ObjectDoesNotExist, TypeError, ValidationError, ValueError:
+            verdict = False
+        if deciding:
+            self.__dict__[_SAVE_VERDICT] = verdict
+        return verdict
+
     def proposed_relationships(
         self, *, using: str | None = None
     ) -> Mapping[str, Iterable[SubjectRef | models.Model]]:
@@ -504,7 +617,7 @@ class RebacMixin(RebacTrackedMixin):
         from its fields, keyed by relation name; consulted by the create gate
         before insert, and by ``check_access("create")`` on an unsaved
         instance. The complementary owner for field-backed relations is
-        ``rebac.field_backing._proposed_forward_relationships``; field-backed
+        ``rebac.field_backing.proposed_forward_relationships``; field-backed
         and const-backed relations belong to the library and must not be
         returned here. Use the supplied write database alias ``using`` when
         resolving subjects. Unreferenced subject iterables are not evaluated.

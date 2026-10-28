@@ -379,7 +379,7 @@ def _parent_links(model: type[models.Model]) -> Iterator[models.Field[Any, Any]]
         yield from _parent_links(parent)
 
 
-def _proposed_forward_relationships(
+def proposed_forward_relationships(
     instance: models.Model,
     definition: Definition,
     *,

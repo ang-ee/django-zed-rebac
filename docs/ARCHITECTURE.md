@@ -1415,7 +1415,7 @@ ID used internally by the walker is not an overlay subject.
 
 `check_new` retains its existing virtual-relationship-only signature. Django
 create paths construct the candidate first, including Python defaults, then
-`_proposed_forward_relationships` projects the field-backed and filtered-constant
+`proposed_forward_relationships` projects the field-backed and filtered-constant
 relations that `create` depends on, including dependencies through named
 permissions and arrow sources. A resolved constant owns `matches_candidate`;
 its predicates use typed SQL literals, including declared column collations, on
@@ -1531,6 +1531,44 @@ Limitations (0.4):
   `type:*` wildcards remain subject classes rather than concrete model IDs.
 
 ---
+
+### Django model validation and stored identity references
+
+`RebacMixin.full_clean()`, `validate_unique()` and `validate_constraints()`
+retain Django's validation rules. A uniqueness or constraint rule that compares
+other rows uses a named system scope only after `check_save()` admits this
+candidate. A refused save gets no elevated duplicate-existence answer. Existing
+rows exclude unreadable fields which their save would leave unwritten. Models
+without resource policy, validation steps without cross-row rules, ambient
+system scopes and actor-less calls retain their ordinary behavior; strict
+actor-less queries still refuse. An instance bypass is honored with its own
+named validation scope. One full-clean invocation shares the save verdict,
+including when a model's save override performs validation recursively, and
+cleans up that temporary instance state on every exit.
+
+`rebac.proposed_forward_relationships(instance, definition, *,
+required_relations, using=None)` is the canonical candidate projection already
+used by native create checks. It returns required field-backed and filtered
+constant relation facts, preserving unknown (`None`) versus known empty
+(`()`) facts and the write alias. It does not add model-proposed tuple facts or
+replace `check_new`. Callers asking about a retained snapshot own whether its
+missing reverse/tuple relations can be known; the projection does not infer
+historical facts from current rows.
+
+`rebac.model_identities(model, instance)` returns the resource and subject
+identities owned by that Django model view. Model lifecycle receivers use the
+same resolver; callers composing a multi-table retirement may ask each existing
+model view separately. It does not discover a deletion graph or decide whether
+a referenced row may be retired.
+
+Both native relationship storage querysets expose `.referencing(identities)`:
+a filtered queryset of stored tuples naming any supplied `ObjectRef` as either
+resource or subject. Empty input selects no rows. Chained filters and explicit
+database aliases are retained, and the registry shape translates the same wire
+columns as its other public filters. Native cleanup and callers share this
+predicate; cleanup's existing transactional invalidation, router safeguard,
+batching and registry-resource cascade remain unchanged. This is an ORM storage
+query contract, not an additional backend permission RPC.
 
 ### Schema source and projection APIs
 

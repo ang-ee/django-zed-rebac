@@ -90,7 +90,8 @@ if TYPE_CHECKING:
         resolve_subjects,
         write_relationships,
     )
-    from .resources import to_object_ref
+    from .field_backing import proposed_forward_relationships
+    from .resources import model_identities, to_object_ref
 
 
 _LAZY = {
@@ -120,6 +121,8 @@ _LAZY = {
     "delete_relationships": ("rebac.relationships", "delete_relationships"),
     "resolve_subjects": ("rebac.relationships", "resolve_subjects"),
     "to_object_ref": ("rebac.resources", "to_object_ref"),
+    "model_identities": ("rebac.resources", "model_identities"),
+    "proposed_forward_relationships": ("rebac.field_backing", "proposed_forward_relationships"),
     "rebac_mcp_tool": ("rebac.mcp", "rebac_mcp_tool"),
     "default_actor_resolver": ("rebac.mcp", "default_actor_resolver"),
     "get_mcp_actor_resolver": ("rebac.mcp", "get_mcp_actor_resolver"),
@@ -190,6 +193,8 @@ __all__ = [
     "to_subject_ref",
     "grant_subject_ref",
     "to_object_ref",
+    "model_identities",
+    "proposed_forward_relationships",
     # composable resolvers
     "bearer_token",
     "chain_resolvers",

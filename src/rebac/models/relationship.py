@@ -18,7 +18,7 @@ returns the one selected by the setting. The wire shape (``RelationshipTuple``
 from __future__ import annotations
 
 from collections.abc import Callable, Collection, Iterable, Mapping
-from typing import Any, cast
+from typing import Any, Self, cast
 
 from django.db import models, router, transaction
 from django.db.models import F, Q
@@ -95,7 +95,28 @@ def _owned_instance_delete(
     return result
 
 
-class RelationshipQuerySet(models.QuerySet["Relationship"]):
+def _identity_query(identities: Iterable[ObjectRef], *, include_subjects: bool) -> Q:
+    query = Q()
+    for identity in sorted(set(identities), key=str):
+        query |= Q(resource_type=identity.resource_type, resource_id=identity.resource_id)
+        if include_subjects:
+            query |= Q(subject_type=identity.resource_type, subject_id=identity.resource_id)
+    return query
+
+
+class _RelationshipReferencesQuerySet[T: models.Model](models.QuerySet[T]):
+    """One stored wire-identity predicate shared by both native storage shapes."""
+
+    def referencing(self, identities: Iterable[ObjectRef]) -> Self:
+        """Select tuples naming these identities at either end; empty selects none."""
+
+        selected = tuple(identities)
+        if not selected:
+            return self.none()
+        return self.filter(_identity_query(selected, include_subjects=True))
+
+
+class RelationshipQuerySet(_RelationshipReferencesQuerySet["Relationship"]):
     """Mode-agnostic queryset helpers for denormalized relationship rows."""
 
     def delete(self) -> tuple[int, dict[str, int]]:
@@ -439,7 +460,7 @@ def _translate_ordering_fields(fields: tuple[Any, ...]) -> tuple[Any, ...]:
     return tuple(translated)
 
 
-class RelationshipRegistryQuerySet(models.QuerySet["RelationshipRegistry"]):
+class RelationshipRegistryQuerySet(_RelationshipReferencesQuerySet["RelationshipRegistry"]):
     """Translating QuerySet for :class:`RelationshipRegistry`.
 
     Rewriting the kwargs at the QuerySet level (rather than only on the

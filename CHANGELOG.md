@@ -5,6 +5,12 @@ pre-1.0; breaking changes within a minor version are explicitly called out.
 
 ## Unreleased
 
+- Model uniqueness and constraint validation respects the save gate before
+  checking all rows, preventing duplicate-existence leaks through denied writes.
+- Public native candidate projection and model identity resolution, plus one
+  stored-relationship `.referencing()` predicate shared by both storage modes
+  and deletion cleanup.
+
 ### Added
 
 - `rebac sync --prune-stale` retires stale package-owned policy, including removed
