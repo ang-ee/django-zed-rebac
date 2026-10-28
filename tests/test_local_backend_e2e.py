@@ -461,8 +461,10 @@ def test_model_write_delete_and_field_write_gates_use_local_backend_end_to_end(
         action="write",
         resource=resource,
     )
-    with pytest.raises(PermissionDenied):
-        Post.objects.as_user(fake_users.bob).filter(pk=post.pk).update(body="after revoke")
+    # Bob no longer reads the row: it is not part of his statement.
+    assert Post.objects.as_user(fake_users.bob).filter(pk=post.pk).update(body="after revoke") == 0
+    with sudo(reason="local-backend-e2e.verify"):
+        assert Post.objects.get(pk=post.pk).body == "editor body"
 
     write_relationships([_grant(fake_users.bob, resource, "editor")])
     with pytest.raises(PermissionDenied, match="write__title"):

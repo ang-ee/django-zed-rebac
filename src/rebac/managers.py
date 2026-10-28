@@ -1649,26 +1649,42 @@ class RebacQuerySet(models.QuerySet[_M]):
         from .signals import _gate_backed_rows, audit_backed_denials
         from .watch import by_key, model_write, statement_keys
 
+        if self.query.combinator or self.query.is_sliced:
+            # Django refuses these before it reads a row.
+            return super().update(**kwargs)
         self._for_write = True
         with (
             audit_backed_denials(),
             model_write(model=self.model, using=self.db, names=kwargs) as watched,
         ):
-            if not watched or self.query.is_sliced:
-                return self._rebac_update(**kwargs)
             actor, bypass = self._resolve_effective_actor()
-            if bypass:
+            if bypass or not (watched or model_resource_type(self.model)):
                 return self._rebac_update(**kwargs)
+            if self.query.distinct_fields:
+                # Django's UPDATE writes every matching row; DISTINCT ON would
+                # select one per value, so the rows checked would not be the
+                # rows written.  Django refuses it for delete() as well.
+                raise TypeError("Cannot call update() after .distinct(*fields) under an actor.")
             # Before any row is selected: a refusal must not depend on a match.
             self._guard_clause_field_reads(actor, bypass, query=self._update_query())
-            # The statement changes a column the policy reads: the gate
-            # decides on its rows, and exactly those rows are written.
-            keys = statement_keys(self._system_capture(reason="rebac.write.rows"))
-            for rows in by_key(self.model._base_manager.using(self.db), keys):
-                _gate_backed_rows(
-                    rows, using=self.db, names=kwargs, proposed=kwargs, actor=actor, bypass=bypass
-                )
-            return sum(rows._rebac_update(**kwargs) for rows in by_key(self, keys))
+            # The statement acts on the rows the actor's scope admits: exactly
+            # those are gated and written, by key.
+            keys = statement_keys(
+                self._rows_in_scope(self._writing_actor(actor), reason="rebac.write.rows")
+            )
+            if watched:
+                for rows in by_key(self.model._base_manager.using(self.db), keys):
+                    _gate_backed_rows(
+                        rows,
+                        using=self.db,
+                        names=kwargs,
+                        proposed=kwargs,
+                        actor=actor,
+                        bypass=bypass,
+                    )
+            written = sum(rows._rebac_update(**kwargs) for rows in by_key(self, keys))
+            self._result_cache = None
+            return written
 
     def bulk_update(
         self, objs: Iterable[_M], fields: Iterable[str], batch_size: int | None = None
@@ -1718,21 +1734,42 @@ class RebacQuerySet(models.QuerySet[_M]):
         return super().update(**kwargs)
 
     def delete(self) -> tuple[int, dict[str, int]]:
-        from .watch import model_write
+        from .watch import by_key, model_write, statement_keys
 
+        if (
+            self.query.combinator
+            or self.query.is_sliced
+            or self.query.distinct_fields
+            or getattr(self, "_fields", None) is not None
+        ):
+            # Django refuses these before it reads a row.
+            return super().delete()
         self._for_write = True
         with model_write(model=self.model, using=self.db):
             from .mixins import deletion_owner
 
             actor, unscoped = self._resolve_effective_actor()
             self._guard_clause_field_reads(actor, unscoped, clears_ordering=True)
-            if not unscoped and model_resource_type(self.model):
-                from .compile.read import deciding_afresh
+            if unscoped or not model_resource_type(self.model):
+                with deletion_owner(self, self.db, actor, unscoped):
+                    return super().delete()
+            from .compile.read import deciding_afresh
 
-                with deciding_afresh():
-                    self._guard_bulk_action(actor, "delete")  # type: ignore[arg-type]
-            with deletion_owner(self, self.db, actor, unscoped):
-                return super().delete()
+            # The statement acts on the rows the actor's scope admits: exactly
+            # those are checked and deleted, by key.  A cascade that reaches
+            # another row checks it as an instance delete does.
+            actor = self._writing_actor(actor)
+            keys = statement_keys(self._rows_in_scope(actor, reason="rebac.delete.rows"))
+            parts = list(by_key(self, keys))
+            with deciding_afresh():
+                for rows in parts:
+                    rows._guard_bulk_action(actor, "delete")
+            deleted: Counter[str] = Counter()
+            for rows in parts:
+                with deletion_owner(rows, self.db, actor, unscoped):
+                    deleted.update(models.QuerySet.delete(rows)[1])
+            self._result_cache = None
+            return sum(deleted.values()), dict(deleted)
 
     def _guard_bulk_action(self, actor: SubjectRef, action: str) -> None:
         from .backends import backend
@@ -1861,8 +1898,33 @@ class RebacQuerySet(models.QuerySet[_M]):
                     f"Bulk write expression reads denied field read__{field_name}."
                 )
 
+    def _rows_in_scope(self, actor: SubjectRef, *, reason: str) -> RebacQuerySet[_M]:
+        """The statement's rows the queryset's scope admits for ``actor``, read
+        without the actor's other checks.
+
+        A bulk write under an actor acts on these rows only, the rows
+        ``count()`` counts: a row outside the scope is not part of it, so a
+        refusal never depends on a row the actor cannot read.
+        """
+        rows = self._system_capture(reason=reason)
+        # The scope stays through the clones that read the keys.
+        rows._rebac_eager_scope = True
+        rows._scope_query(rows.query, actor)
+        return rows
+
+    def _writing_actor(self, actor: SubjectRef | None) -> SubjectRef:
+        """The actor a scoped bulk write acts for; a scope with none (an
+        aggregate scope outside any actor) writes nothing and raises."""
+        if actor is None:
+            raise MissingActorError(
+                f"Bulk write on {self.model.__name__} without an actor. "
+                "Use .with_actor(actor) or .sudo(reason='...')."
+            )
+        return actor
+
     def _affected_resource_ids_for_guard(self) -> set[str]:
-        """Scan the queryset's target rows without read-scoping the guard itself."""
+        """Scan the statement's rows without read-scoping the guard itself: under
+        an actor the statement holds only the rows in scope (``_rows_in_scope``)."""
         attr = resource_id_attr(self.model)
         scan = self._system_capture(reason="rebac.bulk-guard")
         return {str(v) for v in scan.values_list(attr, flat=True)}

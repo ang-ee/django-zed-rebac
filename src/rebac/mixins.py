@@ -369,6 +369,15 @@ class RebacTrackedMixin(models.Model, metaclass=RebacModelBase):
         and other model instances the override saves get back their primary
         key and state.  An override's effects outside that transaction run as
         they would in ``save()``.
+
+        The verdict covers the fields the save writes.  Without
+        ``update_fields``, ``save()`` leaves the fields redacted when the
+        instance was loaded out of the write, even when they were assigned, so
+        the check passes without them.  A caller that validates the instance
+        after a passing check, with more access than the actor (unique or
+        constraint checks under ``system_context``), excludes the fields the
+        actor may not read (``denied_read_fields()``), or the validation
+        answers for values the actor can neither read nor write.
         """
         from .audit import SaveCheck, save_check
         from .errors import PermissionDenied

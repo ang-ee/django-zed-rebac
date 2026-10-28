@@ -37,6 +37,45 @@ pre-1.0; breaking changes within a minor version are explicitly called out.
   Explicitly declaring `base_manager_name = "_rebac_base"` still opts into
   the injected manager.
 
+## [0.28.0] — 2026-10-16
+
+### Changed
+
+- A bulk `update()` or `delete()` under an actor acts only on the rows its
+  queryset's scope admits (its action, `read` by default), the rows
+  `count()` counts. A row the actor cannot read is no longer part of the
+  statement: it is neither checked nor written. Before, a hidden row that
+  matched the filter made the call raise `PermissionDenied` ("row outside
+  actor scope") while the same call returned `0` when nothing matched, which
+  told the caller that a row they cannot read matches the filter (#42).
+  Among the rows in scope the write is still all-or-nothing: a readable row
+  the actor may not write still refuses. The rows in scope are selected by
+  primary key, checked, and written by key, 5,000 per statement; a cascade
+  that reaches a row outside them checks that row as an instance delete
+  does. A caller that relied on the refusal for rows it cannot read now gets
+  the count of the rows written. `bulk_update()` writes through `update()`:
+  an object the actor cannot read is skipped and not counted, where the call
+  used to refuse.
+
+### Fixed
+
+- `.distinct(*fields).update()` under an actor raises `TypeError`, as
+  Django's `delete()` does. Django's UPDATE writes every matching row while
+  `DISTINCT ON` selects one per value, so on PostgreSQL the write checked one
+  row per value and wrote all of them.
+- A bulk `update()` or `delete()` on a scope with no actor (an aggregate
+  scope outside any actor) raises `MissingActorError`.
+
+### Documentation
+
+- `check_save()`: its verdict covers the fields the save writes. Without
+  `update_fields`, `save()` leaves the fields redacted at load out of the
+  write, even when they were assigned, so the check passes without them. A
+  caller that validates after a passing check with more access than the
+  actor (unique or constraint checks under `system_context`) excludes the
+  fields the actor may not read (`denied_read_fields()`) from that
+  validation, or it answers for values the actor can neither read nor write.
+
 ## [0.27.3] — 2026-10-14
 
 ### Fixed
