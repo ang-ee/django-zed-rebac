@@ -9,7 +9,9 @@ pre-1.0; breaking changes within a minor version are explicitly called out.
 
 - `rebac sync --prune-stale` retires stale package-owned policy, including removed
   packages and removed permissions files, without overwriting live `no_update`
-  edits or unmanaged schema. It removes relationships naming retired types and
+  edits or independently selecting unmanaged schema. Retiring a managed parent
+  definition uses Django's native cascade for all its children. It removes
+  relationships naming retired types and
   relations in the same policy transaction, preserves transferred source
   ownership, supports `--package` and read-only `--check`, and requires explicit
   confirmation or `--yes` before writing.

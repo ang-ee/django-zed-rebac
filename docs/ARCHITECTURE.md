@@ -3220,7 +3220,10 @@ removed definitions, relations, permissions and caveats. `--package` restricts
 retirement to that package even when the package is no longer installed.
 
 The mode is independent of `--force-overwrite`: live `no_update` rows and
-unmanaged policy remain protected. Retired managed rows are removed regardless
+unmanaged policy are not independently selected. Explicitly retiring a managed
+parent definition uses Django's native cascade for its children, including
+unmanaged children; their foreign keys cannot survive without the parent. This
+matches existing forced retirement. Retired managed rows are removed regardless
 of `no_update`; the explicit flag authorizes retirement, not replacement of live
 edits. A definition moved to another source package keeps its live target and
 relationships. Its managed metadata transfers to the current source owner when
