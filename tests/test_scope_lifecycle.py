@@ -243,7 +243,7 @@ def test_savepoint_rollback_restores_index_visibility(fixture):
         evaluator_scope(),
     ):
         assert Post.objects.with_actor(ACTOR).count() == 1
-        savepoint = transaction.savepoint()
+        savepoint = transaction.savepoint_create()
         grant(active, hidden, "owner")
         assert Post.objects.with_actor(ACTOR).count() == 2
         transaction.savepoint_rollback(savepoint)

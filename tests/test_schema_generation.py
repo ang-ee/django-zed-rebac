@@ -452,7 +452,7 @@ def test_rollback_without_evaluator_discards_temporary_schema(synced, boundary):
             transaction.set_autocommit(True)
     else:
         with transaction.atomic():
-            savepoint = transaction.savepoint() if boundary == "savepoint" else None
+            savepoint = transaction.savepoint_create() if boundary == "savepoint" else None
             _write_permission("owner", permission.pk)
             assert _check(local, resource)
             if savepoint is not None:

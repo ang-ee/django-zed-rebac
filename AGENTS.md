@@ -11,14 +11,14 @@ Guidance for coding agents (Claude Code reads this file through the
 
 ## Project overview
 
-`django-zed-rebac` is a **standalone, drop-in REBAC plugin for any Django 6.0
+`django-zed-rebac` is a **standalone, drop-in REBAC plugin for any Django 6.1
 project** (the supported matrix is pinned in `pyproject.toml`; see § Tooling). SpiceDB-compatible schema language, two interchangeable
 backends (`LocalBackend`, which compiles permissions to queries over the
 application's own tables in pure Django; planned `SpiceDBBackend` over
 `authzed-py`), strict-by-default queryset scoping, AI-agent Grant pattern,
 MCP / Celery / DRF / GraphQL adapters.
 
-**Status: alpha**, published on PyPI (DjangoVer `6.0.x`, see `CHANGELOG.md`).
+**Status: alpha**, published on PyPI (Django 6.1 line; see `CHANGELOG.md`).
 Shipped: `LocalBackend` with permissions compiled to queries, the mixin and
 managers, the parser, `rebac sync`, the system checks, the DRF, MCP and
 Strawberry adapters, the audit table. Not shipped: `SpiceDBBackend` (a stub)
@@ -395,7 +395,7 @@ Per `docs/ARCHITECTURE.md § Testing`:
   run generated cases against a pinned `spicedb serve-testing` container in
   dev and CI; see ARCHITECTURE.md § SpiceDB conformance suite. SpiceDB is the
   oracle; a `LocalBackend` difference not listed there as deliberate is a bug.
-- **CI matrix:** Python 3.14 × Django 6.0, with SQLite and PostgreSQL jobs, as declared in
+- **CI matrix:** Python 3.14 × Django 6.1, with SQLite and PostgreSQL jobs, as declared in
   `.github/workflows/ci.yml` and `pyproject.toml`. Broader matrices are a
   release decision, not the current contract. `ruff` targets 3.14, so
   3.14-only syntax is in play and `ruff format` emits it: an unparenthesised

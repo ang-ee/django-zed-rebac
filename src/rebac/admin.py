@@ -175,8 +175,9 @@ class PermissionAuditEventAdmin(_ReadOnlyAdmin):
         "occurred_at",
     )
 
-    def get_actions(self, request: HttpRequest) -> dict[str, Any]:
-        # Belt-and-braces: remove bulk delete from an append-only table.
+    def get_actions(self, request: HttpRequest, action_location: Any = None) -> dict[str, Any]:
+        # Belt-and-braces: remove bulk delete from an append-only table,
+        # wherever Django 6.1 would offer actions (change list or change form).
         return {}
 
     @admin.display(description="Actor")

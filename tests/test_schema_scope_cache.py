@@ -140,7 +140,7 @@ def test_manual_savepoint_rollback_discards_temporary_schema_grant(persisted_sch
     local, permission = persisted_schema
     with transaction.atomic(), evaluator_scope() as evaluator:
         assert not _cached_allowed(evaluator, local)
-        savepoint = transaction.savepoint()
+        savepoint = transaction.savepoint_create()
         _set_permission(permission, "viewer", writer)
         assert _cached_allowed(evaluator, local)
         transaction.savepoint_rollback(savepoint)
@@ -154,7 +154,7 @@ def test_new_evaluator_does_not_retain_outer_uncommitted_grant_after_savepoint_r
     local, permission = persisted_schema
     with transaction.atomic(), evaluator_scope() as outer:
         assert not _cached_allowed(outer, local)
-        savepoint = transaction.savepoint()
+        savepoint = transaction.savepoint_create()
         _set_permission(permission, "viewer", "update")
         with evaluator_scope() as inner:
             assert _cached_allowed(inner, local)

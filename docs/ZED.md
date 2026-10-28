@@ -163,6 +163,9 @@ relation member: auth/user // rebac:field={"path":"membership__user","filters":{
 The target predicate and filters share one Django join. An active editor's
 membership row cannot accidentally authorize a different user's inactive row.
 Filter values are JSON scalars; Django validates the complete lookup paths.
+A `null` value means SQL NULL on every field, a `JSONField` included (the
+lookup is spelled `isnull`); to match a JSON scalar `null` inside a
+`JSONField`, filter on the key (`"data__flag": null`) rather than the column.
 Both direct checks and lazy queryset scopes read these columns in the
 statement that evaluates the permission, so every write to them is visible to
 the next read: instance saves, queryset and M2M writes, bulk writes and

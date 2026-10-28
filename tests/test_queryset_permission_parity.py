@@ -464,7 +464,8 @@ def test_field_owner_sql_cost_is_independent_of_visible_row_count(active, corpus
     assert large_cost[0] == 2
     # A fixed statement, independent of the number of visible IDs. The count
     # changes only with the compiler.
-    assert large_cost[1] == 93
+    # Django 6.1 compares the top-level boolean scope predicate with True (one parameter).
+    assert large_cost[1] == 94
 
 
 def test_stored_arrow_resolves_virtual_targets_without_row_multiplication(active):

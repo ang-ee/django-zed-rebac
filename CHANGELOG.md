@@ -3,6 +3,48 @@
 All notable changes to `django-zed-rebac` are tracked here. The project is in
 pre-1.0; breaking changes within a minor version are explicitly called out.
 
+## [0.30.0] — 2026-10-28
+
+### Changed
+
+- **Django 6.1.** The package requires Django 6.1.x (`django>=6.1,<6.2`) and
+  django-stubs 6.1.x; Django 6.0 is no longer supported. The verified private
+  hooks: `Model.from_db` (now takes `fetch_mode`), `QuerySet._clone`,
+  `_fields`, `_merge_known_related_objects`, `_iterable_class`,
+  `_result_cache`, `_fetch_all`, `Manager._queryset_class` / `_hints`,
+  `Model._get_unique_checks` / `_perform_unique_checks`, and
+  `ModelAdmin.get_actions` (now takes `action_location`). Database floors
+  follow Django: PostgreSQL 15, MySQL 8.4 (the vendor contract runs
+  `mysql:8.4`), SQLite 3.37.
+- The `mypy` and `django-stubs` fork pins are gone: development uses the
+  PyPI releases (`mypy>=2.4`, `django-stubs>=6.1,<6.2`). Under upstream
+  django-stubs, `get_queryset()` on a `RebacManager.from_queryset(...)`
+  manager is typed as Django's `QuerySet`, not the custom queryset; the
+  manager's verbs (`with_actor`, `as_user`, ...) keep the custom type, so
+  call them on the manager rather than through `get_queryset()`.
+- Django 6.1's database-level deletes (`DB_CASCADE`, `DB_SET_NULL`,
+  `DB_SET_DEFAULT`) run in the database and send no `pre_delete` /
+  `post_delete`: a tracked or resource row removed that way passes no gate
+  and no identity cleanup. Use the Python-level `on_delete` options on
+  relations the policy reads (proposal 0011).
+
+- A `None` value in a backing's `filters` means SQL NULL on every field,
+  a `JSONField` included: the stored lookup is spelled `isnull`, and the
+  candidate projection already cast it that way. Django's `=None` on a
+  `JSONField` meant the JSON scalar `null` and is deprecated in 6.1 (it
+  becomes SQL NULL in Django 2028); a backing that relied on the JSON-null
+  reading filters on the JSON value explicitly instead.
+- The `drf` extra requires djangorestframework 3.18 (3.17 imports a helper
+  Django 6.1 removed).
+
+### Fixed
+
+- Migration `0004` no longer uses a `None` exact lookup on a `JSONField`
+  (deprecated in Django 6.1; `isnull` is the stored meaning).
+- Combined id-set queries (recursive closures, kept-row unions) clear their
+  ordering: Django 6.1 applies a model's default ordering to a combined
+  query, which an id projection cannot sort by.
+
 ## [0.29.0] — 2026-10-28
 
 ### Added

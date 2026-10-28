@@ -807,7 +807,9 @@ class RebacMixin(RebacTrackedMixin):
         return {}
 
     @classmethod
-    def from_db(cls, db: Any, field_names: Any, values: Any) -> RebacMixin:
+    def from_db(
+        cls, db: Any, field_names: Any, values: Any, *, fetch_mode: Any = None
+    ) -> RebacMixin:
         """Instantiate from a row + snapshot loaded field values.
 
         The snapshot lives on ``instance._rebac_loaded_values`` and powers
@@ -822,7 +824,7 @@ class RebacMixin(RebacTrackedMixin):
         """
         from django.db.models import DEFERRED
 
-        instance = super().from_db(db, field_names, values)
+        instance = super().from_db(db, field_names, values, fetch_mode=fetch_mode)
         snapshot: dict[str, Any] = {}
         for name, value in zip(field_names, values, strict=False):
             if value is DEFERRED:

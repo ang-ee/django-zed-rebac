@@ -10,8 +10,8 @@ make install-dev            # uv sync: the dev group and the caveats, drf, straw
 ```
 
 `make check` needs the `caveats` extra (mypy imports `celpy`). The dev
-tools are a PEP 735 dependency group, not a published extra, so the git pins
-for `mypy` and `django-stubs` in `[tool.uv.sources]` never reach the wheel.
+tools are a PEP 735 dependency group, not a published extra; `mypy` and
+`django-stubs` are the PyPI releases, with no fork pins.
 
 ## Commands
 
@@ -169,7 +169,7 @@ statement counts and compile time per scope. Written assertions are not results.
 
 ## CI matrix
 
-Python 3.14 and Django 6.0, in three workflows:
+Python 3.14 and Django 6.1, in three workflows:
 
 - **CI** (`.github/workflows/ci.yml`) runs on pushes to `main`, on version
   tags and on pull requests, as two parallel jobs. `test (3.14, 6.0)` runs

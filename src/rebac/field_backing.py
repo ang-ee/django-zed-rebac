@@ -57,7 +57,11 @@ class _SourceFilters:
     @property
     def filters(self) -> dict[str, Any]:
         backing = self.relation.backing
-        return dict(backing.filters) if isinstance(backing, (FieldBinding, ConstBinding)) else {}
+        return (
+            stored_filters(backing.filters)
+            if isinstance(backing, (FieldBinding, ConstBinding))
+            else {}
+        )
 
 
 @dataclass(frozen=True, slots=True)
@@ -733,7 +737,7 @@ def _validate_const_filters(
         _query_field, scalar = model_identity_fields(model, lookup.split("__", 1)[0])
         query.add_annotation(Value(None, output_field=scalar), lookup.split("__", 1)[0])
     try:
-        query.add_q(Q(**dict(backing.filters)))
+        query.add_q(Q(**stored_filters(backing.filters)))
     except (FieldError, ValueError, TypeError, ValidationError) as exc:
         raise ValueError(f"invalid constant filters on {model.__name__}: {exc}") from exc
     # Check scalar lookups AND model paths: Django accepts parent_id__name as a traversal.
@@ -784,7 +788,7 @@ def _validate_filters(model: type[models.Model], filters: tuple[tuple[str, Any],
     """Let Django resolve complete lookup paths without executing the query."""
 
     try:
-        model._base_manager.filter(Q(**dict(filters)))
+        model._base_manager.filter(Q(**stored_filters(filters)))
     except (FieldError, ValueError, TypeError, ValidationError) as exc:
         raise ValueError(f"invalid filters on {model.__name__}: {exc}") from exc
 
@@ -853,6 +857,24 @@ def _resolve_field_backing(definition: Definition, relation: Relation) -> Resolv
     )
 
 
+def stored_filters(filters: Iterable[tuple[str, Any]]) -> dict[str, Any]:
+    """Backing filters as lookups on stored rows.
+
+    A ``None`` value means SQL NULL, for a ``JSONField`` too (the candidate
+    side casts it the same way), so it is spelled as the ``isnull`` lookup:
+    Django's ``=None`` on a ``JSONField`` meant the JSON scalar ``null`` and is
+    deprecated in 6.1.
+    """
+
+    stored: dict[str, Any] = {}
+    for lookup, value in filters:
+        if value is None and not lookup.endswith("__isnull"):
+            stored[f"{lookup}__isnull"] = True
+        else:
+            stored[lookup] = value
+    return stored
+
+
 def resolve_field_backing(
     definition: Definition, relation: Relation
 ) -> ResolvedFieldBacking | None:
@@ -900,7 +922,7 @@ def _resolve_attribute_backing(
         field,
         backing.resource,
         backing.value,
-        dict(backing.filters),
+        stored_filters(backing.filters),
     )
 
 

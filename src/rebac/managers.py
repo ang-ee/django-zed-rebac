@@ -1105,7 +1105,8 @@ class RebacQuerySet(models.QuerySet[_M]):
         query.where = WhereNode([query.where, _ScopeWhere(children=[restriction])])
 
     def _clone(self, **kwargs: Any) -> Self:
-        clone: Self = super()._clone(**kwargs)
+        # Django's private clone hook; not in django-stubs.
+        clone: Self = cast(Any, super())._clone(**kwargs)
         clone._rebac_actor = self._rebac_actor
         clone._rebac_action = self._rebac_action
         clone._rebac_sudo_reason = self._rebac_sudo_reason
@@ -1140,8 +1141,9 @@ class RebacQuerySet(models.QuerySet[_M]):
             clone = self._clone()
             clone._query = combined.query.chain(klass=_RebacQuery)
             clone._iterable_class = combined._iterable_class
-            clone._fields = combined._fields
-            clone._merge_known_related_objects(combined)
+            # Django's private projection and related-object state; not in django-stubs.
+            cast(Any, clone)._fields = cast(Any, combined)._fields
+            cast(Any, clone)._merge_known_related_objects(combined)
         query = clone.query
         if isinstance(query, _RebacQuery):
             query._rebac_boolean_operand = False

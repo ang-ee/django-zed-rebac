@@ -105,9 +105,17 @@ def test_every_policy_write_and_revision_are_atomic(kind, path, failure, monkeyp
         elif path == "create":
             model.objects.create(**fields)
         elif path == "get_or_create":
-            model.objects.get_or_create(**fields)
+            # A None JSONField value is not a lookup Django 6.1 accepts
+            # without a deprecation; it is a default, as a consumer writes it.
+            model.objects.get_or_create(
+                **{k: v for k, v in fields.items() if v is not None},
+                defaults={k: v for k, v in fields.items() if v is None},
+            )
         elif path == "update_or_create":
-            model.objects.update_or_create(**fields)
+            model.objects.update_or_create(
+                **{k: v for k, v in fields.items() if v is not None},
+                defaults={k: v for k, v in fields.items() if v is None},
+            )
         elif path == "bulk_create":
             model.objects.bulk_create([row])
         elif path == "instance_update":

@@ -31,7 +31,7 @@ def vendor_database(request):
     mysql = vendor == "mysql"
     worker = os.environ.get("PYTEST_XDIST_WORKER", "master")
     container = f"rebac-schema-test-{os.getpid()}-{worker}-{vendor}"
-    image = "mysql:8.0" if mysql else "postgres:16"
+    image = "mysql:8.4" if mysql else "postgres:16"
     data = "/var/lib/mysql" if mysql else "/var/lib/postgresql/data"
     secret = "MYSQL_ROOT_PASSWORD=schema-test" if mysql else "POSTGRES_PASSWORD=schema-test"
     started = _run(

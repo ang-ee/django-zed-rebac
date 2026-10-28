@@ -228,7 +228,7 @@ def test_savepoint_rollback_then_second_nested_tuple_write():
     first, second, entry, responder = fixture_rows()
 
     def nested_write(**kwargs):
-        savepoint = transaction.savepoint()
+        savepoint = transaction.savepoint_create()
         backend().write_relationships(
             [RelationshipTuple(ObjectRef("blog/post", "rolled"), "viewer", CAROL)]
         )

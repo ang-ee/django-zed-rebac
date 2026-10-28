@@ -165,10 +165,15 @@ def test_candidate_non_scalar_prepared_other_fk_still_raises(folder, monkeypatch
 @pytest.mark.django_db(transaction=True)
 @pytest.mark.parametrize("path", ["metadata", "other__metadata"])
 @pytest.mark.parametrize(
-    ("suffix", "expected", "matches"), [("", None, False), ("__isnull", True, True)]
+    ("suffix", "expected", "matches"), [("", None, True), ("__isnull", True, True)]
 )
 @isolate_apps("tests.testapp")
 def test_candidate_json_none_filters_match_persisted_sql_null(path, suffix, expected, matches):
+    """A ``None`` backing filter means SQL NULL, on a JSONField too: the stored
+    lookup is spelled ``isnull`` (Django 6.1 deprecates ``=None`` as JSON null),
+    and the candidate projection casts the value the same way."""
+    from rebac.field_backing import stored_filters
+
     class JsonTarget(models.Model):
         metadata = models.JSONField(null=True)
 
@@ -189,7 +194,8 @@ def test_candidate_json_none_filters_match_persisted_sql_null(path, suffix, expe
     try:
         target = JsonTarget.objects.create(metadata={"existing": True})
         candidate = JsonCandidate(target=target, other=None, metadata=None)
-        filters = {f"{path}{suffix}": expected}
+        filters = stored_filters([(f"{path}{suffix}", expected)])
+        assert filters == {f"{path}__isnull": True}
         projected = _filter(candidate, "target", target, filters)
         assert projected is not None
         assert projected.exists() is matches

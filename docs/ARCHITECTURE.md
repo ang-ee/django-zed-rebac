@@ -11,7 +11,7 @@
 
 ## TL;DR
 
-`django-zed-rebac` is a **drop-in REBAC engine** for Django 6.0 projects. Add it to `INSTALLED_APPS`, declare your authorisation schema in a per-package `permissions.zed` file, and every queryset, save, and method call is gated against the effective user — without rewriting your viewsets.
+`django-zed-rebac` is a **drop-in REBAC engine** for Django 6.1 projects. Add it to `INSTALLED_APPS`, declare your authorisation schema in a per-package `permissions.zed` file, and every queryset, save, and method call is gated against the effective user — without rewriting your viewsets.
 
 Core capabilities:
 
@@ -2315,6 +2315,13 @@ related-manager wrappers and the explicit-sender receivers.
   a column the policy reads) and write exactly those rows by key, 5,000 keys
   per statement. A row that starts matching the caller's filter in between
   is neither gated nor written. A denied row denies the whole statement.
+- **Database-level deletes.** Django 6.1's `DB_CASCADE`, `DB_SET_NULL` and
+  `DB_SET_DEFAULT` run in the database and send no `pre_delete` /
+  `post_delete`, so the collector never sees the dependent rows: a tracked or
+  resource row removed that way passes no gate and gets no identity cleanup.
+  Relations the policy reads use the Python-level `on_delete` options; the
+  database-level ones are a gap of the same kind as the collector cases
+  pinned under proposal 0011.
 - **Tuple writes.** `write_relationships()` validates every tuple against
   the effective schema and saves the rows in one transaction; model save
   signals run for each row. `delete_relationships()` and queryset deletes on
@@ -3469,7 +3476,7 @@ Three layers of tests define the project target:
 
 The supported matrix is declared once, in `pyproject.toml` (`requires-python`,
 the Django pin) and `.github/workflows/ci.yml`; at the time of writing that is
-Python 3.14 × Django 6.0, with SQLite and PostgreSQL 16 for the `local`
+Python 3.14 × Django 6.1, with SQLite and PostgreSQL 16 for the `local`
 backend. Test databases and temporary files must be worker-local, and fixtures
 must restore process-local state between tests, so any test can run on any
 worker in any order. Random ordering is opt-in with
@@ -3651,9 +3658,12 @@ may add public API and tighten alpha contracts; patch releases are reserved for
 compatible fixes.
 
 LTS support for older Django lines was dropped before 0.7.0. The package
-currently targets Django 6.0.x and Python 3.14+. Package dependencies constrain
-Django and its development stubs to the audited 6.0 line; support for newer
-Django feature releases requires verification of the ORM hooks this package uses.
+currently targets Django 6.1.x and Python 3.14+. Package dependencies constrain
+Django and its development stubs to the audited 6.1 line; support for newer
+Django feature releases requires verification of the ORM hooks this package uses
+(the private queryset, manager, validation and admin hooks it touches are
+listed in the 0.30.0 changelog entry). Database floors follow Django 6.1:
+PostgreSQL 15, MySQL 8.4, SQLite 3.37.
 
 Public API (`rebac.*` direct imports + the schema language) is intended to be
 stable across patch releases. `rebac._internal.*` is private.
