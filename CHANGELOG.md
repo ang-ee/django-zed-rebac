@@ -7,6 +7,12 @@ pre-1.0; breaking changes within a minor version are explicitly called out.
 
 ### Fixed
 
+- A queryset fetch shares one schema snapshot between projected-field guards,
+  SQL compilation and nested prefetches. Guarded subqueries no longer read the
+  stored policy revision twice during one fetch. Independent fetches outside an
+  evaluator still validate their revision, and writes and transaction boundaries
+  invalidate the connection-local snapshot.
+
 - A model whose `Meta` inherits the injected `_rebac_base` option now keeps a
   base manager declared by another parent, including a concrete multi-table
   parent. The inherited fallback no longer masks that manager's write policy.

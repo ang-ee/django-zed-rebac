@@ -1354,7 +1354,9 @@ class RebacQuerySet(models.QuerySet[_M]):
             "enforcement requires model-instance materialisation."
         )
 
+    @schema_operation
     def _fetch_all(self) -> None:
+        """Keep guards, SQL compilation and nested prefetches in one evaluation."""
         fetching = self._result_cache is None
         if fetching:
             self._apply_scope_in_place()

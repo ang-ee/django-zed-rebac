@@ -1012,6 +1012,10 @@ Retry exhaustion uses one uncached load checked against the revision before
 and after; a changing fallback fails closed.
 Within a scope, repeated pinned schema reads and eligible decision-cache hits
 issue no queries. There is no revision SELECT on each cache lookup.
+A Django queryset materialization is one operation: its projected-field guards,
+statement compilation and nested prefetches share the validated snapshot. Outside
+an evaluator, the next independent evaluation validates again. Writes and
+transaction boundaries still invalidate its connection-local pin.
 
 The five policy models (definitions, relations, permissions, caveats and
 overrides) own writes through their shared model/queryset, including base-manager
