@@ -3,6 +3,17 @@
 All notable changes to `django-zed-rebac` are tracked here. The project is in
 pre-1.0; breaking changes within a minor version are explicitly called out.
 
+## Unreleased
+
+### Fixed
+
+- On MySQL, a text identity whose field has its own internal type (a
+  `SlugField`) was cast with `CAST(... AS varchar(64))`, which MySQL refuses;
+  every compiled read of such a type failed with error 1064, and the nightly
+  vendor contract had failed since 0.25.0. The column side of a text identity
+  is now cast as the plain `CharField`/`TextField` type of its length, which
+  Django spells correctly on every vendor.
+
 ## [0.28.0] — 2026-10-16
 
 ### Changed
