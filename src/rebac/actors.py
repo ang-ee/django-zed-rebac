@@ -18,7 +18,7 @@ from collections.abc import AsyncIterator, Callable, Iterator
 from contextlib import asynccontextmanager, contextmanager
 from contextvars import ContextVar
 from importlib import import_module
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 from django.contrib.auth import get_user_model
 
@@ -31,6 +31,9 @@ from .errors import (
 )
 from .resources import model_resource_type, to_object_ref, user_subject_type
 from .types import ObjectRef, SubjectRef
+
+if TYPE_CHECKING:
+    from django.db.models import Model
 
 # ---------- ContextVar ----------
 
@@ -186,7 +189,7 @@ def rebac_subject(*, type: str, id_attr: str = "pk") -> Callable[[type], type]:
     return _decorator
 
 
-def model_identities(model: type[Any], instance: Any) -> set[ObjectRef]:
+def model_identities(model: type[Model], instance: Model) -> set[ObjectRef]:
     """The resource and subject identities one Django model view gives ``instance``.
 
     A model registered as a resource names the row by ``to_object_ref``; a

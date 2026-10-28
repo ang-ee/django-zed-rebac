@@ -31,7 +31,7 @@ jobs:
         uses: astral-sh/setup-uv@v7
       - name: Install dependencies
         run: |
-          uv sync --python 3.14 --managed-python --extra caveats --extra drf --extra strawberry
+          uv sync --locked --python 3.14 --managed-python --extra caveats --extra drf --extra strawberry
           uv run --no-sync python -c 'import sqlite3; print("SQLite", sqlite3.sqlite_version)'
       - name: Lint, format, types and the SQLite suite
         run: make check
@@ -64,8 +64,7 @@ jobs:
         uses: astral-sh/setup-uv@v7
       - name: Install dependencies and PostgreSQL driver
         run: |
-          uv sync --python 3.14 --managed-python --extra caveats --extra drf --extra strawberry
+          uv sync --locked --python 3.14 --managed-python --extra caveats --extra drf --extra strawberry --group postgres
           uv run --no-sync python -c 'import sqlite3; print("SQLite", sqlite3.sqlite_version)'
-          uv pip install 'psycopg[binary]>=3.2,<4'
       - name: PostgreSQL delta
         run: make test-pg

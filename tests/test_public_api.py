@@ -1,107 +1,44 @@
-"""The public import surface documented in CLAUDE.md and ARCHITECTURE.md § Public API surface."""
+"""The public import surface: ARCHITECTURE.md § Public API surface is the one list, and `__all__` matches it."""
 
 from __future__ import annotations
 
 import importlib
+import re
+from pathlib import Path
 
 import pytest
 from django.core.exceptions import PermissionDenied as DjangoPermissionDenied
 
 import rebac
 
-# ARCHITECTURE.md § Public API surface.
-ARCHITECTURE_SURFACE = {
-    "rebac": [
-        "RebacMixin",
-        "RebacTrackedMixin",
-        "RebacManager",
-        "RebacQuerySet",
-        "TrackedManager",
-        "TrackedQuerySet",
-        "require_permission",
-        "rebac_resource",
-        "Backend",
-        "LocalBackend",
-        "SpiceDBBackend",
-        "CheckResult",
-        "Consistency",
-        "Zookie",
-        "ObjectRef",
-        "SubjectRef",
-        "RelationshipTuple",
-        "PermissionDenied",
-        "MissingActorError",
-        "CaveatUnsupportedError",
-        "PermissionDepthExceeded",
-        "NoActorResolvedError",
-        "RelationshipReadError",
-        "ActorLike",
-        "current_actor",
-        "set_current_actor",
-        "actor_context",
-        "sudo",
-        "system_context",
-        "ANONYMOUS_ACTOR",
-        "anonymous_actor",
-        "is_anonymous_actor",
-        "write_relationships",
-        "schema_changes",
-        "delete_relationships",
-        "delete_relationship",
-        "backend",
-        "check_new",
-        "chain_resolvers",
-        "bearer_token",
-        "app_settings",
-    ],
-    "rebac.drf": ["RebacPermission", "RebacFilterBackend"],
-    "rebac.mcp": ["rebac_mcp_tool", "default_actor_resolver", "get_mcp_actor_resolver"],
-    "rebac.schema": ["parse_zed", "validate_schema"],
-    "rebac.memberships": ["grant", "revoke", "members_of", "containers_of"],
-    "rebac.roles": ["grant", "revoke", "roles_of", "members_of"],
-    "rebac.testing": ["install_schema"],
-}
+ROOT = Path(__file__).resolve().parents[1]
 
-# CLAUDE.md § Public API surface.
-CLAUDE_SURFACE = {
-    "rebac": [
-        "RebacMixin",
-        "require_permission",
-        "rebac_resource",
-        "rebac_subject",
-        "Backend",
-        "LocalBackend",
-        "SpiceDBBackend",
-        "backend",
-        "CheckResult",
-        "Consistency",
-        "Zookie",
-        "PermissionResult",
-        "ObjectRef",
-        "SubjectRef",
-        "RelationshipTuple",
-        "ActorLike",
-        "PermissionDenied",
-        "MissingActorError",
-        "CaveatUnsupportedError",
-        "PermissionDepthExceeded",
-        "NoActorResolvedError",
-        "SchemaError",
-        "current_actor",
-        "set_current_actor",
-        "actor_context",
-        "sudo",
-        "system_context",
-        "to_subject_ref",
-        "grant_subject_ref",
-        "to_object_ref",
-        "write_relationships",
-        "delete_relationships",
-        "app_settings",
-    ],
-    "rebac.drf": ["RebacPermission", "RebacFilterBackend"],
-    "rebac.mcp": ["rebac_mcp_tool"],
-}
+
+def _architecture_block() -> str:
+    """The one public API list: the code block under ARCHITECTURE.md § Public API surface."""
+    text = (ROOT / "docs" / "ARCHITECTURE.md").read_text(encoding="utf-8")
+    match = re.search(r"## Public API surface\n\n```python\n(.*?)```", text, re.S)
+    assert match, "ARCHITECTURE.md § Public API surface has no code block"
+    return match.group(1)
+
+
+def _documented_surface() -> dict[str, set[str]]:
+    block = _architecture_block()
+    surface: dict[str, set[str]] = {}
+    top = re.search(r"from rebac import \((.*?)\n\)", block, re.S)
+    assert top
+    names = re.sub(r"#[^\n]*", "", top.group(1))
+    surface["rebac"] = set(re.findall(r"[A-Za-z_][A-Za-z0-9_]*", names))
+    for module, imported in re.findall(
+        r"^from (rebac\.[a-z_.]+)\s+import\s+([^#\n]+)", block, re.M
+    ):
+        surface.setdefault(module, set()).update(
+            name.strip() for name in imported.split(",") if name.strip()
+        )
+    return surface
+
+
+ARCHITECTURE_SURFACE = {module: sorted(names) for module, names in _documented_surface().items()}
 
 PUBLIC_ERRORS = [
     "PermissionDenied",
@@ -139,11 +76,17 @@ def test_architecture_public_surface_is_importable(module: str, name: str) -> No
         assert name in rebac.__all__
 
 
-@pytest.mark.parametrize(("module", "name"), _pairs(CLAUDE_SURFACE))
-def test_claude_md_public_surface_is_importable(module: str, name: str) -> None:
-    assert getattr(importlib.import_module(module), name) is not None
-    if module == "rebac":
-        assert name in rebac.__all__
+def test_every_export_is_in_the_architecture_block() -> None:
+    """AGENTS.md § Public API surface: a name exported and absent from the block is a spec bug."""
+    documented = set(ARCHITECTURE_SURFACE["rebac"])
+    assert sorted(set(rebac.__all__) - documented) == []
+    assert sorted(documented - set(rebac.__all__)) == []
+
+
+def test_agents_md_points_at_the_one_list() -> None:
+    text = (ROOT / "AGENTS.md").read_text(encoding="utf-8")
+    assert "The list lives in one place" in text
+    assert "from rebac import (" not in text
 
 
 def test_celery_adapter_is_not_shipped() -> None:

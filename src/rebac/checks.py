@@ -747,12 +747,15 @@ def check_default_managers(app_configs: Any = None, **kwargs: Any) -> list[check
 
     from .managers import RebacQuerySet
     from .mixins import RebacMixin
+    from .resources import model_resource_type
 
     configs = apps.get_app_configs() if app_configs is None else app_configs
     issues: list[checks.CheckMessage] = []
     for config in configs:
         for model in config.get_models():
-            if not issubclass(model, RebacMixin):
+            # A RebacMixin model without a resource type has no row policy
+            # to scope (a helper table); its manager is its own business.
+            if not issubclass(model, RebacMixin) or not model_resource_type(model):
                 continue
             rows = model._default_manager.all()
             if isinstance(rows, RebacQuerySet):

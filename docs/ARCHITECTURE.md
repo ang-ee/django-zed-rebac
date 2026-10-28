@@ -481,7 +481,7 @@ from rebac import (
     TrackedManager, TrackedQuerySet,    # unscoped; own gated writes; the base for a declared base manager
 
     # Decorators
-    require_permission, rebac_resource,
+    require_permission, rebac_resource, rebac_subject,
 
     # Backend interface
     Backend, LocalBackend, SpiceDBBackend,
@@ -528,6 +528,31 @@ from rebac import (
     model_identities,                   # the resource and subject identities of one model view
     user_subject_type,                  # the installed user model's subject type, no row needed
     proposed_forward_relationships,     # the create gate's field-backed candidate projection
+    to_subject_ref, grant_subject_ref, to_object_ref,   # ActorLike / model -> SubjectRef / ObjectRef
+    resource_id_attr, subject_id_attr,  # the identity attribute a model uses (Meta.rebac_id_attr or the setting)
+    resolve_subjects,                   # the subjects of one relation on one resource
+
+    # Async forms of the bypass blocks
+    asudo, asystem_context,
+
+    # Per-request evaluator and Zookie freshness
+    PermissionEvaluator, evaluator_scope, current_evaluator,
+    zookie_scope, current_zookie, record_zookie, effective_consistency,
+
+    # Results, errors and enums
+    PermissionResult, RebacError, SchemaError, FieldDenyMode,
+
+    # Django auth integration
+    RebacPermissionsMixin,              # Django permission-codename bridge for AUTH_USER_MODEL
+    RebacObjectMeta,                    # the Meta carrier the metaclass reads (rebac_resource_type, ...)
+
+    # Audit
+    emit_audit_event, aemit_audit_event,
+
+    # The MCP adapter, also importable from rebac.mcp
+    rebac_mcp_tool, default_actor_resolver, get_mcp_actor_resolver,
+
+    __version__,
 
     # Settings (advanced)
     app_settings,
@@ -2403,7 +2428,7 @@ The headline feature. By inclusion, every model operation is gated against the e
 
 ### What gets installed
 
-1. `objects = RebacManager.from_queryset(RebacQuerySet)()` replaces the default manager. A concrete model may override `objects` with a `RebacManager` subclass (`RebacManager.from_queryset(...)` keeps a custom queryset's methods and its type); any other default manager leaves the model's reads unscoped and `rebac.E024` reports it.
+1. `objects = RebacManager.from_queryset(RebacQuerySet)()` replaces the default manager. A concrete model may override `objects` with a `RebacManager` subclass (`RebacManager.from_queryset(...)` keeps a custom queryset's methods, and under mypy's Django plugin its type; pyright sees the verbs `RebacManager` declares, typed on the model); any other default manager leaves the model's reads unscoped and `rebac.E024` reports it.
 2. `_default_manager` points at it; the base manager is an **owning, unscoped** manager. When the model declares none, the metaclass injects `_rebac_base = TrackedManager()` and names it in `base_manager_name`, even when consumers declare their own `Meta`. A model that declares `Meta.base_manager_name` keeps its manager, and so does a model whose parent model declares one: every parent model is read in base order, not only the first as in Django's own fallback, so listing `RebacMixin` first does not discard a base manager declared by an abstract parent. `base_manager_name = "_rebac_base"` on the model opts back into the injected one. A declared base manager must be built over a `TrackedQuerySet` subclass (`models.Manager.from_queryset(...)`); class creation raises `ImproperlyConfigured` otherwise, the scoped `RebacManager` included. It may add methods and refuse writes (an append-only queryset), but it must return every row: permission statements read a model's rows, and the write gates read their stored values, through `_base_manager`, so a base manager that filters rows would hide those rows from both. `rebac.E023` reports a declared base manager whose `get_queryset()` returns another queryset class or carries a filter. The base manager never applies actor scope to reads. Its writes that change a backed FK edge (reverse-FK `add(bulk=True)`, `update` of a watched FK) run the backed-edge gate of invariant 5d; an `update` of a watched scalar column through the base manager is not gated (proposal 0013), and collector `SET_NULL` rows are gated under the ambient actor only (proposal 0011).
    Inheriting `_rebac_base` through `class Meta(Parent.Meta)` does not opt back into the fallback: parent models are still searched for a declared manager. Only a `base_manager_name = "_rebac_base"` written on the model's own `Meta` selects that opt-in.
 3. `save_base` owner — create/write and field gates before consumer `pre_save` receivers.
@@ -3291,11 +3316,17 @@ removed packages, installed packages without their former permissions file, and
 removed definitions, relations, permissions and caveats. `--package` restricts
 retirement to that package even when the package is no longer installed.
 
-The mode is independent of `--force-overwrite`: live `no_update` rows and
-unmanaged policy are not independently selected. Explicitly retiring a managed
-parent definition uses Django's native cascade for its children, including
-unmanaged children; their foreign keys cannot survive without the parent. This
-matches existing forced retirement. Retired managed rows are removed regardless
+The mode is independent of `--force-overwrite`: the prune pass retires managed
+records whether or not `--force-overwrite` is given, and never selects live
+`no_update` rows or unmanaged policy on its own; `--force-overwrite` alone
+still deletes stale children including unmanaged ones, and with both flags the
+tuples of an unmanaged stale relation are retired too. A stale child row is
+reported as "retired by --prune-stale" when a managed record owns it (in
+`--check`, "--prune-stale retires"), and as "unmanaged; --force-overwrite to
+delete" otherwise. Explicitly retiring a managed parent definition uses
+Django's native cascade for its children, including unmanaged children; their
+foreign keys cannot survive without the parent. This matches existing forced
+retirement. Retired managed rows are removed regardless
 of `no_update`; the explicit flag authorizes retirement, not replacement of live
 edits. A definition moved to another source package keeps its live target and
 relationships. Its managed metadata transfers to the current source owner when
@@ -3314,17 +3345,9 @@ retirement refuses, with a `CommandError`, to run against a policy alias that
 is not that alias, and skips a database the router does not migrate the model
 to. Retirement, ordinary sync writes, tuple cleanup and the policy revision
 share the existing policy lock and transaction; final stored-policy validation
-can roll them all back. Deleting the tuples is `LocalBackend` behaviour:
-SpiceDB's `WriteSchema` refuses to drop a relation while relationships use
-it, so a deployment that later moves to SpiceDB retires tuples first; this
-is a documented divergence (invariant 1).
-
-`--prune-stale` is independent of `--force-overwrite`: the prune pass retires
-managed records whether or not `--force-overwrite` is given, and
-`--force-overwrite` alone still deletes stale children including unmanaged
-ones. A stale child row is reported as "retired by --prune-stale" when a
-managed record owns it, and as "unmanaged; --force-overwrite to delete"
-otherwise.
+can roll them all back. Deleting the tuples is a deliberate `LocalBackend`
+divergence, listed under § SpiceDB conformance suite: SpiceDB's `WriteSchema`
+refuses to drop a relation while relationships use it.
 
 `--prune-stale` requires confirmation or `--yes`. `--check` requires neither,
 reports retirement as drift and writes nothing. Ordinary sync behavior is
@@ -3578,7 +3601,12 @@ SpiceDB itself. **Planned; not part of the current build.**
     component is accepted. Tests pin the refusal;
   - expiring schema overrides (compared as two effective schemas, before and
     after the deadline);
-  - `check_new` (no SpiceDB equivalent).
+  - `check_new` (no SpiceDB equivalent);
+  - `rebac sync --prune-stale` deletes the tuples naming a retired
+    definition, relation or caveat in the same transaction as the schema
+    write, where SpiceDB's `WriteSchema` refuses the write while such
+    relationships exist (pinned by
+    `tests/test_sync_command.py::test_prune_stale_retires_owned_policy_and_tuples_without_overwriting_live_edits`).
 
   Any other difference is a `LocalBackend` bug.
 - **After it lands.** The in-process oracle stops copying the walker. It

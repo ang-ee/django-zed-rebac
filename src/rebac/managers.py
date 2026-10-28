@@ -1960,7 +1960,7 @@ class RebacManager[M: models.Model](_RebacManagerBase[M]):  # pyright: ignore[re
     # custom queryset's own type; ``get_queryset`` is deliberately not
     # declared, so that inference is Django's.
 
-    def _scoped(self) -> RebacQuerySet[M]:
+    def _rebac_queryset(self) -> RebacQuerySet[M]:
         queryset = self.get_queryset()
         if not isinstance(queryset, RebacQuerySet):
             raise TypeError(
@@ -1970,42 +1970,60 @@ class RebacManager[M: models.Model](_RebacManagerBase[M]):  # pyright: ignore[re
         return queryset
 
     def with_actor(self, actor: ActorLike | None) -> RebacQuerySet[M]:
-        return self._scoped().with_actor(actor)
+        return self._rebac_queryset().with_actor(actor)
 
     def as_user(self, user: Any) -> RebacQuerySet[M]:
-        return self._scoped().as_user(user)
+        return self._rebac_queryset().as_user(user)
 
     def as_agent(self, agent: Any, *, on_behalf_of: Any | None = None) -> RebacQuerySet[M]:
-        return self._scoped().as_agent(agent, on_behalf_of=on_behalf_of)
+        return self._rebac_queryset().as_agent(agent, on_behalf_of=on_behalf_of)
 
     def with_action(self, action: str) -> RebacQuerySet[M]:
-        return self._scoped().with_action(action)
+        return self._rebac_queryset().with_action(action)
 
     def on_field_deny(self, mode: FieldDenyMode) -> RebacQuerySet[M]:
-        return self._scoped().on_field_deny(mode)
+        return self._rebac_queryset().on_field_deny(mode)
 
     def for_write(self) -> RebacQuerySet[M]:
-        return self._scoped().for_write()
+        return self._rebac_queryset().for_write()
 
     def readable(self, field: str) -> models.Expression:
-        return self._scoped().readable(field)
+        return self._rebac_queryset().readable(field)
 
     def rebac_select_related(self, *fields: Any) -> RebacQuerySet[M]:
-        return self._scoped().rebac_select_related(*fields)
+        return self._rebac_queryset().rebac_select_related(*fields)
 
     def rebac_prefetch_related(self, *lookups: Any) -> RebacQuerySet[M]:
-        return self._scoped().rebac_prefetch_related(*lookups)
+        return self._rebac_queryset().rebac_prefetch_related(*lookups)
 
     def sudo(self, *, reason: str) -> RebacQuerySet[M]:
-        return self._scoped().sudo(reason=reason)
+        return self._rebac_queryset().sudo(reason=reason)
 
     def system_context(self, *, reason: str) -> RebacQuerySet[M]:
-        return self._scoped().system_context(reason=reason)
+        return self._rebac_queryset().system_context(reason=reason)
+
+    def scoped(self) -> RebacQuerySet[M]:
+        return self._rebac_queryset().scoped()
+
+    def scoped_for_aggregate(self) -> RebacQuerySet[M]:
+        return self._rebac_queryset().scoped_for_aggregate()
+
+    def actor(self) -> SubjectRef | None:
+        return self._rebac_queryset().actor()
+
+    def is_sudo(self) -> bool:
+        return self._rebac_queryset().is_sudo()
+
+    def effective_actor(self, *, strict: bool = False) -> tuple[SubjectRef | None, bool]:
+        return self._rebac_queryset().effective_actor(strict=strict)
+
+    def insert(self, obj: M) -> M:
+        return self._rebac_queryset().insert(obj)
 
     def raw(
         self, raw_query: str, params: Any = (), translations: Any = None, using: Any = None
     ) -> Any:
-        queryset = self._scoped()
+        queryset = self._rebac_queryset()
         _, bypass = queryset.effective_actor(strict=True)
         if not bypass:
             raise PermissionDenied("raw() cannot be actor-scoped; use sudo or system_context")

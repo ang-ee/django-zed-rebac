@@ -324,3 +324,18 @@ def test_the_decision_marker_is_not_pickled(validation_rows):
     row.__dict__["_rebac_save_verdict"] = True
     copy = pickle.loads(pickle.dumps(row))
     assert "_rebac_save_verdict" not in copy.__dict__
+
+
+def test_a_multi_table_child_has_no_pk_rule_of_its_parent(validation_rows):
+    """Django checks a primary key per the model class that owns the check; a
+    saved multi-table child, whose key is the parent link, has no cross-row
+    rule, so no rehearsal and no audit row."""
+    from tests.testapp.models import ParentLinkedChild
+
+    row = ParentLinkedChild(owner=validation_rows.alice)
+    row._state.adding = False
+    row.pk = 1
+    assert not row._rebac_compares_other_rows("validate_unique", None)
+    adding = ParentLinkedChild(owner=validation_rows.alice)
+    adding.pk = 1
+    assert adding._rebac_compares_other_rows("validate_unique", None)

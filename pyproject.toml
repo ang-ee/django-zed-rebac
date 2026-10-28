@@ -62,6 +62,10 @@ dev = [
     "django-stubs-ext>=6.0,<6.1",
     "strawberry-graphql-django>=0.86.0",
 ]
+# Database drivers for tier 2 and the vendor contracts (make test-pg,
+# make test-schema-vendors); mysqlclient builds against libmysqlclient.
+postgres = ["psycopg[binary]>=3.2,<4"]
+mysql = ["mysqlclient>=2.2"]
 
 # Native manager inference and Django's private QuerySet hooks need two
 # reviewed fixes that upstream has not released yet (branches ``rebac`` of

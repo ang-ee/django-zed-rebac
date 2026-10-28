@@ -35,9 +35,20 @@ def verbs_on_a_model_manager(actor: SubjectRef) -> None:
     assert_type(Post.objects.rebac_select_related("author").get(), Post)
     assert_type(Post.objects.rebac_prefetch_related("tags").get(), Post)
     assert_type(Post.objects.readable("title"), models.Expression)
+    assert_type(Post.objects.insert(Post(title="x")), Post)
+    assert_type(Post.objects.actor(), SubjectRef | None)
 
 
 def verbs_on_a_custom_queryset(actor: SubjectRef) -> None:
     rows = PostQuerySet(model=Post)
     assert_type(rows.with_actor(actor).published(), PostQuerySet)
     assert_type(rows.sudo(reason="sample").published().get(), Post)
+
+
+def verbs_on_a_from_queryset_manager(actor: SubjectRef) -> None:
+    # pyright sees the RebacManager declarations here; the custom queryset's
+    # own methods and type are a mypy-plugin guarantee (tests/test_manager_typing.py).
+    manager: RebacManager[Post] = PostManager()
+    manager.model = Post
+    assert_type(manager.with_actor(actor).count(), int)
+    assert_type(manager.actor(), SubjectRef | None)

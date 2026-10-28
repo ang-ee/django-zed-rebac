@@ -374,9 +374,10 @@ class RebacTrackedMixin(models.Model, metaclass=RebacModelBase):
         instance was loaded out of the write, even when they were assigned, so
         the check passes without them.  A caller that validates the instance
         after a passing check, with more access than the actor (unique or
-        constraint checks under ``system_context``), excludes the fields the
-        actor may not read (``denied_read_fields()``), or the validation
-        answers for values the actor can neither read nor write.
+        constraint checks under ``system_context``), excludes the fields
+        redacted when it loaded (``redacted_fields(instance)``), as
+        ``validate_unique()`` does, or the validation answers for values the
+        actor can neither read nor write.
         """
         from .audit import SaveCheck, save_check
         from .errors import PermissionDenied
@@ -525,14 +526,8 @@ class RebacMixin(RebacTrackedMixin):
         See :meth:`_rebac_validation_scope`.
         """
 
-        outermost = _SAVE_VERDICT not in vars(self)
-        if outermost:
-            vars(self)[_SAVE_VERDICT] = None
-        try:
+        with self._rebac_save_decision():
             super().full_clean(exclude, validate_unique, validate_constraints)
-        finally:
-            if outermost:
-                vars(self).pop(_SAVE_VERDICT, None)
 
     def validate_unique(self, exclude: Collection[str] | None = None) -> None:
         """Check field uniqueness against every row once this row's save may proceed.
@@ -566,16 +561,28 @@ class RebacMixin(RebacTrackedMixin):
         call. The marker is removed when the step established it.
         """
 
-        outermost = _SAVE_VERDICT not in vars(self)
-        if outermost:
-            vars(self)[_SAVE_VERDICT] = None
-        try:
+        with self._rebac_save_decision():
             check = self._rebac_validation_scope(step, exclude)
             if check is None:
                 return
             scope, unwritten = check
             with scope:
                 run({*(exclude or ()), *unwritten} if unwritten else exclude)
+
+    @contextmanager
+    def _rebac_save_decision(self) -> Iterator[None]:
+        """Own the save decision for a validation call, unless an enclosing call does.
+
+        The marker holds ``None`` until the first cross-row rule asks, then the
+        verdict; it is removed on the outermost exit, so nothing survives the
+        call (and ``__getstate__`` never pickles it).
+        """
+
+        outermost = _SAVE_VERDICT not in vars(self)
+        if outermost:
+            vars(self)[_SAVE_VERDICT] = None
+        try:
+            yield
         finally:
             if outermost:
                 vars(self).pop(_SAVE_VERDICT, None)
@@ -604,12 +611,11 @@ class RebacMixin(RebacTrackedMixin):
             return nullcontext(), frozenset()
         if self.is_sudo():
             return system_context(reason=f"{self._meta.label_lower}.{step}"), frozenset()
-        actor, bypass = self.effective_actor()
+        actor, _ = self.effective_actor()
         if actor is None:
             # An ambient bypass already reads every row; no actor reads as
             # strict mode allows.
             return nullcontext(), frozenset()
-        del bypass
         if not self._rebac_save_allowed():
             return None
         unwritten = frozenset() if self._state.adding else redacted_fields(self)
@@ -637,8 +643,11 @@ class RebacMixin(RebacTrackedMixin):
         unique_checks, date_checks = cast(Any, self)._get_unique_checks(exclude=set(exclude or ()))
         if date_checks:
             return True
-        pk_names = {field.name for field in self._meta.pk_fields}
-        for _model, names in unique_checks:
+        for model_class, names in unique_checks:
+            # Django skips a primary-key check unless the row is being added
+            # with its key set, per the model class that owns the check (a
+            # multi-table parent's key is not the child's).
+            pk_names = {field.name for field in model_class._meta.pk_fields}
             if set(names) <= pk_names and not (self._state.adding and self.pk is not None):
                 continue
             return True

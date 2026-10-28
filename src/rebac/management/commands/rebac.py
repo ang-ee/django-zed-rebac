@@ -23,9 +23,11 @@ from typing import TYPE_CHECKING, Any, cast
 
 from django.apps import apps
 from django.core.management.base import BaseCommand, CommandError
-from django.db import connections
+from django.db import connections, router
+from django.db.models import Q
 from django.utils import timezone
 
+from ...conf import app_settings
 from ...errors import SchemaError
 from ...models.resource import RebacResource
 from ...schema import Schema, render_zed, resolve_schema_path
@@ -710,19 +712,19 @@ class Command(BaseCommand):
             # Unmanaged rows (a consumer's own additions) are only ever
             # deleted by --force-overwrite; a managed stale row is retired by
             # --prune-stale through its managed record.
-            managed: set[Any] = set()
-            if retire:
-                ct = ContentType.objects.db_manager(using).get_for_model(model_cls)
-                managed = set(
-                    PackageManagedRecord.objects.using(using)
-                    .filter(target_ct=ct, target_pk__in=[obj.pk for obj in stale])
-                    .values_list("target_pk", flat=True)
-                )
+            ct = ContentType.objects.db_manager(using).get_for_model(model_cls)
+            managed = set(
+                PackageManagedRecord.objects.using(using)
+                .filter(target_ct=ct, target_pk__in=[obj.pk for obj in stale])
+                .values_list("target_pk", flat=True)
+            )
             for obj in stale:
-                if obj.pk in managed:
-                    hint = "retired by --prune-stale" if not check_only else "--prune-stale retires"
-                else:
+                if obj.pk not in managed:
                     hint = "unmanaged; --force-overwrite to delete"
+                elif retire:
+                    hint = "--prune-stale retires" if check_only else "retired by --prune-stale"
+                else:
+                    hint = "--prune-stale or --force-overwrite to delete"
                 self.stdout.write(
                     self.style.WARNING(
                         f"  ! drift: stale {model_cls.__name__} "
@@ -843,9 +845,6 @@ class Command(BaseCommand):
         deleting on the wrong database, and skips a database the router
         does not migrate the model to (as ``cleanup_identities`` does).
         """
-        from django.db import router
-        from django.db.models import Q
-
         from ...models import active_relationship_model
 
         model = active_relationship_model()
@@ -904,11 +903,9 @@ class Command(BaseCommand):
         storage the ``RebacResource`` rows of a retired type go too, as
         ``cleanup_identities`` removes them for deleted objects.
         """
-        from ...conf import app_settings
-        from ...models import RebacResource
-
+        queries = cls._stale_relationship_queries(external_ids, using=using)
         counts: dict[str, int] = {}
-        for fragment, query in cls._stale_relationship_queries(external_ids, using=using).items():
+        for fragment, query in queries.items():
             deleted, _ = query.delete()
             counts[fragment] = deleted
         retired_types = sorted(
@@ -916,7 +913,9 @@ class Command(BaseCommand):
             for external_id in external_ids
             if external_id.startswith("definition:")
         )
-        if retired_types and app_settings.REBAC_LOCAL_BACKEND_STORAGE == "registry":
+        # The registry rows go with the tuples, under the same router guard
+        # (no queries: the router refused the database).
+        if queries and retired_types and app_settings.REBAC_LOCAL_BACKEND_STORAGE == "registry":
             RebacResource.objects.using(using).filter(resource_type__in=retired_types).delete()
         return counts
 

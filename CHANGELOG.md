@@ -43,9 +43,11 @@ pre-1.0; breaking changes within a minor version are explicitly called out.
   Django's own checks; a `CheckConstraint` alone triggers no rehearsal.
 - Development tools are a PEP 735 dependency group, not a published `dev`
   extra: `uv sync --extra caveats --extra drf --extra strawberry` (or
-  `make install-dev`) installs them. `mypy` and `django-stubs` are pinned to
-  reviewed forks under `[tool.uv.sources]` until upstream releases carry the
-  manager-inference fixes; the pins never reach the wheel.
+  `make install-dev`) installs them; the database drivers are the `postgres`
+  and `mysql` groups. `mypy` and `django-stubs` are pinned to reviewed forks
+  under `[tool.uv.sources]` until upstream releases carry the
+  manager-inference fixes; the pins never reach the wheel. CI syncs with
+  `--locked`.
 
 ### Fixed
 

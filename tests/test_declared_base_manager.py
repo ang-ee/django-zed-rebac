@@ -300,6 +300,13 @@ def test_check_reports_a_default_manager_that_is_not_scoped():
                 app_label = "testapp"
                 rebac_resource_type = "test/derived"
 
+        class Helper(RebacMixin, models.Model):
+            # No resource type: no row policy, so a plain manager is fine.
+            objects = models.Manager()  # type: ignore[assignment]
+
+            class Meta:
+                app_label = "testapp"
+
         issues = check_default_managers(app_configs=apps.get_app_configs())
 
     assert [issue.id for issue in issues] == ["rebac.E024"]

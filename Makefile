@@ -145,7 +145,7 @@ require-postgres:
 		exit 1; \
 	fi
 	@uv run --no-sync python -c 'import psycopg' 2>/dev/null || { \
-		echo "psycopg is not installed: uv pip install 'psycopg[binary]>=3.2,<4'" >&2; \
+		echo "psycopg is not installed: uv sync --group postgres (keeps the dev group and extras)" >&2; \
 		exit 1; \
 	}
 
@@ -157,7 +157,7 @@ require-docker:
 
 require-vendor-drivers:
 	@uv run --no-sync python -c 'import MySQLdb, psycopg' 2>/dev/null || { \
-		echo "The vendor contracts need both drivers: uv pip install 'psycopg[binary]>=3.2,<4' mysqlclient" >&2; \
+		echo "The vendor contracts need both drivers: uv sync --group postgres --group mysql" >&2; \
 		exit 1; \
 	}
 
