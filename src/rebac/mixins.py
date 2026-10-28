@@ -15,7 +15,7 @@ overrides where the captured values land.
 from __future__ import annotations
 
 from collections.abc import Callable, Collection, Iterable, Iterator, Mapping
-from contextlib import AbstractContextManager, ExitStack, contextmanager, nullcontext
+from contextlib import AbstractContextManager, contextmanager, nullcontext
 from contextvars import ContextVar
 from dataclasses import dataclass
 from dataclasses import field as dataclass_field
@@ -28,11 +28,17 @@ from django.db.models.base import ModelBase
 from django.db.models.options import DEFAULT_NAMES
 
 from ._id import resource_id_attr
-from .actors import _as_actor_only, actor_context, is_sudo, system_context
+from .actors import _as_actor_only, _bypass_unaudited, actor_context, is_sudo, system_context
 from .conf import app_settings
 from .errors import PermissionDenied
-from .field_visibility import backend_schema, gated_read_fields, redacted_fields
-from .managers import RebacManager, TrackedManager, TrackedQuerySet
+from .field_visibility import (
+    backend_schema,
+    effective_field_deny_mode,
+    gated_read_fields,
+    redacted_fields,
+    runtime_field_deny_mode,
+)
+from .managers import RebacManager, TrackedManager, TrackedQuerySet, _hidden_from
 from .preflight import _check_new_model
 from .resources import model_resource_type
 from .schema.walker import field_gated_actions
@@ -547,13 +553,42 @@ class RebacMixin(RebacTrackedMixin):
         See :meth:`_rebac_validation_scope`.
         """
 
-        self._rebac_validation_step("validate_constraints", exclude, super().validate_constraints)
+        self._rebac_validation_step("validate_constraints", exclude, self._rebac_constraints)
+
+    def _rebac_constraints(self, exclude: Collection[str] | None, hidden: frozenset[str]) -> None:
+        """Django's ``validate_constraints``, with ``hidden`` left out of cross-row constraints only.
+
+        A ``CheckConstraint`` reads the instance alone, so a field the actor
+        may not filter on is no reason to skip it; Django's own loop
+        (``Model.validate_constraints``) is kept, with that one difference.
+        """
+
+        if not hidden:
+            super().validate_constraints(exclude)
+            return
+        using = router.db_for_write(type(self), instance=self)
+        errors: dict[str, list[ValidationError]] = {}
+        for model_class, constraints in self.get_constraints():
+            for constraint in constraints:
+                excluded: set[str] = set(exclude or ())
+                if not isinstance(constraint, models.CheckConstraint):
+                    excluded |= hidden
+                fields: tuple[str, ...] = tuple(getattr(constraint, "fields", ()))
+                try:
+                    constraint.validate(model_class, self, exclude=excluded, using=using)
+                except ValidationError as error:
+                    if getattr(error, "code", None) == "unique" and len(fields) == 1:
+                        errors.setdefault(fields[0], []).append(error)
+                    else:
+                        errors = error.update_error_dict(errors)
+        if errors:
+            raise ValidationError(errors)
 
     def _rebac_validation_step(
         self,
         step: str,
         exclude: Collection[str] | None,
-        run: Callable[[Collection[str] | None], None],
+        run: Callable[..., None],
     ) -> None:
         """Run Django's ``step`` under this row's validation scope.
 
@@ -569,9 +604,13 @@ class RebacMixin(RebacTrackedMixin):
             check = self._rebac_validation_scope(step, exclude)
             if check is None:
                 return
-            scope, unwritten = check
+            scope, unwritten, hidden = check
+            excluded = {*(exclude or ()), *unwritten} if unwritten else exclude
             with scope:
-                run({*(exclude or ()), *unwritten} if unwritten else exclude)
+                if step == "validate_constraints":
+                    self._rebac_constraints(excluded, hidden)
+                else:
+                    run({*(excluded or ()), *hidden} if hidden else excluded)
 
     @contextmanager
     def _rebac_save_decision(self) -> Iterator[None]:
@@ -593,58 +632,77 @@ class RebacMixin(RebacTrackedMixin):
 
     def _rebac_validation_scope(
         self, step: str, exclude: Collection[str] | None
-    ) -> tuple[AbstractContextManager[Any], frozenset[str]] | None:
+    ) -> tuple[AbstractContextManager[Any], frozenset[str], frozenset[str]] | None:
         """How Django's ``step`` (``validate_unique`` or ``validate_constraints``) runs, or ``None``.
 
         A rule that compares this row with other rows reads rows the actor may
-        not see. Under an actor it runs with every row visible, in a named
-        system context attributed to that actor, only when this row's save
-        would pass its REBAC gates (:meth:`_rebac_gates_admit`). When the
-        gates refuse, or the rehearsal cannot reach them, the step still runs,
-        as the actor alone: the rows the actor can read answer, no ambient
-        bypass applies, and the fields a ``read__<field>`` gate protects are
-        left out (a filter on them is refused). A refused save therefore
-        learns nothing it could not read, and Django's own errors (a
-        duplicate it can see, a ``CheckConstraint``) still stand. While a
-        decision is pending (a clean inside the rehearsed save) ``None`` skips
-        the step: the enclosing call runs it. For a saved row the step leaves
-        out the fields redacted when it loaded (the second item): its save
-        leaves them unwritten. The step runs as it is for a model without row
-        policy, when none of its rules reads other rows, under a bypass that
-        is already in effect, and with no actor (where strict mode refuses an
-        actor-less read). The instance's own bypass (``sudo``) enters a system
-        context under its own reason; the pinned actor outranks an ambient
-        bypass, as everywhere.
+        not see. Under an actor it runs with every row visible, in a system
+        context attributed to that actor, only when this row's save would pass
+        its REBAC gates (:meth:`_rebac_gates_admit`). When the gates refuse, or
+        the rehearsal cannot reach them, the step still runs, as the actor
+        alone: the rows the actor can read answer, no ambient bypass applies,
+        and the fields the filter guard would refuse (the third item, by the
+        guard's own rule per model class) are left out of the cross-row rules.
+        A refused save therefore learns nothing it could not read, and
+        Django's own errors (a duplicate it can see, a ``CheckConstraint``)
+        still stand. While a decision is pending (a clean inside the rehearsed
+        save) ``None`` skips the step: the enclosing call runs it; any other
+        row cleaned inside a rehearsal validates as the actor alone, since a
+        bypass entered there could not be audited. For a saved row the step
+        leaves out the fields redacted when it loaded (the second item): its
+        save leaves them unwritten. The step runs as it is for a model without
+        row policy, when none of its rules reads other rows, under a bypass
+        that is already in effect, and with no actor (where strict mode
+        refuses an actor-less read). The instance's own bypass (``sudo``)
+        enters a system context under its own reason; the pinned actor
+        outranks an ambient bypass, as everywhere.
         """
+        from .audit import save_check
 
+        none = frozenset[str]()
         if not model_resource_type(type(self)) or not self._rebac_compares_other_rows(
             step, exclude
         ):
-            return nullcontext(), frozenset()
+            return nullcontext(), none, none
+        running = save_check.get()
+        if running is not None and running.target is self:
+            return None
         label = f"{self._meta.label_lower}.{step}"
+        unwritten = none if self._state.adding else redacted_fields(self)
         if self.is_sudo():
-            return system_context(reason=self._rebac_sudo_reason or label), frozenset()
+            if running is not None:
+                return _bypass_unaudited(self._rebac_sudo_reason or label), none, none
+            return system_context(reason=self._rebac_sudo_reason or label), none, none
         actor, _ = self.effective_actor()
         if actor is None:
             # An ambient bypass already reads every row; no actor reads as
             # strict mode allows.
-            return nullcontext(), frozenset()
-        verdict = self._rebac_gates_admit()
-        if verdict is None:
-            return None
-        unwritten = frozenset() if self._state.adding else redacted_fields(self)
-        if verdict:
-            return self._rebac_elevated(actor, label), unwritten
-        return _as_actor_only(actor), unwritten | gated_read_fields(type(self))
+            return nullcontext(), none, none
+        if running is None:
+            verdict = self._rebac_gates_admit()
+            if verdict is None:
+                return None
+            if verdict:
+                return self._rebac_elevated(actor, label), unwritten, none
+        return _as_actor_only(actor), unwritten, self._rebac_hidden_fields(actor)
+
+    def _rebac_hidden_fields(self, actor: SubjectRef) -> frozenset[str]:
+        """The gated fields a filter would be refused on, by the guard's rule, for every model class of this row."""
+
+        if runtime_field_deny_mode(effective_field_deny_mode(self._rebac_field_deny)) == "allow":
+            return frozenset()
+        hidden: set[str] = set()
+        for model in (type(self), *self._meta.get_parent_list()):
+            hidden.update(_hidden_from(actor, model, gated_read_fields(model)))
+        return frozenset(hidden)
 
     @staticmethod
-    def _rebac_elevated(actor: SubjectRef, reason: str) -> AbstractContextManager[Any]:
+    @contextmanager
+    def _rebac_elevated(actor: SubjectRef, reason: str) -> Iterator[None]:
         """A system context whose audit row names ``actor``, the actor it answers for."""
 
-        stack = ExitStack()
-        stack.enter_context(actor_context(actor))
-        stack.enter_context(system_context(reason=reason))
-        return stack
+        with actor_context(actor), system_context(reason=reason):
+            yield
 
     def _rebac_compares_other_rows(self, step: str, exclude: Collection[str] | None) -> bool:
         """Whether Django's ``step`` has a rule that reads rows other than this one.
@@ -671,7 +729,10 @@ class RebacMixin(RebacTrackedMixin):
         # Django's own inventory of the checks validate_unique() will run;
         # private, unchanged since 1.x, and not in django-stubs.
         unique_checks, date_checks = cast(Any, self)._get_unique_checks(exclude=excluded)
-        if date_checks:
+        # _perform_date_checks skips a check whose date is None.
+        if any(
+            getattr(self, unique_for) is not None for _m, _lookup, _field, unique_for in date_checks
+        ):
             return True
         for model_class, names in unique_checks:
             # Django skips a primary-key check unless the row is being added
@@ -681,7 +742,7 @@ class RebacMixin(RebacTrackedMixin):
             pk_names = {field.name for field in model_class._meta.pk_fields}
             if set(names) <= pk_names and not (self._state.adding and self.pk is not None):
                 continue
-            if all(
+            if any(
                 getattr(self, model_class._meta.get_field(name).attname, None) is None
                 for name in names
             ):

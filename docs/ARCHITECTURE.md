@@ -1586,10 +1586,17 @@ during validation as they would during the save. When the gates refuse, or
 the rehearsal cannot reach them (a related row that does not exist, a
 `ValidationError` the consumer's `save()` raises, a `TypeError` or
 `ValueError`), the step still runs, as the actor alone: the rows the actor
-can read answer, no ambient bypass applies, and the fields a `read__<field>`
-gate protects are left out. A refused save therefore learns nothing it could
-not read, and Django's own errors (a duplicate it can see, a
-`CheckConstraint`) still stand as form errors. A loaded row also excludes
+can read answer, no ambient bypass applies, and the cross-row rules leave
+out the gated fields a filter would be refused on, by the filter guard's own
+rule per model class (none in `"allow"` mode; otherwise the `read__<field>`
+gates that do not hold on every row). A `CheckConstraint` reads the instance
+alone and is never left out for that reason. A refused save therefore learns
+nothing it could not read, and Django's own errors (a duplicate it can see, a
+`CheckConstraint`) still stand as form errors. Inside a rehearsal nothing is
+elevated: the instance being checked skips its cross-row rules (the enclosing
+call runs them), and any other row a consumer `save()` cleans there validates
+as the actor alone, since a bypass entered inside the rolled-back transaction
+could not be audited. A loaded row also excludes
 the fields redacted when it loaded, which its save leaves unwritten. The
 decision is taken once per outermost call, whether that is `full_clean()` or
 a direct `validate_unique()` / `validate_constraints()` as a `ModelForm`

@@ -367,6 +367,21 @@ def _as_actor_only(actor: SubjectRef) -> Iterator[None]:
         _current_actor.reset(actor_token)
 
 
+@contextmanager
+def _bypass_unaudited(reason: str) -> Iterator[None]:
+    """A bypass that writes no audit row: engine-internal, inside a rehearsal.
+
+    Used only while a ``SaveCheck`` runs, where a row written inside the
+    rolled-back transaction would not survive; the bypass being exercised was
+    audited before the rehearsal began (``_audit_bypass_once``).
+    """
+    token = _sudo_state.set({"reason": reason})
+    try:
+        yield
+    finally:
+        _sudo_state.reset(token)
+
+
 def _install_sudo_state(reason: str | None) -> tuple[Any, dict[str, Any], SubjectRef | None]:
     """Reason-check + install the sudo ContextVar slot.
 

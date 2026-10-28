@@ -407,8 +407,77 @@ def test_elevated_validation_is_audited_as_the_pinned_actor(validation_rows):
 
 
 def test_an_ambient_bypass_does_not_answer_for_a_refused_pinned_save(validation_rows):
+    """``code`` on the constraint model is not read-gated, so a leaked ambient
+    bypass would see bob's hidden "taken" and raise; as the actor alone it
+    does not."""
     from rebac import sudo
 
-    row = GuardedUniqueRow(owner=validation_rows.bob, email="bob@example.com", code="C5")
+    row = GuardedConstraintRow(owner=validation_rows.bob, code="taken")
     with sudo(reason="ambient"), actor_context(validation_rows.alice):
         row.with_actor(validation_rows.alice).full_clean()
+
+
+def test_an_instance_bypass_validates_under_its_own_reason(validation_rows):
+    PermissionAuditEvent.objects.all().delete()
+    row = GuardedUniqueRow(owner=validation_rows.bob, email="sudo@example.com", code="C6")
+    row.sudo(reason="instance-bypass").full_clean()
+    rows = PermissionAuditEvent.objects.filter(kind=PermissionAuditEvent.KIND_SUDO_BYPASS)
+    assert rows.exists()
+    assert {r.reason for r in rows} == {"instance-bypass"}
+
+
+def test_in_allow_mode_a_refused_save_still_sees_its_readable_duplicate(validation_rows, settings):
+    """With field read gates not enforced (the default mode), the filter guard
+    refuses nothing, so a refused candidate's gated unique field is still
+    compared against the rows the actor can read."""
+    settings.REBAC_FIELD_READ_MODE = "allow"
+    row = GuardedUniqueRow(owner=validation_rows.bob, email="alice@example.com", code="C7")
+    with actor_context(validation_rows.alice), pytest.raises(ValidationError) as caught:
+        row.full_clean()
+    assert "email" in caught.value.error_dict
+    hidden = GuardedUniqueRow(owner=validation_rows.bob, email="bob@example.com", code="C8")
+    with actor_context(validation_rows.alice):
+        hidden.full_clean()
+
+
+def test_a_check_constraint_on_a_gated_field_still_runs_for_a_refused_save(
+    validation_rows, monkeypatch
+):
+    from django.db import models
+    from django.db.models import Q
+
+    monkeypatch.setattr(
+        GuardedUniqueRow._meta,
+        "constraints",
+        [
+            models.CheckConstraint(
+                condition=Q(code__startswith="ok"), name="validation_unique_code_ok"
+            )
+        ],
+    )
+    row = GuardedUniqueRow(owner=validation_rows.bob, email="check@example.com", code="bad")
+    with actor_context(validation_rows.alice), pytest.raises(ValidationError) as caught:
+        row.full_clean()
+    assert "validation_unique_code_ok" in str(caught.value)
+
+
+def test_another_row_cleaned_inside_a_rehearsal_validates_as_the_actor_alone(
+    validation_rows, monkeypatch
+):
+    """A consumer save() that cleans a second row inside check_save()'s
+    rehearsal never elevates there (the audit row could not survive): the
+    second row is validated as the actor, and a hidden duplicate of it does
+    not surface through the first row's check."""
+    native_save = GuardedConstraintRow.save
+
+    def saving_another(instance, *args, **kwargs):
+        other = GuardedConstraintRow(owner=validation_rows.alice, code="taken")
+        other.full_clean()
+        return native_save(instance, *args, **kwargs)
+
+    monkeypatch.setattr(GuardedConstraintRow, "save", saving_another)
+    PermissionAuditEvent.objects.all().delete()
+    row = GuardedConstraintRow(owner=validation_rows.alice, code="fresh-check")
+    with actor_context(validation_rows.alice):
+        assert row.check_save().allowed
+    assert not PermissionAuditEvent.objects.exists()
