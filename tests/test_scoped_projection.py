@@ -1,3 +1,5 @@
+import operator
+
 import pytest
 from django.db.models import Count, Q, Sum
 from django.test import override_settings
@@ -14,6 +16,7 @@ from rebac import (
 )
 from rebac.backends import LocalBackend, reset_backend
 from rebac.managers import RebacManager, RebacQuerySet
+from rebac.models import PermissionAuditEvent
 from rebac.schema import parse_zed
 from tests.backend_setup import install_schema
 from tests.testapp.models import Post, SluggedPost
@@ -253,3 +256,154 @@ def test_boolean_combination_cannot_escape_to_plain_manager(rows):
     left = Post.objects.with_actor(ALICE).scoped().none()
     with pytest.raises(TypeError, match="require REBAC querysets"):
         left | Post._base_manager.all()
+
+
+@pytest.mark.parametrize("operation", [operator.or_, operator.xor])
+@pytest.mark.parametrize("eager", [False, True])
+@pytest.mark.parametrize("right_sliced", [False, True])
+@pytest.mark.pg_delta
+def test_sliced_boolean_combination_keeps_custom_queryset_scope_and_rebinding(
+    rows, operation, eager, right_sliced
+):
+    first, second, third, _ = rows
+
+    class CustomPostQuerySet(RebacQuerySet[Post]):
+        def custom(self):
+            return self.filter(title__in=["first", "second", "third"])
+
+    left = CustomPostQuerySet(model=Post, using="default").with_actor(ALICE).order_by("pk")
+    right = CustomPostQuerySet(model=Post).with_actor(BOB).filter(title="third")
+    if eager:
+        left, right = left.scoped(), right.scoped()
+    left = left[:1]
+    if right_sliced:
+        right = right.order_by("pk")[:1]
+    combined = operation(left, right)
+
+    assert type(combined) is CustomPostQuerySet
+    assert combined._result_cache is None
+    assert combined.actor() == ALICE
+    assert combined.db == left.db == "default"
+    assert combined.custom().count() == 2
+    assert list(combined.order_by("pk").values_list("pk", flat=True)) == [first.pk, third.pk]
+    assert list(combined.with_actor(BOB).order_by("pk").values_list("pk", flat=True)) == [
+        second.pk,
+        third.pk,
+    ]
+    outer = Post._base_manager.filter(pk__in=combined.with_actor(BOB).values("pk"))
+    assert set(outer.values_list("pk", flat=True)) == {second.pk, third.pk}
+    denied = combined.with_actor(SubjectRef.of("auth/user", "no-read-grants"))
+    assert denied.count() == 0
+    assert list(denied.values_list("pk", flat=True)) == []
+    assert not Post._base_manager.filter(pk__in=denied.values("pk")).exists()
+    assert left.query.high_mark == 1
+    assert left.actor() == ALICE
+    assert right.actor() == BOB
+    assert left._result_cache is right._result_cache is None
+
+
+@pytest.mark.parametrize("operation", [operator.or_, operator.xor])
+def test_sliced_boolean_operand_bypass_is_audited_once_and_only_when_it_applies(rows, operation):
+    """Django resolves a sliced operand into a pk subquery; that resolution is
+    not a use of the operand's own bypass. The combination's bypass is audited
+    once per evaluation, and not at all once the combination is rebound."""
+    first, second, third, _ = rows
+    PermissionAuditEvent.objects.all().delete()
+    left = Post.objects.sudo(reason="left-sudo").order_by("pk")[:1]
+    right = Post.objects.with_actor(BOB).filter(title="third")
+
+    combined = operation(left, right)
+    assert list(combined.order_by("pk").values_list("pk", flat=True)) == [first.pk, third.pk]
+    bypasses = list(PermissionAuditEvent.objects.filter(kind=PermissionAuditEvent.KIND_SUDO_BYPASS))
+    assert [row.reason for row in bypasses] == ["left-sudo"]
+
+    PermissionAuditEvent.objects.all().delete()
+    # Rebound, the sliced operand is the first row BOB reads, not the first row.
+    rebound = combined.with_actor(BOB)
+    assert list(rebound.order_by("pk").values_list("pk", flat=True)) == [second.pk, third.pk]
+    assert not PermissionAuditEvent.objects.filter(
+        kind=PermissionAuditEvent.KIND_SUDO_BYPASS
+    ).exists()
+
+
+@pytest.mark.parametrize("operation", [operator.or_, operator.xor])
+def test_sliced_boolean_right_operand_without_an_actor_takes_the_left_policy(rows, operation):
+    """An operand with no actor of its own is not an error: the left operand's
+    actor governs every operand, as for an unsliced combination."""
+    left = Post.objects.with_actor(ALICE)
+    right = Post.objects.order_by("pk")[:1]
+
+    combined = operation(left, right)
+
+    readable = list(Post.objects.with_actor(ALICE).order_by("pk").values_list("pk", flat=True))
+    first_pk = Post._base_manager.order_by("pk").values_list("pk", flat=True)[0]
+    expected = readable if operation is operator.or_ else [pk for pk in readable if pk != first_pk]
+    assert list(combined.order_by("pk").values_list("pk", flat=True)) == expected
+    assert combined.actor() == ALICE
+
+
+@pytest.mark.parametrize("operation", [operator.or_, operator.xor])
+@pytest.mark.pg_delta
+def test_sliced_boolean_right_operand_uses_left_policy_before_limit(rows, operation):
+    first, second, _third, _ = rows
+    left = Post.objects.with_actor(ALICE).filter(title="first")
+    right = Post.objects.with_actor(BOB).order_by("pk")[:1]
+
+    combined = operation(left, right)
+
+    expected = [first.pk] if operation is operator.or_ else []
+    assert list(combined.order_by("pk").values_list("pk", flat=True)) == expected
+    assert list(combined.with_actor(BOB).order_by("pk").values_list("pk", flat=True)) == [second.pk]
+    assert right.actor() == BOB
+    assert right.query.high_mark == 1
+
+
+@pytest.mark.parametrize("operation", [operator.or_, operator.xor])
+@pytest.mark.pg_delta
+def test_sliced_boolean_combination_keeps_independent_subquery_actor(rows, operation):
+    _first, second, third, _ = rows
+    independent = Post.objects.with_actor(BOB).order_by("pk").values("pk")[:1]
+    left = Post.objects.with_actor(ALICE).filter(pk__in=independent).order_by("pk")[:1]
+    right = Post.objects.with_actor(BOB).filter(title="third")
+
+    combined = operation(left, right)
+
+    assert list(combined.order_by("pk").values_list("pk", flat=True)) == [third.pk]
+    assert list(combined.with_actor(BOB).order_by("pk").values_list("pk", flat=True)) == [
+        second.pk,
+        third.pk,
+    ]
+    assert list(
+        combined.sudo(reason="verify independent actor").order_by("pk").values_list("pk", flat=True)
+    ) == [
+        second.pk,
+        third.pk,
+    ]
+    assert list(independent.values_list("pk", flat=True)) == [second.pk]
+    assert independent.actor() == BOB
+
+
+@pytest.mark.parametrize("operation", [operator.or_, operator.xor])
+@pytest.mark.pg_delta
+def test_sliced_boolean_combination_drops_caches_and_keeps_native_empty_projection(rows, operation):
+    first, _second, third, _ = rows
+    left = Post.objects.with_actor(ALICE).order_by("pk")[:1]
+    right = Post.objects.with_actor(BOB).filter(title="third")
+    assert [row.pk for row in left] == [first.pk]
+    assert [row.pk for row in right] == [third.pk]
+    left_cache, right_cache = left._result_cache, right._result_cache
+
+    combined = operation(left, right)
+
+    assert combined._result_cache is None
+    assert list(combined.order_by("pk").values_list("pk", flat=True)) == [first.pk, third.pk]
+    assert list(combined.order_by("pk").values_list("pk")) == [(first.pk,), (third.pk,)]
+    assert list(combined.order_by("pk").values("pk")) == [{"pk": first.pk}, {"pk": third.pk}]
+    assert left._result_cache is left_cache
+    assert right._result_cache is right_cache
+    projected = left.values_list("pk", flat=True)
+    empty = right.none().values_list("pk", flat=True)
+    preserved = operation(projected, empty)
+    assert list(preserved) == [first.pk]
+    assert preserved.query.high_mark == 1
+    assert preserved._iterable_class is projected._iterable_class

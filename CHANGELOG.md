@@ -3,7 +3,59 @@
 All notable changes to `django-zed-rebac` are tracked here. The project is in
 pre-1.0; breaking changes within a minor version are explicitly called out.
 
-## Unreleased
+## [0.29.0] — 2026-10-28
+
+### Added
+
+- `rebac sync --prune-stale` retires stale package-owned policy: removed
+  packages, removed permissions files, removed definitions, relations,
+  permissions and caveats. It never overwrites live `no_update` edits and
+  never selects unmanaged schema; retiring a managed parent definition uses
+  Django's cascade for its children. It deletes the tuples naming a retired
+  definition (either end), relation (as relation or subject relation) or
+  caveat, and in registry storage the resource rows of a retired type, in the
+  same policy transaction, on the relationship write alias (a policy alias
+  that is not that alias is refused). It reports the tuples per retired
+  fragment, preserves transferred source ownership, supports `--package` and
+  read-only `--check`, and requires confirmation or `--yes` before writing.
+- Public `model_identities(model, instance)`, `user_subject_type()`,
+  `proposed_forward_relationships(...)` (the create gate's own candidate
+  projection, formerly private), `rebac.field_visibility.redacted_fields(instance)`,
+  and `Relationship.objects.referencing(identities)` in both storage modes,
+  shared with the library's own deletion cleanup.
+- System check `rebac.E024`: a `RebacMixin` model with a resource type whose
+  default manager does not return a `RebacQuerySet`. Django's admin, model
+  forms, related managers and `validate_unique()` read rows through
+  `_default_manager`; a plain manager there leaves those reads unscoped with
+  no `MissingActorError`. **Breaking for such a model:** the check is an
+  error, so `migrate` and `check` stop until `objects` derives from
+  `RebacManager` (or the model drops `RebacMixin`).
+- `RebacManager[M]` and `TrackedManager[M]` are generic in their model;
+  `RebacManager.from_queryset(...)` keeps a custom queryset's methods and type
+  under mypy, and pyright sees every actor verb on `Model.objects`. A
+  consumer-shaped sample (`tests/typing/`) runs under both checkers in tier 1.
+
+### Changed
+
+- Model uniqueness and constraint validation compare other rows with every
+  row visible only after the save gate admits the candidate: a denied write
+  can no longer learn whether a value it cannot read is taken. A refused
+  candidate is still validated, as the actor alone (its readable rows, no
+  ambient bypass, gated fields left out), so a duplicate the actor can see
+  and a `CheckConstraint` remain form errors. The decision is taken once per
+  outermost `full_clean()` or direct `validate_unique()` /
+  `validate_constraints()` call (a `ModelForm` makes the direct calls), and
+  `check_save()` rehearses the model's own `save()` to reach it; while it
+  runs, the decision is pending. The elevated step's audit row names the
+  instance's actor. Which rules count as cross-row follows Django's own
+  checks; a `CheckConstraint` alone triggers no rehearsal.
+- Development tools are a PEP 735 dependency group, not a published `dev`
+  extra: `uv sync --extra caveats --extra drf --extra strawberry` (or
+  `make install-dev`) installs them; the database drivers are the `postgres`
+  and `mysql` groups. `mypy` and `django-stubs` are pinned to reviewed forks
+  under `[tool.uv.sources]` until upstream releases carry the
+  manager-inference fixes; the pins never reach the wheel. CI syncs with
+  `--locked`.
 
 ### Fixed
 
@@ -13,6 +65,23 @@ pre-1.0; breaking changes within a minor version are explicitly called out.
   vendor contract had failed since 0.25.0. The column side of a text identity
   is now cast as the plain `CharField`/`TextField` type of its length, which
   Django spells correctly on every vendor.
+
+- A model whose `Meta` inherits the injected `_rebac_base` option keeps a
+  base manager declared by another parent, including a concrete multi-table
+  parent; the inherited fallback no longer masks that manager's write policy.
+- A queryset fetch shares one schema snapshot between projected-field guards,
+  SQL compilation and nested prefetches; guarded subqueries no longer read
+  the stored policy revision twice during one fetch.
+- A sliced Boolean combination (`qs[:n] | other`, `^`) keeps the left
+  operand's actor, projection and queryset class, and Django's bounded
+  pk subquery for the sliced operand is not a use of that operand's own
+  actor: a sudo operand writes one bypass audit row per evaluation and none
+  once the combination is rebound, and an operand without an actor is not
+  an error. Before, the left-sliced case raised and the right-sliced case
+  kept the wrong actor.
+- `RebacManager.raw()` refuses a getter that returns a plain queryset with
+  `TypeError` instead of an `assert`.
+- The E009 error for a field backing that does not resolve names the reason.
 
 ## [0.28.0] — 2026-10-16
 

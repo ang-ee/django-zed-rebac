@@ -1,8 +1,10 @@
 from __future__ import annotations
 
+import operator
 from typing import Any
 
 import pytest
+from django.db import models
 from django.test import override_settings
 
 from rebac import SubjectRef, sudo
@@ -42,6 +44,73 @@ def test_rebac_manager_from_queryset_copied_methods_use_custom_queryset() -> Non
 
     assert isinstance(queryset, CustomPostQuerySet)
     assert str(queryset.query)
+
+
+@pytest.mark.parametrize("operation", [operator.and_, operator.or_, operator.xor])
+def test_boolean_combinations_preserve_same_custom_queryset(operation) -> None:
+    actor = SubjectRef.of("auth/user", "left")
+    left = CustomPostQuerySet(model=Post).with_actor(actor)
+    right = CustomPostQuerySet(model=Post).with_actor(SubjectRef.of("auth/user", "right"))
+
+    for first, second in ((left, right), (left.none(), right), (left, right.none())):
+        combined = operation(first, second)
+        assert type(combined) is CustomPostQuerySet
+        assert combined is not first
+        assert combined is not second
+        assert combined.actor() == actor
+        assert type(combined.titled("Notes")) is CustomPostQuerySet
+    assert right.actor() == SubjectRef.of("auth/user", "right")
+
+
+@pytest.mark.parametrize("operation", [operator.and_, operator.or_, operator.xor])
+def test_empty_boolean_combinations_preserve_django_right_operand_class(operation) -> None:
+    class OtherPostQuerySet(RebacQuerySet[Post]):
+        pass
+
+    actor = SubjectRef.of("auth/user", "left")
+    left = CustomPostQuerySet(model=Post).with_actor(actor)
+    right = OtherPostQuerySet(model=Post).with_actor(SubjectRef.of("auth/user", "right"))
+    first, second = (left, right.none()) if operation is operator.and_ else (left.none(), right)
+
+    combined = operation(first, second)
+
+    assert type(combined) is OtherPostQuerySet
+    assert combined is not first
+    assert combined is not second
+    assert combined.actor() == actor
+    assert right.actor() == SubjectRef.of("auth/user", "right")
+
+
+def test_manager_dispatches_the_custom_queryset_actor_override() -> None:
+    calls = []
+
+    class ActorPostQuerySet(RebacQuerySet[Post]):
+        def with_actor(self, actor: Any) -> ActorPostQuerySet:
+            calls.append(actor)
+            return super().with_actor(actor)
+
+    manager = RebacManager.from_queryset(ActorPostQuerySet)()
+    manager.model = Post
+    actor = SubjectRef.of("auth/user", "custom-actor")
+
+    queryset = manager.with_actor(actor)
+
+    assert type(queryset) is ActorPostQuerySet
+    assert queryset.model is Post
+    assert queryset.actor() == actor
+    assert calls == [actor]
+
+
+def test_raw_rejects_a_custom_getter_without_rebac_policy() -> None:
+    class PlainGetterManager(RebacManager[Post]):
+        def get_queryset(self) -> models.QuerySet[Post]:
+            return models.QuerySet(model=self.model)
+
+    manager = PlainGetterManager()
+    manager.model = Post
+
+    with pytest.raises(TypeError, match=r"a RebacManager must return a RebacQuerySet"):
+        manager.raw("SELECT 1")
 
 
 def test_with_action_survives_queryset_cloning() -> None:

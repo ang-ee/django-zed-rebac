@@ -6,9 +6,12 @@
 - `uv` installed
 
 ```bash
-uv venv --python 3.14
-make install-dev
+make install-dev            # uv sync: the dev group and the caveats, drf, strawberry extras
 ```
+
+`make check` needs the `caveats` extra (mypy imports `celpy`). The dev
+tools are a PEP 735 dependency group, not a published extra, so the git pins
+for `mypy` and `django-stubs` in `[tool.uv.sources]` never reach the wheel.
 
 ## Commands
 
@@ -67,9 +70,11 @@ gh run view <run-id> --log-failed               # the log of each failed step
   database whose role may create databases. Pytest-django adds worker-specific
   test database names. `tests.settings_postgres` fails if the URL is absent;
   it never uses SQLite.
-- The PostgreSQL targets need the driver:
-  `uv pip install 'psycopg[binary]>=3.2,<4'`. The vendor contracts need Docker
-  and both drivers: `uv pip install 'psycopg[binary]>=3.2,<4' mysqlclient`.
+- The PostgreSQL targets need the driver: `uv sync --group postgres`
+  (add the extras from `make install-dev` to keep them). The vendor contracts
+  need Docker and both drivers: `uv sync --group postgres --group mysql`;
+  `mysqlclient` builds against `libmysqlclient` (`brew install mysql-client`
+  and `PKG_CONFIG_PATH` on macOS).
   Each target checks its prerequisites first and fails naming what is missing;
   none of them skips.
 - Every test has a 10-second timeout, fixtures included. The targets that

@@ -82,7 +82,7 @@ def _check_new_model(
 
     from .actors import to_subject_ref
     from .backends import backend as _current_backend
-    from .field_backing import _proposed_forward_relationships
+    from .field_backing import proposed_forward_relationships
     from .resources import model_resource_type
 
     active_backend = backend if backend is not None else _current_backend()
@@ -104,7 +104,7 @@ def _check_new_model(
     relationships: dict[str, tuple[SubjectRef, ...] | None] = {}
     if definition is not None:
         required_relations = relation_dependencies(schema, resource_type, "create")
-        relationships = _proposed_forward_relationships(
+        relationships = proposed_forward_relationships(
             instance,
             definition,
             required_relations=required_relations,

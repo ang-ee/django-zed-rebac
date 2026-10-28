@@ -954,7 +954,7 @@ def test_unreferenced_dangling_relations_create_without_projection_queries(
                 return UnreferencedCreateCandidate
             return model_for_resource_type(resource_type)
 
-        project = field_backing._proposed_forward_relationships
+        project = field_backing.proposed_forward_relationships
 
         def project_without_queries(*args, **kwargs):
             with CaptureQueriesContext(connection) as queries:
@@ -969,7 +969,7 @@ def test_unreferenced_dangling_relations_create_without_projection_queries(
             with (
                 patch("rebac.field_backing.model_for_resource_type", side_effect=resolve_model),
                 patch(
-                    "rebac.field_backing._proposed_forward_relationships",
+                    "rebac.field_backing.proposed_forward_relationships",
                     side_effect=project_without_queries,
                 ) as projection,
                 patch("rebac.preflight.check_new", wraps=preflight.check_new) as check,

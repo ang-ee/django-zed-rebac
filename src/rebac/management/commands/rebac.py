@@ -3,6 +3,7 @@
 python manage.py rebac sync                     # idempotent
 python manage.py rebac sync --check             # CI gate; non-zero on drift
 python manage.py rebac sync --force-overwrite   # destructive
+python manage.py rebac sync --prune-stale --yes # retire removed package policy
 python manage.py rebac check                    # validate without writes
 python manage.py rebac build-zed                # emit effective.zed
 python manage.py rebac explain <type>.<perm>    # print compiled expression
@@ -22,9 +23,11 @@ from typing import TYPE_CHECKING, Any, cast
 
 from django.apps import apps
 from django.core.management.base import BaseCommand, CommandError
-from django.db import connections
+from django.db import connections, router
+from django.db.models import Q
 from django.utils import timezone
 
+from ...conf import app_settings
 from ...errors import SchemaError
 from ...models.resource import RebacResource
 from ...schema import Schema, render_zed, resolve_schema_path
@@ -77,6 +80,32 @@ def _stale_record_prune_order(external_id: str) -> tuple[int, str]:
     return (order.get(kind, 2), external_id)
 
 
+def _external_id(kind: str, resource_type: str, name: str | None = None) -> str:
+    """The managed-record id of one schema fragment: ``kind:type`` or ``kind:type#name``."""
+    return f"{kind}:{resource_type}" if name is None else f"{kind}:{resource_type}#{name}"
+
+
+def _schema_external_ids(schema: Schema) -> set[str]:
+    """Identify the package-owned fragments of one parsed source."""
+    return {
+        *(_external_id("caveat", caveat.name) for caveat in schema.caveats),
+        *(
+            _external_id("definition", definition.resource_type)
+            for definition in schema.definitions
+        ),
+        *(
+            _external_id("relation", definition.resource_type, relation.name)
+            for definition in schema.definitions
+            for relation in definition.relations
+        ),
+        *(
+            _external_id("permission", definition.resource_type, permission.name)
+            for definition in schema.definitions
+            for permission in definition.permissions
+        ),
+    }
+
+
 class Command(BaseCommand):
     help = "Manage rebac schema and relationships."
 
@@ -91,6 +120,11 @@ class Command(BaseCommand):
             "--force-overwrite",
             action="store_true",
             help="Bypass no_update; destructive.",
+        )
+        p_sync.add_argument(
+            "--prune-stale",
+            action="store_true",
+            help="Retire stale package-owned policy without overwriting live edits.",
         )
         p_sync.add_argument("--package", help="Limit to one package")
         p_sync.add_argument("--yes", action="store_true", help="Skip confirmation")
@@ -260,18 +294,24 @@ class Command(BaseCommand):
 
         check_only = options["check"]
         force = options["force_overwrite"]
+        prune_stale = options["prune_stale"]
         only_package = options.get("package")
-        if force and not check_only and not options["yes"]:
+        if (force or prune_stale) and not check_only and not options["yes"]:
+            flag = "--force-overwrite" if force else "--prune-stale"
             if not sys.stdin.isatty():
-                raise CommandError("Non-interactive --force-overwrite requires --yes.")
-            answer = input(
-                "Overwrite edited schema rows and delete stale policy rows? Type 'yes': "
+                raise CommandError(f"Non-interactive {flag} requires --yes.")
+            action = (
+                "Overwrite edited schema rows and delete stale policy rows"
+                if force
+                else "Retire stale package-owned policy and its relationships"
             )
+            answer = input(f"{action}? Type 'yes': ")
             if answer != "yes":
-                raise CommandError("Schema overwrite cancelled; no changes made.")
+                raise CommandError(f"{flag} cancelled; no changes made.")
 
         sources: list[tuple[Any, Path, Any]] = []
         installed_schemas: list[Schema] = []
+        source_owners: dict[str, str] | None = {} if prune_stale else None
         seen_definitions: dict[str, str] = {}
         seen_caveats: dict[str, str] = {}
         for app_config in apps.get_app_configs():
@@ -304,6 +344,11 @@ class Command(BaseCommand):
                         f"Duplicate caveat {caveat.name!r} found in {previous} and {package_name}"
                     )
                 seen_caveats[caveat.name] = package_name
+            if source_owners is not None:
+                source_owners.update(
+                    (external_id, package_name)
+                    for external_id in sorted(_schema_external_ids(schema))
+                )
             if selected:
                 sources.append((app_config, schema_path, schema))
 
@@ -322,33 +367,58 @@ class Command(BaseCommand):
         alias = options.get("database") or router.db_for_write(SchemaDefinition)
         if check_only:
             with schema_write_atomic(alias):
-                self._apply_schema_sources(sources, check_only=True, force=force, using=alias)
+                self._apply_schema_sources(
+                    sources,
+                    check_only=True,
+                    force=force,
+                    using=alias,
+                    prune_stale=prune_stale,
+                    only_package=only_package,
+                    source_owners=source_owners,
+                )
         else:
             from ...models.schema_write import schema_index_write
 
             # One owner: the policy lock is held and the composed policy is
             # validated once, when every package's rows are written.
             with schema_index_write(alias):
-                self._apply_schema_sources(sources, check_only=False, force=force, using=alias)
+                self._apply_schema_sources(
+                    sources,
+                    check_only=False,
+                    force=force,
+                    using=alias,
+                    prune_stale=prune_stale,
+                    only_package=only_package,
+                    source_owners=source_owners,
+                )
 
     def _apply_schema_sources(
-        self, sources: list[tuple[Any, Path, Any]], *, check_only: bool, force: bool, using: str
+        self,
+        sources: list[tuple[Any, Path, Any]],
+        *,
+        check_only: bool,
+        force: bool,
+        using: str,
+        prune_stale: bool = False,
+        only_package: str | None = None,
+        source_owners: dict[str, str] | None = None,
     ) -> None:
         from ...models import SchemaCaveat, SchemaDefinition, SchemaPermission, SchemaRelation
         from ...models.generation import SchemaGeneration, schema_write_atomic
 
         any_drift = False
+        expected_by_package: dict[str, set[str]] = {}
         for app_config, schema_path, schema in sources:
             package_name = app_config.name
 
             self.stdout.write(f"-> {package_name} ({schema_path})")
 
             with schema_write_atomic(using):
-                expected_external_ids: set[str] = set()
+                expected_external_ids = _schema_external_ids(schema)
+                expected_by_package[package_name] = expected_external_ids
                 # Caveats first (definitions reference them).
                 for caveat in schema.caveats:
-                    external_id = f"caveat:{caveat.name}"
-                    expected_external_ids.add(external_id)
+                    external_id = _external_id("caveat", caveat.name)
                     payload = {
                         "params": [{"name": p.name, "type": p.type} for p in caveat.params],
                         "expression": caveat.expression,
@@ -362,13 +432,13 @@ class Command(BaseCommand):
                         check_only=check_only,
                         force=force,
                         using=using,
+                        transfer_ownership=prune_stale,
                     )
                     any_drift = any_drift or drift
 
                 # Definitions
                 for d in schema.definitions:
-                    external_id = f"definition:{d.resource_type}"
-                    expected_external_ids.add(external_id)
+                    external_id = _external_id("definition", d.resource_type)
                     drift = self._sync_row(
                         SchemaDefinition,
                         natural_key={"resource_type": d.resource_type},
@@ -378,6 +448,7 @@ class Command(BaseCommand):
                         check_only=check_only,
                         force=force,
                         using=using,
+                        transfer_ownership=prune_stale,
                     )
                     any_drift = any_drift or drift
                     schema_def = (
@@ -391,8 +462,7 @@ class Command(BaseCommand):
                     relation_names: set[str] = set()
                     for r in d.relations:
                         relation_names.add(r.name)
-                        external_id = f"relation:{d.resource_type}#{r.name}"
-                        expected_external_ids.add(external_id)
+                        external_id = _external_id("relation", d.resource_type, r.name)
                         allowed = [
                             {
                                 "type": s.type,
@@ -417,14 +487,14 @@ class Command(BaseCommand):
                             check_only=check_only,
                             force=force,
                             using=using,
+                            transfer_ownership=prune_stale,
                         )
                         any_drift = any_drift or drift
 
                     permission_names: set[str] = set()
                     for p in d.permissions:
                         permission_names.add(p.name)
-                        external_id = f"permission:{d.resource_type}#{p.name}"
-                        expected_external_ids.add(external_id)
+                        external_id = _external_id("permission", d.resource_type, p.name)
                         drift = self._sync_row(
                             SchemaPermission,
                             natural_key={"definition": schema_def, "name": p.name},
@@ -434,6 +504,7 @@ class Command(BaseCommand):
                             check_only=check_only,
                             force=force,
                             using=using,
+                            transfer_ownership=prune_stale,
                         )
                         any_drift = any_drift or drift
 
@@ -444,6 +515,7 @@ class Command(BaseCommand):
                         check_only=check_only,
                         force=force,
                         using=using,
+                        retire=prune_stale,
                     )
                     any_drift = any_drift or drift
                     drift = self._prune_schema_children(
@@ -453,15 +525,35 @@ class Command(BaseCommand):
                         check_only=check_only,
                         force=force,
                         using=using,
+                        retire=prune_stale,
                     )
                     any_drift = any_drift or drift
 
+                if not prune_stale:
+                    drift = self._prune_package_records(
+                        package=package_name,
+                        keep_external_ids=expected_external_ids,
+                        check_only=check_only,
+                        force=force,
+                        using=using,
+                    )
+                    any_drift = any_drift or drift
+
+        if prune_stale:
+            from ...models import PackageManagedRecord
+
+            managed = PackageManagedRecord.objects.using(using).all()
+            if only_package is not None:
+                managed = managed.filter(package=only_package)
+            for package in sorted(set(managed.values_list("package", flat=True))):
                 drift = self._prune_package_records(
-                    package=package_name,
-                    keep_external_ids=expected_external_ids,
+                    package=package,
+                    keep_external_ids=expected_by_package.get(package, set()),
                     check_only=check_only,
                     force=force,
                     using=using,
+                    source_owners=source_owners,
+                    retire=True,
                 )
                 any_drift = any_drift or drift
 
@@ -488,6 +580,7 @@ class Command(BaseCommand):
         check_only: bool,
         force: bool,
         using: str = "default",
+        transfer_ownership: bool = False,
     ) -> bool:
         """Sync one schema row, respecting `no_update`. Returns True if drifted."""
         from django.contrib.contenttypes.models import ContentType
@@ -522,6 +615,21 @@ class Command(BaseCommand):
                 },
             )
             return False
+
+        if record is None and transfer_ownership:
+            claims = list(
+                PackageManagedRecord.objects.using(using)
+                .filter(external_id=external_id, target_ct=ct, target_pk=existing.pk)
+                .order_by("pk")[:2]
+            )
+            if len(claims) > 1:
+                raise CommandError(f"Ambiguous source ownership for {external_id!r}.")
+            if claims:
+                if check_only:
+                    return True
+                record = claims[0]
+                record.package = package
+                record.save(using=using, update_fields=["package"])
 
         # Already present. Decide based on the actual row payload, not just
         # the provenance hash: an out-of-band edit can leave the
@@ -581,8 +689,13 @@ class Command(BaseCommand):
         check_only: bool,
         force: bool,
         using: str = "default",
+        retire: bool = False,
     ) -> bool:
-        """Remove relation/permission rows no longer declared by the package schema."""
+        """Remove relation/permission rows no longer declared by the package schema.
+
+        ``force`` is ``--force-overwrite``; ``retire`` is ``--prune-stale``, which
+        also deletes the tuples naming a retired relation.
+        """
         stale = list(
             model_cls.objects.using(using)
             .filter(definition=definition)
@@ -590,21 +703,45 @@ class Command(BaseCommand):
         )
         if not stale:
             return False
-        if check_only or not force:
-            for obj in stale:
-                self.stdout.write(
-                    self.style.WARNING(
-                        f"  ! drift: stale {model_cls.__name__} "
-                        f"{definition.resource_type}#{obj.name} "
-                        "(--force-overwrite to delete)"
-                    )
-                )
-            return True
 
         from django.contrib.contenttypes.models import ContentType
 
         from ...models import PackageManagedRecord
 
+        if check_only or not force:
+            # Unmanaged rows (a consumer's own additions) are only ever
+            # deleted by --force-overwrite; a managed stale row is retired by
+            # --prune-stale through its managed record.
+            ct = ContentType.objects.db_manager(using).get_for_model(model_cls)
+            managed = set(
+                PackageManagedRecord.objects.using(using)
+                .filter(target_ct=ct, target_pk__in=[obj.pk for obj in stale])
+                .values_list("target_pk", flat=True)
+            )
+            for obj in stale:
+                if obj.pk not in managed:
+                    hint = "unmanaged; --force-overwrite to delete"
+                elif retire:
+                    hint = "--prune-stale retires" if check_only else "retired by --prune-stale"
+                else:
+                    hint = "--prune-stale or --force-overwrite to delete"
+                self.stdout.write(
+                    self.style.WARNING(
+                        f"  ! drift: stale {model_cls.__name__} "
+                        f"{definition.resource_type}#{obj.name} ({hint})"
+                    )
+                )
+            return True
+
+        if retire:
+            from ...models import SchemaRelation
+
+            if model_cls is SchemaRelation:
+                deleted = self._delete_stale_relationships(
+                    {_external_id("relation", definition.resource_type, obj.name) for obj in stale},
+                    using=using,
+                )
+                self._report_retired_tuples(deleted)
         ct = ContentType.objects.db_manager(using).get_for_model(model_cls)
         target_pks = [obj.pk for obj in stale]
         PackageManagedRecord.objects.using(using).filter(
@@ -621,7 +758,15 @@ class Command(BaseCommand):
         check_only: bool,
         force: bool,
         using: str = "default",
+        source_owners: dict[str, str] | None = None,
+        retire: bool = False,
     ) -> bool:
+        """Remove the managed records (and their rows) a package no longer declares.
+
+        ``force`` is ``--force-overwrite``; ``retire`` is ``--prune-stale``, which
+        transfers a record another source now owns and deletes the tuples naming
+        a retired definition, relation or caveat.
+        """
         from ...models import PackageManagedRecord
 
         schema_prefixes = ("caveat:", "definition:", "relation:", "permission:")
@@ -633,24 +778,153 @@ class Command(BaseCommand):
         ]
         if not stale:
             return False
-        if check_only or not force:
+        if check_only or not (force or retire):
             for record in stale:
+                owner = source_owners.get(record.external_id) if source_owners else None
+                if owner is not None:
+                    hint = f"--prune-stale transfers to {owner}"
+                elif retire:
+                    hint = "--prune-stale retires" if check_only else "will retire"
+                else:
+                    hint = "--prune-stale or --force-overwrite to delete"
                 self.stdout.write(
                     self.style.WARNING(
-                        f"  ! drift: stale managed row {record.external_id} "
-                        "(--force-overwrite to delete)"
+                        f"  ! drift: stale managed row {record.external_id} ({hint})"
+                    )
+                )
+            if retire:
+                self._report_retired_tuples(
+                    self._count_stale_relationships(
+                        self._retired_ids(stale, source_owners), using=using
                     )
                 )
             return True
 
+        retired_ids = self._retired_ids(stale, source_owners)
+        if retire:
+            self._report_retired_tuples(self._delete_stale_relationships(retired_ids, using=using))
         for record in sorted(
             stale, key=lambda record: _stale_record_prune_order(record.external_id)
         ):
-            target = record.target
-            if target is not None:
-                target.delete(using=using)
+            owner = source_owners.get(record.external_id) if source_owners is not None else None
+            if owner is not None:
+                claimed = (
+                    PackageManagedRecord.objects.using(using)
+                    .filter(
+                        package=owner,
+                        external_id=record.external_id,
+                    )
+                    .exclude(pk=record.pk)
+                    .exists()
+                )
+                if not claimed:
+                    record.package = owner
+                    record.save(using=using, update_fields=["package"])
+                    continue
+            else:
+                target = record.target
+                if target is not None:
+                    target.delete(using=using)
             record.delete(using=using)
         return True
+
+    @staticmethod
+    def _retired_ids(stale: list[Any], source_owners: dict[str, str] | None) -> set[str]:
+        return {
+            record.external_id
+            for record in stale
+            if source_owners is None or record.external_id not in source_owners
+        }
+
+    def _report_retired_tuples(self, counts: dict[str, int]) -> None:
+        for fragment, count in sorted(counts.items()):
+            if count:
+                self.stdout.write(f"  - {count} relationship(s) naming retired {fragment}")
+
+    @staticmethod
+    def _stale_relationship_queries(external_ids: set[str], *, using: str) -> dict[str, Any]:
+        """One queryset of stored tuples per retired fragment, on the relationship write alias.
+
+        Tuples are stored on ``router.db_for_write`` of the relationship model,
+        which is the alias every other tuple write uses; retirement refuses
+        to run against a policy alias that is not that alias rather than
+        deleting on the wrong database, and skips a database the router
+        does not migrate the model to (as ``cleanup_identities`` does).
+        """
+        from ...models import active_relationship_model
+
+        model = active_relationship_model()
+        write_alias = router.db_for_write(model)
+        if write_alias != using:
+            raise CommandError(
+                f"--prune-stale writes policy on {using!r} but relationships live on "
+                f"{write_alias!r}; retire them on one database."
+            )
+        if not router.allow_migrate_model(using, model):
+            return {}
+        rows = model.objects.using(using)
+        resource_types: set[str] = set()
+        relations: set[tuple[str, str]] = set()
+        caveats: set[str] = set()
+        for external_id in sorted(external_ids):
+            kind, _, name = external_id.partition(":")
+            if kind == "definition":
+                resource_types.add(name)
+            elif kind in ("relation", "permission"):
+                # A subject relation may name a permission (``type:id#read``).
+                resource_type, _, relation = name.partition("#")
+                relations.add((resource_type, relation))
+            elif kind == "caveat":
+                caveats.add(name)
+        queries: dict[str, Any] = {}
+        for resource_type in sorted(resource_types):
+            queries[f"definition {resource_type}"] = rows.filter(
+                Q(resource_type=resource_type) | Q(subject_type=resource_type)
+            )
+        for resource_type, relation in sorted(relations):
+            if resource_type in resource_types:
+                continue
+            queries[f"relation {resource_type}#{relation}"] = rows.filter(
+                Q(resource_type=resource_type, relation=relation)
+                | Q(subject_type=resource_type, optional_subject_relation=relation)
+            )
+        for caveat in sorted(caveats):
+            queries[f"caveat {caveat}"] = rows.filter(caveat_name=caveat)
+        return queries
+
+    @classmethod
+    def _count_stale_relationships(cls, external_ids: set[str], *, using: str) -> dict[str, int]:
+        return {
+            fragment: query.count()
+            for fragment, query in cls._stale_relationship_queries(
+                external_ids, using=using
+            ).items()
+        }
+
+    @classmethod
+    def _delete_stale_relationships(cls, external_ids: set[str], *, using: str) -> dict[str, int]:
+        """Retire the tuples naming a retired definition, relation or caveat.
+
+        Deletes through the active relationship model's queryset, on the
+        relationship write alias, inside the sync transaction. In registry
+        storage the ``RebacResource`` rows of a retired type go too, as
+        ``cleanup_identities`` removes them for deleted objects.
+        """
+        queries = cls._stale_relationship_queries(external_ids, using=using)
+        counts: dict[str, int] = {}
+        for fragment, query in queries.items():
+            deleted, _ = query.delete()
+            counts[fragment] = deleted
+        retired_types = sorted(
+            external_id.partition(":")[2]
+            for external_id in external_ids
+            if external_id.startswith("definition:")
+        )
+        # The registry rows go with the tuples, under the same router guard
+        # (no queries: the router refused the database).
+        if queries and retired_types and app_settings.REBAC_LOCAL_BACKEND_STORAGE == "registry":
+            RebacResource.objects.using(using).filter(resource_type__in=retired_types).delete()
+        return counts
 
     @staticmethod
     def _hash_payload(payload: dict[str, Any]) -> str:

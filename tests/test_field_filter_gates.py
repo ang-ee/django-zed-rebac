@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import operator
+
 import pytest
 from django.contrib.auth import get_user_model
 from django.db.models import (
@@ -65,11 +67,13 @@ definition blog/post {
 
 
 @pytest.fixture(autouse=True)
-def _schema(db):
-    reset_backend()
-    install_schema(backend(), parse_zed(SCHEMA))
-    yield
-    reset_backend()
+def _schema(db, request):
+    storage = getattr(request, "param", None)
+    with override_settings(**({"REBAC_LOCAL_BACKEND_STORAGE": storage} if storage else {})):
+        reset_backend()
+        install_schema(backend(), parse_zed(SCHEMA))
+        yield
+        reset_backend()
 
 
 def _grant(resource_type, pk, user, relation):
@@ -240,6 +244,25 @@ def test_a_clause_that_reads_a_gated_column_is_refused(people, rows, mode, surfa
     with override_settings(REBAC_FIELD_READ_MODE=mode):
         with pytest.raises(PermissionDenied):
             surfaces(people["alice"])[surface]()
+
+
+@pytest.mark.parametrize("operation", [operator.or_, operator.xor])
+@pytest.mark.parametrize("side", ["left", "right"])
+@pytest.mark.parametrize("_schema", ["denormalized", "registry"], indirect=True)
+@pytest.mark.pg_delta
+def test_sliced_boolean_operand_keeps_gated_ordering_enforcement(people, rows, operation, side):
+    left = Post.objects.as_user(people["alice"]).order_by("title")[:1]
+    right = Post.objects.as_user(people["bob"]).order_by("pk")
+    if side == "right":
+        left, right = right.as_user(people["alice"]), left.as_user(people["bob"])
+    with override_settings(REBAC_FIELD_READ_MODE="redact"):
+        combined = operation(left, right)
+        with pytest.raises(PermissionDenied, match="read__title"):
+            list(combined.order_by("pk").values_list("pk", flat=True))
+        with pytest.raises(PermissionDenied, match="read__title"):
+            combined.count()
+        with pytest.raises(PermissionDenied, match="read__title"):
+            Post._base_manager.filter(pk__in=combined.values("pk")).count()
 
 
 @override_settings(REBAC_FIELD_READ_MODE="redact")

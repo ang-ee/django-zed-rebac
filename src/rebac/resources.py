@@ -11,6 +11,14 @@ from .conf import app_settings
 from .types import ObjectRef
 
 
+def user_subject_type() -> str:
+    """Return the installed user's canonical subject namespace without fetching a row."""
+
+    from django.contrib.auth import get_user_model
+
+    return model_resource_type(get_user_model()) or type_with_prefix(app_settings.REBAC_USER_TYPE)
+
+
 def _resolve_dotted(obj: Any, attr_path: str) -> Any:
     """Resolve a dotted attribute path against ``obj``.
 

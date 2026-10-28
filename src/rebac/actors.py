@@ -18,7 +18,7 @@ from collections.abc import AsyncIterator, Callable, Iterator
 from contextlib import asynccontextmanager, contextmanager
 from contextvars import ContextVar
 from importlib import import_module
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 from django.contrib.auth import get_user_model
 
@@ -29,8 +29,11 @@ from .errors import (
     SudoNotAllowedError,
     SudoReasonRequiredError,
 )
-from .resources import model_resource_type, to_object_ref
+from .resources import model_resource_type, to_object_ref, user_subject_type
 from .types import ObjectRef, SubjectRef
+
+if TYPE_CHECKING:
+    from django.db.models import Model
 
 # ---------- ContextVar ----------
 
@@ -186,6 +189,25 @@ def rebac_subject(*, type: str, id_attr: str = "pk") -> Callable[[type], type]:
     return _decorator
 
 
+def model_identities(model: type[Model], instance: Model) -> set[ObjectRef]:
+    """The resource and subject identities one Django model view gives ``instance``.
+
+    A model registered as a resource names the row by ``to_object_ref``; a
+    model that resolves subjects names it by ``to_subject_ref``. A multi-table
+    row has one view per model class; callers ask each view they retire.
+    """
+
+    identities: set[ObjectRef] = set()
+    if model_resource_type(model):
+        identities.add(to_object_ref(instance))
+    if model_can_resolve_subject(model):
+        try:
+            identities.add(to_subject_ref(instance).object)
+        except NoActorResolvedError:
+            pass
+    return identities
+
+
 def to_subject_ref(actor: ActorLike) -> SubjectRef:
     """Resolve `actor` to a `SubjectRef`. Raises `NoActorResolvedError`.
 
@@ -239,7 +261,7 @@ def to_subject_ref(actor: ActorLike) -> SubjectRef:
             return SubjectRef(resource, subject_relation(user_model))
         attr = subject_id_attr(user_model)
         return SubjectRef.of(
-            type_with_prefix(app_settings.REBAC_USER_TYPE),
+            user_subject_type(),
             str(getattr(actor, attr)),
         )
 
@@ -325,6 +347,39 @@ def actor_context(actor: ActorLike) -> Iterator[None]:
         yield
     finally:
         _current_actor.reset(token)
+
+
+@contextmanager
+def _as_actor_only(actor: SubjectRef) -> Iterator[None]:
+    """Read as ``actor`` with no ambient bypass in effect, for the block.
+
+    The engine's own use: a validation step for a save the gates refused runs
+    Django's checks under the actor's scope alone, so an ambient ``sudo()``
+    cannot answer for rows the actor may not read. Nothing is audited: no
+    bypass takes effect.
+    """
+    actor_token = _current_actor.set(actor)
+    sudo_token = _sudo_state.set(None)
+    try:
+        yield
+    finally:
+        _sudo_state.reset(sudo_token)
+        _current_actor.reset(actor_token)
+
+
+@contextmanager
+def _bypass_unaudited(reason: str) -> Iterator[None]:
+    """A bypass that writes no audit row: engine-internal, inside a rehearsal.
+
+    Used only while a ``SaveCheck`` runs, where a row written inside the
+    rolled-back transaction would not survive; the bypass being exercised was
+    audited before the rehearsal began (``_audit_bypass_once``).
+    """
+    token = _sudo_state.set({"reason": reason})
+    try:
+        yield
+    finally:
+        _sudo_state.reset(token)
 
 
 def _install_sudo_state(reason: str | None) -> tuple[Any, dict[str, Any], SubjectRef | None]:

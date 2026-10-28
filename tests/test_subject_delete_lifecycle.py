@@ -157,7 +157,7 @@ def test_unrelated_model_delete_skips_subject_resolution() -> None:
 
     instance = Unrelated(pk=1)
     with (
-        patch("rebac.signals.to_subject_ref") as resolve_subject,
+        patch("rebac.actors.to_subject_ref") as resolve_subject,
         patch("rebac.models.active_relationship_model") as relationship_model,
     ):
         _rebac_cascade_resource(sender=Unrelated, instance=instance)
@@ -186,7 +186,7 @@ def test_registered_model_subject_delete_still_uses_canonical_resolver(settings)
         [Relationship(**row) for row in (deleted, surviving, by_primary_key)]
     )
     try:
-        with patch("rebac.signals.to_subject_ref", wraps=to_subject_ref) as resolve_subject:
+        with patch("rebac.actors.to_subject_ref", wraps=to_subject_ref) as resolve_subject:
             _rebac_cascade_resource(sender=Device, instance=instance)
     finally:
         _subject_registry.pop(Device, None)

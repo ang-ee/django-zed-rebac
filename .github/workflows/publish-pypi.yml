@@ -76,8 +76,8 @@ jobs:
 
       - name: Verify release version
         run: |
-          uv sync
-          export REBAC_INSTALLED_VERSION="$(uv run python -c 'import rebac; print(rebac.__version__)')"
+          uv sync --no-dev
+          export REBAC_INSTALLED_VERSION="$(uv run --no-sync python -c 'import rebac; print(rebac.__version__)')"
           python - <<'PY'
           import os
           import pathlib

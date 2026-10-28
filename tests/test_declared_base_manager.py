@@ -4,6 +4,7 @@ import pytest
 from django.core import checks
 from django.core.exceptions import ImproperlyConfigured
 from django.db import models
+from django.db.migrations.state import ModelState
 from django.test.utils import isolate_apps
 
 from rebac import (
@@ -11,6 +12,7 @@ from rebac import (
     PermissionDenied,
     RebacManager,
     RebacMixin,
+    RebacQuerySet,
     RebacTrackedMixin,
     TrackedManager,
     TrackedQuerySet,
@@ -20,7 +22,8 @@ from rebac import (
 )
 from rebac.backends import backend
 from rebac.backends.local import LocalBackend
-from rebac.checks import check_declared_base_managers
+from rebac.checks import check_declared_base_managers, check_default_managers
+from rebac.mixins import RebacModelBase
 from rebac.schema import parse_zed
 from rebac.testing import install_schema
 from rebac.types import RelationshipTuple, SubjectRef
@@ -156,6 +159,32 @@ def test_base_manager_declared_on_an_abstract_rebac_parent_is_kept():
     assert _base(Opted) == ("_rebac_base", TrackedQuerySet)
 
 
+@pytest.mark.parametrize("concrete_parent", [False, True])
+def test_inherited_injected_meta_does_not_hide_a_later_parents_declared_manager(concrete_parent):
+    with isolate_apps("tests.testapp"):
+
+        class Fragment(models.Model, metaclass=RebacModelBase):
+            class Meta:
+                abstract = True
+
+        class Evidence(RebacTrackedMixin):
+            system_objects = models.Manager.from_queryset(PolicyQuerySet)()
+
+            class Meta:
+                abstract = not concrete_parent
+                app_label = "testapp"
+                base_manager_name = "system_objects"
+
+        class Part(Fragment, Evidence):
+            class Meta(Fragment.Meta):
+                app_label = "testapp"
+
+        assert Fragment._meta.base_manager_name == "_rebac_base"
+        assert _base(Part) == ("system_objects", PolicyQuerySet)
+        with pytest.raises(TypeError, match="rows are immutable"):
+            Part._base_manager.all().update()
+
+
 @pytest.mark.parametrize("manager_class", [models.Manager, RebacManager])
 def test_declared_base_manager_without_tracking_is_refused(manager_class):
     with isolate_apps("tests.testapp"), pytest.raises(ImproperlyConfigured) as raised:
@@ -205,8 +234,22 @@ def test_undeclared_base_manager_is_the_injected_one():
     for model in (Plain, Tracked, Post, Folder):
         assert _base(model) == ("_rebac_base", TrackedQuerySet)
         assert type(model._base_manager) is TrackedManager
+        assert model._base_manager.name == "_rebac_base"
         assert model._meta.default_manager_name == "objects"
     assert isinstance(Post._default_manager, RebacManager)
+
+
+@isolate_apps("tests.testapp")
+def test_injected_manager_keeps_native_migration_state():
+    class Plain(RebacMixin, models.Model):
+        class Meta:
+            app_label = "testapp"
+            rebac_resource_type = "test/plain"
+
+    manager = Plain._base_manager
+    assert manager.name == "_rebac_base"
+    assert manager.get_queryset().__class__ is TrackedQuerySet
+    assert ModelState.from_model(Plain).options["base_manager_name"] == "_rebac_base"
 
 
 @pytest.mark.parametrize(
@@ -238,6 +281,43 @@ def test_check_reports_a_base_manager_that_hides_rows_or_drops_tracking(manager_
 
 def test_check_accepts_the_injected_and_the_declared_tracked_base_managers():
     assert check_declared_base_managers() == []
+
+
+def test_check_reports_a_default_manager_that_is_not_scoped():
+    with isolate_apps("tests.testapp") as apps:
+
+        class Loose(RebacMixin, models.Model):
+            objects = models.Manager()  # type: ignore[assignment]
+
+            class Meta:
+                app_label = "testapp"
+                rebac_resource_type = "test/loose"
+
+        class Derived(RebacMixin, models.Model):
+            objects = RebacManager.from_queryset(RebacQuerySet)()
+
+            class Meta:
+                app_label = "testapp"
+                rebac_resource_type = "test/derived"
+
+        class Helper(RebacMixin, models.Model):
+            # No resource type: no row policy, so a plain manager is fine.
+            objects = models.Manager()  # type: ignore[assignment]
+
+            class Meta:
+                app_label = "testapp"
+
+        issues = check_default_managers(app_configs=apps.get_app_configs())
+
+    assert [issue.id for issue in issues] == ["rebac.E024"]
+    assert isinstance(issues[0], checks.Error)
+    assert issues[0].obj is Loose
+    assert "returns QuerySet" in issues[0].msg
+    assert Derived._default_manager.all().__class__ is RebacQuerySet
+
+
+def test_check_accepts_the_shipped_default_managers():
+    assert check_default_managers() == []
 
 
 @pytest.fixture

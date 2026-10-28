@@ -12,6 +12,7 @@ from django.contrib.contenttypes.models import ContentType
 from django.core.management import call_command
 from django.db import connection, connections, transaction
 from django.db.backends.base.base import BaseDatabaseWrapper
+from django.db.models import OuterRef, Subquery
 from django.test.utils import CaptureQueriesContext
 
 from rebac import (
@@ -97,8 +98,9 @@ def test_a_subquery_check_adds_no_revision_read(synced, settings, scoped):
         with CaptureQueriesContext(connection) as ran:
             list(outer)
         reads[mode] = (_generation_reads(built), _generation_reads(ran))
-    # The guard of the listing itself reads the revision once under redaction.
-    assert reads["redact"] == (reads["allow"][0], reads["allow"][1] + 1)
+    # Root guards and SQL compilation share one witness for the fetch.
+    assert reads["redact"] == reads["allow"]
+    assert reads["redact"][1] == 1
 
 
 def _permission():
@@ -813,6 +815,27 @@ def test_the_projection_guard_reads_the_schema_once(synced, settings):
     narrow = reads(rows.values_list("pk"))
     assert reads(rows.values_list("pk", "body", "folder_id")) == narrow
     assert reads(rows.values("pk", "body", "folder_id")) == narrow
+
+
+@pytest.mark.pg_delta
+@pytest.mark.parametrize("atomic", [False, True])
+def test_fetch_guard_and_compiled_subquery_share_one_schema_revision(synced, settings, atomic):
+    """A fetch validates nested field reads and executes their SQL in one operation."""
+    settings.REBAC_FIELD_READ_MODE = "redact"
+    _gate_title()
+    with transaction.atomic() if atomic else nullcontext():
+        original_wrappers = tuple(connection.execute_wrappers)
+        for _ in range(2):
+            inner = Post.objects.with_actor(ACTOR).filter(pk=OuterRef("pk")).values("body")[:1]
+            rows = (
+                Post.objects.sudo(reason="test.fetch.scope")
+                .annotate(inner_body=Subquery(inner))
+                .values_list("inner_body", flat=True)
+            )
+            with CaptureQueriesContext(connection) as queries:
+                assert list(rows) == [""]
+            assert _generation_reads(queries) == 1
+            assert tuple(connection.execute_wrappers) == original_wrappers
 
 
 @pytest.mark.parametrize("atomic", [False, True])

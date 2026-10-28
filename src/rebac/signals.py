@@ -11,7 +11,7 @@ from weakref import WeakSet
 
 from django.apps import apps
 from django.db import connections, models, router
-from django.db.models import Model, Q
+from django.db.models import Model
 from django.db.models.functions import Cast
 from django.db.models.signals import (
     class_prepared,
@@ -22,9 +22,9 @@ from django.db.models.signals import (
 )
 from django.dispatch import receiver
 
-from .actors import model_can_resolve_subject, to_subject_ref
+from .actors import model_can_resolve_subject, model_identities
 from .conf import app_settings
-from .errors import NoActorResolvedError, PermissionDenied
+from .errors import PermissionDenied
 from .resources import model_resource_type, to_object_ref
 from .types import ObjectRef, SubjectRef
 
@@ -382,43 +382,33 @@ def _stored(model: type[Model], using: str) -> models.QuerySet[Any]:
     return rows
 
 
-def _identities(sender: type[Model], instance: Any) -> set[ObjectRef]:
-    identities: set[ObjectRef] = set()
-    if model_resource_type(sender):
-        identities.add(to_object_ref(instance))
-    if model_can_resolve_subject(sender):
-        try:
-            identities.add(to_subject_ref(instance).object)
-        except NoActorResolvedError:
-            pass
-    return identities
-
-
 def cleanup_identities(identities: Iterable[ObjectRef], *, using: str) -> None:
     """Remove the tuples that name deleted objects, at either end."""
     from django.db import transaction
 
     from .backends.local import mark_relationships_changed
     from .models import RebacResource, active_relationship_model
+    from .models.relationship import (
+        RelationshipQuerySet,
+        RelationshipRegistryQuerySet,
+        _identity_query,
+    )
 
     identities = sorted(set(identities), key=str)
     if not identities or not router.allow_migrate_model(using, active_relationship_model()):
         return
     with transaction.atomic(using=using):
         for batch in batched(identities, 200, strict=False):
-            references = Q()
-            registry = Q()
-            for identity in batch:
-                pair = Q(resource_type=identity.resource_type, resource_id=identity.resource_id)
-                registry |= pair
-                references |= pair | Q(
-                    subject_type=identity.resource_type, subject_id=identity.resource_id
-                )
-            rows = active_relationship_model().objects.using(using).filter(references)
             if app_settings.REBAC_LOCAL_BACKEND_STORAGE == "registry":
-                RebacResource.objects.using(using).filter(registry).delete()
+                # A registry resource row is the identity; its tuples cascade.
+                RebacResource.objects.using(using).filter(
+                    _identity_query(batch, include_subjects=False)
+                ).delete()
             else:
-                rows.delete()
+                cast(
+                    RelationshipQuerySet | RelationshipRegistryQuerySet,
+                    active_relationship_model().objects.using(using),
+                ).referencing(batch).delete()
         mark_relationships_changed()
 
 
@@ -461,7 +451,7 @@ def _rebac_cascade_resource(
     from .mixins import delete_scope
 
     scope = delete_scope(origin, using)
-    identities = _identities(sender, instance)
+    identities = model_identities(sender, instance)
     if scope is not None:
         scope.identities.update(identities)
         return  # the owner holds the old captures and finishes once for the collection

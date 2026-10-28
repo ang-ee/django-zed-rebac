@@ -253,6 +253,15 @@ def apply_field_visibility(
         cast(Any, inst)._rebac_visibility_marker = marker
 
 
+def redacted_fields(instance: models.Model) -> frozenset[str]:
+    """Names hidden by field-read enforcement on this loaded instance.
+
+    Unmarked models have no redacted fields. The immutable result describes the
+    fetched instance, without evaluating permissions or issuing a query.
+    """
+    return frozenset(getattr(instance, "_rebac_redacted_fields", frozenset()) or frozenset())
+
+
 def mark_denied_fields(
     instance: models.Model,
     fields: Iterable[str],
@@ -266,7 +275,7 @@ def mark_denied_fields(
     for field_name in field_set:
         setattr(instance, field_name, None)
         _scrub_loaded_value(instance, field_name)
-    redacted = set(getattr(instance, "_rebac_redacted_fields", frozenset()) or frozenset())
+    redacted = set(redacted_fields(instance))
     redacted.update(field_set)
     instance._rebac_redacted_fields = frozenset(redacted)  # type: ignore[attr-defined]
     if mode == "omit":

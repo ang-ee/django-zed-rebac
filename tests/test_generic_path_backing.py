@@ -7,11 +7,16 @@ from unittest.mock import patch
 import pytest
 from django.utils import timezone
 
-from rebac import PermissionDenied, sudo, to_object_ref, to_subject_ref
+from rebac import (
+    PermissionDenied,
+    proposed_forward_relationships,
+    sudo,
+    to_object_ref,
+    to_subject_ref,
+)
 from rebac.backends import backend as active_backend
 from rebac.backends import reset_backend
 from rebac.checks import check_field_backed_relations
-from rebac.field_backing import _proposed_forward_relationships
 from rebac.preflight import _check_new_model
 from rebac.schema import Permission, PermRef, parse_zed, validate_schema
 from rebac.schema.introspection import relation_dependencies
@@ -122,7 +127,7 @@ def assert_empty_preflight(backend, candidate, actor, relation):
     resource_type = candidate._meta.rebac_resource_type
     schema = backend.schema()
     definition = schema.get_definition(resource_type)
-    projected = _proposed_forward_relationships(
+    projected = proposed_forward_relationships(
         candidate,
         definition,
         required_relations=relation_dependencies(schema, resource_type, "create"),
@@ -194,7 +199,7 @@ def test_four_hop_filtered_path_and_nil_fragment_exclusion_use_same_entry(backen
         atomic_source_write(retired.save, update_fields=["retired_at"])
     assert_read(backend, BackingQueue, alice, [empty])
     candidate = BackingQueue()
-    projected = _proposed_forward_relationships(
+    projected = proposed_forward_relationships(
         candidate,
         backend.schema().get_definition("test/backingqueue"),
         required_relations=frozenset({"engaged"}),
