@@ -49,6 +49,13 @@ pre-1.0; breaking changes within a minor version are explicitly called out.
 
 ### Fixed
 
+- On MySQL, a text identity whose field has its own internal type (a
+  `SlugField`) was cast with `CAST(... AS varchar(64))`, which MySQL refuses;
+  every compiled read of such a type failed with error 1064, and the nightly
+  vendor contract had failed since 0.25.0. The column side of a text identity
+  is now cast as the plain `CharField`/`TextField` type of its length, which
+  Django spells correctly on every vendor.
+
 - A model whose `Meta` inherits the injected `_rebac_base` option keeps a
   base manager declared by another parent, including a concrete multi-table
   parent; the inherited fallback no longer masks that manager's write policy.

@@ -214,6 +214,33 @@ def _exercise_codec_sql(db):
                     editor.delete_model(model)
 
 
+@pytest.mark.parametrize(
+    ("factory", "cast_type"),
+    [
+        (models.SlugField, models.CharField),
+        (models.CharField, models.CharField),
+        (models.TextField, models.TextField),
+    ],
+)
+def test_text_identity_casts_to_the_plain_character_type(factory, cast_type):
+    """A text identity is cast as CharField/TextField, never as the column's own class.
+
+    Django has a cast spelling for those two on every vendor. A subclass with
+    its own internal type (SlugField) has none on MySQL and fell back to the
+    column's ``varchar(64)``, which MySQL's CAST refuses (the nightly vendor
+    gate). SQLite and PostgreSQL spell ``varchar(64)`` for both, so the cast's
+    output field is asserted here, and the vendor contract asserts the SQL.
+    """
+    with isolate_apps():
+        field = (
+            factory(null=True) if factory is models.TextField else factory(max_length=64, null=True)
+        )
+        codec = identity_codec(_identity_model(field), "identity")
+        cast = codec.to_column(Value("001"))._expression(Value("001"), connection)
+    assert type(cast.output_field) is cast_type
+    assert cast.output_field.max_length == field.max_length
+
+
 @pytest.mark.django_db(transaction=True)
 def test_codec_sql():
     _exercise_codec_sql(connection)
