@@ -49,6 +49,7 @@ from .consistency import (
     record_zookie,
     zookie_scope,
 )
+from .database import database_context
 from .errors import (
     CaveatUnsupportedError,
     MissingActorError,
@@ -214,6 +215,7 @@ __all__ = [
     "SchemaError",
     "RebacError",
     # helpers
+    "database_context",
     "write_relationships",
     "delete_relationship",
     "delete_relationships",

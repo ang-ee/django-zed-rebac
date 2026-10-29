@@ -10,6 +10,7 @@ from django.db import models
 
 from ._id import resource_id_attr
 from .conf import app_settings
+from .database import database_context, read_alias
 from .resources import model_resource_type
 from .schema.ast import Schema
 from .schema.walker import field_gated_actions
@@ -203,54 +204,56 @@ def apply_field_visibility(
     model: type[models.Model],
     actor: SubjectRef,
     mode: FieldDenyMode,
+    using: str | None = None,
 ) -> None:
     """Redact/omit denied ``read__<field>`` values on a fetched batch."""
-    runtime_mode = runtime_field_deny_mode(validate_field_deny_mode(mode))
-    if runtime_mode == "allow":
-        return
-    marker = (actor, runtime_mode)
-    batch = [
-        inst
-        for inst in instances
-        if isinstance(inst, models.Model)
-        and getattr(inst, "_rebac_visibility_marker", None) != marker
-    ]
-    if not batch:
-        return
-    fields = gated_read_fields(model)
-    if not fields:
-        return
+    with database_context(read_alias(model, using=using)):
+        runtime_mode = runtime_field_deny_mode(validate_field_deny_mode(mode))
+        if runtime_mode == "allow":
+            return
+        marker = (actor, runtime_mode)
+        batch = [
+            inst
+            for inst in instances
+            if isinstance(inst, models.Model)
+            and getattr(inst, "_rebac_visibility_marker", None) != marker
+        ]
+        if not batch:
+            return
+        fields = gated_read_fields(model)
+        if not fields:
+            return
 
-    from .backends import backend
+        from .backends import backend
 
-    active_backend = backend()
-    visible = visible_id_sets(
-        model=model,
-        actor=actor,
-        fields=fields,
-        active_backend=active_backend,
-    )
-    rebac_type = model_resource_type(model)
-    if not rebac_type:
-        return
+        active_backend = backend()
+        visible = visible_id_sets(
+            model=model,
+            actor=actor,
+            fields=fields,
+            active_backend=active_backend,
+        )
+        rebac_type = model_resource_type(model)
+        if not rebac_type:
+            return
 
-    for inst in batch:
-        denied: set[str] = set()
-        resource_id = _instance_resource_id(inst)
-        for field_name in fields:
-            ids = visible.get(field_name)
-            if ids is None or resource_id in ids:
-                continue
-            if _conditional_field_is_visible(
-                active_backend,
-                actor=actor,
-                action=f"read__{field_name}",
-                resource=ObjectRef(rebac_type, resource_id),
-            ):
-                continue
-            denied.add(field_name)
-        mark_denied_fields(inst, denied, mode=runtime_mode)
-        cast(Any, inst)._rebac_visibility_marker = marker
+        for inst in batch:
+            denied: set[str] = set()
+            resource_id = _instance_resource_id(inst)
+            for field_name in fields:
+                ids = visible.get(field_name)
+                if ids is None or resource_id in ids:
+                    continue
+                if _conditional_field_is_visible(
+                    active_backend,
+                    actor=actor,
+                    action=f"read__{field_name}",
+                    resource=ObjectRef(rebac_type, resource_id),
+                ):
+                    continue
+                denied.add(field_name)
+            mark_denied_fields(inst, denied, mode=runtime_mode)
+            cast(Any, inst)._rebac_visibility_marker = marker
 
 
 def redacted_fields(instance: models.Model) -> frozenset[str]:

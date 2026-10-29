@@ -30,6 +30,7 @@ from django.db.models.options import DEFAULT_NAMES
 from ._id import resource_id_attr
 from .actors import _as_actor_only, _bypass_unaudited, actor_context, is_sudo, system_context
 from .conf import app_settings
+from .database import database_context, read_alias, write_alias
 from .errors import PermissionDenied
 from .field_visibility import (
     backend_schema,
@@ -330,7 +331,7 @@ class RebacTrackedMixin(models.Model, metaclass=RebacModelBase):
         from .signals import audit_backed_denials
         from .watch import model_write
 
-        alias = using or router.db_for_write(type(self), instance=self)
+        alias = write_alias(type(self), using=using, instance=self)
         if raw:
             return super().save_base(raw, force_insert, force_update, alias, update_fields)
         check = save_check.get()
@@ -396,7 +397,7 @@ class RebacTrackedMixin(models.Model, metaclass=RebacModelBase):
             # The instance's own bypass takes effect with the check, outside
             # the work it rolls back: the save that follows does not audit it.
             self._audit_bypass_once()
-        alias = using or router.db_for_write(type(self), instance=self)
+        alias = write_alias(type(self), using=using, instance=self)
         # save() prepares the instance (an override, Django's related keys);
         # the real save prepares it again, so it is left as it was.
         kept = dict(vars(self))
@@ -439,7 +440,7 @@ class RebacTrackedMixin(models.Model, metaclass=RebacModelBase):
         from .signals import audit_backed_denials
         from .watch import model_write
 
-        alias = using or router.db_for_write(type(self), instance=self)
+        alias = write_alias(type(self), using=using, instance=self)
         if delete_scope(self, alias) is not None:
             return super().delete(using=alias, keep_parents=keep_parents)
         actor = current_actor()
@@ -945,26 +946,27 @@ class RebacMixin(RebacTrackedMixin):
         return self
 
     def _audit_bypass_once(self) -> None:
-        from .audit import save_check
+        with database_context(write_alias(type(self), instance=self)):
+            from .audit import save_check
 
-        if self._rebac_sudo_reason is None or self._rebac_sudo_audited:
-            return
-        if save_check.get() is not None:
-            # Inside a check everything is rolled back: the real save audits it.
-            return
-        from .actors import current_actor
-        from .audit import emit
-        from .models import PermissionAuditEvent
+            if self._rebac_sudo_reason is None or self._rebac_sudo_audited:
+                return
+            if save_check.get() is not None:
+                # Inside a check everything is rolled back: the real save audits it.
+                return
+            from .actors import current_actor
+            from .audit import emit
+            from .models import PermissionAuditEvent
 
-        actor = current_actor()
-        emit(
-            PermissionAuditEvent.KIND_SUDO_BYPASS,
-            actor=actor,
-            origin=actor,
-            reason=self._rebac_sudo_reason,
-            defer_to_commit=False,
-        )
-        self._rebac_sudo_audited = True
+            actor = current_actor()
+            emit(
+                PermissionAuditEvent.KIND_SUDO_BYPASS,
+                actor=actor,
+                origin=actor,
+                reason=self._rebac_sudo_reason,
+                defer_to_commit=False,
+            )
+            self._rebac_sudo_audited = True
 
     def is_sudo(self) -> bool:
         return self._rebac_sudo_reason is not None
@@ -1040,43 +1042,44 @@ class RebacMixin(RebacTrackedMixin):
              relations decide only its creation.
           5. Otherwise dispatch to the backend.
         """
-        from .backends import backend
+        with database_context(read_alias(type(self), instance=self)):
+            from .backends import backend
 
-        rebac_type = model_resource_type(self)
-        if not rebac_type:
-            # Model isn't wired into REBAC — answer permissively to mirror
-            # the manager's no-op behaviour.
-            return CheckResult.has(reason="no resource type")
+            rebac_type = model_resource_type(self)
+            if not rebac_type:
+                # Model isn't wired into REBAC — answer permissively to mirror
+                # the manager's no-op behaviour.
+                return CheckResult.has(reason="no resource type")
 
-        actor, unscoped = self.effective_actor(strict=True)
-        if unscoped:
-            return CheckResult.has(reason="unscoped")
-        assert actor is not None
+            actor, unscoped = self.effective_actor(strict=True)
+            if unscoped:
+                return CheckResult.has(reason="unscoped")
+            assert actor is not None
 
-        if self._state.adding and action == "create":
-            # The candidate save() would insert, not "may the actor create any row?".
-            # A consistency the backend refuses is refused here too; the
-            # candidate's own reads take none.
-            validate = getattr(backend(), "_validate_consistency", None)
-            if consistency is not None and callable(validate):
-                validate(consistency, None)
-            return _check_new_model(
-                self,
+            if self._state.adding and action == "create":
+                # The candidate save() would insert, not "may the actor create any row?".
+                # A consistency the backend refuses is refused here too; the
+                # candidate's own reads take none.
+                validate = getattr(backend(), "_validate_consistency", None)
+                if consistency is not None and callable(validate):
+                    validate(consistency, None)
+                return _check_new_model(
+                    self,
+                    subject=actor,
+                    using=write_alias(type(self), instance=self),
+                    context=context,
+                )
+            # Empty resource_id on adding is the backend's model-level "any row?"
+            # sentinel: an unsaved instance's pk and asserted relations are not
+            # evidence about a stored row.
+            resource_id = "" if self._state.adding else self._rebac_resource_id_for_checks()
+            return backend().check_access(
                 subject=actor,
-                using=router.db_for_write(type(self), instance=self),
+                action=action,
+                resource=ObjectRef(rebac_type, resource_id),
                 context=context,
+                consistency=consistency,
             )
-        # Empty resource_id on adding is the backend's model-level "any row?"
-        # sentinel: an unsaved instance's pk and asserted relations are not
-        # evidence about a stored row.
-        resource_id = "" if self._state.adding else self._rebac_resource_id_for_checks()
-        return backend().check_access(
-            subject=actor,
-            action=action,
-            resource=ObjectRef(rebac_type, resource_id),
-            context=context,
-            consistency=consistency,
-        )
 
     def has_access(
         self,
@@ -1163,7 +1166,7 @@ class RebacMixin(RebacTrackedMixin):
         from .errors import PermissionDenied
         from .watch import model_write
 
-        alias = using or router.db_for_write(type(self), instance=self)
+        alias = write_alias(type(self), using=using, instance=self)
         if raw:
             return super().save_base(raw, force_insert, force_update, alias, update_fields)
         try:
@@ -1188,7 +1191,7 @@ class RebacMixin(RebacTrackedMixin):
         from .errors import PermissionDenied
         from .watch import model_write
 
-        alias = using or router.db_for_write(type(self), instance=self)
+        alias = write_alias(type(self), using=using, instance=self)
         scope = self.effective_actor(strict=bool(model_resource_type(self)))
         try:
             with model_write(model=type(self), using=alias):
@@ -1201,28 +1204,31 @@ class RebacMixin(RebacTrackedMixin):
             raise
 
     def _audit_denial_after_rollback(self, exc: Exception, *, default_action: str) -> None:
-        from .conf import app_settings
-        from .signals import BackedEdgeDenied, audit_edge_denial
+        with database_context(write_alias(type(self), instance=self)):
+            from .conf import app_settings
+            from .signals import BackedEdgeDenied, audit_edge_denial
 
-        if isinstance(exc, BackedEdgeDenied):
-            audit_edge_denial(exc)
-            return
+            if isinstance(exc, BackedEdgeDenied):
+                audit_edge_denial(exc)
+                return
 
-        if not app_settings.REBAC_AUDIT_DENIALS or " cannot " not in str(exc):
-            return
-        resource_type = model_resource_type(type(self))
-        if resource_type is None:
-            return
-        actor, unscoped = self.effective_actor(strict=False)
-        if unscoped:
-            return
-        action = str(exc).split(" cannot ", 1)[1].split(" ", 1)[0] or default_action
-        resource_id = "" if self._state.adding else str(getattr(self, resource_id_attr(type(self))))
-        _maybe_audit_denial(
-            actor=actor,
-            action=action,
-            resource=ObjectRef(resource_type, resource_id),
-        )
+            if not app_settings.REBAC_AUDIT_DENIALS or " cannot " not in str(exc):
+                return
+            resource_type = model_resource_type(type(self))
+            if resource_type is None:
+                return
+            actor, unscoped = self.effective_actor(strict=False)
+            if unscoped:
+                return
+            action = str(exc).split(" cannot ", 1)[1].split(" ", 1)[0] or default_action
+            resource_id = (
+                "" if self._state.adding else str(getattr(self, resource_id_attr(type(self))))
+            )
+            _maybe_audit_denial(
+                actor=actor,
+                action=action,
+                resource=ObjectRef(resource_type, resource_id),
+            )
 
     def _rebac_save(self, *args: Any, **kwargs: Any) -> None:
         """Keep new resource instances insert-only and exclude redacted update fields.

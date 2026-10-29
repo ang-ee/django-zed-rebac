@@ -18,6 +18,7 @@ from django.core.signals import setting_changed
 from django.db import models
 from django.db.backends.base.base import BaseDatabaseWrapper
 
+from ..database import database_context, read_alias, write_alias
 from ..errors import SchemaError
 from ..field_backing import (
     resolve_field_backing,
@@ -174,7 +175,12 @@ class LocalBackend(Backend):
         with self._schema_lock:
             return self._manual_revision
 
-    def _schema_snapshot(self, known_revision: str | None = None) -> SchemaSnapshot:
+    def _schema_snapshot(
+        self, known_revision: str | None = None, *, using: str | None = None
+    ) -> SchemaSnapshot:
+        if using is not None:
+            with database_context(using):
+                return self._schema_snapshot(known_revision)
         if known_revision is None:
             return self._load_schema_snapshot()
         return self._load_schema_snapshot(known_revision)
@@ -204,7 +210,7 @@ class LocalBackend(Backend):
                 )
         with self._schema_invalidation_lock:
             invalidation = self._schema_invalidation_generation
-        connection = connections[SchemaDefinition.objects.db]
+        connection = connections[read_alias(SchemaDefinition)]
         evaluator = current_evaluator()
         operation = _schema_operation_scope.get()
         # Manual transactions have no observable on_commit lifecycle. Keep
@@ -359,8 +365,8 @@ class LocalBackend(Backend):
         from ..models import SchemaDefinition, active_relationship_model
 
         candidates = (
-            connections[active_relationship_model().objects.db],
-            connections[SchemaDefinition.objects.db],
+            connections[read_alias(active_relationship_model())],
+            connections[read_alias(SchemaDefinition)],
         )
         for candidate in candidates:
             if candidate.in_atomic_block or (
@@ -380,7 +386,12 @@ class LocalBackend(Backend):
             for relation in definition.relations
         ):
             return None
-        return snapshot.generation, _relationship_generation
+        return (
+            read_alias(active_relationship_model()),
+            snapshot.using,
+            snapshot.generation,
+            _relationship_generation,
+        )
 
     def _schema_facts(self, snapshot: SchemaSnapshot) -> _SchemaFacts:
         """Whole-schema facts derived once per schema generation."""
@@ -571,7 +582,7 @@ class LocalBackend(Backend):
                 action=action,
                 actor=subject,
                 context=context,
-                using=active_relationship_model().objects.db,
+                using=read_alias(active_relationship_model()),
             )
 
     def check_bulk_permissions(
@@ -590,7 +601,7 @@ class LocalBackend(Backend):
         latest = consistency == Consistency.FULLY_CONSISTENT
         with deciding_afresh() if latest else nullcontext():
             return check_many(
-                backend=self, items=list(items), using=active_relationship_model().objects.db
+                backend=self, items=list(items), using=read_alias(active_relationship_model())
             )
 
     @_schema_operation
@@ -635,7 +646,7 @@ class LocalBackend(Backend):
                     resource_type=resource_type,
                     action=action,
                     actor=subject,
-                    using=active_relationship_model().objects.db,
+                    using=read_alias(active_relationship_model()),
                     context=context,
                 )
             )
@@ -658,7 +669,7 @@ class LocalBackend(Backend):
             resource_type=resource_type,
             action=action,
             actor=subject,
-            using=active_relationship_model().objects.db,
+            using=read_alias(active_relationship_model()),
             context=context,
         )
 
@@ -682,13 +693,13 @@ class LocalBackend(Backend):
             resource=resource,
             action=action,
             subject_type=subject_type,
-            using=active_relationship_model().objects.db,
+            using=read_alias(active_relationship_model()),
             context=context,
         )
 
     @_schema_operation
     def write_relationships(self, writes: Iterable[RelationshipTuple]) -> Zookie:
-        from django.db import router, transaction
+        from django.db import transaction
 
         from ..models import active_relationship_model
         from ..models.relationship import RelationshipRegistry
@@ -697,7 +708,7 @@ class LocalBackend(Backend):
         RelationshipModel = active_relationship_model()
 
         rows = list(writes)
-        using = router.db_for_write(RelationshipModel)
+        using = write_alias(RelationshipModel)
         max_xid = 0
         with transaction.atomic(using=using):
             schema = self._write_schema(using)
@@ -764,12 +775,12 @@ class LocalBackend(Backend):
 
     @_schema_operation
     def delete_relationships(self, filter_: RelationshipFilter) -> Zookie:
-        from django.db import router, transaction
+        from django.db import transaction
 
         from ..models import active_relationship_model
 
         RelationshipModel = active_relationship_model()
-        using = router.db_for_write(RelationshipModel)
+        using = write_alias(RelationshipModel)
         with transaction.atomic(using=using):
             schema = self._write_schema(using)
             backed = self._backed_relation_for_filter(
@@ -791,12 +802,12 @@ class LocalBackend(Backend):
         # via ``WriteRelationships`` with ``OPERATION_DELETE``. Planned to
         # lower through that path in 0.4 once the ABC takes operation-shaped
         # updates — see ARCHITECTURE.md.
-        from django.db import router, transaction
+        from django.db import transaction
 
         from ..models import active_relationship_model
 
         RelationshipModel = active_relationship_model()
-        using = router.db_for_write(RelationshipModel)
+        using = write_alias(RelationshipModel)
         with transaction.atomic(using=using):
             schema = self._write_schema(using)
             definition = schema.get_definition(tuple_.resource.resource_type)
@@ -830,8 +841,7 @@ class LocalBackend(Backend):
 
     def _write_schema(self, using: str) -> Schema:
         """The effective policy a relationship write is validated against."""
-        del using
-        return self._schema_snapshot().schema
+        return self._schema_snapshot(using=using).schema
 
     def _validate_relationship_tuple(self, tup: RelationshipTuple, *, schema: Schema) -> None:
         from django.conf import settings

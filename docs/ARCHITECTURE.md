@@ -507,6 +507,7 @@ from rebac import (
 
     # Convenience helpers
     write_relationships, delete_relationships, delete_relationship, backend,
+    database_context,                  # context-local default for REBAC-owned database operations
 
     # One transaction and one validation for a block of stored-schema writes
     schema_changes,
@@ -569,6 +570,29 @@ from rebac.memberships import grant, revoke, members_of, containers_of   # direc
 from rebac.roles  import grant, revoke, roles_of, members_of   # role-as-namespace helpers
 from rebac.testing import install_schema   # test helper: make a schema and backend current
 ```
+
+### Database selection
+
+`rebac.database_context(using: str)` supplies a context-local database default
+for REBAC-owned operations that have no explicit alias: backend schema and tuple
+operations, membership helpers and audit emission. It neither changes Django's
+routers nor redirects arbitrary application ORM calls, and grants no authority.
+Use it with normal `with` in synchronous or asynchronous code; nested scopes,
+exceptions and concurrent async tasks retain normal `ContextVar` isolation.
+
+An explicitly selected queryset `.using(alias)`, instance save/delete alias or
+helper `using` argument (including audit `emit` / `aemit`) remains authoritative.
+Native permission compilation
+uses the statement's known alias for both its policy snapshot and data reads,
+even inside a different ambient database context. Without a scope, each owner
+retains its existing Django router behavior. Direct Django ORM callers continue
+to select databases through Django's own APIs.
+
+The existing per-alias/revision schema snapshot cache remains the sole cache.
+Schema pins and permission decisions never cross aliases. Audit callbacks capture
+the selected alias when emitted and register against that alias's transaction,
+so later scope changes do not redirect a deferred audit write. Relationship
+writes, generation reads and membership projections share the selected alias.
 
 `rebac.testing.install_schema(schema, *, backend=None, using=None)` is the
 supported way for a dependent project's tests to run against a schema of
