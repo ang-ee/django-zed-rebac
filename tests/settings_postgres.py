@@ -20,3 +20,9 @@ DATABASES = {
         "OPTIONS": dict(parse_qsl(_database_url.query)),
     }
 }
+
+# Alias tests get a second native test database, never the URL's base database.
+DATABASES["selected"] = {
+    **DATABASES["default"],
+    "NAME": DATABASES["default"]["NAME"] + "_selected",
+}

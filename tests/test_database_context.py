@@ -32,7 +32,10 @@ from rebac.models import (
 from rebac.models.schema_write import schema_changes
 from tests.testapp.models import Post
 
-pytestmark = pytest.mark.django_db(transaction=True, databases=["default", "selected"])
+pytestmark = [
+    pytest.mark.django_db(transaction=True, databases=["default", "selected"]),
+    pytest.mark.pg_delta,
+]
 
 
 @pytest.fixture(autouse=True, params=["denormalized", "registry"])
