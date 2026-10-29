@@ -41,10 +41,10 @@ def write_alias(
 def _alias(model: type[models.Model], *, using: str | None, instance: Any, write: bool) -> str:
     if using is not None:
         return using
-    if instance is not None and instance._state.db is not None:
-        return str(instance._state.db)
     scoped = _database.get()
     if scoped is not None:
+        if instance is not None and instance._state.db is not None:
+            return str(instance._state.db)
         return scoped
     resolve = router.db_for_write if write else router.db_for_read
     return str(resolve(model, **({"instance": instance} if instance is not None else {})))

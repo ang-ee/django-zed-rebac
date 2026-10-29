@@ -223,3 +223,69 @@ def test_audit_explicit_alias_overrides_scope():
         emit("test", reason="explicit", using="default")
     assert PermissionAuditEvent.objects.using("default").get().reason == "explicit"
     assert not PermissionAuditEvent.objects.using("selected").exists()
+
+
+def test_unscoped_instance_alias_preserves_native_router_precedence():
+    from rebac.database import write_alias
+
+    post = Post(title="router")
+    post._state.db = "selected"
+    with override_settings(DATABASE_ROUTERS=[DefaultRouter()]):
+        assert read_alias(Post, instance=post) == "default"
+        assert write_alias(Post, instance=post) == "default"
+        with database_context("default"):
+            assert read_alias(Post, instance=post) == "selected"
+            assert write_alias(Post, instance=post, using="default") == "default"
+
+
+def test_bound_instance_redaction_discovers_gates_on_its_database():
+    policy("default", resource_type="blog/post")
+    policy("selected", resource_type="blog/post")
+    definition = SchemaDefinition.objects.using("default").get(resource_type="blog/post")
+    SchemaPermission.objects.using("default").create(
+        definition=definition, name="read__title", expression="nil"
+    )
+    post = Post(id=1, title="secret").with_actor(ACTOR)
+    post._state.db = "default"
+    post._state.adding = False
+    with database_context("selected"):
+        assert post.denied_read_fields() == frozenset({"title"})
+        assert post.redacted(mode="redact").title is None
+
+
+@pytest.mark.parametrize(
+    "operation", ["save", "delete", "check_save", "save_bypass", "delete_bypass"]
+)
+def test_explicit_instance_write_audits_keep_operation_alias(settings, operation):
+    from rebac.errors import PermissionDenied
+
+    settings.REBAC_AUDIT_DENIALS = True
+    for alias in ("default", "selected"):
+        policy(alias, resource_type="blog/post")
+        definition = SchemaDefinition.objects.using(alias).get(resource_type="blog/post")
+        for action in ("write", "delete"):
+            SchemaPermission.objects.using(alias).create(
+                definition=definition, name=action, expression="nil"
+            )
+        with database_context(alias), system_context(reason="fixture"):
+            Post.objects.using(alias).create(id=1, title="unchanged")
+        PermissionAuditEvent.objects.using(alias).all().delete()
+    post = Post.objects.using("default").sudo(reason="fixture read").get(pk=1)
+    PermissionAuditEvent.objects.using("default").all().delete()
+    post.unsudo().with_actor(ACTOR)
+    if operation == "check_save":
+        assert post.sudo(reason="explicit check").check_save(using="selected").allowed
+    elif operation == "save_bypass":
+        post.sudo(reason="explicit save").save_base(using="selected")
+    elif operation == "delete_bypass":
+        post.sudo(reason="explicit delete").delete(using="selected")
+    else:
+        with pytest.raises(PermissionDenied):
+            if operation == "save":
+                post.save_base(using="selected")
+            else:
+                post.delete(using="selected")
+    if operation != "save_bypass":
+        assert post._state.db == "default"
+    assert PermissionAuditEvent.objects.using("selected").count() == 1
+    assert not PermissionAuditEvent.objects.using("default").exists()
