@@ -5,9 +5,10 @@ from __future__ import annotations
 from collections.abc import Iterable
 from typing import Any
 
-from django.db import models, router
+from django.db import models
 from django.db.models import QuerySet
 
+from .database import read_alias, write_alias
 from .resources import model_for_subject_type, stores_rows
 from .types import ObjectRef, RelationshipFilter, RelationshipTuple, SubjectRef, Zookie
 
@@ -23,7 +24,7 @@ def write_relationships(writes: Iterable[RelationshipTuple]) -> Zookie:
     from .audit import emit as emit_audit
     from .backends import backend
     from .consistency import record_zookie
-    from .models import PermissionAuditEvent
+    from .models import PermissionAuditEvent, active_relationship_model
 
     # Materialise so we can both pass to the backend and audit.
     rows = list(writes)
@@ -43,6 +44,7 @@ def write_relationships(writes: Iterable[RelationshipTuple]) -> Zookie:
             origin=actor,
             target_repr=_format_target(tup),
             defer_to_commit=True,
+            using=write_alias(active_relationship_model()),
         )
     return zookie
 
@@ -67,9 +69,7 @@ def delete_relationships(filter_: RelationshipFilter) -> Zookie:
     # models; the FK-side lookups below only apply in registry mode
     # (guarded by ``is_registry``). Type as ``QuerySet[Any]`` so the
     # runtime-dispatched field names don't trip static field validation.
-    qs: QuerySet[Any] = RelationshipModel.objects.using(
-        router.db_for_write(RelationshipModel)
-    ).all()
+    qs: QuerySet[Any] = RelationshipModel.objects.using(write_alias(RelationshipModel)).all()
     qs = qs.filter(**filter_.lookups())
     is_registry = RelationshipModel.__name__ == "RelationshipRegistry"
     if is_registry:
@@ -128,6 +128,7 @@ def delete_relationships(filter_: RelationshipFilter) -> Zookie:
             origin=actor,
             target_repr=_format_target(tuple_),
             defer_to_commit=True,
+            using=write_alias(active_relationship_model()),
         )
     return zookie
 
@@ -152,7 +153,7 @@ def delete_relationship(tuple_: RelationshipTuple) -> Zookie:
 
     RelationshipModel = active_relationship_model()
     snapshot = list(
-        RelationshipModel.objects.using(router.db_for_write(RelationshipModel)).filter(
+        RelationshipModel.objects.using(write_alias(RelationshipModel)).filter(
             resource_type=tuple_.resource.resource_type,
             resource_id=tuple_.resource.resource_id,
             relation=tuple_.relation,
@@ -173,6 +174,7 @@ def delete_relationship(tuple_: RelationshipTuple) -> Zookie:
             origin=actor,
             target_repr=_format_target(tuple_),
             defer_to_commit=True,
+            using=write_alias(active_relationship_model()),
         )
     return zookie
 
@@ -202,7 +204,7 @@ def resolve_subjects(refs: Iterable[SubjectRef | str]) -> dict[SubjectRef, model
         if not stores_rows(model):
             continue
         ids = {ref.subject_id for ref in refs_for_type}
-        rows = model._base_manager.filter(**{f"{id_attr}__in": list(ids)})
+        rows = model._base_manager.using(read_alias(model)).filter(**{f"{id_attr}__in": list(ids)})
         by_id = {str(getattr(row, id_attr)): row for row in rows}
         for ref in refs_for_type:
             row = by_id.get(ref.subject_id)

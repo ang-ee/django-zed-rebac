@@ -30,6 +30,7 @@ from django.db.models.options import DEFAULT_NAMES
 from ._id import resource_id_attr
 from .actors import _as_actor_only, _bypass_unaudited, actor_context, is_sudo, system_context
 from .conf import app_settings
+from .database import database_context, read_alias, write_alias
 from .errors import PermissionDenied
 from .field_visibility import (
     backend_schema,
@@ -330,7 +331,7 @@ class RebacTrackedMixin(models.Model, metaclass=RebacModelBase):
         from .signals import audit_backed_denials
         from .watch import model_write
 
-        alias = using or router.db_for_write(type(self), instance=self)
+        alias = write_alias(type(self), using=using, instance=self)
         if raw:
             return super().save_base(raw, force_insert, force_update, alias, update_fields)
         check = save_check.get()
@@ -392,11 +393,11 @@ class RebacTrackedMixin(models.Model, metaclass=RebacModelBase):
         if running is not None and running.target is self:
             # Asked again from within its own save(): the running check decides.
             return CheckResult.has(reason="the enclosing check decides")
+        alias = write_alias(type(self), using=using, instance=self)
         if isinstance(self, RebacMixin):
             # The instance's own bypass takes effect with the check, outside
             # the work it rolls back: the save that follows does not audit it.
-            self._audit_bypass_once()
-        alias = using or router.db_for_write(type(self), instance=self)
+            self._audit_bypass_once(using=alias)
         # save() prepares the instance (an override, Django's related keys);
         # the real save prepares it again, so it is left as it was.
         kept = dict(vars(self))
@@ -410,7 +411,7 @@ class RebacTrackedMixin(models.Model, metaclass=RebacModelBase):
         try:
             with transaction.atomic(using=alias):
                 try:
-                    self.save(using=using, update_fields=update_fields)
+                    self.save(using=alias, update_fields=update_fields)
                 except _SaveChecked:
                     pass
                 transaction.set_rollback(True, using=alias)
@@ -439,7 +440,7 @@ class RebacTrackedMixin(models.Model, metaclass=RebacModelBase):
         from .signals import audit_backed_denials
         from .watch import model_write
 
-        alias = using or router.db_for_write(type(self), instance=self)
+        alias = write_alias(type(self), using=using, instance=self)
         if delete_scope(self, alias) is not None:
             return super().delete(using=alias, keep_parents=keep_parents)
         actor = current_actor()
@@ -690,12 +691,16 @@ class RebacMixin(RebacTrackedMixin):
     def _rebac_hidden_fields(self, actor: SubjectRef) -> frozenset[str]:
         """The gated fields a filter would be refused on, by the guard's rule, for every model class of this row."""
 
-        if runtime_field_deny_mode(effective_field_deny_mode(self._rebac_field_deny)) == "allow":
-            return frozenset()
-        hidden: set[str] = set()
-        for model in (type(self), *self._meta.get_parent_list()):
-            hidden.update(_hidden_from(actor, model, gated_read_fields(model)))
-        return frozenset(hidden)
+        with database_context(read_alias(type(self), instance=self)):
+            if (
+                runtime_field_deny_mode(effective_field_deny_mode(self._rebac_field_deny))
+                == "allow"
+            ):
+                return frozenset()
+            hidden: set[str] = set()
+            for model in (type(self), *self._meta.get_parent_list()):
+                hidden.update(_hidden_from(actor, model, gated_read_fields(model)))
+            return frozenset(hidden)
 
     @staticmethod
     @contextmanager
@@ -945,27 +950,28 @@ class RebacMixin(RebacTrackedMixin):
         self._rebac_sudo_audited = False
         return self
 
-    def _audit_bypass_once(self) -> None:
-        from .audit import save_check
+    def _audit_bypass_once(self, *, using: str | None = None) -> None:
+        with database_context(write_alias(type(self), using=using, instance=self)):
+            from .audit import save_check
 
-        if self._rebac_sudo_reason is None or self._rebac_sudo_audited:
-            return
-        if save_check.get() is not None:
-            # Inside a check everything is rolled back: the real save audits it.
-            return
-        from .actors import current_actor
-        from .audit import emit
-        from .models import PermissionAuditEvent
+            if self._rebac_sudo_reason is None or self._rebac_sudo_audited:
+                return
+            if save_check.get() is not None:
+                # Inside a check everything is rolled back: the real save audits it.
+                return
+            from .actors import current_actor
+            from .audit import emit
+            from .models import PermissionAuditEvent
 
-        actor = current_actor()
-        emit(
-            PermissionAuditEvent.KIND_SUDO_BYPASS,
-            actor=actor,
-            origin=actor,
-            reason=self._rebac_sudo_reason,
-            defer_to_commit=False,
-        )
-        self._rebac_sudo_audited = True
+            actor = current_actor()
+            emit(
+                PermissionAuditEvent.KIND_SUDO_BYPASS,
+                actor=actor,
+                origin=actor,
+                reason=self._rebac_sudo_reason,
+                defer_to_commit=False,
+            )
+            self._rebac_sudo_audited = True
 
     def is_sudo(self) -> bool:
         return self._rebac_sudo_reason is not None
@@ -974,14 +980,17 @@ class RebacMixin(RebacTrackedMixin):
         """Return the pinned actor on this instance, or ``None``."""
         return self._rebac_actor
 
-    def effective_actor(self, *, strict: bool = False) -> tuple[SubjectRef | None, bool]:
+    def effective_actor(
+        self, *, strict: bool = False, using: str | None = None
+    ) -> tuple[SubjectRef | None, bool]:
         """Return ``(actor_ref, is_unscoped)`` for this instance.
 
         Explicit instance scope wins over ambient scope: per-instance sudo
         bypasses, a pinned actor scopes, ambient sudo only bypasses when no
         actor is pinned, and ambient ``current_actor()`` is the final scoped
         fallback. In observer mode (``strict=False``), a strict-mode no-actor
-        state returns ``(None, False)`` instead of raising.
+        state returns ``(None, False)`` instead of raising. ``using`` carries
+        a known operation alias for its bypass audit; actor resolution is unchanged.
         """
         from .actors import current_actor as _current_actor
         from .actors import is_sudo as _is_sudo_ambient
@@ -993,7 +1002,7 @@ class RebacMixin(RebacTrackedMixin):
             return insert[1], insert[2]
         if self._rebac_sudo_reason is not None:
             if strict:
-                self._audit_bypass_once()
+                self._audit_bypass_once(using=using)
             return (None, True)
         if self._rebac_actor is not None:
             return (self._rebac_actor, False)
@@ -1041,43 +1050,45 @@ class RebacMixin(RebacTrackedMixin):
              relations decide only its creation.
           5. Otherwise dispatch to the backend.
         """
-        from .backends import backend
+        alias = read_alias(type(self), instance=self)
+        with database_context(alias):
+            from .backends import backend
 
-        rebac_type = model_resource_type(self)
-        if not rebac_type:
-            # Model isn't wired into REBAC — answer permissively to mirror
-            # the manager's no-op behaviour.
-            return CheckResult.has(reason="no resource type")
+            rebac_type = model_resource_type(self)
+            if not rebac_type:
+                # Model isn't wired into REBAC — answer permissively to mirror
+                # the manager's no-op behaviour.
+                return CheckResult.has(reason="no resource type")
 
-        actor, unscoped = self.effective_actor(strict=True)
-        if unscoped:
-            return CheckResult.has(reason="unscoped")
-        assert actor is not None
+            actor, unscoped = self.effective_actor(strict=True, using=alias)
+            if unscoped:
+                return CheckResult.has(reason="unscoped")
+            assert actor is not None
 
-        if self._state.adding and action == "create":
-            # The candidate save() would insert, not "may the actor create any row?".
-            # A consistency the backend refuses is refused here too; the
-            # candidate's own reads take none.
-            validate = getattr(backend(), "_validate_consistency", None)
-            if consistency is not None and callable(validate):
-                validate(consistency, None)
-            return _check_new_model(
-                self,
+            if self._state.adding and action == "create":
+                # The candidate save() would insert, not "may the actor create any row?".
+                # A consistency the backend refuses is refused here too; the
+                # candidate's own reads take none.
+                validate = getattr(backend(), "_validate_consistency", None)
+                if consistency is not None and callable(validate):
+                    validate(consistency, None)
+                return _check_new_model(
+                    self,
+                    subject=actor,
+                    using=write_alias(type(self), instance=self),
+                    context=context,
+                )
+            # Empty resource_id on adding is the backend's model-level "any row?"
+            # sentinel: an unsaved instance's pk and asserted relations are not
+            # evidence about a stored row.
+            resource_id = "" if self._state.adding else self._rebac_resource_id_for_checks()
+            return backend().check_access(
                 subject=actor,
-                using=router.db_for_write(type(self), instance=self),
+                action=action,
+                resource=ObjectRef(rebac_type, resource_id),
                 context=context,
+                consistency=consistency,
             )
-        # Empty resource_id on adding is the backend's model-level "any row?"
-        # sentinel: an unsaved instance's pk and asserted relations are not
-        # evidence about a stored row.
-        resource_id = "" if self._state.adding else self._rebac_resource_id_for_checks()
-        return backend().check_access(
-            subject=actor,
-            action=action,
-            resource=ObjectRef(rebac_type, resource_id),
-            context=context,
-            consistency=consistency,
-        )
 
     def has_access(
         self,
@@ -1110,22 +1121,23 @@ class RebacMixin(RebacTrackedMixin):
         context: dict[str, Any] | None = None,
     ) -> frozenset[str]:
         """Return gated field names the current actor may not read on this row."""
-        from .conf import app_settings
-        from .field_visibility import gated_read_fields
-        from .types import PermissionResult
+        with database_context(read_alias(type(self), instance=self)):
+            from .conf import app_settings
+            from .field_visibility import gated_read_fields
+            from .types import PermissionResult
 
-        denied: set[str] = set()
-        for field_name in gated_read_fields(type(self)):
-            result = self.check_access(f"read__{field_name}", context=context)
-            if result.allowed:
-                continue
-            if (
-                result.result is PermissionResult.CONDITIONAL_PERMISSION
-                and not app_settings.REBAC_FIELD_READ_FAIL_CLOSED_ON_CONDITIONAL
-            ):
-                continue
-            denied.add(field_name)
-        return frozenset(denied)
+            denied: set[str] = set()
+            for field_name in gated_read_fields(type(self)):
+                result = self.check_access(f"read__{field_name}", context=context)
+                if result.allowed:
+                    continue
+                if (
+                    result.result is PermissionResult.CONDITIONAL_PERMISSION
+                    and not app_settings.REBAC_FIELD_READ_FAIL_CLOSED_ON_CONDITIONAL
+                ):
+                    continue
+                denied.add(field_name)
+            return frozenset(denied)
 
     def redacted(
         self,
@@ -1164,7 +1176,7 @@ class RebacMixin(RebacTrackedMixin):
         from .errors import PermissionDenied
         from .watch import model_write
 
-        alias = using or router.db_for_write(type(self), instance=self)
+        alias = write_alias(type(self), using=using, instance=self)
         if raw:
             return super().save_base(raw, force_insert, force_update, alias, update_fields)
         try:
@@ -1180,7 +1192,7 @@ class RebacMixin(RebacTrackedMixin):
             # The gate's audit write was inside the rolled-back owner block
             # (model_write always opens one). Re-emit it after the rollback,
             # preserving any caller transaction and the exact field action.
-            self._audit_denial_after_rollback(exc, default_action="write")
+            self._audit_denial_after_rollback(exc, default_action="write", using=alias)
             raise
 
     def delete(
@@ -1189,8 +1201,8 @@ class RebacMixin(RebacTrackedMixin):
         from .errors import PermissionDenied
         from .watch import model_write
 
-        alias = using or router.db_for_write(type(self), instance=self)
-        scope = self.effective_actor(strict=bool(model_resource_type(self)))
+        alias = write_alias(type(self), using=using, instance=self)
+        scope = self.effective_actor(strict=bool(model_resource_type(self)), using=alias)
         try:
             with model_write(model=type(self), using=alias):
                 _gate_delete(type(self), self, scope=scope)
@@ -1198,32 +1210,37 @@ class RebacMixin(RebacTrackedMixin):
                     # The tracked base reuses this scope, preserving consumer MRO.
                     return super().delete(using=alias, keep_parents=keep_parents)
         except PermissionDenied as exc:
-            self._audit_denial_after_rollback(exc, default_action="delete")
+            self._audit_denial_after_rollback(exc, default_action="delete", using=alias)
             raise
 
-    def _audit_denial_after_rollback(self, exc: Exception, *, default_action: str) -> None:
-        from .conf import app_settings
-        from .signals import BackedEdgeDenied, audit_edge_denial
+    def _audit_denial_after_rollback(
+        self, exc: Exception, *, default_action: str, using: str
+    ) -> None:
+        with database_context(using):
+            from .conf import app_settings
+            from .signals import BackedEdgeDenied, audit_edge_denial
 
-        if isinstance(exc, BackedEdgeDenied):
-            audit_edge_denial(exc)
-            return
+            if isinstance(exc, BackedEdgeDenied):
+                audit_edge_denial(exc)
+                return
 
-        if not app_settings.REBAC_AUDIT_DENIALS or " cannot " not in str(exc):
-            return
-        resource_type = model_resource_type(type(self))
-        if resource_type is None:
-            return
-        actor, unscoped = self.effective_actor(strict=False)
-        if unscoped:
-            return
-        action = str(exc).split(" cannot ", 1)[1].split(" ", 1)[0] or default_action
-        resource_id = "" if self._state.adding else str(getattr(self, resource_id_attr(type(self))))
-        _maybe_audit_denial(
-            actor=actor,
-            action=action,
-            resource=ObjectRef(resource_type, resource_id),
-        )
+            if not app_settings.REBAC_AUDIT_DENIALS or " cannot " not in str(exc):
+                return
+            resource_type = model_resource_type(type(self))
+            if resource_type is None:
+                return
+            actor, unscoped = self.effective_actor(strict=False)
+            if unscoped:
+                return
+            action = str(exc).split(" cannot ", 1)[1].split(" ", 1)[0] or default_action
+            resource_id = (
+                "" if self._state.adding else str(getattr(self, resource_id_attr(type(self))))
+            )
+            _maybe_audit_denial(
+                actor=actor,
+                action=action,
+                resource=ObjectRef(resource_type, resource_id),
+            )
 
     def _rebac_save(self, *args: Any, **kwargs: Any) -> None:
         """Keep new resource instances insert-only and exclude redacted update fields.
@@ -1237,7 +1254,8 @@ class RebacMixin(RebacTrackedMixin):
                     "A new REBAC model instance must be inserted; "
                     "force_update and update_fields are not allowed."
                 )
-            _actor, unscoped = self.effective_actor(strict=True)
+            alias = kwargs.get("using") or router.db_for_write(type(self), instance=self)
+            _actor, unscoped = self.effective_actor(strict=True, using=alias)
             if not unscoped:
                 # Django otherwise attempts UPDATE first for populated primary
                 # keys, including parent-table updates during multi-table
@@ -1346,13 +1364,13 @@ def _gate_save(
         # An untyped proxy or child of an edge model is no resource of its
         # own, but it writes the edge's columns.
         if not instance._state.adding:
-            actor, unscoped = instance.effective_actor(strict=False)
+            actor, unscoped = instance.effective_actor(strict=False, using=using)
             if actor is not None and not unscoped:
                 _refuse_moving_edge(sender, instance, using=using or router.db_for_write(sender))
         return
     # Share the observer/check API's precedence: a pinned actor outranks
     # ambient sudo, while an explicit instance bypass still wins locally.
-    actor, unscoped = instance.effective_actor(strict=True)
+    actor, unscoped = instance.effective_actor(strict=True, using=using)
     if unscoped:
         return
     assert actor is not None

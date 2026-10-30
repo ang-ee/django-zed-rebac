@@ -16,7 +16,7 @@ from __future__ import annotations
 import re
 from collections import Counter
 from collections.abc import AsyncIterator, Collection, Iterable, Iterator
-from typing import Any, Self, TypeVar, cast, overload
+from typing import TYPE_CHECKING, Any, Self, TypeVar, cast, overload
 
 from asgiref.sync import sync_to_async
 from django.db import connections, models
@@ -29,6 +29,7 @@ from .actors import ActorLike, current_sudo_reason, grant_subject_ref, to_subjec
 from .actors import current_actor as _current_actor
 from .actors import is_sudo as _is_sudo_ambient
 from .conf import app_settings
+from .database import database_context
 from .errors import MissingActorError, PermissionDenied
 from .field_visibility import (
     accessible_ids,
@@ -78,11 +79,12 @@ class _RebacQuery(Query):
     def as_sql(self, compiler: Any, connection: Any) -> Any:
         # Compiled before the statement that holds it was checked (its
         # queryset is not a rebac one, or no check ran): checked now.
-        _check_subquery(self)
-        reason = self._rebac_pending_bypass_audit
-        if reason is not None:
-            _emit_bypass_audit(reason)
-        return super().as_sql(compiler, connection)
+        with database_context(connection.alias):
+            _check_subquery(self)
+            reason = self._rebac_pending_bypass_audit
+            if reason is not None:
+                _emit_bypass_audit(reason)
+            return super().as_sql(compiler, connection)
 
     # A resolved actor-scoped subquery carries what checking it needs, and
     # is checked once: with the statement that holds it, when that statement
@@ -789,7 +791,7 @@ class RebacQuerySet(models.QuerySet[_M]):
         output_field = cast("models.Field[Any, Any]", model_field).clone()
         output_field.null = True
         actor, bypass = self.effective_actor(strict=True)
-        if bypass or actor is None or field not in gated_read_fields(self.model):
+        if bypass or actor is None or field not in self._gated_read_fields():
             return models.ExpressionWrapper(models.F(field), output_field=output_field)
         readers = (
             type(self)(model=self.model, using=self.db)
@@ -891,15 +893,16 @@ class RebacQuerySet(models.QuerySet[_M]):
         return self._rebac_sudo_reason
 
     def _audit_bypass_once(self) -> None:
-        from .audit import save_check
+        with database_context(self.db):
+            from .audit import save_check
 
-        if self._rebac_sudo_audited or save_check.get() is not None:
-            return
-        reason = self._bypass_audit_reason()
-        if reason is None:
-            return
-        _emit_bypass_audit(reason)
-        self._rebac_sudo_audited = True
+            if self._rebac_sudo_audited or save_check.get() is not None:
+                return
+            reason = self._bypass_audit_reason()
+            if reason is None:
+                return
+            _emit_bypass_audit(reason)
+            self._rebac_sudo_audited = True
 
     def actor(self) -> SubjectRef | None:
         return self._rebac_actor
@@ -1028,82 +1031,83 @@ class RebacQuerySet(models.QuerySet[_M]):
 
     @schema_operation
     def _scope_query(self, query: Query, actor: SubjectRef | None) -> None:
-        for operand in _nested_queries(query.where, boolean_operands_only=True):
-            self._scope_query(operand, actor)
-            if isinstance(operand, _RebacQuery):
-                operand._rebac_check = (self, actor)
-                operand._rebac_checked = False
-        if query.combined_queries:
-            for part in query.combined_queries:
-                self._scope_query(part, actor)
-            return
-        model = query.model
-        if model is None:
-            return
-        rebac_type = model_resource_type(model)
-        if not rebac_type:
-            return
-        if actor is None:
-            # Aggregate projection is fail-closed regardless of strict mode.
-            query.where = WhereNode([query.where, _ScopeWhere(children=[NothingNode()])])
-            return
-        from django.db.models import Q
+        with database_context(self.db):
+            for operand in _nested_queries(query.where, boolean_operands_only=True):
+                self._scope_query(operand, actor)
+                if isinstance(operand, _RebacQuery):
+                    operand._rebac_check = (self, actor)
+                    operand._rebac_checked = False
+            if query.combined_queries:
+                for part in query.combined_queries:
+                    self._scope_query(part, actor)
+                return
+            model = query.model
+            if model is None:
+                return
+            rebac_type = model_resource_type(model)
+            if not rebac_type:
+                return
+            if actor is None:
+                # Aggregate projection is fail-closed regardless of strict mode.
+                query.where = WhereNode([query.where, _ScopeWhere(children=[NothingNode()])])
+                return
+            from django.db.models import Q
 
-        from .backends import backend
+            from .backends import backend
 
-        action = str(self._rebac_action or getattr(model._meta, "rebac_default_action", "read"))
-        active_backend = backend()
-        predicate = active_backend.queryset_filter(
-            model=model, subject=actor, action=action, using=self.db
-        )
-        if predicate is not None:
-            restriction = query.build_where(predicate)
-            query.where = WhereNode([query.where, _ScopeWhere(children=[restriction])])
-            return
-        if backend_grants_all(
-            active_backend,
-            subject=actor,
-            action=action,
-            resource_type=rebac_type,
-        ):
-            return
-        ids: list[Any] = list(
-            accessible_ids(
+            action = str(self._rebac_action or getattr(model._meta, "rebac_default_action", "read"))
+            active_backend = backend()
+            predicate = active_backend.queryset_filter(
+                model=model, subject=actor, action=action, using=self.db
+            )
+            if predicate is not None:
+                restriction = query.build_where(predicate)
+                query.where = WhereNode([query.where, _ScopeWhere(children=[restriction])])
+                return
+            if backend_grants_all(
                 active_backend,
                 subject=actor,
                 action=action,
                 resource_type=rebac_type,
+            ):
+                return
+            ids: list[Any] = list(
+                accessible_ids(
+                    active_backend,
+                    subject=actor,
+                    action=action,
+                    resource_type=rebac_type,
+                )
             )
-        )
-        attr = resource_id_attr(model)
-        if attr == "pk":
-            # Coerce to ints when the PK is integer-typed; leave as
-            # strings for UUID/Char PKs. Only relevant for the pk path
-            # — non-pk attrs (sqid, public_id, slug) are always
-            # string-valued and pass through unchanged.
-            try:
-                pk_field = model._meta.pk
-                if pk_field is not None and pk_field.get_internal_type() in (
-                    "AutoField",
-                    "BigAutoField",
-                    "IntegerField",
-                    "BigIntegerField",
-                    "SmallIntegerField",
-                    "PositiveIntegerField",
-                    "PositiveBigIntegerField",
-                    "PositiveSmallIntegerField",
-                ):
-                    ids = [int(i) for i in ids]
-            except ValueError:
-                pass
-            except TypeError:
-                pass
-        # ``Q.add_q`` works even on sliced queries.
-        restriction = query.build_where(Q(**{f"{attr}__in": ids}))
-        # Keep the authorization clause identifiable, including in Django's
-        # cloned/combined WHERE trees, so changing actor cannot intersect stale
-        # permission IDs with the new actor's scope.
-        query.where = WhereNode([query.where, _ScopeWhere(children=[restriction])])
+            attr = resource_id_attr(model)
+            if attr == "pk":
+                # Coerce to ints when the PK is integer-typed; leave as
+                # strings for UUID/Char PKs. Only relevant for the pk path
+                # — non-pk attrs (sqid, public_id, slug) are always
+                # string-valued and pass through unchanged.
+                try:
+                    pk_field = model._meta.pk
+                    if pk_field is not None and pk_field.get_internal_type() in (
+                        "AutoField",
+                        "BigAutoField",
+                        "IntegerField",
+                        "BigIntegerField",
+                        "SmallIntegerField",
+                        "PositiveIntegerField",
+                        "PositiveBigIntegerField",
+                        "PositiveSmallIntegerField",
+                    ):
+                        ids = [int(i) for i in ids]
+                except ValueError:
+                    pass
+                except TypeError:
+                    pass
+            # ``Q.add_q`` works even on sliced queries.
+            restriction = query.build_where(Q(**{f"{attr}__in": ids}))
+            # Keep the authorization clause identifiable, including in Django's
+            # cloned/combined WHERE trees, so changing actor cannot intersect stale
+            # permission IDs with the new actor's scope.
+            query.where = WhereNode([query.where, _ScopeWhere(children=[restriction])])
 
     def _clone(self, **kwargs: Any) -> Self:
         # Django's private clone hook; not in django-stubs.
@@ -1205,6 +1209,10 @@ class RebacQuerySet(models.QuerySet[_M]):
         combined._refresh_scope()
         return combined
 
+    def _gated_read_fields(self) -> frozenset[str]:
+        with database_context(self.db):
+            return gated_read_fields(self.model)
+
     def _effective_field_mode(self) -> FieldDenyMode:
         return effective_field_deny_mode(self._rebac_field_deny)
 
@@ -1218,74 +1226,77 @@ class RebacQuerySet(models.QuerySet[_M]):
         query: Query | None = None,
         clears_ordering: bool | None = None,
     ) -> None:
-        query = self.query if query is None else query
-        self._guard_clause_field_reads(actor, sudo, query=query, clears_ordering=clears_ordering)
-        selected = dict(query.annotation_select)
-        if expressions:
-            selected.update(expressions)
-        # Root bypass never carries across the protected relation boundary.
-        self._guard_projected_related_reads(selected, query=query)
-        if actor is None or sudo:
-            return
-        if runtime_field_deny_mode(self._effective_field_mode()) == "allow":
-            return
-        for part in _selections(query):
-            if part.model is None:
-                continue
-            if part is not query:
-                computed = dict(part.annotation_select)
-                columns: Iterable[Any] = part.select
-                literal = _hand_written_selection(part, self.db)
-            elif query.combinator:
-                # A combination runs its operands; of its own it adds only
-                # the values computed over their rows.
-                computed, columns, literal = dict(expressions or {}), (), False
-            else:
-                computed, columns = selected, query.select
-                literal = _hand_written_selection(query, self.db)
-            if literal or any(_has_opaque_write_expression(v) for v in computed.values()):
-                raise PermissionDenied(
-                    f"Cannot select hand-written SQL on {part.model.__name__} under an actor: "
-                    "it can read any column, so field read gates cannot be checked. "
-                    "Read it under sudo(reason=...), or select the columns through "
-                    "ORM expressions."
-                )
-            if part is not query and query.selected is None and part.selected is None:
-                # The rows of an operand become instances of the first
-                # operand's model column by column, so a gated value can land
-                # in a field that is not redacted.  No layout is worked out
-                # here: the operands load every field of that one model.
-                plain = (
-                    part.model._meta.concrete_model is self.model._meta.concrete_model
-                    and part.deferred_loading == _EVERY_FIELD
-                    and query.deferred_loading == _EVERY_FIELD
-                )
-                related = bool(part.select_related or query.select_related)
-                if (not plain or related) and (
-                    related or gated_read_fields(self.model) or gated_read_fields(part.model)
-                ):
-                    raise PermissionDenied(
-                        f"Cannot combine {part.model.__name__} rows into "
-                        f"{self.model.__name__} instances under field read enforcement: "
-                        "the operands of a combination that returns model instances must "
-                        "load every field of one model, without only(), defer() or "
-                        "select_related(). Combine values() projections instead."
-                    )
-            for model, requested in sorted(
-                _selected_gated(
-                    part.model, (*columns, *computed.values()), query, reader=actor
-                ).items(),
-                key=lambda item: item[0]._meta.label_lower,
-            ):
-                hidden = _hidden_from(actor, model, requested)
-                if not hidden:
+        with database_context(self.db):
+            query = self.query if query is None else query
+            self._guard_clause_field_reads(
+                actor, sudo, query=query, clears_ordering=clears_ordering
+            )
+            selected = dict(query.annotation_select)
+            if expressions:
+                selected.update(expressions)
+            # Root bypass never carries across the protected relation boundary.
+            self._guard_projected_related_reads(selected, query=query)
+            if actor is None or sudo:
+                return
+            if runtime_field_deny_mode(self._effective_field_mode()) == "allow":
+                return
+            for part in _selections(query):
+                if part.model is None:
                     continue
-                names = ", ".join(f"read__{name}" for name in hidden)
-                raise PermissionDenied(
-                    f"Cannot project gated field(s) {names} on {model.__name__}: "
-                    "field read enforcement requires model-instance materialisation "
-                    "or a projection that omits gated fields."
-                )
+                if part is not query:
+                    computed = dict(part.annotation_select)
+                    columns: Iterable[Any] = part.select
+                    literal = _hand_written_selection(part, self.db)
+                elif query.combinator:
+                    # A combination runs its operands; of its own it adds only
+                    # the values computed over their rows.
+                    computed, columns, literal = dict(expressions or {}), (), False
+                else:
+                    computed, columns = selected, query.select
+                    literal = _hand_written_selection(query, self.db)
+                if literal or any(_has_opaque_write_expression(v) for v in computed.values()):
+                    raise PermissionDenied(
+                        f"Cannot select hand-written SQL on {part.model.__name__} under an actor: "
+                        "it can read any column, so field read gates cannot be checked. "
+                        "Read it under sudo(reason=...), or select the columns through "
+                        "ORM expressions."
+                    )
+                if part is not query and query.selected is None and part.selected is None:
+                    # The rows of an operand become instances of the first
+                    # operand's model column by column, so a gated value can land
+                    # in a field that is not redacted.  No layout is worked out
+                    # here: the operands load every field of that one model.
+                    plain = (
+                        part.model._meta.concrete_model is self.model._meta.concrete_model
+                        and part.deferred_loading == _EVERY_FIELD
+                        and query.deferred_loading == _EVERY_FIELD
+                    )
+                    related = bool(part.select_related or query.select_related)
+                    if (not plain or related) and (
+                        related or gated_read_fields(self.model) or gated_read_fields(part.model)
+                    ):
+                        raise PermissionDenied(
+                            f"Cannot combine {part.model.__name__} rows into "
+                            f"{self.model.__name__} instances under field read enforcement: "
+                            "the operands of a combination that returns model instances must "
+                            "load every field of one model, without only(), defer() or "
+                            "select_related(). Combine values() projections instead."
+                        )
+                for model, requested in sorted(
+                    _selected_gated(
+                        part.model, (*columns, *computed.values()), query, reader=actor
+                    ).items(),
+                    key=lambda item: item[0]._meta.label_lower,
+                ):
+                    hidden = _hidden_from(actor, model, requested)
+                    if not hidden:
+                        continue
+                    names = ", ".join(f"read__{name}" for name in hidden)
+                    raise PermissionDenied(
+                        f"Cannot project gated field(s) {names} on {model.__name__}: "
+                        "field read enforcement requires model-instance materialisation "
+                        "or a projection that omits gated fields."
+                    )
 
     @schema_operation
     def _guard_clause_field_reads(
@@ -1306,126 +1317,135 @@ class RebacQuerySet(models.QuerySet[_M]):
         reveal it.  An actor whose permission on the field does not depend on
         the row reads it everywhere and is not refused.
         """
-        for nested in _nested_queries(self.query if query is None else query):
-            _check_subquery(nested)
-        if actor is None or sudo:
-            return
-        if runtime_field_deny_mode(self._effective_field_mode()) == "allow":
-            return
-        query = self.query if query is None else query
-        if query.model is None:
-            return
-        expressions, literal = _clause_expressions(query, self.db, clears_ordering=clears_ordering)
-        if literal:
-            raise PermissionDenied(
-                f"Cannot filter or order by hand-written SQL on {query.model.__name__} under an "
-                "actor: it can read any column, so field read gates cannot be checked. Run it "
-                "under sudo(reason=...), or filter through ORM expressions."
+        with database_context(self.db):
+            for nested in _nested_queries(self.query if query is None else query):
+                _check_subquery(nested)
+            if actor is None or sudo:
+                return
+            if runtime_field_deny_mode(self._effective_field_mode()) == "allow":
+                return
+            query = self.query if query is None else query
+            if query.model is None:
+                return
+            expressions, literal = _clause_expressions(
+                query, self.db, clears_ordering=clears_ordering
             )
-        for model, requested in sorted(
-            _selected_gated(query.model, expressions, query, reader=actor).items(),
-            key=lambda item: item[0]._meta.label_lower,
-        ):
-            hidden = _hidden_from(actor, model, requested)
-            if hidden:
-                names = ", ".join(f"read__{name}" for name in hidden)
+            if literal:
                 raise PermissionDenied(
-                    f"Cannot filter or order by gated field(s) {names} on {model.__name__} under "
-                    "an actor: the rows matched, their number and their order would reveal the "
-                    "values. Filter on another column, or run it under sudo(reason=...)."
+                    f"Cannot filter or order by hand-written SQL on {query.model.__name__} under an "
+                    "actor: it can read any column, so field read gates cannot be checked. Run it "
+                    "under sudo(reason=...), or filter through ORM expressions."
                 )
+            for model, requested in sorted(
+                _selected_gated(query.model, expressions, query, reader=actor).items(),
+                key=lambda item: item[0]._meta.label_lower,
+            ):
+                hidden = _hidden_from(actor, model, requested)
+                if hidden:
+                    names = ", ".join(f"read__{name}" for name in hidden)
+                    raise PermissionDenied(
+                        f"Cannot filter or order by gated field(s) {names} on {model.__name__} under "
+                        "an actor: the rows matched, their number and their order would reveal the "
+                        "values. Filter on another column, or run it under sudo(reason=...)."
+                    )
 
     def _guard_projected_related_reads(self, expressions: dict[str, Any], *, query: Query) -> None:
-        if not self._rebac_select_related_guards:
-            return
-        from .relation_loading import protected_lookup_prefixes
+        with database_context(self.db):
+            if not self._rebac_select_related_guards:
+                return
+            from .relation_loading import protected_lookup_prefixes
 
-        paths = {
-            path
-            for guard in self._rebac_select_related_guards
-            for path, _ in protected_lookup_prefixes(self.model, guard)
-        }
-        guarded = tuple(f"{path}__" for path in sorted(paths))
-        raw_fields = getattr(self, "_fields", None)
-        related = {
-            field
-            for field in raw_fields or ()
-            if isinstance(field, str) and any(field.startswith(prefix) for prefix in guarded)
-        }
-        for name, expression in expressions.items():
-            for column in _expression_columns(expression):
-                path = _column_relation_path(query, column)
-                if path in paths or any(path.startswith(prefix) for prefix in guarded):
-                    related.add(name)
-        if not related:
-            return
-        names = ", ".join(sorted(related)[:5])
-        raise PermissionDenied(
-            f"Cannot project related field(s) {names}: rebac_select_related() "
-            "enforcement requires model-instance materialisation."
-        )
+            paths = {
+                path
+                for guard in self._rebac_select_related_guards
+                for path, _ in protected_lookup_prefixes(self.model, guard)
+            }
+            guarded = tuple(f"{path}__" for path in sorted(paths))
+            raw_fields = getattr(self, "_fields", None)
+            related = {
+                field
+                for field in raw_fields or ()
+                if isinstance(field, str) and any(field.startswith(prefix) for prefix in guarded)
+            }
+            for name, expression in expressions.items():
+                for column in _expression_columns(expression):
+                    path = _column_relation_path(query, column)
+                    if path in paths or any(path.startswith(prefix) for prefix in guarded):
+                        related.add(name)
+            if not related:
+                return
+            names = ", ".join(sorted(related)[:5])
+            raise PermissionDenied(
+                f"Cannot project related field(s) {names}: rebac_select_related() "
+                "enforcement requires model-instance materialisation."
+            )
 
     @schema_operation
     def _fetch_all(self) -> None:
         """Keep guards, SQL compilation and nested prefetches in one evaluation."""
-        fetching = self._result_cache is None
-        if fetching:
-            self._apply_scope_in_place()
-        actor, sudo = self._resolve_effective_actor()
-        if fetching:
-            # Rows already held were guarded by the evaluation that read them.
+        with database_context(self.db):
+            fetching = self._result_cache is None
+            if fetching:
+                self._apply_scope_in_place()
+            actor, sudo = self._resolve_effective_actor()
+            if fetching:
+                # Rows already held were guarded by the evaluation that read them.
+                self._guard_projected_field_reads(actor, sudo)
+            super()._fetch_all()
+            if self._result_cache is not None and not self._rebac_visibility_applied:
+                if actor is not None and not sudo:
+                    for inst in self._result_cache:
+                        if isinstance(inst, models.Model):
+                            inst._rebac_actor = actor  # type: ignore[attr-defined]
+                            inst._rebac_field_deny = self._rebac_field_deny  # type: ignore[attr-defined]
+                    apply_field_visibility(
+                        self._result_cache,
+                        model=self.model,
+                        actor=actor,
+                        mode=self._effective_field_mode(),
+                        using=self.db,
+                    )
+                self._guard_selected_related_reads()
+                self._rebac_visibility_applied = True
+
+    @schema_operation
+    def iterator(self, *args: Any, **kwargs: Any) -> Any:
+        with database_context(self.db):
+            if self._result_cache is None:
+                self._apply_scope_in_place()
+            actor, sudo = self._resolve_effective_actor()
             self._guard_projected_field_reads(actor, sudo)
-        super()._fetch_all()
-        if self._result_cache is not None and not self._rebac_visibility_applied:
+            rows = list(super().iterator(*args, **kwargs))
             if actor is not None and not sudo:
-                for inst in self._result_cache:
+                for inst in rows:
                     if isinstance(inst, models.Model):
                         inst._rebac_actor = actor  # type: ignore[attr-defined]
                         inst._rebac_field_deny = self._rebac_field_deny  # type: ignore[attr-defined]
                 apply_field_visibility(
-                    self._result_cache,
+                    rows,
                     model=self.model,
                     actor=actor,
                     mode=self._effective_field_mode(),
+                    using=self.db,
                 )
-            self._guard_selected_related_reads()
-            self._rebac_visibility_applied = True
-
-    @schema_operation
-    def iterator(self, *args: Any, **kwargs: Any) -> Any:
-        if self._result_cache is None:
-            self._apply_scope_in_place()
-        actor, sudo = self._resolve_effective_actor()
-        self._guard_projected_field_reads(actor, sudo)
-        rows = list(super().iterator(*args, **kwargs))
-        if actor is not None and not sudo:
-            for inst in rows:
-                if isinstance(inst, models.Model):
-                    inst._rebac_actor = actor  # type: ignore[attr-defined]
-                    inst._rebac_field_deny = self._rebac_field_deny  # type: ignore[attr-defined]
-            apply_field_visibility(
-                rows,
-                model=self.model,
-                actor=actor,
-                mode=self._effective_field_mode(),
-            )
-        self._guard_selected_related_reads(rows)
-        return iter(rows)
+            self._guard_selected_related_reads(rows)
+            return iter(rows)
 
     def _guard_selected_related_reads(self, rows: Iterable[Any] | None = None) -> None:
-        if not self._rebac_select_related_guards:
-            return
-        from .relation_loading import guard_selected_related_instances, relation_actor
+        with database_context(self.db):
+            if not self._rebac_select_related_guards:
+                return
+            from .relation_loading import guard_selected_related_instances, relation_actor
 
-        if rows is None:
-            rows = self._result_cache or ()
-        guard_selected_related_instances(
-            rows,
-            root_model=self.model,
-            paths=self._rebac_select_related_guards,
-            actor=relation_actor(self),
-            mode=self._effective_field_mode(),
-        )
+            if rows is None:
+                rows = self._result_cache or ()
+            guard_selected_related_instances(
+                rows,
+                root_model=self.model,
+                paths=self._rebac_select_related_guards,
+                actor=relation_actor(self),
+                mode=self._effective_field_mode(),
+            )
 
     # ----- Async iteration: Django's aiterator bypasses the sync overrides -----
 
@@ -1457,7 +1477,7 @@ class RebacQuerySet(models.QuerySet[_M]):
         await sync_to_async(self._guard_projected_field_reads)(actor, sudo)
         field_mode = self._effective_field_mode()
         redact = runtime_field_deny_mode(field_mode) != "allow" and bool(
-            await sync_to_async(gated_read_fields)(self.model)
+            await sync_to_async(self._gated_read_fields)()
         )
         guard_related = bool(self._rebac_select_related_guards)
         async for inst in super().aiterator(*args, **kwargs):
@@ -1466,7 +1486,7 @@ class RebacQuerySet(models.QuerySet[_M]):
                 inst._rebac_field_deny = self._rebac_field_deny  # type: ignore[attr-defined]
                 if redact:
                     await sync_to_async(apply_field_visibility)(
-                        [inst], model=self.model, actor=actor, mode=field_mode
+                        [inst], model=self.model, actor=actor, mode=field_mode, using=self.db
                     )
             if guard_related:
                 await sync_to_async(self._guard_selected_related_reads)([inst])
@@ -1494,11 +1514,12 @@ class RebacQuerySet(models.QuerySet[_M]):
     ) -> None:
         """A count or an existence test reads what the query filters on, and the
         selected values only when its rows are distinct, grouped or combined."""
-        query = self.query
-        if query.distinct or query.group_by is not None or query.combinator:
-            self._guard_projected_field_reads(actor, sudo, clears_ordering=clears_ordering)
-        else:
-            self._guard_clause_field_reads(actor, sudo, clears_ordering=clears_ordering)
+        with database_context(self.db):
+            query = self.query
+            if query.distinct or query.group_by is not None or query.combinator:
+                self._guard_projected_field_reads(actor, sudo, clears_ordering=clears_ordering)
+            else:
+                self._guard_clause_field_reads(actor, sudo, clears_ordering=clears_ordering)
 
     def aggregate(self, *args: Any, **kwargs: Any) -> dict[str, Any]:
         """Aggregate over the actor's scope, not the whole table.
@@ -1784,21 +1805,24 @@ class RebacQuerySet(models.QuerySet[_M]):
             return sum(deleted.values()), dict(deleted)
 
     def _guard_bulk_action(self, actor: SubjectRef, action: str) -> None:
-        from .backends import backend
+        with database_context(self.db):
+            from .backends import backend
 
-        rebac_type = model_resource_type(self.model)
-        if not rebac_type:
-            return
-        # Pre-fetch ids in scope, intersect with allowed.
-        affected = self._affected_resource_ids_for_guard()
-        if not affected:
-            return
-        allowed = set(backend().accessible(subject=actor, action=action, resource_type=rebac_type))
-        denied = affected - allowed
-        if denied:
-            raise PermissionDenied(
-                f"Bulk {action}: row outside actor scope. Bulk operations are all-or-nothing."
+            rebac_type = model_resource_type(self.model)
+            if not rebac_type:
+                return
+            # Pre-fetch ids in scope, intersect with allowed.
+            affected = self._affected_resource_ids_for_guard()
+            if not affected:
+                return
+            allowed = set(
+                backend().accessible(subject=actor, action=action, resource_type=rebac_type)
             )
+            denied = affected - allowed
+            if denied:
+                raise PermissionDenied(
+                    f"Bulk {action}: row outside actor scope. Bulk operations are all-or-nothing."
+                )
 
     def _guard_bulk_field_writes(self, actor: SubjectRef, kwargs: dict[str, Any]) -> None:
         """Per-field write enforcement for bulk ``QuerySet.update()``.
@@ -1814,101 +1838,103 @@ class RebacQuerySet(models.QuerySet[_M]):
         through their own server-side schema. The resource-level
         ``write`` check already ran before we got here.
         """
-        from .backends import backend
-        from .schema.ast import Schema
-        from .schema.walker import field_gated_actions
+        with database_context(self.db):
+            from .backends import backend
+            from .schema.ast import Schema
+            from .schema.walker import field_gated_actions
 
-        rebac_type = model_resource_type(self.model)
-        if not rebac_type:
-            return
-        accessor = getattr(backend(), "schema", None)
-        if not callable(accessor):
-            return
-        try:
-            schema = accessor()
-        except Exception:
-            return
-        if not isinstance(schema, Schema):
-            return
-        definition = schema.get_definition(rebac_type)
-        if definition is None:
-            return
-        declared = field_gated_actions(definition, "write")
-        if not declared:
-            return
-
-        affected = self._affected_resource_ids_for_guard()
-        if not affected:
-            return
-
-        meta = self.model._meta
-        for raw_name in kwargs.keys():
-            # Normalise FK attname → field.name so ``write__folder`` matches
-            # an ``update(folder_id=...)`` call.
+            rebac_type = model_resource_type(self.model)
+            if not rebac_type:
+                return
+            accessor = getattr(backend(), "schema", None)
+            if not callable(accessor):
+                return
             try:
-                field = meta.get_field(raw_name)
-                field_name = field.name
+                schema = accessor()
             except Exception:
-                field_name = raw_name
-            action = f"write__{field_name}"
-            if action not in declared:
-                continue
-            allowed = set(
-                accessible_ids(
-                    backend(),
-                    subject=actor,
-                    action=action,
-                    resource_type=rebac_type,
+                return
+            if not isinstance(schema, Schema):
+                return
+            definition = schema.get_definition(rebac_type)
+            if definition is None:
+                return
+            declared = field_gated_actions(definition, "write")
+            if not declared:
+                return
+
+            affected = self._affected_resource_ids_for_guard()
+            if not affected:
+                return
+
+            meta = self.model._meta
+            for raw_name in kwargs.keys():
+                # Normalise FK attname → field.name so ``write__folder`` matches
+                # an ``update(folder_id=...)`` call.
+                try:
+                    field = meta.get_field(raw_name)
+                    field_name = field.name
+                except Exception:
+                    field_name = raw_name
+                action = f"write__{field_name}"
+                if action not in declared:
+                    continue
+                allowed = set(
+                    accessible_ids(
+                        backend(),
+                        subject=actor,
+                        action=action,
+                        resource_type=rebac_type,
+                    )
                 )
-            )
-            denied = affected - allowed
-            if denied:
-                raise PermissionDenied(
-                    f"Bulk {action}: row outside actor scope. Bulk operations are all-or-nothing."
-                )
+                denied = affected - allowed
+                if denied:
+                    raise PermissionDenied(
+                        f"Bulk {action}: row outside actor scope. Bulk operations are all-or-nothing."
+                    )
 
     def _guard_bulk_expression_reads(self, actor: SubjectRef, kwargs: dict[str, Any]) -> None:
-        gated = gated_read_fields(self.model)
-        if gated and any(_has_opaque_write_expression(value) for value in kwargs.values()):
-            raise PermissionDenied(
-                "Write expression has opaque SQL over a model with gated fields."
-            )
-        if runtime_field_deny_mode(self._effective_field_mode()) == "allow":
-            return
-        from .backends import backend
-
-        query = self.query.clone()
-        required: set[str] = set()
-        for value in kwargs.values():
-            resolver = getattr(value, "resolve_expression", None)
-            if not callable(resolver):
-                continue
-            resolved = resolver(query)
-            if _has_gated_subquery(resolved):
-                raise PermissionDenied("Write expression reads a subquery over gated fields.")
-            required.update(
-                column.target.name
-                for column in _expression_columns(resolved)
-                if _column_on_model_lineage(column, self.model) and column.target.name in gated
-            )
-        if not required:
-            return
-        affected = self._affected_resource_ids_for_guard()
-        rebac_type = model_resource_type(self.model)
-        assert rebac_type is not None
-        for field_name in sorted(required):
-            allowed = set(
-                accessible_ids(
-                    backend(),
-                    subject=actor,
-                    action=f"read__{field_name}",
-                    resource_type=rebac_type,
-                )
-            )
-            if affected - allowed:
+        with database_context(self.db):
+            gated = gated_read_fields(self.model)
+            if gated and any(_has_opaque_write_expression(value) for value in kwargs.values()):
                 raise PermissionDenied(
-                    f"Bulk write expression reads denied field read__{field_name}."
+                    "Write expression has opaque SQL over a model with gated fields."
                 )
+            if runtime_field_deny_mode(self._effective_field_mode()) == "allow":
+                return
+            from .backends import backend
+
+            query = self.query.clone()
+            required: set[str] = set()
+            for value in kwargs.values():
+                resolver = getattr(value, "resolve_expression", None)
+                if not callable(resolver):
+                    continue
+                resolved = resolver(query)
+                if _has_gated_subquery(resolved):
+                    raise PermissionDenied("Write expression reads a subquery over gated fields.")
+                required.update(
+                    column.target.name
+                    for column in _expression_columns(resolved)
+                    if _column_on_model_lineage(column, self.model) and column.target.name in gated
+                )
+            if not required:
+                return
+            affected = self._affected_resource_ids_for_guard()
+            rebac_type = model_resource_type(self.model)
+            assert rebac_type is not None
+            for field_name in sorted(required):
+                allowed = set(
+                    accessible_ids(
+                        backend(),
+                        subject=actor,
+                        action=f"read__{field_name}",
+                        resource_type=rebac_type,
+                    )
+                )
+                if affected - allowed:
+                    raise PermissionDenied(
+                        f"Bulk write expression reads denied field read__{field_name}."
+                    )
 
     def _rows_in_scope(self, actor: SubjectRef, *, reason: str) -> RebacQuerySet[_M]:
         """The statement's rows the queryset's scope admits for ``actor``, read
@@ -1955,14 +1981,6 @@ class RebacManager[M: models.Model](_RebacManagerBase[M]):  # pyright: ignore[re
     model parameter through queryset chains.
     """
 
-    # The actor verbs are declared here as well as copied from the queryset
-    # by ``from_queryset``: pyright has no Django plugin and cannot see the
-    # copies, so without these ``Post.objects.with_actor(...)`` is an
-    # attribute error for every editor user. mypy resolves a
-    # ``from_queryset`` subclass's verbs through the plugin, which keeps a
-    # custom queryset's own type; ``get_queryset`` is deliberately not
-    # declared, so that inference is Django's.
-
     def _rebac_queryset(self) -> RebacQuerySet[M]:
         queryset = self.get_queryset()
         if not isinstance(queryset, RebacQuerySet):
@@ -1972,56 +1990,43 @@ class RebacManager[M: models.Model](_RebacManagerBase[M]):  # pyright: ignore[re
             )
         return queryset
 
-    def with_actor(self, actor: ActorLike | None) -> RebacQuerySet[M]:
-        return self._rebac_queryset().with_actor(actor)
+    # Static declarations for checkers without Django's from_queryset plugin.
+    # Runtime dispatch remains Django's native generated queryset methods.
+    if TYPE_CHECKING:
 
-    def as_user(self, user: Any) -> RebacQuerySet[M]:
-        return self._rebac_queryset().as_user(user)
+        def with_actor(self, actor: ActorLike | None) -> RebacQuerySet[M]: ...
 
-    def as_agent(self, agent: Any, *, on_behalf_of: Any | None = None) -> RebacQuerySet[M]:
-        return self._rebac_queryset().as_agent(agent, on_behalf_of=on_behalf_of)
+        def as_user(self, user: Any) -> RebacQuerySet[M]: ...
 
-    def with_action(self, action: str) -> RebacQuerySet[M]:
-        return self._rebac_queryset().with_action(action)
+        def as_agent(self, agent: Any, *, on_behalf_of: Any | None = None) -> RebacQuerySet[M]: ...
 
-    def on_field_deny(self, mode: FieldDenyMode) -> RebacQuerySet[M]:
-        return self._rebac_queryset().on_field_deny(mode)
+        def with_action(self, action: str) -> RebacQuerySet[M]: ...
 
-    def for_write(self) -> RebacQuerySet[M]:
-        return self._rebac_queryset().for_write()
+        def on_field_deny(self, mode: FieldDenyMode) -> RebacQuerySet[M]: ...
 
-    def readable(self, field: str) -> models.Expression:
-        return self._rebac_queryset().readable(field)
+        def for_write(self) -> RebacQuerySet[M]: ...
 
-    def rebac_select_related(self, *fields: Any) -> RebacQuerySet[M]:
-        return self._rebac_queryset().rebac_select_related(*fields)
+        def readable(self, field: str) -> models.Expression: ...
 
-    def rebac_prefetch_related(self, *lookups: Any) -> RebacQuerySet[M]:
-        return self._rebac_queryset().rebac_prefetch_related(*lookups)
+        def rebac_select_related(self, *fields: Any) -> RebacQuerySet[M]: ...
 
-    def sudo(self, *, reason: str) -> RebacQuerySet[M]:
-        return self._rebac_queryset().sudo(reason=reason)
+        def rebac_prefetch_related(self, *lookups: Any) -> RebacQuerySet[M]: ...
 
-    def system_context(self, *, reason: str) -> RebacQuerySet[M]:
-        return self._rebac_queryset().system_context(reason=reason)
+        def sudo(self, *, reason: str) -> RebacQuerySet[M]: ...
 
-    def scoped(self) -> RebacQuerySet[M]:
-        return self._rebac_queryset().scoped()
+        def system_context(self, *, reason: str) -> RebacQuerySet[M]: ...
 
-    def scoped_for_aggregate(self) -> RebacQuerySet[M]:
-        return self._rebac_queryset().scoped_for_aggregate()
+        def scoped(self) -> RebacQuerySet[M]: ...
 
-    def actor(self) -> SubjectRef | None:
-        return self._rebac_queryset().actor()
+        def scoped_for_aggregate(self) -> RebacQuerySet[M]: ...
 
-    def is_sudo(self) -> bool:
-        return self._rebac_queryset().is_sudo()
+        def actor(self) -> SubjectRef | None: ...
 
-    def effective_actor(self, *, strict: bool = False) -> tuple[SubjectRef | None, bool]:
-        return self._rebac_queryset().effective_actor(strict=strict)
+        def is_sudo(self) -> bool: ...
 
-    def insert(self, obj: M) -> M:
-        return self._rebac_queryset().insert(obj)
+        def effective_actor(self, *, strict: bool = False) -> tuple[SubjectRef | None, bool]: ...
+
+        def insert(self, obj: M) -> M: ...
 
     def raw(
         self, raw_query: str, params: Any = (), translations: Any = None, using: Any = None

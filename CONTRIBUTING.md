@@ -13,6 +13,13 @@ make install-dev            # uv sync: the dev group and the caveats, drf, straw
 tools are a PEP 735 dependency group, not a published extra; `mypy` and
 `django-stubs` are the PyPI releases, with no fork pins.
 
+PostgreSQL tests use the URL in `REBAC_TEST_POSTGRES_URL` for credentials and
+base database names. Django creates and drops separate `test_<name>` databases;
+parallel pytest workers append `_gw0`, `_gw1`, and so on. Database alias tests
+also use `test_<name>_selected` with the same worker suffixes. The URL's base
+database is not the test target. Use a disposable name and a test role permitted
+to create those databases.
+
 ## Commands
 
 The tiers are specified in

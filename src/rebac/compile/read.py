@@ -170,15 +170,15 @@ class _Policy:
         return self.tagged.schema
 
 
-def _schema(backend: LocalBackend) -> tuple[Schema, SchemaSnapshot]:
-    snapshot = backend._schema_snapshot()
+def _schema(backend: LocalBackend, using: str) -> tuple[Schema, SchemaSnapshot]:
+    snapshot = backend._schema_snapshot(using=using)
     return snapshot.schema, snapshot
 
 
-def _policy(backend: LocalBackend) -> _Policy:
+def _policy(backend: LocalBackend, using: str) -> _Policy:
     from rebac.models import SchemaOverride
 
-    _effective, snapshot = _schema(backend)
+    _effective, snapshot = _schema(backend, using)
     baseline = snapshot.baseline or snapshot.schema
     key = (
         snapshot.using,
@@ -618,7 +618,7 @@ class _Operation:
         context: Mapping[str, Any] | None = None,
         policy: _Policy | None = None,
     ) -> _Operation:
-        policy = policy if policy is not None else _policy(backend)
+        policy = policy if policy is not None else _policy(backend, using)
         return cls(
             backend,
             policy,
@@ -1202,7 +1202,7 @@ def check(
     context: Mapping[str, Any] | None,
     using: str,
 ) -> CheckResult:
-    schema, _snapshot = _schema(backend)
+    schema, _snapshot = _schema(backend, using)
     definition = schema.get_definition(resource.resource_type)
     if definition is None:
         return CheckResult.no(reason=f"unknown resource type: {resource.resource_type}")
@@ -1302,7 +1302,7 @@ def check_many(
     """What ``check`` answers for each item, from statements the items share."""
     from rebac.evaluator import current_evaluator, evaluator_scope
 
-    schema, _snapshot = _schema(backend)
+    schema, _snapshot = _schema(backend, using)
     answers: dict[int, CheckResult] = {}
     points: list[int] = []
     for index, item in enumerate(items):
@@ -1327,7 +1327,7 @@ def check_many(
                 using=using,
             )
     if points:
-        policy = _policy(backend)
+        policy = _policy(backend, using)
         with ExitStack() as stack:
             if current_evaluator() is None:
                 # The sets decided together are kept where a check looks for them.
@@ -1683,7 +1683,7 @@ class _Scope(Expression):
     @schema_operation
     def as_sql(self, compiler: Any, connection: Any) -> tuple[str, tuple[Any, ...]]:
         resource_type = model_resource_type(self.model)
-        policy = _policy(self.backend)
+        policy = _policy(self.backend, self.using)
         if resource_type is None or policy.snapshot.revision != self.revision:
             return "(1 = 0)", ()
         operation = _Operation.begin(self.backend, self.actor, self.using, policy=policy)
@@ -1714,7 +1714,7 @@ def scope_q(
 ) -> Q:
     if model_resource_type(model) is None:
         return Q(pk__in=[])
-    _schema_at_build, snapshot = _schema(backend)
+    _schema_at_build, snapshot = _schema(backend, using)
     return Q(_Scope(backend, model, action, actor, using, snapshot.revision))
 
 
@@ -1800,7 +1800,7 @@ class _AccessibleResources:
 
     @schema_operation
     def _branches(self) -> list[tuple[models.QuerySet[Any], Callable[[Any], str | None]]]:
-        policy = _policy(self.backend)
+        policy = _policy(self.backend, self.using)
         if policy.snapshot.revision != self.revision:
             return []
         operation = _Operation.begin(self.backend, self.actor, self.using, self.context, policy)
@@ -1894,7 +1894,7 @@ def accessible_ids(
     using: str,
     context: Mapping[str, Any] | None = None,
 ) -> _AccessibleResources:
-    _schema_now, snapshot = _schema(backend)
+    _schema_now, snapshot = _schema(backend, using)
     return _AccessibleResources(
         backend, resource_type, action, actor, using, context, snapshot.revision
     )
@@ -1916,7 +1916,7 @@ def grants_all(
     it for every row only while such facts can only add to it: an exclusion
     on the row itself can take it away from one row, so it never holds for all.
     """
-    schema, _snapshot = _schema(backend)
+    schema, _snapshot = _schema(backend, using)
     if _excludes_on_the_row(schema, resource_type, action):
         return False
     return _point_result(
@@ -2029,7 +2029,7 @@ def _held(
         # The ids left name no row: they have no content types.
         types = {}
     if pending and types is None:
-        types = _key_types(_policy(backend), using, (resource_type, action), pending)
+        types = _key_types(_policy(backend, using), using, (resource_type, action), pending)
     for value in sorted(pending):
         if _point_result(
             backend=backend,
@@ -2060,7 +2060,7 @@ def lookup_subjects(
     Candidates are the subjects that tuples, backed columns and constants
     name on a path from the resource; each is then tested by the lower bound.
     """
-    schema, _snapshot = _schema(backend)
+    schema, _snapshot = _schema(backend, using)
     candidates = list(
         named_subjects(
             schema=schema,
@@ -2074,7 +2074,7 @@ def lookup_subjects(
         return []
     # One read of the resource's content types serves every candidate.
     types = _key_types(
-        _policy(backend), using, (resource.resource_type, action), (resource.resource_id,)
+        _policy(backend, using), using, (resource.resource_type, action), (resource.resource_id,)
     )
     return [
         candidate
