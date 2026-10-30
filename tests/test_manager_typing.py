@@ -105,11 +105,13 @@ def test_queryset_manager_extensions_keep_native_type_checks(tmp_path: Path) -> 
             assert_type(queryset.sudo(reason="typing").get().title, str)
             assert_type(PostManager().answer(), int)
             assert_type(TrackedPostManager().label(), str)
-            # Upstream django-stubs types get_queryset() on a from_queryset
-            # manager as Django's QuerySet; the verbs on the manager itself
-            # keep the custom type (below).
+            assert_type(PostManager().get_queryset(), PostQuerySet[Post])
+            assert_type(TrackedPostManager().get_queryset(), TrackedPostQuerySet[Post])
             assert_type(PostManager().get_queryset().get(), Post)
             assert_type(TrackedPostManager().get_queryset().get(), Post)
+            assert_type(PostManager().sudo(reason="typing"), PostQuerySet[Post])
+            assert_type(PostManager().system_context(reason="typing"), PostQuerySet[Post])
+            assert_type(PostManager().system_context(reason="typing").answer(), int)
             assert_type(PostManager().with_actor(None), PostQuerySet[Post])
             assert_type(PostManager().with_actor(None).answer(), int)
             assert_type(PostManager().get(), Post)

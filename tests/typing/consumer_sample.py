@@ -37,6 +37,10 @@ def verbs_on_a_model_manager(actor: SubjectRef) -> None:
     assert_type(Post.objects.readable("title"), models.Expression)
     assert_type(Post.objects.insert(Post(title="x")), Post)
     assert_type(Post.objects.actor(), SubjectRef | None)
+    assert_type(Post.objects.is_sudo(), bool)
+    assert_type(Post.objects.effective_actor(), tuple[SubjectRef | None, bool])
+    assert_type(Post.objects.scoped().get(), Post)
+    assert_type(Post.objects.scoped_for_aggregate().get(), Post)
 
 
 def verbs_on_a_custom_queryset(actor: SubjectRef) -> None:
