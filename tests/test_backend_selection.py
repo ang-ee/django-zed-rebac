@@ -7,6 +7,8 @@ value is rejected. A failed construction is never cached.
 from __future__ import annotations
 
 import importlib.util
+import subprocess
+import sys
 
 import pytest
 from django.test import override_settings
@@ -25,6 +27,33 @@ def _pretend_authzed_is_installed(monkeypatch: pytest.MonkeyPatch) -> None:
         return _real_find_spec(name, *args, **kwargs)
 
     monkeypatch.setattr("rebac.backends.spicedb.importlib.util.find_spec", find_spec)
+
+
+def test_backend_import_does_not_populate_auth_models() -> None:
+    script = """
+import sys
+from django.apps import apps
+from django.conf import settings
+
+settings.configure(
+    SECRET_KEY="backend-import",
+    INSTALLED_APPS=["django.contrib.contenttypes", "django.contrib.auth", "rebac"],
+)
+assert not apps.apps_ready
+from rebac.backends import backend
+
+assert callable(backend)
+assert not apps.apps_ready
+assert "django.contrib.auth.base_user" not in sys.modules
+"""
+    result = subprocess.run(
+        [sys.executable, "-c", script],
+        capture_output=True,
+        text=True,
+        timeout=8,
+        check=False,
+    )
+    assert result.returncode == 0, result.stderr
 
 
 def test_local_backend_is_the_default_and_is_cached() -> None:

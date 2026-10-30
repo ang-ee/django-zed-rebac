@@ -32,17 +32,19 @@ the next backend (typically ``ModelBackend``) try.
 
 from __future__ import annotations
 
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 from asgiref.sync import sync_to_async
 from django.apps import apps as django_apps
-from django.contrib.auth.base_user import AbstractBaseUser
 
 from ..codenames import codename_to_action
 from ..conf import app_settings
 from ..errors import PermissionDepthExceeded
 from ..resources import model_resource_type
 from ..types import ObjectRef
+
+if TYPE_CHECKING:
+    from django.contrib.auth.base_user import AbstractBaseUser
 
 
 class RebacBackend:

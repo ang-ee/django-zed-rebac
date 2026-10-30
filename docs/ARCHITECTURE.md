@@ -1238,7 +1238,7 @@ class RebacConfig(AppConfig):
         signals.connect_tracked_signals()  # app registry only
 ```
 
-**No queries. No model instantiation. No backend resolution at import time.** The backend singleton is constructed lazily on first access via `rebac.backend()` — this avoids `AppRegistryNotReady` and keeps `migrate` fast.
+**No queries. No model instantiation. No backend resolution at import time.** The backend singleton is constructed lazily on first access via `rebac.backend()` — this avoids `AppRegistryNotReady` and keeps `migrate` fast. Importing `rebac.backends` before app population must not import Django auth models merely for type annotations.
 
 Schema-dependent checks defer an unreadable persisted schema while Django's
 migration graph reports pending REBAC migrations. This lets `migrate` upgrade
