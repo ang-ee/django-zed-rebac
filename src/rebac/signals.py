@@ -24,6 +24,7 @@ from django.dispatch import receiver
 
 from .actors import model_can_resolve_subject, model_identities
 from .conf import app_settings
+from .database import database_context
 from .errors import PermissionDenied
 from .resources import model_resource_type, to_object_ref
 from .types import ObjectRef, SubjectRef
@@ -286,7 +287,7 @@ def _wrap_related_m2m_writes() -> None:
                         **kwargs: Any,
                     ) -> Any:
                         using = router.db_for_write(self.through, instance=self.instance)
-                        with audit_backed_denials():
+                        with database_context(using), audit_backed_denials():
                             gated_pairs: set[tuple[Any, Any]] = set()
                             if _operation in {"clear", "set"}:
                                 gated_pairs |= _gate_m2m(

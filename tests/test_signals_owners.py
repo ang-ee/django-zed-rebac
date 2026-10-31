@@ -1,6 +1,6 @@
 """Owners-first signal regressions. Authored for the later execution phase."""
 
-from contextlib import contextmanager
+from contextlib import contextmanager, nullcontext
 from unittest.mock import patch
 
 import pytest
@@ -735,6 +735,7 @@ def test_backed_edge_write_uses_producer_grants(settings, storage, operation):
     from rebac.types import RelationshipFilter
 
     settings.REBAC_LOCAL_BACKEND_STORAGE = storage
+    settings.REBAC_AUDIT_DENIALS = True
     local = backend()
     schema = parse_zed(
         SCHEMA.replace("permission write = authenticated", "permission write = viewer", 1)
@@ -778,6 +779,10 @@ def test_backed_edge_write_uses_producer_grants(settings, storage, operation):
                 through.objects.using(alias).create(
                     post_id=201, folder_id=101 if operation == "set" else 102
                 )
+        default_audits = list(PermissionAuditEvent.objects.using("default").values())
+        denied_before = (
+            PermissionAuditEvent.objects.using(alias).filter(reason__startswith="denied:").count()
+        )
         default_rows = list(Post._base_manager.using("default").values())
         default_edges = list(active_relationship_model().objects.using("default").values())
         selected = Post._base_manager.using(alias).get(pk=201)
@@ -785,12 +790,18 @@ def test_backed_edge_write_uses_producer_grants(settings, storage, operation):
         through = Post.collections.through
         before_links = list(through.objects.using(alias).values())
         with (
-            database_context(alias),
+            database_context(alias)
+            if operation in {"save", "update", "through"}
+            else nullcontext(),
             actor_context(ALICE),
             CaptureQueriesContext(connections["default"]) as default_queries,
         ):
             try:
-                with transaction.atomic(using=alias):
+                with (
+                    transaction.atomic(using=alias)
+                    if operation in {"save", "update", "through"}
+                    else nullcontext()
+                ):
                     if operation == "save":
                         selected.folder_id = 102
                         selected.save(using=alias, update_fields=["folder"])
@@ -813,6 +824,14 @@ def test_backed_edge_write_uses_producer_grants(settings, storage, operation):
             else:
                 assert permitted
         assert list(default_queries) == []
+        assert list(PermissionAuditEvent.objects.using("default").values()) == default_audits
+        if operation not in {"save", "update", "through"}:
+            denied_after = (
+                PermissionAuditEvent.objects.using(alias)
+                .filter(reason__startswith="denied:")
+                .count()
+            )
+            assert denied_after == denied_before + (not permitted)
         assert list(Post._base_manager.using("default").values()) == default_rows
         assert list(active_relationship_model().objects.using("default").values()) == default_edges
         if permitted:
