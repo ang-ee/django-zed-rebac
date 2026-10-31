@@ -434,3 +434,139 @@ def test_rebac_prefetch_unprotected_tail_does_not_inherit_root_sudo(authored_fol
             .rebac_prefetch_related("authored_posts__author")
             .get(pk=folder.pk)
         )
+
+
+@pytest.mark.django_db
+def test_selected_related_checks_only_distinct_joined_ids(alice, monkeypatch):
+    from tests.testapp.models import Post
+
+    folder = _folder("selected")
+    unrelated = _folder("not selected")
+    _grant("blog/folder", folder.pk, "viewer", alice)
+    _grant("blog/folder", unrelated.pk, "viewer", alice)
+    for title in ("first", "second"):
+        post = _post(title, folder=folder)
+        _grant("blog/post", post.pk, "viewer", alice)
+    active = backend()
+    original = active.check_bulk_permissions
+    requested = []
+
+    def bulk(items, **kwargs):
+        items = list(items)
+        requested.extend(items)
+        return original(items, **kwargs)
+
+    monkeypatch.setattr(active, "check_bulk_permissions", bulk)
+    monkeypatch.setattr(active, "accessible", lambda **kwargs: pytest.fail("unbounded enumeration"))
+    rows = list(Post.objects.as_user(alice).rebac_select_related("folder"))
+    assert len(rows) == 2
+    assert [item.resource for item in requested] == [ObjectRef("blog/folder", str(folder.pk))]
+    assert all(row.folder.name == "selected" for row in rows)
+
+
+@pytest.mark.django_db
+def test_materialized_field_visibility_checks_only_fetched_ids(alice, monkeypatch):
+    from tests.testapp.models import AuthoredPost
+
+    with sudo(reason="test.fixture"):
+        readable = AuthoredPost.objects.create(title="visible", author=alice)
+        denied = AuthoredPost.objects.create(title="private", author=alice)
+        unrelated = AuthoredPost.objects.create(title="not fetched", author=alice)
+    for post in (readable, denied, unrelated):
+        _grant("blog/authoredpost", post.pk, "viewer", alice)
+    for post in (readable, unrelated):
+        _grant("blog/authoredpost", post.pk, "owner", alice)
+    active = backend()
+    original = active.check_bulk_permissions
+    requested = []
+
+    def bulk(items, **kwargs):
+        items = list(items)
+        requested.extend(items)
+        return original(items, **kwargs)
+
+    monkeypatch.setattr(active, "check_bulk_permissions", bulk)
+    monkeypatch.setattr(active, "accessible", lambda **kwargs: pytest.fail("unbounded enumeration"))
+    rows = list(
+        AuthoredPost.objects.as_user(alice)
+        .on_field_deny("redact")
+        .filter(pk__in=(readable.pk, denied.pk))
+    )
+    assert {row.pk: row.title for row in rows} == {readable.pk: "visible", denied.pk: None}
+    assert [(item.action, item.resource.resource_id) for item in requested] == [
+        ("read__title", value) for value in sorted((str(readable.pk), str(denied.pk)))
+    ]
+
+
+@pytest.mark.django_db
+def test_bounded_visibility_keeps_conditional_checks_closed(alice):
+    from rebac.field_visibility import accessible_ids
+
+    active = backend()
+    install_schema(
+        active,
+        parse_zed("""
+        caveat office(inside bool) { inside }
+        definition auth/user {}
+        definition blog/folder {
+            relation viewer: auth/user with office
+            permission read = viewer
+        }
+    """),
+    )
+    folder = _folder("conditional")
+    actor = SubjectRef.of("auth/user", str(alice.pk))
+    active.write_relationships(
+        [
+            RelationshipTuple(
+                ObjectRef("blog/folder", str(folder.pk)), "viewer", actor, caveat_name="office"
+            )
+        ]
+    )
+    assert (
+        accessible_ids(
+            active,
+            subject=actor,
+            action="read",
+            resource_type="blog/folder",
+            resource_ids=(str(folder.pk),),
+        )
+        == ()
+    )
+
+
+@pytest.mark.parametrize("answers", [[], [True, True, True]])
+def test_bounded_visibility_refuses_invalid_bulk_cardinality(monkeypatch, answers):
+    from rebac import CheckResult
+    from rebac.field_visibility import accessible_ids
+
+    active = backend()
+    monkeypatch.setattr(
+        active, "check_bulk_permissions", lambda items: [CheckResult.has() for _ in answers]
+    )
+    with pytest.raises(ValueError):
+        accessible_ids(
+            active,
+            subject=SubjectRef.of("auth/user", "one"),
+            action="read",
+            resource_type="blog/folder",
+            resource_ids=("second", "first"),
+        )
+
+
+def test_empty_bounded_visibility_never_enumerates_or_checks(monkeypatch):
+    from rebac.field_visibility import accessible_ids
+
+    active = backend()
+    monkeypatch.setattr(active, "check_bulk_permissions", lambda items: pytest.fail("empty bulk"))
+    monkeypatch.setattr(active, "accessible", lambda **kwargs: pytest.fail("unbounded enumeration"))
+    assert (
+        accessible_ids(
+            active,
+            subject=SubjectRef.of("auth/user", "one"),
+            action="read",
+            resource_type="blog/folder",
+            resource_ids=(),
+        )
+        == ()
+    )

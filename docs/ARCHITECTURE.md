@@ -2575,7 +2575,12 @@ grant IDs must be recreated along with their relationship tuples before using
 the new helper.
 
 `rebac_select_related()` preserves Django's to-one join optimization, then
-checks every selected REBAC-bound related object in batches. If the actor cannot
+checks only the selected REBAC-bound identities through native bulk permission
+checks. Materialized field-redaction batches and affected bulk-write rows use
+that same bounded membership path, rather than enumerating every readable
+resource of the type. Full-scope enumeration remains available when no candidate
+identities are supplied. Conditional results do not authorize; depth failures
+and malformed bulk result cardinality fail closed. If the actor cannot
 read one of those joined rows, the queryset raises `PermissionDenied` before the
 object can serialize. Related-field projections such as
 `.values("folder__name")` fail closed because they bypass model-instance

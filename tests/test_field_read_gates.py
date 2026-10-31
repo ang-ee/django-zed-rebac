@@ -1036,3 +1036,69 @@ def test_the_projection_guard_runs_once_per_evaluation(alice, monkeypatch):
     assert len(rows) == 1
     assert rows
     assert len(calls) == 1
+
+
+@pytest.mark.django_db
+@pytest.mark.parametrize("expression", [False, True])
+@override_settings(REBAC_FIELD_READ_MODE="redact")
+def test_bulk_field_guards_check_only_affected_ids(alice, monkeypatch, expression):
+    install_schema(
+        backend(),
+        parse_zed(
+            SCHEMA_TEXT.replace(
+                "permission read__title = owner",
+                "permission read__title = owner\n permission write__body = owner",
+            )
+        ),
+    )
+    post = _post(title="selected", body="before")
+    unrelated = _post(title="not selected", body="untouched")
+    for row in (post, unrelated):
+        _grant(row.pk, alice, "owner")
+    active = backend()
+    original = active.check_bulk_permissions
+    requested = []
+
+    def bulk(items, **kwargs):
+        items = list(items)
+        requested.extend(items)
+        return original(items, **kwargs)
+
+    monkeypatch.setattr(active, "check_bulk_permissions", bulk)
+    monkeypatch.setattr(active, "accessible", lambda **kwargs: pytest.fail("unbounded enumeration"))
+    assert (
+        Post.objects.as_user(alice)
+        .filter(pk=post.pk)
+        .update(body=F("title") if expression else "after")
+        == 1
+    )
+    assert [(item.action, item.resource.resource_id) for item in requested] == [
+        (action, str(post.pk))
+        for action in ("write", "write__body", "read__title")[: 3 if expression else 2]
+    ]
+    with sudo(reason="test.verify"):
+        assert Post.objects.get(pk=post.pk).body == ("selected" if expression else "after")
+        assert Post.objects.get(pk=unrelated.pk).body == "untouched"
+
+
+@pytest.mark.django_db
+@pytest.mark.parametrize("expression", [False, True])
+@override_settings(REBAC_FIELD_READ_MODE="redact")
+def test_bounded_bulk_field_refusal_preserves_the_rows(alice, expression):
+    schema = (
+        SCHEMA_TEXT
+        if expression
+        else SCHEMA_TEXT.replace(
+            "permission read__title = owner",
+            "permission read__title = owner\n permission write__body = owner",
+        )
+    )
+    install_schema(backend(), parse_zed(schema))
+    post = _post(title="private", body="before")
+    _grant(post.pk, alice, "editor")
+    with pytest.raises(PermissionDenied):
+        Post.objects.as_user(alice).filter(pk=post.pk).update(
+            body=F("title") if expression else "after"
+        )
+    with sudo(reason="test.verify"):
+        assert Post.objects.get(pk=post.pk).body == "before"

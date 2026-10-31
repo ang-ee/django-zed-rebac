@@ -14,7 +14,7 @@ from .database import database_context, read_alias
 from .resources import model_resource_type
 from .schema.ast import Schema
 from .schema.walker import field_gated_actions
-from .types import CheckResult, FieldDenyMode, ObjectRef, PermissionResult, SubjectRef
+from .types import CheckItem, CheckResult, FieldDenyMode, ObjectRef, PermissionResult, SubjectRef
 
 if TYPE_CHECKING:  # pragma: no cover
     from .backends.base import Backend
@@ -84,8 +84,21 @@ def accessible_ids(
     subject: SubjectRef,
     action: str,
     resource_type: str,
+    resource_ids: Iterable[str] | None = None,
 ) -> tuple[str, ...]:
-    """Route ``accessible`` through the ambient evaluator when one exists."""
+    """Read accessible ids, or check only an explicitly supplied candidate set.
+
+    Materialized batches use native bulk checks instead of enumerating every
+    accessible resource. Omitting candidates retains the enumeration contract.
+    """
+    if resource_ids is not None:
+        ids = tuple(sorted(set(resource_ids)))
+        if not ids:
+            return ()
+        results = active_backend.check_bulk_permissions(
+            [CheckItem(subject, action, ObjectRef(resource_type, value)) for value in ids]
+        )
+        return tuple(value for value, result in zip(ids, results, strict=True) if result.allowed)
     from .evaluator import current_evaluator
 
     evaluator = current_evaluator()
@@ -163,6 +176,7 @@ def visible_id_sets(
     actor: SubjectRef,
     fields: frozenset[str],
     active_backend: Backend | None = None,
+    resource_ids: Iterable[str] | None = None,
 ) -> dict[str, frozenset[str] | None]:
     """Map each gated field to visible resource ids.
 
@@ -176,6 +190,7 @@ def visible_id_sets(
         from .backends import backend
 
         active_backend = backend()
+    candidates = tuple(resource_ids) if resource_ids is not None else None
     visible: dict[str, frozenset[str] | None] = {}
     for field_name in fields:
         action = f"read__{field_name}"
@@ -193,6 +208,7 @@ def visible_id_sets(
                 subject=actor,
                 action=action,
                 resource_type=rebac_type,
+                resource_ids=candidates,
             )
         )
     return visible
@@ -232,6 +248,7 @@ def apply_field_visibility(
             actor=actor,
             fields=fields,
             active_backend=active_backend,
+            resource_ids=(_instance_resource_id(inst) for inst in batch),
         )
         rebac_type = model_resource_type(model)
         if not rebac_type:

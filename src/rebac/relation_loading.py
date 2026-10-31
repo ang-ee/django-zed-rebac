@@ -103,6 +103,7 @@ def guard_selected_related_instances(
                     subject=actor,
                     action=action,
                     resource_type=rebac_type,
+                    resource_ids=rows_by_id,
                 )
             )
             denied = sorted(set(rows_by_id) - allowed)

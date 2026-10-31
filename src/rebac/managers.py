@@ -1815,7 +1815,13 @@ class RebacQuerySet(models.QuerySet[_M]):
             if not affected:
                 return
             allowed = set(
-                backend().accessible(subject=actor, action=action, resource_type=rebac_type)
+                accessible_ids(
+                    backend(),
+                    subject=actor,
+                    action=action,
+                    resource_type=rebac_type,
+                    resource_ids=affected,
+                )
             )
             denied = affected - allowed
             if denied:
@@ -1883,6 +1889,7 @@ class RebacQuerySet(models.QuerySet[_M]):
                         subject=actor,
                         action=action,
                         resource_type=rebac_type,
+                        resource_ids=affected,
                     )
                 )
                 denied = affected - allowed
@@ -1928,6 +1935,7 @@ class RebacQuerySet(models.QuerySet[_M]):
                         subject=actor,
                         action=f"read__{field_name}",
                         resource_type=rebac_type,
+                        resource_ids=affected,
                     )
                 )
                 if affected - allowed:

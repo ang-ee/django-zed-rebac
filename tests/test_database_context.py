@@ -289,3 +289,42 @@ def test_explicit_instance_write_audits_keep_operation_alias(settings, operation
         assert post._state.db == "default"
     assert PermissionAuditEvent.objects.using("selected").count() == 1
     assert not PermissionAuditEvent.objects.using("default").exists()
+
+
+def test_selected_related_bounded_checks_keep_the_queryset_alias(monkeypatch):
+    from rebac import actor_context
+    from tests.testapp.models import Folder
+
+    for alias in ("default", "selected"):
+        policy(alias, resource_type="blog/folder")
+        policy(alias, resource_type="blog/post")
+        with database_context(alias), system_context(reason="bounded related fixtures"):
+            folder = Folder.objects.using(alias).create(pk=771, name=alias)
+            Post.objects.using(alias).create(pk=772, title=alias, folder=folder)
+            write_relationships(
+                [
+                    RelationshipTuple(ObjectRef("blog/post", "772"), "owner", ACTOR),
+                    *(
+                        [RelationshipTuple(ObjectRef("blog/folder", "771"), "owner", ACTOR)]
+                        if alias == "selected"
+                        else []
+                    ),
+                ]
+            )
+    active = backend()
+    original = active.check_bulk_permissions
+    aliases = []
+
+    def bulk(items, **kwargs):
+        aliases.append(read_alias(active_relationship_model()))
+        return original(items, **kwargs)
+
+    monkeypatch.setattr(active, "check_bulk_permissions", bulk)
+    with database_context("default"), actor_context(ACTOR):
+        row = Post.objects.using("selected").rebac_select_related("folder").get(pk=772)
+        assert row.folder.name == "selected"
+        from rebac import PermissionDenied
+
+        with pytest.raises(PermissionDenied):
+            Post.objects.using("default").rebac_select_related("folder").get(pk=772)
+    assert aliases == ["selected", "default"]
