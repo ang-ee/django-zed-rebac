@@ -343,9 +343,9 @@ def test_one_m2m_add_gates_changed_pair_not_whole_through_table(monkeypatch):
     checked = []
     original = signals._check_edge_writes
 
-    def spy(actor, resource_type, ids, *, bulk=False):
+    def spy(actor, resource_type, ids, *, using, bulk=False):
         checked.append((actor, resource_type, set(ids)))
-        return original(actor, resource_type, ids, bulk=bulk)
+        return original(actor, resource_type, ids, using=using, bulk=bulk)
 
     monkeypatch.setattr(signals, "_check_edge_writes", spy)
 
@@ -427,9 +427,9 @@ def test_direct_through_bulk_gate_batches_changed_rows(monkeypatch):
     checked = []
     original = signals._check_edge_writes
 
-    def spy(actor, resource_type, ids, *, bulk=False):
+    def spy(actor, resource_type, ids, *, using, bulk=False):
         checked.append((resource_type, set(ids)))
-        return original(actor, resource_type, ids, bulk=bulk)
+        return original(actor, resource_type, ids, using=using, bulk=bulk)
 
     monkeypatch.setattr(signals, "_check_edge_writes", spy)
     through = Post.collections.through

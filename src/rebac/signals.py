@@ -285,6 +285,7 @@ def _wrap_related_m2m_writes() -> None:
                         _operation: str = operation,
                         **kwargs: Any,
                     ) -> Any:
+                        using = router.db_for_write(self.through, instance=self.instance)
                         with audit_backed_denials():
                             gated_pairs: set[tuple[Any, Any]] = set()
                             if _operation in {"clear", "set"}:
@@ -294,7 +295,7 @@ def _wrap_related_m2m_writes() -> None:
                                     self.reverse,
                                     self.model,
                                     None,
-                                    self.db,
+                                    using,
                                 )
                             if _operation != "clear":
                                 values = (
@@ -309,7 +310,7 @@ def _wrap_related_m2m_writes() -> None:
                                     self.reverse,
                                     self.model,
                                     ids,
-                                    self.db,
+                                    using,
                                 )
                                 if _operation == "set":
                                     if args:
@@ -577,7 +578,7 @@ def _gate_m2m(
             for row in resource_model._base_manager.using(using).filter(pk__in=other_ids):
                 ids.add(to_object_ref(row).resource_id)
         if ids:
-            _check_edge_writes(actor, resource_type, ids)
+            _check_edge_writes(actor, resource_type, ids, using=using)
     return pairs
 
 
@@ -749,7 +750,7 @@ def audit_backed_denials() -> Iterator[None]:
 
 
 def _check_edge_writes(
-    actor: SubjectRef | None, resource_type: str, ids: set[str], *, bulk: bool = False
+    actor: SubjectRef | None, resource_type: str, ids: set[str], *, using: str, bulk: bool = False
 ) -> None:
     from .backends import backend
 
@@ -759,7 +760,6 @@ def _check_edge_writes(
 
     if isinstance(active, LocalBackend):
         from .compile.read import held
-        from .models import active_relationship_model
 
         allowed = held(
             backend=active,
@@ -767,7 +767,7 @@ def _check_edge_writes(
             action="write",
             actor=actor,
             ids=ids,
-            using=active_relationship_model().objects.db,
+            using=using,
         )
     else:
         allowed = {
@@ -924,7 +924,7 @@ def _gate_backed_rows(
         if bypass:
             return
     for resource_type, ids in sorted(candidates.items()):
-        _check_edge_writes(actor, resource_type, ids, bulk=True)
+        _check_edge_writes(actor, resource_type, ids, using=using, bulk=True)
 
 
 def _batched_backed_field_candidates(
@@ -1089,7 +1089,7 @@ def _gate_direct_through_rows(pairs: dict[type[Model], set[tuple[Any, Any]]], us
                         )
                     )
             if ids:
-                _check_edge_writes(actor, resource_type, ids, bulk=True)
+                _check_edge_writes(actor, resource_type, ids, using=using, bulk=True)
 
 
 def _gate_backed_field_change(
@@ -1120,7 +1120,7 @@ def _gate_backed_field_change(
     if bypass:
         return
     for resource_type, ids in sorted(candidates.items()):
-        _check_edge_writes(actor, resource_type, ids)
+        _check_edge_writes(actor, resource_type, ids, using=using)
 
 
 def _backed_field_change_candidates(
