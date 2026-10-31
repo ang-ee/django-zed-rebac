@@ -1075,7 +1075,7 @@ class RebacQuerySet(models.QuerySet[_M]):
                     active_backend,
                     subject=actor,
                     action=action,
-                    resource_type=rebac_type,
+                    model=model,
                 )
             )
             attr = resource_id_attr(model)
@@ -1819,7 +1819,7 @@ class RebacQuerySet(models.QuerySet[_M]):
                     backend(),
                     subject=actor,
                     action=action,
-                    resource_type=rebac_type,
+                    model=self.model,
                     resource_ids=affected,
                 )
             )
@@ -1888,7 +1888,7 @@ class RebacQuerySet(models.QuerySet[_M]):
                         backend(),
                         subject=actor,
                         action=action,
-                        resource_type=rebac_type,
+                        model=self.model,
                         resource_ids=affected,
                     )
                 )
@@ -1934,7 +1934,7 @@ class RebacQuerySet(models.QuerySet[_M]):
                         backend(),
                         subject=actor,
                         action=f"read__{field_name}",
-                        resource_type=rebac_type,
+                        model=self.model,
                         resource_ids=affected,
                     )
                 )

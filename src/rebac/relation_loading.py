@@ -102,7 +102,7 @@ def guard_selected_related_instances(
                     active_backend,
                     subject=actor,
                     action=action,
-                    resource_type=rebac_type,
+                    model=model,
                     resource_ids=rows_by_id,
                 )
             )

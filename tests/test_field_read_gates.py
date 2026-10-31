@@ -1056,15 +1056,17 @@ def test_bulk_field_guards_check_only_affected_ids(alice, monkeypatch, expressio
     for row in (post, unrelated):
         _grant(row.pk, alice, "owner")
     active = backend()
-    original = active.check_bulk_permissions
+    import rebac.managers as managers
+
+    original = managers.accessible_ids
     requested = []
 
-    def bulk(items, **kwargs):
-        items = list(items)
-        requested.extend(items)
-        return original(items, **kwargs)
+    def membership(active_backend, **kwargs):
+        assert kwargs["model"] is Post
+        requested.append((kwargs["action"], tuple(kwargs["resource_ids"])))
+        return original(active_backend, **kwargs)
 
-    monkeypatch.setattr(active, "check_bulk_permissions", bulk)
+    monkeypatch.setattr(managers, "accessible_ids", membership)
     monkeypatch.setattr(active, "accessible", lambda **kwargs: pytest.fail("unbounded enumeration"))
     assert (
         Post.objects.as_user(alice)
@@ -1072,8 +1074,8 @@ def test_bulk_field_guards_check_only_affected_ids(alice, monkeypatch, expressio
         .update(body=F("title") if expression else "after")
         == 1
     )
-    assert [(item.action, item.resource.resource_id) for item in requested] == [
-        (action, str(post.pk))
+    assert requested == [
+        (action, (str(post.pk),))
         for action in ("write", "write__body", "read__title")[: 3 if expression else 2]
     ]
     with sudo(reason="test.verify"):

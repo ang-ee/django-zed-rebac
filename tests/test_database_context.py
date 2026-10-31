@@ -312,14 +312,15 @@ def test_selected_related_bounded_checks_keep_the_queryset_alias(monkeypatch):
                 ]
             )
     active = backend()
-    original = active.check_bulk_permissions
+    original = active.queryset_filter
     aliases = []
 
-    def bulk(items, **kwargs):
-        aliases.append(read_alias(active_relationship_model()))
-        return original(items, **kwargs)
+    def scoped(**kwargs):
+        if kwargs["model"] is Folder:
+            aliases.append(kwargs["using"])
+        return original(**kwargs)
 
-    monkeypatch.setattr(active, "check_bulk_permissions", bulk)
+    monkeypatch.setattr(active, "queryset_filter", scoped)
     with database_context("default"), actor_context(ACTOR):
         row = Post.objects.using("selected").rebac_select_related("folder").get(pk=772)
         assert row.folder.name == "selected"

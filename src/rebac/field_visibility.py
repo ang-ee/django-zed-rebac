@@ -9,9 +9,10 @@ from typing import TYPE_CHECKING, Any, cast
 from django.db import models
 
 from ._id import resource_id_attr
+from .codec import identity_codec
 from .conf import app_settings
 from .database import database_context, read_alias
-from .resources import model_resource_type
+from .resources import model_resource_type, stores_rows
 from .schema.ast import Schema
 from .schema.walker import field_gated_actions
 from .types import CheckItem, CheckResult, FieldDenyMode, ObjectRef, PermissionResult, SubjectRef
@@ -83,18 +84,43 @@ def accessible_ids(
     *,
     subject: SubjectRef,
     action: str,
-    resource_type: str,
+    model: type[models.Model],
     resource_ids: Iterable[str] | None = None,
 ) -> tuple[str, ...]:
     """Read accessible ids, or check only an explicitly supplied candidate set.
 
-    Materialized batches use native bulk checks instead of enumerating every
-    accessible resource. Omitting candidates retains the enumeration contract.
+    Model-backed batches use the backend's native ORM scope over those ids;
+    other backends use native bulk checks. Omitting candidates enumerates.
     """
+    resource_type = model_resource_type(model)
+    if resource_type is None:
+        return ()
     if resource_ids is not None:
         ids = tuple(sorted(set(resource_ids)))
         if not ids:
             return ()
+        using = read_alias(model)
+        if stores_rows(model):
+            predicate = active_backend.queryset_filter(
+                model=model, subject=subject, action=action, using=using
+            )
+            if predicate is not None:
+                identity = resource_id_attr(model)
+                codec = identity_codec(model, identity)
+                candidates = [value for value in ids if codec.is_canonical(value, using=using)]
+                if not candidates:
+                    return ()
+                with database_context(using):
+                    rows = model._base_manager.using(using).filter(
+                        **{f"{identity}__in": candidates}
+                    )
+                    allowed = {
+                        codec.wire(value, using=using)
+                        for value in rows.filter(predicate)
+                        .order_by()
+                        .values_list(identity, flat=True)
+                    }
+                return tuple(value for value in ids if value in allowed)
         results = active_backend.check_bulk_permissions(
             [CheckItem(subject, action, ObjectRef(resource_type, value)) for value in ids]
         )
@@ -207,7 +233,7 @@ def visible_id_sets(
                 active_backend,
                 subject=actor,
                 action=action,
-                resource_type=rebac_type,
+                model=model,
                 resource_ids=candidates,
             )
         )

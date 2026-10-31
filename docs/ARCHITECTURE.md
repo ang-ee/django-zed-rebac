@@ -2243,8 +2243,8 @@ needs one is not in its lower bound.
 | Model-level check (empty resource id) | A row-independent grant, or any accessible identity of the type. |
 | `grants_all()` | The lower bound at the empty id: only a row-independent arm can hold there. False for a permission with an exclusion on the row (in its expression or one it names on the same type): a row-specific fact can take it from one row. |
 | Backed-edge write gate | `write` on the affected declaring rows. More than four ids that are rows of the type's model are tested by one scoped statement per 500 ids; the others by the lower bound, one by one. |
-| Bulk write guard | Every resource id of the statement must be in `accessible()` for the action. Under an actor the statement holds only the rows the queryset's scope admits (see [CRUD enforcement matrix](#crud-enforcement-matrix)). |
-| Field read gate `read__<field>` | `accessible()` for that permission. |
+| Bulk write guard | Every affected resource id must hold the action through the bounded ORM population (native bulk fallback for other backends). Under an actor the statement holds only the rows the queryset's scope admits (see [CRUD enforcement matrix](#crud-enforcement-matrix)). |
+| Field read gate `read__<field>` | The bounded population scope for that permission (native bulk fallback for other backends). |
 | `check_new()` | The walker over the candidate's proposed relations; an arrow into an existing object is answered by `check_access()`. |
 
 The residual evaluator (`rebac.compile.evaluate`) never authorizes. It runs
@@ -2575,12 +2575,14 @@ grant IDs must be recreated along with their relationship tuples before using
 the new helper.
 
 `rebac_select_related()` preserves Django's to-one join optimization, then
-checks only the selected REBAC-bound identities through native bulk permission
-checks. Materialized field-redaction batches and affected bulk-write rows use
+checks only the selected REBAC-bound identities through the backend's native ORM
+scope over that bounded population, or native bulk permission checks when the
+backend has no ORM strategy. Materialized field-redaction batches and affected bulk-write rows use
 that same bounded membership path, rather than enumerating every readable
 resource of the type. Full-scope enumeration remains available when no candidate
-identities are supplied. Conditional results do not authorize; depth failures
-and malformed bulk result cardinality fail closed. If the actor cannot
+identities are supplied. ORM populations use the scope's definite lower bound:
+conditional and depth-undecidable rows do not authorize. Native bulk fallback
+retains point-check depth errors and strict result cardinality. If the actor cannot
 read one of those joined rows, the queryset raises `PermissionDenied` before the
 object can serialize. Related-field projections such as
 `.values("folder__name")` fail closed because they bypass model-instance
