@@ -81,3 +81,24 @@ def test_bulk_checks_agree(branches):
     ]
     answers = local.check_bulk_permissions(items)
     assert [answer.allowed for answer in answers] == [False, True, True, False] * 2
+
+
+@pytest.mark.pg_delta
+@pytest.mark.parametrize("selector", ["exact", "in"])
+def test_parent_link_identity_uses_only_proven_lookup_shapes(branches, monkeypatch, selector):
+    _local, rows, _notes = branches
+    original = read._point_statement
+    compiled = []
+
+    def point(operation, key, *args, **kwargs):
+        compiled.append(key)
+        return original(operation, key, *args, **kwargs)
+
+    monkeypatch.setattr(read, "_point_statement", point)
+    for name in ("region", "other"):
+        row = rows[name]
+        query = NativeParentLinkedBranch.objects.with_actor(ALICE).with_action("write")
+        query = query.filter(pk=row.pk) if selector == "exact" else query.filter(pk__in=[row.pk])
+        assert list(query.values_list("pk", flat=True)) == ([row.pk] if name == "region" else [])
+    # Native RelatedExact is admitted; RelatedIn is deliberately not native In.
+    assert (("test/nativeparentlinkedbranch", "write") in compiled) is (selector == "exact")

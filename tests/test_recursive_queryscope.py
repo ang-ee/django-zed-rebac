@@ -263,20 +263,24 @@ def test_early_grant_and_live_boundary(storage, backing, depth):
 @pytest.mark.parametrize("storage", STORAGE_TIERS)
 @pytest.mark.parametrize("backing", ["tuple", "field"])
 @pytest.mark.parametrize("deep", [3, pytest.param(8, marks=pytest.mark.slow)])
-def test_scope_query_count_is_independent_of_depth(storage, backing, deep):
+@pytest.mark.parametrize("exact", [False, True], ids=["general", "exact"])
+def test_scope_query_count_is_independent_of_depth(storage, backing, deep, exact):
     costs = []
     with schema_context(storage, "folder", backing) as (active, member, hop, action):
         for depth in (1, deep):
             rows = chain(active, hop, backing, depth, prefix=str(depth))
             grant(active, rows[0], member)
+            qs = Folder.objects.with_actor(ACTOR).with_action(action)
             qs = (
-                Folder.objects.with_actor(ACTOR).with_action(action).filter(pk=rows[-1].pk).scoped()
-            )
+                qs.filter(pk=rows[-1].pk)
+                if exact
+                else qs.filter(pk__gte=rows[-1].pk, pk__lte=rows[-1].pk)
+            ).scoped()
             with CaptureQueriesContext(connection) as queries:
                 assert qs.exists()
             costs.append(len(queries))
-    if backing == "tuple":
-        # The actor's stored sets, then the scope.
+    if exact or backing == "tuple":
+        # The actor's stored sets, then the final selecting statement.
         assert costs == [2, 2]
     else:
         # A hierarchy over a foreign key is followed from its seeds first: the

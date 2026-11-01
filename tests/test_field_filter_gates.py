@@ -574,3 +574,21 @@ def test_a_subquery_is_checked_under_any_outer_statement(people, rows, outer):
         run()
     with sudo(reason="test.verify"):
         assert not Post.objects.filter(body="found").exists()
+
+
+@pytest.mark.pg_delta
+@pytest.mark.parametrize("clause", ["filter", "order", "projection"])
+def test_exact_identity_does_not_bypass_field_read_gates(people, rows, clause):
+    _folder, _own, hidden = rows
+    query = Post.objects.with_actor(people["alice"]).filter(pk=hidden.pk)
+    with override_settings(REBAC_FIELD_READ_MODE="redact"):
+        with pytest.raises(PermissionDenied, match="read__title"):
+            if clause == "projection":
+                list(query.values_list("title", flat=True))
+            else:
+                query = (
+                    query.filter(title=hidden.title)
+                    if clause == "filter"
+                    else query.order_by("title")
+                )
+                list(query.values_list("pk", flat=True))

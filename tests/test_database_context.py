@@ -126,7 +126,8 @@ def test_membership_and_system_audit_follow_scope():
     )
 
 
-def test_explicit_queryset_and_loaded_instance_override_scope():
+@pytest.mark.parametrize("exact", [False, True])
+def test_explicit_queryset_and_loaded_instance_override_scope(exact):
     policy("default", resource_type="blog/post")
     policy("selected", "nil", resource_type="blog/post")
     with database_context("default"), system_context(reason="fixture"):
@@ -134,12 +135,18 @@ def test_explicit_queryset_and_loaded_instance_override_scope():
         write_relationships(
             [RelationshipTuple(ObjectRef("blog/post", str(post.pk)), "owner", ACTOR)]
         )
+    with database_context("selected"), system_context(reason="fixture"):
+        Post.objects.using("selected").create(pk=post.pk, title="denied colliding row")
+    default = Post.objects.using("default").with_actor(ACTOR)
+    selected = Post.objects.using("selected").with_actor(ACTOR)
+    if exact:
+        default, selected = default.filter(pk=post.pk), selected.filter(pk=post.pk)
     with database_context("selected"):
-        assert list(
-            Post.objects.using("default").with_actor(ACTOR).values_list("pk", flat=True)
-        ) == [post.pk]
+        assert list(default.values_list("pk", flat=True)) == [post.pk]
         assert post.with_actor(ACTOR).check_access("read").allowed
-        assert not Post.objects.using("selected").with_actor(ACTOR).exists()
+        assert not selected.exists()
+        # A clone changed to the other alias must not retain the first decision.
+        assert not default.using("selected").exists()
 
 
 def test_nested_failure_and_async_tasks_restore_context():

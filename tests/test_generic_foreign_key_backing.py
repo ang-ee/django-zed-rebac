@@ -604,7 +604,9 @@ WITNESS_SCHEMA = SCHEMA.replace(
 )
 
 
-def test_a_row_whose_type_changed_after_the_read_is_denied(world, monkeypatch):
+@pytest.mark.pg_delta
+@pytest.mark.parametrize("operation", ["check", "exact_scope"])
+def test_a_row_whose_type_changed_after_the_read_is_denied(world, monkeypatch, operation):
     """The read says folder, the row is a post: the post arm, pruned, is what
     takes ``unread`` away, so only the statement's witness denies."""
     local = install_schema(WITNESS_SCHEMA)
@@ -614,7 +616,15 @@ def test_a_row_whose_type_changed_after_the_read_is_denied(world, monkeypatch):
     folder_type = ContentType.objects.get_for_model(Folder)
     stale = {resource.resource_id: (("content_type_id", folder_type.pk),)}
     monkeypatch.setattr(read, "_row_types", lambda *_: stale)
-    assert not local.check_access(subject=ALICE, action="unread", resource=resource).allowed
+    if operation == "check":
+        assert not local.check_access(subject=ALICE, action="unread", resource=resource).allowed
+    else:
+        assert not (
+            Attachment.objects.with_actor(ALICE)
+            .with_action("unread")
+            .filter(pk=int(resource.resource_id))
+            .exists()
+        )
 
 
 def test_a_permission_that_reaches_no_generic_relation_reads_no_types(world):

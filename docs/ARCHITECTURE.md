@@ -1792,6 +1792,30 @@ without a model row. Membership of such a statement constant is an `EXISTS`
 with an equality on the key, so the database looks up one row or one
 resource's tuples instead of building the set of every qualifying object.
 
+A queryset whose current resolved Django predicates require one resource identity
+uses the existing point lower-bound statement as an `EXISTS` condition, with
+the canonical identity bound as a parameter. The caller's predicates remain in
+the selecting statement; this is neither a separate permission check nor a
+queryset hint. Recognition happens at SQL compilation, after aliases and fields
+have resolved, and is never retained on a queryset or scope expression.
+
+Only globally mandatory, positive `AND` paths of native `WhereNode` are
+inspected. Eligible leaves are the exact native `Exact`, `IntegerFieldExact`
+and `RelatedExact` classes, or native `In` with a prepared list/tuple containing
+exactly one non-null canonical integer. The leaf must address the scope's
+current `Col` alias and actual unique query identity field. Supported scalar identities
+are native integer/auto fields; native FK/O2O identity fields may normalize
+only their native scalar target's output field. Custom fields/lookups,
+expressions, other aliases/columns, negation, OR/XOR branches, and unproved
+identity shapes keep the general scope path. No boolean factoring, collection
+normalization or inference from raw filter arguments takes place.
+
+This specialization reuses point content-type pruning and its final type
+witness, the policy/generation fence, stored-set witnesses and ordinary
+operation confirmation. Field/clause/projection gates still surround the
+query. Schema changes, cloning, actor/database changes and alias relabeling
+therefore obey the same live authorization contract as a general scope.
+
 A model column is never converted. Where a tuple column meets a model column,
 the tuple column is converted with `identity_codec(...).to_column()` inside
 the tuple subquery; a wire id that is not a canonical identity of that model

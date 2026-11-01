@@ -24,7 +24,10 @@ from typing import TYPE_CHECKING, Any, cast
 from django.core.exceptions import EmptyResultSet
 from django.db import connections, models
 from django.db.models import Exists, Expression, F, Q, Value
-from django.db.models.lookups import Exact, GreaterThanOrEqual, LessThan
+from django.db.models.expressions import Col
+from django.db.models.fields.related_lookups import RelatedExact
+from django.db.models.lookups import Exact, GreaterThanOrEqual, In, IntegerFieldExact, LessThan
+from django.db.models.sql.where import WhereNode
 from django.utils import timezone
 
 from rebac._id import model_identity_fields, resource_id_attr
@@ -1649,6 +1652,66 @@ def _remember(known: tuple[Any, ...], asked: Sequence[tuple[Fact, bool]]) -> Non
             _fact_paths.popitem(last=False)
 
 
+def _exact_identity(model: type[models.Model], lhs: Any, where: Any, using: str) -> str | None:
+    """A native identity equality mandatory in this resolved query, or no proof.
+
+    Only positive AND paths are traversed. Unknown fields, lookups and expression
+    shapes keep the general scope; the original Django predicates are untouched.
+    """
+    if type(lhs) is not Col:
+        return None
+    identity = resource_id_attr(model)
+    field, scalar = model_identity_fields(model, identity)
+    if type(scalar) not in (
+        models.AutoField,
+        models.BigAutoField,
+        models.SmallAutoField,
+        models.IntegerField,
+        models.BigIntegerField,
+        models.SmallIntegerField,
+        models.PositiveIntegerField,
+        models.PositiveBigIntegerField,
+        models.PositiveSmallIntegerField,
+    ):
+        return None
+    if field is not scalar and (
+        type(field) not in (models.ForeignKey, models.OneToOneField)
+        or cast(models.ForeignKey[Any, Any], field).target_field is not scalar
+    ):
+        return None
+    if not field.unique or lhs.target is not field or lhs.output_field is not scalar:
+        return None
+    codec = identity_codec(model, identity)
+    pending = [where]
+    while pending:
+        node = pending.pop()
+        if type(node) is WhereNode:
+            if node.connector == "AND" and not node.negated:
+                pending.extend(node.children)
+            continue
+        if type(node) not in (Exact, IntegerFieldExact, RelatedExact, In):
+            continue
+        column = node.lhs
+        if (
+            type(column) is not Col
+            or column.alias != lhs.alias
+            or column.target is not field
+            or (column.output_field is not field and column.output_field is not scalar)
+        ):
+            continue
+        value = node.rhs
+        if type(node) is In:
+            if type(value) not in (list, tuple) or len(value) != 1:
+                continue
+            [value] = value
+        if type(value) is int:
+            try:
+                return codec.wire(value, using=using)
+            except SchemaError:
+                pass
+    return None
+
+
 class _Scope(Expression):
     """The scope of one queryset, decided when its statement is compiled.
 
@@ -1686,18 +1749,27 @@ class _Scope(Expression):
         policy = _policy(self.backend, self.using)
         if resource_type is None or policy.snapshot.revision != self.revision:
             return "(1 = 0)", ()
+        key = (resource_type, self.action)
+        resource_id = _exact_identity(self.model, self.lhs, compiler.query.where, self.using)
+
+        def statement(operation: _Operation) -> _Kept | bool:
+            if resource_id is None:
+                return _scope_statement(operation, self.model, key)
+            types = _key_types(policy, self.using, key, (resource_id,)).get(resource_id)
+            return _point_statement(operation, key, "lower", types)
+
         operation = _Operation.begin(self.backend, self.actor, self.using, policy=policy)
-        compiled = _scope_statement(operation, self.model, (resource_type, self.action))
+        compiled = statement(operation)
         if not operation.confirm():
             # A decision kept from an earlier statement no longer holds: the
             # scope dropped its decisions, and this statement decides afresh.
             operation = _Operation.begin(self.backend, self.actor, self.using, policy=policy)
-            compiled = _scope_statement(operation, self.model, (resource_type, self.action))
+            compiled = statement(operation)
         if isinstance(compiled, bool):
             # ``True`` cannot occur: a statement that admits rows is a gate.
             return "(1 = 0)", ()
-        params = operation.bound(compiled.params)
-        if compiled.every:
+        params = operation.bound(compiled.params, resource_id)
+        if resource_id is not None or compiled.every:
             return f"EXISTS {compiled.sql}", tuple(params)
         lhs_sql, lhs_params = compiler.compile(self.lhs)
         return f"({lhs_sql} IN {compiled.sql})", (*lhs_params, *params)
