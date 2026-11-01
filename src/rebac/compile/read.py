@@ -24,8 +24,9 @@ from typing import TYPE_CHECKING, Any, cast
 from django.core.exceptions import EmptyResultSet
 from django.db import connections, models
 from django.db.models import Exists, Expression, F, OuterRef, Q, Value
-from django.db.models.expressions import Col
+from django.db.models.expressions import Col, ColPairs
 from django.db.models.fields.related_lookups import RelatedExact
+from django.db.models.fields.tuple_lookups import TupleIn
 from django.db.models.lookups import Exact, GreaterThanOrEqual, In, IntegerFieldExact, LessThan
 from django.db.models.sql.where import WhereNode
 from django.utils import timezone
@@ -1738,9 +1739,24 @@ def _exact_identity(model: type[models.Model], lhs: Any, where: Any, using: str)
             if node.connector == "AND" and not node.negated:
                 pending.extend(node.children)
             continue
-        if type(node) not in (Exact, IntegerFieldExact, RelatedExact, In):
+        if type(node) not in (Exact, IntegerFieldExact, RelatedExact, In, TupleIn):
             continue
         column = node.lhs
+        value = node.rhs
+        if type(node) is TupleIn:
+            if (
+                type(column) is not ColPairs
+                or len(column.targets) != 1
+                or len(column.sources) != 1
+                or type(value) not in (list, tuple)
+                or len(value) != 1
+            ):
+                continue
+            [value] = value
+            if type(value) not in (list, tuple) or len(value) != 1:
+                continue
+            [value] = value
+            [column] = column.get_cols()
         if (
             type(column) is not Col
             or column.alias != lhs.alias
@@ -1748,7 +1764,6 @@ def _exact_identity(model: type[models.Model], lhs: Any, where: Any, using: str)
             or (column.output_field is not field and column.output_field is not scalar)
         ):
             continue
-        value = node.rhs
         if type(node) is In:
             if type(value) not in (list, tuple) or len(value) != 1:
                 continue

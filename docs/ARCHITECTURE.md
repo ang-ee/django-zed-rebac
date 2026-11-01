@@ -1864,7 +1864,12 @@ have resolved, and is never retained on a queryset or scope expression.
 Only globally mandatory, positive `AND` paths of native `WhereNode` are
 inspected. Eligible leaves are the exact native `Exact`, `IntegerFieldExact`
 and `RelatedExact` classes, or native `In` with a prepared list/tuple containing
-exactly one non-null canonical integer. The leaf must address the scope's
+exactly one non-null canonical integer. Native `TupleIn` is eligible only with
+an exact native one-column `ColPairs` and one direct list/tuple row containing
+one such integer, as Django constructs for a singleton forward-FK prefetch.
+Its native `get_cols()` column must pass the same identity proof; composite,
+multirow, custom and expression/subquery shapes retain the general scope.
+The leaf must address the scope's
 current `Col` alias and actual unique query identity field. Supported scalar identities
 are native integer/auto fields; native FK/O2O identity fields may normalize
 only their native scalar target's output field. Custom fields/lookups,
