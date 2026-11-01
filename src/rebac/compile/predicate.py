@@ -255,27 +255,35 @@ def _one_level_out(ref: Any) -> Any:
 
 
 @dataclass(frozen=True)
-class PointRow:
-    """The content types a point check's row has in its GenericForeignKey columns.
+class PointData:
+    """Persisted root-row facts that shape one point statement."""
 
-    ``ref`` is the statement's reference to the row; ``types`` maps each
-    content-type column's attname to its value.  An arm backed by one of those
-    columns names a row of its own type only, so on that row the arm of any
-    other type cannot hold and is not compiled.
-    """
+    types: tuple[tuple[str, Any], ...] = ()
+    filter_matches: tuple[tuple[Key, bool], ...] = ()
+
+
+@dataclass(frozen=True)
+class PointRow:
+    """The root reference with its prepared content types and source filters."""
 
     ref: Any
-    types: tuple[tuple[str, Any], ...]
+    data: PointData
 
     def may_name(self, resolved: ResolvedFieldBacking, at: At, using: str) -> bool:
         if resolved.generic is None or at.ref is not self.ref:
             return True
         column = resolved.source_model._meta.get_field(resolved.generic.ct_field)
-        stored = dict(self.types).get(cast(Any, column).attname, _ABSENT)
+        stored = dict(self.data.types).get(cast(Any, column).attname, _ABSENT)
         if stored is _ABSENT:
             return True
         content_type = _content_type(resolved.target_model, using)
         return content_type is not None and content_type.pk == stored
+
+    def may_match_filter(self, resolved: ResolvedFieldBacking, at: At) -> bool:
+        if at.ref is not self.ref:
+            return True
+        key = at.resource_type, resolved.relation.name
+        return dict(self.data.filter_matches).get(key, True)
 
 
 _ABSENT: Any = object()
@@ -533,6 +541,7 @@ class Compiler:
         self.sets = sets
         self.rows = rows
         self.used_rows: set[Key] = set()
+        self.used_point_filters: dict[Key, ResolvedFieldBacking] = {}
         self.point = point
         self.shape = actor_shape(self.schema, actor, using)
         self._memo: dict[tuple[Any, ...], Q] = {}
@@ -1636,6 +1645,9 @@ class Compiler:
         if self.point is not None and not self.point.may_name(resolved, at, self.using):
             # The point row names another type: this arm's chain is not built.
             return _FALSE
+        if self.point is not None and not self.point.may_match_filter(resolved, at):
+            self.used_point_filters[at.resource_type, resolved.relation.name] = resolved
+            return _FALSE
         allowed = resolved.relation.allowed_subjects[0]
         if allowed.relation and not self._is_relation(allowed.type, allowed.relation):
             return _FALSE
@@ -1990,15 +2002,25 @@ class Compiler:
         return cast(QuerySet[Any], bridge.order_by().values(at.key.name))
 
     def point_witness(self, at: At) -> Q:
-        """The point row still has the content types its arms were chosen by."""
+        """Re-read the root facts that shaped this point's predicate."""
         point = self.point
         if point is None or at.ref is not point.ref:
             return _TRUE
+        parts = []
         model = model_for_resource_type(at.resource_type)
-        if model is None:
-            return _TRUE
-        rows = model._base_manager.using(self.using).filter(**dict(point.types))
-        return self._model_membership(at, rows, model, resource_id_attr(model))
+        if model is not None and point.data.types:
+            rows = model._base_manager.using(self.using).filter(**dict(point.data.types))
+            parts.append(self._model_membership(at, rows, model, resource_id_attr(model)))
+        for _key, resolved in sorted(self.used_point_filters.items()):
+            rows = resolved.source_model._base_manager.using(self.using).filter(
+                Q(**resolved.filters)
+            )
+            parts.append(
+                _not(
+                    self._model_membership(at, rows, resolved.source_model, resolved.source_id_attr)
+                )
+            )
+        return _and(*parts)
 
     def _model_membership(
         self,

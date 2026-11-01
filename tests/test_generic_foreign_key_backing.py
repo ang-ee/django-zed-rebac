@@ -614,8 +614,8 @@ def test_a_row_whose_type_changed_after_the_read_is_denied(world, monkeypatch, o
     local.write_relationships([RelationshipTuple(resource, "viewer", ALICE)])
     assert not local.check_access(subject=ALICE, action="unread", resource=resource).allowed
     folder_type = ContentType.objects.get_for_model(Folder)
-    stale = {resource.resource_id: (("content_type_id", folder_type.pk),)}
-    monkeypatch.setattr(read, "_row_types", lambda *_: stale)
+    stale = {resource.resource_id: read.PointData(types=(("content_type_id", folder_type.pk),))}
+    monkeypatch.setattr(read, "_point_rows", lambda *_: stale)
     if operation == "check":
         assert not local.check_access(subject=ALICE, action="unread", resource=resource).allowed
     else:

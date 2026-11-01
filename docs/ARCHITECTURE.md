@@ -1807,6 +1807,22 @@ non-identity, multi-valued and bare subject-set backings keep their existing
 paths. The final policy, generation, content-type and stored-set witnesses
 remain those of the enclosing point statement.
 
+Point preparation also reads reached root field-backing source filters that
+satisfy the existing local-concrete-column validation contract. Native Django
+`Exists` predicates produce Boolean matches alongside the row's content types,
+in the same query per 500 identities. Related-row filter traversals remain on
+the original path. A false match can omit that field-backed target before it
+is compiled; true or unavailable matches retain the original predicate.
+Only false matches actually used to prune are witnessed, as `NOT EXISTS` over
+the same source identity and filters in the final statement. This protects
+exclusions when a source starts matching between preparation and execution.
+Deleting a source keeps a false match false, so filter-only metadata never
+adds a source-row existence requirement to independent tuple/constant grants.
+The existing content-type witnesses retain their semantics. Point metadata
+is prepared before statement-cache lookup and participates in its shape key;
+no row facts are retained on querysets or scopes. Permissions needing neither
+content types nor eligible filters add no preparation read.
+
 A queryset whose current resolved Django predicates require one resource identity
 uses the existing point lower-bound statement as an `EXISTS` condition, with
 the canonical identity bound as a parameter. The caller's predicates remain in
@@ -2274,7 +2290,7 @@ needs one is not in its lower bound.
 
 | Operation | Implementation |
 |---|---|
-| `check_access()` | The actor's stored sets, when one is in reach. Then the lower bound at the resource id, selected from the fenced generation row: one statement, which alone can answer `HAS`. When it does not hold and neither a caveat nor a recursion is in reach, the answer is `NO`. Otherwise the upper bound is a second statement: when it fails, `NO`. Otherwise, when a recursion is in reach, a third statement probes whether the uncertainty is depth, and the residual evaluator names what is undecided. When the permission reaches relations of the resource's type backed by a `GenericForeignKey`, the row's content types in those columns are read first, by one statement, and the statements compile only the arms of those types (an edge to a party compiles `party->read`, not every target type's chain); each statement re-reads the content types, so a row changed in between selects nothing. `check_bulk_permissions()` reads them for a chunk by one statement per resource type, `lookup_subjects()` once for every candidate, and `accessible()` once for the ids it checks one by one. |
+| `check_access()` | The actor's stored sets, when one is in reach. Then the lower bound at the resource id, selected from the fenced generation row: one statement, which alone can answer `HAS`. When it does not hold and neither a caveat nor a recursion is in reach, the answer is `NO`. Otherwise the upper bound is a second statement: when it fails, `NO`. Otherwise, when a recursion is in reach, a third statement probes whether the uncertainty is depth, and the residual evaluator names what is undecided. When the permission reaches relations of the resource's type backed by a `GenericForeignKey`, the row's content types in those columns are read first, by one statement, and the statements compile only the arms of those types (an edge to a party compiles `party->read`, not every target type's chain); each statement re-reads the content types, so a row changed in between selects nothing. `check_bulk_permissions()` reads them for a chunk by one statement per resource type, `lookup_subjects()` once for every candidate, and `accessible()` once for the ids it checks one by one. Eligible local source-filter facts share that preparation query; when no content types are needed, such filters add one batched metadata read. Only used false facts omit a branch, and the final negative source-query witness protects their freshness without requiring a deleted source to exist. |
 | `check_bulk_permissions()` | The answers of `check_access()`, with the work shared: see [Bulk checks](#bulk-checks). |
 | Queryset scope (`queryset_filter()`) | `Model.filter(holds(key, At(type, identity column, identity field, row=True), LOWER))`, decided when the statement that embeds it is compiled, after the small row sets in its reach (see [Decided rows](#decided-rows)). |
 | `accessible()` | The lower bound over each part of the type's universe: the model's rows, the ids that tuples name at either end, constant targets, attribute containers, and field-backed targets whose model stores no rows. Wildcard and empty ids are excluded and the result is deduplicated. |

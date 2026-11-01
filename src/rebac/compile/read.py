@@ -23,7 +23,7 @@ from typing import TYPE_CHECKING, Any, cast
 
 from django.core.exceptions import EmptyResultSet
 from django.db import connections, models
-from django.db.models import Exists, Expression, F, Q, Value
+from django.db.models import Exists, Expression, F, OuterRef, Q, Value
 from django.db.models.expressions import Col
 from django.db.models.fields.related_lookups import RelatedExact
 from django.db.models.lookups import Exact, GreaterThanOrEqual, In, IntegerFieldExact, LessThan
@@ -35,7 +35,12 @@ from rebac.codec import identity_codec
 from rebac.composition import TaggedComposition, compose_tagged, split_stale_overrides
 from rebac.conf import app_settings
 from rebac.errors import PermissionDepthExceeded, SchemaError
-from rebac.field_backing import resolve_attribute_backing, resolve_field_backing
+from rebac.field_backing import (
+    ResolvedFieldBacking,
+    _validate_const_filters,
+    resolve_attribute_backing,
+    resolve_field_backing,
+)
 from rebac.models import active_relationship_model
 from rebac.models.generation import SchemaGeneration
 from rebac.resources import (
@@ -63,6 +68,7 @@ from .evaluate import named_subjects, residual
 from .predicate import (
     ActorSets,
     Fact,
+    PointData,
     PointRow,
     SelfChain,
     Support,
@@ -133,7 +139,7 @@ def reset() -> None:
         _policies.clear()
         _statements.clear()
         _fact_paths.clear()
-        _generic_columns.clear()
+        _point_requirements_cache.clear()
     evaluator = current_evaluator()
     if evaluator is not None:
         # The decisions the open scope keeps were made under the old ones.
@@ -990,19 +996,18 @@ def _point_statement(
     operation: _Operation,
     key: Key,
     which: str,
-    row_types: RowTypes | None = None,
+    row_data: PointData | None = None,
 ) -> _Kept | bool:
     """One bound of ``key`` at one identity, as SQL; a bool when it needs no rows.
 
-    ``row_types`` are the row's GenericForeignKey content types, when read
-    (``_row_types``): the statement is compiled and kept for them, with only
-    the arms of those types, and re-reads them.
+    ``row_data`` are the root facts read by ``_point_rows``. The statement is
+    compiled and kept for that shape, and re-reads every fact it relies on.
     """
     verdicts = operation.verdicts(key)
 
     def build() -> models.QuerySet[Any] | bool:
         at = At(key[0], _Param(_RESOURCE_WIRE, models.TextField()), None, False)
-        point = PointRow(at.ref, row_types) if row_types is not None else None
+        point = PointRow(at.ref, row_data) if row_data is not None else None
         compiler = operation.compiler(verdicts, point=point)
         if which == "depth":
             condition = compiler.depth_unknown(key, at)
@@ -1026,51 +1031,69 @@ def _point_statement(
                 rows = rows.filter(witness)
         return (rows if is_true(condition) else rows.filter(condition)).values("pk")
 
-    return operation.statement(("point", key, which, row_types), verdicts, build)
+    return operation.statement(("point", key, which, row_data), verdicts, build)
 
 
-# A point row's content types: each content-type column's attname, with its value.
-RowTypes = tuple[tuple[str, Any], ...]
+@dataclass(frozen=True)
+class _PointRequirements:
+    """Schema-derived facts the root row can supply, without target permissions."""
 
-# The content-type columns that prune a permission at a point row, by policy
-# and permission (``_type_columns``).
-_generic_columns: OrderedDict[tuple[Any, ...], tuple[str, ...]] = OrderedDict()
+    columns: tuple[str, ...]
+    filters: tuple[ResolvedFieldBacking, ...]
+
+    @property
+    def shape(self) -> tuple[tuple[str, ...], tuple[str, ...]]:
+        return self.columns, tuple(item.relation.name for item in self.filters)
 
 
-def _type_columns(policy: _Policy, key: Key) -> tuple[str, ...]:
-    """The content-type columns of the GenericForeignKeys that back the
-    relations of ``key``'s type which ``key`` reaches; none when it reaches
-    none, and the row's types are then not read."""
+_point_requirements_cache: OrderedDict[tuple[Any, ...], _PointRequirements] = OrderedDict()
+
+
+def _point_requirements(policy: _Policy, key: Key) -> _PointRequirements:
+    """Reached root GFK columns and field filters with native local-scalar semantics."""
     memo = (policy.key, key)
     with _lock:
-        columns = _generic_columns.get(memo)
-    if columns is not None:
-        return columns
+        requirements = _point_requirements_cache.get(memo)
+    if requirements is not None:
+        return requirements
     definition = policy.schema.get_definition(key[0])
     reached = policy.program.reachable(key)
-    found: set[str] = set()
-    for relation in definition.relations if definition is not None else ():
+    columns: set[str] = set()
+    filters = []
+    relations = sorted(definition.relations, key=lambda item: item.name) if definition else ()
+    for relation in relations:
         if (key[0], relation.name) not in reached or not isinstance(relation.backing, FieldBinding):
             continue
         resolved = resolve_field_backing(definition, relation)  # type: ignore[arg-type]
-        if resolved is not None and resolved.generic is not None:
+        if resolved is None:
+            # The existing predicate resolver reports invalid schema backings.
+            continue
+        if resolved.generic is not None:
             field = resolved.source_model._meta.get_field(resolved.generic.ct_field)
-            found.add(cast(Any, field).attname)
-    columns = tuple(sorted(found))
+            columns.add(cast(Any, field).attname)
+        if relation.backing.filters:
+            try:
+                _validate_const_filters(resolved.source_model, relation.backing)
+            except ValueError:
+                # Valid field filters may need joins; they keep the original
+                # path. The full backing was resolved and validated above.
+                continue
+            filters.append(resolved)
+    requirements = _PointRequirements(tuple(sorted(columns)), tuple(filters))
     with _lock:
-        _generic_columns[memo] = columns
-        while len(_generic_columns) > _LIMIT:
-            _generic_columns.popitem(last=False)
-    return columns
+        _point_requirements_cache[memo] = requirements
+        while len(_point_requirements_cache) > _LIMIT:
+            _point_requirements_cache.popitem(last=False)
+    return requirements
 
 
-def _row_types(
-    using: str, resource_type: str, columns: tuple[str, ...], ids: Iterable[str]
-) -> dict[str, RowTypes]:
-    """The values the rows ``ids`` name have in ``columns``, read by one
-    statement per 500 ids; an id that names no row has none."""
+def _point_rows(
+    using: str, resource_type: str, requirements: _PointRequirements, ids: Iterable[str]
+) -> dict[str, PointData]:
+    """Read root point facts in one statement per 500 native identities."""
     model = model_for_resource_type(resource_type)
-    if not columns or model is None or not stores_rows(model):
+    columns, filters = requirements.columns, requirements.filters
+    if not (columns or filters) or model is None or not stores_rows(model):
         return {}
     identity = resource_id_attr(model)
     codec = identity_codec(model, identity)
@@ -1081,20 +1104,38 @@ def _row_types(
         if value and codec.is_canonical(value, using=using)
     }
     rows = model._base_manager.using(using)
+    aliases = {field.name for field in model._meta.get_fields()} | set(rows.query.annotations)
+    matches = {}
+    for position, resolved in enumerate(filters):
+        name = f"_rebac_point_filter_{position}"
+        while name in aliases:
+            name += "_"
+        aliases.add(name)
+        source = resolved.source_model._base_manager.using(using).filter(
+            Q(**{resolved.source_id_attr: OuterRef(identity)}) & Q(**resolved.filters)
+        )
+        matches[name] = Exists(source)
+    rows = rows.annotate(**matches)
     values = list(native)
-    found: dict[str, RowTypes] = {}
+    found: dict[str, PointData] = {}
     for start in range(0, len(values), 500):
         chunk = values[start : start + 500]
         for value, *row in rows.filter(**{f"{identity}__in": chunk}).values_list(
-            identity, *columns
+            identity, *columns, *matches
         ):
-            found[native[value]] = tuple(zip(columns, row, strict=True))
+            found[native[value]] = PointData(
+                tuple(zip(columns, row[: len(columns)], strict=True)),
+                tuple(
+                    ((resource_type, resolved.relation.name), bool(held))
+                    for resolved, held in zip(filters, row[len(columns) :], strict=True)
+                ),
+            )
     return found
 
 
-def _key_types(policy: _Policy, using: str, key: Key, ids: Iterable[str]) -> dict[str, RowTypes]:
-    """The content types that prune ``key`` on the rows ``ids`` name."""
-    return _row_types(using, key[0], _type_columns(policy, key), ids)
+def _point_data(policy: _Policy, using: str, key: Key, ids: Iterable[str]) -> dict[str, PointData]:
+    """The root-row facts that can prune ``key`` without compiling its targets."""
+    return _point_rows(using, key[0], _point_requirements(policy, key), ids)
 
 
 def _point(
@@ -1102,10 +1143,10 @@ def _point(
     key: Key,
     resource_id: str,
     which: str,
-    row_types: RowTypes | None = None,
+    row_data: PointData | None = None,
 ) -> bool:
     """One bound of ``key`` at one identity, by one statement."""
-    compiled = _point_statement(operation, key, which, row_types)
+    compiled = _point_statement(operation, key, which, row_data)
     if isinstance(compiled, bool):
         return compiled and operation.gate(parametric=False).exists()
     probe = _Sql(compiled.sql, operation.bound(compiled.params, resource_id))
@@ -1115,19 +1156,19 @@ def _point(
 def _points(
     asked: Sequence[tuple[_Operation, Key, str]],
     which: str,
-    types: Sequence[RowTypes | None],
+    point_data: Sequence[PointData | None],
 ) -> list[bool]:
     """One bound of several items: each a column of one statement over the generation row.
 
     A column is the statement ``_point`` would run for the item, with its own
-    fence and witness; ``types`` are the items' row types, in order.
+    fence and witness; ``point_data`` are the items' root facts, in order.
     """
     answers = [False] * len(asked)
     statements: list[dict[str, _Sql]] = [{}]
     size = 0
     fenced: bool | None = None
     for position, (operation, key, resource_id) in enumerate(asked):
-        compiled = _point_statement(operation, key, which, types[position])
+        compiled = _point_statement(operation, key, which, point_data[position])
         if isinstance(compiled, bool):
             if compiled:
                 if fenced is None:
@@ -1171,27 +1212,27 @@ def _point_result(
     context: Mapping[str, Any] | None,
     using: str,
     lower_only: bool = False,
-    types: Mapping[str, RowTypes] | None = None,
+    point_data: Mapping[str, PointData] | None = None,
 ) -> tuple[bool, bool, bool, _Policy]:
-    """``types`` are the row types already read for the resource's id
-    (``_key_types``); without them, they are read here."""
+    """``point_data`` are the root facts already prepared for the resource;
+    without them, the same preparation owner reads them here."""
     operation = _Operation.begin(backend, actor, using, context)
     key = resource.resource_type, action
-    if types is None:
-        types = _key_types(operation.policy, using, key, (resource.resource_id,))
-    row_types = types.get(resource.resource_id)
+    if point_data is None:
+        point_data = _point_data(operation.policy, using, key, (resource.resource_id,))
+    row_data = point_data.get(resource.resource_id)
     # Only LOWER may authorize, and it is one SQL statement with every fact
     # witnessed in that statement.  Subsequent probes can only return NO,
     # CONDITIONAL, or a depth error.
-    if _point(operation, key, resource.resource_id, "lower", row_types):
+    if _point(operation, key, resource.resource_id, "lower", row_data):
         return True, True, False, operation.policy
     recursive = _recursive(operation, key)
     # The bounds differ only where a caveat or a recursion is in reach.
     if lower_only or not (recursive or not operation.verdicts(key).empty):
         return False, False, False, operation.policy
-    if not _point(operation, key, resource.resource_id, "upper", row_types):
+    if not _point(operation, key, resource.resource_id, "upper", row_data):
         return False, False, False, operation.policy
-    deep = recursive and _point(operation, key, resource.resource_id, "depth", row_types)
+    deep = recursive and _point(operation, key, resource.resource_id, "depth", row_data)
     return False, True, deep, operation.policy
 
 
@@ -1366,19 +1407,25 @@ def _check_chunk(
                 prepared[key, context] = operation.verdicts(key)
         asked.append((operation, key, item.resource.resource_id))
     _decide_together(asked)
-    # The row types every bound of the chunk compiles with: one read per
-    # resource type and set of columns.
-    wanted: dict[tuple[str, tuple[str, ...]], set[str]] = {}
+    # The root facts every bound of the chunk compiles with: one read per
+    # resource type and preparation shape.
+    wanted: dict[tuple[str, tuple[tuple[str, ...], tuple[str, ...]]], set[str]] = {}
+    requirements = {}
     for _operation, key, resource_id in asked:
-        columns = _type_columns(policy, key)
-        if columns:
-            wanted.setdefault((key[0], columns), set()).add(resource_id)
-    read = {group: _row_types(using, group[0], group[1], ids) for group, ids in wanted.items()}
-    types = [
-        read.get((key[0], _type_columns(policy, key)), {}).get(resource_id)
+        required = _point_requirements(policy, key)
+        if required.columns or required.filters:
+            group = key[0], required.shape
+            wanted.setdefault(group, set()).add(resource_id)
+            requirements[group] = required
+    read = {
+        group: _point_rows(using, group[0], requirements[group], ids)
+        for group, ids in wanted.items()
+    }
+    point_data = [
+        read.get((key[0], _point_requirements(policy, key).shape), {}).get(resource_id)
         for _operation, key, resource_id in asked
     ]
-    lower = _points(asked, "lower", types)
+    lower = _points(asked, "lower", point_data)
     # The bounds differ only where a caveat or a recursion is in reach.
     open_: list[tuple[int, bool]] = []
     for position, (operation, key, _resource_id) in enumerate(asked):
@@ -1393,7 +1440,7 @@ def _check_chunk(
             _points(
                 [asked[position] for position, _recursive_ in open_],
                 "upper",
-                [types[position] for position, _recursive_ in open_],
+                [point_data[position] for position, _recursive_ in open_],
             ),
             strict=True,
         )
@@ -1405,7 +1452,7 @@ def _check_chunk(
             _points(
                 [asked[position] for position in probed],
                 "depth",
-                [types[position] for position in probed],
+                [point_data[position] for position in probed],
             ),
             strict=True,
         )
@@ -1755,8 +1802,8 @@ class _Scope(Expression):
         def statement(operation: _Operation) -> _Kept | bool:
             if resource_id is None:
                 return _scope_statement(operation, self.model, key)
-            types = _key_types(policy, self.using, key, (resource_id,)).get(resource_id)
-            return _point_statement(operation, key, "lower", types)
+            point_data = _point_data(policy, self.using, key, (resource_id,)).get(resource_id)
+            return _point_statement(operation, key, "lower", point_data)
 
         operation = _Operation.begin(self.backend, self.actor, self.using, policy=policy)
         compiled = statement(operation)
@@ -2071,7 +2118,7 @@ def _held(
 ) -> set[str]:
     pending = set(ids)
     found: set[str] = set()
-    types: Mapping[str, RowTypes] | None = None
+    point_data: Mapping[str, PointData] | None = None
     model = model_for_resource_type(resource_type)
     if model is not None and stores_rows(model) and context is None and len(pending) > 4:
         identity = resource_id_attr(model)
@@ -2098,10 +2145,10 @@ def _held(
             for value in present:
                 pending.discard(native[value])
             found.update(native[value] for value in allowed)
-        # The ids left name no row: they have no content types.
-        types = {}
-    if pending and types is None:
-        types = _key_types(_policy(backend, using), using, (resource_type, action), pending)
+        # The ids left name no row: they have no root-row facts.
+        point_data = {}
+    if pending and point_data is None:
+        point_data = _point_data(_policy(backend, using), using, (resource_type, action), pending)
     for value in sorted(pending):
         if _point_result(
             backend=backend,
@@ -2111,7 +2158,7 @@ def _held(
             context=context,
             using=using,
             lower_only=True,
-            types=types,
+            point_data=point_data,
         )[0]:
             found.add(value)
     return found
@@ -2144,8 +2191,8 @@ def lookup_subjects(
     )
     if not candidates:
         return []
-    # One read of the resource's content types serves every candidate.
-    types = _key_types(
+    # One read of the resource's root facts serves every candidate.
+    point_data = _point_data(
         _policy(backend, using), using, (resource.resource_type, action), (resource.resource_id,)
     )
     return [
@@ -2159,6 +2206,6 @@ def lookup_subjects(
             context=context,
             using=using,
             lower_only=True,
-            types=types,
+            point_data=point_data,
         )[0]
     ]
