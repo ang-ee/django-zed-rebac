@@ -331,3 +331,40 @@ def test_interleaved_scope_exit_removes_only_its_own_observer(persisted_schema):
         if second_open:
             second.run(second_scope.__exit__, None, None, None)
     assert tuple(connection.execute_wrappers) == original
+
+
+@pytest.mark.parametrize(
+    ("sql", "many", "kept"),
+    [
+        ("SELECT 1", False, True),
+        (" (SELECT 1) UNION (SELECT 2)", False, True),
+        ("( \n(SELECT 1)) INTERSECT (SELECT 2)", False, True),
+        ("(SELECT 1) EXCEPT (SELECT 2)", False, True),
+        ("(SELECT 1); DELETE FROM example", False, False),
+        ("(WITH x AS (SELECT 1) SELECT * FROM x)", False, False),
+        ("(/* comment */ SELECT 1)", False, False),
+        ("(DELETE FROM example)", False, False),
+        ("SAVEPOINT example", False, False),
+        ("SELECT 1", True, False),
+    ],
+)
+def test_observer_compound_prefix_keeps_unknown_and_control_statements_conservative(
+    sql, many, kept
+):
+    from rebac.schema.cache import SchemaScope
+
+    scope = SchemaScope()
+    state = scope._state(connections["default"])
+    state.rows["probe"] = None
+    calls = []
+
+    def execute(statement, params, multiple, context):
+        calls.append((statement, params, multiple, context))
+        return "executed"
+
+    try:
+        assert state._observe(execute, sql, (), many, {}) == "executed"
+        assert bool(state.rows) is kept
+        assert calls == [(sql, (), many, {})]
+    finally:
+        scope.clear()

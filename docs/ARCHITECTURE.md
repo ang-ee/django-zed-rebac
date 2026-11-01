@@ -1076,7 +1076,10 @@ statement compilation and nested prefetches share the validated snapshot;
 `aiterator()` validates per statement, as an async generator has no single
 evaluation to scope. Outside
 an evaluator, the next independent evaluation validates again. Writes and
-transaction boundaries still invalidate its connection-local pin.
+transaction boundaries still invalidate its connection-local pin. Native Django
+parenthesized compound SELECTs preserve it, like ordinary SELECTs; the added
+parenthesized form excludes semicolons. Unknown statements, CTEs and leading
+comments conservatively invalidate, while the library's own audit INSERTs do not.
 
 The five policy models (definitions, relations, permissions, caveats and
 overrides) own writes through their shared model/queryset, including base-manager

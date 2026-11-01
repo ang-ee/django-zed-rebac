@@ -612,6 +612,37 @@ def test_a_scope_binds_the_rows_it_decided_again(tree):
     assert _listed(second) == _listed(first)
 
 
+@pytest.mark.parametrize("operation", ["union", "intersection", "difference"])
+def test_native_compound_reads_keep_decisions_but_real_writes_drop_them(tree, operation):
+    from rebac import evaluator_scope
+    from rebac.models.generation import SchemaGeneration
+
+    _local, folders, posts, _grant = tree
+    expected = {posts["child"].pk, posts["leaf"].pk}
+    first = SchemaGeneration.objects.filter(pk=1).order_by().values_list("pk", flat=True)
+    # A negative positive-integer key lets Django elide INTERSECT as empty.
+    # Missing valid key 2 requires every native compound form to execute.
+    empty = SchemaGeneration.objects.filter(pk=2).order_by().values_list("pk", flat=True)
+    compound = getattr(first, operation)(empty)
+    with evaluator_scope():
+        assert visible(Post) == expected
+        with CaptureQueriesContext(connection) as compound_reads:
+            assert list(compound) == ([] if operation == "intersection" else [1])
+        assert len(compound_reads) == 1
+        if connection.vendor == "postgresql":
+            assert compound_reads[0]["sql"].lstrip().startswith("(")
+        with CaptureQueriesContext(connection) as repeated:
+            assert visible(Post) == expected
+        assert _folder_reads(repeated) == []
+        assert len(_confirmations(repeated)) == 1
+        with sudo(reason="test.compound_read_then_move"):
+            Folder.objects.filter(pk=folders["other"].pk).update(parent=folders["child"])
+        with CaptureQueriesContext(connection) as changed:
+            assert visible(Post) == expected | {posts["other"].pk}
+        assert _folder_reads(changed)
+        assert _confirmations(changed) == []
+
+
 def test_nothing_is_kept_outside_a_scope(tree):
     _local, _folders, _posts, _grant = tree
     with CaptureQueriesContext(connection) as first:

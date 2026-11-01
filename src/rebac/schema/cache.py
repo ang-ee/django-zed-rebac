@@ -71,13 +71,18 @@ class _ConnectionSchemas:
     def _observe(
         self, execute: Callable[..., Any], sql: str, params: Any, many: bool, context: Any
     ) -> Any:
-        # Ordinary Django SELECTs preserve the snapshot. CTEs, vendor SQL and
-        # comments are conservative invalidations. Side-effectful SELECTs or
-        # raw driver writes require explicit evaluator.invalidate(); see the
-        # architecture contract. Invalidate before even a failed write/rollback.
-        if (many or not str(sql).lstrip().upper().startswith("SELECT ")) and not _audit_insert(
-            str(sql), context
-        ):
+        # Django SELECTs, including parenthesized compound reads, preserve pins.
+        # CTEs, unknown SQL and comments remain conservative invalidations.
+        # Side-effectful SELECTs or raw driver writes require explicit
+        # evaluator.invalidate(); see the architecture contract. Invalidate
+        # before even a failed write/rollback.
+        statement = str(sql).lstrip()
+        read = statement[:7].upper() == "SELECT " or (
+            statement.startswith("(")
+            and ";" not in statement
+            and statement.lstrip("( \t\r\n")[:7].upper() == "SELECT "
+        )
+        if (many or not read) and not _audit_insert(statement, context):
             self.snapshots.clear()
             self.rows.clear()
         return execute(sql, params, many, context)
