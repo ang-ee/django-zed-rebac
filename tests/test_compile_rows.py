@@ -14,6 +14,7 @@ from rebac.compile import read
 from rebac.field_backing import foreign_key_kept, resolve_field_backing
 from rebac.schema import parse_zed
 from rebac.testing import install_schema
+from tests.test_compile_point_filters import metadata_reads as metadata_reads
 from tests.testapp.models import (
     CodedFolder,
     Folder,
@@ -551,13 +552,21 @@ def test_a_hierarchy_over_an_unconstrained_parent_is_not_followed_from_its_seeds
         Folder._base_manager.filter(pk=folders["leaf"].pk).update(parent=None)
 
 
-def test_point_checks_do_not_decide_sets(tree):
+def test_point_checks_do_not_decide_sets(tree, monkeypatch, metadata_reads):
     local, folders, _posts, _grant = tree
+
+    def refuse_row_decision(*args, **kwargs):
+        pytest.fail("point checks must not decide model-row populations")
+
+    monkeypatch.setattr(read._Rows, "_decide", refuse_row_decision)
     with CaptureQueriesContext(connection) as queries:
         assert local.check_access(
             subject=ALICE, action="read", resource=to_object_ref(folders["leaf"])
         ).allowed
-    assert len(queries) == 1
+    preparation = [item["queries"] for item in metadata_reads if item["queries"]]
+    assert preparation == [1]
+    # One source-fact batch, then the original single final point statement.
+    assert len(queries) - sum(preparation) == 1
     assert not local.check_access(
         subject=ALICE, action="read", resource=ObjectRef("blog/folder", str(folders["root"].pk))
     ).allowed

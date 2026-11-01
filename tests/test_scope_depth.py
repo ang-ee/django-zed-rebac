@@ -10,6 +10,7 @@ from django.utils import timezone
 from rebac import RelationshipTuple, app_settings, to_object_ref
 from rebac.schema import parse_zed
 from tests.backend_setup import STORAGE_TIERS, install_schema
+from tests.test_compile_point_filters import metadata_reads as metadata_reads
 from tests.test_recursive_queryscope import (
     ACTOR,
     OUTSIDER,
@@ -43,7 +44,7 @@ def parse_depth(sql):
     return maximum_selects, maximum_parens
 
 
-def deep_scope_proof(storage, backing, deep, exact):
+def deep_scope_proof(storage, backing, deep, exact, metadata_reads):
     measurements = []
     with schema_context(storage, "folder", backing) as (active, member, hop, action):
         for depth in (1, deep):
@@ -64,16 +65,21 @@ def deep_scope_proof(storage, backing, deep, exact):
                 statements.append(sql)
                 return execute(sql, params, many, context)
 
+            metadata_reads.clear()
             with connection.execute_wrapper(record):
                 sql, params = queryset.query.sql_with_params()
-                # Exact identities use point SQL and only read stored sets;
-                # general field-backed scopes also decide hierarchy levels.
-                decided = len(statements)
+                # Separate the bounded source-fact phase from the original
+                # stored-set/hierarchy preparation contract.
+                source_reads = [item["queries"] for item in metadata_reads if item["queries"]]
+                assert source_reads == ([1] if exact and backing == "field" else [])
+                decided = len(statements) - sum(source_reads)
                 levels = min(depth + 1, app_settings.REBAC_DEPTH_LIMIT)
                 assert decided == (1 if exact or backing == "tuple" else 2 + levels)
                 assert list(queryset.values_list("pk", flat=True)) == [rows[-1].pk]
             # Evaluating it decides the same again, then reads the rows.
-            assert len(statements) == 2 * decided + 1
+            source_reads = [item["queries"] for item in metadata_reads if item["queries"]]
+            assert source_reads == ([1, 1] if exact and backing == "field" else [])
+            assert len(statements) - sum(source_reads) == 2 * decided + 1
             measurements.append(
                 (len(sql), len(params), parse_depth(sql))
                 if backing == "tuple"
@@ -96,8 +102,8 @@ def deep_scope_proof(storage, backing, deep, exact):
 @pytest.mark.parametrize("backing", ["tuple", "field"])
 @pytest.mark.parametrize("deep", [3, pytest.param(8, marks=pytest.mark.slow)])
 @pytest.mark.parametrize("exact", [False, True], ids=["general", "exact"])
-def test_deep_scopes_have_constant_parse_depth(storage, backing, deep, exact):
-    deep_scope_proof(storage, backing, deep, exact)
+def test_deep_scopes_have_constant_parse_depth(storage, backing, deep, exact, metadata_reads):
+    deep_scope_proof(storage, backing, deep, exact, metadata_reads)
 
 
 @pytest.mark.parametrize("storage", STORAGE_TIERS)

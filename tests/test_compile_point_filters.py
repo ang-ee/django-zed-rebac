@@ -1,4 +1,4 @@
-"""Point statements prune impossible declared source filters and witness them."""
+"""Point statements prune impossible source edges and witness their absence."""
 
 from __future__ import annotations
 
@@ -128,7 +128,7 @@ def test_false_to_true_filter_change_cannot_grant_through_exclusion(local, monke
     def stale(using, resource_type, requirements, ids):
         data = original(using, resource_type, requirements, ids)
         if resource_type == "blog/folder" and not changed:
-            assert any(not held for row in data.values() for _key, held in row.filter_matches)
+            assert any(not held for row in data.values() for _key, held in row.source_matches)
             changed.append(True)
             Folder.objects.using(using).sudo(reason="tests.point_filter.race").filter(
                 pk=folder.pk
@@ -177,7 +177,7 @@ def test_filter_only_metadata_does_not_require_deleted_source(local, monkeypatch
         data = original(using, resource_type, requirements, ids)
         if resource_type == "blog/folder" and not deleted:
             assert data[resource.resource_id].types == ()
-            assert data[resource.resource_id].filter_matches
+            assert data[resource.resource_id].source_matches
             deleted.append(True)
             Folder.objects.using(using).sudo(reason="tests.point_filter.delete").filter(
                 pk=folder.pk
@@ -272,7 +272,10 @@ def test_type_and_filter_facts_share_one_metadata_read(local, metadata_reads):
     assert len(own) == 1 and own[0]["queries"] == 1
     data = own[0]["data"][str(attachment.pk)]
     assert data.types == (("content_type_id", attachment.content_type_id),)
-    assert data.filter_matches == ((("test/attachment", "folder"), False),)
+    assert data.source_matches == (
+        (("test/attachment", "folder"), False),
+        (("test/attachment", "post"), True),
+    )
 
 
 def test_bulk_source_metadata_groups_subjects_actions_and_resource_ids(local, metadata_reads):
@@ -296,7 +299,7 @@ def test_bulk_source_metadata_groups_subjects_actions_and_resource_ids(local, me
         assert len(own[0]["data"]) == count
 
 
-def test_permission_without_source_filters_adds_no_metadata_read(local, metadata_reads):
+def test_permission_without_field_backings_adds_no_metadata_read(local, metadata_reads):
     with sudo(reason="tests.point_filter.unfiltered_fixture"):
         folder = Folder.objects.create(name="viewer")
     local.write_relationships([RelationshipTuple(to_object_ref(folder), "viewer", ALICE)])
@@ -307,16 +310,21 @@ def test_permission_without_source_filters_adds_no_metadata_read(local, metadata
     assert all(row["queries"] == 0 for row in metadata_reads)
 
 
+@pytest.mark.parametrize("fact", ["filter", "edge"])
 @pytest.mark.django_db(transaction=True, databases={"default", "selected"})
-def test_source_filter_alias_and_clone_keep_opposite_rows_separate(local):
+def test_source_match_alias_and_clone_keep_opposite_rows_separate(local, fact):
     for alias in ("default", "selected"):
         with database_context(alias):
             install_schema(local, SCHEMA, using=alias)
             with sudo(reason="tests.point_filter.alias_fixture"):
                 folder = Folder.objects.using(alias).create(
-                    pk=71, name=alias, is_active=alias == "default"
+                    pk=71, name=alias, is_active=fact == "edge" or alias == "default"
                 )
-                post = Post.objects.using(alias).create(pk=81, title=alias, folder=folder)
+                post = Post.objects.using(alias).create(
+                    pk=81,
+                    title=alias,
+                    folder=folder if fact == "filter" or alias == "default" else None,
+                )
             local.write_relationships(
                 [
                     RelationshipTuple(to_object_ref(folder), "viewer", ALICE),
@@ -330,14 +338,19 @@ def test_source_filter_alias_and_clone_keep_opposite_rows_separate(local):
     assert not query.using("default").exists()
     assert not query.with_actor(BOB).exists()
     with database_context("selected"):
-        Folder.objects.using("selected").sudo(reason="tests.point_filter.alias_change").filter(
-            pk=71
-        ).update(is_active=True)
+        if fact == "filter":
+            Folder.objects.using("selected").sudo(reason="tests.point_filter.alias_change").filter(
+                pk=71
+            ).update(is_active=True)
+        else:
+            Post.objects.using("selected").sudo(reason="tests.point_source.alias_link").filter(
+                pk=81
+            ).update(folder_id=71)
     assert not query.all().exists()
 
 
-@pytest.fixture
-def scalar_source(local, monkeypatch):
+@pytest.fixture(params=[True])
+def scalar_source(local, monkeypatch, request):
     # Follow the existing isolated-model harness used by test_scope_additive:
     # only the native resource resolver needs the test-local app registry.
     import rebac.compile.predicate
@@ -348,7 +361,9 @@ def scalar_source(local, monkeypatch):
     with isolate_apps("tests.testapp"):
 
         class ScalarSource(RebacMixin, models.Model):
-            target = models.ForeignKey(Folder, on_delete=models.CASCADE)
+            target = models.ForeignKey(
+                Folder, null=True, db_constraint=request.param, on_delete=models.CASCADE
+            )
             metadata = models.JSONField(null=True)
             audience = models.CharField(
                 max_length=32, db_collation="nocase" if connection.vendor == "sqlite" else None
@@ -417,7 +432,7 @@ def test_json_sql_null_and_key_null_keep_native_point_truth(
         assert scalar_source.objects.with_actor(ALICE).filter(pk=row.pk).exists() is matches
         own = [item for item in metadata_reads if item["type"] == "test/pointscalar"]
         assert len(own) == 1 and own[0]["queries"] == 1
-        assert own[0]["data"][str(row.pk)].filter_matches == (
+        assert own[0]["data"][str(row.pk)].source_matches == (
             (("test/pointscalar", "target"), matches),
         )
         assert (
@@ -460,7 +475,7 @@ def test_metadata_preserves_filter_scalar_types_instead_of_python_equality(local
         data = next(item for item in metadata_reads if item["type"] == "blog/folder")["data"][
             str(row.pk)
         ]
-        assert tuple(held for _key, held in data.filter_matches) == expected
+        assert tuple(held for _key, held in data.source_matches) == expected
 
 
 def test_point_preparation_chunks_large_identity_population(local):
@@ -468,6 +483,7 @@ def test_point_preparation_chunks_large_identity_population(local):
         rows = Folder.objects.bulk_create(
             [Folder(name=str(i), is_active=bool(i % 2)) for i in range(501)]
         )
+        Post.objects.bulk_create([Post(title="target", folder=row) for row in rows])
     policy = read._policy(local, "default")
     with CaptureQueriesContext(connection) as queries:
         data = read._point_data(
@@ -476,10 +492,10 @@ def test_point_preparation_chunks_large_identity_population(local):
     assert len(queries) == 2
     assert len(data) == 501
     for row in rows:
-        assert data[str(row.pk)].filter_matches == ((("blog/folder", "posts"), row.is_active),)
+        assert data[str(row.pk)].source_matches == ((("blog/folder", "posts"), row.is_active),)
 
 
-def test_empty_filtered_capability_retains_original_path_without_metadata(local, metadata_reads):
+def test_unfiltered_present_edge_uses_one_metadata_read(local, metadata_reads):
     install_schema(
         local, SCHEMA.replace('field={"path":"posts","filters":{"is_active":true}}', "field=posts")
     )
@@ -489,7 +505,9 @@ def test_empty_filtered_capability_retains_original_path_without_metadata(local,
     local.write_relationships([RelationshipTuple(to_object_ref(post), "viewer", ALICE)])
     metadata_reads.clear()
     assert Folder.objects.with_actor(ALICE).filter(pk=folder.pk).exists()
-    assert all(item["queries"] == 0 for item in metadata_reads)
+    own = [item for item in metadata_reads if item["type"] == "blog/folder"]
+    assert len(own) == 1 and own[0]["queries"] == 1
+    assert own[0]["data"][str(folder.pk)].source_matches == ((("blog/folder", "posts"), True),)
 
 
 def test_invalid_field_filter_is_not_swallowed_as_an_optimization_miss(local):
@@ -532,7 +550,7 @@ def test_matching_filter_still_reads_original_condition_at_execution(local, monk
     def stale(using, resource_type, requirements, ids):
         data = original(using, resource_type, requirements, ids)
         if resource_type == "blog/folder" and not changed:
-            assert all(held for row in data.values() for _key, held in row.filter_matches)
+            assert all(held for row in data.values() for _key, held in row.source_matches)
             changed.append(True)
             Folder.objects.using(using).sudo(reason="tests.point_filter.matching_race").filter(
                 pk=folder.pk
@@ -548,3 +566,216 @@ def test_matching_filter_still_reads_original_condition_at_execution(local, monk
         allowed = Folder.objects.with_actor(ALICE).filter(pk=folder.pk).exists()
     assert not allowed
     assert changed
+
+
+@pytest.mark.parametrize("edge", ["reverse", "nullable"])
+@pytest.mark.parametrize("operation", ["check", "exact_scope"])
+def test_absent_source_edge_never_compiles_target(local, monkeypatch, edge, operation):
+    if edge == "reverse":
+        text = SCHEMA.replace('{"path":"posts","filters":{"is_active":true}}', "posts")
+        source_model, target_type = Folder, "blog/post"
+    else:
+        text = """
+        definition auth/user {}
+        definition blog/folder {
+            relation viewer: auth/user
+            permission read = viewer
+        }
+        definition blog/post {
+            relation viewer: auth/user
+            relation folder: blog/folder // rebac:field=folder
+            permission read = viewer + folder->read
+        }
+        """
+        source_model, target_type = Post, "blog/folder"
+    install_schema(local, text)
+    with sudo(reason="tests.point_source.absent_fixture"):
+        source = (
+            Folder.objects.create(name="empty")
+            if edge == "reverse"
+            else Post.objects.create(title="null")
+        )
+    local.write_relationships([RelationshipTuple(to_object_ref(source), "viewer", ALICE)])
+    original = Compiler._holds
+    targets = []
+
+    def holds(self, key, *args, **kwargs):
+        if key == (target_type, "read"):
+            targets.append(key)
+        return original(self, key, *args, **kwargs)
+
+    monkeypatch.setattr(Compiler, "_holds", holds)
+
+    def allowed(actor):
+        if operation == "check":
+            return local.check_access(
+                subject=actor, action="read", resource=to_object_ref(source)
+            ).allowed
+        return source_model.objects.with_actor(actor).filter(pk=source.pk).exists()
+
+    assert allowed(ALICE)
+    assert not allowed(BOB)
+    assert targets == []
+    with sudo(reason="tests.point_source.add_target"):
+        if edge == "reverse":
+            target = Post.objects.create(title="target", folder=source)
+        else:
+            target = Folder.objects.create(name="target")
+            Post.objects.filter(pk=source.pk).update(folder=target)
+    local.write_relationships([RelationshipTuple(to_object_ref(target), "viewer", ALICE)])
+    targets.clear()
+    assert allowed(ALICE)
+    assert not allowed(BOB)
+    assert targets
+
+
+@pytest.mark.parametrize("edge", ["reverse", "nullable", "many"])
+@pytest.mark.parametrize("operation", ["check", "exact_scope"])
+def test_new_source_edge_is_witnessed_before_exclusion_grants(local, monkeypatch, edge, operation):
+    if edge in {"reverse", "many"}:
+        path = "posts" if edge == "reverse" else "collected_posts"
+        text = SCHEMA.replace('{"path":"posts","filters":{"is_active":true}}', path)
+        source_model = Folder
+    else:
+        text = """
+        definition auth/user {}
+        definition blog/folder {
+            relation viewer: auth/user
+            permission read = viewer
+        }
+        definition blog/post {
+            relation viewer: auth/user
+            relation folder: blog/folder // rebac:field=folder
+            permission exclusion = viewer - folder->read
+        }
+        """
+        source_model = Post
+    install_schema(local, text)
+    with sudo(reason="tests.point_source.race_fixture"):
+        if edge == "nullable":
+            source = Post.objects.create(title="source")
+            target = Folder.objects.create(name="ban")
+        else:
+            source = Folder.objects.create(name="source")
+            target = Post.objects.create(title="ban")
+    local.write_relationships(
+        [RelationshipTuple(to_object_ref(row), "viewer", ALICE) for row in (source, target)]
+    )
+    original = read._point_rows
+    changed = []
+
+    def stale(using, resource_type, requirements, ids):
+        data = original(using, resource_type, requirements, ids)
+        if resource_type == to_object_ref(source).resource_type and not changed:
+            assert any(not held for row in data.values() for _key, held in row.source_matches)
+            changed.append(True)
+            with sudo(reason="tests.point_source.insert_edge"):
+                if edge == "nullable":
+                    Post.objects.using(using).filter(pk=source.pk).update(folder=target)
+                elif edge == "reverse":
+                    Post.objects.using(using).filter(pk=target.pk).update(folder=source)
+                else:
+                    target.collections.add(source)
+        return data
+
+    monkeypatch.setattr(read, "_point_rows", stale)
+    if operation == "check":
+        allowed = local.check_access(
+            subject=ALICE, action="exclusion", resource=to_object_ref(source)
+        ).allowed
+    else:
+        allowed = (
+            source_model.objects.with_actor(ALICE)
+            .with_action("exclusion")
+            .filter(pk=source.pk)
+            .exists()
+        )
+    assert not allowed
+    assert changed
+    assert not local.check_access(
+        subject=ALICE, action="exclusion", resource=to_object_ref(source)
+    ).allowed
+
+
+def test_nonunique_source_identity_keeps_native_population(local, monkeypatch, metadata_reads):
+    with sudo(reason="tests.point_source.nonunique_fixture"):
+        identity = Folder.objects.create(name="shared identity")
+        target = Folder.objects.create(name="allowed")
+        first = Post.objects.create(title="linked", folder=identity)
+        Post.objects.create(title="empty", folder=identity)
+        first.collections.add(target)
+    monkeypatch.setattr(Post._meta, "rebac_id_attr", "folder_id", raising=False)
+    install_schema(
+        local,
+        """
+        definition auth/user {}
+        definition blog/folder {
+            relation viewer: auth/user
+            permission read = viewer
+        }
+        definition blog/post {
+            relation collections: blog/folder // rebac:field=collections
+            permission read = collections->read
+        }
+    """,
+    )
+    local.write_relationships([RelationshipTuple(to_object_ref(target), "viewer", ALICE)])
+    metadata_reads.clear()
+    assert local.check_access(
+        subject=ALICE, action="read", resource=ObjectRef("blog/post", str(identity.pk))
+    ).allowed
+    own = [item for item in metadata_reads if item["type"] == "blog/post"]
+    assert own and all(item["queries"] == 0 and item["data"] == {} for item in own)
+
+
+@pytest.mark.parametrize("scalar_source", [False], indirect=True)
+def test_unconstrained_pointer_presence_does_not_add_target_existence(
+    local, scalar_source, metadata_reads
+):
+    install_schema(
+        local,
+        scalar_schema({}).replace(
+            "permission read = viewer + posts->read", "permission read = authenticated"
+        ),
+    )
+    with sudo(reason="tests.point_source.dangling_fixture"):
+        row = scalar_source.objects.create(target_id=999_999, metadata=None, audience="")
+    metadata_reads.clear()
+    assert scalar_source.objects.with_actor(ALICE).filter(pk=row.pk).exists()
+    own = [item for item in metadata_reads if item["type"] == "test/pointscalar"]
+    assert own[0]["data"][str(row.pk)].source_matches == ((("test/pointscalar", "target"), True),)
+
+
+def test_root_absence_fact_does_not_prune_a_nested_reference(local, metadata_reads):
+    install_schema(
+        local,
+        """
+        definition auth/user {}
+        definition blog/folder {
+            relation viewer: auth/user
+            relation parent: blog/folder // rebac:field=parent
+            relation children: blog/folder // rebac:field=children
+            permission ban = parent->viewer
+            permission read = viewer - children->ban
+        }
+    """,
+    )
+    with sudo(reason="tests.point_source.nested_fixture"):
+        root = Folder.objects.create(name="root")
+        child = Folder.objects.create(name="child", parent=root)
+    resource = to_object_ref(root)
+    local.write_relationships([RelationshipTuple(resource, "viewer", ALICE)])
+    metadata_reads.clear()
+    assert not local.check_access(subject=ALICE, action="read", resource=resource).allowed
+    facts = next(item for item in metadata_reads if item["type"] == "blog/folder")["data"][
+        resource.resource_id
+    ]
+    assert dict(facts.source_matches) == {
+        ("blog/folder", "children"): True,
+        ("blog/folder", "parent"): False,
+    }
+    assert not Folder.objects.with_actor(ALICE).filter(pk=root.pk).exists()
+    with sudo(reason="tests.point_source.remove_nested_edge"):
+        child.delete()
+    assert local.check_access(subject=ALICE, action="read", resource=resource).allowed
+    assert Folder.objects.with_actor(ALICE).filter(pk=root.pk).exists()

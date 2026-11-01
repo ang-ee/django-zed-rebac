@@ -76,6 +76,7 @@ from .predicate import (
     _Compiled,
     _not,
     _Param,
+    _point_source_rows,
     actor_shape,
     bind,
     clock,
@@ -1039,18 +1040,18 @@ class _PointRequirements:
     """Schema-derived facts the root row can supply, without target permissions."""
 
     columns: tuple[str, ...]
-    filters: tuple[ResolvedFieldBacking, ...]
+    sources: tuple[ResolvedFieldBacking, ...]
 
     @property
     def shape(self) -> tuple[tuple[str, ...], tuple[str, ...]]:
-        return self.columns, tuple(item.relation.name for item in self.filters)
+        return self.columns, tuple(item.relation.name for item in self.sources)
 
 
 _point_requirements_cache: OrderedDict[tuple[Any, ...], _PointRequirements] = OrderedDict()
 
 
 def _point_requirements(policy: _Policy, key: Key) -> _PointRequirements:
-    """Reached root GFK columns and field filters with native local-scalar semantics."""
+    """Reached root GFK columns and necessary source predicates with native filters."""
     memo = (policy.key, key)
     with _lock:
         requirements = _point_requirements_cache.get(memo)
@@ -1059,7 +1060,7 @@ def _point_requirements(policy: _Policy, key: Key) -> _PointRequirements:
     definition = policy.schema.get_definition(key[0])
     reached = policy.program.reachable(key)
     columns: set[str] = set()
-    filters = []
+    sources = []
     relations = sorted(definition.relations, key=lambda item: item.name) if definition else ()
     for relation in relations:
         if (key[0], relation.name) not in reached or not isinstance(relation.backing, FieldBinding):
@@ -1071,15 +1072,14 @@ def _point_requirements(policy: _Policy, key: Key) -> _PointRequirements:
         if resolved.generic is not None:
             field = resolved.source_model._meta.get_field(resolved.generic.ct_field)
             columns.add(cast(Any, field).attname)
-        if relation.backing.filters:
-            try:
-                _validate_const_filters(resolved.source_model, relation.backing)
-            except ValueError:
-                # Valid field filters may need joins; they keep the original
-                # path. The full backing was resolved and validated above.
-                continue
-            filters.append(resolved)
-    requirements = _PointRequirements(tuple(sorted(columns)), tuple(filters))
+        try:
+            _validate_const_filters(resolved.source_model, relation.backing)
+        except ValueError:
+            # Valid field filters may need joins; they keep the original
+            # path. The full backing was resolved and validated above.
+            continue
+        sources.append(resolved)
+    requirements = _PointRequirements(tuple(sorted(columns)), tuple(sources))
     with _lock:
         _point_requirements_cache[memo] = requirements
         while len(_point_requirements_cache) > _LIMIT:
@@ -1092,12 +1092,14 @@ def _point_rows(
 ) -> dict[str, PointData]:
     """Read root point facts in one statement per 500 native identities."""
     model = model_for_resource_type(resource_type)
-    columns, filters = requirements.columns, requirements.filters
-    if not (columns or filters) or model is None or not stores_rows(model):
+    columns, sources = requirements.columns, requirements.sources
+    if not (columns or sources) or model is None or not stores_rows(model):
         return {}
     identity = resource_id_attr(model)
     codec = identity_codec(model, identity)
-    _, identity_field = model_identity_fields(model, identity)
+    query_identity, identity_field = model_identity_fields(model, identity)
+    if not query_identity.unique:
+        return {}
     native = {
         identity_field.to_python(value): value
         for value in ids
@@ -1106,13 +1108,13 @@ def _point_rows(
     rows = model._base_manager.using(using)
     aliases = {field.name for field in model._meta.get_fields()} | set(rows.query.annotations)
     matches = {}
-    for position, resolved in enumerate(filters):
-        name = f"_rebac_point_filter_{position}"
+    for position, resolved in enumerate(sources):
+        name = f"_rebac_point_source_{position}"
         while name in aliases:
             name += "_"
         aliases.add(name)
-        source = resolved.source_model._base_manager.using(using).filter(
-            Q(**{resolved.source_id_attr: OuterRef(identity)}) & Q(**resolved.filters)
+        source = _point_source_rows(resolved, using).filter(
+            **{resolved.source_id_attr: OuterRef(identity)}
         )
         matches[name] = Exists(source)
     rows = rows.annotate(**matches)
@@ -1127,7 +1129,7 @@ def _point_rows(
                 tuple(zip(columns, row[: len(columns)], strict=True)),
                 tuple(
                     ((resource_type, resolved.relation.name), bool(held))
-                    for resolved, held in zip(filters, row[len(columns) :], strict=True)
+                    for resolved, held in zip(sources, row[len(columns) :], strict=True)
                 ),
             )
     return found
@@ -1413,7 +1415,7 @@ def _check_chunk(
     requirements = {}
     for _operation, key, resource_id in asked:
         required = _point_requirements(policy, key)
-        if required.columns or required.filters:
+        if required.columns or required.sources:
             group = key[0], required.shape
             wanted.setdefault(group, set()).add(resource_id)
             requirements[group] = required

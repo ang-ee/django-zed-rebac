@@ -259,12 +259,12 @@ class PointData:
     """Persisted root-row facts that shape one point statement."""
 
     types: tuple[tuple[str, Any], ...] = ()
-    filter_matches: tuple[tuple[Key, bool], ...] = ()
+    source_matches: tuple[tuple[Key, bool], ...] = ()
 
 
 @dataclass(frozen=True)
 class PointRow:
-    """The root reference with its prepared content types and source filters."""
+    """The root reference with its prepared content types and source-edge matches."""
 
     ref: Any
     data: PointData
@@ -279,11 +279,24 @@ class PointRow:
         content_type = _content_type(resolved.target_model, using)
         return content_type is not None and content_type.pk == stored
 
-    def may_match_filter(self, resolved: ResolvedFieldBacking, at: At) -> bool:
+    def may_match_source(self, resolved: ResolvedFieldBacking, at: At) -> bool:
         if at.ref is not self.ref:
             return True
         key = at.resource_type, resolved.relation.name
-        return dict(self.data.filter_matches).get(key, True)
+        return dict(self.data.source_matches).get(key, True)
+
+
+def _point_source_rows(resolved: ResolvedFieldBacking, using: str) -> QuerySet[Any]:
+    """Sources that could name a subject, before its permission is compiled.
+
+    This is necessary pointer/path presence, not target-row existence. PointRow
+    and its final type witness own generic CT selection; the permission keeps
+    its own target validation, including dangling GFKs.
+    One filter retains native same-join semantics for multi-valued paths.
+    """
+    return resolved.source_model._base_manager.using(using).filter(
+        Q(**resolved.filters) & Q(**{f"{resolved.target_values_path()}__isnull": False})
+    )
 
 
 _ABSENT: Any = object()
@@ -541,7 +554,7 @@ class Compiler:
         self.sets = sets
         self.rows = rows
         self.used_rows: set[Key] = set()
-        self.used_point_filters: dict[Key, ResolvedFieldBacking] = {}
+        self.used_point_sources: dict[Key, ResolvedFieldBacking] = {}
         self.point = point
         self.shape = actor_shape(self.schema, actor, using)
         self._memo: dict[tuple[Any, ...], Q] = {}
@@ -1645,8 +1658,8 @@ class Compiler:
         if self.point is not None and not self.point.may_name(resolved, at, self.using):
             # The point row names another type: this arm's chain is not built.
             return _FALSE
-        if self.point is not None and not self.point.may_match_filter(resolved, at):
-            self.used_point_filters[at.resource_type, resolved.relation.name] = resolved
+        if self.point is not None and not self.point.may_match_source(resolved, at):
+            self.used_point_sources[at.resource_type, resolved.relation.name] = resolved
             return _FALSE
         allowed = resolved.relation.allowed_subjects[0]
         if allowed.relation and not self._is_relation(allowed.type, allowed.relation):
@@ -2021,10 +2034,8 @@ class Compiler:
         if model is not None and point.data.types:
             rows = model._base_manager.using(self.using).filter(**dict(point.data.types))
             parts.append(self._model_membership(at, rows, model, resource_id_attr(model)))
-        for _key, resolved in sorted(self.used_point_filters.items()):
-            rows = resolved.source_model._base_manager.using(self.using).filter(
-                Q(**resolved.filters)
-            )
+        for _key, resolved in sorted(self.used_point_sources.items()):
+            rows = _point_source_rows(resolved, self.using)
             parts.append(
                 _not(
                     self._model_membership(at, rows, resolved.source_model, resolved.source_id_attr)

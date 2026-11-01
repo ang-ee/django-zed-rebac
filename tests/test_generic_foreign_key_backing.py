@@ -641,7 +641,7 @@ def test_a_permission_that_reaches_no_generic_relation_reads_no_types(world):
     assert not [q for q in queries if '"content_type_id"' in q["sql"]]
 
 
-def test_a_bulk_check_reads_its_resources_types_by_one_statement(world):
+def test_a_bulk_check_reads_its_resources_types_by_one_statement(world, monkeypatch):
     from rebac import CheckItem
 
     local = world.local
@@ -652,11 +652,21 @@ def test_a_bulk_check_reads_its_resources_types_by_one_statement(world):
         for action in ("read", "write")
         for s in (ALICE, BOB)
     ]
+    original = read._point_rows
+    metadata_counts = []
+
+    def point_rows(using, resource_type, requirements, ids):
+        with CaptureQueriesContext(connection) as captured:
+            data = original(using, resource_type, requirements, ids)
+        if resource_type == "test/attachment":
+            metadata_counts.append(len(captured))
+        return data
+
+    monkeypatch.setattr(read, "_point_rows", point_rows)
     with CaptureQueriesContext(connection) as queries:
         answers = local.check_bulk_permissions(items)
     assert [a.allowed for a in answers] == [True, False] * 6
-    reads = [q for q in queries if '"content_type_id" FROM "testapp_attachment"' in q["sql"]]
-    assert len(reads) == 1
+    assert metadata_counts == [1]
     assert all('"testapp_post"' not in q["sql"] for q in queries)
 
 
@@ -807,3 +817,88 @@ def test_generic_scalar_preserves_nullable_and_unsupported_identity_semantics(nu
     assert not world.backend.check_access(
         subject=ALICE, action="read", resource=to_object_ref(good)
     ).allowed
+
+
+@pytest.mark.pg_delta
+@pytest.mark.django_db(transaction=True)
+def test_generic_pointer_presence_preserves_original_target_validation(nullable_generic):
+    world = nullable_generic
+    world.backend.set_schema(
+        parse_zed("""
+        definition auth/user {}
+        definition test/scalargenerictarget { permission read = authenticated }
+        definition test/scalargenericsource {
+            relation row: test/scalargenerictarget // rebac:field=target
+            permission read = row->read
+        }
+    """)
+    )
+    content_type = ContentType.objects.get_for_model(world.target)
+    with sudo(reason="tests.point_source.generic_dangling_fixture"):
+        row = world.source.objects.create(content_type=content_type, object_id=world.missing)
+    resource = to_object_ref(row)
+    data = read._point_data(
+        read._policy(world.backend, connection.alias),
+        connection.alias,
+        (resource.resource_type, "read"),
+        (resource.resource_id,),
+    )
+    assert data[resource.resource_id].source_matches == (((resource.resource_type, "row"), True),)
+    assert not world.backend.check_access(subject=ALICE, action="read", resource=resource).allowed
+    assert not world.source.objects.with_actor(ALICE).filter(pk=row.pk).exists()
+
+
+@pytest.mark.parametrize("changed_column", ["content_type", "object_id"])
+@pytest.mark.parametrize("operation", ["check", "exact_scope"])
+@pytest.mark.pg_delta
+@pytest.mark.django_db(transaction=True)
+def test_prepared_generic_ct_or_null_change_closes_exclusion(
+    nullable_generic, monkeypatch, changed_column, operation
+):
+    world = nullable_generic
+    content_type = ContentType.objects.get_for_model(world.target)
+    wrong_type = ContentType.objects.get_for_model(Folder)
+    with sudo(reason="tests.point_source.generic_race_fixture"):
+        target = world.target.objects.create(pk=world.key)
+        source = world.source.objects.create(
+            content_type=wrong_type if changed_column == "content_type" else content_type,
+            object_id=world.stored if changed_column == "content_type" else None,
+        )
+    resource = to_object_ref(source)
+    world.backend.write_relationships(
+        [RelationshipTuple(to_object_ref(row), "viewer", ALICE) for row in (source, target)]
+    )
+    original = read._point_rows
+    changed = []
+
+    def stale(using, resource_type, requirements, ids):
+        data = original(using, resource_type, requirements, ids)
+        if resource_type == resource.resource_type and not changed:
+            assert dict(data[resource.resource_id].source_matches) == {
+                (resource.resource_type, "row"): changed_column == "content_type"
+            }
+            changed.append(True)
+            with sudo(reason="tests.point_source.generic_race_update"):
+                world.source.objects.using(using).filter(pk=source.pk).update(
+                    **{
+                        changed_column: content_type
+                        if changed_column == "content_type"
+                        else world.stored
+                    }
+                )
+        return data
+
+    monkeypatch.setattr(read, "_point_rows", stale)
+    if operation == "check":
+        allowed = world.backend.check_access(
+            subject=ALICE, action="outside", resource=resource
+        ).allowed
+    else:
+        allowed = (
+            world.source.objects.with_actor(ALICE)
+            .with_action("outside")
+            .filter(pk=source.pk)
+            .exists()
+        )
+    assert not allowed
+    assert changed
