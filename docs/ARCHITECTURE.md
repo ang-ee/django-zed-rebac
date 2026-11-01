@@ -1795,17 +1795,29 @@ resource's tuples instead of building the set of every qualifying object.
 A direct to-one arrow from a constant wire identity can instead select the
 source's FK as a Django scalar `Subquery` and evaluate the target permission
 at `At(target type, scalar, target identity field, row=False)`. The source
-identity must be unique, the FK/O2O must be constrained and store the target's
-actual identity, and the path and source filters must be single-valued.
+identity must be unique, and the path and source filters must be single-valued.
+A forward FK/O2O must be constrained and store the target's actual identity.
+A local GenericForeignKey can use the same form when its object-ID column and
+the target's scalar primary key are ordinary built-in Django integer fields.
+Its source query also applies the resolved generic backing's content-type and
+target-row-existence predicate: a tuple grant on a deleted target cannot make
+a dangling generic reference hold. The generic backing resolver continues to
+own canonical target, primary-key identity and allowed-subject validation.
+
 The scalar uses the selected database, source identity codec and source filters;
 it is not sliced to hide duplicate source rows. A missing or filtered source,
-or a null FK, makes the scalar null and the arrow false. The target retains
-the same bound and recursion visits; it is evaluated as one typed identity,
-without first nesting its row population inside another parent membership.
-This form applies only without a row decider. Generic, unconstrained,
-non-identity, multi-valued and bare subject-set backings keep their existing
-paths. The final policy, generation, content-type and stored-set witnesses
-remain those of the enclosing point statement.
+a null reference, a wrong content type or an absent generic target makes the
+scalar null and the arrow false. The target retains the same bound and
+recursion visits; it is evaluated as one typed identity, without first nesting
+its row population inside another parent membership. This form applies only
+without a row decider. Textual, UUID and custom-conversion generic columns,
+unconstrained non-generic FKs, non-identity, multi-valued and bare subject-set
+backings keep their existing paths. A scalar's output field does not convert
+its SQL value or establish textual collation equivalence. The private native
+integer-field whitelist is shared with exact-query identity recognition; it is
+stricter than generic backing's compatible internal-type family validation.
+The final policy, generation, content-type and stored-set witnesses remain
+those of the enclosing point statement.
 
 Point preparation also reads reached root field-backing source filters that
 satisfy the existing local-concrete-column validation contract. Native Django

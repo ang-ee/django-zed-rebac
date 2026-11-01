@@ -31,7 +31,7 @@ from django.db.models import Exists, Expression, F, OuterRef, Q, QuerySet, Subqu
 from django.db.models.expressions import BaseExpression
 from django.db.models.lookups import Exact, In, IsNull, LessThan
 
-from .._id import model_identity_fields, resource_id_attr
+from .._id import _NATIVE_INTEGER_FIELDS, model_identity_fields, resource_id_attr
 from ..actors import is_anonymous_actor
 from ..codec import identity_codec
 from ..composition import TaggedComposition
@@ -1662,38 +1662,48 @@ class Compiler:
             and at.key is None
             and _one_object(at.ref)
             and target is not None
-            and resolved.generic is None
             and "__" not in resolved.path
-            and isinstance(resolved.field, (models.ForeignKey, models.OneToOneField))
-            and resolved.targets_identity_directly()
             and single
         ):
             source_identity, _ = model_identity_fields(
                 resolved.source_model, resolved.source_id_attr
             )
-            if source_identity.unique and resolved.keeps_target(self.using):
-                # Select this source's one target, rather than embedding the
-                # target permission's entire row set inside parent membership.
-                source = resolved.source_model._base_manager.using(self.using).filter(
-                    Q(
-                        **{
-                            resolved.source_id_attr: identity_codec(
-                                resolved.source_model, resolved.source_id_attr
-                            ).to_column(cast(Expression, at.ref))
-                        }
-                    )
-                    & Q(**resolved.filters)
-                )
+            if source_identity.unique:
                 _, field = model_identity_fields(resolved.target_model, resolved.target_id_attr)
-                reference = Subquery(source.order_by().values(target_path), output_field=field)
-                member = self._holds(
-                    (allowed.type, target),
-                    At(allowed.type, reference, field, False),
-                    bound,
-                    visits,
-                    depth_possible=depth_possible,
+                kept_fk = (
+                    resolved.generic is None
+                    and isinstance(resolved.field, (models.ForeignKey, models.OneToOneField))
+                    and resolved.targets_identity_directly()
+                    and resolved.keeps_target(self.using)
                 )
-                return _and(_not_null(reference), member)
+                generic_scalar = (
+                    resolved.generic is not None
+                    and type(resolved.field) in _NATIVE_INTEGER_FIELDS
+                    and type(field) in _NATIVE_INTEGER_FIELDS
+                )
+                if kept_fk or generic_scalar:
+                    # A constrained FK keeps its target. A GFK must prove both
+                    # its content type and target existence in this source query.
+                    source = resolved.source_model._base_manager.using(self.using).filter(
+                        Q(
+                            **{
+                                resolved.source_id_attr: identity_codec(
+                                    resolved.source_model, resolved.source_id_attr
+                                ).to_column(cast(Expression, at.ref))
+                            }
+                        )
+                        & Q(**resolved.filters)
+                        & resolved.generic_q(self.using, exists=True)
+                    )
+                    reference = Subquery(source.order_by().values(target_path), output_field=field)
+                    member = self._holds(
+                        (allowed.type, target),
+                        At(allowed.type, reference, field, False),
+                        bound,
+                        visits,
+                        depth_possible=depth_possible,
+                    )
+                    return _and(_not_null(reference), member)
         name = target if target is not None else (allowed.relation or None)
         subjects = self._subject_rows(
             allowed.type,

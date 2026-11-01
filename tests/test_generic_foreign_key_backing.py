@@ -1,17 +1,20 @@
 """Relations backed by a GenericForeignKey: an edge's permissions follow the row it names."""
 
 from types import SimpleNamespace
+from uuid import UUID
 
 import pytest
 from django.contrib.auth import get_user_model
+from django.contrib.contenttypes.fields import GenericForeignKey
 from django.contrib.contenttypes.models import ContentType
-from django.db import connection, transaction
+from django.db import connection, models, transaction
 from django.test.utils import CaptureQueriesContext, isolate_apps
 
 from rebac import (
     NoActorResolvedError,
     ObjectRef,
     PermissionDenied,
+    RebacMixin,
     RelationshipTuple,
     SchemaError,
     SubjectRef,
@@ -26,6 +29,8 @@ from rebac.field_backing import field_backing_model_errors, resolve_field_backin
 from rebac.schema import parse_zed
 from rebac.testing import install_schema
 from tests.reference_harness import assert_reads_match, assert_subjects_match
+from tests.test_compile_point_arrows import storage as storage
+from tests.testapp.fields import EncodedIntegerField
 from tests.testapp.models import (
     Attachment,
     BackingStage,
@@ -653,3 +658,152 @@ def test_a_bulk_check_reads_its_resources_types_by_one_statement(world):
     reads = [q for q in queries if '"content_type_id" FROM "testapp_attachment"' in q["sql"]]
     assert len(reads) == 1
     assert all('"testapp_post"' not in q["sql"] for q in queries)
+
+
+@pytest.fixture(params=["integer", "text", "uuid", "custom"])
+def nullable_generic(request, storage, monkeypatch):
+    """Real local GFK columns exercise nulls and supported fallback field families."""
+    import rebac.compile.predicate
+    import rebac.field_backing
+    import rebac.resources
+    import rebac.watch
+
+    kind = request.param
+    if kind == "text":
+        target_field = models.CharField(max_length=64, primary_key=True)
+        object_field = models.CharField(
+            max_length=64,
+            null=True,
+            db_collation="nocase" if connection.vendor == "sqlite" else None,
+        )
+        key = "Public"
+        stored = "PUBLIC" if connection.vendor == "sqlite" else key
+        missing = "not a target"
+    elif kind == "uuid":
+        target_field = models.UUIDField(primary_key=True)
+        object_field = models.UUIDField(null=True)
+        key = stored = UUID("11111111-1111-4111-8111-111111111111")
+        missing = UUID("22222222-2222-4222-8222-222222222222")
+    else:
+        target_field = models.BigAutoField(primary_key=True)
+        object_field = (
+            EncodedIntegerField(null=True)
+            if kind == "custom"
+            else models.PositiveBigIntegerField(null=True)
+        )
+        key, stored, missing = 71, "item-71" if kind == "custom" else 71, 999
+
+    # Same native isolated-model resolver harness as the scalar filter tests.
+    with isolate_apps("tests.testapp"):
+
+        class ScalarGenericTarget(RebacMixin, models.Model):
+            id = target_field
+
+            class Meta:
+                app_label = "testapp"
+                rebac_resource_type = "test/scalargenerictarget"
+
+        class ScalarGenericSource(RebacMixin, models.Model):
+            content_type = models.ForeignKey(ContentType, null=True, on_delete=models.CASCADE)
+            object_id = object_field
+            target = GenericForeignKey("content_type", "object_id")
+
+            class Meta:
+                app_label = "testapp"
+                rebac_resource_type = "test/scalargenericsource"
+
+        original = rebac.resources.model_for_resource_type
+        local_models = {
+            "test/scalargenerictarget": ScalarGenericTarget,
+            "test/scalargenericsource": ScalarGenericSource,
+        }
+        for module in (
+            rebac.resources,
+            rebac.field_backing,
+            rebac.watch,
+            rebac.compile.predicate,
+            read,
+        ):
+            monkeypatch.setattr(
+                module,
+                "model_for_resource_type",
+                lambda name: local_models.get(name) or original(name),
+            )
+        with connection.schema_editor() as editor:
+            editor.create_model(ScalarGenericTarget)
+            editor.create_model(ScalarGenericSource)
+        try:
+            storage.set_schema(
+                parse_zed("""
+                definition auth/user {}
+                definition test/scalargenerictarget {
+                    relation viewer: auth/user
+                    permission read = viewer
+                }
+                definition test/scalargenericsource {
+                    relation row: test/scalargenerictarget // rebac:field=target
+                    relation viewer: auth/user
+                    permission read = row->read
+                    permission outside = viewer - row->read
+                }
+            """)
+            )
+            yield SimpleNamespace(
+                backend=storage,
+                target=ScalarGenericTarget,
+                source=ScalarGenericSource,
+                key=key,
+                stored=stored,
+                missing=missing,
+                kind=kind,
+            )
+        finally:
+            with connection.schema_editor() as editor:
+                editor.delete_model(ScalarGenericSource)
+                editor.delete_model(ScalarGenericTarget)
+
+
+@pytest.mark.pg_delta
+@pytest.mark.django_db(transaction=True)
+def test_generic_scalar_preserves_nullable_and_unsupported_identity_semantics(nullable_generic):
+    world = nullable_generic
+    target_type = ContentType.objects.get_for_model(world.target)
+    wrong_type = ContentType.objects.get_for_model(Folder)
+    with sudo(reason="tests.generic_scalar.nullable_fixture"):
+        target = world.target.objects.create(pk=world.key)
+        good = world.source.objects.create(content_type=target_type, object_id=world.stored)
+        missing = world.source.objects.create(content_type=target_type, object_id=world.missing)
+        wrong = world.source.objects.create(content_type=wrong_type, object_id=world.stored)
+        no_type = world.source.objects.create(content_type=None, object_id=world.stored)
+        no_id = world.source.objects.create(content_type=target_type, object_id=None)
+    rows = (good, missing, wrong, no_type, no_id)
+    world.backend.write_relationships(
+        [
+            RelationshipTuple(to_object_ref(target), "viewer", ALICE),
+            *(RelationshipTuple(to_object_ref(row), "viewer", ALICE) for row in rows),
+        ]
+    )
+    for row in rows:
+        expected = row.pk == good.pk
+        assert world.source.objects.with_actor(ALICE).filter(pk=row.pk).exists() is expected
+        assert (
+            world.backend.check_access(
+                subject=ALICE, action="read", resource=to_object_ref(row)
+            ).allowed
+            is expected
+        )
+        assert world.source.objects.with_actor(ALICE).with_action("outside").filter(
+            pk=row.pk
+        ).exists() is (not expected)
+        assert world.backend.check_access(
+            subject=ALICE, action="outside", resource=to_object_ref(row)
+        ).allowed is (not expected)
+    assert not world.source.objects.with_actor(BOB).filter(pk=good.pk).exists()
+    # The retained target tuple cannot authorize a dangling reference.
+    with sudo(reason="tests.generic_scalar.delete_target"):
+        target.delete()
+    assert not world.source.objects.with_actor(ALICE).filter(pk=good.pk).exists()
+    assert world.source.objects.with_actor(ALICE).with_action("outside").filter(pk=good.pk).exists()
+    assert not world.backend.check_access(
+        subject=ALICE, action="read", resource=to_object_ref(good)
+    ).allowed

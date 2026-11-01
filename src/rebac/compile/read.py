@@ -30,7 +30,7 @@ from django.db.models.lookups import Exact, GreaterThanOrEqual, In, IntegerField
 from django.db.models.sql.where import WhereNode
 from django.utils import timezone
 
-from rebac._id import model_identity_fields, resource_id_attr
+from rebac._id import _NATIVE_INTEGER_FIELDS, model_identity_fields, resource_id_attr
 from rebac.codec import identity_codec
 from rebac.composition import TaggedComposition, compose_tagged, split_stale_overrides
 from rebac.conf import app_settings
@@ -1709,17 +1709,7 @@ def _exact_identity(model: type[models.Model], lhs: Any, where: Any, using: str)
         return None
     identity = resource_id_attr(model)
     field, scalar = model_identity_fields(model, identity)
-    if type(scalar) not in (
-        models.AutoField,
-        models.BigAutoField,
-        models.SmallAutoField,
-        models.IntegerField,
-        models.BigIntegerField,
-        models.SmallIntegerField,
-        models.PositiveIntegerField,
-        models.PositiveBigIntegerField,
-        models.PositiveSmallIntegerField,
-    ):
+    if type(scalar) not in _NATIVE_INTEGER_FIELDS:
         return None
     if field is not scalar and (
         type(field) not in (models.ForeignKey, models.OneToOneField)
