@@ -25,7 +25,7 @@ from rebac.backends import reset_backend
 from rebac.compile import Compiler, read
 from rebac.errors import SchemaError
 from tests.backend_setup import install_schema
-from tests.testapp.models import Attachment, Folder, Post
+from tests.testapp.models import Attachment, BackingQueue, BackingTask, Folder, Post
 
 pytestmark = [pytest.mark.django_db(transaction=True), pytest.mark.pg_delta]
 ALICE = SubjectRef.of("auth/user", "point-filter-alice")
@@ -779,3 +779,67 @@ def test_root_absence_fact_does_not_prune_a_nested_reference(local, metadata_rea
         child.delete()
     assert local.check_access(subject=ALICE, action="read", resource=resource).allowed
     assert Folder.objects.with_actor(ALICE).filter(pk=root.pk).exists()
+
+
+@pytest.mark.parametrize("filters", [{}, {"visibility": "inherited"}])
+@pytest.mark.parametrize("operation", ["check", "exact_scope"])
+def test_mandatory_direct_pointer_only_prepares_when_filtered(
+    local, monkeypatch, metadata_reads, filters, operation
+):
+    binding = {"path": "queue", "filters": filters}
+    install_schema(
+        local,
+        """
+        definition auth/user {}
+        definition test/backingqueue {
+            relation viewer: auth/user
+            permission read = viewer
+        }
+        definition test/backingtask {
+            relation viewer: auth/user
+            relation queue: test/backingqueue // rebac:field="""
+        + json.dumps(binding)
+        + """
+            permission read = viewer + queue->read
+        }
+    """,
+    )
+    with sudo(reason="tests.point_source.mandatory_fixture"):
+        target = BackingQueue.objects.create()
+        source = BackingTask.objects.create(queue=target, visibility="record")
+    grants = [RelationshipTuple(to_object_ref(target), "viewer", ALICE)]
+    if filters:
+        grants.append(RelationshipTuple(to_object_ref(source), "viewer", ALICE))
+    local.write_relationships(grants)
+    original = Compiler._holds
+    targets = []
+
+    def holds(self, key, *args, **kwargs):
+        if key == ("test/backingqueue", "read"):
+            targets.append(key)
+        return original(self, key, *args, **kwargs)
+
+    monkeypatch.setattr(Compiler, "_holds", holds)
+    metadata_reads.clear()
+    for actor, expected in ((ALICE, True), (BOB, False)):
+        if operation == "check":
+            allowed = local.check_access(
+                subject=actor, action="read", resource=to_object_ref(source)
+            ).allowed
+        else:
+            allowed = BackingTask.objects.with_actor(actor).filter(pk=source.pk).exists()
+        assert allowed is expected
+    own = [item for item in metadata_reads if item["type"] == "test/backingtask"]
+    assert own and all(item["queries"] == bool(filters) for item in own)
+    assert bool(targets) is not bool(filters)
+    if not filters:
+        assert all(item["data"] == {} for item in own)
+    # An unavailable model row is never a prepared true fact. Its independent
+    # tuple grant still holds without manufacturing a source edge.
+    virtual = ObjectRef("test/backingtask", "9999999")
+    local.write_relationships([RelationshipTuple(virtual, "viewer", ALICE)])
+    metadata_reads.clear()
+    assert local.check_access(subject=ALICE, action="read", resource=virtual).allowed
+    own = [item for item in metadata_reads if item["type"] == "test/backingtask"]
+    assert own and all(item["data"] == {} for item in own)
+    assert not BackingTask.objects.with_actor(ALICE).filter(pk=9999999).exists()

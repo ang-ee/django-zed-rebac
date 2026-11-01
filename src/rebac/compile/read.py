@@ -1078,6 +1078,16 @@ def _point_requirements(policy: _Policy, key: Key) -> _PointRequirements:
             # Valid field filters may need joins; they keep the original
             # path. The full backing was resolved and validated above.
             continue
+        field = resolved.field
+        if (
+            not relation.backing.filters
+            and resolved.generic is None
+            and (type(field) is models.ForeignKey or type(field) is models.OneToOneField)
+            and not field.null
+            and resolved.target_values_path() == field.attname
+        ):
+            # A found row cannot supply false; a missing row supplies no fact.
+            continue
         sources.append(resolved)
     requirements = _PointRequirements(tuple(sorted(columns)), tuple(sources))
     with _lock:

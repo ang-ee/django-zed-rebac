@@ -1831,6 +1831,13 @@ presence, not target permission or a new target-existence requirement: a
 dangling nongeneric stored FK can remain present, and the original generic
 predicate still requires its target to exist when authorizing.
 
+Unfiltered, nongeneric direct pointers need no preparation when the field is
+exactly a native Django FK/O2O, is nonnullable, and the resolved target-values
+path is its stored attname. That source condition is always true on a found
+root and unavailable on a missing root, so it cannot prune. The original
+permission is still compiled; no true fact is invented. Filtered, nullable,
+generic, custom-field and joined target paths keep their existing admission.
+
 Native Django `Exists` predicates produce Boolean source matches alongside
 content types, in the same query per 500 identities. A false match can omit
 that field-backed target before it is compiled; true or unavailable matches
