@@ -655,9 +655,9 @@ def test_a_bulk_check_reads_its_resources_types_by_one_statement(world, monkeypa
     original = read._point_rows
     metadata_counts = []
 
-    def point_rows(using, resource_type, requirements, ids):
+    def point_rows(using, resource_type, requirements, ids, model_index=None):
         with CaptureQueriesContext(connection) as captured:
-            data = original(using, resource_type, requirements, ids)
+            data = original(using, resource_type, requirements, ids, model_index)
         if resource_type == "test/attachment":
             metadata_counts.append(len(captured))
         return data
@@ -673,10 +673,7 @@ def test_a_bulk_check_reads_its_resources_types_by_one_statement(world, monkeypa
 @pytest.fixture(params=["integer", "text", "uuid", "custom"])
 def nullable_generic(request, storage, monkeypatch):
     """Real local GFK columns exercise nulls and supported fallback field families."""
-    import rebac.compile.predicate
-    import rebac.field_backing
     import rebac.resources
-    import rebac.watch
 
     kind = request.param
     if kind == "text":
@@ -722,23 +719,18 @@ def nullable_generic(request, storage, monkeypatch):
                 app_label = "testapp"
                 rebac_resource_type = "test/scalargenericsource"
 
-        original = rebac.resources.model_for_resource_type
-        local_models = {
-            "test/scalargenerictarget": ScalarGenericTarget,
-            "test/scalargenericsource": ScalarGenericSource,
-        }
-        for module in (
+        original_types = rebac.resources._model_types
+        monkeypatch.setattr(
             rebac.resources,
-            rebac.field_backing,
-            rebac.watch,
-            rebac.compile.predicate,
-            read,
-        ):
-            monkeypatch.setattr(
-                module,
-                "model_for_resource_type",
-                lambda name: local_models.get(name) or original(name),
-            )
+            "_model_types",
+            lambda prefix: (
+                *original_types(prefix),
+                *(
+                    (f"{prefix}{model._meta.rebac_resource_type}", model)
+                    for model in (ScalarGenericTarget, ScalarGenericSource)
+                ),
+            ),
+        )
         with connection.schema_editor() as editor:
             editor.create_model(ScalarGenericTarget)
             editor.create_model(ScalarGenericSource)
@@ -871,8 +863,8 @@ def test_prepared_generic_ct_or_null_change_closes_exclusion(
     original = read._point_rows
     changed = []
 
-    def stale(using, resource_type, requirements, ids):
-        data = original(using, resource_type, requirements, ids)
+    def stale(using, resource_type, requirements, ids, model_index=None):
+        data = original(using, resource_type, requirements, ids, model_index)
         if resource_type == resource.resource_type and not changed:
             assert dict(data[resource.resource_id].source_matches) == {
                 (resource.resource_type, "row"): changed_column == "content_type"

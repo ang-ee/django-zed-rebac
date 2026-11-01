@@ -440,7 +440,7 @@ def test_candidate_column_collation_matches_stored_checks_and_exclusion(
     from django.db import connection, models
     from django.test.utils import isolate_apps
 
-    from rebac import RebacMixin, field_backing
+    from rebac import RebacMixin, resources
 
     if connection.vendor != "sqlite":
         pytest.skip("SQLite's named nocase collation")
@@ -454,12 +454,11 @@ def test_candidate_column_collation_matches_stored_checks_and_exclusion(
                 app_label = "testapp"
                 rebac_resource_type = "test/collatedrow"
 
-        # isolate_apps models are absent from the global model registry used by the resolver.
-        original_resolver = field_backing.model_for_resource_type
+        original_types = resources._model_types
         monkeypatch.setattr(
-            field_backing,
-            "model_for_resource_type",
-            lambda name: CollatedRow if name == "test/collatedrow" else original_resolver(name),
+            resources,
+            "_model_types",
+            lambda prefix: (*original_types(prefix), (f"{prefix}test/collatedrow", CollatedRow)),
         )
         directive = (
             'const={"target_id":"public","filters":{"audience":"PUBLIC"}}'

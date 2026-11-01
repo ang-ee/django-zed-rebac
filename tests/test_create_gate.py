@@ -919,7 +919,7 @@ def test_unreferenced_dangling_relations_create_without_projection_queries(
     from django.test.utils import CaptureQueriesContext, isolate_apps
 
     from rebac import RebacMixin, field_backing, preflight
-    from rebac.resources import model_for_resource_type
+    from rebac.resources import _model_types
     from tests.testapp.models import Folder
 
     with isolate_apps("tests.testapp"):
@@ -949,10 +949,9 @@ def test_unreferenced_dangling_relations_create_without_projection_queries(
             )
         )
 
-        def resolve_model(resource_type):
-            if resource_type == "test/unreferencedcreatecandidate":
-                return UnreferencedCreateCandidate
-            return model_for_resource_type(resource_type)
+        def resolve_types(prefix):
+            yield from _model_types(prefix)
+            yield f"{prefix}test/unreferencedcreatecandidate", UnreferencedCreateCandidate
 
         project = field_backing.proposed_forward_relationships
 
@@ -967,7 +966,7 @@ def test_unreferenced_dangling_relations_create_without_projection_queries(
             editor.create_model(UnreferencedCreateCandidate)
         try:
             with (
-                patch("rebac.field_backing.model_for_resource_type", side_effect=resolve_model),
+                patch("rebac.resources._model_types", side_effect=resolve_types),
                 patch(
                     "rebac.field_backing.proposed_forward_relationships",
                     side_effect=project_without_queries,
@@ -1664,7 +1663,7 @@ def test_multi_table_child_projects_parent_declared_forward_fk(
     from django.db import connection
     from django.test.utils import isolate_apps
 
-    from rebac.resources import model_for_resource_type
+    from rebac.resources import _model_types
     from tests.testapp.models import NativeParentLinkedChild, NativeParentLinkedResource
 
     owner = _django_user("parent-owner")
@@ -1691,15 +1690,14 @@ def test_multi_table_child_projects_parent_declared_forward_fk(
         )
         assert CreateCandidateChild._meta.get_field("owner").model is NativeParentLinkedChild
 
-        def resolve_model(resource_type):
-            if resource_type == "test/createcandidatechild":
-                return CreateCandidateChild
-            return model_for_resource_type(resource_type)
+        def resolve_types(prefix):
+            yield from _model_types(prefix)
+            yield f"{prefix}test/createcandidatechild", CreateCandidateChild
 
         with connection.schema_editor() as editor:
             editor.create_model(CreateCandidateChild)
         try:
-            with patch("rebac.field_backing.model_for_resource_type", side_effect=resolve_model):
+            with patch("rebac.resources._model_types", side_effect=resolve_types):
                 _assert_candidate_create(
                     CreateCandidateChild,
                     {"owner": (_user(str(owner.pk)),)},

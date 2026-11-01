@@ -38,6 +38,7 @@ from rebac.conf import app_settings
 from rebac.errors import PermissionDepthExceeded, SchemaError
 from rebac.field_backing import (
     ResolvedFieldBacking,
+    _field_backing,
     _validate_const_filters,
     resolve_attribute_backing,
     resolve_field_backing,
@@ -45,6 +46,7 @@ from rebac.field_backing import (
 from rebac.models import active_relationship_model
 from rebac.models.generation import SchemaGeneration
 from rebac.resources import (
+    _ModelIndex,
     model_for_resource_type,
     model_for_subject_type,
     model_resource_type,
@@ -480,7 +482,7 @@ class _Rows:
         return _and(*(parts[key] for key in sorted(parts)))
 
     def _decide(self, key: Key) -> _Decision | None:
-        model = model_for_resource_type(key[0])
+        model = self.operation.model_index.resource(key[0])
         if model is None or not stores_rows(model):
             return None
         operation = self.operation
@@ -615,6 +617,7 @@ class _Operation:
     using: str
     context: Mapping[str, Any] | None
     shape: tuple[Any, ...]
+    model_index: _ModelIndex
     _verdicts: dict[Key, CaveatVerdicts] = field(default_factory=dict)
     _roots: dict[int, Key] = field(default_factory=dict)
     _sets: dict[int, ActorSets | None] = field(default_factory=dict)
@@ -630,6 +633,7 @@ class _Operation:
         policy: _Policy | None = None,
     ) -> _Operation:
         policy = policy if policy is not None else _policy(backend, using)
+        model_index = _ModelIndex.capture()
         return cls(
             backend,
             policy,
@@ -638,12 +642,13 @@ class _Operation:
             context,
             (
                 policy.key,
-                actor_shape(policy.schema, actor, using),
+                actor_shape(policy.schema, actor, using, model_index),
                 using,
                 connections[using].vendor,
                 app_settings.REBAC_DEPTH_LIMIT,
                 active_relationship_model()._meta.label_lower,
             ),
+            model_index,
         )
 
     def verdicts(self, key: Key) -> CaveatVerdicts:
@@ -713,6 +718,7 @@ class _Operation:
             tagged=self.policy.tagged,
             verdicts=verdicts,
             program=self.policy.program,
+            model_index=self.model_index,
         )
 
     def sets_conditional(self, keys: frozenset[Key]) -> bool:
@@ -885,6 +891,7 @@ class _Operation:
             tagged=self.policy.tagged,
             verdicts=verdicts,
             program=self.policy.program,
+            model_index=self.model_index,
             parametric=parametric,
             facts=facts,
             sets=self.sets(verdicts),
@@ -1051,7 +1058,11 @@ class _PointRequirements:
 _point_requirements_cache: OrderedDict[tuple[Any, ...], _PointRequirements] = OrderedDict()
 
 
-def _point_requirements(policy: _Policy, key: Key) -> _PointRequirements:
+def _point_requirements(
+    policy: _Policy,
+    key: Key,
+    model_index: _ModelIndex | None = None,
+) -> _PointRequirements:
     """Reached root GFK columns and necessary source predicates with native filters."""
     memo = (policy.key, key)
     with _lock:
@@ -1066,7 +1077,7 @@ def _point_requirements(policy: _Policy, key: Key) -> _PointRequirements:
     for relation in relations:
         if (key[0], relation.name) not in reached or not isinstance(relation.backing, FieldBinding):
             continue
-        resolved = resolve_field_backing(definition, relation)  # type: ignore[arg-type]
+        resolved = _field_backing(definition, relation, model_index)  # type: ignore[arg-type]
         if resolved is None:
             # The existing predicate resolver reports invalid schema backings.
             continue
@@ -1099,10 +1110,18 @@ def _point_requirements(policy: _Policy, key: Key) -> _PointRequirements:
 
 
 def _point_rows(
-    using: str, resource_type: str, requirements: _PointRequirements, ids: Iterable[str]
+    using: str,
+    resource_type: str,
+    requirements: _PointRequirements,
+    ids: Iterable[str],
+    model_index: _ModelIndex | None = None,
 ) -> dict[str, PointData]:
     """Read root point facts in one statement per 500 native identities."""
-    model = model_for_resource_type(resource_type)
+    model = (
+        model_index.resource(resource_type)
+        if model_index is not None
+        else model_for_resource_type(resource_type)
+    )
     columns, sources = requirements.columns, requirements.sources
     if not (columns or sources) or model is None or not stores_rows(model):
         return {}
@@ -1146,9 +1165,18 @@ def _point_rows(
     return found
 
 
-def _point_data(policy: _Policy, using: str, key: Key, ids: Iterable[str]) -> dict[str, PointData]:
+def _point_data(
+    policy: _Policy,
+    using: str,
+    key: Key,
+    ids: Iterable[str],
+    model_index: _ModelIndex | None = None,
+) -> dict[str, PointData]:
     """The root-row facts that can prune ``key`` without compiling its targets."""
-    return _point_rows(using, key[0], _point_requirements(policy, key), ids)
+    model_index = model_index if model_index is not None else _ModelIndex.capture()
+    return _point_rows(
+        using, key[0], _point_requirements(policy, key, model_index), ids, model_index
+    )
 
 
 def _point(
@@ -1232,7 +1260,9 @@ def _point_result(
     operation = _Operation.begin(backend, actor, using, context)
     key = resource.resource_type, action
     if point_data is None:
-        point_data = _point_data(operation.policy, using, key, (resource.resource_id,))
+        point_data = _point_data(
+            operation.policy, using, key, (resource.resource_id,), operation.model_index
+        )
     row_data = point_data.get(resource.resource_id)
     # Only LOWER may authorize, and it is one SQL statement with every fact
     # witnessed in that statement.  Subsequent probes can only return NO,
@@ -1425,17 +1455,19 @@ def _check_chunk(
     wanted: dict[tuple[str, tuple[tuple[str, ...], tuple[str, ...]]], set[str]] = {}
     requirements = {}
     for _operation, key, resource_id in asked:
-        required = _point_requirements(policy, key)
+        required = _point_requirements(policy, key, _operation.model_index)
         if required.columns or required.sources:
             group = key[0], required.shape
             wanted.setdefault(group, set()).add(resource_id)
-            requirements[group] = required
+            requirements[group] = required, _operation.model_index
     read = {
-        group: _point_rows(using, group[0], requirements[group], ids)
+        group: _point_rows(using, group[0], requirements[group][0], ids, requirements[group][1])
         for group, ids in wanted.items()
     }
     point_data = [
-        read.get((key[0], _point_requirements(policy, key).shape), {}).get(resource_id)
+        read.get((key[0], _point_requirements(policy, key, _operation.model_index).shape), {}).get(
+            resource_id
+        )
         for _operation, key, resource_id in asked
     ]
     lower = _points(asked, "lower", point_data)
@@ -1819,7 +1851,9 @@ class _Scope(Expression):
         def statement(operation: _Operation) -> _Kept | bool:
             if resource_id is None:
                 return _scope_statement(operation, self.model, key)
-            point_data = _point_data(policy, self.using, key, (resource_id,)).get(resource_id)
+            point_data = _point_data(
+                policy, self.using, key, (resource_id,), operation.model_index
+            ).get(resource_id)
             return _point_statement(operation, key, "lower", point_data)
 
         operation = _Operation.begin(self.backend, self.actor, self.using, policy=policy)

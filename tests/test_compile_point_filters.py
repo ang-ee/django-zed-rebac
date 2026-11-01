@@ -78,9 +78,9 @@ def metadata_reads(monkeypatch):
     original = read._point_rows
     observed = []
 
-    def point_rows(using, resource_type, requirements, ids):
+    def point_rows(using, resource_type, requirements, ids, model_index=None):
         with CaptureQueriesContext(connections[using]) as queries:
-            data = original(using, resource_type, requirements, ids)
+            data = original(using, resource_type, requirements, ids, model_index)
         observed.append(
             {"using": using, "type": resource_type, "queries": len(queries), "data": data}
         )
@@ -125,8 +125,8 @@ def test_false_to_true_filter_change_cannot_grant_through_exclusion(local, monke
     original = read._point_rows
     changed = []
 
-    def stale(using, resource_type, requirements, ids):
-        data = original(using, resource_type, requirements, ids)
+    def stale(using, resource_type, requirements, ids, model_index=None):
+        data = original(using, resource_type, requirements, ids, model_index)
         if resource_type == "blog/folder" and not changed:
             assert any(not held for row in data.values() for _key, held in row.source_matches)
             changed.append(True)
@@ -173,8 +173,8 @@ def test_filter_only_metadata_does_not_require_deleted_source(local, monkeypatch
     original = read._point_rows
     deleted = []
 
-    def remove_source(using, resource_type, requirements, ids):
-        data = original(using, resource_type, requirements, ids)
+    def remove_source(using, resource_type, requirements, ids, model_index=None):
+        data = original(using, resource_type, requirements, ids, model_index)
         if resource_type == "blog/folder" and not deleted:
             assert data[resource.resource_id].types == ()
             assert data[resource.resource_id].source_matches
@@ -353,10 +353,7 @@ def test_source_match_alias_and_clone_keep_opposite_rows_separate(local, fact):
 def scalar_source(local, monkeypatch, request):
     # Follow the existing isolated-model harness used by test_scope_additive:
     # only the native resource resolver needs the test-local app registry.
-    import rebac.compile.predicate
-    import rebac.field_backing
     import rebac.resources
-    import rebac.watch
 
     with isolate_apps("tests.testapp"):
 
@@ -373,19 +370,18 @@ def scalar_source(local, monkeypatch, request):
                 app_label = "testapp"
                 rebac_resource_type = "test/pointscalar"
 
-        original = rebac.resources.model_for_resource_type
-        for module in (
+        original_types = rebac.resources._model_types
+        monkeypatch.setattr(
             rebac.resources,
-            rebac.field_backing,
-            rebac.watch,
-            rebac.compile.predicate,
-            read,
-        ):
-            monkeypatch.setattr(
-                module,
-                "model_for_resource_type",
-                lambda name: ScalarSource if name == "test/pointscalar" else original(name),
-            )
+            "_model_types",
+            lambda prefix: (
+                *original_types(prefix),
+                *(
+                    (f"{prefix}{model._meta.rebac_resource_type}", model)
+                    for model in (ScalarSource,)
+                ),
+            ),
+        )
         with connection.schema_editor() as editor:
             editor.create_model(ScalarSource)
         try:
@@ -547,8 +543,8 @@ def test_matching_filter_still_reads_original_condition_at_execution(local, monk
     original = read._point_rows
     changed = []
 
-    def stale(using, resource_type, requirements, ids):
-        data = original(using, resource_type, requirements, ids)
+    def stale(using, resource_type, requirements, ids, model_index=None):
+        data = original(using, resource_type, requirements, ids, model_index)
         if resource_type == "blog/folder" and not changed:
             assert all(held for row in data.values() for _key, held in row.source_matches)
             changed.append(True)
@@ -664,8 +660,8 @@ def test_new_source_edge_is_witnessed_before_exclusion_grants(local, monkeypatch
     original = read._point_rows
     changed = []
 
-    def stale(using, resource_type, requirements, ids):
-        data = original(using, resource_type, requirements, ids)
+    def stale(using, resource_type, requirements, ids, model_index=None):
+        data = original(using, resource_type, requirements, ids, model_index)
         if resource_type == to_object_ref(source).resource_type and not changed:
             assert any(not held for row in data.values() for _key, held in row.source_matches)
             changed.append(True)

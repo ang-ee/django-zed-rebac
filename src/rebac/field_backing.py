@@ -19,6 +19,7 @@ from ._candidate_filters import _candidate_literal, _filter_candidate_targets, _
 from ._id import model_identity_fields, model_identity_filter, resource_id_attr
 from .database import read_alias, write_alias
 from .resources import (
+    _ModelIndex,
     _resolve_dotted,
     model_for_resource_type,
     model_for_subject_type,
@@ -819,13 +820,25 @@ def _validate_model_identity(model: type[models.Model], attr: str) -> None:
         raise ValueError(f"{model.__name__} identity {attr!r} must support exact and in lookups")
 
 
-def _resolve_field_backing(definition: Definition, relation: Relation) -> ResolvedFieldBacking:
+def _resolve_field_backing(
+    definition: Definition,
+    relation: Relation,
+    model_index: _ModelIndex | None = None,
+) -> ResolvedFieldBacking:
     backing = relation.backing
     if not isinstance(backing, FieldBinding) or len(relation.allowed_subjects) != 1:
         raise ValueError("field-backed relation must declare exactly one subject type")
     allowed = relation.allowed_subjects[0]
-    source_model = model_for_resource_type(definition.resource_type)
-    target = model_for_subject_type(allowed.type)
+    source_model = (
+        model_index.resource(definition.resource_type)
+        if model_index is not None
+        else model_for_resource_type(definition.resource_type)
+    )
+    target = (
+        model_index.subject(allowed.type)
+        if model_index is not None
+        else model_for_subject_type(allowed.type)
+    )
     if source_model is None or target is None:
         missing = [
             side
@@ -898,27 +911,42 @@ def _json_column(model: type[models.Model], lookup: str) -> str | None:
     return "__".join(parts[:width])
 
 
-def resolve_field_backing(
-    definition: Definition, relation: Relation
+def _field_backing(
+    definition: Definition,
+    relation: Relation,
+    model_index: _ModelIndex | None = None,
 ) -> ResolvedFieldBacking | None:
     """Resolve a field path, returning None for declarations checks will reject."""
 
     if not isinstance(relation.backing, FieldBinding):
         return None
     try:
-        return _resolve_field_backing(definition, relation)
+        return _resolve_field_backing(definition, relation, model_index)
     except ValueError:
         return None
 
 
-def _resolve_attribute_backing(
+def resolve_field_backing(
     definition: Definition, relation: Relation
+) -> ResolvedFieldBacking | None:
+    """Resolve the live declaration using current model metadata."""
+    return _field_backing(definition, relation)
+
+
+def _resolve_attribute_backing(
+    definition: Definition,
+    relation: Relation,
+    model_index: _ModelIndex | None = None,
 ) -> ResolvedAttributeBacking:
     backing = relation.backing
     if not isinstance(backing, AttributeBinding) or len(relation.allowed_subjects) != 1:
         raise ValueError("attribute-backed relation must declare exactly one subject type")
     allowed = relation.allowed_subjects[0]
-    target = model_for_subject_type(allowed.type)
+    target = (
+        model_index.subject(allowed.type)
+        if model_index is not None
+        else model_for_subject_type(allowed.type)
+    )
     if target is None:
         raise ValueError(
             f"attribute-backed relation requires a concrete Django model for subject type "
@@ -949,17 +977,26 @@ def _resolve_attribute_backing(
     )
 
 
-def resolve_attribute_backing(
-    definition: Definition, relation: Relation
+def _attribute_backing(
+    definition: Definition,
+    relation: Relation,
+    model_index: _ModelIndex | None = None,
 ) -> ResolvedAttributeBacking | None:
     """Resolve live subject-column membership independently of a container table."""
 
     if not isinstance(relation.backing, AttributeBinding):
         return None
     try:
-        return _resolve_attribute_backing(definition, relation)
+        return _resolve_attribute_backing(definition, relation, model_index)
     except ValueError:
         return None
+
+
+def resolve_attribute_backing(
+    definition: Definition, relation: Relation
+) -> ResolvedAttributeBacking | None:
+    """Resolve the live declaration using current model metadata."""
+    return _attribute_backing(definition, relation)
 
 
 def attribute_backing_model_errors(definition: Definition, relation: Relation) -> list[str]:
@@ -974,9 +1011,10 @@ def attribute_backing_model_errors(definition: Definition, relation: Relation) -
     return []
 
 
-def resolve_const_backing(
+def _const_backing(
     definition: Definition,
     relation: Relation,
+    model_index: _ModelIndex | None = None,
 ) -> ResolvedConstBacking | None:
     """Resolve a ``// rebac:const=...`` binding to concrete Django metadata.
 
@@ -991,7 +1029,11 @@ def resolve_const_backing(
     if len(relation.allowed_subjects) != 1:
         return None
     allowed = relation.allowed_subjects[0]
-    source_model = model_for_resource_type(definition.resource_type)
+    source_model = (
+        model_index.resource(definition.resource_type)
+        if model_index is not None
+        else model_for_resource_type(definition.resource_type)
+    )
     if source_model is None:
         return None
     try:
@@ -1004,6 +1046,13 @@ def resolve_const_backing(
         allowed.type,
         backing.target_id,
     )
+
+
+def resolve_const_backing(
+    definition: Definition, relation: Relation
+) -> ResolvedConstBacking | None:
+    """Resolve the live declaration using current model metadata."""
+    return _const_backing(definition, relation)
 
 
 def const_backing_model_errors(definition: Definition, relation: Relation) -> list[str]:

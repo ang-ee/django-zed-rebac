@@ -41,14 +41,14 @@ from ..field_backing import (
     ResolvedAttributeBacking,
     ResolvedConstBacking,
     ResolvedFieldBacking,
+    _attribute_backing,
+    _const_backing,
     _content_type,
+    _field_backing,
     _resolve_field_backing,
     foreign_key_kept,
-    resolve_attribute_backing,
-    resolve_const_backing,
-    resolve_field_backing,
 )
-from ..resources import model_for_resource_type, model_for_subject_type
+from ..resources import _ModelIndex
 from ..schema.ast import (
     AllowedSubject,
     AttributeBinding,
@@ -458,8 +458,14 @@ def named_ids(schema: Schema, type_: str) -> frozenset[str]:
     return frozenset(found)
 
 
-def actor_shape(schema: Schema, actor: SubjectRef, using: str) -> ActorShape:
-    target = model_for_subject_type(actor.subject_type)
+def actor_shape(
+    schema: Schema,
+    actor: SubjectRef,
+    using: str,
+    model_index: _ModelIndex | None = None,
+) -> ActorShape:
+    model_index = model_index if model_index is not None else _ModelIndex.capture()
+    target = model_index.subject(actor.subject_type)
     canonical = False
     if target is not None:
         try:
@@ -531,7 +537,9 @@ class Compiler:
         sets: ActorSets | None = None,
         rows: DecidedRows | None = None,
         point: PointRow | None = None,
+        model_index: _ModelIndex | None = None,
     ) -> None:
+        self.model_index = model_index if model_index is not None else _ModelIndex.capture()
         self.schema = tagged.schema if tagged is not None else schema
         self.actor = actor
         self.using = using
@@ -556,9 +564,9 @@ class Compiler:
         self.used_rows: set[Key] = set()
         self.used_point_sources: dict[Key, ResolvedFieldBacking] = {}
         self.point = point
-        self.shape = actor_shape(self.schema, actor, using)
+        self.shape = actor_shape(self.schema, actor, using, self.model_index)
         self._memo: dict[tuple[Any, ...], Q] = {}
-        self._own_identity = model_for_subject_type(actor.subject_type)
+        self._own_identity = self.model_index.subject(actor.subject_type)
 
     # ---------- The actor's id, as a value or as a placeholder ----------
 
@@ -1030,7 +1038,7 @@ class Compiler:
         """The parts of ``p = base + parent->p`` over a self foreign key, if ``key`` is one."""
         definition = self.schema.get_definition(key[0])
         permission = self.schema.get_permission(*key)
-        model = model_for_resource_type(key[0])
+        model = self.model_index.resource(key[0])
         if definition is None or permission is None or model is None:
             return None
         arms = self._union_arms(permission.expression)
@@ -1042,7 +1050,7 @@ class Compiler:
         relation = next((r for r in definition.relations if r.name == recursive_arm.via), None)
         if relation is None or not isinstance(relation.backing, FieldBinding):
             return None
-        resolved = resolve_field_backing(definition, relation)
+        resolved = _field_backing(definition, relation, self.model_index)
         if (
             resolved is None
             or resolved.source_model is not model
@@ -1101,7 +1109,7 @@ class Compiler:
             visits.get(member) for member in self.program.components.get(key, ())
         ):
             return None
-        if model_for_resource_type(key[0]) is not model or resource_id_attr(model) != identity:
+        if self.model_index.resource(key[0]) is not model or resource_id_attr(model) != identity:
             return None
         decided = self.rows.rows(key)
         if decided is not None:
@@ -1134,7 +1142,9 @@ class Compiler:
         def base_at(where: At) -> list[Q]:
             return self._arms(definition, base, where, bound, inside, depth_possible)
 
-        own_row = at.row and model_for_resource_type(at.resource_type) is model and at.key is field
+        own_row = (
+            at.row and self.model_index.resource(at.resource_type) is model and at.key is field
+        )
         if own_row:
             decided = self._decided(key, model, identity, bound, depth_possible)
             if decided is not None:
@@ -1191,7 +1201,7 @@ class Compiler:
         """
         definition = self.schema.get_definition(key[0])
         permission = self.schema.get_permission(*key)
-        model = model_for_resource_type(key[0])
+        model = self.model_index.resource(key[0])
         if definition is None or permission is None or model is None:
             return None
         arms = self._union_arms(permission.expression)
@@ -1203,7 +1213,7 @@ class Compiler:
         relation = next((r for r in definition.relations if r.name == arm.via), None)
         if relation is None or not isinstance(relation.backing, FieldBinding):
             return None
-        resolved = resolve_field_backing(definition, relation)
+        resolved = _field_backing(definition, relation, self.model_index)
         if (
             resolved is None
             or resolved.generic is not None
@@ -1505,7 +1515,7 @@ class Compiler:
             )
         rows: Any
         if at.row:
-            model = model_for_resource_type(at.resource_type)
+            model = self.model_index.resource(at.resource_type)
             if model is None:
                 return _TRUE
             identity = resource_id_attr(model)
@@ -1545,7 +1555,7 @@ class Compiler:
             return _FALSE
         if len(kept) == 1:
             return kept[0]
-        model = model_for_resource_type(at.resource_type)
+        model = self.model_index.resource(at.resource_type)
         if not at.row or model is None:
             return _or(*kept)
         identity = resource_id_attr(model)
@@ -1570,7 +1580,7 @@ class Compiler:
         visits = {**visits, _HOPS: visits.get(_HOPS, 0) + 1}
         if isinstance(relation.backing, FieldBinding):
             try:
-                resolved = _resolve_field_backing(definition, relation)
+                resolved = _resolve_field_backing(definition, relation, self.model_index)
             except ValueError as exc:
                 raise SchemaError(
                     f"Field backing {definition.resource_type}#{relation.name} does not resolve "
@@ -1578,7 +1588,7 @@ class Compiler:
                 ) from exc
             return self._field_relation(resolved, at, bound, visits, target, depth_possible)
         if isinstance(relation.backing, ConstBinding):
-            resolved_const = resolve_const_backing(definition, relation)
+            resolved_const = _const_backing(definition, relation, self.model_index)
             if resolved_const is None:
                 raise SchemaError(
                     f"Constant backing {definition.resource_type}#{relation.name} does not resolve "
@@ -1586,7 +1596,7 @@ class Compiler:
                 )
             return self._const_relation(resolved_const, at, bound, visits, target, depth_possible)
         if isinstance(relation.backing, AttributeBinding):
-            resolved_attr = resolve_attribute_backing(definition, relation)
+            resolved_attr = _attribute_backing(definition, relation, self.model_index)
             if resolved_attr is None:
                 raise SchemaError(
                     f"Attribute backing {definition.resource_type}#{relation.name} does not resolve "
@@ -1999,10 +2009,10 @@ class Compiler:
         expression's depth through its subqueries, and a chain of ANDs is
         left-deep, so a nested subquery must be the final conjunct.
         """
-        model = model_for_resource_type(at.resource_type)
+        model = self.model_index.resource(at.resource_type)
         identity = resource_id_attr(model) if model is not None else None
         if model is None:
-            subject_model = model_for_subject_type(at.resource_type)
+            subject_model = self.model_index.subject(at.resource_type)
             if subject_model is not None:
                 model, identity = subject_model
         if at.key is None or model is None:
@@ -2030,7 +2040,7 @@ class Compiler:
         if point is None or at.ref is not point.ref:
             return _TRUE
         parts = []
-        model = model_for_resource_type(at.resource_type)
+        model = self.model_index.resource(at.resource_type)
         if model is not None and point.data.types:
             rows = model._base_manager.using(self.using).filter(**dict(point.data.types))
             parts.append(self._model_membership(at, rows, model, resource_id_attr(model)))
@@ -2070,7 +2080,7 @@ class Compiler:
     def _wire_equal(self, at: At, wire_id: str) -> Q:
         if at.key is None:
             return Q(Exact(at.ref, Value(wire_id)))
-        model = model_for_resource_type(at.resource_type)
+        model = self.model_index.resource(at.resource_type)
         if model is None:
             return _FALSE
         _, canonical = model_identity_fields(model, resource_id_attr(model))

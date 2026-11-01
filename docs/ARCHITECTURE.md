@@ -1770,6 +1770,26 @@ The library stores no row per application row. Its tables are:
 | `SchemaGeneration` | One row (`pk=1`) with one column, `revision`: the published policy revision. An empty value means that no policy is published. |
 | `PermissionAuditEvent` | Audit events. |
 
+#### Model declaration binding
+
+Each native lowering `_Operation` captures one immutable, ordered inverse model
+index before deriving the actor shape. It uses Django `apps.get_models()` with
+its ordinary order and exclusions; the first declaration of a wire resource
+type wins, including arbitrary aliases. The configured prefix and user/group
+fallback namespaces bind with that index. Resource-declaring models retain
+precedence over legacy subject fallbacks. Operation-created compilers, small-row
+deciders and point metadata use that same index; a standalone `Compiler` owns
+an equivalent local snapshot. Public model/subject resolution outside lowering
+remains live through the same canonical resolution owners.
+
+This index contains model metadata, not permissions, query results or a global
+catalog. Declarations remain stable until rebuild/reload. Tests that replace
+model declarations or prefixes use the existing backend/compiler reset before
+a new operation; mutation during a compilation is not a supported contract.
+Existing SQL/schema/tuple-generation witnesses and retained statement lifetimes
+are unchanged. Isolated native model fixtures contribute to the canonical
+ordered model-type iterator rather than patching copies of each resolver.
+
 #### The predicate
 
 The compiler has one entry point, `Compiler.holds(key, at, bound)`. `key` is

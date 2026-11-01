@@ -27,9 +27,6 @@ pytestmark = pytest.mark.django_db(transaction=True)
 @contextmanager
 def binding_graph(db, monkeypatch, storage):
     """The same graph can run on SQLite and the opt-in vendor connections."""
-    import rebac.compile.predicate
-    import rebac.compile.read
-    import rebac.field_backing
     import rebac.resources
     import rebac.watch
 
@@ -69,31 +66,16 @@ def binding_graph(db, monkeypatch, storage):
             task=fk(target),
             project=fk(types["scope/project"]),
         )
-        # Isolated classes are absent from the process-global app registry
-        # that resolves a resource or subject type to its model.
-        original = rebac.field_backing.model_for_resource_type
-        for module in (
-            rebac.field_backing,
+        # Supply isolated declarations to the one canonical ordered model input.
+        original_types = rebac.resources._model_types
+        monkeypatch.setattr(
             rebac.resources,
-            rebac.watch,
-            rebac.compile.predicate,
-            rebac.compile.read,
-        ):
-            monkeypatch.setattr(
-                module, "model_for_resource_type", lambda name: types.get(name) or original(name)
-            )
-        original_subject = rebac.field_backing.model_for_subject_type
-        for module in (
-            rebac.field_backing,
-            rebac.watch,
-            rebac.compile.predicate,
-            rebac.compile.read,
-        ):
-            monkeypatch.setattr(
-                module,
-                "model_for_subject_type",
-                lambda name: (types[name], "pk") if name in types else original_subject(name),
-            )
+            "_model_types",
+            lambda prefix: (
+                *original_types(prefix),
+                *((f"{prefix}{name}", model) for name, model in types.items()),
+            ),
+        )
         schema = """
         definition auth/user {}
         definition scope/group { relation member: auth/user }
