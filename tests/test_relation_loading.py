@@ -191,7 +191,7 @@ def test_sudo_does_not_bypass_selected_related_projection_guard(alice):
 
 
 @pytest.mark.django_db
-def test_rebac_select_related_skips_guard_when_target_grants_all(alice):
+def test_rebac_select_related_preserves_globally_readable_targets(alice):
     from tests.testapp.models import Post
 
     install_schema(
@@ -437,9 +437,13 @@ def test_rebac_prefetch_unprotected_tail_does_not_inherit_root_sudo(authored_fol
 
 
 @pytest.mark.django_db
-def test_selected_related_checks_only_distinct_joined_ids(alice, monkeypatch):
+@pytest.mark.parametrize("storage", ["denormalized", "registry"])
+def test_selected_related_checks_only_distinct_joined_ids(alice, monkeypatch, settings, storage):
     from tests.testapp.models import Post
 
+    settings.REBAC_LOCAL_BACKEND_STORAGE = storage
+    reset_backend()
+    install_schema(backend(), parse_zed(SCHEMA_TEXT))
     folder = _folder("selected")
     unrelated = _folder("not selected")
     _grant("blog/folder", folder.pk, "viewer", alice)
@@ -466,6 +470,9 @@ def test_selected_related_checks_only_distinct_joined_ids(alice, monkeypatch):
         lambda *args, **kwargs: pytest.fail("ORM population became point checks"),
     )
     monkeypatch.setattr(active, "accessible", lambda **kwargs: pytest.fail("unbounded enumeration"))
+    monkeypatch.setattr(
+        active, "grants_all", lambda **kwargs: pytest.fail("bounded rows need no universal proof")
+    )
     rows = list(Post.objects.as_user(alice).rebac_select_related("folder"))
     assert len(rows) == 2
     assert requested == [("read", (str(folder.pk),))]
@@ -473,9 +480,15 @@ def test_selected_related_checks_only_distinct_joined_ids(alice, monkeypatch):
 
 
 @pytest.mark.django_db
-def test_materialized_field_visibility_checks_only_fetched_ids(alice, monkeypatch):
+@pytest.mark.parametrize("storage", ["denormalized", "registry"])
+def test_materialized_field_visibility_checks_only_fetched_ids(
+    alice, monkeypatch, settings, storage
+):
     from tests.testapp.models import AuthoredPost
 
+    settings.REBAC_LOCAL_BACKEND_STORAGE = storage
+    reset_backend()
+    install_schema(backend(), parse_zed(SCHEMA_TEXT))
     with sudo(reason="test.fixture"):
         readable = AuthoredPost.objects.create(title="visible", author=alice)
         denied = AuthoredPost.objects.create(title="private", author=alice)
@@ -503,6 +516,9 @@ def test_materialized_field_visibility_checks_only_fetched_ids(alice, monkeypatc
         lambda *args, **kwargs: pytest.fail("ORM population became point checks"),
     )
     monkeypatch.setattr(active, "accessible", lambda **kwargs: pytest.fail("unbounded enumeration"))
+    monkeypatch.setattr(
+        active, "grants_all", lambda **kwargs: pytest.fail("bounded rows need no universal proof")
+    )
     rows = list(
         AuthoredPost.objects.as_user(alice)
         .on_field_deny("redact")

@@ -2664,7 +2664,10 @@ checks only the selected REBAC-bound identities through the backend's native ORM
 scope over that bounded population, or native bulk permission checks when the
 backend has no ORM strategy. Materialized field-redaction batches and affected bulk-write rows use
 that same bounded membership path, rather than enumerating every readable
-resource of the type. Full-scope enumeration remains available when no candidate
+resource of the type. A materialized candidate batch asks only for membership
+of those IDs; it does not first prove that the action holds on every resource.
+Unbounded field-visibility queries retain their universal-grant shortcut and
+`None` result contract. Full-scope enumeration remains available when no candidate
 identities are supplied. ORM populations use the scope's definite lower bound:
 conditional and depth-undecidable rows do not authorize. Native bulk fallback
 retains point-check depth errors and strict result cardinality. If the actor cannot

@@ -206,8 +206,9 @@ def visible_id_sets(
 ) -> dict[str, frozenset[str] | None]:
     """Map each gated field to visible resource ids.
 
-    ``None`` means the field action grants every row of this resource type, so
-    callers should skip per-row redaction for that field.
+    Bounded candidates receive their exact visible subset. Without candidates,
+    ``None`` means the action grants every row of this resource type, so callers
+    should skip per-row redaction for that field.
     """
     rebac_type = model_resource_type(model)
     if not rebac_type or not fields:
@@ -220,7 +221,7 @@ def visible_id_sets(
     visible: dict[str, frozenset[str] | None] = {}
     for field_name in fields:
         action = f"read__{field_name}"
-        if backend_grants_all(
+        if candidates is None and backend_grants_all(
             active_backend,
             subject=actor,
             action=action,

@@ -1104,3 +1104,92 @@ def test_bounded_bulk_field_refusal_preserves_the_rows(alice, expression):
         )
     with sudo(reason="test.verify"):
         assert Post.objects.get(pk=post.pk).body == "before"
+
+
+@pytest.mark.django_db
+@pytest.mark.parametrize("storage", ["denormalized", "registry"])
+@pytest.mark.parametrize("orm", [True, False], ids=["orm", "bulk"])
+def test_bounded_field_visibility_keeps_global_grants_and_fresh_refusals(
+    alice, monkeypatch, settings, storage, orm
+):
+    from rebac.field_visibility import visible_id_sets
+    from rebac.types import RelationshipFilter
+
+    settings.REBAC_LOCAL_BACKEND_STORAGE = storage
+    reset_backend()
+    active = backend()
+    install_schema(
+        active,
+        parse_zed("""
+        definition auth/user {}
+        definition blog/post {
+            permission read = authenticated
+            permission read__title = authenticated
+        }
+        """),
+    )
+    selected = _post(title="selected")
+    unrelated = _post(title="not fetched")
+    actor = SubjectRef.of("auth/user", str(alice.pk))
+    if not orm:
+        monkeypatch.setattr(active, "queryset_filter", lambda **kwargs: None)
+    arguments = dict(model=Post, actor=actor, fields=frozenset({"title"}), active_backend=active)
+    assert visible_id_sets(**arguments) == {"title": None}
+    monkeypatch.setattr(
+        active, "grants_all", lambda **kwargs: pytest.fail("bounded rows need no universal proof")
+    )
+    assert visible_id_sets(**arguments, resource_ids=(str(selected.pk),)) == {
+        "title": frozenset({str(selected.pk)})
+    }
+    assert visible_id_sets(**arguments, resource_ids=()) == {"title": frozenset()}
+
+    install_schema(active, parse_zed(SCHEMA_TEXT))
+    for row in (selected, unrelated):
+        _grant(row.pk, alice, "owner")
+    assert visible_id_sets(**arguments, resource_ids=(str(selected.pk),)) == {
+        "title": frozenset({str(selected.pk)})
+    }
+    active.delete_relationships(
+        RelationshipFilter(
+            resource_type="blog/post", resource_id=str(selected.pk), relation="owner"
+        )
+    )
+    assert visible_id_sets(**arguments, resource_ids=(str(selected.pk),)) == {"title": frozenset()}
+
+
+@pytest.mark.django_db(transaction=True, databases={"default", "selected"})
+@pytest.mark.parametrize("storage", ["denormalized", "registry"])
+def test_bounded_field_visibility_keeps_selected_database(alice, settings, storage):
+    from django.db import connections
+
+    from rebac import database_context
+    from rebac.field_visibility import visible_id_sets
+
+    settings.REBAC_LOCAL_BACKEND_STORAGE = storage
+    reset_backend()
+    active = backend()
+    actor = SubjectRef.of("auth/user", str(alice.pk))
+    for alias in ("default", "selected"):
+        with database_context(alias):
+            install_schema(active, parse_zed(SCHEMA_TEXT), using=alias)
+            with sudo(reason="test.bounded_field_visibility.fixture"):
+                Post.objects.using(alias).create(pk=771, title=alias)
+            if alias == "selected":
+                _grant(771, alice, "owner")
+    with CaptureQueriesContext(connections["default"]) as default_queries:
+        with database_context("selected"):
+            assert visible_id_sets(
+                model=Post,
+                actor=actor,
+                fields=frozenset({"title"}),
+                active_backend=active,
+                resource_ids=("771",),
+            ) == {"title": frozenset({"771"})}
+    assert not default_queries
+    assert visible_id_sets(
+        model=Post,
+        actor=actor,
+        fields=frozenset({"title"}),
+        active_backend=active,
+        resource_ids=("771",),
+    ) == {"title": frozenset()}
