@@ -620,6 +620,27 @@ class LocalBackend(Backend):
         return scope_q(backend=self, model=model, action=action, actor=subject, using=using)
 
     @_schema_operation
+    def permission_expression(
+        self,
+        *,
+        model: type[models.Model],
+        subject: SubjectRef,
+        action: str,
+        using: str,
+        identity: models.Expression,
+    ) -> models.Expression:
+        from ..compile.read import scope_expression
+
+        return scope_expression(
+            backend=self,
+            model=model,
+            action=action,
+            actor=subject,
+            using=using,
+            identity=identity,
+        )
+
+    @_schema_operation
     def accessible(
         self,
         *,

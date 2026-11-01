@@ -508,6 +508,7 @@ from rebac import (
     # Convenience helpers
     write_relationships, delete_relationships, delete_relationship, backend,
     database_context,                  # context-local default for REBAC-owned database operations
+    permission_expression,             # lazy explicit-actor Boolean Django projection
 
     # One transaction and one validation for a block of stored-schema writes
     schema_changes,
@@ -2834,6 +2835,27 @@ Actor-scoped `bulk_create(update_conflicts=True)` raises `PermissionDenied`
 before writing: a proposed-row create check cannot authorize updates to existing
 rows or their protected fields. Use checked instance saves for those updates,
 or explicitly bypass with `.sudo(reason=...)` for a trusted bulk import.
+
+### Lazy permission projections
+
+`permission_expression(model, action, *, actor)` returns a Django Boolean
+expression. It captures the explicit actor at construction, never authority from
+ambient actor/sudo, and reads no schema or database then. The executing database
+and policy snapshot bind at SQL compilation; a schema grant introduced since
+construction can therefore apply. This intentionally differs from
+`queryset_filter`, whose explicit database/revision remain early-pinned.
+
+The owning model must be the query model, its physical proxy equivalent or an
+MTI ancestor. Native Django metadata resolves the identity source expression before
+compilation; cloning/relabeling preserves its alias. Ancestor PK correlation
+uses Django OuterRef over the same metadata path, never a captured alias.
+Ancestor projections and backends without a Boolean strategy use the native
+actor-scoped correlated queryset fallback. The optional backend
+`permission_expression` strategy takes the executing alias and resolved identity,
+adds no relation joins, and reuses the same native lower-bound scope factory.
+Denial, conditional answers and SQL NULL project false. Final policy, fact,
+content-type and generation witnesses remain in the executing statement.
+There is no remembered permission result or new identity inference.
 
 ### Field-level read gates (`read__<field>`)
 

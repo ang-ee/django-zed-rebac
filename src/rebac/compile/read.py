@@ -1835,8 +1835,29 @@ def scope_q(
 ) -> Q:
     if model_resource_type(model) is None:
         return Q(pk__in=[])
+    return Q(
+        scope_expression(backend=backend, model=model, action=action, actor=actor, using=using)
+    )
+
+
+@schema_operation
+def scope_expression(
+    *,
+    backend: LocalBackend,
+    model: type[models.Model],
+    action: str,
+    actor: SubjectRef,
+    using: str,
+    identity: Expression | None = None,
+) -> Expression:
+    """Build the native Boolean scope at the caller's chosen snapshot boundary."""
+    if model_resource_type(model) is None:
+        return Value(False, output_field=models.BooleanField())
     _schema_at_build, snapshot = _schema(backend, using)
-    return Q(_Scope(backend, model, action, actor, using, snapshot.revision))
+    expression = _Scope(backend, model, action, actor, using, snapshot.revision)
+    if identity is not None:
+        expression.set_source_expressions([identity])
+    return expression
 
 
 # ---------- Enumeration ----------

@@ -828,3 +828,249 @@ def test_scope_statement_parameters_are_prepared_for_the_vendor(expiring, monkey
         _sql, params = scope(ALICE).query.sql_with_params()
         assert connection.ops.adapt_datetimefield_value(instant) in params
         assert instant not in params or connection.vendor == "postgresql"
+
+
+# Lazy projections use the same native plans, with an execution-time binding.
+
+
+def test_permission_expression_is_lazy_and_captures_actor(active):
+    from rebac import actor_context, permission_expression
+
+    with sudo(reason="tests.permission.fixture"):
+        one = Post.objects.create(title="allowed")
+        two = Post.objects.create(title="denied")
+    active.write_relationships([row(f"blog/post:{one.pk}", "viewer", "auth/user:alice")])
+    with CaptureQueriesContext(connection) as queries:
+        expression = permission_expression(Post, "read", actor=ALICE)
+        pending = Post._base_manager.order_by("pk").annotate(allowed=expression)
+    assert not queries
+    with actor_context(SubjectRef.of("auth/user", "bob")), sudo(reason="tests.permission.outer"):
+        assert list(pending.values_list("pk", "allowed")) == [(one.pk, True), (two.pk, False)]
+    assert list(pending.all().filter(allowed=True).values_list("pk", flat=True)) == [one.pk]
+    assert list(pending.all().filter(allowed=False).values_list("pk", flat=True)) == [two.pk]
+
+
+def test_permission_expression_uses_native_point_and_population_plans(active, monkeypatch):
+    from rebac import permission_expression
+
+    install_schema(
+        active,
+        parse_zed("""
+        definition auth/user {}
+        definition blog/post {
+            relation viewer: auth/user
+            permission read = viewer
+        }
+    """),
+    )
+    with sudo(reason="tests.permission.fixture"):
+        one = Post.objects.create(title="allowed")
+        two = Post.objects.create(title="denied")
+    active.write_relationships([row(f"blog/post:{one.pk}", "viewer", "auth/user:alice")])
+    calls = []
+    point, population = read._point_statement, read._scope_statement
+
+    def at_point(*args, **kwargs):
+        calls.append("point")
+        return point(*args, **kwargs)
+
+    def at_population(*args, **kwargs):
+        calls.append("population")
+        return population(*args, **kwargs)
+
+    monkeypatch.setattr(read, "_point_statement", at_point)
+    monkeypatch.setattr(read, "_scope_statement", at_population)
+    pending = Post._base_manager.annotate(allowed=permission_expression(Post, "read", actor=ALICE))
+    assert pending.filter(pk=one.pk).values_list("allowed", flat=True).get() is True
+    assert calls == ["point"]
+    calls.clear()
+    assert list(pending.order_by("pk").values_list("pk", "allowed")) == [
+        (one.pk, True),
+        (two.pk, False),
+    ]
+    assert calls == ["population"]
+
+
+def test_permission_expression_binds_new_schema_but_scope_remains_pinned(active):
+    from rebac import permission_expression
+
+    with sudo(reason="tests.permission.fixture"):
+        post = Post.objects.create(title="new grant")
+    pending = Post._base_manager.filter(pk=post.pk).annotate(
+        allowed=permission_expression(Post, "read", actor=ALICE)
+    )
+    pinned = read.scope_q(backend=active, model=Post, action="read", actor=ALICE, using="default")
+    install_schema(
+        active,
+        parse_zed(
+            SCHEMA.replace("permission read = walk - blocked", "permission read = authenticated")
+        ),
+    )
+    assert pending.values_list("allowed", flat=True).get() is True
+    assert not Post._base_manager.filter(pinned, pk=post.pk).exists()
+    install_schema(active, parse_zed(SCHEMA))
+    assert pending.all().values_list("allowed", flat=True).get() is False
+
+
+@pytest.mark.parametrize("fallback", [False, True], ids=["orm", "backend-none"])
+def test_permission_expression_keeps_conditional_and_revoked_answers_false(
+    active, monkeypatch, fallback
+):
+    from rebac import permission_expression
+
+    if fallback:
+        monkeypatch.setattr(active, "permission_expression", lambda **kwargs: None)
+        monkeypatch.setattr(active, "queryset_filter", lambda **kwargs: None)
+    with sudo(reason="tests.permission.fixture"):
+        post = Post.objects.create(title="conditional")
+    active.write_relationships(
+        [row(f"blog/post:{post.pk}", "viewer", "auth/user:alice", caveat_name="first")]
+    )
+    pending = Post._base_manager.filter(pk=post.pk).annotate(
+        allowed=permission_expression(Post, "read", actor=ALICE)
+    )
+    assert pending.values_list("allowed", flat=True).get() is False
+    active.write_relationships([row(f"blog/post:{post.pk}", "viewer", "auth/user:alice")])
+    assert pending.all().values_list("allowed", flat=True).get() is True
+    active.delete_relationships(
+        RelationshipFilter(resource_type="blog/post", resource_id=str(post.pk), relation="viewer")
+    )
+    assert pending.all().values_list("allowed", flat=True).get() is False
+
+
+def test_permission_expression_normalizes_backend_null(active, monkeypatch):
+    from django.db.models import BooleanField, Value
+
+    from rebac import permission_expression
+
+    with sudo(reason="tests.permission.fixture"):
+        post = Post.objects.create(title="null")
+    monkeypatch.setattr(
+        active, "permission_expression", lambda **kwargs: Value(None, output_field=BooleanField())
+    )
+    assert (
+        Post._base_manager.filter(pk=post.pk)
+        .annotate(allowed=permission_expression(Post, "read", actor=ALICE))
+        .values_list("allowed", flat=True)
+        .get()
+        is False
+    )
+
+
+@pytest.mark.parametrize("fallback", [False, True])
+def test_permission_expression_preserves_subquery_aliases_and_owner_validation(
+    active, monkeypatch, fallback
+):
+    from rebac import permission_expression
+
+    with sudo(reason="tests.permission.fixture"):
+        one = Post.objects.create(title="allowed")
+        two = Post.objects.create(title="denied")
+    active.write_relationships([row(f"blog/post:{one.pk}", "viewer", "auth/user:alice")])
+    if fallback:
+        monkeypatch.setattr(active, "permission_expression", lambda **kwargs: None)
+    inner = (
+        Post._base_manager.filter(pk=OuterRef("pk"))
+        .annotate(allowed=permission_expression(Post, "read", actor=ALICE))
+        .values("allowed")[:1]
+    )
+    assert list(
+        Post._base_manager.annotate(allowed=Subquery(inner))
+        .order_by("pk")
+        .values_list("pk", "allowed")
+    ) == [(one.pk, True), (two.pk, False)]
+    with pytest.raises(ValueError, match="not an ancestor"):
+        Folder._base_manager.annotate(allowed=permission_expression(Post, "read", actor=ALICE))
+
+
+def test_permission_expression_keeps_mti_ancestor_and_custom_identity(active):
+    from rebac import permission_expression
+    from tests.testapp.models import (
+        NativeParentLinkedBranch,
+        NativeParentLinkedResource,
+        SluggedPost,
+        SubjectContainer,
+    )
+
+    install_schema(
+        active,
+        parse_zed("""
+        definition auth/user {}
+        definition test/nativeparentlinkedresource {
+            relation viewer: auth/user
+            permission read = viewer
+        }
+        definition blog/sluggedpost {
+            relation viewer: auth/user
+            permission read = viewer
+        }
+    """),
+    )
+    with sudo(reason="tests.permission.fixture"):
+        child = NativeParentLinkedBranch.objects.create(name="parent owner")
+        slug = SluggedPost.objects.create(slug="not-the-pk", title="slug")
+    active.write_relationships(
+        [
+            row(f"test/nativeparentlinkedresource:{child.pk}", "viewer", "auth/user:alice"),
+            row("blog/sluggedpost:not-the-pk", "viewer", "auth/user:alice"),
+        ]
+    )
+    assert (
+        NativeParentLinkedBranch._base_manager.filter(pk=child.pk)
+        .annotate(allowed=permission_expression(NativeParentLinkedResource, "read", actor=ALICE))
+        .values_list("allowed", flat=True)
+        .get()
+        is True
+    )
+    inner = (
+        NativeParentLinkedBranch._base_manager.filter(pk=OuterRef("pk"))
+        .annotate(allowed=permission_expression(NativeParentLinkedResource, "read", actor=ALICE))
+        .values("allowed")[:1]
+    )
+    assert (
+        NativeParentLinkedBranch._base_manager.filter(pk=child.pk)
+        .annotate(allowed=Subquery(inner))
+        .values_list("allowed", flat=True)
+        .get()
+        is True
+    )
+    assert (
+        SubjectContainer._base_manager.filter(pk=slug.pk)
+        .annotate(allowed=permission_expression(SluggedPost, "read", actor=ALICE))
+        .values_list("allowed", flat=True)
+        .get()
+        is True
+    )
+    assert (
+        SluggedPost._base_manager.filter(pk=slug.pk)
+        .annotate(
+            allowed=permission_expression(
+                SluggedPost, "read", actor=SubjectRef.of("auth/user", "bob")
+            )
+        )
+        .values_list("allowed", flat=True)
+        .get()
+        is False
+    )
+
+
+@pytest.mark.django_db(databases={"default", "selected"})
+def test_permission_expression_uses_executing_database_after_construction(active):
+    from django.db import connections
+
+    from rebac import database_context, permission_expression
+
+    for alias in ("default", "selected"):
+        with database_context(alias):
+            install_schema(active, parse_zed(SCHEMA), using=alias)
+            with sudo(reason="tests.permission.fixture"):
+                Post.objects.using(alias).create(pk=771, title=alias)
+            if alias == "selected":
+                active.write_relationships([row("blog/post:771", "viewer", "auth/user:alice")])
+    pending = Post._base_manager.filter(pk=771).annotate(
+        allowed=permission_expression(Post, "read", actor=ALICE)
+    )
+    with CaptureQueriesContext(connections["default"]) as default_queries:
+        assert pending.using("selected").values_list("allowed", flat=True).get() is True
+    assert not default_queries
+    assert pending.using("default").values_list("allowed", flat=True).get() is False
