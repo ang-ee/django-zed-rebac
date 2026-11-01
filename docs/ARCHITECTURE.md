@@ -1792,6 +1792,21 @@ without a model row. Membership of such a statement constant is an `EXISTS`
 with an equality on the key, so the database looks up one row or one
 resource's tuples instead of building the set of every qualifying object.
 
+A direct to-one arrow from a constant wire identity can instead select the
+source's FK as a Django scalar `Subquery` and evaluate the target permission
+at `At(target type, scalar, target identity field, row=False)`. The source
+identity must be unique, the FK/O2O must be constrained and store the target's
+actual identity, and the path and source filters must be single-valued.
+The scalar uses the selected database, source identity codec and source filters;
+it is not sliced to hide duplicate source rows. A missing or filtered source,
+or a null FK, makes the scalar null and the arrow false. The target retains
+the same bound and recursion visits; it is evaluated as one typed identity,
+without first nesting its row population inside another parent membership.
+This form applies only without a row decider. Generic, unconstrained,
+non-identity, multi-valued and bare subject-set backings keep their existing
+paths. The final policy, generation, content-type and stored-set witnesses
+remain those of the enclosing point statement.
+
 A queryset whose current resolved Django predicates require one resource identity
 uses the existing point lower-bound statement as an `EXISTS` condition, with
 the canonical identity bound as a parameter. The caller's predicates remain in

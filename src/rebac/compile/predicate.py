@@ -27,7 +27,8 @@ from typing import Any, Final, Protocol, cast
 
 from django.core.exceptions import FieldDoesNotExist
 from django.db import models
-from django.db.models import Exists, Expression, F, OuterRef, Q, QuerySet, Value
+from django.db.models import Exists, Expression, F, OuterRef, Q, QuerySet, Subquery, Value
+from django.db.models.expressions import BaseExpression
 from django.db.models.lookups import Exact, In, IsNull, LessThan
 
 from .._id import model_identity_fields, resource_id_attr
@@ -87,7 +88,7 @@ class At:
     """
 
     resource_type: str
-    ref: Expression | F | OuterRef
+    ref: BaseExpression | F | OuterRef
     key: models.Field[Any, Any] | None
     row: bool
 
@@ -280,7 +281,7 @@ class PointRow:
 _ABSENT: Any = object()
 
 
-def _not_null(expr: Expression | F | OuterRef) -> Q:
+def _not_null(expr: BaseExpression | F | OuterRef) -> Q:
     return Q(IsNull(expr, False))
 
 
@@ -328,7 +329,7 @@ def _one_object(ref: Any) -> bool:
     return isinstance(ref, (Value, _Param))
 
 
-def _in(expr: Expression | F | OuterRef, rows: QuerySet[Any]) -> Q:
+def _in(expr: BaseExpression | F | OuterRef, rows: QuerySet[Any]) -> Q:
     """Two-valued membership: a NULL reference is not a member."""
     return _not_null(expr) & Q(In(expr, _Compiled(rows)))
 
@@ -1639,6 +1640,48 @@ class Compiler:
         if allowed.relation and not self._is_relation(allowed.type, allowed.relation):
             return _FALSE
         target_path = resolved.target_values_path()
+        # Two arms over one multi-valued path must not share its join.
+        single = not _multi_valued(resolved.source_model, resolved.path) and not any(
+            _multi_valued(resolved.source_model, lookup) for lookup in resolved.filters
+        )
+        if (
+            self.rows is None
+            and not at.row
+            and at.key is None
+            and _one_object(at.ref)
+            and target is not None
+            and resolved.generic is None
+            and "__" not in resolved.path
+            and isinstance(resolved.field, (models.ForeignKey, models.OneToOneField))
+            and resolved.targets_identity_directly()
+            and single
+        ):
+            source_identity, _ = model_identity_fields(
+                resolved.source_model, resolved.source_id_attr
+            )
+            if source_identity.unique and resolved.keeps_target(self.using):
+                # Select this source's one target, rather than embedding the
+                # target permission's entire row set inside parent membership.
+                source = resolved.source_model._base_manager.using(self.using).filter(
+                    Q(
+                        **{
+                            resolved.source_id_attr: identity_codec(
+                                resolved.source_model, resolved.source_id_attr
+                            ).to_column(cast(Expression, at.ref))
+                        }
+                    )
+                    & Q(**resolved.filters)
+                )
+                _, field = model_identity_fields(resolved.target_model, resolved.target_id_attr)
+                reference = Subquery(source.order_by().values(target_path), output_field=field)
+                member = self._holds(
+                    (allowed.type, target),
+                    At(allowed.type, reference, field, False),
+                    bound,
+                    visits,
+                    depth_possible=depth_possible,
+                )
+                return _and(_not_null(reference), member)
         name = target if target is not None else (allowed.relation or None)
         subjects = self._subject_rows(
             allowed.type,
@@ -1690,11 +1733,7 @@ class Compiler:
         # A GenericForeignKey backing holds the rows of one content type.
         generic = resolved.generic_q(self.using, exists=not through_rows)
         source_q = Q(**resolved.filters) & generic & source_q
-        # Two arms over one multi-valued path must not share its join, so
-        # only a single-valued lookup may be inlined into the caller's filter.
-        single = not _multi_valued(resolved.source_model, resolved.path) and not any(
-            _multi_valued(resolved.source_model, lookup) for lookup in resolved.filters
-        )
+        # Only a single-valued lookup may be inlined into the caller's filter.
         if at.row and single:
             return source_q
         rows = resolved.source_model._base_manager.using(self.using).filter(source_q)
