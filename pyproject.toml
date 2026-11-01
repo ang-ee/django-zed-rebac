@@ -71,6 +71,17 @@ Homepage = "https://github.com/ang-ee/django-zed-rebac"
 Documentation = "https://github.com/ang-ee/django-zed-rebac/tree/main/docs"
 Issues = "https://github.com/ang-ee/django-zed-rebac/issues"
 
+[tool.uv]
+cache-keys = [
+    { file = "pyproject.toml" },
+    { file = "MANIFEST.in" },
+    { file = "README.md" },
+    { file = "LICENSE*" },
+    { file = "src/rebac/**/*.py" },
+    { file = "src/rebac/py.typed" },
+    { git = { commit = true } },
+]
+
 [tool.setuptools.packages.find]
 where = ["src"]
 include = ["rebac*"]
