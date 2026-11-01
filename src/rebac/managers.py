@@ -1386,7 +1386,8 @@ class RebacQuerySet(models.QuerySet[_M]):
             fetching = self._result_cache is None
             if fetching:
                 self._apply_scope_in_place()
-            actor, sudo = self._resolve_effective_actor()
+            # Django prefetch caches reuse a population's already-audited read.
+            actor, sudo = self._resolve_effective_actor(audit=fetching)
             if fetching:
                 # Rows already held were guarded by the evaluation that read them.
                 self._guard_projected_field_reads(actor, sudo)

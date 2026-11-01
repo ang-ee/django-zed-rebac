@@ -671,3 +671,50 @@ def test_non_sql_scope_combination_uses_each_operand_model(alice, monkeypatch, o
         else getattr(posts, operation)(folders)
     )
     assert list(rows) == ([] if operation == "intersection" else [post.pk])
+
+
+@pytest.mark.django_db
+@pytest.mark.parametrize("size", [1, 8])
+def test_prefetched_sudo_population_audits_once_and_cached_traversal_reads_nothing(
+    size, django_assert_num_queries
+):
+    from rebac.models import PermissionAuditEvent
+    from tests.testapp.models import Folder, Post
+
+    expected = {}
+    for index in range(size):
+        folder = _folder(f"parent {index}")
+        expected[folder.pk] = _post(f"child {index}", folder=folder).pk
+    reason = "test.prefetch.population"
+    children = Post.objects.sudo(reason=reason)
+    audits = PermissionAuditEvent.objects.filter(kind="sudo.bypass", reason=reason)
+    assert audits.count() == 0
+    parents = list(
+        Folder._base_manager.order_by("pk").prefetch_related(Prefetch("posts", queryset=children))
+    )
+    assert audits.count() == 1
+    with django_assert_num_queries(0):
+        for parent in parents:
+            assert [child.pk for child in parent.posts.all()] == [expected[parent.pk]]
+    assert audits.count() == 1
+    # Filtering starts another native SQL evaluation and must still audit it.
+    assert [child.pk for child in parents[0].posts.filter(title__startswith="child")] == [
+        expected[parents[0].pk]
+    ]
+    assert audits.count() == 2
+
+
+@pytest.mark.django_db
+def test_prefetched_cache_still_requires_its_effective_actor(alice):
+    from tests.testapp.models import Folder, Post
+
+    folder = _folder("parent")
+    post = _post("visible child", folder=folder)
+    _grant("blog/post", post.pk, "viewer", alice)
+    with actor_context(alice):
+        parent = Folder._base_manager.prefetch_related(
+            Prefetch("posts", queryset=Post.objects.all())
+        ).get(pk=folder.pk)
+        assert [child.pk for child in parent.posts.all()] == [post.pk]
+    with pytest.raises(MissingActorError):
+        list(parent.posts.all())
