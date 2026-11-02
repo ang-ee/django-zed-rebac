@@ -19,16 +19,21 @@ pre-1.0; breaking changes within a minor version are explicitly called out.
   only `_check_cache` and `_accessible_cache`, which already decline inside
   transactions. Call `invalidate()` after an out-of-band write when either
   cache may hold an answer.
-- **Breaking:** nested stored subject sets are now unrolled to
-  `REBAC_DEPTH_LIMIT`, as other recursion is. Previously, membership was
-  followed to a fixed point for up to 256 sets. Deeper membership denies in
-  scopes and raises `PermissionDepthExceeded` in point checks.
+- Stored subject-set membership now follows a recursive CTE to a fixed point
+  inside the statement, including cycles and memberships deeper than
+  `REBAC_DEPTH_LIMIT`.
+- Stock `django-cte` 5.x supplies statement-local recursive relations for
+  stored tuple traversal and supported native integer self paths. Bulk point
+  statements also respect the database's parameter limit.
 - Queryset scopes bind the policy and caveat verdicts when built. New caveat
   instances are excluded from an existing scope's lower bound. Point checks
   can read caveat instances once before their statement, in addition to the
   policy load; this is the CEL exception to a single statement.
-- Schema pins inside atomic blocks are per operation. Each permission
-  operation therefore reads the schema revision again while in a transaction.
+- Autocommit evaluator scopes reuse a schema pin. Inside atomic blocks, each
+  permission operation reads the schema revision once and pins only for that
+  operation. Django exposes no rollback-safe transaction-boundary signal
+  without connection introspection, so a pin cannot safely span operations
+  there.
 
 ## [0.30.0] — 2026-10-28
 

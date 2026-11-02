@@ -8,7 +8,6 @@ from django.test.utils import CaptureQueriesContext
 
 from rebac import (
     ObjectRef,
-    PermissionDepthExceeded,
     RelationshipTuple,
     SubjectRef,
     evaluator_scope,
@@ -41,7 +40,7 @@ def group(name):
     return SubjectRef.of("auth/group", name, "member")
 
 
-def test_twelve_deep_membership_is_bounded_at_default_depth():
+def test_twelve_deep_membership_reaches_fixed_point_at_default_depth():
     local = install_schema(
         SCHEMA.replace(
             "definition docs/doc {",
@@ -60,11 +59,10 @@ def test_twelve_deep_membership_is_bounded_at_default_depth():
             RelationshipTuple(ObjectRef("blog/post", str(post.pk)), "viewer", group(names[-1])),
         ]
     )
-    assert not Post.objects.with_actor(ACTOR).filter(pk=post.pk).exists()
-    with pytest.raises(PermissionDepthExceeded):
-        local.check_access(
-            subject=ACTOR, action="read", resource=ObjectRef("blog/post", str(post.pk))
-        )
+    assert Post.objects.with_actor(ACTOR).filter(pk=post.pk).exists()
+    assert local.check_access(
+        subject=ACTOR, action="read", resource=ObjectRef("blog/post", str(post.pk))
+    ).allowed
 
 
 def test_nested_sets_and_cycles_are_bounded_inline():

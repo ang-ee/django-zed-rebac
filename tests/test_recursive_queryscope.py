@@ -24,7 +24,6 @@ from rebac import (
 from rebac.backends import reset_backend
 from rebac.schema import parse_zed
 from tests.backend_setup import STORAGE_TIERS, install_schema
-from tests.test_compile_point_filters import metadata_reads as metadata_reads
 from tests.testapp.models import Folder, Post
 
 pytestmark = pytest.mark.django_db
@@ -265,7 +264,7 @@ def test_early_grant_and_live_boundary(storage, backing, depth):
 @pytest.mark.parametrize("backing", ["tuple", "field"])
 @pytest.mark.parametrize("deep", [3, pytest.param(8, marks=pytest.mark.slow)])
 @pytest.mark.parametrize("exact", [False, True], ids=["general", "exact"])
-def test_scope_query_count_is_independent_of_depth(storage, backing, deep, exact, metadata_reads):
+def test_scope_query_count_is_independent_of_depth(storage, backing, deep, exact):
     costs = []
     with schema_context(storage, "folder", backing) as (active, member, hop, action):
         for depth in (1, deep):
@@ -277,23 +276,10 @@ def test_scope_query_count_is_independent_of_depth(storage, backing, deep, exact
                 if exact
                 else qs.filter(pk__gte=rows[-1].pk, pk__lte=rows[-1].pk)
             ).scoped()
-            metadata_reads.clear()
             with CaptureQueriesContext(connection) as queries:
                 assert qs.exists()
-            source_reads = [item["queries"] for item in metadata_reads if item["queries"]]
-            assert source_reads == ([1] if exact and backing == "field" else [])
-            # Retain the stored-set/final-selection contract separately from
-            # the one bounded source-fact read for an exact field-backed point.
-            costs.append(len(queries) - sum(source_reads))
-    if exact or backing == "tuple":
-        # The actor's stored sets, then the final selecting statement.
-        assert costs == [2, 2]
-    else:
-        # A hierarchy over a foreign key is followed from its seeds first: the
-        # seeds, then one statement per level until one finds nothing or the
-        # depth limit is reached.
-        levels = [min(depth + 1, app_settings.REBAC_DEPTH_LIMIT) for depth in (1, deep)]
-        assert costs == [3 + levels[0], 3 + levels[1]]
+            costs.append(len(queries))
+    assert costs == [1, 1]
 
 
 @pytest.mark.pg_delta

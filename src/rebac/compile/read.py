@@ -151,15 +151,7 @@ def _policy(backend: LocalBackend, using: str) -> _Policy:
             or row.expires_at > selected_at
         ],
     )
-    deadlines = tuple(
-        sorted(
-            {
-                row.expires_at
-                for row in overrides
-                if row.kind == SchemaOverride.KIND_RECAVEAT and row.expires_at is not None
-            }
-        )
-    )
+    deadlines = tuple(sorted({row.expires_at for row in overrides if row.expires_at is not None}))
     policy = _Policy(
         key,
         snapshot,
@@ -170,8 +162,8 @@ def _policy(backend: LocalBackend, using: str) -> _Policy:
         deadlines,
     )
     if not deadlines:
-        # A caveat override with a deadline selects its expression by the
-        # clock, so such a policy is prepared afresh each time.
+        # A deadline can change a prebuilt scope's composition, so prepare
+        # policies with deadlines afresh at each construction boundary.
         with _lock:
             _policies[key] = policy
             while len(_policies) > _LIMIT:
@@ -285,6 +277,7 @@ class _Operation:
         verdicts: CaveatVerdicts,
         *,
         parametric: bool = True,
+        share_subject_rows: bool = False,
     ) -> Compiler:
         return Compiler(
             self.policy.schema,
@@ -295,6 +288,7 @@ class _Operation:
             program=self.policy.program,
             model_index=self.model_index,
             parametric=parametric,
+            share_subject_rows=share_subject_rows,
         )
 
     def gate(self, *, parametric: bool = True) -> models.QuerySet[Any]:
@@ -372,7 +366,7 @@ def _point_statement(
 
     def build() -> models.QuerySet[Any] | bool:
         at = At(key[0], _Param(_RESOURCE_WIRE, models.TextField()), None, False)
-        compiler = operation.compiler(verdicts)
+        compiler = operation.compiler(verdicts, share_subject_rows=True)
         if which == "depth":
             condition = compiler.depth_unknown(key, at)
         else:
@@ -380,7 +374,8 @@ def _point_statement(
         if is_false(condition):
             return False
         rows = operation.gate()
-        return (rows if is_true(condition) else rows.filter(condition)).values("pk")
+        selected = (rows if is_true(condition) else rows.filter(condition)).values("pk")
+        return compiler.with_subject_ctes(selected)
 
     return operation.statement(("point", key, which), verdicts, build)
 
@@ -410,6 +405,8 @@ def _points(
     answers = [False] * len(asked)
     statements: list[dict[str, _Sql]] = [{}]
     size = 0
+    parameter_count = 1  # The generation-row primary key in the outer query.
+    parameter_limit = connections[asked[0][0].using].features.max_query_params if asked else None
     fenced: bool | None = None
     for position, (operation, key, resource_id) in enumerate(asked):
         compiled = _point_statement(operation, key, which)
@@ -419,13 +416,17 @@ def _points(
                     fenced = operation.gate(parametric=False).exists()
                 answers[position] = fenced
         else:
-            if statements[-1] and size + len(compiled.sql) > _BULK_SQL:
+            bound = operation.bound(compiled.params, resource_id)
+            if statements[-1] and (
+                size + len(compiled.sql) > _BULK_SQL
+                or (parameter_limit is not None and parameter_count + len(bound) > parameter_limit)
+            ):
                 statements.append({})
                 size = 0
+                parameter_count = 1
             size += len(compiled.sql)
-            statements[-1][f"item{position}"] = _Sql(
-                compiled.sql, operation.bound(compiled.params, resource_id)
-            )
+            parameter_count += len(bound)
+            statements[-1][f"item{position}"] = _Sql(compiled.sql, bound)
     rows = SchemaGeneration.objects.using(asked[0][0].using).filter(pk=1) if asked else None
     for probes in statements:
         if not probes or rows is None:
@@ -691,7 +692,7 @@ def _scope_statement(operation: _Operation, model: type[models.Model], key: Key)
     label = model._meta.label_lower
 
     def build() -> bool | tuple[models.QuerySet[Any], bool]:
-        compiler = operation.compiler(verdicts)
+        compiler = operation.compiler(verdicts, share_subject_rows=True)
         predicate = compiler.holds(key, _model_at(model), Bound.LOWER)
         if is_false(predicate):
             return False
@@ -700,7 +701,7 @@ def _scope_statement(operation: _Operation, model: type[models.Model], key: Key)
             return gate.values("pk"), True
         # The row predicate goes last: it holds the nested subqueries.
         rows = model._base_manager.using(operation.using).filter(Q(Exists(gate)) & predicate)
-        return rows.order_by().values(resource_id_attr(model)), False
+        return compiler.with_subject_ctes(rows.order_by().values(resource_id_attr(model))), False
 
     return operation.statement(("scope", label, key), verdicts, build)
 

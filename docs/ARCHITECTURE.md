@@ -1976,8 +1976,9 @@ A queryset scope is one SQL predicate. Field- and attribute-backed arrows
 select their targets with correlated or uncorrelated subqueries. A constant
 arrow such as `admin->member` is an uncorrelated subquery, and its result is
 not folded into a Python boolean. Stored subject sets remain in the statement
-as tuple-table closure predicates, unrolled to `REBAC_DEPTH_LIMIT`. The same
-bound applies to cycles and nested groups. No arrow target, hierarchy row,
+as recursive CTE closure predicates followed to a fixed point, including
+cycles and nested groups. Other recursive paths retain `REBAC_DEPTH_LIMIT`.
+No arrow target, hierarchy row,
 fixed object, or actor membership is selected into Python while building or
 rendering the permission predicate. A statement sees tuple and backing writes
 in its own database snapshot.
@@ -2000,7 +2001,7 @@ permission expression can load a policy. These paths are unchanged.
 The application clock is bound once per render. The policy revision fence
 closes a predicate whose published revision has changed. Queryset scopes
 without an actor fail closed as described under strict mode.
-A scope built before a recaveat override deadline can close under its
+A scope built before an override deadline can close under its
 revision fence after the deadline rather than recompose itself; the next
 built scope uses the new policy.
 
@@ -2024,9 +2025,11 @@ the fence matches no generation and reads are closed.
 A node is recursive when it lies on a cycle of the policy's dependency graph
 that traverses a relationship: a self-arrow (`parent->read`), a nested group
 (`relation member: auth/user | auth/group#member`), a role that includes
-roles. Recursion is unrolled to `REBAC_DEPTH_LIMIT` levels (default 8): the
+roles. Except for stored subject-set membership, recursion is bounded to
+`REBAC_DEPTH_LIMIT` levels (default 8): the
 bound counts the relations followed since the recursive component was
-entered, whichever of its permissions they pass through. Stored subject sets are unrolled in the statement to the same depth limit.
+entered, whichever of its permissions they pass through. Stored subject sets
+are followed to a fixed point inside a recursive CTE.
 
 A cycle of permissions that refer to each other at the same object, without
 an arrow or a subject set, is not recursion in this sense. It is resolved
@@ -2034,7 +2037,7 @@ from the schema as its least fixed point and consumes no depth.
 
 | Recursive shape | Statement | Upper bound adds |
 |---|---|---|
-| A relation whose subject set is itself (nested groups) | The sets that hold the actor directly, then the sets that contain them, level by level. The closure starts from the actor, so it is the actor's own. | One more hop reaches a set outside the closure. |
+| A relation whose subject set is itself (nested groups) | A recursive CTE follows the sets that hold the actor directly and every set that contains them, to a fixed point. | None; the closure is exact, including cycles. |
 | `p = base + parent->p` over a self foreign key | The row inherits when it, or one of its nearest `REBAC_DEPTH_LIMIT` ancestors, holds `base`: a chain of joins on the parent column, with `base` tested once against all of them. Arrows of `base` to a like-named permission of another type (`drive->read`) are not recursive arms. | The row has more than `REBAC_DEPTH_LIMIT` ancestors. |
 | `p = base + parent->p` over another backed path to the same model (reverse, many-to-many, filtered) | The rows that hold `base`, then the rows whose path reaches the level below. | One more hop reaches a row outside the closure. |
 | `p = base + parent->p` over a stored relation | The resources of the edges whose subject holds `base`, then the resources of the edges above them. | One more hop reaches an object outside the closure. |
@@ -2042,14 +2045,15 @@ from the schema as its least fixed point and consumes no depth.
 
 The contract:
 
-- **A lower bound holds only what is provable within the bound.** A queryset
-  scope and `accessible()` include a row only when a chain of at most
-  `REBAC_DEPTH_LIMIT` hops grants it. They never raise for depth.
+- **A lower bound holds only what is provable within the bound.** For recursive
+  paths other than stored subject sets, a queryset scope and `accessible()`
+  include a row only when a chain of at most `REBAC_DEPTH_LIMIT` hops grants
+  it. They never raise for depth. Stored subject-set membership is exact.
 - **A point check never answers by truncation.** When the lower bound does
   not hold and the upper bound holds only because the bound was reached, the
   check raises `PermissionDepthExceeded`. It never answers `NO` for a chain
   it did not follow to its end, and never `HAS`.
-- **A closure that converges is exact.** For the three closure shapes, when
+- **A closure that converges is exact.** For the bounded closure shapes, when
   one more hop reaches nothing new the closure is complete, data cycles
   included, and the upper bound equals the lower one: the check answers
   `HAS` or `NO`.
@@ -2285,11 +2289,11 @@ of its own.
   subject-set closure. Its size follows the schema and `REBAC_DEPTH_LIMIT`.
 - Permissions that recurse through each other are unrolled without a
   convergence test (see [Recursion](#recursion)).
-- SQLite rejected the earlier inline actor-set fallback at the default
+- SQLite rejected the earlier nested actor-set fallback at the default
   `REBAC_DEPTH_LIMIT=8` when two kinds of subject set nested: `Expression
-  tree is too large (maximum depth 1000)`. Inline sets now apply to every
-  actor. The precise limit for this design awaits the targeted integration
-  measurement; choose a depth within the vendor's query limits.
+  tree is too large (maximum depth 1000)`. The fixed-point CTE replaces that
+  nested form. Other recursive forms still require a depth within the
+  vendor's query limits; the broader integration measurement remains open.
 - Query plans on PostgreSQL tables of tens of millions of rows have not been
   verified. A trial at that scale is in progress.
 - Third-party tracked models are gated on instance saves only.
@@ -2888,6 +2892,15 @@ resource type in the conservative field/attribute backing reachability closure
 returned by `live_backed_resource_types`. Unrelated types remain cacheable.
 Override deadlines refresh the composed schema and its decision generation.
 Eligible cache hits cost zero queries, including no revision SELECT per lookup.
+An evaluator scope reuses its schema pin across permission operations in
+autocommit. Inside an atomic block, each permission operation instead reads
+the schema revision once and pins the snapshot only for that operation.
+Django exposes no rollback-safe transaction-boundary signal without connection
+introspection; reusing a pin across operations could retain a revision rolled
+back between them. The answer caches already decline inside transactions.
+A permission operation in a transaction discards the evaluator's earlier pin,
+so its next autocommit operation validates the revision once before reusing
+the new pin.
 Backend relationship writes and the `post_delete` cascade
 (`mark_relationships_changed()`) invalidate decision generations across local
 backend instances in this process, including evaluators suspended by a nested
@@ -3520,7 +3533,8 @@ SpiceDB itself. **Planned; not part of the current build.**
     at depths within both the server's limit and `REBAC_DEPTH_LIMIT`.
 - **Deliberate divergences** are listed here and nowhere else, and each has a
   test pinning our side:
-  - the depth bound: a set is a lower bound at `REBAC_DEPTH_LIMIT`, and a
+  - the depth bound: a recursive permission other than stored subject-set
+    membership is a lower bound at `REBAC_DEPTH_LIMIT`, and a
     point check that cannot be decided within it raises
     `PermissionDepthExceeded` (SpiceDB fails at its own dispatch limit);
   - data cycles: a closure over tuples, a backed path or nested sets that
