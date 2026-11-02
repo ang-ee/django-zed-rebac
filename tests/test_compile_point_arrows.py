@@ -265,38 +265,3 @@ def test_generic_point_arrow_uses_the_selected_database_for_source_and_target(st
     assert not Attachment.objects.with_actor(ALICE).filter(pk=81).exists()
     assert Attachment.objects.with_actor(BOB).filter(pk=81).exists()
     assert not selected.all().with_actor(BOB).exists()
-
-
-@pytest.mark.parametrize("operation", ["check", "scope"])
-def test_generic_point_arrow_keeps_stale_type_witness_in_an_exclusion(
-    storage, monkeypatch, operation
-):
-    from rebac.compile import read
-
-    install_schema(storage, GENERIC_SCHEMA)
-    folder_type = ContentType.objects.get_for_model(Folder)
-    post_type = ContentType.objects.get_for_model(Post)
-    with sudo(reason="tests.generic_point.stale_type_fixture"):
-        folder = Folder.objects.create(pk=71, name="shared")
-        Post.objects.create(pk=71, title="unshared")
-        edge = Attachment.objects.create(content_type=post_type, object_id=71)
-    storage.write_relationships(
-        [
-            RelationshipTuple(to_object_ref(folder), "viewer", ALICE),
-            RelationshipTuple(to_object_ref(edge), "viewer", ALICE),
-        ]
-    )
-    ref = to_object_ref(edge)
-    assert storage.check_access(subject=ALICE, action="outside", resource=ref).allowed
-    # Same native race harness as the GFK tests: preparation read the old CT.
-    stale = {ref.resource_id: read.PointData(types=(("content_type_id", folder_type.pk),))}
-    monkeypatch.setattr(read, "_point_rows", lambda *_: stale)
-    if operation == "check":
-        assert not storage.check_access(subject=ALICE, action="outside", resource=ref).allowed
-    else:
-        assert (
-            not Attachment.objects.with_actor(ALICE)
-            .with_action("outside")
-            .filter(pk=edge.pk)
-            .exists()
-        )

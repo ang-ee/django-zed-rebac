@@ -3,6 +3,33 @@
 All notable changes to `django-zed-rebac` are tracked here. The project is in
 pre-1.0; breaking changes within a minor version are explicitly called out.
 
+## [Unreleased]
+
+### Changed
+
+- Permission scopes compile arrows, actor-side sets, fixed facts and row
+  membership inline. Rendering a prepared scope, including a caveated one,
+  executes no decision queries and uses no connection observer,
+  `execute_wrappers`, or `run_on_commit`.
+  The `_Rows` and `ActorSets` witnesses and kept-row caches are removed.
+- Invalidation remains library-owned through relationship and schema
+  generations, evaluator scope exit and `invalidate()`. Writes that bypass
+  REBAC's own owners inside one evaluator scope are unobserved. Inline SQL
+  reads the next statement's tuple and backing rows; staleness can affect
+  only `_check_cache` and `_accessible_cache`, which already decline inside
+  transactions. Call `invalidate()` after an out-of-band write when either
+  cache may hold an answer.
+- **Breaking:** nested stored subject sets are now unrolled to
+  `REBAC_DEPTH_LIMIT`, as other recursion is. Previously, membership was
+  followed to a fixed point for up to 256 sets. Deeper membership denies in
+  scopes and raises `PermissionDepthExceeded` in point checks.
+- Queryset scopes bind the policy and caveat verdicts when built. New caveat
+  instances are excluded from an existing scope's lower bound. Point checks
+  can read caveat instances once before their statement, in addition to the
+  policy load; this is the CEL exception to a single statement.
+- Schema pins inside atomic blocks are per operation. Each permission
+  operation therefore reads the schema revision again while in a transaction.
+
 ## [0.30.0] — 2026-10-28
 
 ### Changed

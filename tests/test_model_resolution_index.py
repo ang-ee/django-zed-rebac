@@ -114,7 +114,7 @@ def test_operation_compilers_and_backings_share_one_ordered_index(monkeypatch, s
         actor = SubjectRef.of("auth/user", "7")
         operation = read._Operation.begin(local, actor, "default", policy=policy)
         verdicts = operation.verdicts(("blog/post", "read"))
-        first = operation.sets_compiler(verdicts)
+        first = operation.compiler(verdicts)
         second = operation.compiler(verdicts, parametric=False)
         field = schema.get_definition("blog/post").relations[0]
         resolved = _field_backing(schema.get_definition("blog/post"), field, operation.model_index)

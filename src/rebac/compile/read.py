@@ -1,29 +1,22 @@
 """Execute compiled LocalBackend predicates.
 
-A statement is compiled once per policy, permission and actor shape, and kept
-as Django's own SQL with placeholders for the actor's id (the accepted
-plan-cache exception of ARCHITECTURE).  Facts about fixed objects, such as
-membership of a constant role, are decided before the statement is compiled
-and witnessed inside it, so a decision that no longer holds when the statement
-runs yields no rows instead of a stale answer.
+A statement is compiled from a policy, permission and actor shape into
+Django SQL. Every permission fact remains in the statement's predicate.
 """
 
 from __future__ import annotations
 
-from collections import OrderedDict, deque
+from collections import OrderedDict
 from collections.abc import Callable, Hashable, Iterable, Iterator, Mapping, Sequence
-from contextlib import ExitStack, contextmanager
-from contextvars import ContextVar
 from dataclasses import dataclass, field
 from datetime import datetime
-from functools import partial
-from itertools import batched, pairwise
+from itertools import batched
 from threading import RLock
 from typing import TYPE_CHECKING, Any, cast
 
 from django.core.exceptions import EmptyResultSet
 from django.db import connections, models
-from django.db.models import Exists, Expression, F, OuterRef, Q, Value
+from django.db.models import Exists, Expression, F, Q, Value
 from django.db.models.expressions import Col, ColPairs
 from django.db.models.fields.related_lookups import RelatedExact
 from django.db.models.fields.tuple_lookups import TupleIn
@@ -36,13 +29,7 @@ from rebac.codec import identity_codec
 from rebac.composition import TaggedComposition, compose_tagged, split_stale_overrides
 from rebac.conf import app_settings
 from rebac.errors import PermissionDepthExceeded, SchemaError
-from rebac.field_backing import (
-    ResolvedFieldBacking,
-    _field_backing,
-    _validate_const_filters,
-    resolve_attribute_backing,
-    resolve_field_backing,
-)
+from rebac.field_backing import resolve_attribute_backing, resolve_field_backing
 from rebac.models import active_relationship_model
 from rebac.models.generation import SchemaGeneration
 from rebac.resources import (
@@ -61,32 +48,14 @@ from rebac.schema.ast import (
     PermRef,
     Schema,
 )
-from rebac.schema.cache import KeptRows, SchemaSnapshot, schema_operation
+from rebac.schema.cache import SchemaSnapshot, schema_operation
 from rebac.schema.walker import find_permission, find_relation
 from rebac.types import CheckItem, CheckResult, ObjectRef, SubjectRef
 
 from . import At, Bound, Compiler, predicate
 from .conditions import CaveatVerdicts
 from .evaluate import named_subjects, residual
-from .predicate import (
-    ActorSets,
-    Fact,
-    PointData,
-    PointRow,
-    SelfChain,
-    Support,
-    _and,
-    _Compiled,
-    _not,
-    _Param,
-    _point_source_rows,
-    actor_shape,
-    bind,
-    clock,
-    const_facts,
-    is_false,
-    is_true,
-)
+from .predicate import _Compiled, _Param, actor_shape, bind, clock, is_false, is_true
 from .program import CompileProgram, Key
 
 if TYPE_CHECKING:
@@ -95,27 +64,9 @@ if TYPE_CHECKING:
 _MANUAL_REVISION = object()
 _RESOURCE_WIRE = object()
 _LIMIT = 512
-# An actor in more stored sets than this keeps their membership inside the
-# statement, as a closure over the tuple table.
-_SET_LIMIT = 256
-# The rows one statement may bind from the sets decided for it.  A set that
-# does not fit in what is left stays a subquery of the statement.
-_ROW_LIMIT = 5000
-# Items of a bulk check decided together, and the SQL text one statement of
-# their bounds may reach before it is cut.
+# Bulk point checks share one statement for each bound.
 _BULK = 50
 _BULK_SQL = 64_000
-# What is read of a tuple that puts an actor, or a set, into a stored set.
-_EDGE = (
-    "resource_type",
-    "resource_id",
-    "relation",
-    "subject_type",
-    "subject_id",
-    "subject_relation",
-    "caveat_name",
-    "caveat_key",
-)
 _lock = RLock()
 
 
@@ -130,9 +81,6 @@ class _Kept:
 
 _policies: OrderedDict[tuple[Any, ...], _Policy] = OrderedDict()
 _statements: OrderedDict[tuple[Any, ...], _Kept | bool] = OrderedDict()
-# For each kept scope statement, the facts it asks for: a prefix of decisions
-# maps to the next fact asked, or to None when the statement asks no more.
-_fact_paths: OrderedDict[tuple[Any, ...], dict[tuple[Any, ...], Fact | None]] = OrderedDict()
 
 
 def reset() -> None:
@@ -142,27 +90,10 @@ def reset() -> None:
     with _lock:
         _policies.clear()
         _statements.clear()
-        _fact_paths.clear()
-        _point_requirements_cache.clear()
     evaluator = current_evaluator()
     if evaluator is not None:
-        # The decisions the open scope keeps were made under the old ones.
+        # The open scope's pinned policy may predate this invalidation.
         evaluator._schema_scope.clear()
-
-
-# Set while a read asks for the latest state (``Consistency.FULLY_CONSISTENT``):
-# its scopes decide afresh instead of binding rows a scope kept.
-_afresh: ContextVar[bool] = ContextVar("rebac_decide_afresh", default=False)
-
-
-@contextmanager
-def deciding_afresh() -> Iterator[None]:
-    """Scopes compiled inside decide their rows afresh (proposal 0017)."""
-    token = _afresh.set(True)
-    try:
-        yield
-    finally:
-        _afresh.reset(token)
 
 
 # ---------- The policy a statement is compiled for ----------
@@ -209,7 +140,7 @@ def _policy(backend: LocalBackend, using: str) -> _Policy:
     selected_at = timezone.now()
     active = [row for row in overrides if row.expires_at is None or row.expires_at > selected_at]
     # Permission sites retain their SQL deadlines. CEL expressions cannot be
-    # selected in SQL, so choose them once and witness that selection interval.
+    # selected in SQL, so choose the active override composition for this policy.
     tagged = compose_tagged(
         baseline,
         [
@@ -296,317 +227,6 @@ class _Sql(Expression):
         return f"EXISTS {self.sql}", self.params
 
 
-class _Facts(Mapping[Fact, bool]):
-    """Facts about fixed objects, each decided when a statement first asks for it.
-
-    A statement uses few of the facts in reach of its permission, and each at
-    one bound: a union stops at the first arm that holds, and a lower bound
-    asks for the upper one only under an exclusion.  ``asked`` keeps the
-    decisions in the order they were asked for.
-    """
-
-    def __init__(self, operation: _Operation, key: Key, verdicts: CaveatVerdicts) -> None:
-        self.operation = operation
-        self.verdicts = verdicts
-        self.known = frozenset(const_facts(operation.policy.schema, operation.policy.program, key))
-        self.asked: list[tuple[Fact, bool]] = []
-        self._decided: dict[Fact, bool] = {}
-
-    def __contains__(self, fact: object) -> bool:
-        return fact in self.known
-
-    def __iter__(self) -> Iterator[Fact]:
-        return iter(self.known)
-
-    def __len__(self) -> int:
-        return len(self.known)
-
-    def __getitem__(self, fact: Fact) -> bool:
-        if fact not in self._decided:
-            self._decided[fact] = self._decide(fact)
-            self.asked.append((fact, self._decided[fact]))
-        return self._decided[fact]
-
-    def _decide(self, fact: Fact) -> bool:
-        operation = self.operation
-        compiled = operation.statement(
-            ("fact", fact), self.verdicts, partial(operation._fact_rows, fact, self.verdicts)
-        )
-        if isinstance(compiled, bool):
-            return compiled
-        probe = _Sql(compiled.sql, operation.bound(compiled.params))
-        return (
-            SchemaGeneration.objects.using(operation.using).filter(pk=1).filter(Q(probe)).exists()
-        )
-
-
-@dataclass(frozen=True)
-class _Decision:
-    """The rows decided for one node, and what keeps the decision true."""
-
-    ids: tuple[Any, ...]
-    witness: Q
-    uses: frozenset[Key]
-
-
-class _Rows:
-    """Small sets of rows on which the actor holds a node, decided for one operation.
-
-    A scope reaches other tables through arrows: a file through its folder, a
-    part through its message and thread.  Compiled inline, each arrow is a
-    subquery whose size the planner cannot know, and a hierarchy is tested
-    for every row of its table.  When the set behind an arrow is small it is
-    decided first, by its own statement, and bound into the scope as a list
-    of keys, which the planner can drive an index from.  One statement binds
-    at most ``_ROW_LIMIT`` rows over all its sets; a set that does not fit in
-    what is left stays inline.
-
-    Every decision is a lower bound.  The statement that uses it re-reads it
-    in its own snapshot (``witness``): each listed row that exists still holds
-    the node, so nothing is granted through a row that has left the set.  A
-    row that is gone is left to the place that binds the keys: a key is bound
-    directly only through a reference that proves its row (``keeps_target``).
-    """
-
-    def __init__(self, operation: _Operation, verdicts: CaveatVerdicts) -> None:
-        self.operation = operation
-        self.verdicts = verdicts
-        self.asked = 0
-        self._found: dict[Key, _Decision | None] = {}
-        self._pending: set[Key] = set()
-        # Decisions kept in the evaluator scope (proposal 0017), the ones this
-        # operation took from there, and the ones decided while a node in
-        # progress was compiled inline, which are not kept.
-        self._kept = operation.kept_rows(verdicts)
-        self.reused: dict[Key, _Decision] = {}
-        self._unkept: set[Key] = set()
-
-    @property
-    def room(self) -> int:
-        """The rows the operation's statement may still bind."""
-        return _ROW_LIMIT - sum(len(found.ids) for found in self._found.values() if found)
-
-    def rows(self, key: Key) -> tuple[Any, ...] | None:
-        self.asked += 1
-        if key not in self._found:
-            if key in self._pending:
-                # The node is being decided: its own body compiles it inline.
-                # What is decided meanwhile depends on that, so it is not kept.
-                self._unkept |= self._pending
-                return None
-            if not self._reuse(key):
-                self._pending.add(key)
-                try:
-                    decision = self._decide(key)
-                finally:
-                    self._pending.discard(key)
-                self._found[key] = decision
-                self._keep(key, decision)
-        decision = self._found[key]
-        return decision.ids if decision is not None else None
-
-    def _reuse(self, key: Key) -> bool:
-        """Take ``key``'s decision kept in the scope, with every one it rests on.
-
-        A decision's witness embeds the keys of the decisions it was compiled
-        against, so it is used only with those very decisions: each one this
-        operation already holds, or finds kept, must be the same object.  A
-        decision taken afresh, or kept again after an eviction, under one of
-        those keys makes the kept decision unusable.  One compiled inline then
-        embeds no keys.  One that does not fit what the statement may still
-        bind is decided afresh.
-        """
-        if self._kept is None:
-            return False
-        store, prefix, _budget = self._kept
-        entry = store.get((*prefix, key))
-        if entry is None:
-            return False
-        closure: dict[Key, _Decision] = {key: entry[0]}
-        pending = [entry]
-        while pending:
-            _decision, depends = pending.pop()
-            for used, expected in depends.items():
-                if expected is None:
-                    continue
-                if used in closure:
-                    if closure[used] is not expected:
-                        return False
-                    continue
-                if used in self._found:
-                    if self._found[used] is not expected:
-                        return False
-                    continue
-                kept = store.get((*prefix, used))
-                if kept is None or kept[0] is not expected:
-                    return False
-                closure[used] = expected
-                pending.append(kept)
-        if sum(len(decision.ids) for decision in closure.values()) > self.room:
-            return False
-        for found, decision in closure.items():
-            store.move_to_end((*prefix, found))
-            self._found[found] = decision
-            self.reused[found] = decision
-        return True
-
-    def _keep(self, key: Key, decision: _Decision | None) -> None:
-        if self._kept is None or decision is None or key in self._unkept:
-            return
-        store, prefix, budget = self._kept
-        # The exact decisions its witness was compiled against.
-        depends = {used: self._found.get(used) for used in decision.uses}
-        name = (*prefix, key)
-        replaced = store.pop(name, None)
-        if replaced is not None:
-            store.held -= len(replaced[0].ids)
-        store[name] = (decision, depends)
-        store.held += len(decision.ids)
-        # As many decisions, and as many keys over all of them, as the
-        # evaluator's own size; the least recently used go first.
-        while store and (len(store) > budget or store.held > budget):
-            _name, (dropped, _depends) = store.popitem(last=False)
-            store.held -= len(dropped.ids)
-
-    def witness(self, used: Iterable[Key]) -> Q:
-        """Every decision the statement rests on, directly or through another one."""
-        parts: dict[Key, Q] = {}
-        pending = list(used)
-        while pending:
-            key = pending.pop()
-            decision = self._found.get(key)
-            if key in parts or decision is None:
-                continue
-            parts[key] = decision.witness
-            pending.extend(decision.uses)
-        return _and(*(parts[key] for key in sorted(parts)))
-
-    def _decide(self, key: Key) -> _Decision | None:
-        model = self.operation.model_index.resource(key[0])
-        if model is None or not stores_rows(model):
-            return None
-        operation = self.operation
-        compiler = operation.compiler(self.verdicts, parametric=False, rows=self)
-        # The decision is read now, by its own statements.  Its witness is
-        # read later, inside the statement that uses it, so it is compiled
-        # with that statement's parameters: the same predicate at that
-        # statement's instant, where a grant may have expired since.
-        witness = operation.compiler(self.verdicts, rows=self)
-        gate = Q(Exists(operation.gate(parametric=False)))
-        source = model._base_manager.using(operation.using).order_by()
-        chain = compiler.self_chain(key)
-        if chain is not None:
-            later = witness.self_chain(key)
-            assert later is not None
-            uses = frozenset(compiler.used_rows | witness.used_rows)
-            return self._closure(chain, later.base, source, gate, uses)
-        identity = resource_id_attr(model)
-        member = compiler.holds(key, _model_at(model), Bound.LOWER)
-        if is_true(member):
-            return None
-        if is_false(member):
-            return _Decision((), _and(), frozenset(compiler.used_rows))
-        room = self.room
-        ids = tuple(source.filter(gate).filter(member).values_list(identity, flat=True)[: room + 1])
-        if len(ids) > room:
-            return None
-        if not ids:
-            return _Decision((), _and(), frozenset(compiler.used_rows))
-        held = witness.holds(key, _model_at(model), Bound.LOWER)
-        uses = frozenset(compiler.used_rows | witness.used_rows)
-        left = source.filter(**{f"{identity}__in": ids}).filter(_not(held))
-        return _Decision(ids, ~Q(Exists(left)), uses)
-
-    def _closure(
-        self,
-        chain: SelfChain,
-        base_later: Q,
-        source: models.QuerySet[Any],
-        gate: Q,
-        uses: frozenset[Key],
-    ) -> _Decision | None:
-        """A hierarchy followed from its seeds: the rows that hold the base,
-        then their children, level by level to the depth limit.
-
-        ``base_later`` is the base as the statement that uses the decision
-        reads it.
-        """
-        if is_true(chain.base):
-            return None
-        if is_false(chain.base):
-            return _Decision((), _and(), uses)
-        room = self.room
-        seeds = list(
-            source.filter(gate)
-            .filter(chain.base)
-            .values_list(chain.identity, chain.target)[: room + 1]
-        )
-        if len(seeds) > room:
-            return None
-        known = dict(seeds)
-        # The rows by level: each its identity and the value a child's parent
-        # column names it by.  A row without that value has no children.
-        levels = [seeds]
-        for _ in range(app_settings.REBAC_DEPTH_LIMIT):
-            above = _keys(levels[-1])
-            if not above:
-                break
-            children = list(
-                source.filter(**{f"{chain.parent}__in": above})
-                .exclude(**{f"{chain.identity}__in": list(known)})
-                .values_list(chain.identity, chain.target)[: room + 1 - len(known)]
-            )
-            if len(known) + len(children) > room:
-                return None
-            if not children:
-                break
-            known.update(children)
-            levels.append(children)
-        if not known:
-            return _Decision((), _and(), uses)
-        # The seeds still hold the base and every row of a level still hangs
-        # under a row of the level above.  A chain of parents then loses a
-        # level at each step and ends at a seed: rows that have closed into a
-        # cycle, or that have moved deeper than they were found, fail it.
-        # The parent column is constrained, so the row a child names exists.
-        named = f"{chain.identity}__in"
-        parts = [~Q(Exists(source.filter(**{named: _ids(levels[0])}).filter(_not(base_later))))]
-        for above_level, level in pairwise(levels):
-            above = _keys(above_level)
-            parts.append(
-                ~Q(
-                    Exists(
-                        source.filter(**{named: _ids(level)}).exclude(
-                            **{f"{chain.parent}__in": above}
-                        )
-                    )
-                )
-            )
-            if not chain.keyed:
-                # The parent column names a row by another column than the
-                # identity: the row a child names is still the one found.
-                parts.append(
-                    ~Q(
-                        Exists(
-                            source.filter(**{f"{chain.target}__in": above}).exclude(
-                                **{named: _ids(above_level)}
-                            )
-                        )
-                    )
-                )
-        return _Decision(tuple(known), _and(*parts), uses)
-
-
-def _ids(level: Sequence[tuple[Any, Any]]) -> list[Any]:
-    """The identities of the rows of one level of a hierarchy."""
-    return [identity for identity, _key in level]
-
-
-def _keys(level: Sequence[tuple[Any, Any]]) -> list[Any]:
-    """The values a child's parent column names the rows of one level by."""
-    return [key for _identity, key in level if key is not None]
-
-
 @dataclass(frozen=True)
 class _Operation:
     """What one statement is compiled for: a policy and an actor."""
@@ -619,9 +239,6 @@ class _Operation:
     shape: tuple[Any, ...]
     model_index: _ModelIndex
     _verdicts: dict[Key, CaveatVerdicts] = field(default_factory=dict)
-    _roots: dict[int, Key] = field(default_factory=dict)
-    _sets: dict[int, ActorSets | None] = field(default_factory=dict)
-    _rows: dict[int, _Rows] = field(default_factory=dict)
 
     @classmethod
     def begin(
@@ -657,232 +274,17 @@ class _Operation:
             found = self._verdicts[key] = CaveatVerdicts.prepare(
                 self.policy.schema, key, context=self.context, using=self.using
             )
-            self._roots[id(found)] = key
         return found
 
     def adopt(self, key: Key, verdicts: CaveatVerdicts) -> None:
         """Use verdicts prepared by another operation for the same key and context."""
         self._verdicts[key] = verdicts
-        self._roots[id(verdicts)] = key
-
-    def sets(self, verdicts: CaveatVerdicts) -> ActorSets | None:
-        """The stored sets in reach of the verdicts' permission that hold the actor."""
-        token = id(verdicts)
-        if token not in self._sets:
-            self._sets[token] = self._scoped_sets(self._roots[token], verdicts)
-        return self._sets[token]
-
-    def _scoped_sets(self, key: Key, verdicts: CaveatVerdicts) -> ActorSets | None:
-        """Decide the sets once per evaluator scope, actor and tuple generation.
-
-        A kept decision can be stale: another process may have changed a
-        membership.  The witness of every authorizing statement then selects
-        nothing, so staleness denies and never grants.  A read that decides
-        afresh (``deciding_afresh``) decides the memberships afresh too.
-        """
-        from rebac.evaluator import ABSENT, current_evaluator
-
-        evaluator = current_evaluator()
-        kept = self.sets_kept(key)
-        if evaluator is None or kept is None or _afresh.get():
-            return self._decide_sets(key, verdicts)
-        found = evaluator._kept_sets(kept)
-        if found is ABSENT:
-            found = self._decide_sets(key, verdicts)
-            evaluator._keep_sets(kept, found)
-        return cast("ActorSets | None", found)
-
-    def sets_kept(self, key: Key) -> tuple[Any, ...] | None:
-        """What an evaluator scope keeps the decided sets under; ``None`` when it cannot."""
-        from rebac.backends import local
-        from rebac.evaluator import _ctx_key
-
-        context = _ctx_key(dict(self.context)) if self.context else ()
-        if context is None:
-            return None
-        program = self.policy.program
-        return (
-            self.shape,
-            self.actor,
-            program.stored_sets & program.reachable(key),
-            context,
-            local._relationship_generation,
-        )
-
-    def sets_compiler(self, verdicts: CaveatVerdicts) -> Compiler:
-        """The compiler that reads the tuples of the stored sets."""
-        return Compiler(
-            self.policy.schema,
-            self.actor,
-            self.using,
-            tagged=self.policy.tagged,
-            verdicts=verdicts,
-            program=self.policy.program,
-            model_index=self.model_index,
-        )
-
-    def sets_conditional(self, keys: frozenset[Key]) -> bool:
-        """Whether a caveat can make the two bounds of the sets differ."""
-        schema = self.policy.schema
-        return any(
-            allowed.with_caveat
-            for type_, name in keys
-            if (definition := schema.get_definition(type_)) is not None
-            for relation in definition.relations
-            if relation.name == name
-            for allowed in relation.allowed_subjects
-        )
-
-    def _decide_sets(self, key: Key, verdicts: CaveatVerdicts) -> ActorSets | None:
-        """Follow the tuple table from the actor until no new set appears.
-
-        One statement per level of nesting, and one more that finds nothing.
-        The result is exact, data cycles included: there is no depth bound.
-        """
-        program = self.policy.program
-        keys = program.stored_sets & program.reachable(key)
-        if not keys:
-            return None
-        compiler = self.sets_compiler(verdicts)
-        conditional = self.sets_conditional(keys)
-        tuples = compiler._tuples()
-        decided: dict[Bound, dict[Key, frozenset[str]]] = {}
-        support: list[Support] = []
-        for bound in (Bound.LOWER, Bound.UPPER):
-            if bound is Bound.UPPER and not conditional:
-                decided[bound] = decided[Bound.LOWER]
-                break
-            members: dict[Key, set[str]] = {}
-            while True:
-                step = compiler.sets_step(keys, members, bound)
-                if is_false(step):
-                    break
-                rows = tuples.filter(step)
-                within = compiler.sets_within(members)
-                if not is_false(within):
-                    rows = rows.exclude(within)
-                fresh = list(rows.order_by().values_list(*_EDGE).distinct())
-                if not fresh:
-                    break
-                for type_, resource_id, name, s_type, s_id, s_relation, caveat, digest in fresh:
-                    ids = members.setdefault((type_, name), set())
-                    if resource_id in ids:
-                        continue
-                    ids.add(resource_id)
-                    if bound is Bound.LOWER:
-                        own = (
-                            s_type == self.actor.subject_type
-                            and s_id == self.actor.subject_id
-                            and s_relation == self.actor.optional_relation
-                        )
-                        support.append(
-                            Support(
-                                (type_, name),
-                                resource_id,
-                                s_type,
-                                s_id,
-                                s_relation,
-                                caveat,
-                                digest,
-                                own,
-                            )
-                        )
-                if sum(len(ids) for ids in members.values()) > _SET_LIMIT:
-                    return None
-            decided[bound] = {found: frozenset(ids) for found, ids in members.items()}
-        return ActorSets(keys, decided[Bound.LOWER], decided[Bound.UPPER], tuple(support))
-
-    def kept_rows(self, verdicts: CaveatVerdicts) -> tuple[KeptRows, tuple[Any, ...], int] | None:
-        """Where the evaluator scope keeps decided rows, and their key prefix.
-
-        ``None`` outside a scope, under manual transaction management, and for
-        a caveat context that cannot be keyed.  The prefix holds what a
-        decision depends on besides its node: the operation's shape, the
-        actor, the context, the tuple generation, the actor's decided sets
-        (their memberships are bound into the decision's witness) and the
-        permission the scope asks for.
-        """
-        from rebac.backends import local
-        from rebac.evaluator import _ctx_key, current_evaluator
-
-        evaluator = current_evaluator()
-        if evaluator is None or _afresh.get() or self.policy.caveat_deadlines:
-            # A caveat override with a deadline changes the policy by the
-            # clock alone: nothing is kept under it, as no policy is kept.
-            return None
-        connection = connections[self.using]
-        if not (
-            connection.get_autocommit()
-            or (connection.in_atomic_block and connection.commit_on_exit)
-        ):
-            return None
-        context = _ctx_key(dict(self.context)) if self.context else ()
-        if context is None:
-            return None
-        sets = self.sets(verdicts)
-        prefix = (
-            self.shape,
-            self.actor,
-            context,
-            local._relationship_generation,
-            sets.digest if sets is not None else None,
-            self._roots[id(verdicts)],
-        )
-        return evaluator._schema_scope.rows(connection), prefix, evaluator._max_size
-
-    def confirm(self) -> bool:
-        """Whether every decision taken from the scope still holds.
-
-        One statement reads the witness of each.  When one fails, every
-        decision the scope keeps on this connection is dropped: the caller
-        builds its statement again, deciding afresh.
-        """
-        reused = [
-            (rows, decision) for rows in self._rows.values() for decision in rows.reused.values()
-        ]
-        if not reused:
-            return True
-        probes: dict[str, _Sql] = {}
-        for position, (_rows, decision) in enumerate(reused):
-            try:
-                sql, params = _Compiled(self.gate().filter(decision.witness).values("pk")).as_sql(
-                    None, connections[self.using]
-                )
-            except EmptyResultSet:
-                probes = {}
-                break
-            probes[f"held{position}"] = _Sql(sql, self.bound(params))
-        held = (
-            SchemaGeneration.objects.using(self.using)
-            .filter(pk=1)
-            .annotate(**probes)
-            .values_list(*probes)
-            .first()
-            if probes
-            else None
-        )
-        if held is not None and all(held):
-            return True
-        for rows, _decision in reused:
-            if rows._kept is not None:
-                rows._kept[0].clear()
-        return False
-
-    def rows(self, verdicts: CaveatVerdicts) -> _Rows:
-        """The decider of small row sets for the verdicts' permission."""
-        token = id(verdicts)
-        if token not in self._rows:
-            self._rows[token] = _Rows(self, verdicts)
-        return self._rows[token]
 
     def compiler(
         self,
         verdicts: CaveatVerdicts,
-        facts: Mapping[Fact, bool] | None = None,
         *,
         parametric: bool = True,
-        rows: _Rows | None = None,
-        point: PointRow | None = None,
     ) -> Compiler:
         return Compiler(
             self.policy.schema,
@@ -893,10 +295,6 @@ class _Operation:
             program=self.policy.program,
             model_index=self.model_index,
             parametric=parametric,
-            facts=facts,
-            sets=self.sets(verdicts),
-            rows=rows,
-            point=point,
         )
 
     def gate(self, *, parametric: bool = True) -> models.QuerySet[Any]:
@@ -907,35 +305,19 @@ class _Operation:
         key: tuple[Any, ...],
         verdicts: CaveatVerdicts,
         build: Callable[[], models.QuerySet[Any] | bool | tuple[models.QuerySet[Any], bool]],
-        late: Callable[[], tuple[Any, ...]] | None = None,
     ) -> _Kept | bool:
-        """The SQL of ``build()``; a bool when it needs no rows to be decided.
-
-        ``late`` gives the key to keep the statement under when part of it is
-        known only once the statement is built.
-        """
+        """Compile and cache SQL whose only varying values are bound parameters."""
         # A statement can be kept when nothing in it varies but the actor's
         # id and the clock: that is, when it carries no caveat verdict list.
         keep = verdicts.empty
-        sets = self.sets(verdicts)
-        prefix = (*self.shape, sets.digest if sets is not None else None)
-        full = (*prefix, *key)
+        full = (*self.shape, *key)
         if keep:
             with _lock:
                 kept = _statements.get(full)
                 if kept is not None:
                     _statements.move_to_end(full)
                     return kept
-        decider = self._rows.get(id(verdicts))
-        asked = decider.asked if decider is not None else 0
         built = build()
-        decider = self._rows.get(id(verdicts))
-        if decider is not None and decider.asked != asked:
-            # The build consulted the decider: the statement names an actor's
-            # own rows, or would name them for another actor.
-            keep = False
-        if late is not None:
-            full = (*prefix, *late())
         compiled: _Kept | bool
         if isinstance(built, bool):
             compiled = built
@@ -967,27 +349,6 @@ class _Operation:
                 result.append(param)
         return result
 
-    # ---------- Facts about fixed objects ----------
-
-    def _fact_rows(self, fact: Fact, verdicts: CaveatVerdicts) -> models.QuerySet[Any] | bool:
-        condition = self.compiler(verdicts).fact_q(fact)
-        if is_true(condition) or is_false(condition):
-            return is_true(condition)
-        return (
-            SchemaGeneration.objects.using(self.using).filter(pk=1).filter(condition).values("pk")
-        )
-
-    def witness(
-        self, used: Iterable[Fact], decided: Mapping[Fact, bool], verdicts: CaveatVerdicts
-    ) -> Q:
-        """Each decision used must still be true of the statement's own snapshot."""
-        inline = self.compiler(verdicts)
-        parts = []
-        for fact in sorted(used, key=str):
-            condition = inline.fact_q(fact)
-            parts.append(condition if decided[fact] else _not(condition))
-        return _and(*parts)
-
 
 def _model_at(model: type[models.Model]) -> At:
     identity = resource_id_attr(model)
@@ -1005,178 +366,23 @@ def _point_statement(
     operation: _Operation,
     key: Key,
     which: str,
-    row_data: PointData | None = None,
 ) -> _Kept | bool:
-    """One bound of ``key`` at one identity, as SQL; a bool when it needs no rows.
-
-    ``row_data`` are the root facts read by ``_point_rows``. The statement is
-    compiled and kept for that shape, and re-reads every fact it relies on.
-    """
+    """One bound of ``key`` at one identity, compiled as SQL."""
     verdicts = operation.verdicts(key)
 
     def build() -> models.QuerySet[Any] | bool:
         at = At(key[0], _Param(_RESOURCE_WIRE, models.TextField()), None, False)
-        point = PointRow(at.ref, row_data) if row_data is not None else None
-        compiler = operation.compiler(verdicts, point=point)
+        compiler = operation.compiler(verdicts)
         if which == "depth":
             condition = compiler.depth_unknown(key, at)
         else:
             condition = compiler.holds(key, at, Bound(which))
         if is_false(condition):
             return False
-        if point is not None:
-            condition = _and(condition, compiler.point_witness(at))
-            if is_false(condition):
-                return False
         rows = operation.gate()
-        if which != "upper":
-            # Only the lower statement authorizes, so it re-reads what was
-            # decided.  The depth probe does too: sets that are no longer the
-            # actor's are a change to answer afresh, not a depth to report.
-            witness = compiler.sets_witness()
-            if is_false(witness):
-                return False
-            if not is_true(witness):
-                rows = rows.filter(witness)
         return (rows if is_true(condition) else rows.filter(condition)).values("pk")
 
-    return operation.statement(("point", key, which, row_data), verdicts, build)
-
-
-@dataclass(frozen=True)
-class _PointRequirements:
-    """Schema-derived facts the root row can supply, without target permissions."""
-
-    columns: tuple[str, ...]
-    sources: tuple[ResolvedFieldBacking, ...]
-
-    @property
-    def shape(self) -> tuple[tuple[str, ...], tuple[str, ...]]:
-        return self.columns, tuple(item.relation.name for item in self.sources)
-
-
-_point_requirements_cache: OrderedDict[tuple[Any, ...], _PointRequirements] = OrderedDict()
-
-
-def _point_requirements(
-    policy: _Policy,
-    key: Key,
-    model_index: _ModelIndex | None = None,
-) -> _PointRequirements:
-    """Reached root GFK columns and necessary source predicates with native filters."""
-    memo = (policy.key, key)
-    with _lock:
-        requirements = _point_requirements_cache.get(memo)
-    if requirements is not None:
-        return requirements
-    definition = policy.schema.get_definition(key[0])
-    reached = policy.program.reachable(key)
-    columns: set[str] = set()
-    sources = []
-    relations = sorted(definition.relations, key=lambda item: item.name) if definition else ()
-    for relation in relations:
-        if (key[0], relation.name) not in reached or not isinstance(relation.backing, FieldBinding):
-            continue
-        resolved = _field_backing(definition, relation, model_index)  # type: ignore[arg-type]
-        if resolved is None:
-            # The existing predicate resolver reports invalid schema backings.
-            continue
-        if resolved.generic is not None:
-            field = resolved.source_model._meta.get_field(resolved.generic.ct_field)
-            columns.add(cast(Any, field).attname)
-        try:
-            _validate_const_filters(resolved.source_model, relation.backing)
-        except ValueError:
-            # Valid field filters may need joins; they keep the original
-            # path. The full backing was resolved and validated above.
-            continue
-        field = resolved.field
-        if (
-            not relation.backing.filters
-            and resolved.generic is None
-            and (type(field) is models.ForeignKey or type(field) is models.OneToOneField)
-            and not field.null
-            and resolved.target_values_path() == field.attname
-        ):
-            # A found row cannot supply false; a missing row supplies no fact.
-            continue
-        sources.append(resolved)
-    requirements = _PointRequirements(tuple(sorted(columns)), tuple(sources))
-    with _lock:
-        _point_requirements_cache[memo] = requirements
-        while len(_point_requirements_cache) > _LIMIT:
-            _point_requirements_cache.popitem(last=False)
-    return requirements
-
-
-def _point_rows(
-    using: str,
-    resource_type: str,
-    requirements: _PointRequirements,
-    ids: Iterable[str],
-    model_index: _ModelIndex | None = None,
-) -> dict[str, PointData]:
-    """Read root point facts in one statement per 500 native identities."""
-    model = (
-        model_index.resource(resource_type)
-        if model_index is not None
-        else model_for_resource_type(resource_type)
-    )
-    columns, sources = requirements.columns, requirements.sources
-    if not (columns or sources) or model is None or not stores_rows(model):
-        return {}
-    identity = resource_id_attr(model)
-    codec = identity_codec(model, identity)
-    query_identity, identity_field = model_identity_fields(model, identity)
-    if not query_identity.unique:
-        return {}
-    native = {
-        identity_field.to_python(value): value
-        for value in ids
-        if value and codec.is_canonical(value, using=using)
-    }
-    rows = model._base_manager.using(using)
-    aliases = {field.name for field in model._meta.get_fields()} | set(rows.query.annotations)
-    matches = {}
-    for position, resolved in enumerate(sources):
-        name = f"_rebac_point_source_{position}"
-        while name in aliases:
-            name += "_"
-        aliases.add(name)
-        source = _point_source_rows(resolved, using).filter(
-            **{resolved.source_id_attr: OuterRef(identity)}
-        )
-        matches[name] = Exists(source)
-    rows = rows.annotate(**matches)
-    values = list(native)
-    found: dict[str, PointData] = {}
-    for start in range(0, len(values), 500):
-        chunk = values[start : start + 500]
-        for value, *row in rows.filter(**{f"{identity}__in": chunk}).values_list(
-            identity, *columns, *matches
-        ):
-            found[native[value]] = PointData(
-                tuple(zip(columns, row[: len(columns)], strict=True)),
-                tuple(
-                    ((resource_type, resolved.relation.name), bool(held))
-                    for resolved, held in zip(sources, row[len(columns) :], strict=True)
-                ),
-            )
-    return found
-
-
-def _point_data(
-    policy: _Policy,
-    using: str,
-    key: Key,
-    ids: Iterable[str],
-    model_index: _ModelIndex | None = None,
-) -> dict[str, PointData]:
-    """The root-row facts that can prune ``key`` without compiling its targets."""
-    model_index = model_index if model_index is not None else _ModelIndex.capture()
-    return _point_rows(
-        using, key[0], _point_requirements(policy, key, model_index), ids, model_index
-    )
+    return operation.statement(("point", key, which), verdicts, build)
 
 
 def _point(
@@ -1184,10 +390,9 @@ def _point(
     key: Key,
     resource_id: str,
     which: str,
-    row_data: PointData | None = None,
 ) -> bool:
     """One bound of ``key`` at one identity, by one statement."""
-    compiled = _point_statement(operation, key, which, row_data)
+    compiled = _point_statement(operation, key, which)
     if isinstance(compiled, bool):
         return compiled and operation.gate(parametric=False).exists()
     probe = _Sql(compiled.sql, operation.bound(compiled.params, resource_id))
@@ -1197,19 +402,17 @@ def _point(
 def _points(
     asked: Sequence[tuple[_Operation, Key, str]],
     which: str,
-    point_data: Sequence[PointData | None],
 ) -> list[bool]:
     """One bound of several items: each a column of one statement over the generation row.
 
-    A column is the statement ``_point`` would run for the item, with its own
-    fence and witness; ``point_data`` are the items' root facts, in order.
+    A column is the statement ``_point`` would run for the item.
     """
     answers = [False] * len(asked)
     statements: list[dict[str, _Sql]] = [{}]
     size = 0
     fenced: bool | None = None
     for position, (operation, key, resource_id) in enumerate(asked):
-        compiled = _point_statement(operation, key, which, point_data[position])
+        compiled = _point_statement(operation, key, which)
         if isinstance(compiled, bool):
             if compiled:
                 if fenced is None:
@@ -1236,12 +439,7 @@ def _points(
 def _recursive(operation: _Operation, key: Key) -> bool:
     """Whether a recursion in reach of ``key`` leaves a depth to probe."""
     program = operation.policy.program
-    sets = operation.sets(operation.verdicts(key))
-    # A stored set that was decided is exact: it leaves no depth to probe.
-    return bool(
-        (program.reachable(key) & program.recursive)
-        - (sets.keys if sets is not None else frozenset())
-    )
+    return bool(program.reachable(key) & program.recursive)
 
 
 def _point_result(
@@ -1253,29 +451,19 @@ def _point_result(
     context: Mapping[str, Any] | None,
     using: str,
     lower_only: bool = False,
-    point_data: Mapping[str, PointData] | None = None,
 ) -> tuple[bool, bool, bool, _Policy]:
-    """``point_data`` are the root facts already prepared for the resource;
-    without them, the same preparation owner reads them here."""
     operation = _Operation.begin(backend, actor, using, context)
     key = resource.resource_type, action
-    if point_data is None:
-        point_data = _point_data(
-            operation.policy, using, key, (resource.resource_id,), operation.model_index
-        )
-    row_data = point_data.get(resource.resource_id)
-    # Only LOWER may authorize, and it is one SQL statement with every fact
-    # witnessed in that statement.  Subsequent probes can only return NO,
-    # CONDITIONAL, or a depth error.
-    if _point(operation, key, resource.resource_id, "lower", row_data):
+    # Only the lower bound may authorize. Later probes refine a denial.
+    if _point(operation, key, resource.resource_id, "lower"):
         return True, True, False, operation.policy
     recursive = _recursive(operation, key)
     # The bounds differ only where a caveat or a recursion is in reach.
     if lower_only or not (recursive or not operation.verdicts(key).empty):
         return False, False, False, operation.policy
-    if not _point(operation, key, resource.resource_id, "upper", row_data):
+    if not _point(operation, key, resource.resource_id, "upper"):
         return False, False, False, operation.policy
-    deep = recursive and _point(operation, key, resource.resource_id, "depth", row_data)
+    deep = recursive and _point(operation, key, resource.resource_id, "depth")
     return False, True, deep, operation.policy
 
 
@@ -1387,7 +575,6 @@ def check_many(
     *, backend: LocalBackend, items: Sequence[CheckItem], using: str
 ) -> list[CheckResult]:
     """What ``check`` answers for each item, from statements the items share."""
-    from rebac.evaluator import current_evaluator, evaluator_scope
 
     schema, _snapshot = _schema(backend, using)
     answers: dict[int, CheckResult] = {}
@@ -1415,20 +602,16 @@ def check_many(
             )
     if points:
         policy = _policy(backend, using)
-        with ExitStack() as stack:
-            if current_evaluator() is None:
-                # The sets decided together are kept where a check looks for them.
-                stack.enter_context(evaluator_scope())
-            for chunk in batched(points, _BULK, strict=False):
-                found = _check_chunk(backend, policy, [items[index] for index in chunk], using)
-                answers.update(zip(chunk, found, strict=True))
+        for chunk in batched(points, _BULK, strict=False):
+            found = _check_chunk(backend, policy, [items[index] for index in chunk], using)
+            answers.update(zip(chunk, found, strict=True))
     return [answers[index] for index in range(len(items))]
 
 
 def _check_chunk(
     backend: LocalBackend, policy: _Policy, items: Sequence[CheckItem], using: str
 ) -> list[CheckResult]:
-    """The point checks of up to ``_BULK`` items, by three statements at most after the sets."""
+    """The point checks of up to ``_BULK`` items, with bounded depth probes."""
     from rebac.evaluator import _ctx_key
 
     operations: dict[tuple[SubjectRef, Hashable], _Operation] = {}
@@ -1449,28 +632,7 @@ def _check_chunk(
             else:
                 prepared[key, context] = operation.verdicts(key)
         asked.append((operation, key, item.resource.resource_id))
-    _decide_together(asked)
-    # The root facts every bound of the chunk compiles with: one read per
-    # resource type and preparation shape.
-    wanted: dict[tuple[str, tuple[tuple[str, ...], tuple[str, ...]]], set[str]] = {}
-    requirements = {}
-    for _operation, key, resource_id in asked:
-        required = _point_requirements(policy, key, _operation.model_index)
-        if required.columns or required.sources:
-            group = key[0], required.shape
-            wanted.setdefault(group, set()).add(resource_id)
-            requirements[group] = required, _operation.model_index
-    read = {
-        group: _point_rows(using, group[0], requirements[group][0], ids, requirements[group][1])
-        for group, ids in wanted.items()
-    }
-    point_data = [
-        read.get((key[0], _point_requirements(policy, key, _operation.model_index).shape), {}).get(
-            resource_id
-        )
-        for _operation, key, resource_id in asked
-    ]
-    lower = _points(asked, "lower", point_data)
+    lower = _points(asked, "lower")
     # The bounds differ only where a caveat or a recursion is in reach.
     open_: list[tuple[int, bool]] = []
     for position, (operation, key, _resource_id) in enumerate(asked):
@@ -1485,7 +647,6 @@ def _check_chunk(
             _points(
                 [asked[position] for position, _recursive_ in open_],
                 "upper",
-                [point_data[position] for position, _recursive_ in open_],
             ),
             strict=True,
         )
@@ -1497,7 +658,6 @@ def _check_chunk(
             _points(
                 [asked[position] for position in probed],
                 "depth",
-                [point_data[position] for position in probed],
             ),
             strict=True,
         )
@@ -1518,153 +678,6 @@ def _check_chunk(
     ]
 
 
-def _decide_together(asked: Sequence[tuple[_Operation, Key, str]]) -> None:
-    """Decide the stored sets of the actors that share a shape, for the evaluator scope.
-
-    Each operation of the chunk holds the decision it is answered with, so
-    the chunk does not depend on what the scope still keeps when its
-    statements are built: the scope is bounded, and a chunk can be larger
-    than what it keeps.
-    """
-    from rebac.evaluator import ABSENT, current_evaluator
-
-    evaluator = current_evaluator()
-    assert evaluator is not None
-    groups: dict[tuple[Any, ...], dict[tuple[Any, ...], tuple[_Operation, Key]]] = {}
-    for operation, key, _resource_id in asked:
-        kept = operation.sets_kept(key)
-        if kept is None:
-            continue
-        found = evaluator._kept_sets(kept)
-        if found is not ABSENT:
-            operation._sets[id(operation.verdicts(key))] = found
-            continue
-        shape, _actor, keys, context, generation = kept
-        if not keys:
-            continue
-        verdicts = operation.verdicts(key)
-        group = groups.setdefault((shape, keys, context, generation, id(verdicts)), {})
-        # Kept under the generation the tuples had before they were read.
-        group.setdefault(kept, (operation, key))
-    for group in groups.values():
-        if len(group) < 2:
-            continue
-        operations = [operation for operation, _key in group.values()]
-        first, key = next(iter(group.values()))
-        decided = _decide_sets_together(operations, key, first.verdicts(key))
-        if decided is None:
-            continue
-        for kept, (operation, key) in group.items():
-            sets = decided[operation.actor]
-            evaluator._keep_sets(kept, sets)
-            operation._sets[id(operation.verdicts(key))] = sets
-
-
-def _decide_sets_together(
-    operations: Sequence[_Operation], key: Key, verdicts: CaveatVerdicts
-) -> dict[SubjectRef, ActorSets | None] | None:
-    """The stored sets of several actors of one shape, from statements they share.
-
-    One statement selects the tuples that name any of the actors, and one per
-    level of nesting selects the tuples that name the sets found.  Each
-    actor's sets are then followed from the actor through those tuples
-    (``_follow``).  ``None`` when the sets found are too many to follow
-    together: each actor then decides its own.
-    """
-    first = operations[0]
-    program = first.policy.program
-    keys = program.stored_sets & program.reachable(key)
-    if not keys:
-        return {operation.actor: None for operation in operations}
-    compiler = first.sets_compiler(verdicts)
-    tuples = compiler._tuples()
-    actors = Q(subject_id__in=sorted({operation.actor.subject_id for operation in operations}))
-    edges: dict[Bound, _Edges] = {}
-    for bound in (Bound.LOWER, Bound.UPPER):
-        if bound is Bound.UPPER and not first.sets_conditional(keys):
-            edges[bound] = edges[Bound.LOWER]
-            break
-        found: _Edges = {}
-        expanded: set[tuple[str, str, str]] = set()
-        step = compiler.sets_step(keys, {}, bound, own=actors)
-        while not is_false(step):
-            fresh: dict[Key, set[str]] = {}
-            for row in tuples.filter(step).order_by().values_list(*_EDGE).distinct():
-                type_, resource_id, name, s_type, s_id, s_relation = row[:6]
-                found.setdefault((s_type, s_relation, s_id), []).append(row)
-                if (type_, name, resource_id) not in expanded:
-                    expanded.add((type_, name, resource_id))
-                    fresh.setdefault((type_, name), set()).add(resource_id)
-            if not fresh:
-                break
-            if len(expanded) > _SET_LIMIT * len(operations):
-                return None
-            step = compiler.sets_step(keys, fresh, bound, direct=False)
-        for rows in found.values():
-            rows.sort()
-        edges[bound] = found
-    decided: dict[SubjectRef, ActorSets | None] = {}
-    for operation in operations:
-        lower = _follow(operation.actor, edges[Bound.LOWER])
-        upper = (
-            lower
-            if edges[Bound.UPPER] is edges[Bound.LOWER]
-            else _follow(operation.actor, edges[Bound.UPPER])
-        )
-        decided[operation.actor] = (
-            None
-            if lower is None or upper is None
-            else ActorSets(keys, lower[0], upper[0], lower[1])
-        )
-    return decided
-
-
-# The tuples that put a subject into a stored set, by that subject.
-type _Edges = dict[tuple[str, str, str], list[tuple[str, ...]]]
-
-
-def _follow(
-    actor: SubjectRef, edges: _Edges
-) -> tuple[dict[Key, frozenset[str]], tuple[Support, ...]] | None:
-    """The sets a chain of tuples leads to from the actor, and the tuple that first reached each.
-
-    A set is added only from a tuple whose subject is the actor, the wildcard
-    of its type, or a set already added: every support stands on the ones
-    before it.  ``None`` over ``_SET_LIMIT`` sets.
-    """
-    itself = (actor.subject_type, actor.optional_relation, actor.subject_id)
-    pending = deque([itself])
-    if not actor.optional_relation:
-        pending.append((actor.subject_type, "", "*"))
-    members: dict[Key, set[str]] = {}
-    support: list[Support] = []
-    while pending:
-        subject = pending.popleft()
-        for type_, resource_id, name, s_type, s_id, s_relation, caveat, digest in edges.get(
-            subject, ()
-        ):
-            ids = members.setdefault((type_, name), set())
-            if resource_id in ids:
-                continue
-            ids.add(resource_id)
-            if len(support) >= _SET_LIMIT:
-                return None
-            support.append(
-                Support(
-                    (type_, name),
-                    resource_id,
-                    s_type,
-                    s_id,
-                    s_relation,
-                    caveat,
-                    digest,
-                    subject == itself,
-                )
-            )
-            pending.append((type_, name, resource_id))
-    return {found: frozenset(ids) for found, ids in members.items()}, tuple(support)
-
-
 # ---------- Scopes ----------
 
 
@@ -1672,76 +685,24 @@ def _scope_statement(operation: _Operation, model: type[models.Model], key: Key)
     """The ids of ``model`` the actor holds ``key`` on, as SQL.
 
     ``False`` when there are none.  ``every`` is set when every row qualifies
-    and the SQL is only the gate: the policy fence and the fact witnesses.
+    and the SQL is only the policy fence.
     """
     verdicts = operation.verdicts(key)
-    decided = _Facts(operation, key, verdicts)
-    decider = operation.rows(verdicts)
     label = model._meta.label_lower
 
     def build() -> bool | tuple[models.QuerySet[Any], bool]:
-        compiler = operation.compiler(verdicts, decided, rows=decider)
+        compiler = operation.compiler(verdicts)
         predicate = compiler.holds(key, _model_at(model), Bound.LOWER)
         if is_false(predicate):
             return False
-        witness = _and(
-            operation.witness(compiler.used_facts, decided, verdicts),
-            compiler.sets_witness(),
-            decider.witness(compiler.used_rows),
-        )
-        if is_false(witness):
-            return False
         gate = operation.gate()
         if is_true(predicate):
-            return (gate if is_true(witness) else gate.filter(witness)).values("pk"), True
+            return gate.values("pk"), True
         # The row predicate goes last: it holds the nested subqueries.
-        condition = Q(Exists(gate))
-        if not is_true(witness):
-            condition &= witness
-        rows = model._base_manager.using(operation.using).filter(condition & predicate)
+        rows = model._base_manager.using(operation.using).filter(Q(Exists(gate)) & predicate)
         return rows.order_by().values(resource_id_attr(model)), False
 
-    # A kept statement is keyed by the facts it asked for, in order.  The
-    # order is learned from the first build and replayed from then on.
-    sets = operation.sets(verdicts)
-    known = (*operation.shape, sets.digest if sets is not None else None, label, key)
-    path = _replay(known, decided)
-    asked = decider.asked
-    compiled = operation.statement(
-        ("scope", label, key, path),
-        verdicts,
-        build,
-        late=lambda: ("scope", label, key, tuple(decided.asked)),
-    )
-    if verdicts.empty and decider.asked == asked:
-        _remember(known, decided.asked)
-    return compiled
-
-
-def _replay(known: tuple[Any, ...], facts: _Facts) -> tuple[tuple[Fact, bool], ...] | None:
-    """Decide the facts a kept statement asked for, in its order; ``None`` when unknown."""
-    with _lock:
-        paths = _fact_paths.get(known)
-        if paths is not None:
-            _fact_paths.move_to_end(known)
-    path: tuple[tuple[Fact, bool], ...] = ()
-    while paths is not None and path in paths:
-        following = paths[path]
-        if following is None:
-            return path
-        path = (*path, (following, facts[following]))
-    return None
-
-
-def _remember(known: tuple[Any, ...], asked: Sequence[tuple[Fact, bool]]) -> None:
-    with _lock:
-        paths = _fact_paths.setdefault(known, {})
-        for position, (fact, _value) in enumerate(asked):
-            paths[tuple(asked[:position])] = fact
-        paths[tuple(asked)] = None
-        _fact_paths.move_to_end(known)
-        while len(_fact_paths) > _LIMIT:
-            _fact_paths.popitem(last=False)
+    return operation.statement(("scope", label, key), verdicts, build)
 
 
 def _exact_identity(model: type[models.Model], lhs: Any, where: Any, using: str) -> str | None:
@@ -1809,10 +770,10 @@ def _exact_identity(model: type[models.Model], lhs: Any, where: Any, using: str)
 
 
 class _Scope(Expression):
-    """The scope of one queryset, decided when its statement is compiled.
+    """A queryset scope with policy and caveat verdicts pinned when built.
 
-    Schema overrides, caveat instances and fixed-object facts can change after
-    a queryset was constructed, so nothing is prepared before this point.
+    A caveat instance written later is absent from the lower bound and present
+    in the upper bound, so the prepared scope fails closed.
     """
 
     def __init__(
@@ -1822,7 +783,8 @@ class _Scope(Expression):
         action: str,
         actor: SubjectRef,
         using: str,
-        revision: str | None,
+        policy: _Policy,
+        verdicts: CaveatVerdicts,
     ) -> None:
         super().__init__(output_field=models.BooleanField())
         self.backend = backend
@@ -1830,7 +792,8 @@ class _Scope(Expression):
         self.action = action
         self.actor = actor
         self.using = using
-        self.revision = revision
+        self.policy = policy
+        self.verdicts = verdicts
         self.lhs: Any = F(resource_id_attr(model))
 
     def get_source_expressions(self) -> list[Any]:
@@ -1842,27 +805,19 @@ class _Scope(Expression):
     @schema_operation
     def as_sql(self, compiler: Any, connection: Any) -> tuple[str, tuple[Any, ...]]:
         resource_type = model_resource_type(self.model)
-        policy = _policy(self.backend, self.using)
-        if resource_type is None or policy.snapshot.revision != self.revision:
+        policy = self.policy
+        if resource_type is None:
             return "(1 = 0)", ()
         key = (resource_type, self.action)
         resource_id = _exact_identity(self.model, self.lhs, compiler.query.where, self.using)
 
-        def statement(operation: _Operation) -> _Kept | bool:
-            if resource_id is None:
-                return _scope_statement(operation, self.model, key)
-            point_data = _point_data(
-                policy, self.using, key, (resource_id,), operation.model_index
-            ).get(resource_id)
-            return _point_statement(operation, key, "lower", point_data)
-
         operation = _Operation.begin(self.backend, self.actor, self.using, policy=policy)
-        compiled = statement(operation)
-        if not operation.confirm():
-            # A decision kept from an earlier statement no longer holds: the
-            # scope dropped its decisions, and this statement decides afresh.
-            operation = _Operation.begin(self.backend, self.actor, self.using, policy=policy)
-            compiled = statement(operation)
+        operation.adopt(key, self.verdicts)
+        compiled = (
+            _scope_statement(operation, self.model, key)
+            if resource_id is None
+            else _point_statement(operation, key, "lower")
+        )
         if isinstance(compiled, bool):
             # ``True`` cannot occur: a statement that admits rows is a gate.
             return "(1 = 0)", ()
@@ -1902,8 +857,13 @@ def scope_expression(
     """Build the native Boolean scope at the caller's chosen snapshot boundary."""
     if model_resource_type(model) is None:
         return Value(False, output_field=models.BooleanField())
-    _schema_at_build, snapshot = _schema(backend, using)
-    expression = _Scope(backend, model, action, actor, using, snapshot.revision)
+    policy = _policy(backend, using)
+    resource_type = model_resource_type(model)
+    assert resource_type is not None
+    verdicts = CaveatVerdicts.prepare(
+        policy.schema, (resource_type, action), context=None, using=using
+    )
+    expression = _Scope(backend, model, action, actor, using, policy, verdicts)
     if identity is not None:
         expression.set_source_expressions([identity])
     return expression
@@ -2018,7 +978,7 @@ def _accessible_branches(
     key = self.resource_type, self.action
     verdicts = operation.verdicts(key)
     compiler = operation.compiler(verdicts, parametric=False)
-    gate = _and(Q(Exists(operation.gate(parametric=False))), compiler.sets_witness())
+    gate = Q(Exists(operation.gate(parametric=False)))
     branches: list[tuple[models.QuerySet[Any], Callable[[Any], str | None]]] = []
 
     model = model_for_resource_type(self.resource_type)
@@ -2034,7 +994,7 @@ def _accessible_branches(
 
         if self.context is None:
             condition = Q(
-                _Scope(self.backend, model, self.action, self.actor, self.using, self.revision)
+                _Scope(self.backend, model, self.action, self.actor, self.using, policy, verdicts)
             )
         else:
             condition = gate & compiler.holds(key, _model_at(model), Bound.LOWER)
@@ -2162,20 +1122,18 @@ def held(
 ) -> set[str]:
     """The ids among ``ids`` on which the actor holds the action.
 
-    Ids that are rows of the type's model are tested by one scoped statement
-    per chunk; the others (no row, or not a valid identity) one by one.  A
-    write gate asks this: it decides afresh, never through rows a scope kept.
+    Ids that are rows of the type's model share scoped statements per chunk;
+    the others are checked individually.
     """
-    with deciding_afresh():
-        return _held(
-            backend=backend,
-            resource_type=resource_type,
-            action=action,
-            actor=actor,
-            ids=ids,
-            using=using,
-            context=context,
-        )
+    return _held(
+        backend=backend,
+        resource_type=resource_type,
+        action=action,
+        actor=actor,
+        ids=ids,
+        using=using,
+        context=context,
+    )
 
 
 def _held(
@@ -2190,7 +1148,6 @@ def _held(
 ) -> set[str]:
     pending = set(ids)
     found: set[str] = set()
-    point_data: Mapping[str, PointData] | None = None
     model = model_for_resource_type(resource_type)
     if model is not None and stores_rows(model) and context is None and len(pending) > 4:
         identity = resource_id_attr(model)
@@ -2217,10 +1174,6 @@ def _held(
             for value in present:
                 pending.discard(native[value])
             found.update(native[value] for value in allowed)
-        # The ids left name no row: they have no root-row facts.
-        point_data = {}
-    if pending and point_data is None:
-        point_data = _point_data(_policy(backend, using), using, (resource_type, action), pending)
     for value in sorted(pending):
         if _point_result(
             backend=backend,
@@ -2230,7 +1183,6 @@ def _held(
             context=context,
             using=using,
             lower_only=True,
-            point_data=point_data,
         )[0]:
             found.add(value)
     return found
@@ -2263,10 +1215,6 @@ def lookup_subjects(
     )
     if not candidates:
         return []
-    # One read of the resource's root facts serves every candidate.
-    point_data = _point_data(
-        _policy(backend, using), using, (resource.resource_type, action), (resource.resource_id,)
-    )
     return [
         candidate
         for candidate in candidates
@@ -2278,6 +1226,5 @@ def lookup_subjects(
             context=context,
             using=using,
             lower_only=True,
-            point_data=point_data,
         )[0]
     ]

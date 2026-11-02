@@ -105,11 +105,13 @@ class ResolvedFieldBacking(_SourceFilters):
         """
         if self.generic is None:
             return Q()
-        content_type = _content_type(self.target_model, using)
-        if content_type is None:
-            # No row can carry a content type the database does not have.
-            return Q(pk__in=[])
-        predicate = Q(**{self.generic.ct_field: content_type})
+        from django.contrib.contenttypes.models import ContentType
+
+        content_types = ContentType.objects.db_manager(using).filter(
+            app_label=self.target_model._meta.app_label,
+            model=self.target_model._meta.model_name,
+        )
+        predicate = Q(**{f"{self.generic.ct_field}__in": content_types.values("pk")})
         if exists:
             rows = self.target_model._base_manager.using(using).order_by().values("pk")
             predicate &= Q(**{f"{self.path}__in": rows})

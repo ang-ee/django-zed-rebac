@@ -24,7 +24,6 @@ from rebac import (
     sudo,
     to_object_ref,
 )
-from rebac.compile import read
 from rebac.field_backing import field_backing_model_errors, resolve_field_backing
 from rebac.schema import parse_zed
 from rebac.testing import install_schema
@@ -435,18 +434,14 @@ def edges(world):
 READABLE = ("mine", "shared", "post", "child")
 
 
-@pytest.mark.parametrize("decided", [True, False], ids=["decided", "inline"])
-def test_a_scope_reads_the_edges_whose_target_is_readable(world, edges, monkeypatch, decided):
-    if not decided:
-        monkeypatch.setattr(read, "_ROW_LIMIT", 0)
+def test_a_scope_reads_the_edges_whose_target_is_readable(world, edges):
     rows = Attachment.objects.with_actor(ALICE)
     assert set(rows.values_list("pk", flat=True)) == {edges[name].pk for name in READABLE}
     assert not Attachment.objects.with_actor(BOB).exists()
     # The edges of one record, with no check per edge.
     with CaptureQueriesContext(connection) as queries:
         assert list(rows.filter(**at(world.mine))) == [edges["mine"]]
-    # One decision for each target type, then the edges.
-    assert len(queries) == 4 + 1
+    assert len(queries) == 1
 
 
 def test_checks_enumeration_and_subjects_agree_with_the_reference(world, edges):
@@ -579,7 +574,7 @@ def _point_statements(queries):
     ]
 
 
-def test_a_point_check_compiles_only_the_arm_of_its_rows_type(world):
+def test_a_point_check_reads_each_generic_arm_inline(world):
     local = world.local
     attachment = edge(world.mine)
     resource = to_object_ref(attachment)
@@ -587,10 +582,6 @@ def test_a_point_check_compiles_only_the_arm_of_its_rows_type(world):
         assert local.check_access(subject=ALICE, action="read", resource=resource).allowed
     statements = _point_statements(queries)
     assert statements
-    # The folder arm is compiled; the post, resource and shelf chains are not.
-    assert all('"testapp_post"' not in sql for sql in statements)
-    assert all('"testapp_shelf"' not in sql for sql in statements)
-    assert any('"testapp_folder"' in sql for sql in statements)
     # Every type answers as before.
     for row, allowed in ((world.post, True), (world.other, False), (world.shared, True)):
         assert (
@@ -609,29 +600,6 @@ WITNESS_SCHEMA = SCHEMA.replace(
 )
 
 
-@pytest.mark.pg_delta
-@pytest.mark.parametrize("operation", ["check", "exact_scope"])
-def test_a_row_whose_type_changed_after_the_read_is_denied(world, monkeypatch, operation):
-    """The read says folder, the row is a post: the post arm, pruned, is what
-    takes ``unread`` away, so only the statement's witness denies."""
-    local = install_schema(WITNESS_SCHEMA)
-    resource = to_object_ref(edge(world.post))
-    local.write_relationships([RelationshipTuple(resource, "viewer", ALICE)])
-    assert not local.check_access(subject=ALICE, action="unread", resource=resource).allowed
-    folder_type = ContentType.objects.get_for_model(Folder)
-    stale = {resource.resource_id: read.PointData(types=(("content_type_id", folder_type.pk),))}
-    monkeypatch.setattr(read, "_point_rows", lambda *_: stale)
-    if operation == "check":
-        assert not local.check_access(subject=ALICE, action="unread", resource=resource).allowed
-    else:
-        assert not (
-            Attachment.objects.with_actor(ALICE)
-            .with_action("unread")
-            .filter(pk=int(resource.resource_id))
-            .exists()
-        )
-
-
 def test_a_permission_that_reaches_no_generic_relation_reads_no_types(world):
     local = install_schema(WITNESS_SCHEMA)
     resource = to_object_ref(edge(world.post))
@@ -639,35 +607,6 @@ def test_a_permission_that_reaches_no_generic_relation_reads_no_types(world):
     with CaptureQueriesContext(connection) as queries:
         assert local.check_access(subject=ALICE, action="viewer", resource=resource).allowed
     assert not [q for q in queries if '"content_type_id"' in q["sql"]]
-
-
-def test_a_bulk_check_reads_its_resources_types_by_one_statement(world, monkeypatch):
-    from rebac import CheckItem
-
-    local = world.local
-    rows = [edge(world.mine) for _ in range(3)]
-    items = [
-        CheckItem(subject=s, action=action, resource=to_object_ref(row))
-        for row in rows
-        for action in ("read", "write")
-        for s in (ALICE, BOB)
-    ]
-    original = read._point_rows
-    metadata_counts = []
-
-    def point_rows(using, resource_type, requirements, ids, model_index=None):
-        with CaptureQueriesContext(connection) as captured:
-            data = original(using, resource_type, requirements, ids, model_index)
-        if resource_type == "test/attachment":
-            metadata_counts.append(len(captured))
-        return data
-
-    monkeypatch.setattr(read, "_point_rows", point_rows)
-    with CaptureQueriesContext(connection) as queries:
-        answers = local.check_bulk_permissions(items)
-    assert [a.allowed for a in answers] == [True, False] * 6
-    assert metadata_counts == [1]
-    assert all('"testapp_post"' not in q["sql"] for q in queries)
 
 
 @pytest.fixture(params=["integer", "text", "uuid", "custom"])
@@ -809,88 +748,3 @@ def test_generic_scalar_preserves_nullable_and_unsupported_identity_semantics(nu
     assert not world.backend.check_access(
         subject=ALICE, action="read", resource=to_object_ref(good)
     ).allowed
-
-
-@pytest.mark.pg_delta
-@pytest.mark.django_db(transaction=True)
-def test_generic_pointer_presence_preserves_original_target_validation(nullable_generic):
-    world = nullable_generic
-    world.backend.set_schema(
-        parse_zed("""
-        definition auth/user {}
-        definition test/scalargenerictarget { permission read = authenticated }
-        definition test/scalargenericsource {
-            relation row: test/scalargenerictarget // rebac:field=target
-            permission read = row->read
-        }
-    """)
-    )
-    content_type = ContentType.objects.get_for_model(world.target)
-    with sudo(reason="tests.point_source.generic_dangling_fixture"):
-        row = world.source.objects.create(content_type=content_type, object_id=world.missing)
-    resource = to_object_ref(row)
-    data = read._point_data(
-        read._policy(world.backend, connection.alias),
-        connection.alias,
-        (resource.resource_type, "read"),
-        (resource.resource_id,),
-    )
-    assert data[resource.resource_id].source_matches == (((resource.resource_type, "row"), True),)
-    assert not world.backend.check_access(subject=ALICE, action="read", resource=resource).allowed
-    assert not world.source.objects.with_actor(ALICE).filter(pk=row.pk).exists()
-
-
-@pytest.mark.parametrize("changed_column", ["content_type", "object_id"])
-@pytest.mark.parametrize("operation", ["check", "exact_scope"])
-@pytest.mark.pg_delta
-@pytest.mark.django_db(transaction=True)
-def test_prepared_generic_ct_or_null_change_closes_exclusion(
-    nullable_generic, monkeypatch, changed_column, operation
-):
-    world = nullable_generic
-    content_type = ContentType.objects.get_for_model(world.target)
-    wrong_type = ContentType.objects.get_for_model(Folder)
-    with sudo(reason="tests.point_source.generic_race_fixture"):
-        target = world.target.objects.create(pk=world.key)
-        source = world.source.objects.create(
-            content_type=wrong_type if changed_column == "content_type" else content_type,
-            object_id=world.stored if changed_column == "content_type" else None,
-        )
-    resource = to_object_ref(source)
-    world.backend.write_relationships(
-        [RelationshipTuple(to_object_ref(row), "viewer", ALICE) for row in (source, target)]
-    )
-    original = read._point_rows
-    changed = []
-
-    def stale(using, resource_type, requirements, ids, model_index=None):
-        data = original(using, resource_type, requirements, ids, model_index)
-        if resource_type == resource.resource_type and not changed:
-            assert dict(data[resource.resource_id].source_matches) == {
-                (resource.resource_type, "row"): changed_column == "content_type"
-            }
-            changed.append(True)
-            with sudo(reason="tests.point_source.generic_race_update"):
-                world.source.objects.using(using).filter(pk=source.pk).update(
-                    **{
-                        changed_column: content_type
-                        if changed_column == "content_type"
-                        else world.stored
-                    }
-                )
-        return data
-
-    monkeypatch.setattr(read, "_point_rows", stale)
-    if operation == "check":
-        allowed = world.backend.check_access(
-            subject=ALICE, action="outside", resource=resource
-        ).allowed
-    else:
-        allowed = (
-            world.source.objects.with_actor(ALICE)
-            .with_action("outside")
-            .filter(pk=source.pk)
-            .exists()
-        )
-    assert not allowed
-    assert changed

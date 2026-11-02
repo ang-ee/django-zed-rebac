@@ -128,7 +128,7 @@ def test_residual_marks_recursive_ban_cycle_as_depth_relevant(monkeypatch):
 
 
 @pytest.mark.django_db
-def test_reused_scope_sees_new_caveat_instance_at_statement_execution():
+def test_reused_scope_excludes_new_caveat_instance_until_rebuilt():
     local = install_schema(
         """
         caveat active(flag bool) { flag }
@@ -161,7 +161,12 @@ def test_reused_scope_sees_new_caveat_instance_at_statement_execution():
             )
         ]
     )
-    assert list(rows.values_list("pk", flat=True)) == [post.pk]
+    assert list(rows.values_list("pk", flat=True)) == []
+    assert list(
+        Post._base_manager.filter(
+            scope_q(backend=local, model=Post, action="read", actor=actor, using="default")
+        ).values_list("pk", flat=True)
+    ) == [post.pk]
     assert list(ids) == [str(post.pk)]
 
 
@@ -235,7 +240,7 @@ def test_revision_change_during_lazy_compilation_cannot_replace_the_pinned_polic
 
 
 @pytest.mark.django_db
-def test_reused_scope_recompiles_after_override_deadline(monkeypatch):
+def test_reused_scope_stays_closed_after_override_deadline_until_rebuilt(monkeypatch):
     clock = clocks(monkeypatch)
     deadline = clock["app"] + timedelta(minutes=1)
     definition = SchemaDefinition.objects.create(resource_type="blog/post")
@@ -264,7 +269,12 @@ def test_reused_scope_recompiles_after_override_deadline(monkeypatch):
     assert not rows.exists()
 
     clock["sql"] = clock["app"]
-    assert list(rows.values_list("pk", flat=True)) == [post.pk]
+    assert list(rows.values_list("pk", flat=True)) == []
+    assert list(
+        Post._base_manager.filter(
+            scope_q(backend=local, model=Post, action="read", actor=actor, using="default")
+        ).values_list("pk", flat=True)
+    ) == [post.pk]
 
 
 @pytest.mark.django_db

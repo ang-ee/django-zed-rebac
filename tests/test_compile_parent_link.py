@@ -63,12 +63,8 @@ def test_a_point_check_inherits_through_the_self_foreign_key(branches, name):
         assert answer.allowed is held
 
 
-@pytest.mark.parametrize("decided", [True, False], ids=["decided", "inline"])
-def test_a_scope_inherits_through_the_self_foreign_key(branches, monkeypatch, decided):
+def test_a_scope_inherits_through_the_self_foreign_key(branches):
     _local, rows, notes = branches
-    if not decided:
-        # Every set inside the statement: the chain of ancestors is compiled.
-        monkeypatch.setattr(read, "_ROW_LIMIT", 0)
     assert writable(NativeParentLinkedBranch) == {rows["region"].pk, rows["office"].pk}
     assert writable(NativeParentLinkedNote) == {notes["region"].pk, notes["office"].pk}
 

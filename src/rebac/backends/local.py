@@ -213,11 +213,9 @@ class LocalBackend(Backend):
         connection = connections[read_alias(SchemaDefinition)]
         evaluator = current_evaluator()
         operation = _schema_operation_scope.get()
-        # Manual transactions have no observable on_commit lifecycle. Keep
-        # their pins operation-local, as before revision caching was added.
-        scoped = connection.get_autocommit() or (
-            connection.in_atomic_block and connection.commit_on_exit
-        )
+        # A rollback has no library-owned notification. Transactional pins
+        # therefore live for one operation, including reused Atomic blocks.
+        scoped = connection.get_autocommit() and not connection.in_atomic_block
         scope = evaluator._schema_scope if evaluator is not None and scoped else operation
         pins = scope.snapshots(connection) if scope is not None else None
         operation_pins = operation.snapshots(connection) if operation is not None else None
@@ -569,21 +567,17 @@ class LocalBackend(Backend):
         at_zookie: Zookie | None = None,
     ) -> CheckResult:
         self._validate_consistency(consistency, at_zookie)
-        from contextlib import nullcontext
-
-        from ..compile.read import check, deciding_afresh
+        from ..compile.read import check
         from ..models import active_relationship_model
 
-        latest = consistency == Consistency.FULLY_CONSISTENT
-        with deciding_afresh() if latest else nullcontext():
-            return check(
-                backend=self,
-                resource=resource,
-                action=action,
-                actor=subject,
-                context=context,
-                using=read_alias(active_relationship_model()),
-            )
+        return check(
+            backend=self,
+            resource=resource,
+            action=action,
+            actor=subject,
+            context=context,
+            using=read_alias(active_relationship_model()),
+        )
 
     def check_bulk_permissions(
         self,
@@ -593,16 +587,12 @@ class LocalBackend(Backend):
         at_zookie: Zookie | None = None,
     ) -> list[CheckResult]:
         self._validate_consistency(consistency, at_zookie)
-        from contextlib import nullcontext
-
-        from ..compile.read import check_many, deciding_afresh
+        from ..compile.read import check_many
         from ..models import active_relationship_model
 
-        latest = consistency == Consistency.FULLY_CONSISTENT
-        with deciding_afresh() if latest else nullcontext():
-            return check_many(
-                backend=self, items=list(items), using=read_alias(active_relationship_model())
-            )
+        return check_many(
+            backend=self, items=list(items), using=read_alias(active_relationship_model())
+        )
 
     @_schema_operation
     def queryset_filter(
@@ -651,26 +641,20 @@ class LocalBackend(Backend):
         consistency: Consistency | None = None,
         at_zookie: Zookie | None = None,
     ) -> Iterable[str]:
-        from contextlib import nullcontext
-
-        from ..compile.read import accessible_ids, deciding_afresh
+        from ..compile.read import accessible_ids
         from ..models import active_relationship_model
 
         self._validate_consistency(consistency, at_zookie)
-        # The latest state asked for explicitly is not read through rows an
-        # evaluator scope kept (proposal 0017).
-        latest = consistency == Consistency.FULLY_CONSISTENT
-        with deciding_afresh() if latest else nullcontext():
-            return list(
-                accessible_ids(
-                    backend=self,
-                    resource_type=resource_type,
-                    action=action,
-                    actor=subject,
-                    using=read_alias(active_relationship_model()),
-                    context=context,
-                )
+        return list(
+            accessible_ids(
+                backend=self,
+                resource_type=resource_type,
+                action=action,
+                actor=subject,
+                using=read_alias(active_relationship_model()),
+                context=context,
             )
+        )
 
     @_schema_operation
     def grants_all(
