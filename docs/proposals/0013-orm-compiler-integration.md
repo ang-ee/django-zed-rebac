@@ -17,8 +17,10 @@ for "every model", so the integration attaches to each model (`RebacMixin`,
 |---|---|
 | `save()` / `delete()` on a mixin model | `save_base` and `delete` overrides |
 | `update()`, `bulk_update()`, `bulk_create()`, queryset `delete()` | `RebacQuerySet` / `TrackedQuerySet` overrides |
-| reverse-FK `add`/`remove`/`set`/`clear`, M2M in both directions | patched related-manager classes, a `ContextVar` of pre-gated pairs, an `m2m_changed` receiver |
-| auto-created through tables | the through model's `objects` manager replaced |
+| reverse-FK `add`/`remove`/`set`/`clear` | queryset and model owners |
+| auto-created M2M in both directions | an `m2m_changed` receiver gates the changed pairs |
+| declared M2M through models | `RebacTrackedMixin` instance and queryset owners gate their writes; related-manager write querysets use the ambient actor because they have no instance carrier |
+| auto-created through tables | direct writes are unobserved infrastructure writes; gated bulk writes require an explicit `through=` model inheriting `RebacTrackedMixin` |
 | collector CASCADE and SET_NULL | `post_delete` receivers, `_base_manager` injection, delete scopes in a `ContextVar` |
 | third-party models (`User`, `Group`, `REBAC_TRACKED_MODELS`) | `pre_save`/`post_save`/`pre_delete` receivers, the D2 autocommit warning |
 | `raw()`, `explain()`, pickling, `refresh_from_db()` | one override each |
@@ -68,8 +70,9 @@ Models no longer opt in. A model is a resource because the schema declares its
 type and `rebac_resource` or the registry maps the type to the model; a table
 is watched because a backing path reads it. `RebacMixin` keeps its instance
 conveniences (`check_access`, `with_actor`, `sudo`) and loses its write
-machinery; `RebacTrackedMixin`, `REBAC_TRACKED_MODELS` and the tracked
-signals go.
+machinery; `RebacTrackedMixin` remains the supported owner for declared
+through and backing models. `REBAC_TRACKED_MODELS` and the tracked signals
+made redundant by compiler-owned writes go.
 
 ### Reads: `SQLCompiler`
 
@@ -155,8 +158,8 @@ base-table scope would hide.
 ## Migration
 
 0.24.x keeps the current integration. 1.0 ships the backends and the
-compilers, removes `RebacTrackedMixin`, `REBAC_TRACKED_MODELS`, the
-related-manager patches, the through-manager swap, the tracked signals, the
+compilers, retains `RebacTrackedMixin` for declared through and backing models,
+and removes `REBAC_TRACKED_MODELS`, the redundant tracked signals, the
 `_base_manager` injection, the write overrides on `RebacMixin` and
 `RebacQuerySet`, and W003; `RebacMixin` becomes optional. A system check
 (`rebac.E022`) fails startup when a resource model is served by a database
@@ -173,10 +176,12 @@ This proposal replaces proposal 0011 and the maintenance half of proposal
   byte-identical.
 - The strict expected failures in `tests/test_security_proposal_0013.py`
   become ordinary tests: a crafted `Case` whose leading arm SQL evaluates
-  first (negated `Q`, `F("pk")`, string or `Value` pk); literal SQL behind a
+  first (negated `Q`, `F("pk")`, string or `Value` pk), including a through-row
+  relink; literal SQL behind a
   `Q` in a `When` or an `F()` over a destination annotation; a multi-table
-  child's related-manager call; through-model `_base_manager` writes; a
-  base-manager `update` of a watched scalar column. The rest of the review
+  child's related-manager call; a
+  base-manager `update` of a watched scalar column; and bulk writes through
+  an auto-created table's plain `_base_manager`. The rest of the review
   probe corpus from the 0.24 rounds (mirrored pairs, consumer handlers during
   related-manager calls, pk-changing updates, collector rows) joins them as a
   permanent tier-1 suite; every case must deny.
