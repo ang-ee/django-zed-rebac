@@ -91,6 +91,32 @@ def _post(title: str, folder=None):
 
 
 @pytest.mark.django_db
+def test_relation_actor_public_result_is_actor_or_none(alice):
+    from rebac.relation_loading import relation_actor
+    from tests.testapp.models import Post
+
+    ref = SubjectRef.of("auth/user", str(alice.pk))
+    pinned = relation_actor(Post.objects.as_user(alice))
+    assert isinstance(pinned, SubjectRef)
+    assert pinned == ref
+    with actor_context(ref):
+        assert relation_actor(Post.objects.all()) == ref
+        with sudo(reason="test.relation-actor"):
+            assert relation_actor(Post.objects.all()) is None
+            assert relation_actor(Post.objects.as_user(alice)) == ref
+
+
+@pytest.mark.django_db
+@pytest.mark.parametrize("strict", [True, False])
+def test_relation_actor_default_manager_without_ambient_actor_is_none(strict):
+    from rebac.relation_loading import relation_actor
+    from tests.testapp.models import Post
+
+    with override_settings(REBAC_STRICT_MODE=strict):
+        assert relation_actor(Post.objects.all()) is None
+
+
+@pytest.mark.django_db
 @override_settings(REBAC_STRICT_MODE=False)
 def test_related_managers_read_without_actor_in_non_strict_mode():
     from tests.testapp.models import Post

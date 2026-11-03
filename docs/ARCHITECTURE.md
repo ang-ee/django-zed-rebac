@@ -559,6 +559,7 @@ from rebac import (
 )
 
 from rebac.field_visibility import redacted_fields        # fields redacted on a loaded instance
+from rebac.relation_loading import relation_actor          # related-read SubjectRef or None
 # Relationship.objects.referencing(identities) and RelationshipRegistry.objects.referencing(...):
 # the stored tuples naming any of the identities, at either end (0.29+)
 
