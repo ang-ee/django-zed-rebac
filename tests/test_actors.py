@@ -19,8 +19,8 @@ from rebac import (
     system_context,
     to_subject_ref,
 )
-from rebac.actors import current_sudo_reason, default_resolver, is_sudo
-from rebac.errors import SudoNotAllowedError, SudoReasonRequiredError
+from rebac.actors import current_sudo_reason, default_resolver, is_sudo, resolve
+from rebac.errors import MissingActorError, SudoNotAllowedError, SudoReasonRequiredError
 
 
 def test_subject_ref_passes_through():
@@ -239,6 +239,16 @@ def test_actor_context_block_scope():
     with actor_context(s):
         assert current_actor() == s
     assert current_actor() is None
+
+
+@pytest.mark.parametrize("label", ["Tracked delete", "Backed relation write"])
+def test_resolve_uses_one_strict_missing_actor_template(label):
+    with override_settings(REBAC_STRICT_MODE=True):
+        with pytest.raises(
+            MissingActorError,
+            match=rf"^{label} requires an actor\. Bind an actor or use sudo\(reason='\.\.\.'\)\.$",
+        ):
+            resolve(mode="ambient", strict=True, subject_label=label)
 
 
 def test_sudo_requires_reason_when_strict():

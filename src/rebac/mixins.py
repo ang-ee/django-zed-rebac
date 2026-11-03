@@ -28,7 +28,7 @@ from django.db.models.base import ModelBase
 from django.db.models.options import DEFAULT_NAMES
 
 from ._id import resource_id_attr
-from .actors import _as_actor_only, _bypass_unaudited, actor_context, is_sudo, system_context
+from .actors import _as_actor_only, _bypass_unaudited, actor_context, system_context
 from .conf import app_settings
 from .database import database_context, read_alias, write_alias
 from .errors import PermissionDenied
@@ -435,16 +435,14 @@ class RebacTrackedMixin(models.Model, metaclass=RebacModelBase):
     def delete(
         self, using: str | None = None, keep_parents: bool = False
     ) -> tuple[int, dict[str, int]]:
-        from .actors import current_actor
-        from .conf import app_settings
+        from .actors import resolve
         from .signals import audit_backed_denials
         from .watch import model_write
 
         alias = write_alias(type(self), using=using, instance=self)
         if delete_scope(self, alias) is not None:
             return super().delete(using=alias, keep_parents=keep_parents)
-        actor = current_actor()
-        unscoped = is_sudo() or (actor is None and not app_settings.REBAC_STRICT_MODE)
+        actor, unscoped = resolve(mode="ambient", strict=False, subject_label=type(self).__name__)
         with audit_backed_denials(), model_write(model=type(self), using=alias):
             from .signals import _gate_backed_field_change
 
@@ -925,15 +923,9 @@ class RebacMixin(RebacTrackedMixin):
         on this instance. FK / reverse-FK / M2M accessors do not — and
         must not — inherit the flag.
         """
-        from .conf import app_settings
-        from .errors import SudoNotAllowedError, SudoReasonRequiredError
+        from .actors import require_sudo_allowed
 
-        if not app_settings.REBAC_ALLOW_SUDO:
-            raise SudoNotAllowedError("sudo() denied: REBAC_ALLOW_SUDO is False")
-        if app_settings.REBAC_REQUIRE_SUDO_REASON and not reason:
-            raise SudoReasonRequiredError(
-                "sudo() requires reason= when REBAC_REQUIRE_SUDO_REASON=True"
-            )
+        require_sudo_allowed(reason)
         self._rebac_sudo_reason = reason
         self._rebac_sudo_audited = False
         return self
@@ -959,17 +951,10 @@ class RebacMixin(RebacTrackedMixin):
                 # Inside a check everything is rolled back: the real save audits it.
                 return
             from .actors import current_actor
-            from .audit import emit
-            from .models import PermissionAuditEvent
+            from .audit import emit_bypass
 
             actor = current_actor()
-            emit(
-                PermissionAuditEvent.KIND_SUDO_BYPASS,
-                actor=actor,
-                origin=actor,
-                reason=self._rebac_sudo_reason,
-                defer_to_commit=False,
-            )
+            emit_bypass(self._rebac_sudo_reason, actor=actor)
             self._rebac_sudo_audited = True
 
     def is_sudo(self) -> bool:
@@ -991,33 +976,21 @@ class RebacMixin(RebacTrackedMixin):
         state returns ``(None, False)`` instead of raising. ``using`` carries
         a known operation alias for its bypass audit; actor resolution is unchanged.
         """
-        from .actors import current_actor as _current_actor
-        from .actors import is_sudo as _is_sudo_ambient
-        from .conf import app_settings
-        from .errors import MissingActorError
+        from .actors import resolve
 
         insert = _insert_scope.get()
         if insert is not None and insert[0] is self:
             return insert[1], insert[2]
-        if self._rebac_sudo_reason is not None:
-            if strict:
-                self._audit_bypass_once(using=using)
-            return (None, True)
-        if self._rebac_actor is not None:
-            return (self._rebac_actor, False)
-        if _is_sudo_ambient():
-            return (None, True)
-        ambient = _current_actor()
-        if ambient is not None:
-            return (ambient, False)
-        if app_settings.REBAC_STRICT_MODE:
-            if strict:
-                raise MissingActorError(
-                    f"{type(self).__name__}.check_access() called with no actor. "
-                    f"Use instance.with_actor(actor) or wrap in `with sudo(reason='...'):`."
-                )
-            return (None, False)
-        return (None, True)
+        result = resolve(
+            pinned_actor=self._rebac_actor,
+            pinned_sudo=self.is_sudo(),
+            mode="row",
+            strict=strict,
+            subject_label=f"{type(self).__name__}.check_access()",
+        )
+        if strict and self.is_sudo():
+            self._audit_bypass_once(using=using)
+        return result
 
     # ----- Check API (Odoo PR #179148 triple) -----
 

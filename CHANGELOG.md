@@ -7,6 +7,28 @@ pre-1.0; breaking changes within a minor version are explicitly called out.
 
 ### Changed
 
+- Actor resolution, sudo validation and bypass emission now share one owner
+  each. Ambient `sudo()` covers related reads when no actor is pinned; an
+  instance or queryset sudo pin still does not cross a relation. The private
+  `_resolve_effective_actor` and manager-specific `raw` override
+  were removed; Django supplies `RebacManager.raw` from `RebacQuerySet.raw`.
+- Guarded `rebac_select_related()` fails closed without an actor in both strict
+  modes: `rebac_select_related()` raises for related instances and projections,
+  while ambient sudo permits both. An actor pinned after
+  `rebac_prefetch_related()` also scopes its protected prefetch querysets.
+  This helper inherits the root actor; an unpinned caller-supplied `Prefetch`
+  queryset in plain `prefetch_related()` keeps its own scope.
+- Related-manager reads use the source instance's pinned actor before the
+  ambient actor or ambient sudo, including the current-member read in M2M
+  `set(clear=False)`. The pin is transferred only to a fresh related-manager
+  queryset; shared Django router hints never grant authority to a reused
+  `Prefetch` queryset. During queryset evaluation through `_fetch_all`, root
+  instances receive their actor before Django prefetches related rows.
+  Iterator chunk prefetching is tracked
+  by expected-failure tests for the W2-E iterator lane.
+  Without an actor, ordinary related-manager reads and backed M2M writes keep
+  the non-strict unscoped fallback; guarded `rebac_select_related()` reads
+  remain fail closed.
 - Bounded model-row, actor-set and fixed-fact decisions are prepared before
   queryset SQL renders and witnessed in each statement that binds them.
   An evaluator scope reuses decisions until a library-owned write advances

@@ -213,3 +213,26 @@ def test_pin_current_actor_preserves_ambient_sudo(alice):
     with actor_context(alice), sudo(reason="test.pin"):
         unscoped = _pin_current_actor(Post.objects.all())
     assert getattr(unscoped, "_rebac_actor", None) is None
+
+
+@pytest.mark.django_db
+def test_pin_current_actor_ignores_router_instance_hint(alice):
+    from django.contrib.auth import get_user_model
+
+    from rebac.graphql.strawberry_django import _pin_current_actor
+
+    bob = atomic_source_write(get_user_model().objects.create, username="bob", is_active=True)
+    folder = _folder("alice folder")
+    alice_post = _post("alice post")
+    bob_post = _post("bob post")
+    _grant("blog/folder", folder.pk, "viewer", alice)
+    _grant("blog/post", alice_post.pk, "viewer", alice)
+    _grant("blog/post", bob_post.pk, "viewer", bob)
+    pinned_folder = Folder.objects.as_user(alice).get(pk=folder.pk)
+    hinted = Post.objects.db_manager(hints={"instance": pinned_folder}).all()
+
+    with actor_context(bob):
+        scoped = _pin_current_actor(hinted)
+
+    assert scoped.actor() == SubjectRef.of("auth/user", str(bob.pk))
+    assert list(scoped.values_list("pk", flat=True)) == [bob_post.pk]
