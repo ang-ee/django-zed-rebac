@@ -191,6 +191,42 @@ def test_standalone_scope_fallback_memoizes_after_first_render(scoped):
     assert len(second) == 0
 
 
+def test_inline_permission_and_accessible_reuse_compiled_statements(direct_scope, monkeypatch):
+    local, row = direct_scope
+    read.reset()
+    built = []
+    original = read.Compiler.holds
+
+    def count_build(self, key, at, bound=read.Bound.LOWER):
+        if at.row:
+            built.append(True)
+        return original(self, key, at, bound)
+
+    monkeypatch.setattr(read.Compiler, "holds", count_build)
+
+    def render_permission():
+        query = models.QuerySet(model=Post).annotate(
+            allowed=permission_expression(Post, "read", actor=ACTOR)
+        )
+        assert "SELECT" in str(query.query)
+
+    render_permission()
+    first = len(built)
+    render_permission()
+    assert len(built) == first
+
+    read.reset()
+    built.clear()
+    assert list(local.accessible(subject=ACTOR, action="read", resource_type="blog/post")) == [
+        str(row.pk)
+    ]
+    first = len(built)
+    assert list(local.accessible(subject=ACTOR, action="read", resource_type="blog/post")) == [
+        str(row.pk)
+    ]
+    assert len(built) == first
+
+
 def test_lazy_with_actor_embedding_renders_without_queries(scoped):
     _local, row, _rows = scoped
     lazy = type(row).objects.with_actor(ACTOR)

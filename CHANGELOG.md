@@ -25,6 +25,16 @@ pre-1.0; breaking changes within a minor version are explicitly called out.
 - Stock `django-cte` 5.x supplies statement-local recursive relations for
   stored tuple traversal and supported native integer self paths. Bulk point
   statements also respect the database's parameter limit.
+- Compatible prepared union operands share model-backed targets and recursive
+  closures as statement-local CTEs. Rebac queryset unions hoist common
+  definitions from cloned operands; caveated or time-sensitive policies keep
+  their existing inline form.
+- Added `rebac.managers.share_scoped_definitions()` for owners that combine
+  independently scoped operands in a plain Django union. It shares compatible
+  definitions across that union, passes through sudo and empty operands, and
+  rejects mismatched scoped actors. Late `permission_expression()` scopes
+  compile self-contained because SQL compilation cannot add to an emitted
+  `WITH` clause.
 - Queryset scopes bind the policy and caveat verdicts when built. New caveat
   instances are excluded from an existing scope's lower bound. Point checks
   prepare bounded sets and fixed facts as needed before their statement;

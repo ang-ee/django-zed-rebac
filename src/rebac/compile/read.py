@@ -11,6 +11,7 @@ from collections.abc import Callable, Hashable, Iterable, Iterator, Mapping, Seq
 from dataclasses import dataclass, field
 from datetime import datetime
 from itertools import batched
+from secrets import token_hex
 from threading import RLock
 from typing import TYPE_CHECKING, Any, cast
 
@@ -23,6 +24,7 @@ from django.db.models.fields.tuple_lookups import TupleIn
 from django.db.models.lookups import Exact, GreaterThanOrEqual, In, IntegerFieldExact, LessThan
 from django.db.models.sql.where import WhereNode
 from django.utils import timezone
+from django_cte import CTE, with_cte
 
 from rebac._id import _NATIVE_INTEGER_FIELDS, model_identity_fields, resource_id_attr
 from rebac.codec import identity_codec
@@ -249,7 +251,26 @@ class _Sql(Expression):
 class _Decision:
     ids: tuple[Any, ...]
     witness: Q
-    uses: frozenset[Key] = frozenset()
+    uses: tuple[_Decision, ...] = ()
+    sets: ActorSets | None = None
+
+
+def _decision_closure(decisions: Iterable[_Decision]) -> tuple[_Decision, ...]:
+    pending = list(decisions)
+    seen: set[int] = set()
+    found = []
+    while pending:
+        decision = pending.pop()
+        if id(decision) in seen:
+            continue
+        seen.add(id(decision))
+        found.append(decision)
+        pending.extend(decision.uses)
+    return tuple(found)
+
+
+def _decision_size(decision: _Decision) -> int:
+    return sum(len(part.ids) for part in _decision_closure((decision,)))
 
 
 def _memo_eligible(operation: _Operation, root: Key) -> bool:
@@ -280,7 +301,11 @@ class _Facts(Mapping[Fact, bool]):
         self.operation = operation
         self.root = root
         self.verdicts = verdicts
-        self.known = frozenset(const_facts(operation.policy.schema, operation.policy.program, root))
+        self.known = frozenset(
+            fact
+            for member in (operation._shared_keys or (root,))
+            for fact in const_facts(operation.policy.schema, operation.policy.program, member)
+        )
         self._decided: dict[Fact, bool] = {}
 
     def __iter__(self) -> Iterator[Fact]:
@@ -317,7 +342,10 @@ class _Facts(Mapping[Fact, bool]):
         )
         evaluator = current_evaluator()
         eligible = (
-            evaluator is not None and context is not None and _memo_eligible(operation, self.root)
+            evaluator is not None
+            and context is not None
+            and not operation._shared_keys
+            and _memo_eligible(operation, self.root)
         )
         if evaluator is not None and eligible and name in evaluator._fact_decisions:
             evaluator._fact_decisions.move_to_end(name)
@@ -338,14 +366,18 @@ class _Facts(Mapping[Fact, bool]):
             rows=self.operation.rows(self.verdicts),
             sets=self.operation.sets(self.verdicts),
         )
+        if (shared := self.operation.rows(self.verdicts).shared_compiler) is not None:
+            compiler = shared.fork_shared()
+            compiler.facts = None
         parts = []
         for fact in sorted(used, key=str):
             condition = compiler.fact_q(fact)
             parts.append(condition if self[fact] else _not(condition))
         return _and(
             *parts,
-            self.operation.rows(self.verdicts).witness(compiler.used_rows),
-            compiler.sets_witness(),
+            self.operation.rows(self.verdicts).witness(
+                compiler.used_rows, witnessed_sets=compiler.sets
+            ),
         )
 
 
@@ -358,10 +390,22 @@ class _Rows:
         self.root = root
         self._found: dict[Key, _Decision | None] = {}
         self._pending: set[Key] = set()
+        self.shared_compiler: Compiler | None = None
 
     @property
     def room(self) -> int:
-        return _ROW_LIMIT - sum(len(found.ids) for found in self._found.values() if found)
+        return _ROW_LIMIT - sum(
+            len(found.ids)
+            for found in _decision_closure(value for value in self._found.values() if value)
+        )
+
+    def _dependencies(self, keys: Iterable[Key]) -> tuple[_Decision, ...]:
+        return tuple(found for key in sorted(keys) if (found := self._found.get(key)) is not None)
+
+    def _fits(self, decision: _Decision) -> bool:
+        selected = (value for value in self._found.values() if value is not None)
+        total = sum(len(part.ids) for part in _decision_closure((*selected, decision)))
+        return total <= _ROW_LIMIT
 
     def rows(self, key: Key) -> tuple[Any, ...] | None:
         # The statement selects the root rows itself. Only an arrow target
@@ -402,41 +446,45 @@ class _Rows:
         eligible = (
             evaluator is not None
             and context is not None
+            and not self.operation._shared_keys
             and _memo_eligible(self.operation, self.root)
         )
         if evaluator is not None and eligible and name in evaluator._row_decisions:
             evaluator._row_decisions.move_to_end(name)
             found = cast("_Decision | None", evaluator._row_decisions[name])
-            if found is not None and len(found.ids) <= self.room:
+            if found is not None and self._fits(found):
                 return found
         found = self._decide(key)
         if evaluator is not None and eligible and found is not None:
             previous = evaluator._row_decisions.get(name)
             if previous is not None:
-                evaluator._row_decision_ids -= len(previous.ids)
+                evaluator._row_decision_ids -= _decision_size(previous)
             evaluator._row_decisions[name] = found
-            evaluator._row_decision_ids += len(found.ids)
+            evaluator._row_decision_ids += _decision_size(found)
             while (
                 evaluator._row_decision_ids > evaluator._max_size
                 or len(evaluator._row_decisions) > evaluator._max_size
             ):
                 _, evicted = evaluator._row_decisions.popitem(last=False)
-                evaluator._row_decision_ids -= len(evicted.ids)
+                evaluator._row_decision_ids -= _decision_size(evicted)
         return found
 
-    def witness(self, used: Iterable[Key]) -> Q:
-        pending = list(used)
-        seen: set[Key] = set()
-        parts = []
-        while pending:
-            key = pending.pop()
-            if key in seen:
+    def witness(self, used: Iterable[Key], *, witnessed_sets: ActorSets | None = None) -> Q:
+        decisions = _decision_closure(self._dependencies(used))
+        parts = [found.witness for found in decisions]
+        seen_sets = {id(witnessed_sets)} if witnessed_sets is not None else set()
+        for found in decisions:
+            sets = found.sets
+            if sets is None or id(sets) in seen_sets:
                 continue
-            seen.add(key)
-            found = self._found.get(key)
-            if found is not None:
-                parts.append(found.witness)
-                pending.extend(found.uses - seen)
+            seen_sets.add(id(sets))
+            compiler = (
+                self.shared_compiler.fork_shared()
+                if self.shared_compiler is not None
+                else self.operation.compiler(self.verdicts, sets=sets)
+            )
+            compiler.sets = sets
+            parts.append(compiler.sets_witness())
         return _and(*parts)
 
     def _decide(self, key: Key) -> _Decision | None:
@@ -447,6 +495,8 @@ class _Rows:
         source = model._base_manager.using(operation.using).order_by()
         identity = resource_id_attr(model)
         sets = operation.sets(self.verdicts)
+        # Preparation executes its own statement. Only the later witness
+        # contributes definitions to the union owner's registry.
         compiler = operation.compiler(
             self.verdicts, parametric=False, share_subject_rows=True, rows=self, sets=sets
         )
@@ -454,22 +504,39 @@ class _Rows:
         if is_true(member):
             return None
         if is_false(member):
-            return _Decision((), _and(), frozenset(compiler.used_rows))
+            return _Decision((), _and(), self._dependencies(compiler.used_rows), sets)
         gate = Q(Exists(operation.gate(parametric=False)))
         selected = compiler.with_subject_ctes(source.filter(gate & member))
         ids = tuple(selected.values_list(identity, flat=True)[: self.room + 1])
         if len(ids) > self.room:
             return None
         if not ids:
-            return _Decision((), _and(), frozenset(compiler.used_rows))
-        later = operation.compiler(self.verdicts, share_subject_rows=True, rows=self, sets=sets)
-        held = later.holds(key, _model_at(model), Bound.LOWER)
-        if is_true(held):
-            return _Decision(ids, _and(), frozenset(compiler.used_rows | later.used_rows))
-        failing = later.with_subject_ctes(
-            source.filter(**{f"{identity}__in": ids}).filter(_not(held))
+            return _Decision((), _and(), self._dependencies(compiler.used_rows), sets)
+        later = (
+            self.shared_compiler.fork_shared()
+            if self.shared_compiler is not None
+            else operation.compiler(self.verdicts, share_subject_rows=True, rows=self, sets=sets)
         )
-        return _Decision(ids, ~Q(Exists(failing)), frozenset(compiler.used_rows | later.used_rows))
+        if self.shared_compiler is not None:
+            # A witness must recheck fixed-object facts. The owner's decided
+            # value cannot serve as its own proof after a revocation.
+            later.facts = None
+        held = later.holds(key, _model_at(model), Bound.LOWER)
+        if len(ids) > self.room:
+            return None
+        if is_true(held):
+            return _Decision(
+                ids, _and(), self._dependencies(compiler.used_rows | later.used_rows), sets
+            )
+        failing = source.filter(**{f"{identity}__in": ids}).filter(_not(held))
+        if self.shared_compiler is None:
+            failing = later.with_subject_ctes(failing)
+        return _Decision(
+            ids,
+            ~Q(Exists(failing)),
+            self._dependencies(compiler.used_rows | later.used_rows),
+            sets,
+        )
 
 
 @dataclass(frozen=True)
@@ -488,6 +555,7 @@ class _Operation:
     _sets: dict[int, ActorSets | None] = field(default_factory=dict)
     _rows: dict[int, _Rows] = field(default_factory=dict)
     _bulk: set[int] = field(default_factory=set)
+    _shared_keys: set[Key] = field(default_factory=set)
 
     @classmethod
     def begin(
@@ -559,7 +627,12 @@ class _Operation:
             row_generation(),
         )
         evaluator = current_evaluator()
-        eligible = evaluator is not None and context is not None and _memo_eligible(self, root)
+        eligible = (
+            evaluator is not None
+            and context is not None
+            and not self._shared_keys
+            and _memo_eligible(self, root)
+        )
         if evaluator is not None and eligible and name in evaluator._set_decisions:
             evaluator._set_decisions.move_to_end(name)
             found = cast("ActorSets | None", evaluator._set_decisions[name])
@@ -603,7 +676,9 @@ class _Operation:
         The result is exact, data cycles included: there is no depth bound.
         """
         program = self.policy.program
-        keys = program.stored_sets & program.reachable(key)
+        keys = program.stored_sets & set().union(
+            *(program.reachable(root) | {root} for root in (self._shared_keys or (key,)))
+        )
         if not keys:
             return None
         compiler = self.sets_compiler(verdicts)
@@ -664,6 +739,7 @@ class _Operation:
         rows: _Rows | None = None,
         sets: ActorSets | None = None,
         facts: Mapping[Fact, bool] | None = None,
+        cte_owner: str | None = None,
     ) -> Compiler:
         return Compiler(
             self.policy.schema,
@@ -678,6 +754,7 @@ class _Operation:
             rows=rows,
             sets=sets,
             facts=facts,
+            cte_owner=cte_owner,
         )
 
     def gate(self, *, parametric: bool = True) -> models.QuerySet[Any]:
@@ -690,26 +767,23 @@ class _Operation:
         build: Callable[[], models.QuerySet[Any] | bool | tuple[models.QuerySet[Any], bool]],
         *,
         cache: bool = True,
+        signature: tuple[Any, ...] = (),
     ) -> _Kept | bool:
         """Compile and cache SQL whose only varying values are bound parameters."""
-        # Decisions are discovered while building. Only the undecided shape
-        # has parameters independent of the rows currently in the database.
         keep = cache and verdicts.empty
-        full = (*self.shape, *key)
-        built = build()
-        root = key[1] if key[0] == "point" else key[2]
-        if keep and (
-            any(rows._found for rows in self._rows.values())
-            or any(value is not None for value in self._sets.values())
-            or bool(const_facts(self.policy.schema, self.policy.program, root))
-        ):
-            keep = False
+        full = (*self.shape, *key, signature)
         if keep:
             with _lock:
                 kept = _statements.get(full)
                 if kept is not None:
                     _statements.move_to_end(full)
                     return kept
+        built = build()
+        if keep and (
+            any(rows._found for rows in self._rows.values())
+            or any(value is not None for value in self._sets.values())
+        ):
+            keep = False
         compiled: _Kept | bool
         if isinstance(built, bool):
             compiled = built
@@ -763,13 +837,18 @@ def _point_statement(
 ) -> _Kept | bool:
     """One bound of ``key`` at one identity, compiled as SQL."""
     verdicts = operation.verdicts(key)
-    sets = operation.sets(verdicts) if decide else None
-    decider = operation.rows(verdicts) if decide else None
     facts = (
         _Facts(operation, key, verdicts) if decide and id(verdicts) not in operation._bulk else None
     )
+    signature: tuple[Any, ...] = (
+        ("decided", tuple((fact, facts[fact]) for fact in sorted(facts.known, key=str)))
+        if facts is not None
+        else ("inline" if not decide else "bulk",)
+    )
 
     def build() -> models.QuerySet[Any] | bool:
+        sets = operation.sets(verdicts) if decide else None
+        decider = operation.rows(verdicts) if decide else None
         at = At(key[0], _Param(_RESOURCE_WIRE, models.TextField()), None, False)
         compiler = operation.compiler(
             verdicts, share_subject_rows=True, sets=sets, rows=decider, facts=facts
@@ -785,14 +864,14 @@ def _point_statement(
             rows = rows.filter(
                 _and(
                     compiler.sets_witness(),
-                    decider.witness(compiler.used_rows) if decider else _and(),
+                    decider.witness(compiler.used_rows, witnessed_sets=sets) if decider else _and(),
                     facts.witness(compiler.used_facts) if facts else _and(),
                 )
             )
         selected = (rows if is_true(condition) else rows.filter(condition)).values("pk")
         return compiler.with_subject_ctes(selected)
 
-    return operation.statement(("point", key, which), verdicts, build, cache=decide)
+    return operation.statement(("point", key, which), verdicts, build, signature=signature)
 
 
 def _point(
@@ -1113,11 +1192,16 @@ def _scope_statement(
     """
     verdicts = operation.verdicts(key)
     label = model._meta.label_lower
-    sets = operation.sets(verdicts) if decide else None
-    decider = operation.rows(verdicts) if decide else None
     facts = _Facts(operation, key, verdicts) if decide else None
+    signature: tuple[Any, ...] = (
+        ("decided", tuple((fact, facts[fact]) for fact in sorted(facts.known, key=str)))
+        if facts is not None
+        else ("inline",)
+    )
 
     def build() -> bool | tuple[models.QuerySet[Any], bool]:
+        sets = operation.sets(verdicts) if decide else None
+        decider = operation.rows(verdicts) if decide else None
         compiler = operation.compiler(
             verdicts, share_subject_rows=True, rows=decider, sets=sets, facts=facts
         )
@@ -1126,7 +1210,7 @@ def _scope_statement(
             return False
         gate = operation.gate().filter(
             _and(
-                decider.witness(compiler.used_rows) if decider else _and(),
+                decider.witness(compiler.used_rows, witnessed_sets=sets) if decider else _and(),
                 compiler.sets_witness(),
                 facts.witness(compiler.used_facts) if facts else _and(),
             )
@@ -1137,7 +1221,157 @@ def _scope_statement(
         rows = model._base_manager.using(operation.using).filter(Q(Exists(gate)) & predicate)
         return compiler.with_subject_ctes(rows.order_by().values(resource_id_attr(model))), False
 
-    return operation.statement(("scope", label, key), verdicts, build, cache=decide)
+    return operation.statement(("scope", label, key), verdicts, build, signature=signature)
+
+
+def _shared_scope_predicate(model: type[models.Model], key: Key, compiler: Compiler) -> Q:
+    """Build an operand against the union owner's decisions and CTEs."""
+    identity = resource_id_attr(model)
+    decided = compiler._decided(key, model, identity, Bound.LOWER, True)
+    if decided is not None:
+        return Q(**{f"{identity}__in": decided})
+    subjects = compiler._subject_cte(key, model, identity, Bound.LOWER, {}, True)
+    if subjects is False:
+        return Q(**{f"{identity}__in": ()})
+    return (
+        Q(**{f"{identity}__in": _Compiled(subjects.order_by().values(identity))})
+        if isinstance(subjects, models.QuerySet)
+        else compiler.holds(key, _model_at(model), Bound.LOWER)
+    )
+
+
+def _shared_scope_statement(
+    operation: _Operation,
+    model: type[models.Model],
+    predicate: Q,
+    gate: models.QuerySet[Any],
+) -> _Kept | bool:
+    """Compile one scope against the union owner's gate and CTEs."""
+    identity = resource_id_attr(model)
+    if is_false(predicate):
+        return False
+    if is_true(predicate):
+        rows = gate.values("pk")
+    else:
+        rows = (
+            model._base_manager.using(operation.using)
+            .filter(Q(Exists(gate)) & predicate)
+            .order_by()
+            .values(identity)
+        )
+    try:
+        sql, params = _Compiled(rows).as_sql(None, connections[operation.using])
+    except EmptyResultSet:
+        return False
+    return _Kept(sql, params, is_true(predicate))
+
+
+def _shareable_scope(scope: _Scope) -> bool:
+    """A shared CTE may not freeze a clock or a caveat verdict at build time."""
+    policy = scope.policy
+    return (
+        scope.verdicts.empty
+        and not policy.caveat_deadlines
+        and not any(
+            tag.deadline for tag in (*policy.tagged.arms.values(), *policy.tagged.sites.values())
+        )
+        and not any(
+            relation.with_expiration
+            for definition in policy.schema.definitions
+            for relation in definition.relations
+        )
+    )
+
+
+def share_combined_scopes(query: Any) -> bool | None:
+    """Hoist common subject sets from scoped UNION operands to their owner."""
+
+    def in_where(node: Any) -> Iterator[_Scope]:
+        if isinstance(node, _Scope):
+            yield node
+        elif isinstance(node, WhereNode):
+            for child in node.children:
+                yield from in_where(child)
+        else:
+            sources = getattr(node, "get_source_expressions", None)
+            if callable(sources):
+                for child in cast(Iterable[Any], sources()):
+                    yield from in_where(child)
+
+    part_scopes = [(part, tuple(in_where(part.where))) for part in query.combined_queries]
+    owners = [(part, scope) for part, scopes in part_scopes for scope in scopes]
+    scopes = [scope for _, scope in owners]
+    if not scopes:
+        return None
+    signature = tuple(id(scope._rebac_scope_token) for scope in scopes)
+    if getattr(query, "_rebac_combined_ctes_shared", None) == signature:
+        return True
+    first = scopes[0]
+    if any(scope.actor != first.actor or scope.using != first.using for scope in scopes):
+        return False
+    if any(scope.policy is not first.policy for scope in scopes):
+        return None
+    if len(scopes) < 2 or any(not _shareable_scope(scope) for scope in scopes):
+        return None
+    # Django includes the left queryset's Query as the first union part.
+    # Copy every part before relocating CTEs or assigning a shared plan.
+    query.combined_queries = tuple(part.clone() for part in query.combined_queries)
+    part_scopes = [(part, tuple(in_where(part.where))) for part in query.combined_queries]
+    owners = [(part, scope) for part, found in part_scopes for scope in found]
+    old_ctes = {
+        id(cte)
+        for part in (*query.combined_queries, query)
+        for cte in getattr(part, "_rebac_subject_plan", ((), ()))[1]
+    }
+    for part in (*query.combined_queries, query):
+        if hasattr(part, "_with_ctes"):
+            part._with_ctes = tuple(cte for cte in part._with_ctes if id(cte) not in old_ctes)
+    operation = _Operation.begin(first.backend, first.actor, first.using, policy=first.policy)
+    keys = frozenset(
+        (cast(str, model_resource_type(scope.model)), scope.action) for scope in scopes
+    )
+    operation._shared_keys.update(keys)
+    shared_root: Key = ("__union__", "__union__")
+    operation._roots[id(first.verdicts)] = shared_root
+    rows = operation.rows(first.verdicts)
+    sets = operation.sets(first.verdicts)
+    facts = _Facts(operation, shared_root, first.verdicts)
+    compiler = operation.compiler(
+        first.verdicts,
+        parametric=False,
+        share_subject_rows=True,
+        rows=rows,
+        sets=sets,
+        facts=facts,
+        cte_owner=token_hex(8),
+    )
+    rows.shared_compiler = compiler
+    predicates: list[tuple[_Scope, Q]] = []
+    for scope in scopes:
+        key = (cast(str, model_resource_type(scope.model)), scope.action)
+        predicates.append((scope, _shared_scope_predicate(scope.model, key, compiler)))
+    witness = _and(
+        rows.witness(compiler.used_rows, witnessed_sets=sets),
+        compiler.sets_witness(),
+        facts.witness(compiler.used_facts),
+    )
+    gate = operation.gate(parametric=False).filter(witness)
+    if not is_true(witness):
+        fence = CTE(gate.values("pk"), name=compiler._cte_name("rebac_gate"))
+        compiler._statement_ctes.append(fence)
+        gate = compiler._cte_queryset(fence)
+    members: list[tuple[_Scope, _Kept | bool]] = []
+    for scope, condition in predicates:
+        members.append((scope, _shared_scope_statement(operation, scope.model, condition, gate)))
+    ctes = compiler.statement_ctes()
+    if ctes:
+        with_cte(*ctes, select=models.QuerySet(model=query.model, query=query))
+    plan = (tuple(members), ctes)
+    for part, _scope in owners:
+        part._rebac_subject_plan = plan
+    query._rebac_subject_plan = plan
+    query._rebac_combined_ctes_shared = signature
+    return True
 
 
 def _exact_identity(model: type[models.Model], lhs: Any, where: Any, using: str) -> str | None:
@@ -1237,6 +1471,7 @@ class _Scope(Expression):
         # Django resolves a new shallow expression copy on every SQL render.
         # The shared holder lets standalone fallback copies reuse preparation.
         self._plans: dict[tuple[str, str], _Kept | bool] = {}
+        self._rebac_scope_token = object()
 
     def prepare(self, using: str) -> None:
         """Read bounded decisions on the known alias before SQL rendering."""
@@ -1287,15 +1522,35 @@ class _Scope(Expression):
         if resource_type is None:
             return "(1 = 0)", ()
         resource_id = _exact_identity(self.model, self.lhs, compiler.query.where, self.using)
+        plan = getattr(compiler.query, "_rebac_subject_plan", None)
+        shared = (
+            next(
+                (
+                    sql
+                    for scope, sql in plan[0]
+                    if scope._rebac_scope_token is self._rebac_scope_token
+                ),
+                None,
+            )
+            if plan
+            else None
+        )
         # Combinator operands and standalone permission expressions can reach
         # the compiler without a queryset preparation owner. Keep this first
         # render fallback on the expression for every later render.
-        if resource_id is not None and self._point_prepared is None and self._prepared is None:
+        if (
+            shared is None
+            and resource_id is not None
+            and self._point_prepared is None
+            and self._prepared is None
+        ):
             self.prepare_point(connection.alias)
-        elif resource_id is None and self._prepared is None:
+        elif shared is None and resource_id is None and self._prepared is None:
             self.prepare(connection.alias)
-        compiled = (
-            self._point_prepared
+        compiled: _Kept | bool | None = (
+            shared
+            if shared is not None
+            else self._point_prepared
             if resource_id is not None and self._point_prepared is not None
             else self._prepared
         )

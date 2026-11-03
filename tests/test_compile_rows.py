@@ -9,6 +9,7 @@ from rebac import ObjectRef, RelationshipTuple, SubjectRef, evaluator_scope, sud
 from rebac.compile import read
 from rebac.evaluator import PermissionEvaluator, current_evaluator
 from rebac.field_backing import foreign_key_kept, resolve_field_backing
+from rebac.models import active_relationship_model
 from rebac.schema import parse_zed
 from rebac.testing import install_schema
 from tests.testapp.models import (
@@ -179,18 +180,27 @@ def test_undecided_point_sql_compiles_once_per_revision_and_actor_shape(monkeypa
     local.write_relationships([RelationshipTuple(to_object_ref(post), "viewer", ACTOR)])
     read.reset()
     compiled = []
+    built = []
     original = read._Compiled.as_sql
+    original_holds = read.Compiler.holds
 
     def count_compilation(self, compiler, connection):
         compiled.append(True)
         return original(self, compiler, connection)
 
+    def count_build(self, key, at, bound=read.Bound.LOWER):
+        built.append(True)
+        return original_holds(self, key, at, bound)
+
     monkeypatch.setattr(read._Compiled, "as_sql", count_compilation)
+    monkeypatch.setattr(read.Compiler, "holds", count_build)
     resource = to_object_ref(post)
     assert local.check_access(subject=ACTOR, action="read", resource=resource).allowed
     first = len(compiled)
+    first_build = len(built)
     assert local.check_access(subject=ACTOR, action="read", resource=resource).allowed
     assert len(compiled) == first
+    assert len(built) == first_build
     other_shape = SubjectRef.of("auth/group", "readers")
     assert not local.check_access(subject=other_shape, action="read", resource=resource).allowed
     assert len(compiled) > first
@@ -200,6 +210,27 @@ def test_undecided_point_sql_compiles_once_per_revision_and_actor_shape(monkeypa
     )
     assert local.check_access(subject=ACTOR, action="read", resource=resource).allowed
     assert len(compiled) > second
+
+
+def test_const_fact_values_key_the_point_statement_cache():
+    local = install_schema("""
+        definition auth/user {}
+        definition test/role { relation member: auth/user }
+        definition blog/post {
+            relation admin: test/role // rebac:const=admin
+            permission read = admin->member
+        }
+    """)
+    with sudo(reason="fact cache fixture"):
+        post = Post.objects.create(title="fact")
+    resource = to_object_ref(post)
+    membership = RelationshipTuple(ObjectRef("test/role", "admin"), "member", ACTOR)
+    read.reset()
+    assert not local.check_access(subject=ACTOR, action="read", resource=resource).allowed
+    local.write_relationships([membership])
+    assert local.check_access(subject=ACTOR, action="read", resource=resource).allowed
+    local.delete_relationship(membership)
+    assert not local.check_access(subject=ACTOR, action="read", resource=resource).allowed
 
 
 @pytest.mark.django_db(transaction=True)
@@ -377,6 +408,35 @@ def test_raw_sql_write_in_evaluator_scope_hides_and_never_grants(tree):
             )
         # A new member cannot appear in a previously decided lower bound.
         assert new_post.pk not in set(Post.objects.with_actor(ACTOR).values_list("pk", flat=True))
+
+
+@pytest.mark.django_db(transaction=True)
+def test_memoized_nested_decision_witnesses_raw_sql_revocation():
+    local = install_schema("""
+        definition auth/user {}
+        definition blog/folder {
+            relation parent: blog/folder // rebac:field=parent
+            relation viewer: auth/user
+            permission view = viewer
+            permission read = parent->view
+        }
+        definition blog/post {
+            relation folder: blog/folder // rebac:field=folder
+            permission read = folder->read
+        }
+    """)
+    with sudo(reason="nested memo witness fixture"):
+        top = Folder.objects.create(name="top")
+        child = Folder.objects.create(name="child", parent=top)
+        post = Post.objects.create(title="child", folder=child)
+    local.write_relationships([RelationshipTuple(to_object_ref(top), "viewer", ACTOR)])
+    with evaluator_scope() as evaluator:
+        assert visible(Post) == {post.pk}
+        assert evaluator.stats()["row_decision_entries"] > 0
+        table = active_relationship_model()._meta.db_table
+        with connection.cursor() as cursor:
+            cursor.execute(f'DELETE FROM "{table}" WHERE "relation" = %s', ["viewer"])
+        assert visible(Post) == set()
 
 
 def test_inline_hierarchy_respects_depth_limit(tree, settings):
