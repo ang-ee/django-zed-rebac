@@ -855,7 +855,7 @@ class RebacQuerySet(models.QuerySet[_M]):
             clone._rebac_internal_bypass = True
             clone._rebac_ambient_bypass = True
         clone._rebac_eager_scope = True
-        clone._apply_scope_in_place()
+        clone._apply_scope_in_place(prepare=False)
         return clone
 
     def scoped_for_aggregate(self) -> Self:
@@ -1031,7 +1031,7 @@ class RebacQuerySet(models.QuerySet[_M]):
     # ``(actor, bypass)`` as the scope was applied.
     _rebac_scope_decision: tuple[SubjectRef | None, bool] | None = None
 
-    def _apply_scope_in_place(self, *, audit: bool = True) -> None:
+    def _apply_scope_in_place(self, *, audit: bool = True, prepare: bool = True) -> None:
         """Inject ``<id_attr>__in=<accessible>`` onto the query's WHERE clause.
 
         ``id_attr`` defaults to ``"pk"`` but can be flipped per-model via
@@ -1056,6 +1056,8 @@ class RebacQuerySet(models.QuerySet[_M]):
         generation = (local._relationship_generation, row_generation())
         if self._rebac_scope_applied:
             if self._rebac_scope_generation == generation:
+                if prepare:
+                    self._prepare_applied_scope()
                 return
             # A tracked write can invalidate a prepared lower bound. Rebuild
             # before compilation; raw SQL writes are still checked by witnesses.
@@ -1066,25 +1068,44 @@ class RebacQuerySet(models.QuerySet[_M]):
         self._rebac_scope_generation = generation
         if sudo:
             return
-        self._scope_query(self.query, actor, prepare=not bool(self.query.combined_queries))
+        self._scope_query(
+            self.query, actor, prepare=prepare and not bool(self.query.combined_queries)
+        )
         if self.query.combined_queries:
             from .compile.read import prepare_resolved_filter, share_combined_scopes
 
             if share_combined_scopes(self.query) is not True:
-                for part in self.query.combined_queries:
-                    prepare_resolved_filter(part.where, part.where, self.db)
+                if prepare:
+                    for part in self.query.combined_queries:
+                        prepare_resolved_filter(part.where, part.where, self.db)
+
+    def _prepare_applied_scope(self) -> None:
+        from .compile.read import prepare_resolved_filter
+
+        if getattr(self.query, "_rebac_subject_plan", None) is not None:
+            return
+        parts = self.query.combined_queries or (self.query,)
+        for part in parts:
+            prepare_resolved_filter(part.where, part.where, self.db)
 
     @schema_operation
-    def _scope_query(self, query: Query, actor: SubjectRef | None, *, prepare: bool = True) -> None:
+    def _scope_query(
+        self,
+        query: Query,
+        actor: SubjectRef | None,
+        *,
+        prepare: bool = True,
+        fallback: bool = False,
+    ) -> None:
         with database_context(self.db):
             for operand in _nested_queries(query.where, boolean_operands_only=True):
-                self._scope_query(operand, actor, prepare=prepare)
+                self._scope_query(operand, actor, prepare=prepare, fallback=fallback)
                 if isinstance(operand, _RebacQuery):
                     operand._rebac_check = (self, actor)
                     operand._rebac_checked = False
             if query.combined_queries:
                 for part in query.combined_queries:
-                    self._scope_query(part, actor, prepare=False)
+                    self._scope_query(part, actor, prepare=False, fallback=True)
                 return
             model = query.model
             if model is None:
@@ -1112,8 +1133,9 @@ class RebacQuerySet(models.QuerySet[_M]):
                 from .compile.read import prepare_resolved_filter
 
                 restriction = query.build_where(predicate)
-                if prepare:
-                    prepare_resolved_filter(restriction, query.where, self.db)
+                prepare_resolved_filter(
+                    restriction, query.where, self.db, prepare=prepare, fallback=fallback
+                )
                 query.where = WhereNode([query.where, _ScopeWhere(children=[restriction])])
                 return
             if backend_grants_all(

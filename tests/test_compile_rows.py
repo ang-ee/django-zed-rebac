@@ -55,9 +55,12 @@ def tree():
     return local, child, leaf, post
 
 
-def test_hierarchy_and_arrow_scope_is_prepared(tree):
+def test_hierarchy_and_arrow_scope_prepares_at_first_evaluation(tree):
     _local, child, leaf, post = tree
-    scope = Post.objects.with_actor(ACTOR).scoped()
+    with CaptureQueriesContext(connection) as construction:
+        scope = Post.objects.with_actor(ACTOR).scoped()
+    assert len(construction) == 0
+    assert scope.exists()
     with CaptureQueriesContext(connection) as queries:
         sql = str(scope.query)
     assert len(queries) == 0
@@ -165,6 +168,31 @@ def test_the_row_limit_is_what_one_statement_may_bind(chain, monkeypatch):
     assert Attachment.objects.with_actor(ACTOR).count() == 1
 
 
+def test_abandoned_row_decision_releases_nested_budget(tree, monkeypatch):
+    local, _child, _leaf, _post = tree
+    operation = read._Operation.begin(local, ACTOR, "default")
+    verdicts = operation.verdicts(("blog/post", "read"))
+    decisions = operation.rows(verdicts)
+    target = ("blog/folder", "read")
+    nested = ("synthetic/nested", "read")
+    monkeypatch.setattr(read, "_ROW_LIMIT", 2)
+    original = read.Compiler.holds
+    inserted = []
+
+    def with_late_nested_decision(self, key, at, bound=read.Bound.LOWER):
+        result = original(self, key, at, bound)
+        if self.rows is decisions and self.parametric and key == target and not inserted:
+            decisions._found[nested] = read._Decision(("nested",), models.Q())
+            inserted.append(True)
+        return result
+
+    monkeypatch.setattr(read.Compiler, "holds", with_late_nested_decision)
+    assert decisions.rows(target) is None
+    assert inserted
+    assert nested not in decisions._found
+    assert decisions.room == 2
+
+
 def test_undecided_point_sql_compiles_once_per_revision_and_actor_shape(monkeypatch):
     schema = """
     definition auth/user {}
@@ -231,6 +259,37 @@ def test_const_fact_values_key_the_point_statement_cache():
     assert local.check_access(subject=ACTOR, action="read", resource=resource).allowed
     local.delete_relationship(membership)
     assert not local.check_access(subject=ACTOR, action="read", resource=resource).allowed
+
+
+def test_three_reachable_facts_do_not_add_point_or_scope_reads():
+    local = install_schema("""
+        definition auth/user {}
+        definition site/role { relation member: auth/user }
+        definition blog/folder {
+            relation viewer: auth/user
+            relation admin: site/role // rebac:const=admin
+            relation auditor: site/role // rebac:const=auditor
+            relation support: site/role // rebac:const=support
+            permission read = viewer + admin->member + auditor->member + support->member
+        }
+        definition blog/post {
+            relation folder: blog/folder // rebac:field=folder
+            relation viewer: auth/user
+            permission read = viewer + folder->read
+        }
+    """)
+    with sudo(reason="fact query count fixture"):
+        folder = Folder.objects.create(name="facts")
+        post = Post.objects.create(title="facts", folder=folder)
+    local.write_relationships([RelationshipTuple(to_object_ref(post), "viewer", ACTOR)])
+    resource = to_object_ref(post)
+    assert local.check_access(subject=ACTOR, action="read", resource=resource).allowed
+    with CaptureQueriesContext(connection) as point_queries:
+        assert local.check_access(subject=ACTOR, action="read", resource=resource).allowed
+    with CaptureQueriesContext(connection) as scope_queries:
+        assert Post.objects.with_actor(ACTOR).count() == 1
+    assert len(point_queries) == 1
+    assert len(scope_queries) == 1
 
 
 @pytest.mark.django_db(transaction=True)

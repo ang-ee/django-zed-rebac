@@ -2039,25 +2039,29 @@ Before compiling a scope, `_Rows` reads model-backed arrow targets into native
 ID lists, up to 5,000 IDs across the statement, including transitive witness
 dependencies recovered from evaluator memo hits. An
 oversized set stays inline, using the same recursive CTE lowering where
-applicable. A standalone scope selects its root rows in the statement; a
-compatible union may decide a root as a target of another operand. Polymorphic
+applicable. Each scope selects its root rows in the statement; a union only
+decides a root when another operand reaches it as an arrow target. Polymorphic
 generic-FK targets stay inline. Bulk point checks
 keep actor memberships in their shared SQL bounds instead of expanding each
 actor separately. `_Operation._decide_sets` follows stored actor-set membership to
 a fixed point before compilation when it fits 256 members. `_Facts` decides
-fixed-object permissions used by constant backings. Point statements also
-prepare the sets and facts they use.
+fixed-object permissions used by constant backings when one fixed object is
+reachable. Several independent fixed objects stay inline to avoid one
+preparation read per object. Point statements prepare only the decisions they
+use.
 
-Preparation runs when `RebacQuerySet._apply_scope_in_place` builds the scope
-on its selected database alias, including from `_RebacQuery.resolve_expression`
-for an embedded queryset. The resolved WHERE selects the point plan when a
-native identity is mandatory, otherwise the population plan. A combinator
+`.scoped()` installs the scope and pins its actor without preparing bounded
+decisions. First evaluation or embedding prepares on the selected database
+alias, including from `_RebacQuery.resolve_expression` for an embedded queryset.
+The resolved WHERE selects the point plan when a native identity is mandatory,
+otherwise the population plan. A combinator
 operand Django renders without its queryset owner prepares on first render
-and retains that result for another render. A standalone expression retains
-its first prepared plan across library-owned writes; its witness can close
-that older lower bound. A library-owned write changes the
+and retains that result for another render. An unprepared ordinary queryset
+or standalone scope expression renders its inline form without a decision read;
+its next evaluation can still prepare a decided plan. A library-owned write changes the
 generation and an eager queryset rebuilds its scope before its next evaluation.
 Under the union-sharing precondition, the union owner prepares decisions once
+before any operand prepares separately,
 and `_Scope.as_sql` uses its shared plan. Otherwise each operand prepares its
 own plan. Once prepared for that query shape, `_Scope.as_sql` only binds parameters and
 compiles SQL; it performs no database read or connection introspection.
@@ -2092,7 +2096,8 @@ Django keeps compiled undecided inline statements for a policy revision, actor
 shape, model, action, database alias and vendor. The cache lookup precedes
 predicate construction. `_policies` retains parsed
 policies and `_statements` retains Django-compiled SQL text, both with bounded
-least-recently-used eviction. Statement keys contain fixed-fact values but no
+least-recently-used eviction. Statement keys contain values only for facts a
+cacheable predicate used, but no
 membership lists or row decisions; statements with decisions are compiled for
 that operation. Inline `permission_expression()` and `accessible()` statements
 have their own cache keys. Actor id, the

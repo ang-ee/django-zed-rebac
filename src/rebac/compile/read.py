@@ -109,6 +109,7 @@ class _Kept:
 
 _policies: OrderedDict[tuple[Any, ...], _Policy] = OrderedDict()
 _statements: OrderedDict[tuple[Any, ...], _Kept | bool] = OrderedDict()
+_fact_uses: OrderedDict[tuple[Any, ...], tuple[Fact, ...]] = OrderedDict()
 
 
 def reset() -> None:
@@ -118,6 +119,7 @@ def reset() -> None:
     with _lock:
         _policies.clear()
         _statements.clear()
+        _fact_uses.clear()
     evaluator = current_evaluator()
     if evaluator is not None:
         # The open scope's pinned policy may predate this invalidation.
@@ -491,6 +493,12 @@ class _Rows:
         model = self.operation.model_index.resource(key[0])
         if model is None or not stores_rows(model):
             return None
+        held_before = set(self._found)
+
+        def abandon() -> None:
+            for nested in self._found.keys() - held_before:
+                del self._found[nested]
+
         operation = self.operation
         source = model._base_manager.using(operation.using).order_by()
         identity = resource_id_attr(model)
@@ -502,6 +510,7 @@ class _Rows:
         )
         member = compiler.holds(key, _model_at(model), Bound.LOWER)
         if is_true(member):
+            abandon()
             return None
         if is_false(member):
             return _Decision((), _and(), self._dependencies(compiler.used_rows), sets)
@@ -509,6 +518,7 @@ class _Rows:
         selected = compiler.with_subject_ctes(source.filter(gate & member))
         ids = tuple(selected.values_list(identity, flat=True)[: self.room + 1])
         if len(ids) > self.room:
+            abandon()
             return None
         if not ids:
             return _Decision((), _and(), self._dependencies(compiler.used_rows), sets)
@@ -523,6 +533,7 @@ class _Rows:
             later.facts = None
         held = later.holds(key, _model_at(model), Bound.LOWER)
         if len(ids) > self.room:
+            abandon()
             return None
         if is_true(held):
             return _Decision(
@@ -768,11 +779,25 @@ class _Operation:
         *,
         cache: bool = True,
         signature: tuple[Any, ...] = (),
+        facts: _Facts | None = None,
     ) -> _Kept | bool:
         """Compile and cache SQL whose only varying values are bound parameters."""
         keep = cache and verdicts.empty
-        full = (*self.shape, *key, signature)
-        if keep:
+        base = (*self.shape, *key, signature)
+        used: tuple[Fact, ...] | None = () if facts is None else None
+        if keep and facts is not None:
+            with _lock:
+                used = _fact_uses.get(base)
+                if used is not None:
+                    _fact_uses.move_to_end(base)
+        full = (
+            (*base, tuple((fact, facts[fact]) for fact in used))
+            if facts is not None and used is not None
+            else base
+            if facts is None
+            else None
+        )
+        if keep and full is not None:
             with _lock:
                 kept = _statements.get(full)
                 if kept is not None:
@@ -784,6 +809,13 @@ class _Operation:
             or any(value is not None for value in self._sets.values())
         ):
             keep = False
+        if keep and facts is not None:
+            used = tuple(sorted(facts._decided, key=str))
+            full = (*base, tuple((fact, facts[fact]) for fact in used))
+            with _lock:
+                _fact_uses[base] = used
+                while len(_fact_uses) > _LIMIT:
+                    _fact_uses.popitem(last=False)
         compiled: _Kept | bool
         if isinstance(built, bool):
             compiled = built
@@ -797,7 +829,7 @@ class _Operation:
                 compiled = False
             else:
                 compiled = _Kept(sql, params, every)
-        if keep:
+        if keep and full is not None:
             with _lock:
                 _statements[full] = compiled
                 while len(_statements) > _LIMIT:
@@ -837,18 +869,20 @@ def _point_statement(
 ) -> _Kept | bool:
     """One bound of ``key`` at one identity, compiled as SQL."""
     verdicts = operation.verdicts(key)
+    known = const_facts(operation.policy.schema, operation.policy.program, key)
+    # Several independent fixed objects cost one preparation read apiece.
+    # The point bound can check all of them together in its own statement.
+    one_object = len({fact[:3] for fact in known}) <= 1
     facts = (
-        _Facts(operation, key, verdicts) if decide and id(verdicts) not in operation._bulk else None
+        _Facts(operation, key, verdicts)
+        if decide and id(verdicts) not in operation._bulk and one_object
+        else None
     )
-    signature: tuple[Any, ...] = (
-        ("decided", tuple((fact, facts[fact]) for fact in sorted(facts.known, key=str)))
-        if facts is not None
-        else ("inline" if not decide else "bulk",)
-    )
+    signature = ("decided",) if decide else ("inline",)
 
     def build() -> models.QuerySet[Any] | bool:
         sets = operation.sets(verdicts) if decide else None
-        decider = operation.rows(verdicts) if decide else None
+        decider = operation.rows(verdicts) if decide and one_object else None
         at = At(key[0], _Param(_RESOURCE_WIRE, models.TextField()), None, False)
         compiler = operation.compiler(
             verdicts, share_subject_rows=True, sets=sets, rows=decider, facts=facts
@@ -871,7 +905,9 @@ def _point_statement(
         selected = (rows if is_true(condition) else rows.filter(condition)).values("pk")
         return compiler.with_subject_ctes(selected)
 
-    return operation.statement(("point", key, which), verdicts, build, signature=signature)
+    return operation.statement(
+        ("point", key, which), verdicts, build, signature=signature, facts=facts
+    )
 
 
 def _point(
@@ -1192,16 +1228,14 @@ def _scope_statement(
     """
     verdicts = operation.verdicts(key)
     label = model._meta.label_lower
-    facts = _Facts(operation, key, verdicts) if decide else None
-    signature: tuple[Any, ...] = (
-        ("decided", tuple((fact, facts[fact]) for fact in sorted(facts.known, key=str)))
-        if facts is not None
-        else ("inline",)
-    )
+    known = const_facts(operation.policy.schema, operation.policy.program, key)
+    one_object = len({fact[:3] for fact in known}) <= 1
+    facts = _Facts(operation, key, verdicts) if decide and one_object else None
+    signature = ("decided",) if decide else ("inline",)
 
     def build() -> bool | tuple[models.QuerySet[Any], bool]:
         sets = operation.sets(verdicts) if decide else None
-        decider = operation.rows(verdicts) if decide else None
+        decider = operation.rows(verdicts) if decide and one_object else None
         compiler = operation.compiler(
             verdicts, share_subject_rows=True, rows=decider, sets=sets, facts=facts
         )
@@ -1221,15 +1255,14 @@ def _scope_statement(
         rows = model._base_manager.using(operation.using).filter(Q(Exists(gate)) & predicate)
         return compiler.with_subject_ctes(rows.order_by().values(resource_id_attr(model))), False
 
-    return operation.statement(("scope", label, key), verdicts, build, signature=signature)
+    return operation.statement(
+        ("scope", label, key), verdicts, build, signature=signature, facts=facts
+    )
 
 
 def _shared_scope_predicate(model: type[models.Model], key: Key, compiler: Compiler) -> Q:
     """Build an operand against the union owner's decisions and CTEs."""
     identity = resource_id_attr(model)
-    decided = compiler._decided(key, model, identity, Bound.LOWER, True)
-    if decided is not None:
-        return Q(**{f"{identity}__in": decided})
     subjects = compiler._subject_cte(key, model, identity, Bound.LOWER, {}, True)
     if subjects is False:
         return Q(**{f"{identity}__in": ()})
@@ -1468,6 +1501,9 @@ class _Scope(Expression):
         self.lhs: Any = F(resource_id_attr(model))
         self._prepared: _Kept | bool | None = None
         self._point_prepared: _Kept | bool | None = None
+        # Only an unprepared combinator operand needs a render-time decision.
+        # Ordinary queryset rendering can use the undecided inline statement.
+        self._render_fallback = False
         # Django resolves a new shallow expression copy on every SQL render.
         # The shared holder lets standalone fallback copies reuse preparation.
         self._plans: dict[tuple[str, str], _Kept | bool] = {}
@@ -1535,24 +1571,43 @@ class _Scope(Expression):
             if plan
             else None
         )
-        # Combinator operands and standalone permission expressions can reach
-        # the compiler without a queryset preparation owner. Keep this first
-        # render fallback on the expression for every later render.
+        # A combinator operand may reach the compiler without its queryset
+        # owner. Keep that first-render preparation for later renders. Other
+        # unprepared expressions compile inline without reading the database;
+        # evaluation can still prepare their decided plan later.
         if (
             shared is None
+            and self._render_fallback
             and resource_id is not None
             and self._point_prepared is None
             and self._prepared is None
         ):
             self.prepare_point(connection.alias)
-        elif shared is None and resource_id is None and self._prepared is None:
+        elif (
+            shared is None
+            and self._render_fallback
+            and resource_id is None
+            and self._prepared is None
+        ):
             self.prepare(connection.alias)
+        inline: _Kept | bool | None = None
+        if shared is None and self._prepared is None and self._point_prepared is None:
+            operation = _Operation.begin(self.backend, self.actor, connection.alias, policy=policy)
+            key = resource_type, self.action
+            operation.adopt(key, self.verdicts)
+            inline = (
+                _point_statement(operation, key, "lower", decide=False)
+                if resource_id is not None
+                else _scope_statement(operation, self.model, key, decide=False)
+            )
         compiled: _Kept | bool | None = (
             shared
             if shared is not None
             else self._point_prepared
             if resource_id is not None and self._point_prepared is not None
             else self._prepared
+            if self._prepared is not None
+            else inline
         )
         if isinstance(compiled, bool):
             # ``True`` cannot occur: a statement that admits rows is a gate.
@@ -1560,7 +1615,9 @@ class _Scope(Expression):
         assert compiled is not None
         operation = _Operation.begin(self.backend, self.actor, self.using, policy=policy)
         params = operation.bound(compiled.params, resource_id)
-        if (resource_id is not None and compiled is self._point_prepared) or compiled.every:
+        if (
+            resource_id is not None and (compiled is self._point_prepared or inline is not None)
+        ) or compiled.every:
             return f"EXISTS {compiled.sql}", tuple(params)
         lhs_sql, lhs_params = compiler.compile(self.lhs)
         return f"({lhs_sql} IN {compiled.sql})", (*lhs_params, *params)
@@ -1582,24 +1639,28 @@ def scope_q(
     )
 
 
-def prepare_resolved_filter(restriction: Any, where: WhereNode, using: str) -> None:
+def prepare_resolved_filter(
+    restriction: Any, where: WhereNode, using: str, *, prepare: bool = True, fallback: bool = False
+) -> None:
     """Prepare the native point or population plan from the resolved WHERE."""
     if isinstance(restriction, _Scope):
-        if _exact_identity(restriction.model, restriction.lhs, where, using) is not None:
-            restriction.prepare_point(using)
-        else:
-            restriction.prepare(using)
+        restriction._render_fallback = fallback
+        if prepare:
+            if _exact_identity(restriction.model, restriction.lhs, where, using) is not None:
+                restriction.prepare_point(using)
+            else:
+                restriction.prepare(using)
         return
     children = getattr(restriction, "children", None)
     if children is not None:
         for child in children:
-            prepare_resolved_filter(child, where, using)
+            prepare_resolved_filter(child, where, using, prepare=prepare, fallback=fallback)
         return
     source = getattr(restriction, "get_source_expressions", None)
     if callable(source):
         for child in cast(Iterable[Any], source()):
             if child is not None:
-                prepare_resolved_filter(child, where, using)
+                prepare_resolved_filter(child, where, using, prepare=prepare, fallback=fallback)
 
 
 @schema_operation

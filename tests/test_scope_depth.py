@@ -65,10 +65,11 @@ def deep_scope_proof(storage, backing, deep, exact):
                 return execute(sql, params, many, context)
 
             with connection.execute_wrapper(record):
+                assert [row.pk for row in queryset] == [rows[-1].pk]
+                # One preparation read and one scoped statement at either depth.
+                assert len(statements) == 2
                 sql, params = queryset.query.sql_with_params()
-                assert len(statements) == 0
-                assert list(queryset.values_list("pk", flat=True)) == [rows[-1].pk]
-            assert len(statements) == 1
+                assert len(statements) == 2
             measurements.append(
                 (len(sql), len(params), parse_depth(sql))
                 if backing == "tuple"

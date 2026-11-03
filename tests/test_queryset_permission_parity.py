@@ -466,8 +466,12 @@ def test_field_owner_sql_cost_is_independent_of_visible_row_count(active, corpus
     # changes only with the compiler; recursive CTE lowering raises the fixed count.
     # Django 6.1 compares the top-level boolean scope predicate with True (one
     # parameter) where the backend has no native boolean type.
-    # Prepared target decisions reduce this lane's fixed parameter count.
-    assert large_cost[1] == 93 + (not connection.features.has_native_boolean_field)
+    # .scoped() defers preparation, so this pre-evaluation SQL render uses the
+    # inline form. SQLite's lowering adds six fixed parameters versus the
+    # decided form; PostgreSQL retains its previous fixed count.
+    assert large_cost[1] == 93 + 6 * (connection.vendor == "sqlite") + (
+        not connection.features.has_native_boolean_field
+    )
 
 
 def test_stored_arrow_resolves_virtual_targets_without_row_multiplication(active):

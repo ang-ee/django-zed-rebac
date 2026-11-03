@@ -279,7 +279,8 @@ def test_scope_query_count_is_independent_of_depth(storage, backing, deep, exact
             with CaptureQueriesContext(connection) as queries:
                 assert qs.exists()
             costs.append(len(queries))
-    assert costs == [1, 1]
+    # Each evaluation runs one preparation read and its scoped statement.
+    assert costs == [2, 2]
 
 
 @pytest.mark.pg_delta

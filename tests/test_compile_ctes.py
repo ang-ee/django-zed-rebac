@@ -4,17 +4,19 @@ import gc
 import re
 
 import pytest
+from django.contrib.contenttypes.models import ContentType
 from django.db import connection, models
 from django.db.models import F, Q, Subquery
 from django.test.utils import CaptureQueriesContext
 
 from rebac import ObjectRef, RelationshipTuple, SubjectRef, sudo, to_object_ref
+from rebac.compile import read
 from rebac.errors import PermissionDenied
 from rebac.managers import share_scoped_definitions
 from rebac.models import active_relationship_model
 from rebac.schema import parse_zed
 from rebac.testing import install_schema
-from tests.testapp.models import Folder, Post
+from tests.testapp.models import Attachment, Folder, Post
 
 pytestmark = pytest.mark.django_db
 
@@ -64,15 +66,19 @@ def test_repeated_recursive_arrow_shares_its_target_cte():
     local.write_relationships([RelationshipTuple(to_object_ref(folder), "viewer", actor)])
 
     def shape(action):
-        sql = str(Post.objects.with_actor(actor).with_action(action).scoped().query)
+        queryset = Post.objects.with_actor(actor).with_action(action).scoped()
+        assert queryset.exists()
+        sql = str(queryset.query)
         return len(re.findall(r'"rebac_[^\"]+" AS \(', sql)), sql
 
-    once, _ = shape("once")
-    many, _ = shape("many")
-    # The bounded folder target has no inline subject CTE; its witness
-    # retains only the folder's recursive residual.
+    once, once_sql = shape("once")
+    many, many_sql = shape("many")
+    # After evaluation, the bounded folder target has no subject CTE. Its
+    # repeated recursive residual uses one keyed closure CTE per statement.
     assert once == 1
     assert many == once
+    assert len(re.findall(r'"rebac_closure_[^\"]+" AS \(', once_sql)) == 1
+    assert len(re.findall(r'"rebac_closure_[^\"]+" AS \(', many_sql)) == 1
     separate = sum(shape(action)[0] for action in ("once", "many") * 3)
     assert separate == 6
     expressions = [
@@ -122,7 +128,11 @@ def test_repeated_recursive_arrow_shares_its_target_cte():
     shared_sql = str(shared_outer.query)
     names = re.findall(r'"(rebac_[^\"]+)" AS \(', shared_sql)
     after = len(names)
-    assert before == separate
+    # Unprepared branches render inline, with a subject and closure CTE each.
+    assert before == 2 * separate
+    # The shared owner keeps one recursive target CTE across all six branches.
+    assert sum(name.startswith("rebac_closure_") for name in names) == 1
+    assert after == 4
     assert 0 < after < before
     assert len(names) == len(set(names))
     assert all(shared_sql.count(f'"{name}"') > 1 for name in names)
@@ -377,6 +387,85 @@ def test_shared_actor_set_witness_catches_new_excluded_membership():
     assert list(shared.values_list("pk", flat=True)) == [post.pk] * 2
     local.write_relationships([RelationshipTuple(group, "member", actor)])
     assert list(shared.all().values_list("pk", flat=True)) == []
+
+
+def test_three_operand_union_prepares_once_and_is_smaller_than_inline(monkeypatch):
+    local = install_schema("""
+        definition auth/user {}
+        definition auth/group { relation member: auth/user | auth/group#member }
+        definition site/role { relation member: auth/user | auth/group#member }
+        definition blog/folder {
+            relation parent: blog/folder // rebac:field=parent
+            relation viewer: auth/user | auth/group#member
+            relation admin: site/role // rebac:const=admin
+            permission read = viewer + parent->read + admin->member
+        }
+        definition blog/post {
+            relation folder: blog/folder // rebac:field=folder
+            relation viewer: auth/user | auth/group#member
+            relation admin: site/role // rebac:const=admin
+            permission read = viewer + folder->read + admin->member
+        }
+        definition test/attachment {
+            relation target: blog/post // rebac:field=target
+            relation post: blog/post // rebac:field=object_id
+            relation viewer: auth/user | auth/group#member
+            permission read = viewer + target->read
+        }
+    """)
+    actor = SubjectRef.of("auth/user", "three-operand")
+    with sudo(reason="three-operand fixture"):
+        root = Folder.objects.create(name="root")
+        child = Folder.objects.create(name="child", parent=root)
+        other = Folder.objects.create(name="other")
+        post = Post.objects.create(title="visible", folder=child)
+        hidden = Post.objects.create(title="hidden", folder=other)
+        content_type = ContentType.objects.get_for_model(Post)
+        Attachment.objects.create(content_type=content_type, object_id=post.pk)
+        Attachment.objects.create(content_type=content_type, object_id=hidden.pk)
+    group = ObjectRef("auth/group", "readers")
+    local.write_relationships(
+        [
+            RelationshipTuple(group, "member", actor),
+            RelationshipTuple(to_object_ref(root), "viewer", SubjectRef(group, "member")),
+        ]
+    )
+
+    def statement():
+        with CaptureQueriesContext(connection) as branches:
+            scoped = [
+                model.objects.with_actor(actor)
+                .scoped()
+                .order_by()
+                .annotate(_kind=models.Value(index, output_field=models.IntegerField()))
+                .values("_kind", "pk")
+                for index, model in enumerate((Folder, Post, Attachment))
+            ]
+        first, *rest = scoped
+        plain = models.QuerySet(model=first.model, query=first.query.clone(), using=first.db)
+        with CaptureQueriesContext(connection) as prepared:
+            combined = share_scoped_definitions(plain.union(*rest, all=True).order_by())
+        with CaptureQueriesContext(connection) as rendered:
+            str(combined.query)
+        with CaptureQueriesContext(connection) as executed:
+            result = sorted(combined.values_list("_kind", "pk"))
+        assert len(branches) == 0
+        assert len(rendered) == 0
+        assert len(executed) == 1
+        return result, len(executed[0]["sql"].encode()), len(prepared)
+
+    decided_rows, decided_bytes, preparation = statement()
+    assert preparation == 4
+    with monkeypatch.context() as inline:
+        inline.setattr(read._Rows, "rows", lambda self, key: None)
+        inline.setattr(read._Operation, "sets", lambda self, verdicts: None)
+        inline.setattr(read, "const_facts", lambda *args: ())
+        read.reset()
+        inline_rows, inline_bytes, inline_preparation = statement()
+    assert inline_preparation == 0
+    assert decided_rows == inline_rows
+    print(f"three-operand union bytes: composed={decided_bytes}, R2={inline_bytes}")
+    assert decided_bytes <= inline_bytes
 
 
 @pytest.mark.parametrize("count", [32, pytest.param(300, marks=pytest.mark.slow)])

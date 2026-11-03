@@ -140,6 +140,8 @@ def direct_scope():
 @pytest.mark.parametrize("embedding", ["direct", "subquery", "exists", "union"])
 def test_sql_render_executes_no_queries(scoped, embedding):
     _local, row, rows = scoped
+    # `.scoped()` installs the restriction; first evaluation prepares it.
+    assert rows.exists()
     plain = models.QuerySet(model=type(row), using="default")
     if embedding == "direct":
         statement = rows
@@ -178,17 +180,33 @@ def test_accessible_uses_prepared_inline_scope(scoped, request):
     assert len(queries) <= (4 if request.node.callspec.params["scoped"] == "caveat" else 3)
 
 
-def test_standalone_scope_fallback_memoizes_after_first_render(scoped):
+def test_standalone_scope_renders_inline_without_reads(scoped):
     local, row, _rows = scoped
     expression = read.scope_expression(
         backend=local, model=type(row), action="read", actor=ACTOR, using="default"
     )
     statement = models.QuerySet(model=type(row)).filter(expression)
-    with CaptureQueriesContext(connection):
+    with CaptureQueriesContext(connection) as first:
         assert "SELECT" in str(statement.query)
     with CaptureQueriesContext(connection) as second:
         assert "SELECT" in str(statement.query)
+    assert len(first) == 0
     assert len(second) == 0
+
+
+def test_scoped_sql_render_is_read_free_before_and_after_evaluation(scoped):
+    _local, _row, rows = scoped
+
+    with CaptureQueriesContext(connection) as before:
+        assert "SELECT" in str(rows.query)
+        assert rows.query.get_compiler(using="default").as_sql()[0]
+    assert len(before) == 0
+
+    assert rows.exists()
+    with CaptureQueriesContext(connection) as after:
+        assert "SELECT" in str(rows.query)
+        assert rows.query.get_compiler(using="default").as_sql()[0]
+    assert len(after) == 0
 
 
 def test_inline_permission_and_accessible_reuse_compiled_statements(direct_scope, monkeypatch):
