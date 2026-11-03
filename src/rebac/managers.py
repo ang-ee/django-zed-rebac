@@ -1423,9 +1423,9 @@ class RebacQuerySet(models.QuerySet[_M]):
         with database_context(self.db):
             if not self._rebac_select_related_guards:
                 return
-            from .relation_loading import protected_lookup_prefixes, relation_actor
+            from .relation_loading import _relation_scope, protected_lookup_prefixes
 
-            if relation_actor(self)[1]:
+            if _relation_scope(self)[1]:
                 return
 
             paths = {
@@ -1516,11 +1516,11 @@ class RebacQuerySet(models.QuerySet[_M]):
         with database_context(self.db):
             if not self._rebac_select_related_guards:
                 return
-            from .relation_loading import guard_selected_related_instances, relation_actor
+            from .relation_loading import _relation_scope, guard_selected_related_instances
 
             if rows is None:
                 rows = self._result_cache or ()
-            actor, bypass = relation_actor(self)
+            actor, bypass = _relation_scope(self)
             guard_selected_related_instances(
                 rows,
                 root_model=self.model,

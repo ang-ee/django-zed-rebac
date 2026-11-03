@@ -22,7 +22,9 @@ pre-1.0; breaking changes within a minor version are explicitly called out.
   ambient actor or ambient sudo, including the current-member read in M2M
   `set(clear=False)`. The pin is transferred only to a fresh related-manager
   queryset; shared Django router hints never grant authority to a reused
-  `Prefetch` queryset. During queryset evaluation through `_fetch_all`, root
+  `Prefetch` queryset. Public `relation_actor(queryset)` still returns only a
+  `SubjectRef` or `None`; bypass state stays internal. During queryset
+  evaluation through `_fetch_all`, root
   instances receive their actor before Django prefetches related rows.
   Iterator chunk prefetching is tracked
   by expected-failure tests for the W2-E iterator lane.

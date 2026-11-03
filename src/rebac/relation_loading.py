@@ -21,8 +21,14 @@ from .resources import model_resource_type
 from .types import FieldDenyMode, SubjectRef
 
 
-def relation_actor(queryset: Any) -> tuple[SubjectRef | None, bool]:
-    """Resolve a related read without inheriting the root queryset's sudo pin."""
+def relation_actor(queryset: Any) -> SubjectRef | None:
+    """Return the actor for a related read, or ``None`` when none resolves."""
+    actor, _ = _relation_scope(queryset)
+    return actor
+
+
+def _relation_scope(queryset: Any) -> tuple[SubjectRef | None, bool]:
+    """Resolve a related guard's actor and bypass without inheriting a sudo pin."""
     pinned_actor = getattr(queryset, "_rebac_actor", None)
     if pinned_actor is None:
         pinned_actor = getattr(queryset, "_rebac_relation_actor", None)
