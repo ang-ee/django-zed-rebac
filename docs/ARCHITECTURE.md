@@ -1985,9 +1985,10 @@ witnesses every decision it binds in its own database snapshot.
 
 A union owner prepares one set of bounded row, actor-set and fixed-fact
 decisions for all compatible operands. The same fresh compiler builds their
-predicates and decision witnesses. A decided subject set needs no shared CTE;
-each residual inline subject set uses a named CTE keyed by the policy, actor,
-permission or relation, and bound. One owner gate checks the witnesses for all
+predicates and decision witnesses. A decided actor set stays an ID list and
+needs no subject CTE. Each residual inline subject set uses one named CTE per
+permission or relation and bound in that owner's actor, policy and database
+alias. One owner gate checks the witnesses for all
 operands. Its query holds the plan and definitions
 together through `Query.clone()`; a new plan never mutates a compiler retained
 by a sibling clone. The union's parts are cloned before their CTEs are moved
@@ -2003,8 +2004,14 @@ stable while making each live plan's names distinct.
 Sharing applies at recursion-free points when the prepared scopes have one
 policy and actor and need no render-time caveat verdict or clock. Caveated,
 expiring and deadline-bearing policies retain independent inline predicates.
-`permission_expression()` binds during SQL compilation; its late scope cannot
-join an already emitted `WITH` clause and compiles a self-contained predicate.
+`permission_expression()` projections already present in scoped union operands
+join the owner plan only when they use the scope actor, their concrete row model
+equals their declared owner model (not an MTI ancestor), no caveated tuple is in
+reach, and the global backend is the scopes' backend. At render, the database
+alias must also equal the owner's alias. A shared projection uses the owner's
+pinned policy, decided sets and witness gate. Other permission expressions bind
+during SQL compilation; their late scopes cannot join an already emitted
+`WITH` clause and compile self-contained predicates.
 Separate nested queries retain separate definitions. A plain Django union can
 explicitly hoist compatible prepared operands with
 `share_scoped_definitions()`. No connection-wide registry is involved. Empty

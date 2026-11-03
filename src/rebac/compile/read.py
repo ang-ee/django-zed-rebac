@@ -1260,17 +1260,28 @@ def _scope_statement(
     )
 
 
-def _shared_scope_predicate(model: type[models.Model], key: Key, compiler: Compiler) -> Q:
+def _shared_scope_predicate(
+    model: type[models.Model], key: Key, compiler: Compiler, *, projection: bool = False
+) -> Q:
     """Build an operand against the union owner's decisions and CTEs."""
     identity = resource_id_attr(model)
     subjects = compiler._subject_cte(key, model, identity, Bound.LOWER, {}, True)
     if subjects is False:
         return Q(**{f"{identity}__in": ()})
-    return (
-        Q(**{f"{identity}__in": _Compiled(subjects.order_by().values(identity))})
-        if isinstance(subjects, models.QuerySet)
-        else compiler.holds(key, _model_at(model), Bound.LOWER)
-    )
+    if isinstance(subjects, models.QuerySet):
+        return Q(**{f"{identity}__in": _Compiled(subjects.order_by().values(identity))})
+    inline = compiler.holds(key, _model_at(model), Bound.LOWER)
+    if (
+        not projection
+        or is_true(inline)
+        or is_false(inline)
+        or (compiler.sets is not None and key in compiler.sets.keys)
+    ):
+        return inline
+    # A projection is resolved after Django has assembled the operand's FROM.
+    # Keep a field backing's joins inside this independent identity subquery.
+    rows = model._base_manager.using(compiler.using).filter(inline).order_by().values(identity)
+    return Q(**{f"{identity}__in": _Compiled(rows)})
 
 
 def _shared_scope_statement(
@@ -1319,6 +1330,20 @@ def _shareable_scope(scope: _Scope) -> bool:
 def share_combined_scopes(query: Any) -> bool | None:
     """Hoist common subject sets from scoped UNION operands to their owner."""
 
+    from rebac.expressions import _Permission
+
+    def in_permissions(node: Any) -> Iterator[_Permission]:
+        if isinstance(node, _Permission):
+            yield node
+        elif isinstance(node, WhereNode):
+            for child in node.children:
+                yield from in_permissions(child)
+        else:
+            sources = getattr(node, "get_source_expressions", None)
+            if callable(sources):
+                for child in cast(Iterable[Any], sources()):
+                    yield from in_permissions(child)
+
     def in_where(node: Any) -> Iterator[_Scope]:
         if isinstance(node, _Scope):
             yield node
@@ -1351,17 +1376,44 @@ def share_combined_scopes(query: Any) -> bool | None:
     query.combined_queries = tuple(part.clone() for part in query.combined_queries)
     part_scopes = [(part, tuple(in_where(part.where))) for part in query.combined_queries]
     owners = [(part, scope) for part, found in part_scopes for scope in found]
+    projections = [
+        permission
+        for part, _scope in owners
+        for expression in (*part.annotations.values(), part.where)
+        for permission in in_permissions(expression)
+        if permission.actor == first.actor
+        and permission.row_model is not None
+        and permission.row_model._meta.concrete_model is permission.model._meta.concrete_model
+        and part.model is not None
+        and part.model._meta.concrete_model is permission.model._meta.concrete_model
+    ]
+    if projections:
+        from rebac.backends import backend
+
+        if backend() is not first.backend:
+            projections = []
     old_ctes = {
         id(cte)
         for part in (*query.combined_queries, query)
-        for cte in getattr(part, "_rebac_subject_plan", ((), ()))[1]
+        for cte in getattr(part, "_rebac_subject_plan", ((), (), {}, None))[1]
     }
     for part in (*query.combined_queries, query):
         if hasattr(part, "_with_ctes"):
             part._with_ctes = tuple(cte for cte in part._with_ctes if id(cte) not in old_ctes)
     operation = _Operation.begin(first.backend, first.actor, first.using, policy=first.policy)
-    keys = frozenset(
+    scope_keys = frozenset(
         (cast(str, model_resource_type(scope.model)), scope.action) for scope in scopes
+    )
+    projections = [
+        permission
+        for permission in projections
+        if operation.verdicts(
+            (cast(str, model_resource_type(permission.model)), permission.action)
+        ).empty
+    ]
+    keys = scope_keys | frozenset(
+        (cast(str, model_resource_type(permission.model)), permission.action)
+        for permission in projections
     )
     operation._shared_keys.update(keys)
     shared_root: Key = ("__union__", "__union__")
@@ -1383,6 +1435,15 @@ def share_combined_scopes(query: Any) -> bool | None:
     for scope in scopes:
         key = (cast(str, model_resource_type(scope.model)), scope.action)
         predicates.append((scope, _shared_scope_predicate(scope.model, key, compiler)))
+    projection_predicates = {
+        permission._rebac_permission_token: _shared_scope_predicate(
+            permission.model,
+            (cast(str, model_resource_type(permission.model)), permission.action),
+            compiler,
+            projection=True,
+        )
+        for permission in projections
+    }
     witness = _and(
         rows.witness(compiler.used_rows, witnessed_sets=sets),
         compiler.sets_witness(),
@@ -1396,10 +1457,13 @@ def share_combined_scopes(query: Any) -> bool | None:
     members: list[tuple[_Scope, _Kept | bool]] = []
     for scope, condition in predicates:
         members.append((scope, _shared_scope_statement(operation, scope.model, condition, gate)))
+    shared_permissions = {
+        token: Q(Exists(gate)) & condition for token, condition in projection_predicates.items()
+    }
     ctes = compiler.statement_ctes()
     if ctes:
         with_cte(*ctes, select=models.QuerySet(model=query.model, query=query))
-    plan = (tuple(members), ctes)
+    plan = (tuple(members), ctes, shared_permissions, first.using)
     for part, _scope in owners:
         part._rebac_subject_plan = plan
     query._rebac_subject_plan = plan
@@ -1558,7 +1622,7 @@ class _Scope(Expression):
         if resource_type is None:
             return "(1 = 0)", ()
         resource_id = _exact_identity(self.model, self.lhs, compiler.query.where, self.using)
-        plan = getattr(compiler.query, "_rebac_subject_plan", None)
+        plan: Any = getattr(compiler.query, "_rebac_subject_plan", ((), (), {}, None))
         shared = (
             next(
                 (
@@ -1568,7 +1632,7 @@ class _Scope(Expression):
                 ),
                 None,
             )
-            if plan
+            if plan[0]
             else None
         )
         # A combinator operand may reach the compiler without its queryset

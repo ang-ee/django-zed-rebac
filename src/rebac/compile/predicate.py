@@ -539,6 +539,9 @@ class Compiler:
             or self.model_index.resource(key[0]) is not model
             or resource_id_attr(model) != identity
             or not stores_rows(model)
+            # The decided actor set is already a bounded id list. A subject
+            # CTE around that list only repeats a definition in the owner.
+            or (self.sets is not None and key in self.sets.keys)
             or any(visits.get(node) for node in self.program.recursive)
         ):
             return None

@@ -18,13 +18,15 @@ from .types import SubjectRef
 def permission_expression(
     model: type[models.Model], action: str, *, actor: ActorLike
 ) -> models.Expression:
-    """Project definite permission for this row, binding policy at SQL compilation.
+    """Project definite permission for this row.
 
     The explicit actor is captured now; ambient actor/sudo never grants this
     capability. The executing database and schema bind later. The owner must be
     the query's model, its physical proxy equivalent, or an MTI ancestor.
     Denied, conditional and SQL NULL answers are false. No rows are fetched at
-    construction. This differs from the early-pinned ``queryset_filter`` API.
+    construction. Normally the policy binds during SQL compilation. A
+    compatible union owner prepares this projection earlier under its pinned
+    policy. This differs from the early-pinned ``queryset_filter`` API.
     """
     if not action:
         raise ValueError("permission_expression() requires an action")
@@ -47,6 +49,9 @@ class _Permission(models.Expression):
         self.identity: Any = models.F(resource_id_attr(model))
         self.owner_lookup = "pk"
         self.row_model: type[models.Model] | None = None
+        # Resolution makes shallow copies; all copies identify one projection
+        # when a union owner shares its permission predicate.
+        self._rebac_permission_token = object()
 
     def get_source_expressions(self) -> list[Any]:
         return [self.identity]
@@ -91,16 +96,24 @@ class _Permission(models.Expression):
             raise ValueError("Resolve a permission expression into its model query first")
         using = connection.alias
         with database_context(using):
-            active = backend()
-            condition: BaseExpression | None = None
-            if self.row_model._meta.concrete_model is self.model._meta.concrete_model:
-                condition = active.permission_expression(
-                    model=self.model,
-                    subject=self.actor,
-                    action=self.action,
-                    using=using,
-                    identity=self.identity,
-                )
+            plan: Any = getattr(compiler.query, "_rebac_subject_plan", ((), (), {}, None))
+            shared = (
+                plan[2].get(self._rebac_permission_token)
+                if plan[3] == using
+                and self.row_model._meta.concrete_model is self.model._meta.concrete_model
+                else None
+            )
+            condition: BaseExpression | None = shared
+            if condition is None:
+                active = backend()
+                if self.row_model._meta.concrete_model is self.model._meta.concrete_model:
+                    condition = active.permission_expression(
+                        model=self.model,
+                        subject=self.actor,
+                        action=self.action,
+                        using=using,
+                        identity=self.identity,
+                    )
             if condition is None:
                 rows = self.model._default_manager.all().using(using)
                 if not isinstance(rows, RebacQuerySet):

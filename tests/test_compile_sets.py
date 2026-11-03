@@ -15,12 +15,13 @@ from rebac import (
     evaluator_scope,
     sudo,
 )
+from rebac._id import resource_id_attr
 from rebac.compile import read
 from rebac.compile.predicate import Bound
 from rebac.compile.program import CompileProgram
 from rebac.schema import parse_zed
 from rebac.testing import install_schema
-from tests.testapp.models import Post
+from tests.testapp.models import Folder, Post
 
 pytestmark = pytest.mark.django_db
 ACTOR = SubjectRef.of("auth/user", "alice")
@@ -64,6 +65,48 @@ def test_actor_set_decision_reaches_fixed_point_through_cycle():
     sets = operation.sets(operation.verdicts(("docs/doc", "read")))
     assert sets is not None
     assert sets.ids(("auth/group", "member"), Bound.LOWER) == frozenset(names)
+
+
+def test_decided_actor_set_does_not_also_define_subject_cte():
+    local = install_schema("""
+        definition auth/user {}
+        definition blog/folder {
+            relation member: auth/user | blog/folder#member
+        }
+        definition blog/post {
+            relation viewer: blog/folder#member
+            permission read = viewer
+        }
+    """)
+    with sudo(reason="decided actor set fixture"):
+        folder = Folder.objects.create(name="staff")
+    local.write_relationships(
+        [RelationshipTuple(ObjectRef("blog/folder", str(folder.pk)), "member", ACTOR)]
+    )
+    operation = read._Operation.begin(local, ACTOR, "default")
+    verdicts = operation.verdicts(("blog/post", "read"))
+    sets = operation.sets(verdicts)
+    assert sets is not None
+    model = operation.model_index.resource("blog/folder")
+    assert model is not None
+    compiler = operation.compiler(verdicts, sets=sets, share_subject_rows=True)
+    assert (
+        compiler._subject_cte(
+            ("blog/folder", "member"),
+            model,
+            resource_id_attr(model),
+            Bound.LOWER,
+            {},
+            True,
+        )
+        is None
+    )
+    assert compiler.statement_ctes() == ()
+    predicate = compiler.holds(("blog/folder", "member"), read._model_at(model), Bound.LOWER)
+    matching = Folder._base_manager.filter(predicate)
+    _sql, params = matching.query.sql_with_params()
+    assert str(folder.pk) in {str(param) for param in params}
+    assert list(matching.values_list("pk", flat=True)) == [folder.pk]
 
 
 def test_stale_set_decision_cannot_grant(monkeypatch):

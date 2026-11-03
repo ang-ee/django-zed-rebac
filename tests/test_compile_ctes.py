@@ -12,6 +12,7 @@ from django.test.utils import CaptureQueriesContext
 from rebac import ObjectRef, RelationshipTuple, SubjectRef, sudo, to_object_ref
 from rebac.compile import read
 from rebac.errors import PermissionDenied
+from rebac.expressions import permission_expression
 from rebac.managers import share_scoped_definitions
 from rebac.models import active_relationship_model
 from rebac.schema import parse_zed
@@ -161,6 +162,181 @@ def test_repeated_recursive_arrow_shares_its_target_cte():
     assert list(
         Post.objects.with_actor(actor).with_action("many").values_list("pk", flat=True)
     ) == [post.pk]
+
+
+def test_six_operand_owner_defines_each_subject_set_key_once():
+    local = install_schema("""
+        definition auth/user {}
+        definition blog/folder {
+            relation viewer: auth/user
+            permission read = viewer
+        }
+        definition blog/post {
+            relation folder: blog/folder // rebac:field=folder
+            permission first = folder->read
+            permission second = folder->read
+            permission third = folder->read
+        }
+    """)
+    actor = SubjectRef.of("auth/user", "six-operand-ids")
+    with sudo(reason="six operand subject CTE fixture"):
+        folder = Folder.objects.create(name="shared")
+        post = Post.objects.create(title="shared", folder=folder)
+    local.write_relationships([RelationshipTuple(to_object_ref(folder), "viewer", actor)])
+
+    branches = [
+        Post.objects.with_actor(actor)
+        .with_action(action)
+        .scoped()
+        .annotate(can_first=permission_expression(Post, "first", actor=actor))
+        .values("pk", "can_first")
+        for action in ("first", "second") * 3
+    ]
+    plain = [
+        models.QuerySet(model=Post, query=branch.query.clone(), using=branch.db)
+        for branch in branches
+    ]
+    union = plain[0].union(*plain[1:], all=True)
+    before_sql = str(union.query)
+    shared = share_scoped_definitions(union)
+    with CaptureQueriesContext(connection) as renders:
+        after_sql = str(shared.query)
+    assert len(renders) == 0
+    names = re.findall(r'"(rebac_ids_(\d+)_(lower|upper)(?:_[^\"]+)?)" AS \(', after_sql)
+    keys = {(ordinal, bound) for _name, ordinal, bound in names}
+    assert len(names) == len(keys) == 2
+    assert len(re.findall(r'"rebac_ids_[^\"]+" AS \(', before_sql)) == 12
+    assert list(shared.values_list("pk", "can_first")) == [(post.pk, True)] * 6
+    unscoped = Post._base_manager.annotate(
+        can_first=permission_expression(Post, "third", actor=actor)
+    ).values("pk", "can_first")
+    mixed = share_scoped_definitions(plain[0].union(plain[1], unscoped, all=True))
+    assert len(mixed.query._rebac_subject_plan[2]) == 2
+    assert sum(cte.name.startswith("rebac_ids_") for cte in mixed.query._rebac_subject_plan[1]) == 2
+    assert list(mixed.values_list("pk", "can_first")) == [(post.pk, True)] * 3
+
+
+def test_shared_projection_keeps_row_truth_and_where_joins(monkeypatch):
+    local = install_schema("""
+        definition auth/user {}
+        definition blog/folder {
+            relation viewer: auth/user
+            relation editor: auth/user
+            permission read = viewer
+            permission edit = editor
+        }
+        definition blog/post {
+            relation ancestor: blog/folder // rebac:field=folder__parent
+            permission first = ancestor->read
+            permission second = ancestor->edit
+            permission visible = (first + second)
+        }
+    """)
+    actor = SubjectRef.of("auth/user", "projection-owner")
+    other = SubjectRef.of("auth/user", "projection-other")
+    with sudo(reason="projection row parity fixture"):
+        viewed = Folder.objects.create(name="viewed")
+        edited = Folder.objects.create(name="edited")
+        viewed_child = Folder.objects.create(name="viewed child", parent=viewed)
+        edited_child = Folder.objects.create(name="edited child", parent=edited)
+        first = Post.objects.create(title="first", folder=viewed_child)
+        second = Post.objects.create(title="second", folder=edited_child)
+    local.write_relationships(
+        [
+            RelationshipTuple(to_object_ref(viewed), "viewer", actor),
+            RelationshipTuple(to_object_ref(edited), "editor", actor),
+        ]
+    )
+
+    def union(*, in_where=False, projection_actor=actor):
+        branches = []
+        for _ in range(2):
+            branch = (
+                Post.objects.with_actor(actor)
+                .with_action("visible")
+                .scoped()
+                .annotate(can_first=permission_expression(Post, "first", actor=projection_actor))
+            )
+            if in_where:
+                branch = branch.filter(can_first=True)
+            branch = branch.values("pk", "can_first")
+            branches.append(
+                models.QuerySet(model=Post, query=branch.query.clone(), using=branch.db)
+            )
+        return branches[0].union(branches[1], all=True)
+
+    expected = sorted(union().values_list("pk", "can_first"))
+    expected_where = sorted(union(in_where=True).values_list("pk", "can_first"))
+    assert expected == sorted([(first.pk, True), (second.pk, False)] * 2)
+    assert expected_where == [(first.pk, True)] * 2
+
+    normal_shared = share_scoped_definitions(union())
+    assert len(normal_shared.query._rebac_subject_plan[2]) == 2
+    assert sorted(normal_shared.values_list("pk", "can_first")) == expected
+
+    original = read.Compiler._subject_cte
+
+    def without_projection_cte(self, key, model, identity, bound, visits, depth_possible):
+        if key == ("blog/post", "first"):
+            return None
+        return original(self, key, model, identity, bound, visits, depth_possible)
+
+    monkeypatch.setattr(read.Compiler, "_subject_cte", without_projection_cte)
+    assert sorted(share_scoped_definitions(union()).values_list("pk", "can_first")) == expected
+    assert (
+        sorted(share_scoped_definitions(union(in_where=True)).values_list("pk", "can_first"))
+        == expected_where
+    )
+    different = share_scoped_definitions(union(projection_actor=other))
+    assert different.query._rebac_subject_plan[2] == {}
+    assert sorted(different.values_list("pk", "can_first")) == sorted(
+        [(first.pk, False), (second.pk, False)] * 2
+    )
+
+
+def test_shared_decided_set_projection_has_no_target_subject_cte():
+    local = install_schema("""
+        definition auth/user {}
+        definition blog/folder {
+            relation member: auth/user | blog/folder#member
+        }
+        definition blog/post {
+            relation viewer: blog/folder#member
+            permission read = viewer
+            permission check = viewer
+        }
+    """)
+    actor = SubjectRef.of("auth/user", "projected-set")
+    with sudo(reason="projected set fixture"):
+        folder = Folder.objects.create(name="member set")
+        post = Post.objects.create(title="set reader")
+    local.write_relationships(
+        [
+            RelationshipTuple(to_object_ref(folder), "member", actor),
+            RelationshipTuple(
+                to_object_ref(post),
+                "viewer",
+                SubjectRef.of("blog/folder", str(folder.pk), "member"),
+            ),
+        ]
+    )
+    branches = [
+        Post.objects.with_actor(actor)
+        .with_action("read")
+        .scoped()
+        .annotate(can_check=permission_expression(Post, "check", actor=actor))
+        .values("pk", "can_check")
+        for _ in range(3)
+    ]
+    plain = [
+        models.QuerySet(model=Post, query=branch.query.clone(), using=branch.db)
+        for branch in branches
+    ]
+    shared = share_scoped_definitions(plain[0].union(*plain[1:], all=True))
+    sql = str(shared.query)
+    ids = re.findall(r'"rebac_ids_(\d+)_(lower|upper)(?:_[^\"]+)?" AS \(', sql)
+    assert len(ids) == len(set(ids)) == 2
+    assert list(shared.values_list("pk", "can_check")) == [(post.pk, True)] * 3
 
 
 def test_late_nested_set_scopes_compile_self_contained():
