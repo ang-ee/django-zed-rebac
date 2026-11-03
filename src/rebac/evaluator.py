@@ -103,14 +103,20 @@ class PermissionEvaluator:
     __slots__ = (
         "_accessible_cache",
         "_check_cache",
+        "_fact_decisions",
         "_max_size",
+        "_row_decisions",
         "_schema_scope",
+        "_set_decisions",
     )
 
     def __init__(self, *, max_size: int = 10_000) -> None:
         self._check_cache: OrderedDict[tuple[Any, ...], CheckResult] = OrderedDict()
         self._accessible_cache: OrderedDict[tuple[Any, ...], tuple[str, ...]] = OrderedDict()
         self._max_size = max_size
+        self._row_decisions: OrderedDict[tuple[Any, ...], Any] = OrderedDict()
+        self._set_decisions: OrderedDict[tuple[Any, ...], Any] = OrderedDict()
+        self._fact_decisions: OrderedDict[tuple[Any, ...], bool] = OrderedDict()
         self._schema_scope = SchemaScope()
 
     # ----- public API -----
@@ -219,6 +225,9 @@ class PermissionEvaluator:
         """
         self._check_cache.clear()
         self._accessible_cache.clear()
+        self._row_decisions.clear()
+        self._set_decisions.clear()
+        self._fact_decisions.clear()
         self._schema_scope.clear()
 
     # ----- introspection (for tests + debugging) -----
@@ -295,6 +304,9 @@ def evaluator_scope(
         evaluator._schema_scope.users -= 1
         if evaluator._schema_scope.users == 0:
             evaluator._schema_scope.clear()
+            evaluator._row_decisions.clear()
+            evaluator._set_decisions.clear()
+            evaluator._fact_decisions.clear()
         try:
             _current_evaluator.reset(token)
         except ValueError:

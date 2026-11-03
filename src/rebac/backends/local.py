@@ -981,8 +981,11 @@ def mark_relationships_changed() -> None:
     every evaluator scope in this process drops its decisions.
     """
     global _relationship_generation
+    from ..watch import bump_row_generation
+
     with _backend_registry_lock:
         _relationship_generation += 1
+    bump_row_generation()
 
 
 def mark_db_loaded_schemas_stale(**kwargs: Any) -> None:

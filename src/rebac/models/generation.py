@@ -39,6 +39,7 @@ class SchemaGenerationManager(models.Manager["SchemaGeneration"]):
     def advance(self, *, using: str) -> None:
         """Publish policy writes atomically, using a fresh, rollback-safe identity."""
         from ..signals import _mark_schema_caches_stale
+        from ..watch import bump_row_generation
 
         with schema_write_atomic(using):
             rows = self.using(using)
@@ -49,6 +50,7 @@ class SchemaGenerationManager(models.Manager["SchemaGeneration"]):
                     # Another writer repaired the row between UPDATE and INSERT.
                     rows.filter(pk=1).update(revision=revision)
             _mark_schema_caches_stale()
+            bump_row_generation()
 
 
 class SchemaGeneration(models.Model):

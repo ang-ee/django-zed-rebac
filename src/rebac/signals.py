@@ -17,6 +17,7 @@ from django.db.models.signals import (
     class_prepared,
     m2m_changed,
     post_delete,
+    post_save,
     pre_delete,
     pre_save,
 )
@@ -169,6 +170,7 @@ def connect_owned_model(model: type[Model]) -> None:
         return
     _owned.add(model)
     _connect(pre_delete, _rebac_pre_delete, model)
+    _connect(post_save, _tracked_post_save, model)
     connect_subject_model(model)
 
 
@@ -194,6 +196,7 @@ def _register_model(model: type[Model]) -> None:
         if model not in _tracked:
             _tracked.add(model)
             _connect(pre_save, _tracked_pre_save, model)
+            _connect(post_save, _tracked_post_save, model)
             _connect(pre_delete, _rebac_pre_delete, model)
             connect_subject_model(model)  # also finishes non-identity tracked deletes
     # Avoid get_user_model() during class preparation; labels/lineage suffice.
@@ -229,6 +232,7 @@ def connect_tracked_signals() -> None:
         if not tracked_model(model):
             for signal, handler in (
                 (pre_save, _tracked_pre_save),
+                (post_save, _tracked_post_save),
                 (pre_delete, _rebac_pre_delete),
             ):
                 signal.disconnect(sender=model, dispatch_uid=handler.__name__)
@@ -451,6 +455,9 @@ def _rebac_cascade_resource(
     **kwargs: Any,
 ) -> None:
     from .mixins import delete_scope
+    from .watch import bump_row_generation
+
+    bump_row_generation()
 
     scope = delete_scope(origin, using)
     identities = model_identities(sender, instance)
@@ -459,6 +466,12 @@ def _rebac_cascade_resource(
         return  # the owner holds the old captures and finishes once for the collection
     else:
         cleanup_identities(identities, using=using)
+
+
+def _tracked_post_save(sender: type[Model], **kwargs: Any) -> None:
+    from .watch import bump_row_generation
+
+    bump_row_generation()
 
 
 @receiver(post_delete, sender="rebac.SchemaOverride")
@@ -509,6 +522,11 @@ def _tracked_m2m(
     **kwargs: Any,
 ) -> None:
     if sender not in _throughs:
+        return
+    if action in {"post_add", "post_remove", "post_clear"}:
+        from .watch import bump_row_generation
+
+        bump_row_generation()
         return
     if action in {"pre_add", "pre_remove", "pre_clear"}:
         pre_gated = _related_m2m_write.get()

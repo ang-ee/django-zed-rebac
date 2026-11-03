@@ -626,6 +626,7 @@ class RebacQuerySet(models.QuerySet[_M]):
         self._rebac_eager_scope = False
         self._rebac_aggregate_scope = False
         self._rebac_visibility_applied = False
+        self._rebac_scope_generation: tuple[int, int] | None = None
 
     def __getstate__(self) -> dict[str, Any]:
         """Do not transport actor or sudo authority through a pickle."""
@@ -640,6 +641,7 @@ class RebacQuerySet(models.QuerySet[_M]):
         state["_rebac_internal_bypass"] = False
         state["_rebac_ambient_bypass"] = False
         state["_rebac_scope_applied"] = False
+        state["_rebac_scope_generation"] = None
         state["_rebac_scope_decision"] = None
         state["_rebac_eager_scope"] = False
         state["_rebac_visibility_applied"] = False
@@ -847,6 +849,7 @@ class RebacQuerySet(models.QuerySet[_M]):
         self._query = _without_query_scope(self.query)
         self._rebac_scope_applied = False
         self._rebac_scope_decision = None
+        self._rebac_scope_generation = None
 
     def _refresh_scope(self) -> None:
         self._reset_scope()
@@ -1019,11 +1022,20 @@ class RebacQuerySet(models.QuerySet[_M]):
         the underlying relationship SQL is bounded by the schema's
         depth, not by the number of resolvers fired.
         """
+        from .backends import local
+        from .watch import row_generation
+
+        generation = (local._relationship_generation, row_generation())
         if self._rebac_scope_applied:
-            return
+            if self._rebac_scope_generation == generation:
+                return
+            # A tracked write can invalidate a prepared lower bound. Rebuild
+            # before compilation; raw SQL writes are still checked by witnesses.
+            self._reset_scope()
         actor, sudo = self._resolve_effective_actor(audit=audit)
         self._rebac_scope_applied = True
         self._rebac_scope_decision = (actor, sudo)
+        self._rebac_scope_generation = generation
         if sudo:
             return
         self._scope_query(self.query, actor)
@@ -1060,7 +1072,13 @@ class RebacQuerySet(models.QuerySet[_M]):
                 model=model, subject=actor, action=action, using=self.db
             )
             if predicate is not None:
+                # `_apply_scope_in_place`, including its embedded-queryset
+                # path in `_RebacQuery.resolve_expression`, owns preparation
+                # on this resolved alias. The expression keeps the result.
+                from .compile.read import prepare_resolved_filter
+
                 restriction = query.build_where(predicate)
+                prepare_resolved_filter(restriction, query.where, self.db)
                 query.where = WhereNode([query.where, _ScopeWhere(children=[restriction])])
                 return
             if backend_grants_all(
@@ -1123,6 +1141,7 @@ class RebacQuerySet(models.QuerySet[_M]):
         clone._rebac_aggregate_scope = self._rebac_aggregate_scope
         clone._rebac_scope_applied = self._rebac_scope_applied
         clone._rebac_scope_decision = self._rebac_scope_decision
+        clone._rebac_scope_generation = self._rebac_scope_generation
         if not self._rebac_eager_scope:
             clone._reset_scope()
         return clone

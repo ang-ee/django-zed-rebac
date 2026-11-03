@@ -7,28 +7,28 @@ pre-1.0; breaking changes within a minor version are explicitly called out.
 
 ### Changed
 
-- Permission scopes compile arrows, actor-side sets, fixed facts and row
-  membership inline. Rendering a prepared scope, including a caveated one,
-  executes no decision queries and uses no connection observer,
-  `execute_wrappers`, or `run_on_commit`.
-  The `_Rows` and `ActorSets` witnesses and kept-row caches are removed.
-- Invalidation remains library-owned through relationship and schema
-  generations, evaluator scope exit and `invalidate()`. Writes that bypass
-  REBAC's own owners inside one evaluator scope are unobserved. Inline SQL
-  reads the next statement's tuple and backing rows; staleness can affect
-  only `_check_cache` and `_accessible_cache`, which already decline inside
-  transactions. Call `invalidate()` after an out-of-band write when either
-  cache may hold an answer.
-- Stored subject-set membership now follows a recursive CTE to a fixed point
-  inside the statement, including cycles and memberships deeper than
+- Bounded model-row, actor-set and fixed-fact decisions are prepared before
+  queryset SQL renders and witnessed in each statement that binds them.
+  An evaluator scope reuses decisions until a library-owned write advances
+  the relationship or row generation; outside it, decisions are per operation.
+  Oversized sets retain the inline and recursive CTE fallback. A raw SQL
+  change can hide newly readable rows until scope exit but cannot grant
+  through a stale decision. Rendering a prepared scope issues no queries.
+  Root rows stay in the selecting statement; eager scopes prepare afresh after
+  library-owned writes, and bulk checks keep actor memberships in shared SQL.
+  No connection observer, `execute_wrappers`, `run_on_commit` or confirmation
+  query is used.
+- Stored subject-set membership follows a fixed point in preparation when
+  bounded, or a recursive CTE inside the statement when it exceeds the
+  decision budget; both include cycles and memberships deeper than
   `REBAC_DEPTH_LIMIT`.
 - Stock `django-cte` 5.x supplies statement-local recursive relations for
   stored tuple traversal and supported native integer self paths. Bulk point
   statements also respect the database's parameter limit.
 - Queryset scopes bind the policy and caveat verdicts when built. New caveat
   instances are excluded from an existing scope's lower bound. Point checks
-  can read caveat instances once before their statement, in addition to the
-  policy load; this is the CEL exception to a single statement.
+  prepare bounded sets and fixed facts as needed before their statement;
+  caveat instances can also require a preparation read.
 - Autocommit evaluator scopes reuse a schema pin. Inside atomic blocks, each
   permission operation reads the schema revision once and pins only for that
   operation. Django exposes no rollback-safe transaction-boundary signal

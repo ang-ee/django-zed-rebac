@@ -35,6 +35,22 @@ if TYPE_CHECKING:
     from .backends.local import LocalBackend
 
 
+_row_generation_lock = Lock()
+_row_generation = 0
+
+
+def row_generation() -> int:
+    """Process-local invalidation token for bounded row decisions."""
+    with _row_generation_lock:
+        return _row_generation
+
+
+def bump_row_generation() -> None:
+    global _row_generation
+    with _row_generation_lock:
+        _row_generation += 1
+
+
 @dataclass(frozen=True)
 class WatchSpec:
     model_label: str
@@ -383,6 +399,7 @@ def model_write(
         with database_context(using), transaction.atomic(using=using):
             yield policy is not None and model_is_watched(policy.watched, model, names)
     finally:
+        bump_row_generation()
         if token is not None:
             _open.reset(token)
 

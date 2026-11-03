@@ -82,6 +82,7 @@ class CompileProgram:
     components: dict[Key, frozenset[Key]]
     recursive: frozenset[Key]
     alias_cycles: frozenset[Key]
+    stored_sets: frozenset[Key]
 
     @classmethod
     def build(cls, schema: Schema) -> CompileProgram:
@@ -138,6 +139,7 @@ class CompileProgram:
             components,
             frozenset(recursive),
             frozenset(alias_cycles),
+            _stored_sets(schema),
         )
 
     def reachable(self, root: Key) -> frozenset[Key]:
@@ -151,6 +153,36 @@ class CompileProgram:
             pending.extend(dep.target for dep in self.dependencies.get(key, ()))
             pending.extend(self.via_dependencies.get(key, ()))
         return frozenset(result)
+
+
+def _stored_sets(schema: Schema) -> frozenset[Key]:
+    """Subject-set relations whose closure depends only on stored tuples."""
+    relations = {
+        (definition.resource_type, relation.name): relation
+        for definition in schema.definitions
+        for relation in definition.relations
+    }
+    stored = {
+        (allowed.type, allowed.relation)
+        for relation in relations.values()
+        for allowed in relation.allowed_subjects
+        if allowed.relation
+    }
+    stored = {key for key in stored if key in relations and relations[key].backing is None}
+    while True:
+        dropped = {
+            key
+            for key in stored
+            if any(
+                allowed.relation
+                and (allowed.type, allowed.relation) in relations
+                and (allowed.type, allowed.relation) not in stored
+                for allowed in relations[key].allowed_subjects
+            )
+        }
+        if not dropped:
+            return frozenset(stored)
+        stored -= dropped
 
 
 def program_errors(schema: Schema) -> list[checks.CheckMessage]:

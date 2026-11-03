@@ -1,10 +1,11 @@
-"""Inline permission scopes follow live tuple and backing rows."""
+"""Bounded row decisions and inline overflow follow live permission data."""
 
 import pytest
 from django.db import connection, models
 from django.test.utils import CaptureQueriesContext, isolate_apps
 
 from rebac import ObjectRef, RelationshipTuple, SubjectRef, evaluator_scope, sudo, to_object_ref
+from rebac.compile import read
 from rebac.field_backing import foreign_key_kept, resolve_field_backing
 from rebac.schema import parse_zed
 from rebac.testing import install_schema
@@ -50,7 +51,7 @@ def tree():
     return local, child, leaf, post
 
 
-def test_hierarchy_and_arrow_are_inline(tree):
+def test_hierarchy_and_arrow_scope_is_prepared(tree):
     _local, child, leaf, post = tree
     scope = Post.objects.with_actor(ACTOR).scoped()
     with CaptureQueriesContext(connection) as queries:
@@ -59,6 +60,89 @@ def test_hierarchy_and_arrow_are_inline(tree):
     assert "SELECT" in sql
     assert set(Folder.objects.with_actor(ACTOR).values_list("pk", flat=True)) == {child.pk, leaf.pk}
     assert list(scope.values_list("pk", flat=True)) == [post.pk]
+
+
+def test_small_hierarchy_binds_ids_and_keeps_statement_bounded(tree):
+    _local, child, leaf, post = tree
+    with CaptureQueriesContext(connection) as queries:
+        assert list(Post.objects.with_actor(ACTOR).values_list("pk", flat=True)) == [post.pk]
+    sql = queries[-1]["sql"]
+    assert f'"folder_id" IN ({child.pk}, {leaf.pk})' in sql
+    assert len(sql) < 25_000
+
+
+def test_overflow_keeps_inline_fallback(tree, monkeypatch):
+    _local, child, leaf, post = tree
+    monkeypatch.setattr(read, "_ROW_LIMIT", 1)
+    with CaptureQueriesContext(connection) as queries:
+        assert list(Post.objects.with_actor(ACTOR).values_list("pk", flat=True)) == [post.pk]
+    assert f'"folder_id" IN ({child.pk}, {leaf.pk})' not in queries[-1]["sql"]
+
+
+def test_evaluator_reuses_decided_rows_without_a_second_read(tree):
+    _local, _child, _leaf, post = tree
+    with evaluator_scope():
+        with CaptureQueriesContext(connection) as first:
+            assert list(Post.objects.with_actor(ACTOR).values_list("pk", flat=True)) == [post.pk]
+        with CaptureQueriesContext(connection) as second:
+            assert list(Post.objects.with_actor(ACTOR).values_list("pk", flat=True)) == [post.pk]
+    assert len(first) > 1
+    assert len(second) == 1
+
+
+def test_owned_model_write_invalidates_decided_rows(tree):
+    _local, child, _leaf, post = tree
+    with sudo(reason="owned row generation fixture"):
+        other = Folder.objects.create(name="other")
+        new_post = Post.objects.create(title="other", folder=other)
+    with evaluator_scope():
+        assert set(Post.objects.with_actor(ACTOR).values_list("pk", flat=True)) == {post.pk}
+        with sudo(reason="owned row generation update"):
+            Folder.objects.filter(pk=other.pk).update(parent=child)
+        assert set(Post.objects.with_actor(ACTOR).values_list("pk", flat=True)) == {
+            post.pk,
+            new_post.pk,
+        }
+
+
+def test_revocation_after_decision_fails_witness(tree, monkeypatch):
+    local, child, _leaf, _post = tree
+    original = read._Rows._decide
+    changed = []
+
+    def decide_then_revoke(self, key):
+        found = original(self, key)
+        if key == ("blog/folder", "read") and not changed:
+            changed.append(True)
+            local.delete_relationship(RelationshipTuple(to_object_ref(child), "viewer", ACTOR))
+        return found
+
+    monkeypatch.setattr(read._Rows, "_decide", decide_then_revoke)
+    assert not Post.objects.with_actor(ACTOR).exists()
+    assert changed
+
+
+def test_raw_sql_write_in_evaluator_scope_hides_and_never_grants(tree):
+    _local, child, leaf, post = tree
+    with sudo(reason="raw SQL witness fixture"):
+        other = Folder.objects.create(name="other")
+        new_post = Post.objects.create(title="new", folder=other)
+    with evaluator_scope():
+        assert set(Post.objects.with_actor(ACTOR).values_list("pk", flat=True)) == {post.pk}
+        with connection.cursor() as cursor:
+            cursor.execute(
+                'UPDATE "testapp_folder" SET "parent_id" = %s WHERE "id" = %s',
+                [other.pk, leaf.pk],
+            )
+        # The old set is still bound, but its witness re-reads the moved row.
+        assert not Post.objects.with_actor(ACTOR).exists()
+        with connection.cursor() as cursor:
+            cursor.execute(
+                'UPDATE "testapp_folder" SET "parent_id" = %s WHERE "id" = %s',
+                [child.pk, other.pk],
+            )
+        # A new member cannot appear in a previously decided lower bound.
+        assert new_post.pk not in set(Post.objects.with_actor(ACTOR).values_list("pk", flat=True))
 
 
 def test_inline_hierarchy_respects_depth_limit(tree, settings):

@@ -408,8 +408,9 @@ For **unfiltered** constants, resolution is fixed-target rather than per-row,
 which has two consequences in
 `LocalBackend`:
 
-- **One inline subquery per fixed target.** The constant arrow is a
-  row-independent subquery in the permission statement. Nothing is stored per
+- **One fixed-target decision per operation.** The constant arrow is a
+  row-independent fact decided before the permission statement and re-read
+  by its witness. Nothing is stored per
   resource, so new rows need nothing written for this constant. A
   resource-specific ban (`- banned`) is evaluated per row in the same
   statement.
@@ -1744,8 +1745,9 @@ guards. A permission is compiled to a Django `Q` predicate over the
 application's own tables and the relationship table, and the database
 evaluates it when the statement runs. Field-, attribute- and const-backed
 relations are read from the model columns; stored relations are read from
-tuples. Nothing is built, rebuilt or verified: a model write or a tuple write
-is visible to the next read. The schema walker (`rebac.schema.walker`) remains
+tuples. Small model-backed target sets, stored actor sets and fixed-object
+facts are decided before rendering and witnessed by the statement. Sets that
+do not fit remain inline. The schema walker (`rebac.schema.walker`) remains
 for `check_new`, which evaluates a row that does not exist yet.
 
 The implementation is the package `rebac.compile`: `program` (the dependency
@@ -1844,8 +1846,8 @@ A queryset whose current resolved Django predicates require one resource identit
 uses the existing point lower-bound statement as an `EXISTS` condition, with
 the canonical identity bound as a parameter. The caller's predicates remain in
 the selecting statement; this is neither a separate permission check nor a
-queryset hint. Recognition happens at SQL compilation, after aliases and fields
-have resolved, and is never retained on a queryset or scope expression.
+queryset hint. Recognition happens after aliases and fields resolve, before
+scope SQL renders, and is never retained on a queryset or scope expression.
 
 Only globally mandatory, positive `AND` paths of native `WhereNode` are
 inspected. Eligible leaves are the exact native `Exact`, `IntegerFieldExact`
@@ -1902,9 +1904,10 @@ alternative. Its subject admits the actor when the subject is:
 - a subject set `T:s#rel`, when the actor holds `rel` on `T:s` or is that
   subject set itself.
 
-The third case is the arrow mechanism applied to a relation. Stored and
-backed subject sets both compile inline, with recursion bounded by
-`REBAC_DEPTH_LIMIT`.
+The third case is the arrow mechanism applied to a relation. Stored subject
+sets are decided to a fixed point when they fit the 256-member budget;
+otherwise their recursive CTE remains inline. Backed subject sets use
+model-backed row decisions when they fit, otherwise the inline predicate.
 
 The compiler reads model rows through `_base_manager` and applies no
 application filter, so soft-deleted rows are read like any other.
@@ -1970,33 +1973,29 @@ with two deliberate exceptions, in both of which the SQL is Django's own:
    positions. `tests/test_codec_cache.py` pins the cached SQL and parameters
    equal to the uncached ones for integer, text and UUID identities.
 
-#### Inline permission scopes
+#### Prepared permission scopes
 
-A queryset scope is one SQL predicate. Field- and attribute-backed arrows
-select their targets with correlated or uncorrelated subqueries. A constant
-arrow such as `admin->member` is an uncorrelated subquery, and its result is
-not folded into a Python boolean. Stored subject sets remain in the statement
-as recursive CTE closure predicates followed to a fixed point, including
-cycles and nested groups. Other recursive paths retain `REBAC_DEPTH_LIMIT`.
-No arrow target, hierarchy row,
-fixed object, or actor membership is selected into Python while building or
-rendering the permission predicate. A statement sees tuple and backing writes
-in its own database snapshot.
+A queryset scope is one SQL predicate. Bounded field- and attribute-backed
+arrow targets are bound as native ID lists. Oversized targets retain their
+correlated or uncorrelated inline subqueries. Constant arrows use prepared
+fixed-object facts. Bounded stored subject sets are decided to a fixed point;
+oversized sets retain the recursive CTE closure, including cycles and nested
+groups. Other recursive paths retain `REBAC_DEPTH_LIMIT`. The statement
+witnesses every decision it binds in its own database snapshot.
 
 Queryset scopes pin the policy and caveat verdicts when the scope is built.
 Rendering a prepared scope therefore performs no decision read, including
 when a caveated relation is reachable. A newly written caveat instance is
 absent from that scope's lower bound and present in its upper bound, so it
 cannot add a grant. A newly built scope sees the instance. Point checks
-prepare caveat verdicts once before their statement when caveated relations
-are reachable; this is the only pre-statement decision read beyond loading
-the policy, because CEL cannot run in SQL.
+prepare caveat verdicts, bounded sets and fixed facts before their statement
+when reachable. CEL verdicts cannot run in SQL.
 
 `permission_expression()` binds its policy and caveat verdicts at SQL
-compilation by its existing late-binding contract. Two other render-time
-database accesses remain outside the prepared-scope contract: an embedded
-sudo queryset writes its audit row during compilation, and the late-bound
-permission expression can load a policy. These paths are unchanged.
+compilation by its existing late-binding contract. It also prepares the point
+or population plan then, after the final query's identity filter is known.
+This late-bound projection and an embedded sudo queryset's audit write remain
+outside the prepared-queryset-scope contract.
 
 The application clock is bound once per render. The policy revision fence
 closes a predicate whose published revision has changed. Queryset scopes
@@ -2005,13 +2004,52 @@ A scope built before an override deadline can close under its
 revision fence after the deadline rather than recompose itself; the next
 built scope uses the new policy.
 
+#### Decided rows
+
+Before compiling a scope, `_Rows` reads model-backed arrow targets and
+hierarchies into native ID lists, up to 5,000 IDs across the statement. An
+oversized set stays inline, using the same recursive CTE lowering where
+applicable. Root rows are selected by the statement and are never decided as
+a population. Polymorphic generic-FK targets stay inline. Bulk point checks
+keep actor memberships in their shared SQL bounds instead of expanding each
+actor separately. `_Operation._decide_sets` follows stored actor-set membership to
+a fixed point before compilation when it fits 256 members. `_Facts` decides
+fixed-object permissions used by constant backings. Point statements also
+prepare the sets and facts they use.
+
+Preparation runs when `RebacQuerySet._apply_scope_in_place` builds the scope
+on its selected database alias, including from `_RebacQuery.resolve_expression`
+for an embedded queryset. The resolved WHERE selects the point plan when a
+native identity is mandatory, otherwise the population plan. A combinator
+operand Django renders without its queryset owner prepares on first render
+and retains that result for another render. A library-owned write changes the
+generation and an eager queryset rebuilds its scope before its next evaluation.
+Once prepared for that query shape, `_Scope.as_sql` only binds parameters and
+compiles SQL; it performs no database read or connection introspection.
+
+Every authorizing statement re-reads the rows and tuple memberships on
+which its bound decisions depend. The witness is a lower bound: a raw SQL
+write or another process may make a new row readable without adding it to
+an evaluator scope's kept IDs, so it stays hidden; a changed or revoked
+member fails the witness and cannot grant. Library-owned model writes,
+tracked-model saves, delete cascades, M2M writes, tuple writes and schema
+publication bump a process-wide row generation. Along with the relationship
+generation, it invalidates decisions kept by `PermissionEvaluator`.
+The bounded evaluator memo is keyed by policy revision and shape, actor,
+scalar caveat-context key, root model and action, database alias, node or
+fact, relationship generation and row generation. Outside an evaluator scope
+decisions last for one operation. `invalidate()` and scope exit clear them.
+There is no statement observer, `execute_wrappers`, `run_on_commit`, or
+confirmation query.
+
 #### Kept statements and the policy fence
 
-Django compiles each inline statement once for a policy revision, actor
+Django compiles each undecided inline statement once for a policy revision, actor
 shape, model, action, database alias and vendor. `_policies` retains parsed
 policies and `_statements` retains Django-compiled SQL text, both with bounded
 least-recently-used eviction. Statement keys contain no membership lists,
-row decisions, or fact verdicts. Actor id, the application clock, point
+row decisions, or fact verdicts; statements with decisions are compiled for
+that operation. Actor id, the application clock, point
 resource id, and manual-schema revision are bound parameters. Statements
 whose caveat verdicts vary are compiled at each use.
 
@@ -2139,7 +2177,7 @@ needs one is not in its lower bound.
 |---|---|
 | `check_access()` | The lower bound at the resource id is one fenced SQL statement. When it fails and a caveat or recursion is in reach, the upper bound and depth probe may run afterward. GenericForeignKey content types are selected by a SQL subquery. |
 | `check_bulk_permissions()` | The answers of `check_access()`, with the work shared: see [Bulk checks](#bulk-checks). |
-| Queryset scope (`queryset_filter()`) | `Model.filter(holds(key, At(type, identity column, identity field, row=True), LOWER))`, with every arrow and set inline. |
+| Queryset scope (`queryset_filter()`) | The lower bound at the model identity, with bounded target IDs and actor sets prepared before rendering and witnessed in SQL. Oversized sets remain inline. |
 | `accessible()` | The lower bound over each part of the type's universe: the model's rows, the ids that tuples name at either end, constant targets, attribute containers, and field-backed targets whose model stores no rows. Wildcard and empty ids are excluded and the result is deduplicated. |
 | `lookup_subjects()` | Candidates are the subjects that tuples, backed columns and constants name on a path from the one resource; each is tested by its own point check, so the cost grows with the number of candidates. To ask about subjects already in hand, use `check_bulk_permissions()`. |
 | Model-level check (empty resource id) | A row-independent grant, or any accessible identity of the type. |
@@ -2171,8 +2209,8 @@ model still reads it.
 with the same context. Up to 50 lower-bound checks are columns of one SQL
 statement over the generation row. Items still undecided receive upper-bound
 and depth probes in further statements. Long SQL is split at about 64 KB.
-Each item has its own inline actor-set predicate; there is no Python set
-expansion or decision cache.
+Stored actor sets are decided in Python when bounded and reused within an
+evaluator scope; oversized sets retain the inline CTE predicate.
 
 #### Writes
 
@@ -2285,8 +2323,8 @@ of its own.
 
 #### Known limits
 
-- An inline scope embeds the target predicates of its arrows and the actor's
-  subject-set closure. Its size follows the schema and `REBAC_DEPTH_LIMIT`.
+- An oversized target or actor set remains inline; its statement size follows
+  the schema and `REBAC_DEPTH_LIMIT`.
 - Permissions that recurse through each other are unrolled without a
   convergence test (see [Recursion](#recursion)).
 - SQLite rejected the earlier nested actor-set fallback at the default
@@ -2876,8 +2914,9 @@ with evaluator_scope() as evaluator:
 ```
 
 The check and accessible caches share the `REBAC_EVALUATOR_CACHE_SIZE`
-(default `10_000`) LRU budget. They hold only returned answers, never
-actor-set or row decisions. Conditional results
+(default `10_000`) LRU budget for returned answers. The bounded row,
+actor-set and fixed-fact decision memos each use that size limit and follow
+the [Decided rows](#decided-rows) invalidation key. Conditional results
 (`CONDITIONAL_PERMISSION(missing=[...])`) are NOT cached — the missing caveat
 params are part of the answer and the next call may supply them. Per-call
 explicit `consistency` / `at_zookie` also bypass the cache.
@@ -3474,7 +3513,7 @@ no scale suite at the moment. Drivers, environment and release gates are in
 |---|---|---|
 | Pure reference gate | `tests/test_reference_model.py`, over `tests/reference_model.py` | The opt-in `reference_exhaustive` sweep exhausts every expression through four leaves over two relations, an arrow, builtins and a constant; up to three users, two nested groups including a wildcard member, two resources, three instants, and no/partial/full caveat context. Expression cases use 32 shards per shape/universe/instant/context; direct-tuple powersets use 16. The default gate retains all named counterexamples, all one/two-leaf expressions and deterministic samples of larger trees. The reference computes each actor's set membership directly; it uses no compiler code, no ORM and no walker. |
 | Differential semantics | `tests/test_compile_semantics.py`, `tests/test_read_contract.py`, with `tests/reference_harness.py` and `tests/reference_oracle.py` | Compare the compiled reads with the source facts, the frozen walker and the pure reference. Recursive schemas within and past `REBAC_DEPTH_LIMIT`, and data cycles; nested and wildcard groups; intersection and subtraction; constants with concrete bans; field paths (multi-hop, reverse, M2M, MTI, filtered), dynamic and fixed attributes; expiring tuples, override deadlines and recaveats; caveats in every operator position with all three check states; missing sets equal the reference's canonical residual set and are a subset of the walker's; subject-set actors, anonymous and empty ids; both relationship storage modes. |
-| Compiler | `tests/test_compile_*.py`, `tests/test_inline_render.py` | Dependency graph and schema validation; inline arrows, subject sets and fixed facts; tuple-only objects, bounds under caveats and depth, and revision fencing; SQL rendering without preparation queries; `caveat_key` on tuple writes and in migration `0008`. |
+| Compiler | `tests/test_compile_*.py`, `tests/test_inline_render.py` | Dependency graph and schema validation; bounded decisions and inline overflow for arrows, subject sets and fixed facts; tuple-only objects, bounds under caveats and depth, and revision fencing; prepared SQL rendering without decision queries; `caveat_key` on tuple writes and in migration `0008`. |
 | Enumeration and embedding | `tests/test_read_contract.py` | Scope rows equal definite per-row results; `Subquery`, `Exists`, `__in`, `Prefetch`, field gates and bulk guards remain scoped. `lookup_subjects` agrees with the reference. Public context arguments, model-level and model-less reads keep their meaning. |
 | Write effects | `tests/test_write_effects.py`, `tests/test_write_propagation*.py` | After every owner and signal path the next read reports the written state: mixin and plain re-parenting, subtree deletion, watched-field update, `bulk_update` in many batches, M2M add/remove/clear/set, collector SET_NULL/CASCADE, override create/delete/deadline, schema updates, tuple write owners. Writes outside the owners are read as stored, with no command run. A rolled-back write leaves reads as they were. Writes before the first sync, and while the library's tables are not migrated, proceed, and reads stay closed. |
 | Watch map and identities | `tests/test_watch.py`, `tests/test_codec.py`, `tests/test_codec_cache.py` | The watched columns of every backing kind, resolved from metadata without reading rows; canonical identity conversion for integer, text and UUID fields, with an invalid wire id matching nothing; the cached conversion guard equal to the uncached one. |

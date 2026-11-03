@@ -20,6 +20,7 @@ from rebac import (
     to_object_ref,
 )
 from rebac.backends import reset_backend
+from rebac.compile import read
 from rebac.errors import SchemaError
 from tests.backend_setup import install_schema
 from tests.testapp.models import BackingQueue, BackingTask, Folder, Post
@@ -40,6 +41,41 @@ definition blog/folder {
     permission exclusion = viewer - posts->read
 }
 """
+
+
+def test_fixed_fact_revoked_after_decision_fails_point_witness(local, monkeypatch):
+    install_schema(
+        local,
+        """
+        definition auth/user {}
+        definition site/role {
+            relation member: auth/user
+        }
+        definition blog/post {
+            relation admin: site/role // rebac:const=admin
+            permission read = admin->member
+        }
+    """,
+    )
+    with sudo(reason="fixed fact fixture"):
+        post = Post.objects.create(title="fixed fact")
+    grant = RelationshipTuple(ObjectRef("site/role", "admin"), "member", ALICE)
+    local.write_relationships([grant])
+    original = read._Facts._decide
+    changed = []
+
+    def decide_then_revoke(self, fact):
+        found = original(self, fact)
+        if not changed:
+            changed.append(True)
+            local.delete_relationship(grant)
+        return found
+
+    monkeypatch.setattr(read._Facts, "_decide", decide_then_revoke)
+    assert not local.check_access(
+        subject=ALICE, action="read", resource=to_object_ref(post)
+    ).allowed
+    assert changed
 
 
 @pytest.fixture(params=["denormalized", "registry"])

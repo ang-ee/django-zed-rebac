@@ -1,4 +1,4 @@
-"""Actor-side subject sets stay inside the permission statement."""
+"""Actor-side stored sets are decided before and witnessed in statements."""
 
 from itertools import pairwise
 
@@ -13,6 +13,10 @@ from rebac import (
     evaluator_scope,
     sudo,
 )
+from rebac.compile import read
+from rebac.compile.predicate import Bound
+from rebac.compile.program import CompileProgram
+from rebac.schema import parse_zed
 from rebac.testing import install_schema
 from tests.testapp.models import Post
 
@@ -40,6 +44,55 @@ def group(name):
     return SubjectRef.of("auth/group", name, "member")
 
 
+def test_stored_set_relation_is_detected():
+    assert CompileProgram.build(parse_zed(SCHEMA)).stored_sets == {("auth/group", "member")}
+
+
+def test_actor_set_decision_reaches_fixed_point_through_cycle():
+    local = install_schema(SCHEMA)
+    names = [f"g{index}" for index in range(12)]
+    local.write_relationships(
+        [
+            member(names[0], ACTOR),
+            *(member(outer, group(inner)) for inner, outer in pairwise(names)),
+            member(names[0], group(names[-1])),
+        ]
+    )
+    operation = read._Operation.begin(local, ACTOR, "default")
+    sets = operation.sets(operation.verdicts(("docs/doc", "read")))
+    assert sets is not None
+    assert sets.ids(("auth/group", "member"), Bound.LOWER) == frozenset(names)
+
+
+def test_stale_set_decision_cannot_grant(monkeypatch):
+    local = install_schema(SCHEMA)
+    edge = member("staff", ACTOR)
+    local.write_relationships([edge, RelationshipTuple(DOC, "viewer", group("staff"))])
+    operation = read._Operation.begin(local, ACTOR, "default")
+    stale = operation.sets(operation.verdicts(("docs/doc", "read")))
+    assert stale is not None
+    local.delete_relationship(edge)
+    monkeypatch.setattr(read._Operation, "_decide_sets", lambda self, key, verdicts: stale)
+    assert not local.check_access(subject=ACTOR, action="read", resource=DOC).allowed
+
+
+def test_evaluator_reuses_actor_set_decision():
+    local = install_schema(SCHEMA)
+    local.write_relationships(
+        [member("staff", ACTOR), RelationshipTuple(DOC, "viewer", group("staff"))]
+    )
+    with evaluator_scope():
+        with CaptureQueriesContext(connection) as first:
+            assert local.check_access(subject=ACTOR, action="read", resource=DOC).allowed
+        with CaptureQueriesContext(connection) as second:
+            assert not local.check_access(
+                subject=ACTOR, action="read", resource=ObjectRef("docs/doc", "other")
+            ).allowed
+    assert len(first) > 1
+    # The denied point still needs its lower and upper probes, but no set walk.
+    assert len(second) == 2
+
+
 def test_twelve_deep_membership_reaches_fixed_point_at_default_depth():
     local = install_schema(
         SCHEMA.replace(
@@ -65,7 +118,7 @@ def test_twelve_deep_membership_reaches_fixed_point_at_default_depth():
     ).allowed
 
 
-def test_nested_sets_and_cycles_are_bounded_inline():
+def test_nested_sets_and_cycles_are_decided_once():
     local = install_schema(SCHEMA)
     local.write_relationships(
         [
@@ -77,7 +130,9 @@ def test_nested_sets_and_cycles_are_bounded_inline():
     )
     with CaptureQueriesContext(connection) as queries:
         assert local.check_access(subject=ACTOR, action="read", resource=DOC).allowed
-    assert len(queries) == 1
+    # Two levels, the empty frontier, then the point statement.
+    assert len(queries) == 4
+    assert max(len(query["sql"]) for query in queries) < 6000
 
 
 def test_revoked_membership_changes_next_statement():
