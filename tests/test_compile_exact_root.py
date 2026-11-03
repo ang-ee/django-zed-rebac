@@ -54,9 +54,9 @@ def paths(monkeypatch):
         calls["point"].append(key)
         return point(operation, key, *args, **kwargs)
 
-    def scope_statement(operation, model, key):
+    def scope_statement(operation, model, key, *args, **kwargs):
         calls["scope"].append(key)
-        return scope(operation, model, key)
+        return scope(operation, model, key, *args, **kwargs)
 
     monkeypatch.setattr(read, "_point_statement", point_statement)
     monkeypatch.setattr(read, "_scope_statement", scope_statement)

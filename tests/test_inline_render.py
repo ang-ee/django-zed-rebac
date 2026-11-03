@@ -11,6 +11,8 @@ from django.db.models import Exists, OuterRef, Subquery
 from django.test.utils import CaptureQueriesContext
 
 from rebac import ObjectRef, RelationshipTuple, SubjectRef, evaluator_scope, sudo, to_object_ref
+from rebac.compile import read
+from rebac.expressions import permission_expression
 from rebac.testing import install_schema
 from tests.testapp.models import Attachment, Folder, Post
 
@@ -152,6 +154,41 @@ def test_sql_render_executes_no_queries(scoped, embedding):
     assert len(queries) == 0
     assert "SELECT" in sql
     assert row.pk is not None
+
+
+def test_permission_expression_does_not_read_decisions_while_rendering(scoped, request):
+    _local, row, _rows = scoped
+    statement = models.QuerySet(model=type(row)).annotate(
+        allowed=permission_expression(type(row), "read", actor=ACTOR)
+    )
+    with CaptureQueriesContext(connection) as queries:
+        assert "SELECT" in str(statement.query)
+        assert "SELECT" in str(statement.query)
+    # Caveat verdict lookup is the projection's existing late-binding read.
+    expected = 2 if request.node.callspec.params["scoped"] == "caveat" else 0
+    assert len(queries) == expected
+
+
+def test_accessible_uses_prepared_inline_scope(scoped, request):
+    local, row, _rows = scoped
+    with CaptureQueriesContext(connection) as queries:
+        ids = set(local.accessible(subject=ACTOR, action="read", resource_type="blog/post"))
+    if type(row) is Post:
+        assert str(row.pk) in ids
+    assert len(queries) <= (4 if request.node.callspec.params["scoped"] == "caveat" else 3)
+
+
+def test_standalone_scope_fallback_memoizes_after_first_render(scoped):
+    local, row, _rows = scoped
+    expression = read.scope_expression(
+        backend=local, model=type(row), action="read", actor=ACTOR, using="default"
+    )
+    statement = models.QuerySet(model=type(row)).filter(expression)
+    with CaptureQueriesContext(connection):
+        assert "SELECT" in str(statement.query)
+    with CaptureQueriesContext(connection) as second:
+        assert "SELECT" in str(statement.query)
+    assert len(second) == 0
 
 
 def test_lazy_with_actor_embedding_renders_without_queries(scoped):

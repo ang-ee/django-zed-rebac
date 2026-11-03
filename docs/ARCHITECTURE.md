@@ -1992,10 +1992,11 @@ prepare caveat verdicts, bounded sets and fixed facts before their statement
 when reachable. CEL verdicts cannot run in SQL.
 
 `permission_expression()` binds its policy and caveat verdicts at SQL
-compilation by its existing late-binding contract. It also prepares the point
-or population plan then, after the final query's identity filter is known.
-This late-bound projection and an embedded sudo queryset's audit write remain
-outside the prepared-queryset-scope contract.
+compilation by its existing late-binding contract. Its point or population
+plan stays inline, so rendering does not read bounded row, set, or fact
+decisions. Caveat verdicts retain their existing late read. An embedded sudo
+queryset's audit write also remains outside the prepared-queryset-scope contract.
+`accessible()` prepares its inline model-row scope before that query renders.
 
 The application clock is bound once per render. The policy revision fence
 closes a predicate whose published revision has changed. Queryset scopes
@@ -2006,8 +2007,8 @@ built scope uses the new policy.
 
 #### Decided rows
 
-Before compiling a scope, `_Rows` reads model-backed arrow targets and
-hierarchies into native ID lists, up to 5,000 IDs across the statement. An
+Before compiling a scope, `_Rows` reads model-backed arrow targets into native
+ID lists, up to 5,000 IDs across the statement. An
 oversized set stays inline, using the same recursive CTE lowering where
 applicable. Root rows are selected by the statement and are never decided as
 a population. Polymorphic generic-FK targets stay inline. Bulk point checks
@@ -2031,7 +2032,11 @@ Every authorizing statement re-reads the rows and tuple memberships on
 which its bound decisions depend. The witness is a lower bound: a raw SQL
 write or another process may make a new row readable without adding it to
 an evaluator scope's kept IDs, so it stays hidden; a changed or revoked
-member fails the witness and cannot grant. Library-owned model writes,
+member fails the witness and cannot grant. When any witness fails, its
+containing scope admits no rows for that statement.
+Witnesses compile against the statement's other row and actor-set decisions;
+their transitive row dependencies are witnessed too, so a decided node's full
+inline body need not be repeated in each witness. Library-owned model writes,
 tracked-model saves, delete cascades, M2M writes, tuple writes and schema
 publication bump a process-wide row generation. Along with the relationship
 generation, it invalidates decisions kept by `PermissionEvaluator`.
@@ -2039,18 +2044,23 @@ The bounded evaluator memo is keyed by policy revision and shape, actor,
 scalar caveat-context key, root model and action, database alias, node or
 fact, relationship generation and row generation. Outside an evaluator scope
 decisions last for one operation. `invalidate()` and scope exit clear them.
+The evaluator does not memoize decisions inside a transaction, when a reachable
+relationship can expire, or across an override deadline. This follows the
+LocalBackend answer-cache rollback and clock rules. The row memo limits the
+number of held IDs as well as entries; an overflow result is never memoized.
 There is no statement observer, `execute_wrappers`, `run_on_commit`, or
 confirmation query.
 
 #### Kept statements and the policy fence
 
-Django compiles each undecided inline statement once for a policy revision, actor
+Django keeps compiled undecided inline statements for a policy revision, actor
 shape, model, action, database alias and vendor. `_policies` retains parsed
 policies and `_statements` retains Django-compiled SQL text, both with bounded
 least-recently-used eviction. Statement keys contain no membership lists,
 row decisions, or fact verdicts; statements with decisions are compiled for
-that operation. Actor id, the application clock, point
-resource id, and manual-schema revision are bound parameters. Statements
+that operation. Rebuilding an undecided predicate may still be needed to
+discover its shape, but Django SQL compilation is reused. Actor id, the
+application clock, point resource id, and manual-schema revision are bound parameters. Statements
 whose caveat verdicts vary are compiled at each use.
 
 Every statement carries the `SchemaGeneration` revision fence. A scope built

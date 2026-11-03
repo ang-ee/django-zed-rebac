@@ -105,6 +105,7 @@ class PermissionEvaluator:
         "_check_cache",
         "_fact_decisions",
         "_max_size",
+        "_row_decision_ids",
         "_row_decisions",
         "_schema_scope",
         "_set_decisions",
@@ -115,6 +116,7 @@ class PermissionEvaluator:
         self._accessible_cache: OrderedDict[tuple[Any, ...], tuple[str, ...]] = OrderedDict()
         self._max_size = max_size
         self._row_decisions: OrderedDict[tuple[Any, ...], Any] = OrderedDict()
+        self._row_decision_ids = 0
         self._set_decisions: OrderedDict[tuple[Any, ...], Any] = OrderedDict()
         self._fact_decisions: OrderedDict[tuple[Any, ...], bool] = OrderedDict()
         self._schema_scope = SchemaScope()
@@ -226,6 +228,7 @@ class PermissionEvaluator:
         self._check_cache.clear()
         self._accessible_cache.clear()
         self._row_decisions.clear()
+        self._row_decision_ids = 0
         self._set_decisions.clear()
         self._fact_decisions.clear()
         self._schema_scope.clear()
@@ -236,6 +239,10 @@ class PermissionEvaluator:
         return {
             "check_entries": len(self._check_cache),
             "accessible_entries": len(self._accessible_cache),
+            "row_decision_entries": len(self._row_decisions),
+            "row_decision_ids": self._row_decision_ids,
+            "set_decision_entries": len(self._set_decisions),
+            "fact_decision_entries": len(self._fact_decisions),
             "max_size": self._max_size,
         }
 
@@ -305,6 +312,7 @@ def evaluator_scope(
         if evaluator._schema_scope.users == 0:
             evaluator._schema_scope.clear()
             evaluator._row_decisions.clear()
+            evaluator._row_decision_ids = 0
             evaluator._set_decisions.clear()
             evaluator._fact_decisions.clear()
         try:

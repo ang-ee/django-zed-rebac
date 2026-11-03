@@ -249,6 +249,28 @@ class _Sql(Expression):
 class _Decision:
     ids: tuple[Any, ...]
     witness: Q
+    uses: frozenset[Key] = frozenset()
+
+
+def _memo_eligible(operation: _Operation, root: Key) -> bool:
+    """Use evaluator decisions only where a rollback or clock cannot stale them."""
+    from rebac.database import read_alias
+    from rebac.models import SchemaDefinition
+
+    if operation.policy.caveat_deadlines:
+        return False
+    for model in (active_relationship_model(), SchemaDefinition):
+        connection = connections[read_alias(model)]
+        if connection.in_atomic_block or (
+            connection.connection is not None and not connection.get_autocommit()
+        ):
+            return False
+    for type_, name in operation.policy.program.reachable(root) | {root}:
+        definition = operation.policy.schema.get_definition(type_)
+        relation = find_relation(definition, name) if definition is not None else None
+        if relation is not None and relation.with_expiration:
+            return False
+    return True
 
 
 class _Facts(Mapping[Fact, bool]):
@@ -294,26 +316,37 @@ class _Facts(Mapping[Fact, bool]):
             fact,
         )
         evaluator = current_evaluator()
-        if evaluator is not None and context is not None and name in evaluator._fact_decisions:
+        eligible = (
+            evaluator is not None and context is not None and _memo_eligible(operation, self.root)
+        )
+        if evaluator is not None and eligible and name in evaluator._fact_decisions:
             evaluator._fact_decisions.move_to_end(name)
             return bool(evaluator._fact_decisions[name])
         condition = operation.compiler(self.verdicts, parametric=False).fact_q(fact)
         found = is_true(condition) or (
             not is_false(condition) and operation.gate(parametric=False).filter(condition).exists()
         )
-        if evaluator is not None and context is not None:
+        if evaluator is not None and eligible:
             evaluator._fact_decisions[name] = found
             while len(evaluator._fact_decisions) > evaluator._max_size:
                 evaluator._fact_decisions.popitem(last=False)
         return found
 
     def witness(self, used: Iterable[Fact]) -> Q:
-        compiler = self.operation.compiler(self.verdicts)
+        compiler = self.operation.compiler(
+            self.verdicts,
+            rows=self.operation.rows(self.verdicts),
+            sets=self.operation.sets(self.verdicts),
+        )
         parts = []
         for fact in sorted(used, key=str):
             condition = compiler.fact_q(fact)
             parts.append(condition if self[fact] else _not(condition))
-        return _and(*parts)
+        return _and(
+            *parts,
+            self.operation.rows(self.verdicts).witness(compiler.used_rows),
+            compiler.sets_witness(),
+        )
 
 
 class _Rows:
@@ -366,22 +399,44 @@ class _Rows:
             local._relationship_generation,
             row_generation(),
         )
-        if evaluator is not None and context is not None and name in evaluator._row_decisions:
+        eligible = (
+            evaluator is not None
+            and context is not None
+            and _memo_eligible(self.operation, self.root)
+        )
+        if evaluator is not None and eligible and name in evaluator._row_decisions:
             evaluator._row_decisions.move_to_end(name)
             found = cast("_Decision | None", evaluator._row_decisions[name])
-            if found is None or len(found.ids) <= self.room:
+            if found is not None and len(found.ids) <= self.room:
                 return found
         found = self._decide(key)
-        if evaluator is not None and context is not None:
+        if evaluator is not None and eligible and found is not None:
+            previous = evaluator._row_decisions.get(name)
+            if previous is not None:
+                evaluator._row_decision_ids -= len(previous.ids)
             evaluator._row_decisions[name] = found
-            while len(evaluator._row_decisions) > evaluator._max_size:
-                evaluator._row_decisions.popitem(last=False)
+            evaluator._row_decision_ids += len(found.ids)
+            while (
+                evaluator._row_decision_ids > evaluator._max_size
+                or len(evaluator._row_decisions) > evaluator._max_size
+            ):
+                _, evicted = evaluator._row_decisions.popitem(last=False)
+                evaluator._row_decision_ids -= len(evicted.ids)
         return found
 
     def witness(self, used: Iterable[Key]) -> Q:
-        parts = [
-            found.witness for key in sorted(used) if (found := self._found.get(key)) is not None
-        ]
+        pending = list(used)
+        seen: set[Key] = set()
+        parts = []
+        while pending:
+            key = pending.pop()
+            if key in seen:
+                continue
+            seen.add(key)
+            found = self._found.get(key)
+            if found is not None:
+                parts.append(found.witness)
+                pending.extend(found.uses - seen)
         return _and(*parts)
 
     def _decide(self, key: Key) -> _Decision | None:
@@ -391,27 +446,30 @@ class _Rows:
         operation = self.operation
         source = model._base_manager.using(operation.using).order_by()
         identity = resource_id_attr(model)
-        compiler = operation.compiler(self.verdicts, parametric=False, share_subject_rows=True)
+        sets = operation.sets(self.verdicts)
+        compiler = operation.compiler(
+            self.verdicts, parametric=False, share_subject_rows=True, rows=self, sets=sets
+        )
         member = compiler.holds(key, _model_at(model), Bound.LOWER)
         if is_true(member):
             return None
         if is_false(member):
-            return _Decision((), _and())
+            return _Decision((), _and(), frozenset(compiler.used_rows))
         gate = Q(Exists(operation.gate(parametric=False)))
         selected = compiler.with_subject_ctes(source.filter(gate & member))
         ids = tuple(selected.values_list(identity, flat=True)[: self.room + 1])
         if len(ids) > self.room:
             return None
         if not ids:
-            return _Decision((), _and())
-        later = operation.compiler(self.verdicts, share_subject_rows=True)
+            return _Decision((), _and(), frozenset(compiler.used_rows))
+        later = operation.compiler(self.verdicts, share_subject_rows=True, rows=self, sets=sets)
         held = later.holds(key, _model_at(model), Bound.LOWER)
         if is_true(held):
-            return _Decision(ids, _and())
+            return _Decision(ids, _and(), frozenset(compiler.used_rows | later.used_rows))
         failing = later.with_subject_ctes(
             source.filter(**{f"{identity}__in": ids}).filter(_not(held))
         )
-        return _Decision(ids, ~Q(Exists(failing)))
+        return _Decision(ids, ~Q(Exists(failing)), frozenset(compiler.used_rows | later.used_rows))
 
 
 @dataclass(frozen=True)
@@ -429,6 +487,7 @@ class _Operation:
     _roots: dict[int, Key] = field(default_factory=dict)
     _sets: dict[int, ActorSets | None] = field(default_factory=dict)
     _rows: dict[int, _Rows] = field(default_factory=dict)
+    _bulk: set[int] = field(default_factory=set)
 
     @classmethod
     def begin(
@@ -500,12 +559,13 @@ class _Operation:
             row_generation(),
         )
         evaluator = current_evaluator()
-        if evaluator is not None and context is not None and name in evaluator._set_decisions:
+        eligible = evaluator is not None and context is not None and _memo_eligible(self, root)
+        if evaluator is not None and eligible and name in evaluator._set_decisions:
             evaluator._set_decisions.move_to_end(name)
             found = cast("ActorSets | None", evaluator._set_decisions[name])
         else:
             found = self._decide_sets(root, verdicts)
-            if evaluator is not None and context is not None:
+            if evaluator is not None and eligible:
                 evaluator._set_decisions[name] = found
                 while len(evaluator._set_decisions) > evaluator._max_size:
                     evaluator._set_decisions.popitem(last=False)
@@ -632,17 +692,24 @@ class _Operation:
         cache: bool = True,
     ) -> _Kept | bool:
         """Compile and cache SQL whose only varying values are bound parameters."""
-        # A statement can be kept when nothing in it varies but the actor's
-        # id and the clock: that is, when it carries no caveat verdict list.
+        # Decisions are discovered while building. Only the undecided shape
+        # has parameters independent of the rows currently in the database.
         keep = cache and verdicts.empty
         full = (*self.shape, *key)
+        built = build()
+        root = key[1] if key[0] == "point" else key[2]
+        if keep and (
+            any(rows._found for rows in self._rows.values())
+            or any(value is not None for value in self._sets.values())
+            or bool(const_facts(self.policy.schema, self.policy.program, root))
+        ):
+            keep = False
         if keep:
             with _lock:
                 kept = _statements.get(full)
                 if kept is not None:
                     _statements.move_to_end(full)
                     return kept
-        built = build()
         compiled: _Kept | bool
         if isinstance(built, bool):
             compiled = built
@@ -691,12 +758,16 @@ def _point_statement(
     operation: _Operation,
     key: Key,
     which: str,
+    *,
+    decide: bool = True,
 ) -> _Kept | bool:
     """One bound of ``key`` at one identity, compiled as SQL."""
     verdicts = operation.verdicts(key)
-    sets = operation.sets(verdicts)
-    decider = operation.rows(verdicts)
-    facts = _Facts(operation, key, verdicts)
+    sets = operation.sets(verdicts) if decide else None
+    decider = operation.rows(verdicts) if decide else None
+    facts = (
+        _Facts(operation, key, verdicts) if decide and id(verdicts) not in operation._bulk else None
+    )
 
     def build() -> models.QuerySet[Any] | bool:
         at = At(key[0], _Param(_RESOURCE_WIRE, models.TextField()), None, False)
@@ -714,14 +785,14 @@ def _point_statement(
             rows = rows.filter(
                 _and(
                     compiler.sets_witness(),
-                    decider.witness(compiler.used_rows),
-                    facts.witness(compiler.used_facts),
+                    decider.witness(compiler.used_rows) if decider else _and(),
+                    facts.witness(compiler.used_facts) if facts else _and(),
                 )
             )
         selected = (rows if is_true(condition) else rows.filter(condition)).values("pk")
         return compiler.with_subject_ctes(selected)
 
-    return operation.statement(("point", key, which), verdicts, build, cache=False)
+    return operation.statement(("point", key, which), verdicts, build, cache=decide)
 
 
 def _point(
@@ -982,6 +1053,7 @@ def _check_chunk(
     for operation, key, _resource_id in asked:
         verdicts = operation.verdicts(key)
         operation._sets[id(verdicts)] = None
+        operation._bulk.add(id(verdicts))
     lower = _points(asked, "lower")
     # The bounds differ only where a caveat or a recursion is in reach.
     open_: list[tuple[int, bool]] = []
@@ -1031,7 +1103,9 @@ def _check_chunk(
 # ---------- Scopes ----------
 
 
-def _scope_statement(operation: _Operation, model: type[models.Model], key: Key) -> _Kept | bool:
+def _scope_statement(
+    operation: _Operation, model: type[models.Model], key: Key, *, decide: bool = True
+) -> _Kept | bool:
     """The ids of ``model`` the actor holds ``key`` on, as SQL.
 
     ``False`` when there are none.  ``every`` is set when every row qualifies
@@ -1039,9 +1113,9 @@ def _scope_statement(operation: _Operation, model: type[models.Model], key: Key)
     """
     verdicts = operation.verdicts(key)
     label = model._meta.label_lower
-    sets = operation.sets(verdicts)
-    decider = operation.rows(verdicts)
-    facts = _Facts(operation, key, verdicts)
+    sets = operation.sets(verdicts) if decide else None
+    decider = operation.rows(verdicts) if decide else None
+    facts = _Facts(operation, key, verdicts) if decide else None
 
     def build() -> bool | tuple[models.QuerySet[Any], bool]:
         compiler = operation.compiler(
@@ -1052,9 +1126,9 @@ def _scope_statement(operation: _Operation, model: type[models.Model], key: Key)
             return False
         gate = operation.gate().filter(
             _and(
-                decider.witness(compiler.used_rows),
+                decider.witness(compiler.used_rows) if decider else _and(),
                 compiler.sets_witness(),
-                facts.witness(compiler.used_facts),
+                facts.witness(compiler.used_facts) if facts else _and(),
             )
         )
         if is_true(predicate):
@@ -1063,7 +1137,7 @@ def _scope_statement(operation: _Operation, model: type[models.Model], key: Key)
         rows = model._base_manager.using(operation.using).filter(Q(Exists(gate)) & predicate)
         return compiler.with_subject_ctes(rows.order_by().values(resource_id_attr(model))), False
 
-    return operation.statement(("scope", label, key), verdicts, build, cache=False)
+    return operation.statement(("scope", label, key), verdicts, build, cache=decide)
 
 
 def _exact_identity(model: type[models.Model], lhs: Any, where: Any, using: str) -> str | None:
@@ -1146,6 +1220,7 @@ class _Scope(Expression):
         using: str,
         policy: _Policy,
         verdicts: CaveatVerdicts,
+        decide: bool = True,
     ) -> None:
         super().__init__(output_field=models.BooleanField())
         self.backend = backend
@@ -1155,13 +1230,21 @@ class _Scope(Expression):
         self.using = using
         self.policy = policy
         self.verdicts = verdicts
+        self.decide = decide
         self.lhs: Any = F(resource_id_attr(model))
         self._prepared: _Kept | bool | None = None
         self._point_prepared: _Kept | bool | None = None
+        # Django resolves a new shallow expression copy on every SQL render.
+        # The shared holder lets standalone fallback copies reuse preparation.
+        self._plans: dict[tuple[str, str], _Kept | bool] = {}
 
     def prepare(self, using: str) -> None:
         """Read bounded decisions on the known alias before SQL rendering."""
         if self._prepared is not None:
+            return
+        token = using, "scope"
+        if token in self._plans:
+            self._prepared = self._plans[token]
             return
         operation = _Operation.begin(self.backend, self.actor, using, policy=self.policy)
         resource_type = model_resource_type(self.model)
@@ -1170,11 +1253,16 @@ class _Scope(Expression):
             return
         key = resource_type, self.action
         operation.adopt(key, self.verdicts)
-        self._prepared = _scope_statement(operation, self.model, key)
+        self._prepared = _scope_statement(operation, self.model, key, decide=self.decide)
+        self._plans[token] = self._prepared
 
     def prepare_point(self, using: str) -> None:
         """Prepare the narrower point form when the caller has a mandatory ID."""
         if self._point_prepared is not None:
+            return
+        token = using, "point"
+        if token in self._plans:
+            self._point_prepared = self._plans[token]
             return
         resource_type = model_resource_type(self.model)
         if resource_type is None:
@@ -1183,7 +1271,8 @@ class _Scope(Expression):
         key = resource_type, self.action
         operation = _Operation.begin(self.backend, self.actor, using, policy=self.policy)
         operation.adopt(key, self.verdicts)
-        self._point_prepared = _point_statement(operation, key, "lower")
+        self._point_prepared = _point_statement(operation, key, "lower", decide=self.decide)
+        self._plans[token] = self._point_prepared
 
     def get_source_expressions(self) -> list[Any]:
         return [self.lhs]
@@ -1267,6 +1356,7 @@ def scope_expression(
     actor: SubjectRef,
     using: str,
     identity: Expression | None = None,
+    decide: bool = True,
 ) -> Expression:
     """Build the native Boolean scope at the caller's chosen snapshot boundary."""
     if model_resource_type(model) is None:
@@ -1277,7 +1367,7 @@ def scope_expression(
     verdicts = CaveatVerdicts.prepare(
         policy.schema, (resource_type, action), context=None, using=using
     )
-    expression = _Scope(backend, model, action, actor, using, policy, verdicts)
+    expression = _Scope(backend, model, action, actor, using, policy, verdicts, decide)
     if identity is not None:
         expression.set_source_expressions([identity])
     return expression
@@ -1407,9 +1497,18 @@ def _accessible_branches(
                 return None
 
         if self.context is None:
-            condition = Q(
-                _Scope(self.backend, model, self.action, self.actor, self.using, policy, verdicts)
+            scope = _Scope(
+                self.backend,
+                model,
+                self.action,
+                self.actor,
+                self.using,
+                policy,
+                verdicts,
+                decide=False,
             )
+            scope.prepare(self.using)
+            condition = Q(scope)
         else:
             condition = gate & compiler.holds(key, _model_at(model), Bound.LOWER)
         rows = model._base_manager.using(self.using).filter(condition)

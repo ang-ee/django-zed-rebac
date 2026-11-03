@@ -1,10 +1,12 @@
 """Actor-side stored sets are decided before and witnessed in statements."""
 
+from datetime import timedelta
 from itertools import pairwise
 
 import pytest
 from django.db import connection
 from django.test.utils import CaptureQueriesContext
+from django.utils import timezone
 
 from rebac import (
     ObjectRef,
@@ -76,6 +78,7 @@ def test_stale_set_decision_cannot_grant(monkeypatch):
     assert not local.check_access(subject=ACTOR, action="read", resource=DOC).allowed
 
 
+@pytest.mark.django_db(transaction=True)
 def test_evaluator_reuses_actor_set_decision():
     local = install_schema(SCHEMA)
     local.write_relationships(
@@ -118,7 +121,7 @@ def test_twelve_deep_membership_reaches_fixed_point_at_default_depth():
     ).allowed
 
 
-def test_nested_sets_and_cycles_are_decided_once():
+def test_nested_sets_and_cycles_are_decided_once(monkeypatch):
     local = install_schema(SCHEMA)
     local.write_relationships(
         [
@@ -132,7 +135,14 @@ def test_nested_sets_and_cycles_are_decided_once():
         assert local.check_access(subject=ACTOR, action="read", resource=DOC).allowed
     # Two levels, the empty frontier, then the point statement.
     assert len(queries) == 4
-    assert max(len(query["sql"]) for query in queries) < 6000
+    decided = max(len(query["sql"].encode()) for query in queries)
+    monkeypatch.setattr(read._Operation, "sets", lambda self, verdicts: None)
+    read.reset()
+    with CaptureQueriesContext(connection) as inline_queries:
+        assert local.check_access(subject=ACTOR, action="read", resource=DOC).allowed
+    inline = len(inline_queries[-1]["sql"].encode())
+    print(f"sets SQL bytes: decided={decided}, inline={inline}")
+    assert decided < inline, (decided, inline)
 
 
 def test_revoked_membership_changes_next_statement():
@@ -156,3 +166,62 @@ def test_new_membership_excludes_in_same_evaluator_scope():
         assert local.check_access(subject=ACTOR, action="read", resource=DOC).allowed
         local.write_relationships([member("out", ACTOR)])
         assert not local.check_access(subject=ACTOR, action="read", resource=DOC).allowed
+
+
+def test_membership_appearing_before_statement_excludes_point_and_scope(monkeypatch):
+    schema = SCHEMA.replace("definition docs/doc {", "definition blog/post {")
+    local = install_schema(schema)
+    with sudo(reason="excluded membership fixture"):
+        post = Post.objects.create(title="excluded")
+    resource = ObjectRef("blog/post", str(post.pk))
+    local.write_relationships(
+        [
+            RelationshipTuple(resource, "viewer", ACTOR),
+            RelationshipTuple(resource, "banned", group("out")),
+        ]
+    )
+    operation = read._Operation.begin(local, ACTOR, "default")
+    stale = operation.sets(operation.verdicts(("blog/post", "read")))
+    assert stale is not None
+    local.write_relationships([member("out", ACTOR)])
+    monkeypatch.setattr(read._Operation, "_decide_sets", lambda self, key, verdicts: stale)
+    assert not local.check_access(subject=ACTOR, action="read", resource=resource).allowed
+    assert not Post.objects.with_actor(ACTOR).filter(pk=post.pk).exists()
+
+
+@pytest.mark.django_db(transaction=True)
+def test_wildcard_caveat_and_expiry_shape_the_two_bounds(monkeypatch):
+    import rebac.clock
+
+    local = install_schema("""
+        use expiration
+        caveat active(ok bool) { ok }
+        definition auth/user {}
+        definition docs/doc {
+            relation viewer: auth/user:* with active with expiration
+            permission read = viewer
+        }
+    """)
+    now = timezone.now()
+    deadline = now + timedelta(minutes=1)
+    local.write_relationships(
+        [
+            RelationshipTuple(
+                DOC,
+                "viewer",
+                SubjectRef.of("auth/user", "*"),
+                caveat_name="active",
+                expires_at=deadline,
+            )
+        ]
+    )
+    monkeypatch.setattr(rebac.clock, "application_now", lambda: now)
+    undecided = local.check_access(subject=ACTOR, action="read", resource=DOC)
+    assert undecided.conditional_on == ("ok",)
+    assert local.check_access(
+        subject=ACTOR, action="read", resource=DOC, context={"ok": True}
+    ).allowed
+    monkeypatch.setattr(rebac.clock, "application_now", lambda: deadline)
+    assert not local.check_access(
+        subject=ACTOR, action="read", resource=DOC, context={"ok": True}
+    ).allowed

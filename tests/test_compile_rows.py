@@ -1,15 +1,18 @@
 """Bounded row decisions and inline overflow follow live permission data."""
 
 import pytest
-from django.db import connection, models
+from django.contrib.contenttypes.models import ContentType
+from django.db import connection, models, transaction
 from django.test.utils import CaptureQueriesContext, isolate_apps
 
 from rebac import ObjectRef, RelationshipTuple, SubjectRef, evaluator_scope, sudo, to_object_ref
 from rebac.compile import read
+from rebac.evaluator import PermissionEvaluator, current_evaluator
 from rebac.field_backing import foreign_key_kept, resolve_field_backing
 from rebac.schema import parse_zed
 from rebac.testing import install_schema
 from tests.testapp.models import (
+    Attachment,
     Folder,
     NativeParentLinkedChild,
     NativeParentLinkedResource,
@@ -71,14 +74,244 @@ def test_small_hierarchy_binds_ids_and_keeps_statement_bounded(tree):
     assert len(sql) < 25_000
 
 
+def _statement_bytes(model, monkeypatch, *, inline=False):
+    with monkeypatch.context() as patcher:
+        if inline:
+            patcher.setattr(read._Rows, "rows", lambda self, key: None)
+            patcher.setattr(read._Operation, "sets", lambda self, verdicts: None)
+            patcher.setattr(read, "const_facts", lambda *args: ())
+            read.reset()
+        with CaptureQueriesContext(connection) as queries:
+            model.objects.with_actor(ACTOR).count()
+    return len(queries[-1]["sql"].encode())
+
+
+def test_decided_tree_statement_is_smaller_than_inline(monkeypatch):
+    schema = SCHEMA.replace(
+        "permission read = folder->read",
+        "relation top: blog/folder // rebac:field=folder__parent\n"
+        "    permission read = folder->read + top->read",
+    )
+    local = install_schema(schema)
+    with sudo(reason="tree size fixture"):
+        root = Folder.objects.create(name="root")
+        child = Folder.objects.create(name="child", parent=root)
+        leaf = Folder.objects.create(name="leaf", parent=child)
+        Post.objects.create(title="leaf", folder=leaf)
+    local.write_relationships([RelationshipTuple(to_object_ref(child), "viewer", ACTOR)])
+    decided = _statement_bytes(Post, monkeypatch)
+    inline = _statement_bytes(Post, monkeypatch, inline=True)
+    print(f"tree SQL bytes: decided={decided}, inline={inline}")
+    assert decided < inline, (decided, inline)
+
+
+@pytest.fixture
+def chain():
+    schema = """
+    definition auth/user {}
+    definition auth/group { relation member: auth/user | auth/group#member }
+    definition site/role { relation member: auth/user | auth/group#member }
+    definition blog/folder {
+        relation parent: blog/folder // rebac:field=parent
+        relation viewer: auth/user | auth/group#member
+        relation admin: site/role // rebac:const=admin
+        permission read = viewer + parent->read + admin->member
+    }
+    definition blog/post {
+        relation folder: blog/folder // rebac:field=folder
+        relation viewer: auth/user | auth/group#member
+        relation admin: site/role // rebac:const=admin
+        permission read = viewer + folder->read + admin->member
+    }
+    definition test/attachment {
+        relation target: blog/post // rebac:field=target
+        relation viewer: auth/user | auth/group#member
+        permission read = viewer + target->read
+    }
+    """
+    local = install_schema(schema)
+    with sudo(reason="chain size fixture"):
+        root = Folder.objects.create(name="root")
+        child = Folder.objects.create(name="child", parent=root)
+        post = Post.objects.create(title="post", folder=child)
+        Attachment.objects.create(
+            content_type=ContentType.objects.get_for_model(Post), object_id=post.pk
+        )
+    group = ObjectRef("auth/group", "readers")
+    local.write_relationships(
+        [
+            RelationshipTuple(group, "member", ACTOR),
+            RelationshipTuple(to_object_ref(root), "viewer", SubjectRef(group, "member")),
+        ]
+    )
+    return local
+
+
+def test_decided_three_level_chain_is_smaller_than_inline(chain, monkeypatch):
+    decided = _statement_bytes(Attachment, monkeypatch)
+    inline = _statement_bytes(Attachment, monkeypatch, inline=True)
+    print(f"chain SQL bytes: decided={decided}, inline={inline}")
+    assert decided < inline, (decided, inline)
+
+
+def test_the_row_limit_is_what_one_statement_may_bind(chain, monkeypatch):
+    monkeypatch.setattr(read, "_ROW_LIMIT", 1)
+    operation = read._Operation.begin(chain, ACTOR, "default")
+    key = ("test/attachment", "read")
+    read._scope_statement(operation, Attachment, key)
+    decisions = operation.rows(operation.verdicts(key))._found.values()
+    assert sum(len(decision.ids) for decision in decisions if decision is not None) <= 1
+    assert Attachment.objects.with_actor(ACTOR).count() == 1
+
+
+def test_undecided_point_sql_compiles_once_per_revision_and_actor_shape(monkeypatch):
+    schema = """
+    definition auth/user {}
+    definition auth/group {}
+    definition blog/post {
+        relation viewer: auth/user | auth/group
+        permission read = viewer
+    }
+    """
+    local = install_schema(schema)
+    with sudo(reason="kept point fixture"):
+        post = Post.objects.create(title="kept")
+    local.write_relationships([RelationshipTuple(to_object_ref(post), "viewer", ACTOR)])
+    read.reset()
+    compiled = []
+    original = read._Compiled.as_sql
+
+    def count_compilation(self, compiler, connection):
+        compiled.append(True)
+        return original(self, compiler, connection)
+
+    monkeypatch.setattr(read._Compiled, "as_sql", count_compilation)
+    resource = to_object_ref(post)
+    assert local.check_access(subject=ACTOR, action="read", resource=resource).allowed
+    first = len(compiled)
+    assert local.check_access(subject=ACTOR, action="read", resource=resource).allowed
+    assert len(compiled) == first
+    other_shape = SubjectRef.of("auth/group", "readers")
+    assert not local.check_access(subject=other_shape, action="read", resource=resource).allowed
+    assert len(compiled) > first
+    second = len(compiled)
+    local.set_schema(
+        parse_zed(schema.replace("permission read = viewer", "permission read = viewer + viewer"))
+    )
+    assert local.check_access(subject=ACTOR, action="read", resource=resource).allowed
+    assert len(compiled) > second
+
+
+@pytest.mark.django_db(transaction=True)
+def test_rolled_back_tuple_write_does_not_blank_evaluator_scope():
+    local = install_schema(SCHEMA)
+    with sudo(reason="rollback fixture"):
+        allowed = Folder.objects.create(name="allowed")
+        denied = Folder.objects.create(name="denied")
+        post = Post.objects.create(title="allowed", folder=allowed)
+        other = Post.objects.create(title="denied", folder=denied)
+    local.write_relationships([RelationshipTuple(to_object_ref(allowed), "viewer", ACTOR)])
+
+    class Rollback(Exception):
+        pass
+
+    with evaluator_scope() as evaluator:
+        assert visible(Post) == {post.pk}
+        before = evaluator.stats()["row_decision_entries"]
+        with pytest.raises(Rollback), transaction.atomic():
+            local.write_relationships([RelationshipTuple(to_object_ref(denied), "viewer", ACTOR)])
+            assert visible(Post) == {post.pk, other.pk}
+            assert evaluator.stats()["row_decision_entries"] == before
+            raise Rollback
+        assert visible(Post) == {post.pk}
+
+
+@pytest.mark.django_db(transaction=True)
+def test_kept_rows_are_the_actors_own_and_cleared_at_scope_exit():
+    local = install_schema(SCHEMA)
+    bob = SubjectRef.of("auth/user", "bob")
+    with sudo(reason="actor-specific rows fixture"):
+        first = Folder.objects.create(name="first")
+        second = Folder.objects.create(name="second")
+        first_post = Post.objects.create(title="first", folder=first)
+        second_post = Post.objects.create(title="second", folder=second)
+    local.write_relationships(
+        [
+            RelationshipTuple(to_object_ref(first), "viewer", ACTOR),
+            RelationshipTuple(to_object_ref(second), "viewer", bob),
+        ]
+    )
+    evaluator = PermissionEvaluator()
+    with evaluator_scope(evaluator):
+        assert visible(Post) == {first_post.pk}
+        assert set(Post.objects.with_actor(bob).values_list("pk", flat=True)) == {second_post.pk}
+        assert evaluator.stats()["row_decision_entries"] >= 2
+        assert evaluator.stats()["row_decision_ids"] >= 2
+    assert current_evaluator() is None
+    assert evaluator.stats()["row_decision_entries"] == 0
+    assert evaluator.stats()["row_decision_ids"] == 0
+
+
+@pytest.mark.django_db(transaction=True)
+def test_kept_row_ids_obey_evaluator_budget():
+    local = install_schema(SCHEMA)
+    with sudo(reason="row budget fixture"):
+        root = Folder.objects.create(name="root")
+        child = Folder.objects.create(name="child", parent=root)
+        post = Post.objects.create(title="bounded", folder=child)
+    local.write_relationships([RelationshipTuple(to_object_ref(root), "viewer", ACTOR)])
+    with evaluator_scope(PermissionEvaluator(max_size=1)) as evaluator:
+        assert visible(Post) == {post.pk}
+        assert evaluator.stats()["row_decision_ids"] <= 1
+
+
+def test_decided_rows_are_not_kept_outside_evaluator_scope(tree):
+    _local, _child, _leaf, post = tree
+    read.reset()
+    assert visible(Post) == {post.pk}
+    assert current_evaluator() is None
+    assert not read._statements
+
+
+@pytest.mark.django_db(transaction=True)
+def test_expiring_grant_is_rechecked_after_preparation(monkeypatch):
+    from datetime import timedelta
+
+    from django.utils import timezone
+
+    import rebac.clock
+
+    schema = SCHEMA.replace(
+        "definition auth/user {}", "use expiration\ndefinition auth/user {}"
+    ).replace("relation viewer: auth/user", "relation viewer: auth/user with expiration")
+    local = install_schema(schema)
+    with sudo(reason="expiry fixture"):
+        folder = Folder.objects.create(name="expiring")
+        post = Post.objects.create(title="expiring", folder=folder)
+    now = timezone.now()
+    deadline = now + timedelta(minutes=1)
+    local.write_relationships(
+        [RelationshipTuple(to_object_ref(folder), "viewer", ACTOR, expires_at=deadline)]
+    )
+    monkeypatch.setattr(rebac.clock, "application_now", lambda: now)
+    with evaluator_scope():
+        prepared = Post.objects.with_actor(ACTOR).scoped()
+        assert list(prepared.values_list("pk", flat=True)) == [post.pk]
+        monkeypatch.setattr(rebac.clock, "application_now", lambda: deadline)
+        assert not prepared.all().exists()
+
+
+@pytest.mark.django_db(transaction=True)
 def test_overflow_keeps_inline_fallback(tree, monkeypatch):
     _local, child, leaf, post = tree
     monkeypatch.setattr(read, "_ROW_LIMIT", 1)
-    with CaptureQueriesContext(connection) as queries:
+    with evaluator_scope() as evaluator, CaptureQueriesContext(connection) as queries:
         assert list(Post.objects.with_actor(ACTOR).values_list("pk", flat=True)) == [post.pk]
+        assert evaluator.stats()["row_decision_entries"] == 0
     assert f'"folder_id" IN ({child.pk}, {leaf.pk})' not in queries[-1]["sql"]
 
 
+@pytest.mark.django_db(transaction=True)
 def test_evaluator_reuses_decided_rows_without_a_second_read(tree):
     _local, _child, _leaf, post = tree
     with evaluator_scope():
@@ -122,6 +355,7 @@ def test_revocation_after_decision_fails_witness(tree, monkeypatch):
     assert changed
 
 
+@pytest.mark.django_db(transaction=True)
 def test_raw_sql_write_in_evaluator_scope_hides_and_never_grants(tree):
     _local, child, leaf, post = tree
     with sudo(reason="raw SQL witness fixture"):
