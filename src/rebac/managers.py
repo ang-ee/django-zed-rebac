@@ -7,7 +7,8 @@ Per ARCHITECTURE.md § Three actor-resolution paths:
   4. Fallback — STRICT_MODE=True raises; else system_context()
 
 The actor lives on the queryset instance (NOT a ContextVar). It survives
-chaining via `_clone()` and propagates into instances via `from_db()`.
+chaining via `_clone()`; `_fetch_all()` and the iterators stamp it onto every
+loaded instance (it is not visible inside `from_db()`).
 """
 
 from __future__ import annotations
