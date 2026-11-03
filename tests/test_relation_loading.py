@@ -9,6 +9,7 @@ import pytest
 from django.contrib.auth import get_user_model
 from django.contrib.auth.models import Group
 from django.db.models import F, Prefetch
+from django.test import override_settings
 
 from rebac import (
     MissingActorError,
@@ -87,6 +88,21 @@ def _post(title: str, folder=None):
 
     with sudo(reason="test.fixture"):
         return Post.objects.create(title=title, folder=folder)
+
+
+@pytest.mark.django_db
+@override_settings(REBAC_STRICT_MODE=False)
+def test_related_managers_read_without_actor_in_non_strict_mode():
+    from tests.testapp.models import Post
+
+    folder = _folder("root")
+    post = _post("child", folder=folder)
+    with sudo(reason="test.fixture"):
+        post.collections.add(folder)
+
+    assert [row.pk for row in post.collections.all()] == [folder.pk]
+    assert [row.pk for row in folder.posts.all()] == [post.pk]
+    assert [row.pk for row in Post.objects.all()] == [post.pk]
 
 
 @pytest.mark.django_db
@@ -219,7 +235,7 @@ def test_rebac_select_related_preserves_globally_readable_targets(alice):
 
 
 @pytest.mark.django_db
-def test_rebac_select_related_still_guards_inside_ambient_sudo(alice):
+def test_pinned_actor_select_related_still_guards_inside_ambient_sudo(alice):
     from tests.testapp.models import Post
 
     folder = _folder("private")
@@ -229,6 +245,48 @@ def test_rebac_select_related_still_guards_inside_ambient_sudo(alice):
     with sudo(reason="test.ambient"):
         with pytest.raises(PermissionDenied):
             Post.objects.as_user(alice).rebac_select_related("folder").get(pk=post.pk)
+
+
+@pytest.mark.django_db
+def test_ambient_sudo_bypasses_selected_related_guard(alice):
+    from tests.testapp.models import Post
+
+    folder = _folder("private")
+    post = _post("visible", folder=folder)
+    with actor_context(SubjectRef.of("auth/user", str(alice.pk))):
+        queryset = Post.objects.rebac_select_related("folder")
+        with sudo(reason="test.ambient-related"):
+            row = queryset.get(pk=post.pk)
+            projected = list(queryset.filter(pk=post.pk).values_list("folder__name", flat=True))
+
+    assert row.folder.name == "private"
+    assert projected == ["private"]
+
+
+@pytest.mark.django_db
+def test_select_related_without_actor_raises_in_non_strict_mode():
+    from tests.testapp.models import Post
+
+    folder = _folder("private")
+    post = _post("visible", folder=folder)
+    with override_settings(REBAC_STRICT_MODE=False):
+        with pytest.raises(MissingActorError):
+            Post.objects.rebac_select_related("folder").get(pk=post.pk)
+
+
+@pytest.mark.django_db
+def test_select_related_projection_without_actor_raises_in_non_strict_mode():
+    from tests.testapp.models import Post
+
+    folder = _folder("private")
+    post = _post("visible", folder=folder)
+    with override_settings(REBAC_STRICT_MODE=False):
+        with pytest.raises(PermissionDenied):
+            list(
+                Post.objects.rebac_select_related("folder")
+                .filter(pk=post.pk)
+                .values("folder__name")
+            )
 
 
 @pytest.mark.django_db
@@ -280,6 +338,156 @@ def test_rebac_prefetch_related_scopes_reverse_relation(alice):
 
     assert [post.title for post in row.posts.all()] == ["visible"]
     assert hidden.title == "hidden"
+
+
+@pytest.mark.django_db
+def test_ambient_sudo_bypasses_prefetched_related_scope(alice):
+    from tests.testapp.models import Folder
+
+    folder = _folder("root")
+    visible = _post("visible", folder=folder)
+    _post("hidden", folder=folder)
+    _grant("blog/folder", folder.pk, "viewer", alice)
+    _grant("blog/post", visible.pk, "viewer", alice)
+
+    with actor_context(SubjectRef.of("auth/user", str(alice.pk))):
+        queryset = Folder.objects.rebac_prefetch_related("posts")
+        with sudo(reason="test.ambient-prefetch"):
+            row = queryset.get(pk=folder.pk)
+            titles = sorted(post.title for post in row.posts.all())
+
+    assert titles == ["hidden", "visible"]
+
+
+@pytest.mark.django_db
+def test_pinned_actor_keeps_prefetched_scope_inside_ambient_sudo(alice):
+    from tests.testapp.models import Folder
+
+    folder = _folder("root")
+    visible = _post("visible", folder=folder)
+    _post("hidden", folder=folder)
+    _grant("blog/folder", folder.pk, "viewer", alice)
+    _grant("blog/post", visible.pk, "viewer", alice)
+
+    with sudo(reason="test.ambient-prefetch"):
+        row = Folder.objects.as_user(alice).rebac_prefetch_related("posts").get(pk=folder.pk)
+
+    assert [post.title for post in row.posts.all()] == ["visible"]
+
+
+@pytest.mark.django_db
+def test_actor_pinned_after_prefetch_scopes_related_rows_inside_ambient_sudo(alice):
+    from tests.testapp.models import Folder
+
+    bob = atomic_source_write(get_user_model().objects.create, username="bob", is_active=True)
+    folder = _folder("root")
+    visible = _post("visible", folder=folder)
+    hidden = _post("hidden", folder=folder)
+    _grant("blog/folder", folder.pk, "viewer", alice)
+    _grant("blog/post", visible.pk, "viewer", alice)
+    _grant("blog/post", hidden.pk, "viewer", bob)
+
+    with actor_context(SubjectRef.of("auth/user", str(bob.pk))):
+        queryset = Folder.objects.rebac_prefetch_related("posts").as_user(alice)
+        with sudo(reason="test.ambient-prefetch"):
+            row = queryset.get(pk=folder.pk)
+
+    assert [post.title for post in row.posts.all()] == ["visible"]
+
+
+def _split_related_posts(alice):
+    bob = atomic_source_write(get_user_model().objects.create, username="bob", is_active=True)
+    folder = _folder("root")
+    alice_post = _post("alice post", folder=folder)
+    bob_post = _post("bob post", folder=folder)
+    _grant("blog/folder", folder.pk, "viewer", alice)
+    _grant("blog/post", alice_post.pk, "viewer", alice)
+    _grant("blog/post", bob_post.pk, "viewer", bob)
+    return bob, folder, alice_post, bob_post
+
+
+@pytest.mark.django_db
+def test_prefetch_does_not_transfer_instance_hint_authority_to_reused_queryset(alice):
+    from tests.testapp.models import Folder, Post
+
+    bob, folder, _alice_post, bob_post = _split_related_posts(alice)
+    posts_qs = Post.objects.all()
+    with actor_context(bob):
+        list(
+            Folder.objects.as_user(alice)
+            .filter(pk=folder.pk)
+            .prefetch_related(Prefetch("posts", queryset=posts_qs))
+        )
+        assert [post.pk for post in posts_qs] == [bob_post.pk]
+        with sudo(reason="test.hint-bypass"):
+            assert {post.pk for post in posts_qs.all()} == {
+                _alice_post.pk,
+                bob_post.pk,
+            }
+
+
+@pytest.mark.django_db
+def test_db_manager_instance_hint_does_not_pin_actor(alice):
+    from tests.testapp.models import Folder, Post
+
+    bob, folder, _alice_post, bob_post = _split_related_posts(alice)
+    pinned_folder = Folder.objects.as_user(alice).get(pk=folder.pk)
+    hinted = Post.objects.db_manager(hints={"instance": pinned_folder}).all()
+
+    with actor_context(bob):
+        assert list(hinted.values_list("pk", flat=True)) == [bob_post.pk]
+
+
+@pytest.mark.django_db
+def test_plain_prefetched_related_manager_uses_root_instance_pin(alice):
+    from tests.testapp.models import Folder
+
+    bob, folder, alice_post, _bob_post = _split_related_posts(alice)
+    with actor_context(bob):
+        [loaded] = list(
+            Folder.objects.as_user(alice).filter(pk=folder.pk).prefetch_related("posts")
+        )
+        assert [post.pk for post in loaded.posts.all()] == [alice_post.pk]
+
+
+@pytest.mark.django_db
+@override_settings(REBAC_STRICT_MODE=True)
+@pytest.mark.xfail(
+    strict=True,
+    reason="W2-E iterator lane (cluster 5): stamp each root chunk before prefetch",
+)
+def test_iterator_prefetched_related_manager_uses_pinned_root_actor(alice):
+    from tests.testapp.models import Folder
+
+    bob, folder, alice_post, _bob_post = _split_related_posts(alice)
+    with actor_context(bob):
+        rows = list(
+            Folder.objects.as_user(alice)
+            .filter(pk=folder.pk)
+            .prefetch_related("posts")
+            .iterator(chunk_size=1)
+        )
+        assert [post.pk for post in rows[0].posts.all()] == [alice_post.pk]
+
+
+@pytest.mark.django_db(transaction=True)
+@override_settings(REBAC_STRICT_MODE=True)
+@pytest.mark.xfail(
+    strict=True,
+    reason="W2-E iterator lane (cluster 5): stamp each root chunk before prefetch",
+)
+def test_aiterator_prefetched_related_manager_uses_pinned_root_actor(alice):
+    from tests.testapp.models import Folder
+
+    bob, folder, alice_post, _bob_post = _split_related_posts(alice)
+    queryset = Folder.objects.as_user(alice).filter(pk=folder.pk).prefetch_related("posts")
+
+    async def collect():
+        return [row async for row in queryset.aiterator(chunk_size=1)]
+
+    with actor_context(bob):
+        rows = asyncio.run(collect())
+        assert [post.pk for post in rows[0].posts.all()] == [alice_post.pk]
 
 
 @pytest.mark.django_db

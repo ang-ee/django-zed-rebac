@@ -194,9 +194,12 @@ because `env` propagates through every traversal. We don't:
   FK accessor / reverse-FK manager / M2M / chained queryset on it re-resolves
   the actor against the carrying scope (`current_actor()` or the queryset's
   pinned actor) — it does NOT inherit the sudo flag.
-- If you genuinely need related rows under sudo, the inner queryset must call
-  `.sudo(reason="...")` again. The audit log records every bypass
-  independently — that's the point.
+- An ambient `with sudo(reason="..."):` block covers related rows when no
+  actor is pinned. Outside that block, the inner queryset must call
+  `.sudo(reason="...")` for its own bypass. The audit log records each
+  bypass independently. Guarded `rebac_select_related()` reads with no actor
+  and no sudo fail closed even when `REBAC_STRICT_MODE = False`; ordinary
+  related-manager reads retain the non-strict unscoped fallback.
 - **Don't** add a "sudo flag propagates through `from_db`" shortcut.
   Transitive sudo is a contagion; cutting it at every relationship boundary
   forces each bypass to be greppable. See
@@ -527,8 +530,13 @@ model) keeps it; nothing is injected then. That manager must be built over a
 `TrackedQuerySet` subclass and return every row, unscoped and unfiltered: class
 creation refuses any other queryset and `rebac.E023` reports one that filters.
 Don't weaken either check to admit a consumer's manager.
-This is why bare-string `prefetch_related("rel")` doesn't auto-scope and the
-spec requires the explicit `Prefetch(queryset=...)` form.
+A related manager built from a pinned `RebacMixin` instance scopes its fresh
+queryset to that actor, including plain `prefetch_related("rel")` during
+`_fetch_all` evaluation after the root instances are stamped. Iterator chunk
+prefetching needs the W2-E per-chunk stamp. Caller-supplied `Prefetch`
+querysets keep their own actor resolution; use an explicit
+`Prefetch(queryset=...)` to fix their scope.
+Django's shared database-router `instance` hint never carries authority.
 
 ### Don't forget the operator-precedence parens
 `a + b & c` ≠ `a + (b & c)`. Always emit parens in compound expressions.

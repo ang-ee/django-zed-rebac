@@ -819,6 +819,59 @@ def test_m2m_set_accepts_objs_keyword_under_actor(world):
     assert _stored_collections(world) == {folders[1].pk}
 
 
+@override_settings(REBAC_STRICT_MODE=True)
+def test_m2m_set_uses_pinned_instance_actor_without_ambient(world):
+    alice = get_user_model().objects.create_user(username="m2m_alice")
+    alice_ref = SubjectRef.of("auth/user", str(alice.pk))
+    for folder in world[0]:
+        _grant("blog/folder", folder.pk, "owner", alice_ref)
+    _grant("blog/post", world[1][0].pk, "owner", alice_ref)
+    post = Post.objects.as_user(alice).get(pk=world[1][0].pk)
+    target = Folder.objects.as_user(alice).get(pk=world[0][1].pk)
+    assert list(post.collections.using("default").values_list("pk", flat=True)) == [world[0][0].pk]
+
+    with transaction.atomic():
+        post.collections.set([target])
+
+    assert _stored_collections(world) == {target.pk}
+
+
+@override_settings(REBAC_STRICT_MODE=True)
+def test_m2m_set_uses_pinned_instance_actor_over_ambient(world):
+    alice = get_user_model().objects.create_user(username="m2m_alice")
+    bob = get_user_model().objects.create_user(username="m2m_bob")
+    alice_ref = SubjectRef.of("auth/user", str(alice.pk))
+    bob_ref = SubjectRef.of("auth/user", str(bob.pk))
+    for folder in world[0]:
+        _grant("blog/folder", folder.pk, "owner", alice_ref)
+    _grant("blog/post", world[1][0].pk, "owner", alice_ref)
+    _grant("blog/folder", world[0][1].pk, "viewer", bob_ref)
+    post = Post.objects.as_user(alice).get(pk=world[1][0].pk)
+    target = Folder.objects.as_user(alice).get(pk=world[0][1].pk)
+
+    with actor_context(bob_ref), transaction.atomic():
+        assert list(post.collections.using("default").values_list("pk", flat=True)) == [
+            world[0][0].pk
+        ]
+        post.collections.set([target])
+
+    assert _stored_collections(world) == {target.pk}
+
+
+@override_settings(REBAC_STRICT_MODE=False)
+def test_backed_m2m_write_without_actor_uses_non_strict_bypass():
+    install_schema(backend(), parse_zed(REVERSE_M2M_SCHEMA))
+    with sudo(reason="test.fixture"):
+        post = Post.objects.create(title="source")
+        folder = Folder.objects.create(name="target")
+
+    post.collections.add(folder)
+
+    assert list(Post.collections.through.objects.values_list("post_id", "folder_id")) == [
+        (post.pk, folder.pk)
+    ]
+
+
 # ---------- relationship rows ----------
 
 

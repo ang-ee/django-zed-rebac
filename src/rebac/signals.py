@@ -720,27 +720,18 @@ def _changed_hop_prefixes(
 
 
 def _edge_actor(instance: Any, *, relation: bool = False) -> tuple[SubjectRef | None, bool]:
-    from .actors import current_actor, is_sudo
-    from .errors import MissingActorError
+    from .actors import resolve
     from .mixins import RebacMixin
 
     effective = getattr(instance, "effective_actor", None)
     if isinstance(instance, RebacMixin) and callable(effective) and not relation:
         return cast(tuple[SubjectRef | None, bool], effective(strict=True))
-    if relation:
-        pinned = getattr(instance, "actor", None)
-        if (
-            isinstance(instance, RebacMixin)
-            and callable(pinned)
-            and (actor := pinned()) is not None
-        ):
-            return cast(SubjectRef, actor), False
-    if is_sudo():
-        return None, True
-    actor = current_actor()
-    if actor is None and app_settings.REBAC_STRICT_MODE:
-        raise MissingActorError("Backed relation write requires an actor.")
-    return actor, actor is None
+    return resolve(
+        pinned_actor=instance.actor() if relation and isinstance(instance, RebacMixin) else None,
+        mode="relation" if relation else "ambient",
+        strict=True,
+        subject_label="Backed relation write",
+    )
 
 
 class BackedEdgeDenied(PermissionDenied):
