@@ -759,6 +759,8 @@ class TrackedQuerySet[T: models.Model](models.QuerySet[T]):
                     return models.QuerySet.update(self, **kwargs)
             rows = self._write_rows(actor, _WriteStep.UPDATE)
             keys = statement_keys(rows)
+            # QuerySet.update() sends no model signals, so this internal capture
+            # cannot be observed as a signal origin.
             parts = list(by_key(rows, keys))
             if backed:
                 for stored in by_key(self.model._base_manager.using(self.db), keys):
@@ -800,7 +802,9 @@ class TrackedQuerySet[T: models.Model](models.QuerySet[T]):
                     return models.QuerySet.delete(self)
             rows = self._write_rows(actor, _WriteStep.DELETE)
             keys = statement_keys(rows)
-            parts = list(by_key(rows, keys))
+            # Django's collector forwards each part as pre_delete's origin.
+            # Preserve the caller's authority on that queryset.
+            parts = list(by_key(self, keys))
             if watched and not self._actor_scoped_writes:
                 for stored in by_key(self.model._base_manager.using(self.db), keys):
                     _gate_backed_rows(stored, using=self.db, deleting=True)
