@@ -47,6 +47,25 @@ from .types import FieldDenyMode, SubjectRef
 _M = TypeVar("_M", bound=models.Model)
 
 
+def share_scoped_definitions[T: models.Model](
+    outer_queryset: models.QuerySet[T],
+) -> models.QuerySet[T]:
+    """Share CTE definitions across a plain union of prepared REBAC operands.
+
+    Scoped operands must use one actor, policy and database alias. Unscoped
+    operands pass through. The returned queryset leaves the input untouched.
+    """
+    from .compile.read import share_combined_scopes
+
+    result = outer_queryset.all()
+    query = result.query
+    if query.combinator != "union" or len(query.combined_queries) < 2:
+        return result
+    if share_combined_scopes(query) is False:
+        raise PermissionDenied("Union operands must have compatible prepared REBAC scopes")
+    return result
+
+
 class _ScopeWhere(WhereNode):
     """A removable authorization restriction, separate from caller predicates."""
 
@@ -265,6 +284,14 @@ def _without_scope(node: WhereNode) -> WhereNode:
 
 def _without_query_scope(query: Query) -> Query:
     clone = query.clone()
+    plan = getattr(clone, "_rebac_subject_plan", None)
+    if plan is not None:
+        owned = {id(cte) for cte in plan[1]}
+        if hasattr(clone, "_with_ctes"):
+            clone._with_ctes = tuple(cte for cte in clone._with_ctes if id(cte) not in owned)
+        delattr(clone, "_rebac_subject_plan")
+    if hasattr(clone, "_rebac_combined_ctes_shared"):
+        delattr(clone, "_rebac_combined_ctes_shared")
     if isinstance(clone, _RebacQuery) and clone._rebac_boolean_operand:
         clone._rebac_check = None
         clone._rebac_checked = False
@@ -1027,6 +1054,10 @@ class RebacQuerySet(models.QuerySet[_M]):
         if sudo:
             return
         self._scope_query(self.query, actor)
+        if self.query.combined_queries:
+            from .compile.read import share_combined_scopes
+
+            share_combined_scopes(self.query)
 
     @schema_operation
     def _scope_query(self, query: Query, actor: SubjectRef | None) -> None:
@@ -1206,6 +1237,10 @@ class RebacQuerySet(models.QuerySet[_M]):
     ) -> RebacQuerySet[_M]:
         combined: RebacQuerySet[_M] = super()._combinator_query(combinator, *other_qs, all=all)  # type: ignore[misc]
         combined._refresh_scope()
+        if combined._rebac_scope_applied and combined.query.combined_queries:
+            from .compile.read import share_combined_scopes
+
+            share_combined_scopes(combined.query)
         return combined
 
     def _gated_read_fields(self) -> frozenset[str]:

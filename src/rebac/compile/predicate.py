@@ -19,6 +19,7 @@ Three rules shape every statement:
 
 from __future__ import annotations
 
+import hashlib
 from collections.abc import Iterable, Mapping, Sequence
 from dataclasses import dataclass
 from datetime import datetime
@@ -391,6 +392,7 @@ class Compiler:
         parametric: bool = False,
         model_index: _ModelIndex | None = None,
         share_subject_rows: bool = False,
+        cte_owner: str | None = None,
     ) -> None:
         self.model_index = model_index if model_index is not None else _ModelIndex.capture()
         self.schema = tagged.schema if tagged is not None else schema
@@ -415,6 +417,16 @@ class Compiler:
         self._own_identity = self.model_index.subject(actor.subject_type)
         self._share_subject_rows = share_subject_rows
         self._subject_ctes: dict[tuple[Key, Bound], CTE] = {}
+        self._set_ctes: dict[tuple[Key, Bound], CTE] = {}
+        self._reached_ctes: dict[tuple[Key, Any, Bound, bool], CTE] = {}
+        self._path_ctes: dict[tuple[Key, Bound, bool], CTE] = {}
+        self._closure_ctes: dict[tuple[Key, Bound, bool], CTE] = {}
+        self._statement_ctes: list[CTE] = []
+        actor_tag = hashlib.blake2s(
+            f"{actor.subject_type}:{actor.subject_id}:{actor.optional_relation}".encode(),
+            digest_size=4,
+        ).hexdigest()
+        self._cte_namespace = f"_{cte_owner}_{actor_tag}" if cte_owner is not None else ""
         self._subject_ordinals = (
             {key: ordinal for ordinal, key in enumerate(sorted(self.program.dependencies))}
             if share_subject_rows
@@ -423,6 +435,7 @@ class Compiler:
         self._cte_tables: set[str] | None = None
 
     def _cte_name(self, name: str) -> str:
+        name += self._cte_namespace
         if self._cte_tables is None:
             self._cte_tables = {
                 owner._meta.db_table for owner in apps.get_models(include_auto_created=True)
@@ -436,7 +449,10 @@ class Compiler:
         return QuerySet(model=selected.model, query=selected.query, using=self.using)
 
     def with_subject_ctes(self, rows: QuerySet[Any]) -> QuerySet[Any]:
-        return with_cte(*self._subject_ctes.values(), select=rows) if self._subject_ctes else rows
+        return with_cte(*self._statement_ctes, select=rows) if self._statement_ctes else rows
+
+    def statement_ctes(self) -> tuple[CTE, ...]:
+        return tuple(self._statement_ctes)
 
     def _subject_cte(
         self,
@@ -447,14 +463,13 @@ class Compiler:
         visits: Mapping[Key, int],
         depth_possible: bool,
     ) -> QuerySet[Any] | bool | None:
-        """Share a complete acyclic model subject set within this statement."""
+        """Share a complete model subject set within this statement."""
         if (
             not self._share_subject_rows
             or not depth_possible
             or self.model_index.resource(key[0]) is not model
             or resource_id_attr(model) != identity
             or not stores_rows(model)
-            or self.program.reachable(key) & self.program.recursive
             or any(visits.get(node) for node in self.program.recursive)
         ):
             return None
@@ -475,6 +490,7 @@ class Compiler:
             name = self._cte_name(f"rebac_ids_{self._subject_ordinals[key]}_{bound.value}")
             cte = CTE(rows, name=name)
             self._subject_ctes[slot] = cte
+            self._statement_ctes.append(cte)
         return self._cte_queryset(cte)
 
     # ---------- The actor's id, as a value or as a placeholder ----------
@@ -646,7 +662,15 @@ class Compiler:
     def _live(self, rows: Any, relation: Relation, bound: Bound) -> Any:
         return rows.filter(self._live_q(relation, bound))
 
-    def _closure(self, seed: QuerySet[Any], edges: Any, hops: int) -> QuerySet[Any]:
+    def _closure(
+        self,
+        key: Key,
+        bound: Bound,
+        depth_possible: bool,
+        seed: QuerySet[Any],
+        edges: Any,
+        hops: int,
+    ) -> QuerySet[Any]:
         """The wire ids within ``hops`` edges of ``seed``, in a finite CTE."""
         if hops <= 0:
             return seed
@@ -666,19 +690,47 @@ class Compiler:
             )
             return cast(QuerySet[Any], first.union(step))
 
-        cte = CTE.recursive(body, name=self._cte_name("rebac_closure"))
+        slot = key, bound, depth_possible
+        cte = self._closure_ctes.get(slot) if self._share_subject_rows else None
+        if cte is None:
+            name = (
+                f"rebac_closure_{self._subject_ordinals[key]}_{bound.value}_{int(depth_possible)}"
+                if self._share_subject_rows
+                else "rebac_closure"
+            )
+            cte = CTE.recursive(body, name=self._cte_name(name))
+            if self._share_subject_rows:
+                self._closure_ctes[slot] = cte
+                self._statement_ctes.append(cte)
+        if self._share_subject_rows:
+            return self._cte_queryset(cte).values("resource_id")
         return cast(
             QuerySet[Any], with_cte(cte, select=self._cte_queryset(cte).values("resource_id"))
         )
 
-    def _sets_closure(self, seed: QuerySet[Any], edges: Any) -> QuerySet[Any]:
+    def _sets_closure(
+        self, key: Key, bound: Bound, seed: QuerySet[Any], edges: Any
+    ) -> QuerySet[Any]:
         """Actor-side stored subject sets to a fixed point, including cycles."""
+
+        slot = key, bound
+        if self._share_subject_rows and (kept := self._set_ctes.get(slot)) is not None:
+            return self._cte_queryset(kept).values("resource_id")
 
         def body(cte: CTE) -> QuerySet[Any]:
             step = cte.join(edges, subject_id=cte.col.resource_id).order_by().values("resource_id")
             return seed.union(step)
 
-        cte = CTE.recursive(body, name=self._cte_name("rebac_sets"))
+        name = (
+            f"rebac_sets_{self._subject_ordinals[key]}_{bound.value}"
+            if self._share_subject_rows
+            else "rebac_sets"
+        )
+        cte = CTE.recursive(body, name=self._cte_name(name))
+        if self._share_subject_rows:
+            self._set_ctes[slot] = cte
+            self._statement_ctes.append(cte)
+            return self._cte_queryset(cte).values("resource_id")
         return cast(
             QuerySet[Any], with_cte(cte, select=self._cte_queryset(cte).values("resource_id"))
         )
@@ -787,7 +839,9 @@ class Compiler:
         ).exclude(subject_id="*")
         if hop.id:
             edges = edges.filter(subject_id=hop.id)
-        closure = self._sets_closure(rows.filter(direct).order_by().values("resource_id"), edges)
+        closure = self._sets_closure(
+            key, bound, rows.filter(direct).order_by().values("resource_id"), edges
+        )
         return self._wire_membership(at, every, closure)
 
     def _self_fk(
@@ -1047,9 +1101,22 @@ class Compiler:
                 )
                 return cast(QuerySet[Any], first.union(step))
 
-            cte = CTE.recursive(path_rows, name=self._cte_name("rebac_path"))
+            slot = key, bound, depth_possible
+            cte = self._path_ctes.get(slot) if self._share_subject_rows else None
+            if cte is None:
+                name = (
+                    f"rebac_path_{self._subject_ordinals[key]}_{bound.value}_{int(depth_possible)}"
+                    if self._share_subject_rows
+                    else "rebac_path"
+                )
+                cte = CTE.recursive(path_rows, name=self._cte_name(name))
+                if self._share_subject_rows:
+                    self._path_ctes[slot] = cte
+                    self._statement_ctes.append(cte)
             reached = self._cte_queryset(cte).values("pk")
-            members = with_cte(cte, select=source.filter(pk__in=_Compiled(reached)))
+            members = source.filter(pk__in=_Compiled(reached))
+            if not self._share_subject_rows:
+                members = with_cte(cte, select=members)
             parts.append(self._model_membership(at, members, model, identity))
             return self._union(at, parts)
         closure = seed
@@ -1190,15 +1257,31 @@ class Compiler:
                     )
                     return cast(QuerySet[Any], first.union(step))
 
-                cte = CTE.recursive(reached_rows, name=self._cte_name("rebac_reached"))
+                slot = key, at.ref, bound, depth_possible
+                cte = self._reached_ctes.get(slot) if self._share_subject_rows else None
+                if cte is None:
+                    name = (
+                        f"rebac_reached_{self._subject_ordinals[key]}_{bound.value}_{int(depth_possible)}_{len(self._reached_ctes)}"
+                        if self._share_subject_rows
+                        else "rebac_reached"
+                    )
+                    cte = CTE.recursive(reached_rows, name=self._cte_name(name))
+                    if self._share_subject_rows:
+                        self._reached_ctes[slot] = cte
+                        self._statement_ctes.append(cte)
                 reached_cte = self._cte_queryset(cte).values("subject_id")
-                matched = with_cte(cte, select=holders.filter(self._from(at, reached_cte)))
+                matched = holders.filter(self._from(at, reached_cte))
+                if not self._share_subject_rows:
+                    matched = with_cte(cte, select=matched)
                 return _or(point, Q(Exists(matched)))
             reached: QuerySet[Any] | None = None
             for _ in range(self.depth_limit - 1):
                 reached = edges.filter(self._from(at, reached)).order_by().values("subject_id")
             return _or(point, Q(Exists(holders.filter(self._from(at, reached)))))
         closure = self._closure(
+            key,
+            bound,
+            depth_possible,
             (edges if seed is _TRUE else edges.filter(seed)).order_by().values("resource_id"),
             edges,
             self.depth_limit - 1,

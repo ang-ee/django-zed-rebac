@@ -1983,6 +1983,31 @@ fixed object, or actor membership is selected into Python while building or
 rendering the permission predicate. A statement sees tuple and backing writes
 in its own database snapshot.
 
+A union owner can share model-backed subject sets through named CTEs keyed by
+the policy, actor, permission or relation, and bound. A fresh compiler builds
+an immutable plan for that owner. Its query holds the plan and definitions
+together through `Query.clone()`; a new plan never mutates a compiler retained
+by a sibling clone. The union's parts are cloned before their CTEs are moved
+to the owner with stock `with_cte()`. Stock django-cte 5.x has no move method,
+so relocation reads and replaces the cloned parts' `_with_ctes` tuples.
+Recursive stored-set, reached-object, self-path and closure relations are
+keyed in the owner plan as well; bounded recursive keys also include whether
+a depth proof is possible. Their names include a random per-plan tag and the
+actor, so independently shared operands can be combined without name clashes
+even after an earlier owner query is collected. The tag keeps the SQL shape
+stable while making each live plan's names distinct.
+
+Sharing applies at recursion-free points when the prepared scopes have one
+policy and actor and need no render-time caveat verdict or clock. Caveated,
+expiring and deadline-bearing policies retain independent inline predicates.
+`permission_expression()` binds during SQL compilation; its late scope cannot
+join an already emitted `WITH` clause and compiles a self-contained predicate.
+Separate nested queries retain separate definitions. A plain Django union can
+explicitly hoist compatible prepared operands with
+`share_scoped_definitions()`. No connection-wide registry is involved. Empty
+subject sets fold to false before a CTE is attached, so an empty negated arm
+cannot empty the enclosing statement.
+
 Queryset scopes pin the policy and caveat verdicts when the scope is built.
 Rendering a prepared scope therefore performs no decision read, including
 when a caveated relation is reachable. A newly written caveat instance is
@@ -2342,6 +2367,33 @@ The headline feature. By inclusion, every model operation is gated against the e
 6. `Meta` extension — the metaclass captures `rebac_resource_type`, `rebac_id_attr`, `rebac_default_action` and `rebac_subject_relation` (the `REBAC_META_OPTIONS` tuple), strips them before Django's `Options` sees them, and re-attaches them on `_meta`. `rebac_subject_relation` makes `to_subject_ref(instance)` emit the model's object reference as a subject set (`auth/group:<id>#member`); `rebac.E011` checks the relation exists. See [proposal 0006](./proposals/0006-model-subject-identity.md). A model with no `Meta` of its own takes the Django options (`ordering`, `indexes`, `constraints`, `permissions`, verbose names and the rest of Django's `DEFAULT_NAMES`) of the first base that has a `Meta`, as Django itself does. The `rebac_*` options are per model: they pass to a child only through a `Meta` the child writes (`class Meta(Parent.Meta)`), never to a child with no `Meta`.
 
 ### Manager and queryset surface
+
+`RebacQuerySet.union()` rebinds its operands to the left queryset's actor and
+action, including when the combined queryset is rebound later. This behavior
+is required by `test_sql_set_combinations_scope_each_operand_and_rebind`.
+An owner that needs each operand's distinct model or action can wrap already
+scoped operands as plain querysets and share their definitions at the union
+owner:
+
+```python
+from django.db import models
+from rebac.managers import share_scoped_definitions
+
+plain = [
+    models.QuerySet(model=rows.model, query=rows.query.clone(), using=rows.db).values("pk")
+    for rows in scoped_operands
+]
+timeline_rows = share_scoped_definitions(plain[0].union(*plain[1:], all=True))
+```
+
+The helper returns a clone. A non-union or single operand passes through.
+Sudo and empty operands also pass through without contributing definitions.
+Scoped operands must have the same actor and database alias; a mismatch
+raises `PermissionDenied`. A policy-revision mismatch leaves each scope
+self-contained without sharing. The helper reads the union's
+`combined_queries` and attaches each distinct shareable definition once to
+the outer query. Late permission expressions and nested scoped subqueries
+remain self-contained. Other SQL shapes retain their independent predicates.
 
 ```python
 ActorLike = Union[SubjectRef, User, Group, "AnyRebacSubject"]
@@ -3584,6 +3636,8 @@ The verified private hooks include `Model.from_db` (including `fetch_mode`),
 `ModelAdmin.get_actions` (including `action_location`), and `Query.as_sql()`
 for Django-compiled uncorrelated subqueries. The library uses no connection
 execution wrapper, transaction callback list or SQL text classification.
+Statement-local sharing also uses django-cte 5.0.1's `_with_ctes` tuple and
+its `combined_queries` setter, which hoists operand definitions.
 Database floors follow Django 6.1:
 PostgreSQL 15, MySQL 8.4, SQLite 3.37.
 

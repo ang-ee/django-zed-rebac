@@ -11,6 +11,7 @@ from collections.abc import Callable, Hashable, Iterable, Iterator, Mapping, Seq
 from dataclasses import dataclass, field
 from datetime import datetime
 from itertools import batched
+from secrets import token_hex
 from threading import RLock
 from typing import TYPE_CHECKING, Any, cast
 
@@ -23,6 +24,7 @@ from django.db.models.fields.tuple_lookups import TupleIn
 from django.db.models.lookups import Exact, GreaterThanOrEqual, In, IntegerFieldExact, LessThan
 from django.db.models.sql.where import WhereNode
 from django.utils import timezone
+from django_cte import with_cte
 
 from rebac._id import _NATIVE_INTEGER_FIELDS, model_identity_fields, resource_id_attr
 from rebac.codec import identity_codec
@@ -278,6 +280,7 @@ class _Operation:
         *,
         parametric: bool = True,
         share_subject_rows: bool = False,
+        cte_owner: str | None = None,
     ) -> Compiler:
         return Compiler(
             self.policy.schema,
@@ -289,6 +292,7 @@ class _Operation:
             model_index=self.model_index,
             parametric=parametric,
             share_subject_rows=share_subject_rows,
+            cte_owner=cte_owner,
         )
 
     def gate(self, *, parametric: bool = True) -> models.QuerySet[Any]:
@@ -706,6 +710,129 @@ def _scope_statement(operation: _Operation, model: type[models.Model], key: Key)
     return operation.statement(("scope", label, key), verdicts, build)
 
 
+def _shared_scope_statement(
+    operation: _Operation, model: type[models.Model], key: Key, compiler: Compiler
+) -> _Kept | bool:
+    """Compile one scope against CTEs owned by its enclosing query."""
+    identity = resource_id_attr(model)
+    subjects = compiler._subject_cte(key, model, identity, Bound.LOWER, {}, True)
+    if subjects is False:
+        return False
+    predicate = (
+        Q(**{f"{identity}__in": _Compiled(subjects.order_by().values(identity))})
+        if isinstance(subjects, models.QuerySet)
+        else compiler.holds(key, _model_at(model), Bound.LOWER)
+    )
+    if is_false(predicate):
+        return False
+    gate = operation.gate()
+    if is_true(predicate):
+        rows = gate.values("pk")
+    else:
+        rows = (
+            model._base_manager.using(operation.using)
+            .filter(Q(Exists(gate)) & predicate)
+            .order_by()
+            .values(identity)
+        )
+    try:
+        sql, params = _Compiled(rows).as_sql(None, connections[operation.using])
+    except EmptyResultSet:
+        return False
+    return _Kept(sql, params, is_true(predicate))
+
+
+def _shareable_scope(scope: _Scope) -> bool:
+    """A shared CTE may not freeze a clock or a caveat verdict at build time."""
+    policy = scope.policy
+    return (
+        scope.verdicts.empty
+        and not policy.caveat_deadlines
+        and not any(
+            tag.deadline for tag in (*policy.tagged.arms.values(), *policy.tagged.sites.values())
+        )
+        and not any(
+            relation.with_expiration
+            for definition in policy.schema.definitions
+            for relation in definition.relations
+        )
+    )
+
+
+def share_combined_scopes(query: Any) -> bool | None:
+    """Hoist common subject sets from scoped UNION operands to their owner."""
+
+    def in_where(node: Any) -> Iterator[_Scope]:
+        if isinstance(node, _Scope):
+            yield node
+        elif isinstance(node, WhereNode):
+            for child in node.children:
+                yield from in_where(child)
+        else:
+            sources = getattr(node, "get_source_expressions", None)
+            if callable(sources):
+                for child in sources():
+                    yield from in_where(child)
+
+    part_scopes = [(part, tuple(in_where(part.where))) for part in query.combined_queries]
+    owners = [(part, scope) for part, scopes in part_scopes for scope in scopes]
+    scopes = [scope for _, scope in owners]
+    if not scopes:
+        return None
+    signature = tuple(id(scope._rebac_scope_token) for scope in scopes)
+    if getattr(query, "_rebac_combined_ctes_shared", None) == signature:
+        return True
+    first = scopes[0]
+    if any(scope.actor != first.actor or scope.using != first.using for scope in scopes):
+        return False
+    if any(scope.policy is not first.policy for scope in scopes):
+        return None
+    if len(scopes) < 2 or any(not _shareable_scope(scope) for scope in scopes):
+        return None
+    # Django includes the left queryset's Query as the first union part.
+    # Copy every part before relocating CTEs or assigning a shared plan.
+    query.combined_queries = tuple(part.clone() for part in query.combined_queries)
+    part_scopes = [(part, tuple(in_where(part.where))) for part in query.combined_queries]
+    owners = [(part, scope) for part, found in part_scopes for scope in found]
+    old_ctes = {
+        id(cte)
+        for part in (*query.combined_queries, query)
+        for cte in getattr(part, "_rebac_subject_plan", ((), ()))[1]
+    }
+    for part in (*query.combined_queries, query):
+        if hasattr(part, "_with_ctes"):
+            part._with_ctes = tuple(cte for cte in part._with_ctes if id(cte) not in old_ctes)
+    operation = _Operation.begin(first.backend, first.actor, first.using, policy=first.policy)
+    compiler = operation.compiler(
+        first.verdicts,
+        parametric=False,
+        share_subject_rows=True,
+        cte_owner=token_hex(8),
+    )
+    members: list[tuple[_Scope, _Kept | bool]] = []
+    for scope in scopes:
+        resource_type = model_resource_type(scope.model)
+        assert resource_type is not None
+        operation = _Operation.begin(scope.backend, scope.actor, scope.using, policy=scope.policy)
+        members.append(
+            (
+                scope,
+                _shared_scope_statement(
+                    operation, scope.model, (resource_type, scope.action), compiler
+                ),
+            )
+        )
+    ctes = compiler.statement_ctes()
+    if ctes:
+        with_cte(*ctes, select=models.QuerySet(model=query.model, query=query))
+    plan = (tuple(members), ctes)
+    for part, _scope in owners:
+        part._rebac_subject_plan = plan
+    query._rebac_subject_plan = plan
+    query._rebac_combined_ctes_shared = signature
+    return True
+
+
 def _exact_identity(model: type[models.Model], lhs: Any, where: Any, using: str) -> str | None:
     """A native identity equality mandatory in this resolved query, or no proof.
 
@@ -796,6 +923,7 @@ class _Scope(Expression):
         self.policy = policy
         self.verdicts = verdicts
         self.lhs: Any = F(resource_id_attr(model))
+        self._rebac_scope_token = object()
 
     def get_source_expressions(self) -> list[Any]:
         return [self.lhs]
@@ -814,10 +942,25 @@ class _Scope(Expression):
 
         operation = _Operation.begin(self.backend, self.actor, self.using, policy=policy)
         operation.adopt(key, self.verdicts)
+        plan = getattr(compiler.query, "_rebac_subject_plan", None)
+        shared = (
+            next(
+                (
+                    sql
+                    for scope, sql in plan[0]
+                    if scope._rebac_scope_token is self._rebac_scope_token
+                ),
+                None,
+            )
+            if plan
+            else None
+        )
         compiled = (
-            _scope_statement(operation, self.model, key)
-            if resource_id is None
-            else _point_statement(operation, key, "lower")
+            _point_statement(operation, key, "lower")
+            if resource_id is not None
+            else shared
+            if shared is not None
+            else _scope_statement(operation, self.model, key)
         )
         if isinstance(compiled, bool):
             # ``True`` cannot occur: a statement that admits rows is a gate.
