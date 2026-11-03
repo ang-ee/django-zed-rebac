@@ -7,6 +7,14 @@ pre-1.0; breaking changes within a minor version are explicitly called out.
 
 ### Changed
 
+- **Write gate ownership and `check_save()` semantics.** `RebacQuerySet` now
+  inherits the single write owner in `TrackedQuerySet`; resource scoping and
+  row checks use hooks. `RebacTrackedMixin.save_base()` owns one gate and
+  transaction for tracked and resource models. Public `check_save()` evaluates
+  the current instance's gates directly and no longer runs a consumer
+  `save()` override. Validation uses that verdict and Django's own constraint
+  validation with hidden fields excluded. Gate denials carry the exact actor,
+  action and resource to the audit owner, including cascaded child deletes.
 - Bounded model-row, actor-set and fixed-fact decisions are prepared before
   queryset SQL renders and witnessed in each statement that binds them.
   An evaluator scope reuses decisions until a library-owned write advances

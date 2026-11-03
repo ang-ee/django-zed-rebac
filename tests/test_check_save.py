@@ -1,4 +1,4 @@
-"""check_save: the verdict the save gates reach for save(), without writing or auditing."""
+"""check_save: a direct verdict over the current instance before a real save."""
 
 from __future__ import annotations
 
@@ -168,6 +168,23 @@ def test_a_deferred_instance_is_checked_on_its_loaded_fields(world):
     assert edited.get_deferred_fields() == deferred
 
 
+def test_all_non_key_fields_deferred_still_checks_full_save(world):
+    _alice, _bob, carol, _mine, _theirs, post = world
+    with sudo(reason="test.fixture"):
+        instance = Post.objects.only("pk").get(pk=post.pk)
+    instance.with_actor(to_subject_ref(carol))
+    assert not instance.check_save().allowed
+    with pytest.raises(PermissionDenied):
+        instance.save()
+
+
+def test_check_save_rejects_unknown_update_fields(world):
+    alice, _bob, _carol, _mine, _theirs, post = world
+    instance = _loaded(alice, post)
+    with pytest.raises(ValueError, match="do not exist"):
+        instance.check_save(update_fields=["not_a_field"])
+
+
 def _moved(user, post, folder):
     instance = _loaded(user, post)
     instance.folder = folder
@@ -194,7 +211,7 @@ def test_a_related_object_saved_after_it_was_assigned_is_checked(world):
     assert not _agree(moved)
 
 
-def test_the_models_save_override_runs(world, monkeypatch):
+def test_the_models_save_override_runs_only_at_the_real_save(world, monkeypatch):
     alice, _bob, _carol, _mine, theirs, post = world
     original = Post.save
 
@@ -205,8 +222,10 @@ def test_the_models_save_override_runs(world, monkeypatch):
     monkeypatch.setattr(Post, "save", save)
     edited = _loaded(alice, post)
     edited.body = "an edit"
-    # The override moves the post into carol's folder, which alice may not write.
-    assert not _agree(edited)
+    # The direct check sees the current instance; the real save gates the override's change.
+    assert edited.check_save().allowed
+    with pytest.raises(PermissionDenied):
+        edited.save()
 
 
 def test_nothing_is_written_and_no_denial_is_audited(world, settings):
@@ -225,6 +244,9 @@ def test_nothing_is_written_and_no_denial_is_audited(world, settings):
     with pytest.raises(PermissionDenied):
         retitled.save()
     assert _denials() == before + 1
+    assert PermissionAuditEvent.objects.get(reason__startswith="denied:").target_repr == (
+        f"blog/post:{post.pk}#write__title"
+    )
 
 
 def test_an_instance_bypass_is_audited_once(world):
@@ -271,7 +293,7 @@ def test_a_check_from_within_its_own_save_does_not_recurse(world, monkeypatch):
     assert _agree(edited)
 
 
-def test_what_the_override_saves_and_changes_is_restored(world, monkeypatch):
+def test_check_save_does_not_run_an_override_that_creates_related_rows(world, monkeypatch):
     alice, _bob, _carol, _mine, _theirs, _post = world
     original = Post.save
 
@@ -284,15 +306,15 @@ def test_what_the_override_saves_and_changes_is_restored(world, monkeypatch):
 
     monkeypatch.setattr(Post, "save", save)
     candidate = Post(title="new").with_actor(to_subject_ref(alice))
-    assert candidate.check_save().allowed
-    # The folder the override made was rolled back; the post is as it was.
+    assert not candidate.check_save().allowed
+    # No override ran during the direct gate check.
     assert candidate.folder_id is None
     assert candidate._state.adding
     candidate.save()
     assert Folder._base_manager.filter(pk=candidate.folder_id).exists()
 
 
-def test_a_bypass_taken_inside_the_check_is_audited_by_the_save(world, monkeypatch):
+def test_a_bypass_in_the_save_override_is_audited_by_the_save(world, monkeypatch):
     alice, _bob, _carol, _mine, _theirs, post = world
     original = Post.save
 
@@ -311,7 +333,7 @@ def test_a_bypass_taken_inside_the_check_is_audited_by_the_save(world, monkeypat
     assert rows.count() == 1
 
 
-def test_a_swallowed_denial_still_answers_no(world, monkeypatch):
+def test_a_swallowed_save_denial_does_not_change_the_direct_verdict(world, monkeypatch):
     _alice, bob, _carol, _mine, _theirs, post = world
     original = Post.save
 

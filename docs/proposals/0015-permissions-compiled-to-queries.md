@@ -513,8 +513,9 @@ READ COMMITTED snapshots that never coexisted; SQL remains the allow authority.
 `create()` are reflected in reads the moment they commit, because nothing
 was copied.
 
-**Gates keep their rules and their entry points.** `RebacMixin.save_base`
-and `delete`, the scoped and tracked querysets, the related-manager wrappers,
+**Gates keep their rules and their entry points.** `RebacTrackedMixin.save_base`
+with its `RebacMixin` resource hook, `RebacMixin.delete`, the shared tracked
+queryset write owner with scoped hooks, the related-manager wrappers,
 the `m2m_changed` receiver and invariant 5d stay. Their mechanics change:
 
 - The gate's reads go through the compiled predicate.

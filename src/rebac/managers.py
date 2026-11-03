@@ -15,7 +15,8 @@ from __future__ import annotations
 import re
 from collections import Counter
 from collections.abc import AsyncIterator, Collection, Iterable, Iterator
-from typing import TYPE_CHECKING, Any, Self, TypeVar, cast, overload
+from enum import Enum, auto
+from typing import TYPE_CHECKING, Any, ClassVar, Self, TypeVar, cast, overload
 
 from asgiref.sync import sync_to_async
 from django.db import connections, models
@@ -621,7 +622,283 @@ def _column_relation_path(query: Query, column: Col) -> str:
     return "__".join(reversed(names))
 
 
-class RebacQuerySet(models.QuerySet[_M]):
+class _WriteStep(Enum):
+    UPDATE = auto()
+    UPDATE_CLAUSE = auto()
+    DELETE = auto()
+    DELETE_CLAUSE = auto()
+    CREATE = auto()
+
+
+def _refuse_moving_edges(
+    queryset: TrackedQuerySet[Any], kwargs: dict[str, Any], *, actor_scoped: bool
+) -> None:
+    """Reject a generic edge move at the point chosen by the write owner."""
+    from .actors import current_actor, is_sudo
+    from .watch import gate_policy, refuse_moving_edges
+
+    related_owner = queryset._rebac_related_owner
+    if actor_scoped or (
+        not is_sudo() and (related_owner is not None or current_actor() is not None)
+    ):
+        refuse_moving_edges(gate_policy(queryset.db), queryset.model, kwargs)
+
+
+class TrackedQuerySet[T: models.Model](models.QuerySet[T]):
+    """Own model writes without applying an actor scope to reads."""
+
+    _actor_scoped_writes: ClassVar[bool] = False
+
+    _rebac_related_owner: models.Model | None
+
+    def __init__(self, *args: Any, **kwargs: Any) -> None:
+        super().__init__(*args, **kwargs)
+        self._rebac_related_owner = None
+
+    def __getstate__(self) -> dict[str, Any]:
+        state = super().__getstate__()
+        state["_rebac_related_owner"] = None
+        return state
+
+    def _clone(self, **kwargs: Any) -> Self:
+        clone: Self = cast(Any, super())._clone(**kwargs)
+        clone._rebac_related_owner = self._rebac_related_owner
+        return clone
+
+    def _write_scope(self, step: _WriteStep) -> tuple[SubjectRef | None, bool]:
+        from .actors import current_actor, is_sudo
+        from .conf import app_settings
+        from .mixins import RebacMixin
+        from .signals import _edge_actor
+
+        if step is _WriteStep.DELETE:
+            actor = current_actor()
+            return actor, (
+                issubclass(self.model, RebacMixin)
+                or is_sudo()
+                or (actor is None and not app_settings.REBAC_STRICT_MODE)
+            )
+        if step is _WriteStep.UPDATE:
+            related_owner = self._rebac_related_owner
+            if related_owner is not None:
+                return _edge_actor(related_owner, relation=True)
+        return None, is_sudo()
+
+    def _write_rows(self, actor: SubjectRef | None, step: _WriteStep) -> TrackedQuerySet[T]:
+        return self
+
+    def _guard_rows(
+        self,
+        step: _WriteStep,
+        actor: SubjectRef | None,
+        bypass: bool,
+        *,
+        rows: TrackedQuerySet[T] | None = None,
+        candidates: list[T] | None = None,
+        kwargs: dict[str, Any] | None = None,
+        watched: bool = False,
+        update_conflicts: bool = False,
+        update_fields: Collection[str] | None = None,
+    ) -> None:
+        """Plain tracked rows need only the signal-free create gate."""
+        from .actors import is_sudo
+        from .mixins import RebacMixin
+        from .signals import _gate_backed_rows
+        from .watch import gate_policy
+
+        if step is not _WriteStep.CREATE or issubclass(self.model, RebacMixin):
+            return
+        if candidates is None:
+            raise TypeError("bulk_create requires candidate rows")
+        policy = gate_policy(self.db) if watched else None
+        if update_conflicts and update_fields and not is_sudo() and policy is not None:
+            watch = policy.watched.get(self.model._meta.label_lower)
+            if watch is not None and any(
+                {field.name, field.attname} & set(update_fields) & watch.fields
+                for field in self.model._meta.concrete_fields
+            ):
+                raise PermissionDenied(
+                    "Conflicting bulk create cannot check both sides of a backed edge; "
+                    "use checked saves or sudo."
+                )
+        _gate_backed_rows(candidates, using=self.db, bypass=bypass)
+
+    def update(self, **kwargs: Any) -> int:
+        from .actors import is_sudo
+        from .mixins import RebacMixin
+        from .signals import _gate_backed_rows, audit_denials
+        from .watch import by_key, model_write, statement_keys
+
+        if self.query.combinator or self.query.is_sliced:
+            return models.QuerySet.update(self, **kwargs)
+        self._for_write = True
+        with (
+            audit_denials(using=self.db),
+            model_write(model=self.model, using=self.db, names=kwargs) as watched,
+        ):
+            related_owner = self._rebac_related_owner
+            if self._actor_scoped_writes:
+                actor, bypass = self._write_scope(_WriteStep.UPDATE)
+                if bypass:
+                    return models.QuerySet.update(self, **kwargs)
+                self._guard_rows(_WriteStep.UPDATE_CLAUSE, actor, bypass)
+                backed = watched
+            else:
+                actor, bypass = None, is_sudo()
+                # Tracked roots have no resource gate; a generic edge move
+                # must be refused before resolving a related owner's actor.
+                _refuse_moving_edges(self, kwargs, actor_scoped=False)
+                related_fk_write = any(
+                    isinstance(field, (models.ForeignKey, models.OneToOneField))
+                    and {field.name, field.attname} & kwargs.keys()
+                    for field in self.model._meta.concrete_fields
+                )
+                backed = watched and (
+                    not issubclass(self.model, RebacMixin)
+                    or related_owner is not None
+                    or related_fk_write
+                )
+                if not backed or bypass:
+                    return models.QuerySet.update(self, **kwargs)
+                actor, bypass = self._write_scope(_WriteStep.UPDATE)
+                if bypass:
+                    return models.QuerySet.update(self, **kwargs)
+            rows = self._write_rows(actor, _WriteStep.UPDATE)
+            keys = statement_keys(rows)
+            parts = list(by_key(rows, keys))
+            if backed:
+                for stored in by_key(self.model._base_manager.using(self.db), keys):
+                    _gate_backed_rows(
+                        stored,
+                        using=self.db,
+                        names=kwargs,
+                        proposed=kwargs,
+                        actor=actor,
+                        bypass=bypass,
+                    )
+            if self._actor_scoped_writes:
+                # A backed denial takes precedence on actor-scoped writes.
+                _refuse_moving_edges(self, kwargs, actor_scoped=True)
+            for part in parts:
+                self._guard_rows(_WriteStep.UPDATE, actor, bypass, rows=part, kwargs=kwargs)
+            written = sum(models.QuerySet.update(part, **kwargs) for part in parts)
+            self._result_cache = None
+            return written
+
+    def delete(self) -> tuple[int, dict[str, int]]:
+        from .mixins import deletion_owner
+        from .signals import _gate_backed_rows, audit_denials
+        from .watch import by_key, model_write, statement_keys
+
+        if (
+            self.query.combinator
+            or self.query.is_sliced
+            or self.query.distinct_fields
+            or getattr(self, "_fields", None) is not None
+        ):
+            return models.QuerySet.delete(self)
+        self._for_write = True
+        with audit_denials(using=self.db), model_write(model=self.model, using=self.db) as watched:
+            actor, bypass = self._write_scope(_WriteStep.DELETE)
+            self._guard_rows(_WriteStep.DELETE_CLAUSE, actor, bypass)
+            if bypass or (not watched and not self._actor_scoped_writes):
+                with deletion_owner(self, self.db, actor, bypass):
+                    return models.QuerySet.delete(self)
+            rows = self._write_rows(actor, _WriteStep.DELETE)
+            keys = statement_keys(rows)
+            parts = list(by_key(rows, keys))
+            if watched and not self._actor_scoped_writes:
+                for stored in by_key(self.model._base_manager.using(self.db), keys):
+                    _gate_backed_rows(stored, using=self.db, deleting=True)
+            for part in parts:
+                self._guard_rows(_WriteStep.DELETE, actor, bypass, rows=part)
+            deleted: Counter[str] = Counter()
+            for part in parts:
+                with deletion_owner(part, self.db, actor, bypass):
+                    deleted.update(models.QuerySet.delete(part)[1])
+            self._result_cache = None
+            return sum(deleted.values()), dict(deleted)
+
+    def bulk_create(
+        self,
+        objs: Iterable[T],
+        batch_size: int | None = None,
+        ignore_conflicts: bool = False,
+        update_conflicts: bool = False,
+        update_fields: Collection[str] | None = None,
+        unique_fields: Collection[str] | None = None,
+    ) -> list[T]:
+        from .actors import is_sudo
+        from .signals import audit_denials
+        from .watch import model_write
+
+        self._for_write = True
+        candidates = list(objs)
+        with audit_denials(using=self.db), model_write(model=self.model, using=self.db) as watched:
+            actor, bypass = (
+                self._write_scope(_WriteStep.CREATE)
+                if self._actor_scoped_writes
+                else (None, is_sudo())
+            )
+            self._guard_rows(
+                _WriteStep.CREATE,
+                actor,
+                bypass,
+                candidates=candidates,
+                watched=watched,
+                update_conflicts=update_conflicts,
+                update_fields=update_fields,
+            )
+            result = models.QuerySet.bulk_create(
+                self,
+                candidates,
+                batch_size=batch_size,
+                ignore_conflicts=ignore_conflicts,
+                update_conflicts=update_conflicts,
+                update_fields=update_fields,
+                unique_fields=unique_fields,
+            )
+            if self._actor_scoped_writes and actor is not None and not bypass:
+                for row in result:
+                    row._rebac_actor = actor  # type: ignore[attr-defined]
+                    row._rebac_sudo_reason = None  # type: ignore[attr-defined]
+            return result
+
+    def bulk_update(
+        self, objs: Iterable[T], fields: Iterable[str], batch_size: int | None = None
+    ) -> int:
+        from .signals import audit_denials
+        from .watch import model_write
+
+        self._for_write = True
+        field_names = tuple(fields)
+        with (
+            audit_denials(using=self.db),
+            model_write(model=self.model, using=self.db, names=field_names),
+        ):
+            return models.QuerySet.bulk_update(self, objs, field_names, batch_size=batch_size)
+
+
+_TrackedManagerBase = models.Manager.from_queryset(TrackedQuerySet)
+
+
+def _related_manager_queryset[Q: TrackedQuerySet[Any]](manager: object, queryset: Q) -> Q:
+    """Carry a related manager's owner independently of mutable router hints."""
+    owner = getattr(manager, "instance", None)
+    if isinstance(owner, models.Model):
+        queryset._rebac_related_owner = owner
+    return queryset
+
+
+# Keep the same model parameter on Django's generated, generic manager base.
+class TrackedManager[M: models.Model](_TrackedManagerBase[M]):  # pyright: ignore[reportInvalidTypeArguments]
+    """Unfiltered manager whose writes to columns the policy reads are gated."""
+
+    def get_queryset(self) -> TrackedQuerySet[M]:
+        return _related_manager_queryset(self, cast(TrackedQuerySet[M], super().get_queryset()))
+
+
+class RebacQuerySet(TrackedQuerySet[_M]):
     """REBAC-aware queryset.
 
     Use `.with_actor(actor)`, `.as_user(user)`, `.as_agent(agent, on_behalf_of=u)`,
@@ -664,6 +941,7 @@ class RebacQuerySet(models.QuerySet[_M]):
         # authorization-sensitive query merely to pickle an inert query.
         state = {**self.__dict__, "_django_version": django.__version__}
         state["_rebac_actor"] = None
+        state["_rebac_related_owner"] = None
         state["_rebac_sudo_reason"] = None
         state["_rebac_sudo_audited"] = False
         state["_rebac_internal_bypass"] = False
@@ -924,9 +1202,7 @@ class RebacQuerySet(models.QuerySet[_M]):
 
     def _audit_bypass_once(self) -> None:
         with database_context(self.db):
-            from .audit import save_check
-
-            if self._rebac_sudo_audited or save_check.get() is not None:
+            if self._rebac_sudo_audited:
                 return
             reason = self._bypass_audit_reason()
             if reason is None:
@@ -1680,199 +1956,78 @@ class RebacQuerySet(models.QuerySet[_M]):
             obj.save(force_insert=True, using=self.db)
         return obj
 
-    def bulk_create(
+    _actor_scoped_writes: ClassVar[bool] = True
+
+    def _write_scope(self, step: _WriteStep) -> tuple[SubjectRef | None, bool]:
+        return self._resolve_effective_actor()
+
+    def _write_rows(self, actor: SubjectRef | None, step: _WriteStep) -> RebacQuerySet[_M]:
+        action = "delete" if step is _WriteStep.DELETE else "update"
+        return self._rows_in_scope(self._writing_actor(actor), reason=f"rebac.{action}.rows")
+
+    def _guard_rows(
         self,
-        objs: Iterable[_M],
-        batch_size: int | None = None,
-        ignore_conflicts: bool = False,
+        step: _WriteStep,
+        actor: SubjectRef | None,
+        bypass: bool,
+        *,
+        rows: TrackedQuerySet[_M] | None = None,
+        candidates: list[_M] | None = None,
+        kwargs: dict[str, Any] | None = None,
+        watched: bool = False,
         update_conflicts: bool = False,
         update_fields: Collection[str] | None = None,
-        unique_fields: Collection[str] | None = None,
-    ) -> list[_M]:
-        from .signals import audit_backed_denials
-        from .watch import model_write
-
-        self._for_write = True
-        with audit_backed_denials(), model_write(model=self.model, using=self.db):
-            return self._rebac_bulk_create(
-                list(objs),
-                batch_size,
-                ignore_conflicts,
-                update_conflicts,
-                update_fields,
-                unique_fields,
-            )
-
-    def _rebac_bulk_create(
-        self,
-        objs: Iterable[_M],
-        batch_size: int | None = None,
-        ignore_conflicts: bool = False,
-        update_conflicts: bool = False,
-        update_fields: Collection[str] | None = None,
-        unique_fields: Collection[str] | None = None,
-    ) -> list[_M]:
-        """Authorize inserts before Django's signal-free bulk path runs."""
-        self._for_write = True
-        candidates = list(objs)
-        for candidate in candidates:
-            if type(candidate) is not self.model:
-                raise TypeError(
-                    f"{self.model.__name__}.bulk_create() accepts only exact "
-                    f"{self.model.__name__} instances; got {type(candidate).__name__}."
-                )
-        actor, unscoped = self._resolve_effective_actor()
+    ) -> None:
+        from .preflight import _check_new_model
         from .signals import _gate_backed_rows
 
-        _gate_backed_rows(candidates, using=self.db, actor=actor, bypass=unscoped)
-        rebac_type = model_resource_type(self.model)
-        if not unscoped and rebac_type:
-            if actor is None:
-                raise MissingActorError(
-                    f"{self.model.__name__}.bulk_create() called with no actor."
-                )
-            from .preflight import _check_new_model
-
-            for candidate in candidates:
-                result = _check_new_model(candidate, subject=actor, using=self.db)
-                if not result.allowed:
-                    raise PermissionDenied(
-                        f"Denied: {actor} cannot create a proposed {rebac_type} row."
-                    )
-        if update_conflicts and not unscoped and model_resource_type(self.model):
-            raise PermissionDenied(
-                "Actor-scoped bulk_create(update_conflicts=True) cannot check write "
-                "permissions on conflicting rows. Use checked saves or explicit sudo."
-            )
-        rows = super().bulk_create(
-            candidates,
-            batch_size=batch_size,
-            ignore_conflicts=ignore_conflicts,
-            update_conflicts=update_conflicts,
-            update_fields=update_fields,
-            unique_fields=unique_fields,
-        )
-        if actor is not None and not unscoped:
-            for row in rows:
-                row._rebac_actor = actor  # type: ignore[attr-defined]
-                row._rebac_sudo_reason = None  # type: ignore[attr-defined]
-        return rows
-
-    def update(self, **kwargs: Any) -> int:
-        from .signals import _gate_backed_rows, audit_backed_denials
-        from .watch import by_key, model_write, statement_keys
-
-        if self.query.combinator or self.query.is_sliced:
-            # Django refuses these before it reads a row.
-            return super().update(**kwargs)
-        self._for_write = True
-        with (
-            audit_backed_denials(),
-            model_write(model=self.model, using=self.db, names=kwargs) as watched,
-        ):
-            actor, bypass = self._resolve_effective_actor()
-            if bypass or not (watched or model_resource_type(self.model)):
-                return self._rebac_update(**kwargs)
+        if step is _WriteStep.UPDATE_CLAUSE:
             if self.query.distinct_fields:
-                # Django's UPDATE writes every matching row; DISTINCT ON would
-                # select one per value, so the rows checked would not be the
-                # rows written.  Django refuses it for delete() as well.
                 raise TypeError("Cannot call update() after .distinct(*fields) under an actor.")
-            # Before any row is selected: a refusal must not depend on a match.
             self._guard_clause_field_reads(actor, bypass, query=self._update_query())
-            # The statement acts on the rows the actor's scope admits: exactly
-            # those are gated and written, by key.
-            keys = statement_keys(
-                self._rows_in_scope(self._writing_actor(actor), reason="rebac.write.rows")
-            )
-            if watched:
-                for rows in by_key(self.model._base_manager.using(self.db), keys):
-                    _gate_backed_rows(
-                        rows,
-                        using=self.db,
-                        names=kwargs,
-                        proposed=kwargs,
-                        actor=actor,
-                        bypass=bypass,
+        elif step is _WriteStep.DELETE_CLAUSE:
+            self._guard_clause_field_reads(actor, bypass, clears_ordering=True)
+        elif step is _WriteStep.UPDATE or step is _WriteStep.DELETE:
+            if not isinstance(rows, RebacQuerySet):
+                raise TypeError("An actor-scoped write requires a RebacQuerySet.")
+            if actor is None or not model_resource_type(self.model):
+                return
+            rows._guard_bulk_action(actor, "write" if step is _WriteStep.UPDATE else "delete")
+            if step is _WriteStep.UPDATE and kwargs is not None:
+                rows._guard_bulk_field_writes(actor, kwargs)
+                rows._guard_bulk_expression_reads(actor, kwargs)
+        elif step is _WriteStep.CREATE:
+            if candidates is None:
+                raise TypeError("bulk_create requires candidate rows")
+            for candidate in candidates:
+                if type(candidate) is not self.model:
+                    raise TypeError(
+                        f"{self.model.__name__}.bulk_create() accepts only exact "
+                        f"{self.model.__name__} instances; got {type(candidate).__name__}."
                     )
-            written = sum(rows._rebac_update(**kwargs) for rows in by_key(self, keys))
-            self._result_cache = None
-            return written
-
-    def bulk_update(
-        self, objs: Iterable[_M], fields: Iterable[str], batch_size: int | None = None
-    ) -> int:
-        from .signals import audit_backed_denials
-        from .watch import model_write
-
-        self._for_write = True
-        # Django dispatches batches through update(); this outer owner keeps
-        # all batches in one transaction.
-        field_names = tuple(fields)
-        with (
-            audit_backed_denials(),
-            model_write(model=self.model, using=self.db, names=field_names),
-        ):
-            return super().bulk_update(objs, field_names, batch_size=batch_size)
+            _gate_backed_rows(candidates, using=self.db, actor=actor, bypass=bypass)
+            rebac_type = model_resource_type(self.model)
+            if not bypass and rebac_type:
+                if actor is None:
+                    raise MissingActorError(
+                        f"{self.model.__name__}.bulk_create() called with no actor."
+                    )
+                for candidate in candidates:
+                    if not _check_new_model(candidate, subject=actor, using=self.db).allowed:
+                        raise PermissionDenied(
+                            f"Denied: {actor} cannot create a proposed {rebac_type} row."
+                        )
+            if update_conflicts and not bypass and rebac_type:
+                raise PermissionDenied(
+                    "Actor-scoped bulk_create(update_conflicts=True) cannot check write "
+                    "permissions on conflicting rows. Use checked saves or explicit sudo."
+                )
 
     def _update_query(self) -> Query:
-        """The query an ``UPDATE`` reads: an explicit ordering stays (MySQL emits
-        it, so the order of the writes, and which one fails a unique constraint
-        first, follows it); a model's default ordering does not."""
+        """The query an UPDATE reads without model default ordering."""
         query = self.query.clone()
         query.default_ordering = False
         return query
-
-    def _rebac_update(self, **kwargs: Any) -> int:
-        from .watch import gate_policy, refuse_moving_edges
-
-        actor, sudo = self._resolve_effective_actor()
-        if sudo:
-            return super().update(**kwargs)
-        refuse_moving_edges(gate_policy(self.db), self.model, kwargs)
-        self._guard_clause_field_reads(actor, sudo, query=self._update_query())
-        rebac_type = model_resource_type(self.model)
-        if rebac_type:
-            self._guard_bulk_action(actor, "write")  # type: ignore[arg-type]
-            # Per-field write gates retain all-or-nothing semantics.
-            self._guard_bulk_field_writes(actor, kwargs)  # type: ignore[arg-type]
-            self._guard_bulk_expression_reads(actor, kwargs)  # type: ignore[arg-type]
-        return super().update(**kwargs)
-
-    def delete(self) -> tuple[int, dict[str, int]]:
-        from .watch import by_key, model_write, statement_keys
-
-        if (
-            self.query.combinator
-            or self.query.is_sliced
-            or self.query.distinct_fields
-            or getattr(self, "_fields", None) is not None
-        ):
-            # Django refuses these before it reads a row.
-            return super().delete()
-        self._for_write = True
-        with model_write(model=self.model, using=self.db):
-            from .mixins import deletion_owner
-
-            actor, unscoped = self._resolve_effective_actor()
-            self._guard_clause_field_reads(actor, unscoped, clears_ordering=True)
-            if unscoped or not model_resource_type(self.model):
-                with deletion_owner(self, self.db, actor, unscoped):
-                    return super().delete()
-            # The statement acts on the rows the actor's scope admits: exactly
-            # those are checked and deleted, by key.  A cascade that reaches
-            # another row checks it as an instance delete does.
-            actor = self._writing_actor(actor)
-            keys = statement_keys(self._rows_in_scope(actor, reason="rebac.delete.rows"))
-            parts = list(by_key(self, keys))
-            for rows in parts:
-                rows._guard_bulk_action(actor, "delete")
-            deleted: Counter[str] = Counter()
-            for rows in parts:
-                with deletion_owner(rows, self.db, actor, unscoped):
-                    deleted.update(models.QuerySet.delete(rows)[1])
-            self._result_cache = None
-            return sum(deleted.values()), dict(deleted)
 
     def _guard_bulk_action(self, actor: SubjectRef, action: str) -> None:
         with database_context(self.db):
@@ -1903,7 +2058,7 @@ class RebacQuerySet(models.QuerySet[_M]):
     def _guard_bulk_field_writes(self, actor: SubjectRef, kwargs: dict[str, Any]) -> None:
         """Per-field write enforcement for bulk ``QuerySet.update()``.
 
-        Mirrors the per-field gate run in ``RebacMixin.save_base``: for each
+        Mirrors the per-field gate run in ``RebacMixin``'s save gate: for each
         ``f`` in ``kwargs`` whose resource type declares a permission
         named ``write__<f>``, every row in the current scope must pass
         that check too — same all-or-nothing semantics as the
@@ -2059,6 +2214,9 @@ class RebacManager[M: models.Model](_RebacManagerBase[M]):  # pyright: ignore[re
     model parameter through queryset chains.
     """
 
+    def get_queryset(self) -> RebacQuerySet[M]:
+        return _related_manager_queryset(self, cast(RebacQuerySet[M], super().get_queryset()))
+
     def _rebac_queryset(self) -> RebacQuerySet[M]:
         queryset = self.get_queryset()
         if not isinstance(queryset, RebacQuerySet):
@@ -2115,148 +2273,3 @@ class RebacManager[M: models.Model](_RebacManagerBase[M]):  # pyright: ignore[re
             raise PermissionDenied("raw() cannot be actor-scoped; use sudo or system_context")
         raw_method = queryset.raw
         return raw_method(raw_query, params=params, translations=translations, using=using)
-
-
-class TrackedQuerySet[T: models.Model](models.QuerySet[T]):
-    """Owning queryset without actor scoping, also used by both base managers."""
-
-    def update(self, **kwargs: Any) -> int:
-        from .actors import current_actor, is_sudo
-        from .mixins import RebacMixin
-        from .signals import _edge_actor, _gate_backed_rows, audit_backed_denials
-        from .watch import by_key, gate_policy, model_write, refuse_moving_edges, statement_keys
-
-        self._for_write = True
-        with (
-            audit_backed_denials(),
-            model_write(model=self.model, using=self.db, names=kwargs) as watched,
-        ):
-            related_owner = cast(Any, self)._hints.get("instance")
-            if not is_sudo() and (related_owner is not None or current_actor() is not None):
-                # A generic related manager re-points edges through here.
-                refuse_moving_edges(gate_policy(self.db), self.model, kwargs)
-            related_fk_write = any(
-                isinstance(field, (models.ForeignKey, models.OneToOneField))
-                and {field.name, field.attname} & kwargs.keys()
-                for field in self.model._meta.concrete_fields
-            )
-            if (
-                not watched
-                or self.query.is_sliced
-                or not (
-                    not issubclass(self.model, RebacMixin)
-                    or related_owner is not None
-                    or related_fk_write
-                )
-            ):
-                return super().update(**kwargs)
-            actor, bypass = (
-                _edge_actor(related_owner, relation=True)
-                if related_owner is not None
-                else (None, is_sudo())
-            )
-            if bypass:
-                return super().update(**kwargs)
-            # The gate decides on the statement's rows, and exactly those rows
-            # are written.
-            keys = statement_keys(self)
-            for rows in by_key(self.model._base_manager.using(self.db), keys):
-                _gate_backed_rows(
-                    rows, using=self.db, names=kwargs, proposed=kwargs, actor=actor, bypass=bypass
-                )
-            return sum(models.QuerySet.update(rows, **kwargs) for rows in by_key(self, keys))
-
-    def delete(self) -> tuple[int, dict[str, int]]:
-        from .actors import current_actor, is_sudo
-        from .conf import app_settings
-        from .mixins import RebacMixin, deletion_owner
-        from .signals import _gate_backed_rows, audit_backed_denials
-        from .watch import by_key, model_write, statement_keys
-
-        self._for_write = True
-        actor = current_actor()
-        # Resource base-manager writes are intentionally unscoped infrastructure
-        # operations. Plain tracked roots retain ambient scope for resource cascades.
-        unscoped = (
-            issubclass(self.model, RebacMixin)
-            or is_sudo()
-            or (actor is None and not app_settings.REBAC_STRICT_MODE)
-        )
-        with audit_backed_denials(), model_write(model=self.model, using=self.db) as watched:
-            if (
-                not watched
-                or issubclass(self.model, RebacMixin)
-                or is_sudo()
-                or self.query.is_sliced
-            ):
-                with deletion_owner(self, self.db, actor, unscoped):
-                    return super().delete()
-            keys = statement_keys(self)
-            for rows in by_key(self.model._base_manager.using(self.db), keys):
-                _gate_backed_rows(rows, using=self.db, deleting=True)
-            deleted: Counter[str] = Counter()
-            for rows in by_key(self, keys):
-                with deletion_owner(rows, self.db, actor, unscoped):
-                    deleted.update(models.QuerySet.delete(rows)[1])
-            return sum(deleted.values()), dict(deleted)
-
-    def bulk_create(
-        self,
-        objs: Iterable[T],
-        batch_size: int | None = None,
-        ignore_conflicts: bool = False,
-        update_conflicts: bool = False,
-        update_fields: Collection[str] | None = None,
-        unique_fields: Collection[str] | None = None,
-    ) -> list[T]:
-        from .actors import is_sudo
-        from .mixins import RebacMixin
-        from .signals import _gate_backed_rows, audit_backed_denials
-        from .watch import gate_policy, model_write
-
-        self._for_write = True
-        candidates = list(objs)
-        with audit_backed_denials(), model_write(model=self.model, using=self.db) as watched:
-            if not issubclass(self.model, RebacMixin):
-                policy = gate_policy(self.db) if watched else None
-                if update_conflicts and update_fields and not is_sudo() and policy is not None:
-                    watch = policy.watched.get(self.model._meta.label_lower)
-                    if watch is not None and any(
-                        {field.name, field.attname} & set(update_fields) & watch.fields
-                        for field in self.model._meta.concrete_fields
-                    ):
-                        raise PermissionDenied(
-                            "Conflicting bulk create cannot check both sides of a backed edge; "
-                            "use checked saves or sudo."
-                        )
-                _gate_backed_rows(candidates, using=self.db, bypass=is_sudo())
-            return super().bulk_create(
-                candidates,
-                batch_size,
-                ignore_conflicts,
-                update_conflicts,
-                update_fields,
-                unique_fields,
-            )
-
-    def bulk_update(
-        self, objs: Iterable[T], fields: Iterable[str], batch_size: int | None = None
-    ) -> int:
-        from .signals import audit_backed_denials
-        from .watch import model_write
-
-        self._for_write = True
-        field_names = tuple(fields)
-        with (
-            audit_backed_denials(),
-            model_write(model=self.model, using=self.db, names=field_names),
-        ):
-            return super().bulk_update(objs, field_names, batch_size=batch_size)
-
-
-_TrackedManagerBase = models.Manager.from_queryset(TrackedQuerySet)
-
-
-# Keep the same model parameter on Django's generated, generic manager base.
-class TrackedManager[M: models.Model](_TrackedManagerBase[M]):  # pyright: ignore[reportInvalidTypeArguments]
-    """Unfiltered manager whose writes to columns the policy reads are gated."""

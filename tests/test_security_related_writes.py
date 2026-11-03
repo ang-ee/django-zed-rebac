@@ -6,13 +6,15 @@ Related managers, raw relationship deletes, bulk updates reading gated columns,
 
 from __future__ import annotations
 
+import pickle
 from datetime import timedelta
 
 import pytest
 from django.contrib.auth import get_user_model
 from django.db import connection, transaction
-from django.db.models import F, OuterRef, Subquery
+from django.db.models import F, OuterRef, Prefetch, Subquery
 from django.db.models.expressions import RawSQL
+from django.db.models.signals import post_save
 from django.test import override_settings
 from django.test.utils import CaptureQueriesContext
 from django.utils import timezone
@@ -32,6 +34,7 @@ from rebac.backends import reset_backend
 from rebac.models import PermissionAuditEvent, Relationship, RelationshipRegistry
 from rebac.models.resource import RebacResource
 from rebac.schema import parse_zed
+from rebac.signals import BackedEdgeDenied
 from tests.backend_setup import install_schema
 from tests.testapp.models import (
     BackingEntry,
@@ -184,7 +187,7 @@ def test_instance_sudo_does_not_bypass_m2m_backing_gate():
 
 
 @override_settings(REBAC_AUDIT_DENIALS=True)
-@pytest.mark.parametrize("operation", ["update", "m2m", "instance_save"])
+@pytest.mark.parametrize("operation", ["update", "bulk_update", "m2m", "instance_save"])
 def test_backed_edge_denial_audits_declaring_resource_after_rollback(operation):
     install_schema(
         backend(), parse_zed(REVERSE_M2M_SCHEMA if operation == "m2m" else REVERSE_FK_SCHEMA)
@@ -201,6 +204,9 @@ def test_backed_edge_denial_audits_declaring_resource_after_rollback(operation):
             row = Post.objects.with_actor(EDITOR).get(pk=post.pk)
             if operation == "m2m":
                 row.collections.add(folder)
+            elif operation == "bulk_update":
+                row.folder = folder
+                Post.objects.with_actor(EDITOR).bulk_update([row], ["folder"])
             else:
                 row.folder = folder
                 row.save()
@@ -210,6 +216,85 @@ def test_backed_edge_denial_audits_declaring_resource_after_rollback(operation):
         )
     )
     assert targets == [f"blog/folder:{folder.pk}#write"]
+
+
+@override_settings(REBAC_AUDIT_DENIALS=True)
+def test_nested_save_denial_audits_inner_declaring_resource_after_outer_rollback():
+    install_schema(backend(), parse_zed(REVERSE_FK_SCHEMA))
+    with sudo(reason="test.fixture"):
+        outer = Post.objects.create(title="outer")
+        inner = Post.objects.create(title="inner")
+        folder = Folder.objects.create(name="victim")
+    for post in (outer, inner):
+        _grant("blog/post", post.pk, "owner", EDITOR)
+    _grant("blog/folder", folder.pk, "owner", READER)
+    outer = Post.objects.with_actor(EDITOR).get(pk=outer.pk)
+    inner = Post.objects.with_actor(EDITOR).get(pk=inner.pk)
+
+    def save_inner(sender, instance, **kwargs):
+        if instance.pk == outer.pk:
+            inner.folder = folder
+            inner.save()
+
+    post_save.connect(save_inner, sender=Post, weak=False, dispatch_uid="nested-denial-audit")
+    try:
+        outer.title = "changed"
+        with pytest.raises(PermissionDenied):
+            outer.save()
+    finally:
+        post_save.disconnect(sender=Post, dispatch_uid="nested-denial-audit")
+    assert Post._base_manager.get(pk=outer.pk).title == "outer"
+    assert list(
+        PermissionAuditEvent.objects.filter(reason__startswith="denied:").values_list(
+            "target_repr", flat=True
+        )
+    ) == [f"blog/folder:{folder.pk}#write"]
+
+
+def test_unwatched_tracked_related_writes_need_no_actor():
+    with sudo(reason="test.fixture"):
+        round_ = BackingRound.objects.create()
+    user = get_user_model().objects.create_user(username="unwatched related")
+    BackingEntry.objects.create(round=round_, responder=user)
+    assert round_.entries.update(retired_at=timezone.now()) == 1
+    created = round_.entries.bulk_create([BackingEntry(round=round_, responder=user)])
+    assert len(created) == 1
+    assert BackingEntry.objects.filter(round=round_).count() == 2
+
+
+def test_unwatched_direct_through_bulk_create_checks_owner_write():
+    install_schema(
+        backend(),
+        parse_zed("""
+        definition auth/user {}
+        definition blog/post {
+            relation owner: auth/user
+            permission read = owner
+            permission write = owner
+        }
+        definition blog/folder {
+            relation owner: auth/user
+            permission read = owner
+            permission write = owner
+        }
+        """),
+    )
+    with sudo(reason="test.fixture"):
+        post = Post.objects.create(title="not editor's")
+        folder = Folder.objects.create(name="editor's")
+    _grant("blog/folder", folder.pk, "owner", EDITOR)
+    through = Post.collections.through
+    with actor_context(EDITOR), pytest.raises(BackedEdgeDenied):
+        through.objects.bulk_create([through(post_id=post.pk, folder_id=folder.pk)])
+    assert not through.objects.exists()
+
+
+def test_resource_bulk_create_checks_actor_and_create_before_conflict_update():
+    options = {"update_conflicts": True, "update_fields": ["title"], "unique_fields": ["id"]}
+    with pytest.raises(MissingActorError):
+        Post.objects.bulk_create([Post(title="new")], **options)
+    with actor_context(EDITOR), pytest.raises(PermissionDenied, match="cannot create"):
+        Post.objects.bulk_create([Post(title="new")], **options)
 
 
 @override_settings(REBAC_AUDIT_DENIALS=True)
@@ -580,6 +665,51 @@ def test_backing_filter_column_change_requires_write_on_source(operation):
             entry.retired_at = None
             BackingEntry.objects.bulk_update([entry], ["retired_at"])
     assert BackingEntry._base_manager.get(pk=entry.pk).retired_at is not None
+
+
+@pytest.mark.parametrize("hint_source", ["prefetch", "db_manager"])
+def test_tracked_write_ignores_untrusted_router_instance_hint(hint_source):
+    install_schema(
+        backend(),
+        parse_zed("""
+        definition auth/user {}
+        definition test/backinground {
+            relation owner: auth/user
+            relation responders: auth/user // rebac:field={"path":"entries__responder","filters":{"entries__retired_at__isnull":true}}
+            permission read = owner
+            permission write = owner
+        }
+        """),
+    )
+    with sudo(reason="test.fixture"):
+        round_ = BackingRound.objects.create()
+        user = get_user_model().objects.create_user(username="hint responder")
+        entry = BackingEntry.objects.create(round=round_, responder=user, retired_at=timezone.now())
+    _grant("test/backinground", round_.pk, "owner", EDITOR)
+    owner = BackingRound.objects.with_actor(EDITOR).get(pk=round_.pk)
+    if hint_source == "prefetch":
+        caller_qs = BackingEntry.objects.filter(pk=entry.pk)
+        loaded = (
+            BackingRound.objects.with_actor(EDITOR)
+            .filter(pk=round_.pk)
+            .prefetch_related(Prefetch("entries", queryset=caller_qs))
+            .get()
+        )
+        assert caller_qs._hints.get("instance") is loaded
+    else:
+        caller_qs = BackingEntry.objects.db_manager(hints={"instance": owner}).filter(pk=entry.pk)
+    assert caller_qs._rebac_related_owner is None
+    with actor_context(READER), pytest.raises(PermissionDenied):
+        caller_qs.update(retired_at=None)
+    assert BackingEntry._base_manager.get(pk=entry.pk).retired_at is not None
+    # The real related manager still carries its pinned owner through clones.
+    related = owner.entries.filter(pk=entry.pk)
+    assert related._rebac_related_owner is owner
+    restored = pickle.loads(pickle.dumps(related))
+    assert restored._rebac_related_owner is None
+    with actor_context(READER), pytest.raises(PermissionDenied):
+        restored.update(retired_at=None)
+    assert related.update(retired_at=None) == 1
 
 
 def test_attribute_rekey_requires_write_on_old_and_new_containers():
