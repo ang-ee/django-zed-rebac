@@ -85,8 +85,9 @@ the Django API that produced the write:
 2. One gate, `rebac.signals.gate_edge_changes(changes, actor)`, batches the
    check per declaring type with one scoped existence query per type (the
    scoped queryset for the write-class action filtered to the affected ids,
-   compared by count). It emits one denial audit row per denied type after
-   the owner's transaction has unwound.
+   compared by count). A structured gate denial carries the exact declaring
+   resource, actor and action. The owner emits its audit row after the
+   transaction has unwound.
 3. Call sites shrink to: `save_base` (field changes), the collector hook
    (deletes, CASCADE, SET_NULL, in one batch before deletion), `m2m_changed`
    (related-manager changes), and the reverse-FK queryset owners (`add`,

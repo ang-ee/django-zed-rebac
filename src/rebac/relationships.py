@@ -142,8 +142,7 @@ def delete_relationship(tuple_: RelationshipTuple) -> Zookie:
     No direct SpiceDB equivalent — SpiceDB expresses the same intent via
     ``WriteRelationships`` with an ``OPERATION_DELETE`` update. This helper
     is therefore local-only today; the plan for 0.4 is to lower it through
-    that path once the backend ABC accepts operation-shaped updates. See
-    ``docs/ARCHITECTURE.md``.
+    that path through the LocalBackend API. See ``docs/ARCHITECTURE.md``.
     """
     from .actors import current_actor
     from .audit import emit as emit_audit

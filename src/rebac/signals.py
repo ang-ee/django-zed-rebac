@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from collections.abc import Iterable, Iterator
-from contextlib import contextmanager
+from contextlib import contextmanager, nullcontext
 from itertools import batched
 from typing import Any, cast
 from weakref import ReferenceType, WeakKeyDictionary, WeakSet, ref
@@ -24,7 +24,8 @@ from django.dispatch import receiver
 
 from .actors import model_can_resolve_subject, model_identities
 from .conf import app_settings
-from .errors import PermissionDenied
+from .database import database_context
+from .errors import GateDenied, PermissionDenied
 from .resources import model_resource_type, to_object_ref
 from .types import ObjectRef, SubjectRef
 
@@ -340,7 +341,7 @@ def _rebac_pre_delete(
     origin: Any = None,
     **kwargs: Any,
 ) -> None:
-    from .managers import RebacQuerySet, TrackedQuerySet
+    from .managers import TrackedQuerySet
     from .mixins import RebacMixin, _gate_delete, delete_scope
 
     scope = delete_scope(origin, using)
@@ -349,7 +350,7 @@ def _rebac_pre_delete(
     covered = scope is not None and (
         origin is instance
         or (
-            isinstance(origin, (RebacQuerySet, TrackedQuerySet))
+            isinstance(origin, TrackedQuerySet)
             and origin.model is sender
             and instance.pk in scope.root_pks
         )
@@ -693,28 +694,26 @@ def _edge_actor(instance: Any, *, relation: bool = False) -> tuple[SubjectRef | 
     )
 
 
-class BackedEdgeDenied(PermissionDenied):
+class BackedEdgeDenied(GateDenied):
     """Carry the denied declaring resource across an owner's rollback."""
 
     def __init__(self, message: str, actor: SubjectRef, resource: ObjectRef) -> None:
-        super().__init__(message)
-        self.actor = actor
-        self.resource = resource
+        super().__init__(message, actor, "write", resource)
 
-
-def audit_edge_denial(exc: BaseException) -> None:
-    if isinstance(exc, BackedEdgeDenied):
-        from .mixins import _maybe_audit_denial
-
-        _maybe_audit_denial(actor=exc.actor, action="write", resource=exc.resource)
+    def __reduce__(self) -> tuple[object, tuple[object, ...]]:
+        return (type(self), (str(self), self.actor, self.resource))
 
 
 @contextmanager
-def audit_backed_denials() -> Iterator[None]:
+def audit_denials(*, using: str | None = None) -> Iterator[None]:
+    """Emit a denied write after its owner's transaction has unwound."""
     try:
         yield
-    except BackedEdgeDenied as exc:
-        audit_edge_denial(exc)
+    except GateDenied as exc:
+        from .mixins import _maybe_audit_denial
+
+        with database_context(using) if using is not None else nullcontext():
+            _maybe_audit_denial(actor=exc.actor, action=exc.action, resource=exc.resource)
         raise
 
 
@@ -751,7 +750,6 @@ def _gate_backed_rows(
     deleting: bool = False,
 ) -> None:
     """Batch the backed-edge gate for signal-free queryset writes."""
-    from .errors import PermissionDenied
 
     if bypass:
         return

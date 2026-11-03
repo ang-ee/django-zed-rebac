@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 
 import pytest
+from django.core.exceptions import PermissionDenied
 from django.core.management import call_command
 from django.db import transaction
 from django.test import override_settings
@@ -55,7 +56,7 @@ class DefaultRouter:
         return "default"
 
 
-def policy(alias, expression="owner", resource_type="demo/item"):
+def policy(alias, expression="owner", resource_type="demo/item", write_expression=None):
     with schema_changes(using=alias):
         SchemaDefinition.objects.using(alias).get_or_create(resource_type="auth/user")
         item = SchemaDefinition.objects.using(alias).create(resource_type=resource_type)
@@ -65,6 +66,10 @@ def policy(alias, expression="owner", resource_type="demo/item"):
         SchemaPermission.objects.using(alias).create(
             definition=item, name="read", expression=expression
         )
+        if write_expression is not None:
+            SchemaPermission.objects.using(alias).create(
+                definition=item, name="write", expression=write_expression
+            )
 
 
 def test_scope_keeps_tuples_schema_audit_and_cache_on_one_alias():
@@ -147,6 +152,28 @@ def test_explicit_queryset_and_loaded_instance_override_scope(exact):
         assert not selected.exists()
         # A clone changed to the other alias must not retain the first decision.
         assert not default.using("selected").exists()
+
+
+def test_check_save_denies_on_selected_database_policy():
+    policy("default", resource_type="blog/post", write_expression="owner")
+    policy("selected", resource_type="blog/post", write_expression="nil")
+    with database_context("default"), system_context(reason="fixture"):
+        post = Post.objects.using("default").create(title="default row")
+        write_relationships(
+            [RelationshipTuple(ObjectRef("blog/post", str(post.pk)), "owner", ACTOR)]
+        )
+    with database_context("selected"), system_context(reason="fixture"):
+        Post.objects.using("selected").create(pk=post.pk, title="selected row")
+        write_relationships(
+            [RelationshipTuple(ObjectRef("blog/post", str(post.pk)), "owner", ACTOR)]
+        )
+    candidate = Post.objects.using("selected").with_actor(ACTOR).get(pk=post.pk)
+    candidate.title = "refused"
+    assert not candidate.check_save(using="selected").allowed
+    assert not candidate._rebac_gates_admit()
+    with pytest.raises(PermissionDenied):
+        candidate.save(using="selected")
+    assert Post._base_manager.using("selected").get(pk=post.pk).title == "selected row"
 
 
 def test_nested_failure_and_async_tasks_restore_context():

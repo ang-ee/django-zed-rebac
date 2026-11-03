@@ -737,6 +737,42 @@ def check_default_managers(app_configs: Any = None, **kwargs: Any) -> list[check
 
 
 @checks.register("rebac")
+def check_tracked_default_managers(
+    app_configs: Any = None, **kwargs: Any
+) -> list[checks.CheckMessage]:
+    """E025: a tracked model's default manager must carry related owners."""
+    from django.apps import apps
+
+    from .managers import RebacManager, TrackedManager
+    from .mixins import RebacTrackedMixin
+
+    configs = apps.get_app_configs() if app_configs is None else app_configs
+    issues: list[checks.CheckMessage] = []
+    for config in configs:
+        for model in config.get_models():
+            if not issubclass(model, RebacTrackedMixin) or isinstance(
+                model._default_manager, TrackedManager | RebacManager
+            ):
+                continue
+            issues.append(
+                checks.Error(
+                    f"{model._meta.label}: the default manager "
+                    f"{model._meta.default_manager_name!r} is a "
+                    f"{type(model._default_manager).__name__}, not a rebac.TrackedManager "
+                    "or rebac.RebacManager subclass.",
+                    hint=(
+                        "Related managers must carry their owner into write gates. "
+                        "Derive the default manager from TrackedManager or RebacManager "
+                        "(including their from_queryset(...) forms)."
+                    ),
+                    obj=model,
+                    id="rebac.E025",
+                )
+            )
+    return issues
+
+
+@checks.register("rebac")
 def check_stale_override_references(
     app_configs: Any = None, **kwargs: Any
 ) -> list[checks.CheckMessage]:

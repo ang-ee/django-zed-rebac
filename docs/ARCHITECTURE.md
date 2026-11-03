@@ -1239,6 +1239,7 @@ System checks (in `rebac/checks.py`):
 | `rebac.E021` | Error | The schema declares a caveat but `cel-python` (the `caveats` extra) is not installed, so caveat bodies cannot be validated or evaluated. |
 | `rebac.E023` | Error | A `RebacMixin` / `RebacTrackedMixin` model's declared base manager returns a queryset that is not a `TrackedQuerySet`, or one that filters rows. The library reads a model's rows and owns its gated writes through the base manager. (`E020` and `E022` are reserved by proposals 0011 and 0013.) |
 | `rebac.E024` | Error | A `RebacMixin` model's default manager returns a queryset that is not a `RebacQuerySet`. Django's admin, model forms, related managers and `validate_unique()` read rows through `_default_manager`; a plain manager there leaves those reads unscoped with no `MissingActorError`. Override `objects` only with a `RebacManager` subclass. |
+| `rebac.E025` | Error | A `RebacTrackedMixin` model's default manager is not a `TrackedManager` or `RebacManager` subclass. Those managers carry a related owner's actor into write gates; a plain `models.Manager.from_queryset(TrackedQuerySet)` drops it. |
 | `rebac.W001` | Warning | `rebac.backends.RebacBackend` not in `AUTHENTICATION_BACKENDS`. |
 | `rebac.W002` | Warning | A model with `Meta.rebac_resource_type` is missing `RebacMixin`. |
 | `rebac.W003` | Warning | An RBAC-bound relation exists where bare `select_related("rel")` / `prefetch_related("rel")` can be unsafe outside the REBAC helpers or Strawberry-Django optimizer. |
@@ -1578,50 +1579,27 @@ Limitations (0.4):
 
 ### Django model validation and stored identity references
 
-`RebacMixin.full_clean()`, `validate_unique()` and `validate_constraints()`
-retain Django's validation rules and add one access decision. A rule that
-compares this row with other rows (a unique field, `unique_together`,
-`unique_for_*`, a `UniqueConstraint` or any constraint other than a
-`CheckConstraint`, a primary key only for a row being added with its key
-set, none whose values are all `None`, none naming an excluded field, as
-Django itself checks) reads rows the actor may not see. Under an actor it
-runs with every row visible only after `check_save()` admits this candidate,
-in a system context whose audit row names that actor. `check_save()`
-rehearses the save: the model's own `save()` runs inside a transaction that
-is rolled back, so a consumer override's effects outside the database happen
-during validation as they would during the save. When the gates refuse, or
-the rehearsal cannot reach them (a related row that does not exist, a
-`ValidationError` the consumer's `save()` raises, a `TypeError` or
-`ValueError`), the step still runs, as the actor alone: the rows the actor
-can read answer, no ambient bypass applies, and the cross-row rules leave
-out the gated fields a filter would be refused on, by the filter guard's own
-rule per model class (none in `"allow"` mode; otherwise the `read__<field>`
-gates that do not hold on every row). A `CheckConstraint` reads the instance
-alone and is never left out for that reason. A refused save therefore learns
-nothing it could not read, and Django's own errors (a duplicate it can see, a
-`CheckConstraint`) still stand as form errors. Inside a rehearsal nothing is
-elevated: the instance being checked skips its cross-row rules (the enclosing
-call runs them), and any other row a consumer `save()` cleans there validates
-as the actor alone, since a bypass entered inside the rolled-back transaction
-could not be audited. A loaded row also excludes
-the fields redacted when it loaded, which its save leaves unwritten. The
-decision is taken once per outermost call, whether that is `full_clean()` or
-a direct `validate_unique()` / `validate_constraints()` as a `ModelForm`
-makes them; while `check_save()` runs, and inside the rehearsal it drives,
-the decision is pending, so a consumer `save()` that cleans again never
-validates with more access than the actor, whichever call is outermost. The
-instance marker that carries the decision is removed on every outermost
-exit and is not pickled. The instance's pinned actor outranks an ambient
-bypass, as everywhere: an instance bypass (`sudo`) validates in a system
-context under its own reason; with no actor and no bypass the rules run as
-they are, and strict mode refuses the actor-less read. Models without
-resource policy and steps without a cross-row rule run unchanged, with no
-rehearsal. A `ModelForm` makes the two direct calls separately, so it pays
-two rehearsals and two audit rows per `is_valid()`; one decision per form is
-a later optimisation. Known limitation: Django's `clean_fields()` validates
-a foreign key through `_base_manager`, so a hidden row's id passes where a
-nonexistent id does not; that existence oracle predates this section and is
-not closed by it.
+A `RebacMixin` instance's inherited `full_clean()`, `validate_unique()` and `validate_constraints()`
+retain Django's validation rules. Cross-row rules run with every row visible
+only when the instance's direct save gates admit its current values. The gate
+verdict checks create or write, dirty `write__<field>` permissions, backed
+edges, expression reads and redacted writes. `check_save()` exposes the same
+verdict without writing. It does not run a consumer `save()` override; any
+changes that override makes are checked by the real save before mutation.
+
+When a gate refuses, cross-row validation runs as the actor alone and excludes
+fields whose read gates would refuse a filter. This prevents a refused write
+from revealing hidden duplicates. Django's own `validate_constraints()` receives
+both the caller's excluded fields and these hidden fields. A `CheckConstraint`
+that names a hidden field is then left to the database at save time. A loaded
+row also excludes fields redacted when it was read. An admitted cross-row
+check enters a system context whose bypass audit names the actor. Each direct
+`validate_unique()` or `validate_constraints()` call takes its own verdict.
+An instance's pinned actor outranks ambient sudo; instance sudo validates in
+its own system context. Models without resource policy and steps without a
+cross-row rule use Django's validation path unchanged. Django's `clean_fields()`
+checks a foreign key through `_base_manager`, so a hidden row's id passes where
+a nonexistent id does not; that preexisting existence oracle remains.
 
 `rebac.proposed_forward_relationships(instance, definition, *,
 required_relations, using=None)` is the canonical candidate projection already
@@ -2254,8 +2232,11 @@ else. The write gates keep the rules of the
 [CRUD enforcement matrix](#crud-enforcement-matrix) and of invariant 5d
 (a change to a backed edge requires `write` on every affected row of the
 declaring type), with the same entry points: `save_base` and `delete` on the
-mixins, the scoped and tracked querysets, the injected base manager, and the
-explicit-sender receivers.
+mixins, the shared tracked queryset write owner (with scoped queryset hooks), the
+injected base manager, and the explicit-sender receivers. Gate denials carry
+their actor, action and exact resource through each owner rollback. Each owner
+emits afterward if enabled; nested owners' audit rows roll back with their
+enclosing owner, leaving one durable row.
 
 - **The watch map.** `rebac.watch.watched_for(schema)` resolves, from model
   metadata alone, the models and columns that the schema's backings read:
@@ -2407,7 +2388,7 @@ The headline feature. By inclusion, every model operation is gated against the e
 ### What gets installed
 
 1. `objects = RebacManager.from_queryset(RebacQuerySet)()` replaces the default manager. A concrete model may override `objects` with a `RebacManager` subclass (`RebacManager.from_queryset(...)` keeps a custom queryset's methods, and under mypy's Django plugin its type; pyright sees the verbs `RebacManager` declares, typed on the model); any other default manager leaves the model's reads unscoped and `rebac.E024` reports it.
-2. `_default_manager` points at it; the base manager is an **owning, unscoped** manager. When the model declares none, the metaclass injects `_rebac_base = TrackedManager()` and names it in `base_manager_name`, even when consumers declare their own `Meta`. A model that declares `Meta.base_manager_name` keeps its manager, and so does a model whose parent model declares one: every parent model is read in base order, not only the first as in Django's own fallback, so listing `RebacMixin` first does not discard a base manager declared by an abstract parent. `base_manager_name = "_rebac_base"` on the model opts back into the injected one. A declared base manager must be built over a `TrackedQuerySet` subclass (`models.Manager.from_queryset(...)`); class creation raises `ImproperlyConfigured` otherwise, the scoped `RebacManager` included. It may add methods and refuse writes (an append-only queryset), but it must return every row: permission statements read a model's rows, and the write gates read their stored values, through `_base_manager`, so a base manager that filters rows would hide those rows from both. `rebac.E023` reports a declared base manager whose `get_queryset()` returns another queryset class or carries a filter. The base manager never applies actor scope to reads. Its writes that change a backed FK edge (reverse-FK `add(bulk=True)`, `update` of a watched FK) run the backed-edge gate of invariant 5d; an `update` of a watched scalar column through the base manager is not gated (proposal 0013), and collector `SET_NULL` rows are gated under the ambient actor only (proposal 0011).
+2. `_default_manager` points at it; the base manager is an **owning, unscoped** manager. When the model declares none, the metaclass injects `_rebac_base = TrackedManager()` and names it in `base_manager_name`, even when consumers declare their own `Meta`. A model that declares `Meta.base_manager_name` keeps its manager, and so does a model whose parent model declares one: every parent model is read in base order, not only the first as in Django's own fallback, so listing `RebacMixin` first does not discard a base manager declared by an abstract parent. `base_manager_name = "_rebac_base"` on the model opts back into the injected one. A declared base manager must be built over a `TrackedQuerySet` subclass that is not a `RebacQuerySet` subclass (`models.Manager.from_queryset(...)`); class creation raises `ImproperlyConfigured` otherwise, the scoped `RebacManager` included. It may add methods and refuse writes (an append-only queryset), but it must return every row: permission statements read a model's rows, and the write gates read their stored values, through `_base_manager`, so a base manager that filters rows would hide those rows from both. `rebac.E023` reports a declared base manager whose `get_queryset()` returns another queryset class or carries a filter. The base manager never applies actor scope to reads. Its writes that change a backed FK edge (reverse-FK `add(bulk=True)`, `update` of a watched FK) run the backed-edge gate of invariant 5d; an `update` of a watched scalar column through the base manager is not gated (proposal 0013), and collector `SET_NULL` rows are gated under the ambient actor only (proposal 0011).
    Inheriting `_rebac_base` through `class Meta(Parent.Meta)` does not opt back into the fallback: parent models are still searched for a declared manager. Only a `base_manager_name = "_rebac_base"` written on the model's own `Meta` selects that opt-in.
 3. `save_base` owner — create/write and field gates before consumer `pre_save` receivers.
 4. `delete` owner — root gate and a deletion ContextVar carrying the root actor/bypass for collector children; explicit-sender `pre_delete` gates those children only. Owners batch identity tuple cleanup.
@@ -2601,12 +2582,11 @@ Resolution order:
 A pinned actor (path 2) wins over ambient state (paths 3-4) when that queryset
 or instance carries the pin into its gate. The ambient actor cannot override
 an explicit `.with_actor(...)` on that carrier. This is the inverse of Odoo's
-`allowed_company_ids` ambient-scope precedence. A declared-through
-related-manager write queryset has no instance pin, as described below.
+`allowed_company_ids` ambient-scope precedence.
 
-Django does not carry the instance's pin into a declared through model's
-related-manager write queryset. That queryset uses its ambient
-actor; a pinned-only related-manager call needs an ambient actor or sudo.
+Django builds a declared through model's write queryset from that model's
+default manager, without the source instance's pin. It uses the ambient actor;
+a pinned-only related-manager write needs an ambient actor or sudo.
 
 **Critical: scope sticks across writes.** A queryset created with `with_actor(actor)` produces instances tagged with that actor; `instance.save()` re-checks against the same actor, regardless of what `current_actor()` says now. This is the Odoo `with_user(...)` invariant translated into Django — the actor follows the recordset.
 Only a REBAC queryset or `RebacMixin` instance can carry that pin; an unrelated
@@ -2620,10 +2600,10 @@ tracked model's callable attribute named `actor` does not become an actor scope.
 | `Model.objects.create(**fields)` | `create` on the proposed row's forward relations | Constructs the instance and delegates to `insert()`. |
 | `Model.objects.insert(obj)` | `create` on the proposed row's forward relations | Pins queryset scope on the prepared instance; the `save_base` `check_new` gate authorizes the insert. |
 | `Model.objects.bulk_create(rows)` | `create` on each proposed row's forward relations | Every candidate is preflighted before Django issues insert SQL. |
-| `instance.save()` (loaded/non-adding instance) | `write` on the row | `RebacMixin.save_base`, before consumer `pre_save`. |
+| `instance.save()` (loaded/non-adding instance) | `write` on the row | `RebacTrackedMixin.save_base` via the resource gate hook, before consumer `pre_save`. |
 | `instance.save()` (new instance) | `create` on the proposed row's forward relations | `save_base` projects the constructed candidate into `check_new`. |
 | `instance.check_access("create")` / `has_access("create")` (new instance) | `create` on the proposed row's forward relations | The same projection into `check_new`, on the instance as it is now: without a caveat context it is the decision the save gate makes on the same alias, so a caller can check before validating or saving. What `save()` prepares later (an override, Django's refresh of a related object saved after it was assigned) is not seen. A context the caller supplies is used, though `save()` supplies none; a `consistency` the backend refuses is refused, and the candidate's reads take none. It can answer `CONDITIONAL_PERMISSION`, and raises what the projection raises (an invalid field value, an unavailable related row, `SchemaError` or another error from `proposed_relationships()`), as the save gate would. Any other action on a new instance asks the model-level sentinel; a loaded instance is checked as the row it is. |
-| `instance.check_save(*, using=None, update_fields=None)` | What the instance's first save through `save()` with the same arguments meets at the gates | Runs `save()` itself (the model's override; Django's preparation: a deferred instance's loaded fields, the key of a related object saved after it was assigned, the checks on `update_fields`; the redacted rewrite; the gates: the create candidate, or `write`, `write__<field>` on changed fields, a moving edge, expression reads, redacted writes, and the backed-edge gate) inside a transaction on the write alias that it rolls back, and stops where Django would send `pre_save` and write. `HAS_PERMISSION` when that save passes the gates or writes nothing, `NO_PERMISSION` with the denial's reason otherwise, even when an override swallows the denial. Nothing is audited inside: the instance's own bypass is taken, and audited, before; another bypass is left for the real save; no denial is audited. Other model instances the override saves get back their primary key and state. Not covered: a second save of the instance in the same override, `pre_save`/`post_save` receivers, effects outside that transaction (another alias, a durable block, anything outside the database). A caller that runs validation with more access than the actor (unique checks under `system_context`) asks it first, so validation never answers for a save the gates would refuse. The verdict covers the fields the save writes: without `update_fields`, `save()` leaves the fields redacted at load out of the write, even when assigned, and the check passes without them. Such a caller excludes the fields the actor may not read from the validation (`instance.validate_unique(exclude=redacted_fields(instance))`), or it answers for values the actor can neither read nor write. |
+| `instance.check_save(*, using=None, update_fields=None)` | Direct verdict over the current instance's save gates | Evaluates the gate functions on the selected database without writing or running a consumer `save()` override. It prepares assigned related keys, validates explicit `update_fields`, and follows the save's redacted and deferred field selection, including generated fields and same-database handling. `HAS_PERMISSION` when the gates pass or `update_fields` is empty; `NO_PERMISSION` carries a gate denial reason. The probe has no force-insert or force-update mode. The instance's own sudo bypass is audited when used; denials are not audited by a check. A real save checks changes made by a consumer override before it writes. |
 | `instance.delete()` | `delete` on the row | `RebacMixin.delete`; explicit-sender `pre_delete` checks collector children. |
 | `Model.objects.update(**kwargs)` | `write` on each affected row and every resource row whose backed FK edge changes | Under an actor the statement acts on the rows the queryset's scope admits (its action, `read` by default), the rows `count()` counts: a row outside the scope is not part of it, is neither checked nor written, and never causes a refusal. The primary keys of the rows in scope are selected; every one must be in the actor's `write` scope, and in `write__<field>` for a gated field it sets, or the update raises; exactly those rows are written, by key (see [Writes](#writes)). A backed FK update checks old and proposed source rows before SQL; expressions whose proposed FK cannot be resolved are refused. When the update touches a column the policy reads, the selected rows are gated from their stored values. Under an actor, `.distinct(*fields).update()` raises `TypeError`, as Django's `delete()` does: the rows `DISTINCT ON` selects are not the rows the UPDATE writes. |
 | `Model.objects.delete()` | `delete` on each row | The same rows: under an actor, those the queryset's scope admits, selected by primary key. Every one must be in the actor's `delete` scope, or the delete raises; exactly those rows are deleted, by key. A cascade that reaches a row outside them checks that row as an instance delete does. |
@@ -2645,29 +2625,29 @@ transaction-managed case.
 Direct writes to auto-created through tables, including `bulk_create`,
 `update`, and `delete`, are unobserved infrastructure writes. An M2M that
 requires gated bulk writes declares an explicit `through=` model inheriting
-`RebacTrackedMixin`. Its own instance and queryset gates check the M2M owner
-and declaring resources for direct and related-manager writes; REBAC attaches
-no `m2m_changed` receiver to it. A pinned-only related-manager write
-through such a model needs an ambient actor or sudo. Cascaded through rows
+`RebacTrackedMixin`. Its saves, instance deletes, and queryset `bulk_create`
+check the M2M owner's `write` even when no schema field reads the through row.
+Queryset `update` and `delete` check that owner when a schema field watches
+the through row; without such a field, they skip that owner check. Watched
+declaring resources are checked as well. Related-manager adds use the through
+create path, while removes and clears use its queryset delete path. REBAC
+attaches no `m2m_changed` receiver to a declared through. Cascaded through rows
 use the root delete's actor but currently gate one row at a time; batching
 that gate is a known performance follow-up.
-An M2M `set(clear=False)` reads existing targets through their REBAC queryset.
-Until the actor-resolution change carries the instance pin into related-manager
-reads, strict mode needs an ambient actor or sudo for that read. A forward
-related-manager call from a multi-table child of the declaring model is not
-gated (proposal 0013). Through gates use the changed FK pairs and
-their source rows rather than the whole through table.
+A forward related-manager call from a multi-table child of the declaring model
+is not gated (proposal 0013). Through gates use the changed FK pairs and their
+source rows rather than the whole through table.
 For an auto-created through table, the carrying actor wins over ambient
-context; instance sudo does not propagate to the related manager. A declared
-through write queryset instead uses its ambient actor. Related-manager querysets read through the source
-instance's actor pin, including the current-member read in M2M
+context; instance sudo does not propagate to the related manager.
+Related-manager querysets read through the source instance's actor pin,
+including the current-member read in M2M
 `set(clear=False)`. The related manager transfers that pin only while building
 its own fresh queryset; Django's shared database-router `instance` hint never
 grants authority to a caller-owned or reused queryset. Root instances are
 stamped before Django prefetches during queryset `_fetch_all` evaluation, so a
 cached related manager has the same carrying actor on that path. `iterator()`
-and `aiterator()` chunk prefetching still stamps roots afterward; W2-E's
-iterator lane owns the per-chunk stamp. Without that pin, related-manager
+and `aiterator()` chunk prefetching still stamps roots afterward; per-chunk
+stamping remains planned. Without that pin, related-manager
 reads resolve ambient authority in relation mode; in non-strict mode, no actor
 falls through to full visibility, as ordinary root reads and backed M2M writes
 do. A block-scoped sudo bypass does apply when no actor is pinned, including
@@ -2681,9 +2661,16 @@ actors on caller-supplied `Prefetch` querysets remain authoritative. Protected
 `rebac_select_related()` reads and projections with no actor and no sudo fail
 closed even when `REBAC_STRICT_MODE=False`: instance loading raises
 `MissingActorError`, and a related-field projection raises `PermissionDenied`.
-Without an actor, strict mode raises `MissingActorError`
-only if an affected resource type declares `write`. An unwatched through table
-without a REBAC owner needs no backed-edge gate. On tracked backing models,
+A queryset freshly built by a related manager to read its related model carries
+the source owner privately through clones. A `RebacTrackedMixin` model's default
+manager must derive from `TrackedManager` or `RebacManager` (`rebac.E025`),
+including when customized with `from_queryset(...)`; those managers capture
+the related owner. Django's
+mutable database-router hints carry no authorization. Pickling strips the
+private owner. On a backed write, strict mode raises `MissingActorError`
+without an actor only if an affected resource type declares `write`. An
+unwatched through table without a REBAC owner needs no backed-edge gate. On
+tracked backing models,
 signal-free `bulk_create`, `update`, `bulk_update`, and tracked deletes apply
 the same backed-column gate.
 `bulk_update`'s per-row literal `Case`/`When` values are resolved and checked;

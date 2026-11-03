@@ -41,8 +41,8 @@ pre-1.0; breaking changes within a minor version are explicitly called out.
   `SubjectRef` or `None`; bypass state stays internal. During queryset
   evaluation through `_fetch_all`, root
   instances receive their actor before Django prefetches related rows.
-  Iterator chunk prefetching is tracked
-  by expected-failure tests for the W2-E iterator lane.
+  `iterator()` and `aiterator()` can prefetch related rows before stamping
+  each root with its pinned actor; expected-failure tests pin that scope gap.
   Without an actor, ordinary related-manager reads and backed M2M writes keep
   the non-strict unscoped fallback; guarded `rebac_select_related()` reads
   remain fail closed.
@@ -53,8 +53,8 @@ pre-1.0; breaking changes within a minor version are explicitly called out.
   transaction rules; callers that catch them and continue use an `atomic()`
   block. `REBAC_AUDIT_DENIALS` records nothing for these signal denials,
   including for transaction-managed callers who catch and continue. Direct
-  writes to auto-created through
-  tables are unobserved infrastructure writes. Fixture loads with `raw=True`
+  writes to auto-created through tables were previously gated and are now
+  unobserved infrastructure writes. Fixture loads with `raw=True`
   skip the signal gate while still advancing the row generation.
 - An explicit `through=` model inheriting `RebacTrackedMixin` uses its own
   instance and queryset write gates for saves, deletes, bulk writes,
@@ -62,6 +62,16 @@ pre-1.0; breaking changes within a minor version are explicitly called out.
   resource require `write` when they declare it. Cascaded through rows use the
   deleting root's pinned actor; related-manager through writes use the ambient
   actor, so a pinned-only call needs an ambient actor or sudo.
+- Write gates share the tracked queryset write owner. Resource querysets supply
+  scoping and row checks through three hooks. `RebacTrackedMixin.save_base()`
+  owns one gate and transaction for tracked and resource models. `check_save()`
+  now evaluates the current instance's gates directly; it no longer runs a
+  consumer `save()` override. Validation excludes hidden fields from Django's
+  constraint checks. Gate denials retain the exact actor, action and resource
+  for audit after rollback, including cascaded child deletes. New system check
+  `rebac.E025` rejects a `RebacTrackedMixin` default manager that does not
+  derive from `TrackedManager` or `RebacManager`, because it cannot carry a
+  related owner's authority into write gates.
 - Bounded model-row, actor-set and fixed-fact decisions are prepared before
   queryset SQL renders and witnessed in each statement that binds them.
   An evaluator scope reuses decisions until a library-owned write advances

@@ -854,8 +854,7 @@ class LocalBackend:
         # values, where ``delete_relationships`` treats them as wildcards).
         # Has no direct SpiceDB equivalent; SpiceDB expresses the same intent
         # via ``WriteRelationships`` with ``OPERATION_DELETE``. Planned to
-        # lower through that path in 0.4 once the ABC takes operation-shaped
-        # updates — see ARCHITECTURE.md.
+        # lower through that path in the LocalBackend API — see ARCHITECTURE.md.
         from django.db import transaction
 
         from ..models import active_relationship_model

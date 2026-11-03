@@ -104,6 +104,19 @@ def test_pickle_strips_pinned_actor(alice, post):
     assert restored.pk == post.pk
 
 
+def test_queryset_pickle_strips_related_owner_from_query_state(alice, post):
+    from tests.testapp.models import Post
+
+    queryset = Post.objects.as_user(alice).filter(pk=post.pk)
+    queryset._rebac_related_owner = post
+    _ = queryset.query
+    assert queryset._query._rebac_state["_rebac_related_owner"] is post
+
+    restored = pickle.loads(pickle.dumps(queryset))
+    assert restored._rebac_related_owner is None
+    assert "_rebac_related_owner" not in restored._query._rebac_state
+
+
 def test_pickle_strips_sudo_flag(alice, post):
     """Manually setting ``_rebac_sudo_reason`` does not survive pickling
     — the bypass cannot leak past a process boundary."""

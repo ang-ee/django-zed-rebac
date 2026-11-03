@@ -513,9 +513,10 @@ READ COMMITTED snapshots that never coexisted; SQL remains the allow authority.
 `create()` are reflected in reads the moment they commit, because nothing
 was copied.
 
-**Gates keep their rules and their entry points.** `RebacMixin.save_base`
-and `delete`, the scoped and tracked querysets, the related-manager wrappers,
-the `m2m_changed` receiver and invariant 5d stay. Their mechanics change:
+**Gates keep their rules and their entry points.** `RebacTrackedMixin.save_base`
+with its `RebacMixin` resource hook, `RebacMixin.delete`, the shared tracked
+queryset write owner with scoped hooks, the `m2m_changed` receiver and
+invariant 5d stay. Their mechanics change:
 
 - The gate's reads go through the compiled predicate.
 - **Inserts** keep `check_new` per candidate, including
@@ -568,8 +569,10 @@ Removed by this proposal:
   meaning; D2.
 
 Not removed by this proposal: `RebacTrackedMixin`, `TrackedQuerySet`, the
-injected base manager, the related-manager wrappers and the gate code in
-`signals.py`. They exist for gates now, not for maintenance (§ 13).
+injected base manager and the gate code in `signals.py`. They exist for gates
+now, not for maintenance (§ 13). Related-manager M2M writes reach the
+`m2m_changed` receiver for auto-created throughs or the declared through's
+own write gates.
 
 Added: `rebac/compile/` (the predicate compiler, identity expressions,
 unrolling) and the single-object evaluator for conditional results.
