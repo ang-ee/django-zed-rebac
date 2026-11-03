@@ -31,11 +31,10 @@ from .conf import app_settings
 from .database import database_context
 from .errors import MissingActorError, PermissionDenied
 from .field_visibility import (
-    accessible_ids,
     apply_field_visibility,
-    backend_grants_all,
     effective_field_deny_mode,
     gated_read_fields,
+    held_ids,
     runtime_field_deny_mode,
     validate_field_deny_mode,
     warn_raise_mode_degrades,
@@ -362,8 +361,8 @@ def _hidden_from(
         for name in names
         if actor is None
         or resource_type is None
-        or not backend_grants_all(
-            backend(), subject=actor, action=f"read__{name}", resource_type=resource_type
+        or not backend().grants_all(
+            subject=actor, action=f"read__{name}", resource_type=resource_type
         )
     )
 
@@ -1032,23 +1031,13 @@ class RebacQuerySet(models.QuerySet[_M]):
     _rebac_scope_decision: tuple[SubjectRef | None, bool] | None = None
 
     def _apply_scope_in_place(self, *, audit: bool = True, prepare: bool = True) -> None:
-        """Inject ``<id_attr>__in=<accessible>`` onto the query's WHERE clause.
+        """Add the compiled permission predicate to this query's WHERE clause.
 
-        ``id_attr`` defaults to ``"pk"`` but can be flipped per-model via
-        ``Meta.rebac_id_attr`` or globally via ``REBAC_RESOURCE_ID_ATTR``.
-
-        Avoids ``self.filter(...)`` because ``.get()`` pre-slices the
-        queryset and ``.filter()`` rejects post-slice. ``Q.add_q``
-        operates at the SQL level and bypasses the slice check.
-
-        ``backend().accessible()`` is memoised per-actor + action +
-        resource_type via the ambient ``_accessible_cache`` ContextVar
-        (``rebac.actors``). A single GraphQL request that materialises
-        the same scoped queryset multiple times (aggregate primary
-        + ``totalCount`` + per-measure resolvers, paginated lookups,
-        nested edges) collapses to one ``accessible()`` graph walk —
-        the underlying relationship SQL is bounded by the schema's
-        depth, not by the number of resolvers fired.
+        The predicate checks each selected row on the queryset's database
+        alias. Adding it to the underlying Query also works after ``.get()``
+        slices the queryset, when ``.filter()`` would be rejected. Prepared
+        decisions are invalidated when tracked relationships or backing rows
+        change.
         """
         from .backends import local
         from .watch import row_generation
@@ -1117,8 +1106,6 @@ class RebacQuerySet(models.QuerySet[_M]):
                 # Aggregate projection is fail-closed regardless of strict mode.
                 query.where = WhereNode([query.where, _ScopeWhere(children=[NothingNode()])])
                 return
-            from django.db.models import Q
-
             from .backends import backend
 
             action = str(self._rebac_action or getattr(model._meta, "rebac_default_action", "read"))
@@ -1126,61 +1113,16 @@ class RebacQuerySet(models.QuerySet[_M]):
             predicate = active_backend.queryset_filter(
                 model=model, subject=actor, action=action, using=self.db
             )
-            if predicate is not None:
-                # `_apply_scope_in_place`, including its embedded-queryset
-                # path in `_RebacQuery.resolve_expression`, owns preparation
-                # on this resolved alias. The expression keeps the result.
-                from .compile.read import prepare_resolved_filter
+            # `_apply_scope_in_place`, including its embedded-queryset
+            # path in `_RebacQuery.resolve_expression`, owns preparation
+            # on this resolved alias. The expression keeps the result.
+            from .compile.read import prepare_resolved_filter
 
-                restriction = query.build_where(predicate)
-                prepare_resolved_filter(
-                    restriction, query.where, self.db, prepare=prepare, fallback=fallback
-                )
-                query.where = WhereNode([query.where, _ScopeWhere(children=[restriction])])
-                return
-            if backend_grants_all(
-                active_backend,
-                subject=actor,
-                action=action,
-                resource_type=rebac_type,
-            ):
-                return
-            ids: list[Any] = list(
-                accessible_ids(
-                    active_backend,
-                    subject=actor,
-                    action=action,
-                    model=model,
-                )
+            assert predicate is not None
+            restriction = query.build_where(predicate)
+            prepare_resolved_filter(
+                restriction, query.where, self.db, prepare=prepare, fallback=fallback
             )
-            attr = resource_id_attr(model)
-            if attr == "pk":
-                # Coerce to ints when the PK is integer-typed; leave as
-                # strings for UUID/Char PKs. Only relevant for the pk path
-                # — non-pk attrs (sqid, public_id, slug) are always
-                # string-valued and pass through unchanged.
-                try:
-                    pk_field = model._meta.pk
-                    if pk_field is not None and pk_field.get_internal_type() in (
-                        "AutoField",
-                        "BigAutoField",
-                        "IntegerField",
-                        "BigIntegerField",
-                        "SmallIntegerField",
-                        "PositiveIntegerField",
-                        "PositiveBigIntegerField",
-                        "PositiveSmallIntegerField",
-                    ):
-                        ids = [int(i) for i in ids]
-                except ValueError:
-                    pass
-                except TypeError:
-                    pass
-            # ``Q.add_q`` works even on sliced queries.
-            restriction = query.build_where(Q(**{f"{attr}__in": ids}))
-            # Keep the authorization clause identifiable, including in Django's
-            # cloned/combined WHERE trees, so changing actor cannot intersect stale
-            # permission IDs with the new actor's scope.
             query.where = WhereNode([query.where, _ScopeWhere(children=[restriction])])
 
     def _clone(self, **kwargs: Any) -> Self:
@@ -1525,6 +1467,7 @@ class RebacQuerySet(models.QuerySet[_M]):
                 paths=self._rebac_select_related_guards,
                 actor=relation_actor(self),
                 mode=self._effective_field_mode(),
+                using=self.db,
             )
 
     # ----- Async iteration: Django's aiterator bypasses the sync overrides -----
@@ -1886,7 +1829,7 @@ class RebacQuerySet(models.QuerySet[_M]):
             if not affected:
                 return
             allowed = set(
-                accessible_ids(
+                held_ids(
                     backend(),
                     subject=actor,
                     action=action,
@@ -1955,7 +1898,7 @@ class RebacQuerySet(models.QuerySet[_M]):
                 if action not in declared:
                     continue
                 allowed = set(
-                    accessible_ids(
+                    held_ids(
                         backend(),
                         subject=actor,
                         action=action,
@@ -2001,7 +1944,7 @@ class RebacQuerySet(models.QuerySet[_M]):
             assert rebac_type is not None
             for field_name in sorted(required):
                 allowed = set(
-                    accessible_ids(
+                    held_ids(
                         backend(),
                         subject=actor,
                         action=f"read__{field_name}",

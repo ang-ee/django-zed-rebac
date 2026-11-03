@@ -53,9 +53,7 @@ def _backend(*, persisted=False, expiration=False):
 def _allowed(evaluator, local, surface):
     if surface == "check":
         return evaluator.check(local, subject=ACTOR, action="read", resource=RESOURCE).allowed
-    return "1" in evaluator.accessible(
-        local, subject=ACTOR, action="read", resource_type="blog/post"
-    )
+    return "1" in local.accessible(subject=ACTOR, action="read", resource_type="blog/post")
 
 
 @pytest.mark.parametrize("persisted", [False, True])

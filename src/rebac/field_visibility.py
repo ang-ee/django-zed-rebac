@@ -9,16 +9,15 @@ from typing import TYPE_CHECKING, Any, cast
 from django.db import models
 
 from ._id import resource_id_attr
-from .codec import identity_codec
 from .conf import app_settings
 from .database import database_context, read_alias
-from .resources import model_resource_type, stores_rows
+from .resources import model_resource_type
 from .schema.ast import Schema
 from .schema.walker import field_gated_actions
-from .types import CheckItem, CheckResult, FieldDenyMode, ObjectRef, PermissionResult, SubjectRef
+from .types import CheckResult, FieldDenyMode, ObjectRef, PermissionResult, SubjectRef
 
 if TYPE_CHECKING:  # pragma: no cover
-    from .backends.base import Backend
+    from .backends.local import LocalBackend
 
 
 FIELD_DENY_MODES = frozenset({"allow", "redact", "omit", "raise"})
@@ -56,100 +55,40 @@ def backend_schema() -> Schema | None:
     """Best-effort schema accessor shared by read and write field gates."""
     from .backends import backend
 
-    accessor = getattr(backend(), "schema", None)
-    if not callable(accessor):
-        return None
     try:
-        result = accessor()
+        return backend().schema()
     except Exception:
         return None
-    return result if isinstance(result, Schema) else None
 
 
-def backend_grants_all(
-    active_backend: Backend,
-    *,
-    subject: SubjectRef,
-    action: str,
-    resource_type: str,
-) -> bool:
-    grants_all = getattr(active_backend, "grants_all", None)
-    if not callable(grants_all):
-        return False
-    return bool(grants_all(subject=subject, action=action, resource_type=resource_type))
-
-
-def accessible_ids(
-    active_backend: Backend,
+def held_ids(
+    active_backend: LocalBackend,
     *,
     subject: SubjectRef,
     action: str,
     model: type[models.Model],
-    resource_ids: Iterable[str] | None = None,
+    resource_ids: Iterable[str],
+    using: str | None = None,
 ) -> tuple[str, ...]:
-    """Read accessible ids, or check only an explicitly supplied candidate set.
-
-    Model-backed batches use the backend's native ORM scope over those ids;
-    other backends use native bulk checks. Omitting candidates enumerates.
-    """
+    """Check an explicitly supplied candidate set with ``LocalBackend.held``."""
     resource_type = model_resource_type(model)
     if resource_type is None:
         return ()
-    if resource_ids is not None:
-        ids = tuple(sorted(set(resource_ids)))
-        if not ids:
-            return ()
-        using = read_alias(model)
-        if stores_rows(model):
-            predicate = active_backend.queryset_filter(
-                model=model, subject=subject, action=action, using=using
-            )
-            if predicate is not None:
-                identity = resource_id_attr(model)
-                codec = identity_codec(model, identity)
-                candidates = [value for value in ids if codec.is_canonical(value, using=using)]
-                if not candidates:
-                    return ()
-                with database_context(using):
-                    rows = model._base_manager.using(using).filter(
-                        **{f"{identity}__in": candidates}
-                    )
-                    allowed = {
-                        codec.wire(value, using=using)
-                        for value in rows.filter(predicate)
-                        .order_by()
-                        .values_list(identity, flat=True)
-                    }
-                return tuple(value for value in ids if value in allowed)
-        results = active_backend.check_bulk_permissions(
-            [CheckItem(subject, action, ObjectRef(resource_type, value)) for value in ids]
-        )
-        return tuple(value for value, result in zip(ids, results, strict=True) if result.allowed)
-    from .evaluator import current_evaluator
-
-    evaluator = current_evaluator()
-    if evaluator is None:
-        return tuple(
-            str(v)
-            for v in active_backend.accessible(
-                subject=subject,
-                action=action,
-                resource_type=resource_type,
-            )
-        )
-    return tuple(
-        str(v)
-        for v in evaluator.accessible(
-            active_backend,
-            subject=subject,
-            action=action,
-            resource_type=resource_type,
-        )
+    ids = tuple(dict.fromkeys(resource_ids))
+    if not ids:
+        return ()
+    allowed = active_backend.held(
+        subject=subject,
+        action=action,
+        resource_type=resource_type,
+        ids=ids,
+        using=read_alias(model, using=using),
     )
+    return tuple(value for value in ids if value in allowed)
 
 
 def check_field_access(
-    active_backend: Backend,
+    active_backend: LocalBackend,
     *,
     subject: SubjectRef,
     action: str,
@@ -201,15 +140,10 @@ def visible_id_sets(
     model: type[models.Model],
     actor: SubjectRef,
     fields: frozenset[str],
-    active_backend: Backend | None = None,
-    resource_ids: Iterable[str] | None = None,
-) -> dict[str, frozenset[str] | None]:
-    """Map each gated field to visible resource ids.
-
-    Bounded candidates receive their exact visible subset. Without candidates,
-    ``None`` means the action grants every row of this resource type, so callers
-    should skip per-row redaction for that field.
-    """
+    resource_ids: Iterable[str],
+    active_backend: LocalBackend | None = None,
+) -> dict[str, frozenset[str]]:
+    """Map each gated field to its visible subset of the supplied row ids."""
     rebac_type = model_resource_type(model)
     if not rebac_type or not fields:
         return {}
@@ -217,20 +151,12 @@ def visible_id_sets(
         from .backends import backend
 
         active_backend = backend()
-    candidates = tuple(resource_ids) if resource_ids is not None else None
-    visible: dict[str, frozenset[str] | None] = {}
+    candidates = tuple(resource_ids)
+    visible: dict[str, frozenset[str]] = {}
     for field_name in fields:
         action = f"read__{field_name}"
-        if candidates is None and backend_grants_all(
-            active_backend,
-            subject=actor,
-            action=action,
-            resource_type=rebac_type,
-        ):
-            visible[field_name] = None
-            continue
         visible[field_name] = frozenset(
-            accessible_ids(
+            held_ids(
                 active_backend,
                 subject=actor,
                 action=action,
@@ -285,8 +211,8 @@ def apply_field_visibility(
             denied: set[str] = set()
             resource_id = _instance_resource_id(inst)
             for field_name in fields:
-                ids = visible.get(field_name)
-                if ids is None or resource_id in ids:
+                ids = visible[field_name]
+                if resource_id in ids:
                     continue
                 if _conditional_field_is_visible(
                     active_backend,
@@ -399,7 +325,7 @@ def _scrub_loaded_value(instance: models.Model, field_name: str) -> None:
 
 
 def _conditional_field_is_visible(
-    active_backend: Backend,
+    active_backend: LocalBackend,
     *,
     actor: SubjectRef,
     action: str,

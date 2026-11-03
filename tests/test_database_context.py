@@ -299,6 +299,9 @@ def test_explicit_instance_write_audits_keep_operation_alias(settings, operation
 
 
 def test_selected_related_bounded_checks_keep_the_queryset_alias(monkeypatch):
+    from django.db import connections
+    from django.test.utils import CaptureQueriesContext
+
     from rebac import actor_context
     from tests.testapp.models import Folder
 
@@ -319,15 +322,23 @@ def test_selected_related_bounded_checks_keep_the_queryset_alias(monkeypatch):
                 ]
             )
     active = backend()
-    original = active.queryset_filter
-    aliases = []
+    original = active.held
+    observed = []
 
     def scoped(**kwargs):
-        if kwargs["model"] is Folder:
-            aliases.append(kwargs["using"])
-        return original(**kwargs)
+        if kwargs["resource_type"] != "blog/folder":
+            return original(**kwargs)
+        using = kwargs["using"]
+        other = "default" if using == "selected" else "selected"
+        with (
+            CaptureQueriesContext(connections[using]) as queries,
+            CaptureQueriesContext(connections[other]) as other_queries,
+        ):
+            result = original(**kwargs)
+        observed.append((using, [query["sql"] for query in queries], len(other_queries)))
+        return result
 
-    monkeypatch.setattr(active, "queryset_filter", scoped)
+    monkeypatch.setattr(active, "held", scoped)
     with database_context("default"), actor_context(ACTOR):
         row = Post.objects.using("selected").rebac_select_related("folder").get(pk=772)
         assert row.folder.name == "selected"
@@ -335,4 +346,11 @@ def test_selected_related_bounded_checks_keep_the_queryset_alias(monkeypatch):
 
         with pytest.raises(PermissionDenied):
             Post.objects.using("default").rebac_select_related("folder").get(pk=772)
-    assert aliases == ["selected", "default"]
+    assert [alias for alias, _sql, _other_count in observed] == ["selected", "default"]
+    assert all(other_count == 0 for _alias, _sql, other_count in observed)
+    assert all(
+        any(
+            "SELECT" in statement and "rebac_relationship" in statement.lower() for statement in sql
+        )
+        for _alias, sql, _other_count in observed
+    )

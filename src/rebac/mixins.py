@@ -1068,9 +1068,8 @@ class RebacMixin(RebacTrackedMixin):
                 # The candidate save() would insert, not "may the actor create any row?".
                 # A consistency the backend refuses is refused here too; the
                 # candidate's own reads take none.
-                validate = getattr(backend(), "_validate_consistency", None)
-                if consistency is not None and callable(validate):
-                    validate(consistency, None)
+                if consistency is not None:
+                    backend()._validate_consistency(consistency, None)
                 return _check_new_model(
                     self,
                     subject=actor,
@@ -1611,11 +1610,8 @@ def _enforce_per_field_writes(
     UPDATE — unusual), every non-pk concrete field is treated as dirty
     (conservative; fail-closed).
 
-    Schema lookup goes via ``backend().schema()`` when the backend
-    exposes one (LocalBackend always does; SpiceDBBackend will route
-    through its own server-side schema once 0.5 lands). Backends without
-    an in-process schema accessor skip per-field enforcement — the
-    resource-level ``write`` check already gated the operation.
+    Schema lookup goes via ``backend().schema()``. The resource-level
+    ``write`` check has already gated the operation.
 
     Pure in-memory comparison; never queries the DB to refresh state.
     """

@@ -10,12 +10,12 @@ that the new row would have once created — e.g.::
     }
 
 There are no ``Relationship`` rows on ``blog/post:<id>`` yet, so the
-normal :meth:`Backend.check_access` short-circuits to deny. Instead,
+normal :meth:`LocalBackend.check_access` short-circuits to deny. Instead,
 the caller supplies the relations the row *would* carry, and
 :func:`check_new` evaluates the permission expression against that
 in-memory overlay using the shared
 :func:`rebac.schema.walker.eval_expr` walker. Arrow hops cross into
-the (real) target resources via :meth:`Backend.check_access` — so all
+the (real) target resources via :meth:`LocalBackend.check_access` — so all
 post-hop evaluation reuses the canonical backend semantics; only the
 top-level lookups are virtual.
 
@@ -34,14 +34,8 @@ Limitations (v0.4):
   caveat name or pinned context. These tuples must match an explicitly
   uncaveated schema alternative; required-caveat alternatives fail closed.
   Caveat-conditional ``create`` permissions remain
-  evaluated through :meth:`Backend.check_access` for the *post-hop*
+  evaluated through :meth:`LocalBackend.check_access` for the *post-hop*
   targets only.
-* SpiceDB-style backends don't ship a "check with proposed tuples"
-  RPC. The cleanest production strategy when 0.5 SpiceDB support
-  lands is: open a sub-transaction, ``WriteRelationships`` for the
-  proposed tuples, ``CheckPermission`` on the (now-real) row, then
-  roll back. Until that ships, :func:`check_new` raises ``RuntimeError``
-  if the active backend's :meth:`schema` raises ``NotImplementedError``.
 """
 
 from __future__ import annotations
@@ -66,7 +60,7 @@ from .schema.walker import (
 from .types import CheckResult, ObjectRef, PermissionResult, SubjectRef
 
 if TYPE_CHECKING:  # pragma: no cover
-    from .backends.base import Backend
+    from .backends.local import LocalBackend
     from .schema.ast import Definition, Schema
 
 
@@ -76,7 +70,7 @@ def _check_new_model(
     *,
     subject: SubjectRef,
     using: str | None = None,
-    backend: Backend | None = None,
+    backend: LocalBackend | None = None,
     context: dict[str, object] | None = None,
 ) -> CheckResult:
     """Evaluate one constructed Django candidate through :func:`check_new`."""
@@ -91,18 +85,8 @@ def _check_new_model(
         resource_type = model_resource_type(type(instance))
         if resource_type is None:
             return CheckResult.has()
-        try:
-            schema = active_backend.schema()
-            definition = schema.get_definition(resource_type)
-        except NotImplementedError:
-            # Preserve check_new's backend-specific fail-closed diagnostic.
-            return check_new(
-                subject=subject,
-                action="create",
-                resource_type=resource_type,
-                backend=active_backend,
-                context=context,
-            )
+        schema = active_backend.schema()
+        definition = schema.get_definition(resource_type)
         relationships: dict[str, tuple[SubjectRef, ...] | None] = {}
         if definition is not None:
             required_relations = relation_dependencies(schema, resource_type, "create")
@@ -156,7 +140,7 @@ def check_new(
     action: str,
     resource_type: str,
     relationships: Mapping[str, Sequence[SubjectRef] | None] | None = None,
-    backend: Backend | None = None,
+    backend: LocalBackend | None = None,
     context: dict[str, object] | None = None,
 ) -> CheckResult:
     """Check whether ``subject`` may perform ``action`` on a not-yet-persisted
@@ -190,15 +174,7 @@ def check_new(
     rels: Mapping[str, Sequence[SubjectRef] | None] = relationships or {}
     active_backend = backend if backend is not None else _current_backend()
 
-    try:
-        schema = active_backend.schema()
-    except NotImplementedError as exc:
-        raise RuntimeError(
-            f"check_new requires a backend that implements schema() "
-            f"(got {type(active_backend).__name__}). SpiceDB-style backends "
-            "will need a 'write-then-rollback' strategy or a server-side "
-            "preflight RPC; see rebac/preflight.py module docstring."
-        ) from exc
+    schema = active_backend.schema()
 
     definition = schema.get_definition(resource_type)
     if definition is None:
@@ -315,7 +291,7 @@ def _merge_const_backed_relationships(
 
 def _build_ctx(
     *,
-    backend: Backend,
+    backend: LocalBackend,
     schema: Schema,
     subject: SubjectRef,
     context: dict[str, object] | None,
@@ -407,7 +383,7 @@ def _build_ctx(
 def _virtual_membership(
     *,
     ctx: WalkContext,
-    backend: Backend,
+    backend: LocalBackend,
     candidates: Sequence[SubjectRef],
     depth: int,
 ) -> bool | None:
@@ -440,7 +416,7 @@ def _virtual_membership(
 def _candidate_matches(
     *,
     ctx: WalkContext,
-    backend: Backend,
+    backend: LocalBackend,
     candidate: SubjectRef,
     depth: int,
 ) -> bool | None:

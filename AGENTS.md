@@ -12,17 +12,16 @@ Guidance for coding agents (Claude Code reads this file through the
 ## Project overview
 
 `django-zed-rebac` is a **standalone, drop-in REBAC plugin for any Django 6.1
-project** (the supported matrix is pinned in `pyproject.toml`; see § Tooling). SpiceDB-compatible schema language, two interchangeable
-backends (`LocalBackend`, which compiles permissions to queries over the
-application's own tables in pure Django; planned `SpiceDBBackend` over
-`authzed-py`), strict-by-default queryset scoping, AI-agent Grant pattern,
+project** (the supported matrix is pinned in `pyproject.toml`; see § Tooling). SpiceDB-compatible schema language, one backend
+(`LocalBackend`, which compiles permissions to queries over the
+application's own tables in pure Django), strict-by-default queryset scoping, AI-agent Grant pattern,
 MCP / Celery / DRF / GraphQL adapters.
 
 **Status: alpha**, published on PyPI (Django 6.1 line; see `CHANGELOG.md`).
 Shipped: `LocalBackend` with permissions compiled to queries, the mixin and
 managers, the parser, `rebac sync`, the system checks, the DRF, MCP and
-Strawberry adapters, the audit table. Not shipped: `SpiceDBBackend` (a stub)
-and the SpiceDB conformance suite; see `docs/ROADMAP.md`. Layout:
+Strawberry adapters, the audit table. The SpiceDB conformance suite is planned;
+see `docs/ROADMAP.md`. Layout:
 
 ```
 django-zed-rebac/
@@ -71,7 +70,7 @@ how design intent erodes.
 | Python module | `rebac` |
 | Settings prefix | `REBAC_*` |
 | Management command | `manage.py rebac <subcommand>` |
-| System-check IDs | `rebac.E001` … `rebac.W101` |
+| System-check IDs | `rebac.E001` … `rebac.E024`, `rebac.W001` … `rebac.W010` (with gaps and retired IDs documented in the check table) |
 | Schema header comments | `// @rebac_package`, `// @rebac_package_version`, `// @rebac_schema_revision` |
 | App label | `rebac` |
 | Public Python imports | `from rebac import ...` |
@@ -82,22 +81,26 @@ These are stable. Don't propose alternatives without a spec PR first.
 
 ## Critical project invariants
 
-These are non-negotiable. Violations break either the SpiceDB-compatibility
-contract or the security-critical strict-by-default posture.
+These are non-negotiable. Violations break either the SpiceDB-compatible
+schema contract or the security-critical strict-by-default posture.
 
 ### 1. SpiceDB compatibility is a public contract
 
-The schema language, terminology (subjects / resources / relations /
-permissions / caveats / Zookies), and the `Backend` API surface mirror SpiceDB
-so that flipping `REBAC_BACKEND = "spicedb"` is a **configuration change,
-not a code change**.
+The schema language and terminology (subjects / resources / relations /
+permissions / caveats / Zookies) mirror SpiceDB. The runtime has one backend,
+`LocalBackend`, and no `Backend` ABC.
 
-- **Don't** add `LocalBackend`-only conveniences that have no SpiceDB
-  equivalent (e.g., a "list all permissions for this user across all resource
-  types" RPC SpiceDB doesn't expose).
-- **Do** mirror `authzed.api.v1` method names in the Python `Backend` ABC
-  (snake_case wrappers around `CheckPermission`, `CheckBulkPermissions`,
-  `LookupResources`, `LookupSubjects`, `WriteRelationships`, `WriteSchema`,
+- **Don't** add `LocalBackend`-only conveniences without a SpiceDB equivalent
+  (for example, a cross-resource-type "all permissions for this user" RPC).
+  The documented exceptions are `held()` and the ORM integration methods
+  `queryset_filter()`, `permission_expression()` and `grants_all()`.
+  `held()` checks bounded candidate IDs through the compiled read path and
+  corresponds to a batched `CheckBulkPermissions` for one subject, action and
+  resource type. The three ORM methods predate this recovery and have no
+  SpiceDB RPC equivalents.
+- **Do** mirror `authzed.api.v1` method names in `LocalBackend` (snake_case
+  wrappers around `CheckPermission`, `CheckBulkPermissions`, `LookupResources`,
+  `LookupSubjects`, `WriteRelationships`, `WriteSchema`,
   `ExpandPermissionTree`).
 - **Do** emit `use typechecking` at the top of every generated `.zed` file
   (catches mutually-exclusive-type intersections at WriteSchema time).
@@ -457,8 +460,7 @@ access via `rebac.backend()`.
 - Read via `app_settings` object exposed by `rebac.conf`.
 - Validation routed through Django's system checks framework (IDs
   `rebac.E001`, etc.). **Don't** raise at import time or in `ready()`.
-- Production-only checks (`--deploy`) for things like
-  `REBAC_SPICEDB_TLS = False`.
+- Production-only checks (`--deploy`) belong in Django's system-check framework.
 
 ### Public API surface
 

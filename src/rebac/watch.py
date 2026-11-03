@@ -353,15 +353,12 @@ def gate_policy(using: str, backend: LocalBackend | None = None) -> GatePolicy |
     write is gated by one policy, however many rows and owners it nests.
     """
     from .backends import backend as active_backend
-    from .backends.local import LocalBackend
 
     if backend is None:
         held = _open.get()
         if using in held:
             return held[using]
     active = backend if backend is not None else active_backend()
-    if not isinstance(active, LocalBackend):
-        return None
     revision = published_revision(using, active)
     if not revision:
         return None
