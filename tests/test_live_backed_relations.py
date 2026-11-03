@@ -135,11 +135,10 @@ def test_types_unreachable_from_live_backing_keep_caching_decisions():
 
     with evaluator_scope() as evaluator:
         assert evaluator.check(backend, subject=subject, action="read", resource=resource).allowed
-        assert evaluator.accessible(
-            backend, subject=subject, action="read", resource_type="test/static"
-        ) == ("one",)
+        assert set(
+            backend.accessible(subject=subject, action="read", resource_type="test/static")
+        ) == {"one"}
         assert evaluator.stats()["check_entries"] == 1
-        assert evaluator.stats()["accessible_entries"] == 1
 
 
 @pytest.mark.django_db(transaction=True)
@@ -158,9 +157,9 @@ def test_types_reaching_live_backing_through_const_targets_bypass_caching():
 
     with evaluator_scope() as evaluator:
         assert evaluator.check(backend, subject=subject, action="read", resource=resource).allowed
-        assert evaluator.accessible(
-            backend, subject=subject, action="access", resource_type="test/role"
-        ) == ("admin",)
+        assert set(
+            backend.accessible(subject=subject, action="access", resource_type="test/role")
+        ) == {"admin"}
         user.is_staff = False
         with sudo(reason="test.attribute-fixture"):
             atomic_source_write(user.save, update_fields=["is_staff"])
@@ -168,13 +167,10 @@ def test_types_reaching_live_backing_through_const_targets_bypass_caching():
             backend, subject=subject, action="read", resource=resource
         ).allowed
         assert (
-            evaluator.accessible(
-                backend, subject=subject, action="access", resource_type="test/role"
-            )
-            == ()
+            list(backend.accessible(subject=subject, action="access", resource_type="test/role"))
+            == []
         )
         assert evaluator.stats()["check_entries"] == 0
-        assert evaluator.stats()["accessible_entries"] == 0
 
 
 @pytest.mark.django_db(transaction=True)

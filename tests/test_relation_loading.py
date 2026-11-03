@@ -689,20 +689,15 @@ def test_selected_related_checks_only_distinct_joined_ids(alice, monkeypatch, se
     import rebac.field_visibility as visibility
     import rebac.relation_loading as loading
 
-    original = visibility.accessible_ids
+    original = visibility.held_ids
     requested = []
 
     def membership(active_backend, **kwargs):
         requested.append((kwargs["action"], tuple(kwargs["resource_ids"])))
         return original(active_backend, **kwargs)
 
-    monkeypatch.setattr(loading, "accessible_ids", membership)
-    monkeypatch.setattr(visibility, "accessible_ids", membership)
-    monkeypatch.setattr(
-        active,
-        "check_bulk_permissions",
-        lambda *args, **kwargs: pytest.fail("ORM population became point checks"),
-    )
+    monkeypatch.setattr(loading, "held_ids", membership)
+    monkeypatch.setattr(visibility, "held_ids", membership)
     monkeypatch.setattr(active, "accessible", lambda **kwargs: pytest.fail("unbounded enumeration"))
     monkeypatch.setattr(
         active, "grants_all", lambda **kwargs: pytest.fail("bounded rows need no universal proof")
@@ -735,20 +730,15 @@ def test_materialized_field_visibility_checks_only_fetched_ids(
     import rebac.field_visibility as visibility
     import rebac.relation_loading as loading
 
-    original = visibility.accessible_ids
+    original = visibility.held_ids
     requested = []
 
     def membership(active_backend, **kwargs):
         requested.append((kwargs["action"], tuple(kwargs["resource_ids"])))
         return original(active_backend, **kwargs)
 
-    monkeypatch.setattr(loading, "accessible_ids", membership)
-    monkeypatch.setattr(visibility, "accessible_ids", membership)
-    monkeypatch.setattr(
-        active,
-        "check_bulk_permissions",
-        lambda *args, **kwargs: pytest.fail("ORM population became point checks"),
-    )
+    monkeypatch.setattr(loading, "held_ids", membership)
+    monkeypatch.setattr(visibility, "held_ids", membership)
     monkeypatch.setattr(active, "accessible", lambda **kwargs: pytest.fail("unbounded enumeration"))
     monkeypatch.setattr(
         active, "grants_all", lambda **kwargs: pytest.fail("bounded rows need no universal proof")
@@ -764,7 +754,7 @@ def test_materialized_field_visibility_checks_only_fetched_ids(
 
 @pytest.mark.django_db
 def test_bounded_visibility_keeps_conditional_checks_closed(alice):
-    from rebac.field_visibility import accessible_ids
+    from rebac.field_visibility import held_ids
     from tests.testapp.models import Folder
 
     active = backend()
@@ -789,7 +779,7 @@ def test_bounded_visibility_keeps_conditional_checks_closed(alice):
         ]
     )
     assert (
-        accessible_ids(
+        held_ids(
             active,
             subject=actor,
             action="read",
@@ -800,36 +790,15 @@ def test_bounded_visibility_keeps_conditional_checks_closed(alice):
     )
 
 
-@pytest.mark.parametrize("answers", [[], [True, True, True]])
-def test_bounded_visibility_refuses_invalid_bulk_cardinality(monkeypatch, answers):
-    from rebac import CheckResult
-    from rebac.field_visibility import accessible_ids
-    from tests.testapp.models import Folder
-
-    active = backend()
-    monkeypatch.setattr(active, "queryset_filter", lambda **kwargs: None)
-    monkeypatch.setattr(
-        active, "check_bulk_permissions", lambda items: [CheckResult.has() for _ in answers]
-    )
-    with pytest.raises(ValueError):
-        accessible_ids(
-            active,
-            subject=SubjectRef.of("auth/user", "one"),
-            action="read",
-            model=Folder,
-            resource_ids=("second", "first"),
-        )
-
-
 def test_empty_bounded_visibility_never_enumerates_or_checks(monkeypatch):
-    from rebac.field_visibility import accessible_ids
+    from rebac.field_visibility import held_ids
     from tests.testapp.models import Folder
 
     active = backend()
-    monkeypatch.setattr(active, "check_bulk_permissions", lambda items: pytest.fail("empty bulk"))
+    monkeypatch.setattr(active, "held", lambda **kwargs: pytest.fail("empty candidate check"))
     monkeypatch.setattr(active, "accessible", lambda **kwargs: pytest.fail("unbounded enumeration"))
     assert (
-        accessible_ids(
+        held_ids(
             active,
             subject=SubjectRef.of("auth/user", "one"),
             action="read",
@@ -846,7 +815,7 @@ def test_bounded_orm_population_cost_does_not_grow_per_identity(alice, monkeypat
     from django.db import connection
     from django.test.utils import CaptureQueriesContext
 
-    from rebac.field_visibility import accessible_ids
+    from rebac.field_visibility import held_ids
     from tests.testapp.models import Folder
 
     with sudo(reason="test.bounded.population"):
@@ -862,33 +831,30 @@ def test_bounded_orm_population_cost_does_not_grow_per_identity(alice, monkeypat
         ]
     )
     monkeypatch.setattr(active, "accessible", lambda **kwargs: pytest.fail("unbounded enumeration"))
-    monkeypatch.setattr(
-        active, "check_bulk_permissions", lambda *args, **kwargs: pytest.fail("point expansion")
-    )
-    counts = []
+    counts = {}
     with evaluator_scope():
-        accessible_ids(
+        held_ids(
             active, subject=actor, action="read", model=Folder, resource_ids=(str(folders[0].pk),)
         )
-        for size in (5, 50):
+        for size in (1, 2, 4, 5, 50):
             requested = [str(row.pk) for row in folders[:size]]
             with CaptureQueriesContext(connection) as queries:
-                allowed = accessible_ids(
+                allowed = held_ids(
                     active,
                     subject=actor,
                     action="read",
                     model=Folder,
                     resource_ids=(*requested, requested[0], "*", "bad", "01"),
                 )
-            assert allowed == tuple(sorted(requested))
+            assert allowed == tuple(requested)
             assert str(folders[-1].pk) not in allowed
-            counts.append(len(queries))
-    assert counts[0] == counts[1], counts
+            counts[size] = len(queries)
+    assert counts == dict.fromkeys((1, 2, 4, 5, 50), 1), counts
 
 
 @pytest.mark.django_db
 @pytest.mark.parametrize("operation", ["union", "intersection", "difference"])
-def test_non_sql_scope_combination_uses_each_operand_model(alice, monkeypatch, operation):
+def test_sql_scope_combination_uses_each_operand_model(alice, operation):
     from tests.testapp.models import Folder, Post
 
     with sudo(reason="test.mixed-model.colliding-identities"):
@@ -896,7 +862,6 @@ def test_non_sql_scope_combination_uses_each_operand_model(alice, monkeypatch, o
         post = Post.objects.create(pk=771, title="readable")
     assert folder.pk == post.pk
     _grant("blog/post", post.pk, "viewer", alice)
-    monkeypatch.setattr(backend(), "queryset_filter", lambda **kwargs: None)
     posts = Post.objects.as_user(alice).values_list("pk", flat=True)
     folders = Folder.objects.as_user(alice).values_list("pk", flat=True)
     rows = (

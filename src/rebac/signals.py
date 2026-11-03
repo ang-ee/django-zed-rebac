@@ -766,27 +766,13 @@ def _check_edge_writes(
 
     assert actor is not None
     active = backend()
-    from .backends.local import LocalBackend
-
-    if isinstance(active, LocalBackend):
-        from .compile.read import held
-
-        allowed = held(
-            backend=active,
-            resource_type=resource_type,
-            action="write",
-            actor=actor,
-            ids=ids,
-            using=using,
-        )
-    else:
-        allowed = {
-            id_
-            for id_ in ids
-            if active.check_access(
-                subject=actor, action="write", resource=ObjectRef(resource_type, id_)
-            ).allowed
-        }
+    allowed = active.held(
+        resource_type=resource_type,
+        action="write",
+        subject=actor,
+        ids=ids,
+        using=using,
+    )
     denied = ids - allowed
     if denied:
         resource = ObjectRef(resource_type, sorted(denied)[0])

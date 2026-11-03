@@ -14,8 +14,8 @@ from .actors import resolve
 from .backends import backend
 from .errors import MissingActorError, PermissionDenied
 from .field_visibility import (
-    accessible_ids,
     apply_field_visibility,
+    held_ids,
 )
 from .resources import model_resource_type
 from .types import FieldDenyMode, SubjectRef
@@ -65,6 +65,7 @@ def guard_selected_related_instances(
     actor: SubjectRef | None,
     bypass: bool = False,
     mode: FieldDenyMode,
+    using: str | None = None,
 ) -> None:
     """Batch-check selected to-one related objects before callers serialize them."""
     if not paths or bypass:
@@ -104,12 +105,13 @@ def guard_selected_related_instances(
         rows = [row for copies in rows_by_id.values() for row in copies.values()]
 
         allowed = set(
-            accessible_ids(
+            held_ids(
                 active_backend,
                 subject=actor,
                 action=action,
                 model=model,
                 resource_ids=rows_by_id,
+                using=using,
             )
         )
         denied = sorted(set(rows_by_id) - allowed)
@@ -123,7 +125,7 @@ def guard_selected_related_instances(
         for row in rows:
             row._rebac_actor = actor  # type: ignore[attr-defined]
             row._rebac_field_deny = mode  # type: ignore[attr-defined]
-        apply_field_visibility(rows, model=model, actor=actor, mode=mode)
+        apply_field_visibility(rows, model=model, actor=actor, mode=mode, using=using)
 
 
 def scope_prefetch_lookups(

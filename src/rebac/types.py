@@ -1,7 +1,6 @@
 """Core public types: subject/resource references, check results, Zookie.
 
-Wire-shape mirrors `authzed.api.v1` so `LocalBackend` ↔ `SpiceDBBackend` is a
-configuration swap.
+Wire-shape mirrors `authzed.api.v1` for SpiceDB-compatible terminology.
 """
 
 from __future__ import annotations
@@ -108,7 +107,7 @@ class CheckResult:
 
 @dataclass(frozen=True, slots=True)
 class CheckItem:
-    """One item of ``Backend.check_bulk_permissions``: ``subject`` asks ``action`` on ``resource``.
+    """One item of ``LocalBackend.check_bulk_permissions``: ``subject`` asks ``action`` on ``resource``.
 
     Mirrors ``authzed.api.v1.CheckBulkPermissionsRequestItem``.
     """

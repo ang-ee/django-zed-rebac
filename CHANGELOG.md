@@ -5,6 +5,21 @@ pre-1.0; breaking changes within a minor version are explicitly called out.
 
 ## [Unreleased]
 
+### Removed
+
+- **Breaking:** Removed the unimplemented `SpiceDBBackend`, the `Backend` ABC,
+  the `spicedb` extra, and four `REBAC_SPICEDB_*` settings. `REBAC_BACKEND`
+  accepts only `"local"`; `rebac.E002` and `rebac.W101` no longer apply.
+- **Breaking:** Removed `PermissionEvaluator.accessible()` and its cache.
+- Removed the unreachable queryset enumeration fallback.
+
+### Added
+
+- `LocalBackend.held()` checks a bounded set of candidate IDs through the
+  compiled read path. Absent canonical IDs are point-checked in one batch;
+  non-canonical and empty IDs are denied. `LocalBackend.accessible()` remains
+  the enumeration API.
+
 ### Changed
 
 - Actor resolution, sudo validation and bypass emission now share one owner

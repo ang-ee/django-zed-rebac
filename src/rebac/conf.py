@@ -15,10 +15,6 @@ _DEFAULTS: dict[str, Any] = {
     "REBAC_BACKEND": "local",
     "REBAC_TRACKED_MODELS": [],
     "REBAC_RELATIONSHIP_MODEL": "rebac.Relationship",
-    "REBAC_SPICEDB_ENDPOINT": None,
-    "REBAC_SPICEDB_TOKEN": None,
-    "REBAC_SPICEDB_TLS": True,
-    "REBAC_SPICEDB_AUTO_WRITE_SCHEMA": True,
     "REBAC_SCHEMA_DIR": None,  # resolves to <cwd>/rebac at use site
     "REBAC_DEPTH_LIMIT": 8,
     "REBAC_DEFAULT_CONSISTENCY": "minimize_latency",
@@ -96,14 +92,13 @@ _DEFAULTS: dict[str, Any] = {
     # Migration between the two is one-shot via
     # ``python manage.py rebac migrate-storage --to registry``. The wire
     # shape (``RelationshipTuple`` + string kwargs to the public manager)
-    # is unchanged in either mode. Setting affects ``LocalBackend`` only;
-    # ``SpiceDBBackend`` is unaffected.
+    # is unchanged in either mode.
     "REBAC_LOCAL_BACKEND_STORAGE": "denormalized",
     # Batch size for ``rebac migrate-storage`` when streaming rows between
     # the two shapes. Lower this on tight-memory hosts; raise it on big
     # transactional DBs where round-trip cost dominates per-row work.
     "REBAC_LOCAL_BACKEND_REGISTRY_BATCH_SIZE": 5000,
-    # Total entries (across both ``check`` and ``accessible`` caches)
+    # Total entries in the ``check`` cache
     # the per-request :class:`rebac.evaluator.PermissionEvaluator` holds
     # before evicting LRU. 10_000 covers the largest realistic GraphQL
     # query fan-out without risk of OOM under adversarial input. Raise

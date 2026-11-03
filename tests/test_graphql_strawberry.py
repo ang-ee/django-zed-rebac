@@ -21,6 +21,7 @@ pytest.importorskip(
 
 from rebac import (
     CheckResult,
+    LocalBackend,
     ObjectRef,
     SubjectRef,
     Zookie,
@@ -189,7 +190,13 @@ def test_real_subscription_does_not_reuse_permission_after_revocation():
     allowed = True
     calls = 0
 
-    class MutableBackend:
+    class MutableBackend(LocalBackend):
+        def __init__(self):
+            super().__init__()
+
+        def _cache_generation(self, resource_type: str) -> int:
+            return 1
+
         def check_access(self, **kwargs):
             nonlocal calls
             calls += 1

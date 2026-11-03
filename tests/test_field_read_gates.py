@@ -686,6 +686,31 @@ def test_no_read_gates_do_not_add_field_accessible_calls(alice, monkeypatch):
 
 
 @override_settings(REBAC_FIELD_READ_MODE="redact")
+def test_two_field_gates_use_one_candidate_statement_each(alice):
+    install_schema(
+        backend(),
+        parse_zed(
+            SCHEMA_TEXT.replace(
+                "permission read__title = owner",
+                "permission read__title = owner\n    permission read__body = owner",
+            )
+        ),
+    )
+    posts = [_post(title=f"title {index}", body=f"body {index}") for index in range(3)]
+    for post in posts:
+        _grant(post.pk, alice, "viewer")
+    _grant(posts[0].pk, alice, "owner")
+    with CaptureQueriesContext(connection) as queries:
+        rows = list(Post.objects.as_user(alice).order_by("pk"))
+    assert [(row.title, row.body) for row in rows] == [
+        ("title 0", "body 0"),
+        (None, None),
+        (None, None),
+    ]
+    assert len(queries) == 3
+
+
+@override_settings(REBAC_FIELD_READ_MODE="redact")
 def test_redaction_scrubs_loaded_value_snapshot(alice, bob):
     from tests.testapp.models import Post
 
@@ -1058,7 +1083,7 @@ def test_bulk_field_guards_check_only_affected_ids(alice, monkeypatch, expressio
     active = backend()
     import rebac.managers as managers
 
-    original = managers.accessible_ids
+    original = managers.held_ids
     requested = []
 
     def membership(active_backend, **kwargs):
@@ -1066,7 +1091,7 @@ def test_bulk_field_guards_check_only_affected_ids(alice, monkeypatch, expressio
         requested.append((kwargs["action"], tuple(kwargs["resource_ids"])))
         return original(active_backend, **kwargs)
 
-    monkeypatch.setattr(managers, "accessible_ids", membership)
+    monkeypatch.setattr(managers, "held_ids", membership)
     monkeypatch.setattr(active, "accessible", lambda **kwargs: pytest.fail("unbounded enumeration"))
     assert (
         Post.objects.as_user(alice)
@@ -1108,9 +1133,8 @@ def test_bounded_bulk_field_refusal_preserves_the_rows(alice, expression):
 
 @pytest.mark.django_db
 @pytest.mark.parametrize("storage", ["denormalized", "registry"])
-@pytest.mark.parametrize("orm", [True, False], ids=["orm", "bulk"])
 def test_bounded_field_visibility_keeps_global_grants_and_fresh_refusals(
-    alice, monkeypatch, settings, storage, orm
+    alice, monkeypatch, settings, storage
 ):
     from rebac.field_visibility import visible_id_sets
     from rebac.types import RelationshipFilter
@@ -1131,10 +1155,7 @@ def test_bounded_field_visibility_keeps_global_grants_and_fresh_refusals(
     selected = _post(title="selected")
     unrelated = _post(title="not fetched")
     actor = SubjectRef.of("auth/user", str(alice.pk))
-    if not orm:
-        monkeypatch.setattr(active, "queryset_filter", lambda **kwargs: None)
     arguments = dict(model=Post, actor=actor, fields=frozenset({"title"}), active_backend=active)
-    assert visible_id_sets(**arguments) == {"title": None}
     monkeypatch.setattr(
         active, "grants_all", lambda **kwargs: pytest.fail("bounded rows need no universal proof")
     )

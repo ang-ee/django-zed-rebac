@@ -90,7 +90,7 @@ def test_schema_checks_do_not_query_without_explicit_databases(monkeypatch):
     assert system_checks.check_policy_models(databases=[]) == []
 
 
-@override_settings(REBAC_BACKEND="spicedb")
+@override_settings(REBAC_BACKEND="bogus")
 def test_schema_checks_are_local_backend_only():
     assert system_checks.check_policy_models(databases=["default"]) == []
 

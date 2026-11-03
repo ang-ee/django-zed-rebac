@@ -4,7 +4,7 @@
 
 ---
 
-> **Status: alpha.** The package is published on PyPI and the core local REBAC path is usable: `LocalBackend`, `RebacMixin`/manager, schema parser, `rebac sync`, caveats, expirations, schema overrides, audit events, middleware, system checks, DRF helpers, the Strawberry GraphQL adapter, a REBAC-safe Strawberry-Django optimizer, field-backed structural relations, and the FastMCP `rebac_mcp_tool` adapter. `SpiceDBBackend` is roadmap work. Track the milestones at [docs/ARCHITECTURE.md § Roadmap](./docs/ARCHITECTURE.md#roadmap).
+> **Status: alpha.** The package is published on PyPI and the local REBAC path is usable: `LocalBackend`, `RebacMixin`/manager, schema parser, `rebac sync`, caveats, expirations, schema overrides, audit events, middleware, system checks, DRF helpers, the Strawberry GraphQL adapter, a REBAC-safe Strawberry-Django optimizer, field-backed structural relations, and the FastMCP `rebac_mcp_tool` adapter. A remote SpiceDB adapter is roadmap work. Track the milestones at [docs/ARCHITECTURE.md § Roadmap](./docs/ARCHITECTURE.md#roadmap).
 
 ---
 
@@ -12,10 +12,10 @@
 
 `django-zed-rebac` ports [SpiceDB](https://github.com/authzed/spicedb)'s relation-based access control model into Django. You author your permission schema as a SpiceDB-native `.zed` file alongside your app; the plugin loads it into DB tables on install with `noupdate=True` semantics that preserve admin edits, and admins tweak overrides through the admin UI (or your own GraphQL layer).
 
-The backend interface is designed around one Python API:
+The runtime backend uses one Python API:
 
 - **`LocalBackend`** — pure Django. A permission is compiled to a query over your own tables and the relationship table and evaluated when it is read: field-, attribute- and const-backed relations come from the model columns, stored relations from tuples. The library stores no row per application row, there is no build step, and a write is visible to the next read. Recursive permissions are unrolled to `REBAC_DEPTH_LIMIT` levels. Caveats are decided in Python and bound into the statement. See [the design and its limits](./docs/ARCHITECTURE.md#compiled-permissions--the-localbackend-read-path).
-- **`SpiceDBBackend`** — planned adapter for the official [`authzed`](https://pypi.org/project/authzed/) Python client. The class exists today as a clear stub, but `REBAC_BACKEND = "spicedb"` is not a supported runtime path yet.
+`REBAC_BACKEND` accepts only `"local"`. A remote SpiceDB adapter is planned.
 
 Add the mixin to your model and `Post.objects.all()` returns only what the user can read. Add `Model.objects.with_actor(actor)` for explicit actor scoping in Celery tasks, GraphQL resolvers, management commands, and other non-HTTP entrypoints — `actor` can be a Django `User`, a registered `Agent`, an `agents/grant` (agent-acting-on-behalf-of-user, shipped by your `agents` app), or anything `@rebac_subject`-registered. Typed shorthands `as_user(user)` and `as_agent(agent, on_behalf_of=user)` cover the common cases. The default Django actor labels are `auth/user` and `auth/group`; include their definitions in your application schema (automatic base-schema emission is planned). `agents/agent`, `agents/grant`, `auth/apikey`, and other subject types live in your own apps.
 
@@ -117,7 +117,7 @@ see [database selection](./docs/ARCHITECTURE.md#database-selection).
 | Problem | Existing options | What `django-zed-rebac` does |
 |---|---|---|
 | Per-object permissions in Django | `django-guardian` (per-object ACL via GenericFK; no JOIN propagation; no graph traversal) | True REBAC graph; SpiceDB-compatible; manager-level queryset scoping; cross-relation propagation. |
-| Run SpiceDB-style permissions locally without infrastructure | None — SpiceDB itself is a Go binary that needs Postgres + a sidecar | `LocalBackend`: pure Django; permissions are compiled to queries over relationships and declared backings. Same API surface the planned `SpiceDBBackend` will use. |
+| Run SpiceDB-style permissions locally without infrastructure | None — SpiceDB itself is a Go binary that needs Postgres + a sidecar | `LocalBackend`: pure Django; permissions are compiled to queries over relationships and declared backings. |
 | AI-agent authorization | Cedar (no graph traversal); Casbin (in-memory post-filter); Polar/Oso (deprecated 2023) | Consumer-defined grant objects and permission expressions can combine delegation and capability conditions. The engine evaluates those explicit relationships; resolving an agent or grant subject does not confer the user's permissions. |
 | Permission scoping outside HTTP | Manual `if user.has_perm(...)` everywhere | `Model.objects.with_actor(actor)` works in Celery tasks, cron, management commands, plain Python, and MCP servers. The actor is generic: Django `User`, `Agent`, `agents/grant`, `auth/apikey`, or any registered subject. |
 | Strict-by-default (no silent leaks) | `django-guardian` returns all rows when nothing scopes; easy to forget | Querysets without an actor raise `MissingActorError` rather than returning everything. Bypass requires an explicit `reason`; block-scoped `sudo()` is logged. |
@@ -136,7 +136,7 @@ see [database selection](./docs/ARCHITECTURE.md#database-selection).
 - **`with_actor(actor)` ≠ `sudo(reason=...)`.** Distinct verbs for distinct intents. `with_actor` re-evaluates checks as that subject (user, agent, grant, apikey, …); `sudo` bypasses them with mandatory `reason` and audit-log entry. Originating uid preserved through bypass for audit. An instance or queryset sudo pin does not propagate through relationship traversal; an ambient sudo block covers related reads without a pinned actor.
 - **Strict by default.** A queryset without an actor scope raises rather than leaking. Bypass requires an explicit reason; block-scoped `sudo()` writes a structured audit event.
 - **Drop-in DRF integration.** `permission_classes = [RebacPermission]` + `filter_backends = [RebacFilterBackend]`. Per-action permission map; customisable.
-- **GraphQL + WebSocket-aware.** Per-request `PermissionEvaluator` LRU-caches `check_access` / `accessible` calls — a single GraphQL query that fans out across 50 nested resolvers makes 1 backend call per `(actor, action, resource)`, not 50. The Strawberry adapter (`pip install django-zed-rebac[strawberry]`) ships `RebacExtension` (per-operation scope, per-emission for subscriptions) and `RebacChannelsConsumerMixin` (actor resolved at WS handshake; per-emission cache reset means revoked grants take effect on the next subscription tick). Strawberry-Django users can install `django-zed-rebac[strawberry-django]` and use `RebacDjangoOptimizerExtension` for permission-aware `select_related` / `prefetch_related` optimization. See [docs/ARCHITECTURE.md § Per-request evaluator + Zookie freshness](./docs/ARCHITECTURE.md#per-request-evaluator--zookie-freshness).
+- **GraphQL + WebSocket-aware.** Per-request `PermissionEvaluator` LRU-caches `check_access` calls — a single GraphQL query that fans out across 50 nested resolvers makes 1 backend call per `(actor, action, resource)`, not 50. The Strawberry adapter (`pip install django-zed-rebac[strawberry]`) ships `RebacExtension` (per-operation scope, per-emission for subscriptions) and `RebacChannelsConsumerMixin` (actor resolved at WS handshake; per-emission cache reset means revoked grants take effect on the next subscription tick). Strawberry-Django users can install `django-zed-rebac[strawberry-django]` and use `RebacDjangoOptimizerExtension` for permission-aware `select_related` / `prefetch_related` optimization. See [docs/ARCHITECTURE.md § Per-request evaluator + Zookie freshness](./docs/ARCHITECTURE.md#per-request-evaluator--zookie-freshness).
 - **Write-then-read freshness via Zookie ContextVar.** Every write returns a `Zookie`; subsequent LocalBackend reads in the same scope auto-upgrade to `Consistency.AT_LEAST_AS_FRESH(zookie)`. Cross-request transport (SPA / JWT) is opt-in via `REBAC_ZOOKIE_TRANSPORT = "header" | "session"`. LocalBackend uses `Relationship.written_at_xid` as the freshness witness; the same public API is reserved for the planned SpiceDB adapter.
 - **Celery tasks use explicit actor scope.** Pass the authenticated actor reference through your trusted task producer, then use `actor_context()` or `.with_actor()` inside the worker. Automatic Celery propagation is planned; no `rebac.celery` module is shipped.
 - **MCP integration shipped.** Model MCP tools as schema resources and gate them with `from rebac.mcp import rebac_mcp_tool` — it resolves the actor from the request context (`ctx.request_context.meta["actor_subject"]` by default), checks the permission, then runs the tool body. Sync and async tools both supported. See [proposal 0004](./docs/proposals/0004-mcp-tool-integration.md).
@@ -173,28 +173,12 @@ Database support: PostgreSQL 15+ (production target), MySQL 8.4+ (opt-in vendor 
 
 `django-zed-rebac` is the first Django package targeting full SpiceDB schema-language compatibility AND a working in-process backend AND a first-class AI-agent pattern AND admin-editable policy with safe upgrades — none of the others combine all four.
 
-## Backends in detail
+## Backend in detail
 
-```
-┌─ Your application ──────────────────────────────────────────────┐
-│   RebacMixin / RebacPermission / @rebac_resource                  │
-│                            │                                      │
-│            ┌───────────────▼──────────────────┐                  │
-│            │  rebac.backends.Backend (ABC)   │                  │
-│            │   check_access  has_access        │                  │
-│            │   accessible    lookup_subjects   │                  │
-│            └───────────────┬──────────────────┘                  │
-│              ┌─────────────┴────────────┐                        │
-│              │                          │                        │
-│   ┌──────────▼──────────┐   ┌───────────▼───────────┐           │
-│   │  LocalBackend       │   │  SpiceDBBackend        │           │
-│   │  compiled queries + │   │  planned authzed       │           │
-│   │  cel-python caveats │   │  adapter               │           │
-│   └─────────────────────┘   └────────────────────────┘           │
-└──────────────────────────────────────────────────────────────────┘
-```
-
-`LocalBackend` is the supported runtime backend today. `SpiceDBBackend` is on the roadmap behind the same `Backend` interface; persisted consistency tokens (`Zookie`s) are intentionally backend-tagged and will not be portable across that future swap.
+`rebac.backend()` lazily returns one cached `LocalBackend`. It exposes
+`check_access`, `has_access`, `check_bulk_permissions`, `accessible` (enumeration),
+`held` (candidate checks), `lookup_subjects`, and relationship writes. Persisted
+consistency tokens (`Zookie`s) carry the backend kind.
 
 ## What `django-zed-rebac` is NOT
 
@@ -215,7 +199,7 @@ This is an **alpha** package. The architecture is settled (see [docs/ARCHITECTUR
 - **0.11** — FastMCP `rebac_mcp_tool` adapter ([proposal 0004](./docs/proposals/0004-mcp-tool-integration.md)).
 - **0.23–0.24** — full subject expansion, reference and differential test suites, PostgreSQL CI, write gates for backed edges.
 - **Unreleased** — permissions compiled to queries over the application's own tables ([proposal 0015](./docs/proposals/0015-permissions-compiled-to-queries.md)): no derived tables, no build step. The trial on a large PostgreSQL database is pending.
-- **Next** — `SpiceDBBackend` adapter.
+- **Next** — a remote SpiceDB adapter.
 - **1.0** — Stable release with full docs and CI matrix green.
 
 Track the full plan in [docs/ARCHITECTURE.md § Roadmap](./docs/ARCHITECTURE.md#roadmap).
