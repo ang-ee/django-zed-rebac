@@ -239,12 +239,13 @@ write gates share these resolved backings.
 An edge change requires `write` on every affected resource row whose declared
 backing watches the changed column or through table, provided that resource
 type declares a `write` permission. This includes reverse FK and M2M accessors,
-`RebacTrackedMixin` deletes, queryset writes through an auto-created through
-model, scalar predicate columns, nested field paths whose source is another
+`RebacTrackedMixin` deletes, writes through a declared through model inheriting
+`RebacTrackedMixin`, scalar predicate columns, nested field paths whose source is another
 model, and both mirror rows of a symmetrical self-M2M. `RebacMixin` deletes
-are not gated; the collector's CASCADE and SET_NULL rows are gated under the
-ambient actor, not the actor pinned on the deleted row; instance-level
-through-model writes are not gated (all three: proposal 0011). Reads see
+can still miss another type's backed edges; collector CASCADE and SET_NULL
+rows outside a declared through use the ambient actor rather than the deleted
+row's pin (proposal 0011). Declared-through cascade rows use the deleting
+root's pin. Reads see
 all of these writes when they commit; what is open is their authorization.
 The gate finds source rows through the unchanged
 prefix of each affected path, before mutation and under the carrying or ambient
@@ -256,7 +257,10 @@ rows, then queries only declaring rows at the path prefix before the M2M hop.
 Using the full path would compare target PKs to source PKs and miss edges when
 the two sequences differ.
 Instance sudo does not carry through a related manager. A denied
-declaring resource is audited after the failed owner transaction unwinds.
+declaring resource is audited after the failed owner transaction unwinds,
+except for an auto-created-through M2M signal denial: `REBAC_AUDIT_DENIALS` records no
+row for that denial, including when a transaction-managed caller catches it
+and continues.
 Tracked models can be backing sources even when their own saves have no
 resource write gate. A backing type without a permission literally named
 `write`, including resource types that name it `edit` or `update`, has no
@@ -2270,8 +2274,8 @@ else. The write gates keep the rules of the
 [CRUD enforcement matrix](#crud-enforcement-matrix) and of invariant 5d
 (a change to a backed edge requires `write` on every affected row of the
 declaring type), with the same entry points: `save_base` and `delete` on the
-mixins, the scoped and tracked querysets, the injected base manager, the
-related-manager wrappers and the explicit-sender receivers.
+mixins, the scoped and tracked querysets, the injected base manager, and the
+explicit-sender receivers.
 
 - **The watch map.** `rebac.watch.watched_for(schema)` resolves, from model
   metadata alone, the models and columns that the schema's backings read:
@@ -2609,7 +2613,15 @@ Resolution order:
 4. **Implicit from `current_actor()`**, the contextvar populated by middleware (see [§ Middleware](#middleware)) or explicit task actor scopes.
 5. **Falls through to** `REBAC_STRICT_MODE` handling: `True` → raise for gates/materialisation; `False` → full visibility.
 
-A pinned actor (path 2) **always wins** over ambient state (paths 3-4) — there is no path by which ambient sudo or the ambient actor ContextVar can override an explicit `.with_actor(...)`. This is the inverse of Odoo's `allowed_company_ids` ambient-scope precedence; we want the explicit local scope to be the authoritative one. If code truly wants bypass inside an elevated block, it must call `.sudo(reason=...)` on that queryset or instance.
+A pinned actor (path 2) wins over ambient state (paths 3-4) when that queryset
+or instance carries the pin into its gate. The ambient actor cannot override
+an explicit `.with_actor(...)` on that carrier. This is the inverse of Odoo's
+`allowed_company_ids` ambient-scope precedence. A declared-through
+related-manager write queryset has no instance pin, as described below.
+
+Django does not carry the instance's pin into a declared through model's
+related-manager write queryset. That queryset uses its ambient
+actor; a pinned-only related-manager call needs an ambient actor or sudo.
 
 **Critical: scope sticks across writes.** A queryset created with `with_actor(actor)` produces instances tagged with that actor; `instance.save()` re-checks against the same actor, regardless of what `current_actor()` says now. This is the Odoo `with_user(...)` invariant translated into Django — the actor follows the recordset.
 Only a REBAC queryset or `RebacMixin` instance can carry that pin; an unrelated
@@ -2633,27 +2645,41 @@ tracked model's callable attribute named `actor` does not become an actor scope.
 
 For an automatically created M2M through table, a `RebacMixin` owner needs
 `write` on its row even if the table backs no relation. When the table is
-watched, `add` / `remove` / `set` / `clear` also check every
-resource type that owns an affected backed edge, including reverse-manager and
-symmetrical self-M2M calls. The related manager preflights the changed pairs once
-outside Django's own atomic block so denial audit survives that rollback.
-Its `set()` wrapper accepts Django's positional and `objs=` keyword forms.
-The `m2m_changed` receiver gates related-manager writes the wrapper has not
-already gated, and queryset writes through
-the auto-created through model's `objects` manager (`bulk_create`, `update`,
-queryset `delete`) are gated; the related-manager wrapper exempts
-only the exact pairs it already gated, as inserts or deletes, so rows a
-consumer `m2m_changed` handler writes during the call are gated on their own.
-Instance-level through writes are not gated (proposal
-0011); writes through the through model's `_base_manager`, and a
-related-manager call from a multi-table child of the declaring model, are
-not gated (proposal 0013). Through gates use the changed FK pairs and
+watched, the `m2m_changed` receiver gates `add` / `remove` / `set` / `clear`
+on every affected declaring resource, including reverse-manager and
+symmetrical self-M2M calls. Django's `set()` sends signals for the difference,
+so unchanged memberships need no write permission. An incomplete symmetrical
+self-M2M pair also gates a mirror row Django inserts without another signal.
+An `add()` on an instance with incomplete symmetrical pairs needs `write`
+on every half-pair partner, since Django may insert every missing mirror.
+Fixture loads with `raw=True` bypass the gate but still bump the row generation.
+A denial follows Django's transaction rules: callers that catch it and continue
+wrap the related-manager call in `atomic()`. `REBAC_AUDIT_DENIALS` records
+nothing for auto-created-through signal denials, including in that
+transaction-managed case.
+Direct writes to auto-created through tables, including `bulk_create`,
+`update`, and `delete`, are unobserved infrastructure writes. An M2M that
+requires gated bulk writes declares an explicit `through=` model inheriting
+`RebacTrackedMixin`. Its own instance and queryset gates check the M2M owner
+and declaring resources for direct and related-manager writes; REBAC attaches
+no `m2m_changed` receiver to it. A pinned-only related-manager write
+through such a model needs an ambient actor or sudo. Cascaded through rows
+use the root delete's actor but currently gate one row at a time; batching
+that gate is a known performance follow-up.
+An M2M `set(clear=False)` reads existing targets through their REBAC queryset.
+Until the actor-resolution change carries the instance pin into related-manager
+reads, strict mode needs an ambient actor or sudo for that read. A forward
+related-manager call from a multi-table child of the declaring model is not
+gated (proposal 0013). Through gates use the changed FK pairs and
 their source rows rather than the whole through table.
-The carrying actor wins over ambient context; instance sudo does not propagate
-to the related manager. Without an actor, strict mode raises `MissingActorError`
+For an auto-created through table, the carrying actor wins over ambient
+context; instance sudo does not propagate to the related manager. A declared
+through write queryset instead uses its ambient actor. Without an actor,
+strict mode raises `MissingActorError`
 only if an affected resource type declares `write`. An unwatched through table
-without a REBAC owner needs no backed-edge gate. Signal-free `bulk_create`, `update`,
-`bulk_update`, and tracked deletes apply the same backed-column gate.
+without a REBAC owner needs no backed-edge gate. On tracked backing models,
+signal-free `bulk_create`, `update`, `bulk_update`, and tracked deletes apply
+the same backed-column gate.
 `bulk_update`'s per-row literal `Case`/`When` values are resolved and checked;
 arbitrary ORM expressions for a proposed watched value are refused unless
 explicitly bypassed.

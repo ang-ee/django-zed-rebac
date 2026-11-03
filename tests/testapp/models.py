@@ -93,15 +93,20 @@ class PinnedPost(RebacMixin, models.Model):
     """A many-to-many relation through a declared model."""
 
     title = models.CharField(max_length=200)
-    folders = models.ManyToManyField(Folder, through="PostPin", related_name="pinned_posts")
+    folders = models.ManyToManyField(
+        Folder, through="PostPin", through_fields=("post", "folder"), related_name="pinned_posts"
+    )
 
     class Meta:
         app_label = "testapp"
         rebac_resource_type = "blog/pinnedpost"
 
 
-class PostPin(models.Model):
+class PostPin(RebacTrackedMixin):
     post = models.ForeignKey(PinnedPost, on_delete=models.CASCADE)
+    referrer = models.ForeignKey(
+        PinnedPost, null=True, blank=True, on_delete=models.SET_NULL, related_name="+"
+    )
     folder = models.ForeignKey(Folder, on_delete=models.CASCADE)
     note = models.CharField(max_length=100, blank=True, default="")
 

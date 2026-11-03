@@ -3,11 +3,10 @@
 from __future__ import annotations
 
 from collections.abc import Iterable, Iterator
-from contextlib import contextmanager, nullcontext
-from contextvars import ContextVar
+from contextlib import contextmanager
 from itertools import batched
 from typing import Any, cast
-from weakref import WeakSet
+from weakref import ReferenceType, WeakKeyDictionary, WeakSet, ref
 
 from django.apps import apps
 from django.db import connections, models, router
@@ -25,7 +24,6 @@ from django.dispatch import receiver
 
 from .actors import model_can_resolve_subject, model_identities
 from .conf import app_settings
-from .database import database_context
 from .errors import PermissionDenied
 from .resources import model_resource_type, to_object_ref
 from .types import ObjectRef, SubjectRef
@@ -36,102 +34,100 @@ _subjects: WeakSet[type[Model]] = WeakSet()
 _tracked: WeakSet[type[Model]] = WeakSet()
 _throughs: WeakSet[type[Model]] = WeakSet()
 _through_candidates: WeakSet[type[Model]] = WeakSet()
-
-
-class _PreGatedThroughWrite:
-    """The through pairs a related-manager call already gated.
-
-    Only these exact rows skip the per-row gates while the call runs; any other
-    through row written during it, for example by a consumer ``m2m_changed``
-    handler, is gated on its own.
-    """
-
-    __slots__ = ("pairs", "through")
-
-    def __init__(self, through: type[Model], pairs: set[tuple[Any, Any]]) -> None:
-        self.through = through
-        self.pairs = frozenset(pairs)
-
-    def covers(
-        self,
-        sender: type[Model],
-        instance: Any,
-        reverse: bool,
-        pk_set: set[Any] | None,
-        using: str,
-    ) -> bool:
-        if sender is not self.through:
-            return False
-        return _through_pairs(sender, instance, reverse, pk_set, using) <= self.pairs
-
-    def covers_row(self, row: Model) -> bool:
-        if type(row)._meta.concrete_model is not self.through._meta.concrete_model:
-            return False
-        fields = [
-            field for field in self.through._meta.fields if isinstance(field, models.ForeignKey)
-        ]
-        return tuple(getattr(row, field.attname) for field in fields) in self.pairs
-
-
-_related_m2m_write: ContextVar[_PreGatedThroughWrite | None] = ContextVar(
-    "rebac_related_m2m_write", default=None
+type ThroughBinding = tuple[
+    type[Model], models.ForeignKey[Any, Any], models.ForeignKey[Any, Any], bool
+]
+type ThroughBindingSpec = tuple[
+    ReferenceType[type[Model]],
+    ReferenceType[models.ForeignKey[Any, Any]],
+    ReferenceType[models.ForeignKey[Any, Any]],
+    bool,
+]
+_through_binding_cache: WeakKeyDictionary[type[Model], list[ThroughBindingSpec]] = (
+    WeakKeyDictionary()
 )
+type ThroughPairs = dict[tuple[type[Model], type[Model], str, str], set[tuple[Any, Any]]]
 
 
-def _through_pairs(
+def _through_other_ids(
     sender: type[Model],
     instance: Any,
     reverse: bool,
     pk_set: set[Any] | None,
     using: str,
-) -> set[tuple[Any, Any]]:
-    """The through rows ``(fk_a, fk_b)``, in field order, a signal is about."""
-    return _through_edges(sender, instance, reverse, pk_set, using)[0]
-
-
-def _through_edges(
-    sender: type[Model],
-    instance: Any,
-    reverse: bool,
-    pk_set: set[Any] | None,
-    using: str,
-) -> tuple[set[tuple[Any, Any]], set[Any]]:
-    """The through pairs of a related-manager signal and the other-side ids."""
-    fields = [field for field in sender._meta.fields if isinstance(field, models.ForeignKey)]
+) -> set[Any]:
+    """The other-side ids named by a related-manager signal."""
     instance_model = instance._meta.concrete_model
     assert instance_model is not None
-    # A multi-table child writes through its parent's M2M, so match by lineage.
-    own = [
-        field
-        for field in fields
-        if (target := field.remote_field.model._meta.concrete_model) is not None
-        and issubclass(instance_model, target)
-    ]
-    if not own:
-        return set(), set()
-    instance_field = fields[1 if reverse else 0] if len(own) == len(fields) else own[0]
-    other_field = next(field for field in fields if field is not instance_field)
-    other_ids = (
-        pk_set
-        if pk_set is not None
-        else set(
-            sender._base_manager.using(using)
-            .filter(**{instance_field.attname: instance.pk})
-            .values_list(other_field.attname, flat=True)
+    other_ids: set[Any] = set()
+    for owner, source, target, _ in _through_bindings(sender):
+        source_model = owner._meta.concrete_model
+        target_model = target.remote_field.model._meta.concrete_model
+        if not (
+            (reverse and target_model is not None and issubclass(instance_model, target_model))
+            or (
+                not reverse
+                and source_model is not None
+                and issubclass(instance_model, source_model)
+            )
+        ):
+            continue
+        instance_field, other_field = (target, source) if reverse else (source, target)
+        if pk_set is not None:
+            other_ids.update(pk_set)
+        else:
+            other_ids.update(
+                sender._base_manager.using(using)
+                .filter(**{instance_field.attname: instance.pk})
+                .values_list(other_field.attname, flat=True)
+            )
+    return other_ids
+
+
+def _through_bindings(through: type[Model]) -> tuple[ThroughBinding, ...]:
+    """Declared M2M owners and their ordered through foreign keys."""
+    bindings: list[ThroughBinding] = []
+    for owner_ref, source_ref, target_ref, symmetrical in _through_binding_cache.get(through, ()):
+        owner = owner_ref()
+        source = source_ref()
+        target = target_ref()
+        if owner is None or source is None or target is None:
+            continue
+        bindings.append((owner, source, target, symmetrical))
+    return tuple(bindings)
+
+
+def _remember_through_binding(owner: type[Model], field: models.ManyToManyField[Any, Any]) -> None:
+    through = field.remote_field.through
+    if not isinstance(through, type) or not hasattr(field, "m2m_field_name"):
+        return
+    source = through._meta.get_field(field.m2m_field_name())
+    target = through._meta.get_field(field.m2m_reverse_field_name())
+    assert isinstance(source, models.ForeignKey) and isinstance(target, models.ForeignKey)
+    binding = (ref(owner), ref(source), ref(target), field.remote_field.symmetrical)
+    bindings = _through_binding_cache.setdefault(through, [])
+    if binding not in bindings:
+        bindings.append(binding)
+
+
+def _missing_mirror_ids(sender: type[Model], instance: Model, using: str) -> set[Any]:
+    """Half-pairs whose mirror Django may insert without another signal."""
+    for owner, source, target, symmetrical in _through_bindings(sender):
+        if not symmetrical or not isinstance(instance, owner):
+            continue
+        from django.db.models import Exists, OuterRef
+
+        rows = sender._base_manager.using(using)
+        mirror = rows.filter(
+            **{source.attname: OuterRef(target.attname), target.attname: instance.pk}
         )
-    )
-    if instance_field is fields[0]:
-        pairs = {(instance.pk, other) for other in other_ids}
-    else:
-        pairs = {(other, instance.pk) for other in other_ids}
-    owner_meta = getattr(sender._meta.auto_created, "_meta", None)
-    if owner_meta is not None and any(
-        m2m.remote_field.through is sender and m2m.remote_field.symmetrical
-        for m2m in cast(Any, owner_meta).local_many_to_many
-    ):
-        # Django writes the mirror row of a symmetrical self-M2M in the same call.
-        pairs |= {(b, a) for a, b in pairs}
-    return pairs, set(other_ids)
+        return set(
+            rows.filter(**{source.attname: instance.pk})
+            .alias(_rebac_mirror=Exists(mirror))
+            .filter(_rebac_mirror=False)
+            .values_list(target.attname, flat=True)
+        )
+    return set()
 
 
 def tracked_model(model: type[Model]) -> bool:
@@ -152,10 +148,18 @@ def tracked_model(model: type[Model]) -> bool:
 
 
 def tracked_through(model: type[Model]) -> bool:
-    return bool(model._meta.auto_created) and any(
-        isinstance(field.remote_field.model, type) and tracked_model(field.remote_field.model)
-        for field in model._meta.fields
-        if isinstance(field, models.ForeignKey)
+    if model._meta.auto_created:
+        return any(
+            isinstance(field.remote_field.model, type) and tracked_model(field.remote_field.model)
+            for field in model._meta.fields
+            if isinstance(field, models.ForeignKey)
+        )
+    from .mixins import RebacTrackedMixin
+
+    return (
+        model._meta.apps.models_ready
+        and issubclass(model, RebacTrackedMixin)
+        and bool(_through_bindings(model))
     )
 
 
@@ -204,25 +208,38 @@ def _register_model(model: type[Model]) -> None:
         connect_subject_model(model)
     if model._meta.auto_created:
         _through_candidates.add(model)
-    for through in tuple(_through_candidates):
-        eligible = tracked_through(through)
-        if not eligible and through._meta.apps is model._meta.apps and tracked_model(model):
-            # class_prepared runs just before registry insertion and lazy FK
-            # resolution. Match a pending string endpoint to this known class.
-            eligible = any(
-                isinstance(field.remote_field.model, str)
-                and (
-                    field.remote_field.model
-                    if "." in field.remote_field.model
-                    else f"{through._meta.app_label}.{field.remote_field.model}"
-                ).lower()
-                == model._meta.label_lower
-                for field in through._meta.fields
-                if isinstance(field, models.ForeignKey)
-            )
-        if eligible and through not in _throughs:
-            _throughs.add(through)
+    for field in model._meta.local_many_to_many:
+        _remember_through_binding(model, field)
+        through = field.remote_field.through
+        if isinstance(through, type):
+            _register_through(through)
+    if tracked_model(model) and not model._meta.auto_created:
+        for through in tuple(_through_candidates):
+            _register_through(through, prepared=model)
+
+
+def _register_through(through: type[Model], prepared: type[Model] | None = None) -> None:
+    eligible = tracked_through(through)
+    if not eligible and prepared is not None and through._meta.apps is prepared._meta.apps:
+        # A late tracked endpoint may still be a string during class_prepared.
+        eligible = any(
+            isinstance(field.remote_field.model, str)
+            and (
+                field.remote_field.model
+                if "." in field.remote_field.model
+                else f"{through._meta.app_label}.{field.remote_field.model}"
+            ).lower()
+            == prepared._meta.label_lower
+            for field in through._meta.fields
+            if isinstance(field, models.ForeignKey)
+        )
+    if eligible and through not in _throughs:
+        _throughs.add(through)
+        if through._meta.auto_created:
             _connect(m2m_changed, _tracked_m2m, through)
+        else:
+            _connect(pre_save, _tracked_through_pre_save, through)
+            _connect(pre_delete, _tracked_through_pre_delete, through)
 
 
 def connect_tracked_signals() -> None:
@@ -242,122 +259,20 @@ def connect_tracked_signals() -> None:
                 _subjects.discard(model)
     for model in tuple(_throughs):
         if not tracked_through(model):
-            m2m_changed.disconnect(sender=model, dispatch_uid="_tracked_m2m")
+            if model._meta.auto_created:
+                m2m_changed.disconnect(sender=model, dispatch_uid="_tracked_m2m")
+            else:
+                pre_save.disconnect(sender=model, dispatch_uid="_tracked_through_pre_save")
+                pre_delete.disconnect(sender=model, dispatch_uid="_tracked_through_pre_delete")
             _throughs.discard(model)
     for model in apps.get_models(include_auto_created=True):
         _register_model(model)
-    _own_through_managers()
-    _wrap_related_m2m_writes()
-
-
-def _own_through_managers() -> None:
-    from .managers import TrackedManager
-
-    for through in tuple(_throughs):
-        if getattr(through, "_rebac_owned_through_manager", False):
-            continue
-        through._meta.local_managers = [
-            manager for manager in through._meta.local_managers if manager.name != "objects"
-        ]
-        through.add_to_class("objects", TrackedManager())
-        cast(Any, through._meta)._expire_cache()
-        cast(Any, through)._rebac_owned_through_manager = True
-
-
-def _wrap_related_m2m_writes() -> None:
-    """Preflight related-manager calls outside Django's internal atomic block."""
-    for source in apps.get_models():
-        for field in source._meta.local_many_to_many:
-            through = field.remote_field.through
-            if through not in _throughs:
-                continue
-            target = field.remote_field.model
-            descriptors = [getattr(source, field.name)]
-            accessor = field.remote_field.get_accessor_name()
-            if accessor and hasattr(target, accessor):
-                descriptors.append(getattr(target, accessor))
-            for descriptor in descriptors:
-                manager_class = descriptor.related_manager_cls
-                if manager_class.__dict__.get("_rebac_edge_gate_wrapped"):
-                    continue
-                for operation in ("add", "remove", "clear", "set"):
-                    original = getattr(manager_class, operation)
-
-                    def guarded(
-                        self: Any,
-                        *args: Any,
-                        _original: Any = original,
-                        _operation: str = operation,
-                        **kwargs: Any,
-                    ) -> Any:
-                        using = router.db_for_write(self.through, instance=self.instance)
-                        with database_context(using), audit_backed_denials():
-                            gated_pairs: set[tuple[Any, Any]] = set()
-                            if _operation in {"clear", "set"}:
-                                gated_pairs |= _gate_m2m(
-                                    self.through,
-                                    self.instance,
-                                    self.reverse,
-                                    self.model,
-                                    None,
-                                    using,
-                                )
-                            if _operation != "clear":
-                                values = (
-                                    tuple(args[0] if args else kwargs["objs"])
-                                    if _operation == "set"
-                                    else args
-                                )
-                                ids = {getattr(value, "pk", value) for value in values}
-                                gated_pairs |= _gate_m2m(
-                                    self.through,
-                                    self.instance,
-                                    self.reverse,
-                                    self.model,
-                                    ids,
-                                    using,
-                                )
-                                if _operation == "set":
-                                    if args:
-                                        args = (values, *args[1:])
-                                    else:
-                                        kwargs["objs"] = values
-                            from .actors import actor_context
-                            from .mixins import RebacMixin
-
-                            pinned = getattr(self.instance, "actor", None)
-                            carried = (
-                                pinned()
-                                if isinstance(self.instance, RebacMixin) and callable(pinned)
-                                else None
-                            )
-                            scope = actor_context(carried) if carried is not None else nullcontext()
-                            # Only the pairs gated above are exempt from the
-                            # per-row gates below; a consumer m2m_changed
-                            # handler writing other through rows during the
-                            # call is gated like any other write.
-                            token = _related_m2m_write.set(
-                                _PreGatedThroughWrite(self.through, gated_pairs)
-                            )
-                            try:
-                                with scope:
-                                    return _original(self, *args, **kwargs)
-                            finally:
-                                _related_m2m_write.reset(token)
-
-                    setattr(manager_class, operation, guarded)
-                manager_class._rebac_edge_gate_wrapped = True
 
 
 @receiver(class_prepared, dispatch_uid="rebac.model_prepared")
 def _model_prepared(sender: type[Model], **kwargs: Any) -> None:
     _register_model(sender)
-    # A through model can be prepared before its endpoint finishes resolving.
-    # Revisit local M2M fields once the endpoint is prepared (no registry query).
-    for field in sender._meta.local_many_to_many:
-        through = field.remote_field.through
-        if isinstance(through, type):
-            _register_model(through)
+    # _register_model records each newly prepared field's binding.
 
 
 def _current_watch(
@@ -511,6 +426,54 @@ def _tracked_pre_save(
         _gate_backed_field_change(sender, instance, using, update_fields)
 
 
+def _tracked_through_pre_save(
+    sender: type[Model],
+    instance: Model,
+    using: str,
+    raw: bool = False,
+    update_fields: Iterable[str] | None = None,
+    **kwargs: Any,
+) -> None:
+    if raw:
+        return
+    before: ThroughPairs = {}
+    if not instance._state.adding:
+        old = sender._base_manager.using(using).filter(pk=instance.pk).first()
+        if old is not None:
+            _collect_through_pair(old, before, names=update_fields)
+    after: ThroughPairs = {}
+    _collect_through_pair(instance, after, names=update_fields)
+    if before == after:
+        return
+    for binding, changed in after.items():
+        before.setdefault(binding, set()).update(changed)
+    _gate_direct_through_rows(before, using)
+
+
+def _tracked_through_pre_delete(
+    sender: type[Model], instance: Model, using: str, origin: Any = None, **kwargs: Any
+) -> None:
+    from .managers import TrackedQuerySet
+    from .mixins import delete_scope
+
+    scope = delete_scope(origin, using)
+    if (
+        scope is not None
+        and isinstance(origin, TrackedQuerySet)
+        and origin.model is sender
+        and instance.pk in scope.root_pks
+    ):
+        return
+    pairs: ThroughPairs = {}
+    _collect_through_pair(instance, pairs)
+    _gate_direct_through_rows(
+        pairs,
+        using,
+        actor=scope.actor if scope is not None else None,
+        bypass=scope.unscoped if scope is not None else False,
+    )
+
+
 def _tracked_m2m(
     sender: type[Model],
     instance: Any,
@@ -529,9 +492,12 @@ def _tracked_m2m(
         bump_row_generation()
         return
     if action in {"pre_add", "pre_remove", "pre_clear"}:
-        pre_gated = _related_m2m_write.get()
-        if pre_gated is None or not pre_gated.covers(sender, instance, reverse, pk_set, using):
-            _gate_m2m(sender, instance, reverse, model, pk_set, using)
+        if kwargs.get("raw"):
+            return
+        ids = pk_set
+        if action == "pre_add":
+            ids = set(pk_set or ()) | _missing_mirror_ids(sender, instance, using)
+        _gate_m2m(sender, instance, reverse, model, ids, using)
 
 
 def _gate_m2m(
@@ -541,13 +507,8 @@ def _gate_m2m(
     model: type[Model],
     pk_set: set[Any] | None,
     using: str,
-) -> set[tuple[Any, Any]]:
-    """Gate each resource endpoint owning an affected M2M-backed edge.
-
-    Returns the through pairs the gate decided on, so the related-manager
-    wrapper can exempt exactly those rows from the per-row gates; an early
-    return yields no pairs, and the per-row gates then decide for themselves.
-    """
+) -> None:
+    """Gate each resource endpoint owning an affected M2M-backed edge."""
     from .actors import is_sudo
     from .mixins import RebacMixin
     from .resources import model_for_resource_type
@@ -557,27 +518,26 @@ def _gate_m2m(
     if is_sudo() and (
         not isinstance(instance, RebacMixin) or not callable(pinned) or pinned() is None
     ):
-        return set()
+        return
     owner_model = sender._meta.auto_created
-    if not isinstance(owner_model, type):
-        return set()
+    assert isinstance(owner_model, type)
     owner_type = model_resource_type(owner_model)
     program = gate_policy(using)
     if program is None:
-        return set()
+        return
     watched = program.watched.get(sender._meta.label_lower)
     types = {owner_type} if owner_type is not None else set()
     if watched is not None:
         types.update(watched.resource_types)
     types = {type_ for type_ in types if program.has_node(type_, "write")}
     if not types or pk_set == set():
-        return set()
+        return
     actor, bypass = _edge_actor(instance, relation=True)
     if bypass:
-        return set()
+        return
     instance_model = instance._meta.concrete_model
     assert instance_model is not None
-    pairs, other_ids = _through_edges(sender, instance, reverse, pk_set, using)
+    other_ids = _through_other_ids(sender, instance, reverse, pk_set, using)
     owner_pks: dict[type[Model], set[Any]] = {instance_model: {instance.pk}}
     other_model = model._meta.concrete_model
     assert other_model is not None
@@ -598,7 +558,6 @@ def _gate_m2m(
                 ids.add(to_object_ref(row).resource_id)
         if ids:
             _check_edge_writes(actor, resource_type, ids, using=using)
-    return pairs
 
 
 def _affected_backing_ids(
@@ -821,14 +780,6 @@ def _gate_backed_rows(
         return
     changed_names = set(names) if names is not None else None
     materialized = list(rows)
-    pre_gated = _related_m2m_write.get()
-    if pre_gated is not None and materialized and proposed is None:
-        # The related-manager wrapper checked exactly these pairs as inserts
-        # or deletes; rows a consumer handler adds during the call, and any
-        # update that would move a gated pair elsewhere, are still gated here.
-        materialized = [row for row in materialized if not pre_gated.covers_row(row)]
-        if not materialized:
-            return
     from .watch import gate_policy
 
     program = gate_policy(using)
@@ -858,12 +809,11 @@ def _gate_backed_rows(
             continue
         for values in _stored(model, using).filter(pk__in=pks).values("pk", *columns):
             stored[(model, values["pk"])] = values
-    through_pairs: dict[type[Model], set[tuple[Any, Any]]] = {}
+    through_pairs: ThroughPairs = {}
     last_row: Model | None = None
     for row in materialized:
         last_row = row
-        if row._meta.auto_created:
-            _collect_through_pair(row, through_pairs)
+        _collect_through_pair(row, through_pairs, names=changed_names)
         if proposed is not None:
             watch = program.watched.get(row._meta.label_lower)
             for field in row._meta.concrete_fields:
@@ -923,12 +873,11 @@ def _gate_backed_rows(
                     setattr(row, field.name, value)
                 else:
                     setattr(row, field.attname, value)
-            if row._meta.auto_created:
-                _collect_through_pair(row, through_pairs)
+            _collect_through_pair(row, through_pairs, names=changed_names)
     candidates = _batched_backed_field_candidates(
         materialized, stored, program, using, changed_names, deleting=deleting
     )
-    _gate_direct_through_rows(through_pairs, using)
+    _gate_direct_through_rows(through_pairs, using, actor=actor, bypass=bypass)
     if not candidates:
         return
     candidates = {
@@ -1032,42 +981,48 @@ def _batched_backed_field_candidates(
     return candidates
 
 
-def _collect_through_pair(row: Model, pairs: dict[type[Model], set[tuple[Any, Any]]]) -> None:
-    owner_model = row._meta.auto_created
-    if not isinstance(owner_model, type):
+def _collect_through_pair(
+    row: Model, pairs: ThroughPairs, *, names: Iterable[str] | None = None
+) -> None:
+    through = type(row)
+    if through._meta.auto_created or through not in _throughs:
         return
-    fields = [field for field in row._meta.fields if isinstance(field, models.ForeignKey)]
-    source_field = next(
-        (field for field in fields if field.remote_field.model is owner_model), None
-    )
-    if source_field is None:
-        return
-    target_field = next(field for field in fields if field is not source_field)
-    source_pk = getattr(row, source_field.attname)
-    target_pk = getattr(row, target_field.attname)
-    if source_pk is None or target_pk is None:
-        return
-    pairs.setdefault(type(row), set()).add((source_pk, target_pk))
+    changed = set(names) if names is not None else None
+    for owner, source, target, _ in _through_bindings(through):
+        if (
+            changed is not None
+            and not {source.name, source.attname, target.name, target.attname} & changed
+        ):
+            continue
+        source_pk = getattr(row, source.attname)
+        target_pk = getattr(row, target.attname)
+        if source_pk is None or target_pk is None:
+            continue
+        pairs.setdefault((through, owner, source.name, target.name), set()).add(
+            (source_pk, target_pk)
+        )
 
 
-def _gate_direct_through_rows(pairs: dict[type[Model], set[tuple[Any, Any]]], using: str) -> None:
+def _gate_direct_through_rows(
+    pairs: ThroughPairs,
+    using: str,
+    *,
+    actor: SubjectRef | None = None,
+    bypass: bool = False,
+) -> None:
     from .resources import model_for_resource_type
     from .watch import gate_policy
 
+    if not pairs:
+        return
+    if bypass:
+        return
     program = gate_policy(using)
     if program is None:
         return
-    for through, changed in pairs.items():
-        owner_model = through._meta.auto_created
-        if not isinstance(owner_model, type):
-            continue
-        fields = [field for field in through._meta.fields if isinstance(field, models.ForeignKey)]
-        source_field = next(
-            (field for field in fields if field.remote_field.model is owner_model), None
-        )
-        if source_field is None:
-            continue
-        target_field = next(field for field in fields if field is not source_field)
+    for (through, owner_model, _source_name, target_name), changed in pairs.items():
+        target_field = through._meta.get_field(target_name)
+        assert isinstance(target_field, models.ForeignKey)
         owner_type = model_resource_type(owner_model)
         watched = program.watched.get(through._meta.label_lower)
         types = {owner_type} if owner_type is not None else set()
@@ -1081,9 +1036,11 @@ def _gate_direct_through_rows(pairs: dict[type[Model], set[tuple[Any, Any]]], us
         sources = list(owner_model._base_manager.using(using).filter(pk__in=source_ids))
         if not sources:
             continue
-        actor, bypass = _edge_actor(sources[0], relation=True)
-        if bypass:
-            continue
+        resolved_actor = actor
+        if resolved_actor is None:
+            resolved_actor, row_bypass = _edge_actor(sources[0], relation=True)
+            if row_bypass:
+                continue
         target_model = target_field.remote_field.model
         source_concrete = owner_model._meta.concrete_model
         target_concrete = target_model._meta.concrete_model
@@ -1108,7 +1065,7 @@ def _gate_direct_through_rows(pairs: dict[type[Model], set[tuple[Any, Any]]], us
                         )
                     )
             if ids:
-                _check_edge_writes(actor, resource_type, ids, using=using, bulk=True)
+                _check_edge_writes(resolved_actor, resource_type, ids, using=using, bulk=True)
 
 
 def _gate_backed_field_change(

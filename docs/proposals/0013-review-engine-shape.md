@@ -52,7 +52,7 @@ added to its gate (§ 7).
 | A gated field a joined multi-table child inherits is not guarded (pinned) | The guard does not know which model a join came through | **Solved.** `Join.join_field.related_model` and `parent_alias` give the model of every alias |
 | `filter(folder__name__startswith=…)`, `order_by("folder__name")`, `select_related` read rows of another type unscoped | Scope is applied to the base table only | **Solved for rows**, with a semantic decision to make (§ 4.2). Filtering and ordering on a gated *field* is a separate oracle and needs its own rule (§ 4.3) |
 | `Case` in `bulk_update` resolved differently by Python and by SQL; literal SQL behind a `Q` or an annotation (seven pinned tests) | The write gate reads the ORM call | **Solved.** The values a statement will assign are selected from the statement's own rows by the database |
-| Through-model `_base_manager` writes, base-manager `update` of a watched scalar, MTI child related-manager calls (pinned) | Each path needs its own interception | **Solved.** They are ordinary `INSERT` / `UPDATE` / `DELETE` statements |
+| Direct writes through auto-created through tables, base-manager `update` of a watched scalar, MTI child related-manager calls (pinned) | Each path needs its own interception | **Solved.** They are ordinary `INSERT` / `UPDATE` / `DELETE` statements |
 | Collector CASCADE and SET_NULL gated under the ambient actor, reverse-FK `add(bulk=True)` ignores the pinned actor (0011 pins) | The pinned actor lives on a queryset or an instance the path does not pass through | **Not solved by the engine.** The compiler sees pk batches and no instance. A carrier is still needed (§ 3.2) |
 | Hand-written SQL in a selection (now: under sudo only) | Cannot be inspected | **Unchanged**, but stated once: the compiler sees `RawSQL` and `extra` as nodes of the statement and refuses them on a statement that touches a resource table under an actor |
 | Field redaction loads `accessible()` for the whole type, per gated field | Redaction happens after rows are materialised | **Solved.** The field's predicate is part of the row's own statement, in the same snapshot |
@@ -304,10 +304,9 @@ The roadmap's step 3 stands, with these corrections.
   narrow rule needs none of that.
 
 What goes: the write overrides on `RebacQuerySet` and `TrackedQuerySet`, the
-related-manager patches, the through-manager swap, the injected base manager
-and E023, the tracked signals, `RebacTrackedMixin`, `REBAC_TRACKED_MODELS`,
-the `Case` emulation and the pre-gated pair tracking: most of `signals.py`
-(1,204 lines).
+injected base manager and E023, redundant tracked signals,
+`REBAC_TRACKED_MODELS`, and the `Case` emulation. `RebacTrackedMixin`
+remains available as the owner of declared through and backing models.
 
 ## 7. The spike, and what to add to its gate
 

@@ -723,9 +723,7 @@ def test_tracked_through_bulk_owners_grant_and_revoke_existing_resource(active):
 
 @pytest.mark.pg_delta
 @pytest.mark.parametrize("storage", STORAGE_TIERS)
-@pytest.mark.parametrize(
-    "operation", ["save", "update", "m2m", "remove", "set", "clear", "through"]
-)
+@pytest.mark.parametrize("operation", ["save", "update", "m2m", "remove", "set", "clear"])
 @pytest.mark.django_db(transaction=True, databases=["default", "selected"])
 def test_backed_edge_write_uses_producer_grants(settings, storage, operation):
     from django.db import connections
@@ -790,16 +788,14 @@ def test_backed_edge_write_uses_producer_grants(settings, storage, operation):
         through = Post.collections.through
         before_links = list(through.objects.using(alias).values())
         with (
-            database_context(alias)
-            if operation in {"save", "update", "through"}
-            else nullcontext(),
+            database_context(alias) if operation in {"save", "update"} else nullcontext(),
             actor_context(ALICE),
             CaptureQueriesContext(connections["default"]) as default_queries,
         ):
             try:
                 with (
                     transaction.atomic(using=alias)
-                    if operation in {"save", "update", "through"}
+                    if operation in {"save", "update"}
                     else nullcontext()
                 ):
                     if operation == "save":
@@ -815,23 +811,19 @@ def test_backed_edge_write_uses_producer_grants(settings, storage, operation):
                         selected.collections.clear()
                     elif operation == "set":
                         selected.collections.set([Folder._base_manager.using(alias).get(pk=102)])
-                    else:
-                        through.objects.using(alias).bulk_create(
-                            [through(post_id=201, folder_id=102)]
-                        )
             except PermissionDenied:
                 assert not permitted
             else:
                 assert permitted
         assert list(default_queries) == []
         assert list(PermissionAuditEvent.objects.using("default").values()) == default_audits
-        if operation not in {"save", "update", "through"}:
+        if operation not in {"save", "update"}:
             denied_after = (
                 PermissionAuditEvent.objects.using(alias)
                 .filter(reason__startswith="denied:")
                 .count()
             )
-            assert denied_after == denied_before + (not permitted)
+            assert denied_after == denied_before
         assert list(Post._base_manager.using("default").values()) == default_rows
         assert list(active_relationship_model().objects.using("default").values()) == default_edges
         if permitted:

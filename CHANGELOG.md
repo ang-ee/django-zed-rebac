@@ -7,6 +7,24 @@ pre-1.0; breaking changes within a minor version are explicitly called out.
 
 ### Changed
 
+- Auto-created M2M related-manager writes are gated by `m2m_changed` on the
+  memberships Django actually changes, including reverse add, remove and clear
+  from a multi-table child of the target model. `set()` no longer requires
+  `write` on unchanged memberships. For every M2M, `set(clear=False)` needs
+  an ambient actor or sudo for its target read until the actor-resolution change carries
+  the instance pin into related-manager reads. Denials follow Django's
+  transaction rules; callers that catch them and continue use an `atomic()`
+  block. `REBAC_AUDIT_DENIALS` records nothing for these signal denials,
+  including for transaction-managed callers who catch and continue. Direct
+  writes to auto-created through
+  tables are unobserved infrastructure writes. Fixture loads with `raw=True`
+  skip the signal gate while still advancing the row generation.
+- An explicit `through=` model inheriting `RebacTrackedMixin` uses its own
+  instance and queryset write gates for saves, deletes, bulk writes,
+  related-manager changes and cascades. Both the M2M owner and each declaring
+  resource require `write` when they declare it. Cascaded through rows use the
+  deleting root's pinned actor; related-manager through writes use the ambient
+  actor, so a pinned-only call needs an ambient actor or sudo.
 - Bounded model-row, actor-set and fixed-fact decisions are prepared before
   queryset SQL renders and witnessed in each statement that binds them.
   An evaluator scope reuses decisions until a library-owned write advances
@@ -44,6 +62,13 @@ pre-1.0; breaking changes within a minor version are explicitly called out.
   operation. Django exposes no rollback-safe transaction-boundary signal
   without connection introspection, so a pin cannot safely span operations
   there.
+
+### Known issues
+
+- The pre-existing `_through_candidates` set accumulates migration-history
+  through models. After test-database setup, repeated sender registration can
+  take about 11 ms per `connect_tracked_signals()` call; this buildup predates
+  the M2M recovery.
 
 ## [0.30.0] — 2026-10-28
 
