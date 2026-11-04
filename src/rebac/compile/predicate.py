@@ -1444,7 +1444,7 @@ class Compiler:
                     .order_by()
                     .values("pk", "_rebac_depth")
                 )
-                return cast(QuerySet[Any], first.union(step))
+                return cast(QuerySet[Any], first.union(step).order_by())
 
             slot = key, bound, depth_possible
             cte = self._path_ctes.get(slot) if self._share_subject_rows else None
