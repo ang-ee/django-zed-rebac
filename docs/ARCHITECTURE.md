@@ -517,6 +517,7 @@ from rebac import (
 
     # Per-request evaluator and Zookie freshness
     PermissionEvaluator, evaluator_scope, current_evaluator,
+    decision_scope,                    # one atomic transaction and its decision memo
     zookie_scope, current_zookie, record_zookie, effective_consistency,
 
     # Results, errors and enums
@@ -1059,8 +1060,21 @@ statement compilation and nested prefetches share the validated snapshot;
 `aiterator()` validates per statement, as an async generator has no single
 evaluation to scope. Outside
 an evaluator, the next independent evaluation validates again. Library-owned schema writes invalidate scope pins through schema generation.
-Inside a transaction, pins are operation-local so rollback cannot retain an
-uncommitted policy. An evaluator scope clears its pins on exit or `invalidate()`.
+Inside an ordinary transaction, pins are operation-local so rollback cannot
+retain an uncommitted policy. `decision_scope(*, using="default")` opens an
+atomic block and a fresh evaluator on that alias. Its schema pin and bounded
+decision memos live only until that block exits, including rollback. A warm
+schema reads the revision once for reads; each owned write still reads it once
+through `gate_policy`. A cold load validates it again before sharing
+the parsed snapshot. A supported schema write inside the block invalidates the
+pin, so the next operation reads its newly published revision. Memos and pins
+created inside a nested savepoint carry its savepoint stack and cannot be
+reused after that savepoint rolls back. A concurrent schema commit closes an
+older SQL predicate through its revision fence; the next `decision_scope()`
+re-reads the revision. Another connection's committed revocations are denied
+at once by statement witnesses; newly granted rows may remain hidden until
+the next scope. An evaluator scope clears its
+pins on exit or `invalidate()`.
 
 The five policy models (definitions, relations, permissions, caveats and
 overrides) own writes through their shared model/queryset, including base-manager
@@ -2041,17 +2055,20 @@ containing scope admits no rows for that statement.
 Witnesses compile against the statement's other row and actor-set decisions;
 their transitive row dependencies are witnessed too, so a decided node's full
 inline body need not be repeated in each witness. Library-owned model writes,
-tracked-model saves, delete cascades, M2M writes, tuple writes and schema
-publication bump a process-wide row generation. Along with the relationship
-generation, it invalidates decisions kept by `PermissionEvaluator`.
-The bounded evaluator memo is keyed by policy revision and shape, actor,
-scalar caveat-context key, root model and action, database alias, node or
-fact, relationship generation and row generation. A memo hit carries its
+tracked-model saves, delete cascades and M2M writes advance the written
+model's generation. Tuple writes advance the relationship generation; schema
+publication invalidates the schema pin. The bounded evaluator memo is keyed
+by policy revision and shape, actor, scalar caveat-context key, database
+alias, decided node or fact, relationship generation and the generations of
+model tables in that node's reachable policy closure. Tuple writes and schema
+publication advance a fallback `"*"` generation for unknown row sources. An
+unrelated watched model write does not invalidate
+that node's memo. A memo hit carries its
 nested row decisions and actor sets into the new statement's witness. Outside an evaluator scope
 decisions last for one operation. `invalidate()` and scope exit clear them.
-The evaluator does not memoize decisions inside a transaction, when a reachable
-relationship can expire, or across an override deadline. This follows the
-LocalBackend answer-cache rollback and clock rules. The row memo limits the
+Ordinary transactions do not memoize decisions; `decision_scope()` does so
+only inside the atomic block it owns. Expiring reachable relationships and
+override deadlines still disable memoization. The row memo limits the
 number of held IDs as well as entries; an overflow result is never memoized.
 There is no statement observer, `execute_wrappers`, `run_on_commit`, or
 confirmation query.
@@ -2636,8 +2653,11 @@ the through row; without such a field, they skip that owner check. Watched
 declaring resources are checked as well. Related-manager adds use the through
 create path, while removes and clears use its queryset delete path. REBAC
 attaches no `m2m_changed` receiver to a declared through. Cascaded through rows
-use the root delete's actor but currently gate one row at a time; batching
-that gate is a known performance follow-up.
+use the root delete's actor. An owned delete builds Django's collector before
+mutation and checks each collected REBAC resource model in one scoped
+candidate-set statement per 500 collected rows of that model. Those rows are
+marked covered, so their `pre_delete` receivers do not issue point checks.
+Root and cascade gates share one schema operation.
 A forward related-manager call from a multi-table child of the declaring model
 is not gated (proposal 0013). Through gates use the changed FK pairs and their
 source rows rather than the whole through table.
@@ -3025,18 +3045,21 @@ Cache keys include backend instance identity, including reentrant checks through
 different backends. Context keys preserve scalar types (`True`, `1`, and `1.0` differ).
 Complex context values bypass caching, including nested dictionaries and lists.
 
-LocalBackend retains the 0.18.2 decision-cache rules. It declines caching inside
-a transaction, when the schema declares expiring relationships, or for a
+LocalBackend retains the 0.18.2 returned-answer cache rules. It declines that
+cache inside a transaction, when the schema declares expiring relationships, or for a
 resource type in the conservative field/attribute backing reachability closure
 returned by `live_backed_resource_types`. Unrelated types remain cacheable.
 Override deadlines refresh the composed schema and its decision generation.
 Eligible cache hits cost zero queries, including no revision SELECT per lookup.
 An evaluator scope reuses its schema pin across permission operations in
-autocommit. Inside an atomic block, each permission operation instead reads
-the schema revision once and pins the snapshot only for that operation.
-Django exposes no rollback-safe transaction-boundary signal without connection
-introspection; reusing a pin across operations could retain a revision rolled
-back between them. The answer caches already decline inside transactions.
+autocommit. Inside an ordinary atomic block, each permission operation instead
+reads the schema revision once and pins the snapshot only for that operation.
+`decision_scope()` supplies a transaction-bound pin and bounded decision memos
+on its database alias. No returned answer is cached in any transaction,
+including a decision scope. Every authorizing statement checks its witness
+and revision fence. A pin or memo created inside a nested savepoint is reused
+only while its saved savepoint stack is a prefix of the current stack; a
+rolled-back savepoint cannot leave an uncommitted answer in the scope.
 A permission operation in a transaction discards the evaluator's earlier pin,
 so its next autocommit operation validates the revision once before reusing
 the new pin.

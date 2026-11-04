@@ -235,11 +235,20 @@ class LocalBackend:
         # A rollback has no library-owned notification. Transactional pins
         # therefore live for one operation, including reused Atomic blocks.
         scoped = connection.get_autocommit() and not connection.in_atomic_block
-        if evaluator is not None and not scoped:
+        decision_scoped = (
+            evaluator is not None
+            and evaluator._decision_connection is connection
+            and connection.in_atomic_block
+        )
+        if evaluator is not None and not (scoped or decision_scoped):
             # A transactional read can see a revision that later rolls back.
             # Refresh the evaluator pin on its next autocommit operation.
             evaluator._schema_scope.snapshots(connection).clear()
-        scope = evaluator._schema_scope if evaluator is not None and scoped else operation
+        scope = (
+            evaluator._schema_scope
+            if evaluator is not None and (scoped or decision_scoped)
+            else operation
+        )
         pins = scope.snapshots(connection) if scope is not None else None
         operation_pins = operation.snapshots(connection) if operation is not None else None
         for candidate in (pins, operation_pins):
@@ -248,7 +257,16 @@ class LocalBackend:
                 snapshot is not None
                 and snapshot.invalidation_generation == invalidation
                 and (snapshot.expires_at is None or snapshot.expires_at > timezone.now())
+                and (
+                    snapshot.savepoint_ids is None
+                    or tuple(connection.savepoint_ids[: len(snapshot.savepoint_ids)])
+                    == snapshot.savepoint_ids
+                )
             ):
+                if operation_pins is not None:
+                    operation_pins[self] = snapshot._replace(
+                        savepoint_ids=tuple(connection.savepoint_ids) if decision_scoped else None
+                    )
                 return snapshot
 
         # Database I/O and waiting for another loader happen outside the process
@@ -336,9 +354,14 @@ class LocalBackend:
                 if invalidation != self._schema_invalidation_generation:
                     continue
             if snapshot is not None:
-                pin = snapshot._replace(invalidation_generation=invalidation)
+                pin = snapshot._replace(
+                    invalidation_generation=invalidation,
+                    savepoint_ids=tuple(connection.savepoint_ids) if decision_scoped else None,
+                )
                 if pins is not None:
                     pins[self] = pin
+                if operation_pins is not None:
+                    operation_pins[self] = pin
                 return pin
         # Do not retain the final fallback, but fence its schema with the
         # revision read on both sides of the load. A loader retry miss alone

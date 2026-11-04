@@ -138,6 +138,7 @@ class _Policy:
     program: CompileProgram
     selected_at: datetime
     caveat_deadlines: tuple[datetime, ...]
+    watched_models: tuple[tuple[str, frozenset[str]], ...]
 
     @property
     def schema(self) -> Schema:
@@ -151,6 +152,7 @@ def _schema(backend: LocalBackend, using: str) -> tuple[Schema, SchemaSnapshot]:
 
 def _policy(backend: LocalBackend, using: str) -> _Policy:
     from rebac.models import SchemaOverride
+    from rebac.watch import model_lineage, watched_for
 
     _effective, snapshot = _schema(backend, using)
     baseline = snapshot.baseline or snapshot.schema
@@ -190,6 +192,11 @@ def _policy(backend: LocalBackend, using: str) -> _Policy:
         CompileProgram.build(tagged.schema),
         selected_at,
         deadlines,
+        tuple(
+            (member._meta.label_lower, spec.resource_types)
+            for spec in watched_for(tagged.schema).values()
+            for member in model_lineage(spec.model)
+        ),
     )
     if not deadlines:
         # A deadline can change a prebuilt scope's composition, so prepare
@@ -275,25 +282,102 @@ def _decision_size(decision: _Decision) -> int:
     return sum(len(part.ids) for part in _decision_closure((decision,)))
 
 
-def _memo_eligible(operation: _Operation, root: Key) -> bool:
-    """Use evaluator decisions only where a rollback or clock cannot stale them."""
+def _memo_eligible(
+    backend: LocalBackend,
+    resource_type: str,
+    *,
+    using: str,
+    witnessed: bool,
+    operation: _Operation | None = None,
+    root: Key | None = None,
+) -> bool:
+    """Admit witnessed decisions in a bound transaction, answers only in autocommit."""
     from rebac.database import read_alias
+    from rebac.evaluator import current_evaluator
     from rebac.models import SchemaDefinition
 
-    if operation.policy.caveat_deadlines:
+    evaluator = current_evaluator()
+    bound = evaluator._decision_connection if evaluator is not None else None
+    if bound is not None and connections[using] is not bound:
         return False
-    for model in (active_relationship_model(), SchemaDefinition):
-        connection = connections[read_alias(model)]
+    if not witnessed:
+        # Returned answers have no statement witness. The check cache owns
+        # their live-type and expiration rule, including schema refresh.
+        connection = connections[using]
         if connection.in_atomic_block or (
             connection.connection is not None and not connection.get_autocommit()
         ):
             return False
+        return backend._cache_generation(resource_type) is not None
+    if operation is None or root is None:
+        raise ValueError("Witnessed memo eligibility needs an operation and root")
+    if operation.policy.caveat_deadlines:
+        return False
+    for connection in (
+        connections[using],
+        connections[read_alias(active_relationship_model())],
+        connections[read_alias(SchemaDefinition)],
+    ):
+        if bound is not None and connection is not bound:
+            return False
+        if connection.in_atomic_block or (
+            connection.connection is not None and not connection.get_autocommit()
+        ):
+            if bound is not connection:
+                return False
     for type_, name in operation.policy.program.reachable(root) | {root}:
         definition = operation.policy.schema.get_definition(type_)
         relation = find_relation(definition, name) if definition is not None else None
         if relation is not None and relation.with_expiration:
             return False
     return True
+
+
+def _row_dependency_key(
+    operation: _Operation | LocalBackend, node: Key, *, using: str | None = None
+) -> tuple[tuple[str, int], ...]:
+    """The written model tables in this node's reachable policy closure.
+
+    Callers with an operation reuse its captured policy. A returned-answer
+    memo can pass its backend and alias to use the same dependency owner.
+    """
+    from rebac.watch import model_lineage, row_generations
+
+    if isinstance(operation, _Operation):
+        policy = operation.policy
+        model_index = operation.model_index
+        alias = operation.using
+    else:
+        if using is None:
+            raise ValueError("A backend dependency key needs a database alias")
+        policy = _policy(operation, using)
+        model_index = _ModelIndex.capture()
+        alias = using
+    types = {type_ for type_, _ in policy.program.reachable(node) | {node}}
+    labels = {
+        member._meta.label_lower
+        for type_ in types
+        if (model := model_index.resource(type_)) is not None
+        for member in model_lineage(model)
+    }
+    labels.update(
+        label for label, resource_types in policy.watched_models if types & resource_types
+    )
+    return row_generations(labels, using=alias)
+
+
+def _memo_keys(evaluator: Any, name: tuple[Any, ...]) -> tuple[tuple[Any, ...], ...]:
+    """A savepoint memo is valid only inside its own surviving stack."""
+    connection = evaluator._decision_connection
+    if connection is None:
+        return (name,)
+    stack = tuple(connection.savepoint_ids)
+    return tuple((*name, stack[:depth]) for depth in range(len(stack), -1, -1))
+
+
+def _memo_key(evaluator: Any, name: tuple[Any, ...]) -> tuple[Any, ...]:
+    connection = evaluator._decision_connection
+    return name if connection is None else (*name, tuple(connection.savepoint_ids))
 
 
 class _Facts(Mapping[Fact, bool]):
@@ -326,7 +410,6 @@ class _Facts(Mapping[Fact, bool]):
     def _decide(self, fact: Fact) -> bool:
         from rebac.backends import local
         from rebac.evaluator import _ctx_key, current_evaluator
-        from rebac.watch import row_generation
 
         operation = self.operation
         context = _ctx_key(dict(operation.context)) if operation.context else ()
@@ -335,29 +418,39 @@ class _Facts(Mapping[Fact, bool]):
             operation.shape,
             operation.actor,
             context,
-            self.root,
-            operation.model_index.resource(self.root[0]),
+            fact,
             operation.using,
             local._relationship_generation,
-            row_generation(),
-            fact,
+            _row_dependency_key(operation, (fact[0], fact[2])),
         )
         evaluator = current_evaluator()
         eligible = (
             evaluator is not None
             and context is not None
             and not operation._shared_keys
-            and _memo_eligible(operation, self.root)
+            and _memo_eligible(
+                operation.backend,
+                fact[0],
+                using=operation.using,
+                witnessed=True,
+                operation=operation,
+                root=(fact[0], fact[2]),
+            )
         )
-        if evaluator is not None and eligible and name in evaluator._fact_decisions:
-            evaluator._fact_decisions.move_to_end(name)
-            return bool(evaluator._fact_decisions[name])
+        keys = _memo_keys(evaluator, name) if eligible else ()
+        hit = next(
+            (key for key in keys if evaluator is not None and key in evaluator._fact_decisions),
+            None,
+        )
+        if evaluator is not None and hit is not None:
+            evaluator._fact_decisions.move_to_end(hit)
+            return bool(evaluator._fact_decisions[hit])
         condition = operation.compiler(self.verdicts, parametric=False).fact_q(fact)
         found = is_true(condition) or (
             not is_false(condition) and operation.gate(parametric=False).filter(condition).exists()
         )
         if evaluator is not None and eligible:
-            evaluator._fact_decisions[name] = found
+            evaluator._fact_decisions[_memo_key(evaluator, name)] = found
             while len(evaluator._fact_decisions) > evaluator._max_size:
                 evaluator._fact_decisions.popitem(last=False)
         return found
@@ -428,7 +521,6 @@ class _Rows:
     def _memoized_decision(self, key: Key) -> _Decision | None:
         from rebac.backends import local
         from rebac.evaluator import _ctx_key, current_evaluator
-        from rebac.watch import row_generation
 
         evaluator = current_evaluator()
         context = _ctx_key(dict(self.operation.context)) if self.operation.context else ()
@@ -438,30 +530,46 @@ class _Rows:
             self.operation.shape,
             self.operation.actor,
             context,
-            self.root,
             model,
             key,
             self.operation.using,
             local._relationship_generation,
-            row_generation(),
+            _row_dependency_key(self.operation, key),
         )
         eligible = (
             evaluator is not None
             and context is not None
             and not self.operation._shared_keys
-            and _memo_eligible(self.operation, self.root)
+            and _memo_eligible(
+                self.operation.backend,
+                key[0],
+                using=self.operation.using,
+                witnessed=True,
+                operation=self.operation,
+                root=key,
+            )
         )
-        if evaluator is not None and eligible and name in evaluator._row_decisions:
-            evaluator._row_decisions.move_to_end(name)
-            found = cast("_Decision | None", evaluator._row_decisions[name])
+        keys = _memo_keys(evaluator, name) if eligible else ()
+        hit = next(
+            (
+                candidate
+                for candidate in keys
+                if evaluator is not None and candidate in evaluator._row_decisions
+            ),
+            None,
+        )
+        if evaluator is not None and hit is not None:
+            evaluator._row_decisions.move_to_end(hit)
+            found = cast("_Decision | None", evaluator._row_decisions[hit])
             if found is not None and self._fits(found):
                 return found
         found = self._decide(key)
         if evaluator is not None and eligible and found is not None:
-            previous = evaluator._row_decisions.get(name)
+            save_key = _memo_key(evaluator, name)
+            previous = evaluator._row_decisions.get(save_key)
             if previous is not None:
                 evaluator._row_decision_ids -= _decision_size(previous)
-            evaluator._row_decisions[name] = found
+            evaluator._row_decisions[save_key] = found
             evaluator._row_decision_ids += _decision_size(found)
             while (
                 evaluator._row_decision_ids > evaluator._max_size
@@ -619,7 +727,6 @@ class _Operation:
     def sets(self, verdicts: CaveatVerdicts) -> ActorSets | None:
         from rebac.backends import local
         from rebac.evaluator import _ctx_key, current_evaluator
-        from rebac.watch import row_generation
 
         token = id(verdicts)
         if token in self._sets:
@@ -635,22 +742,34 @@ class _Operation:
             self.model_index.resource(root[0]),
             self.using,
             local._relationship_generation,
-            row_generation(),
+            _row_dependency_key(self, root),
         )
         evaluator = current_evaluator()
         eligible = (
             evaluator is not None
             and context is not None
             and not self._shared_keys
-            and _memo_eligible(self, root)
+            and _memo_eligible(
+                self.backend,
+                root[0],
+                using=self.using,
+                witnessed=True,
+                operation=self,
+                root=root,
+            )
         )
-        if evaluator is not None and eligible and name in evaluator._set_decisions:
-            evaluator._set_decisions.move_to_end(name)
-            found = cast("ActorSets | None", evaluator._set_decisions[name])
+        keys = _memo_keys(evaluator, name) if eligible else ()
+        hit = next(
+            (key for key in keys if evaluator is not None and key in evaluator._set_decisions),
+            None,
+        )
+        if evaluator is not None and hit is not None:
+            evaluator._set_decisions.move_to_end(hit)
+            found = cast("ActorSets | None", evaluator._set_decisions[hit])
         else:
             found = self._decide_sets(root, verdicts)
             if evaluator is not None and eligible:
-                evaluator._set_decisions[name] = found
+                evaluator._set_decisions[_memo_key(evaluator, name)] = found
                 while len(evaluator._set_decisions) > evaluator._max_size:
                     evaluator._set_decisions.popitem(last=False)
         self._sets[token] = found

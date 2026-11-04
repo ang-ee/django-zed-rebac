@@ -5,7 +5,15 @@ from django.contrib.contenttypes.models import ContentType
 from django.db import connection, models, transaction
 from django.test.utils import CaptureQueriesContext, isolate_apps
 
-from rebac import ObjectRef, RelationshipTuple, SubjectRef, evaluator_scope, sudo, to_object_ref
+from rebac import (
+    ObjectRef,
+    RelationshipTuple,
+    SubjectRef,
+    decision_scope,
+    evaluator_scope,
+    sudo,
+    to_object_ref,
+)
 from rebac.compile import read
 from rebac.evaluator import PermissionEvaluator, current_evaluator
 from rebac.field_backing import foreign_key_kept, resolve_field_backing
@@ -19,6 +27,7 @@ from tests.testapp.models import (
     NativeParentLinkedResource,
     Post,
     TextIdentityFolder,
+    VirtualFolder,
 )
 
 pytestmark = pytest.mark.django_db
@@ -426,6 +435,42 @@ def test_owned_model_write_invalidates_decided_rows(tree):
             post.pk,
             new_post.pk,
         }
+
+
+@pytest.mark.django_db(transaction=True)
+def test_decided_folder_memo_survives_ten_post_writes_but_not_folder_write(tree):
+    _local, child, _leaf, post = tree
+    with decision_scope():
+        assert visible(Post) == {post.pk}
+        reads = []
+        for _ in range(10):
+            with sudo(reason="unrelated model write"):
+                Post.objects.filter(pk=post.pk).update(folder_id=post.folder_id)
+            with CaptureQueriesContext(connection) as queries:
+                assert visible(Post) == {post.pk}
+            reads.append(len(queries))
+        # Ten writes to the root model do not re-decide the folder node.
+        assert reads == [1] * 10
+        with sudo(reason="decided model write"):
+            Folder.objects.filter(pk=child.pk).update(parent_id=child.parent_id)
+        with CaptureQueriesContext(connection) as queries:
+            assert visible(Post) == {post.pk}
+        assert len(queries) == 2
+
+
+@pytest.mark.django_db(transaction=True)
+@pytest.mark.parametrize("scope_kind", ["evaluator", "decision"])
+def test_proxy_write_invalidates_concrete_model_decision(tree, scope_kind):
+    _local, child, _leaf, post = tree
+    with sudo(reason="proxy fixture"):
+        other = Folder.objects.create(name="other")
+        second = Post.objects.create(title="second", folder=other)
+    scope = evaluator_scope() if scope_kind == "evaluator" else decision_scope()
+    with scope:
+        assert visible(Post) == {post.pk}
+        with sudo(reason="proxy backed write"):
+            VirtualFolder._base_manager.filter(pk=other.pk).update(parent=child)
+        assert visible(Post) == {post.pk, second.pk}
 
 
 def test_revocation_after_decision_fails_witness(tree, monkeypatch):

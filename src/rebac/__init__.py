@@ -61,7 +61,7 @@ from .errors import (
     RelationshipReadError,
     SchemaError,
 )
-from .evaluator import PermissionEvaluator, current_evaluator, evaluator_scope
+from .evaluator import PermissionEvaluator, current_evaluator, decision_scope, evaluator_scope
 from .preflight import check_new
 from .types import (
     CheckItem,
@@ -226,6 +226,7 @@ __all__ = [
     "aemit_audit_event",
     # evaluator
     "PermissionEvaluator",
+    "decision_scope",
     "current_evaluator",
     "evaluator_scope",
     # preflight — create-time check against not-yet-persisted resources

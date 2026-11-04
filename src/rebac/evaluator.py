@@ -95,6 +95,7 @@ class PermissionEvaluator:
 
     __slots__ = (
         "_check_cache",
+        "_decision_connection",
         "_fact_decisions",
         "_max_size",
         "_row_decision_ids",
@@ -111,6 +112,7 @@ class PermissionEvaluator:
         self._set_decisions: OrderedDict[tuple[Any, ...], Any] = OrderedDict()
         self._fact_decisions: OrderedDict[tuple[Any, ...], bool] = OrderedDict()
         self._schema_scope = SchemaScope()
+        self._decision_connection: Any = None
 
     # ----- public API -----
 
@@ -258,3 +260,22 @@ def evaluator_scope(
             # real error being unwound (the ContextVar is discarded with its
             # context, so nothing leaks).
             pass
+
+
+@contextmanager
+def decision_scope(*, using: str = "default") -> Iterator[PermissionEvaluator]:
+    """Open one transaction with a transaction-bound decision and schema memo.
+
+    The memo dies before the atomic block exits, including on rollback. A
+    supported write advances its dependency generation within the block.
+    """
+    from django.db import connections, transaction
+
+    from .database import database_context
+
+    with database_context(using), transaction.atomic(using=using), evaluator_scope() as evaluator:
+        evaluator._decision_connection = connections[using]
+        try:
+            yield evaluator
+        finally:
+            evaluator._decision_connection = None

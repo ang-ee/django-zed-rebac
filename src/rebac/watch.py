@@ -37,6 +37,8 @@ if TYPE_CHECKING:
 
 _row_generation_lock = Lock()
 _row_generation = 0
+_model_generations: dict[tuple[str, str], int] = {}
+_unknown_generation = 0
 
 
 def row_generation() -> int:
@@ -45,10 +47,25 @@ def row_generation() -> int:
         return _row_generation
 
 
-def bump_row_generation() -> None:
-    global _row_generation
+def row_generations(labels: Iterable[str], *, using: str) -> tuple[tuple[str, int], ...]:
+    """Version only the model tables a decided node reads."""
+    with _row_generation_lock:
+        return (
+            ("*", _unknown_generation),
+            *((label, _model_generations.get((using, label), 0)) for label in sorted(set(labels))),
+        )
+
+
+def bump_row_generation(model: type[models.Model] | None = None, *, using: str = "default") -> None:
+    global _row_generation, _unknown_generation
     with _row_generation_lock:
         _row_generation += 1
+        if model is None:
+            _unknown_generation += 1
+        else:
+            for member in model_lineage(model):
+                key = using, member._meta.label_lower
+                _model_generations[key] = _model_generations.get(key, 0) + 1
 
 
 @dataclass(frozen=True)
@@ -389,16 +406,23 @@ def model_write(
     change.  Nothing is maintained afterwards: reads see the columns as they
     are.
     """
-    held = _open.get()
-    policy = gate_policy(using)
-    token = _open.set({**held, using: policy}) if using not in held else None
-    try:
-        with database_context(using), transaction.atomic(using=using):
-            yield policy is not None and model_is_watched(policy.watched, model, names)
-    finally:
-        bump_row_generation()
-        if token is not None:
-            _open.reset(token)
+    from .schema.cache import schema_operation_scope
+
+    with schema_operation_scope(), database_context(using):
+        held = _open.get()
+        policy = gate_policy(using)
+        token = _open.set({**held, using: policy}) if using not in held else None
+        watched = policy is not None and model_is_watched(policy.watched, model, names)
+        succeeded = False
+        try:
+            with transaction.atomic(using=using):
+                yield watched
+            succeeded = True
+        finally:
+            if watched and succeeded:
+                bump_row_generation(model, using=using)
+            if token is not None:
+                _open.reset(token)
 
 
 KEY_CHUNK = 5000

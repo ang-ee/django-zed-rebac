@@ -15,6 +15,11 @@ pre-1.0; breaking changes within a minor version are explicitly called out.
 
 ### Added
 
+- `decision_scope(*, using="default")` opens one atomic transaction with a
+  transaction-bound evaluator. Warm stored schemas read their revision once
+  for that scope; bounded row, fact and actor-set decisions are reused until
+  an owned dependency write advances their generation. The scope is discarded
+  on commit or rollback.
 - Exported `is_sudo()` from `rebac` to report the ambient sudo scope.
 - `LocalBackend.held()` checks a bounded set of candidate IDs through the
   compiled read path. Absent canonical IDs are point-checked in one batch;
@@ -23,6 +28,13 @@ pre-1.0; breaking changes within a minor version are explicitly called out.
 
 ### Changed
 
+- Row and fact decision memo keys use the decided node's reachable model
+  tables instead of one process-wide row generation; actor-set memos still
+  key by root. Unwatched owned model writes no longer invalidate these memos.
+  Owned deletes share one schema operation and gate each collected resource
+  model as a candidate set,
+  rather than point-checking every cascaded row. A depth-uncertain cascaded
+  row now raises `GateDenied` before consumer `pre_delete` receivers run.
 - Actor resolution, sudo validation and bypass emission now share one owner
   each. Ambient `sudo()` covers related reads when no actor is pinned; an
   instance or queryset sudo pin still does not cross a relation. The private

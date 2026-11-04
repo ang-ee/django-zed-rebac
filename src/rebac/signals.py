@@ -349,6 +349,7 @@ def _rebac_pre_delete(
     # unscoped. Only rows actually covered by that root operation can skip.
     covered = scope is not None and (
         origin is instance
+        or instance.pk in scope.covered_pks.get(sender, set())
         or (
             isinstance(origin, TrackedQuerySet)
             and origin.model is sender
@@ -373,7 +374,7 @@ def _rebac_cascade_resource(
     from .mixins import delete_scope
     from .watch import bump_row_generation
 
-    bump_row_generation()
+    bump_row_generation(sender, using=using)
 
     scope = delete_scope(origin, using)
     identities = model_identities(sender, instance)
@@ -387,7 +388,7 @@ def _rebac_cascade_resource(
 def _tracked_post_save(sender: type[Model], **kwargs: Any) -> None:
     from .watch import bump_row_generation
 
-    bump_row_generation()
+    bump_row_generation(sender, using=kwargs["using"])
 
 
 @receiver(post_delete, sender="rebac.SchemaOverride")
@@ -490,7 +491,7 @@ def _tracked_m2m(
     if action in {"post_add", "post_remove", "post_clear"}:
         from .watch import bump_row_generation
 
-        bump_row_generation()
+        bump_row_generation(sender, using=using)
         return
     if action in {"pre_add", "pre_remove", "pre_clear"}:
         if kwargs.get("raw"):
