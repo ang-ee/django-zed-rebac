@@ -1715,10 +1715,10 @@ the CTE's identity set only when actor, action, resource model, alias, backend,
 policy and caveat verdicts agree and the scope has no render-time caveat or
 clock decision. Otherwise they keep their own inline predicates. Exact
 late projections retain their point form; queryset scopes with exact or
-bounded native identities use the candidate-root form before an ordinary
-single-action shared plan. A multi-action plan shares its first action's
-identity CTE with the outer row scope when that scope proves an identity set
-that is a subset of the handle's candidates.
+bounded native identities use the candidate-root form unless an attached
+shared plan is bounded to a superset of those identities. A multi-action plan
+shares its first action's identity CTE with the outer row scope under the
+same subset proof.
 Other literal ID sets stay on the compiler's general scope path. The CTE
 captures
 policy and caveat verdicts afresh at each `attach()`; its row and relationship
@@ -1754,44 +1754,48 @@ action makes the entire multi-action closure ineligible. Those projections
 keep their inline proofs. Attachment always rebuilds and pins the plan for that statement;
 candidate IDs never become authority for a different statement.
 
+A handle built without explicit IDs may acquire candidates when its attached
+statement is compiled. One mandatory positive exact or bounded `__in` lookup
+on that statement's resource identity, including Django's one-column,
+multi-row forward-FK prefetch `TupleIn`, proves the candidate set. NULL rows
+in that `TupleIn` are discarded, as they are by Django's rendered lookup. It must
+name the same model, alias and native identity field, contain distinct
+canonical integers, and stay within `SCOPE_CTE_CANDIDATE_LIMIT`. The attached
+body and its sharing plan then use those IDs. A statement with no such proof,
+an oversized set, or a different model keeps the original unbounded plan and
+its inline fallback rules. A statement that reads the handle's CTE through
+`SharedScope.queryset()` anywhere in its query tree also keeps the unbounded
+definition: those references may need identities outside the statement's own
+row set. Each statement clone derives its own candidates;
+the handle and sibling statements are not narrowed. This applies to ordinary
+single-action handles as well as multi-action closures. The multi-row
+`TupleIn` proof also applies to ordinary queryset scopes with no shared
+handle: a scoped forward-FK prefetch can use the bounded candidate-root path
+for its related statement.
+
 ```python
 actions = ("read", "write", "share", "delete")
-page = list(invoice_queryset)  # fetch the root page before building this batch
-ids = {invoice.party_id for invoice in page if invoice.party_id is not None}
-if ids:
-    # Keep the actual related queryset's type hook and optimizer projections.
-    rows = related_party_queryset.filter(pk__in=ids).annotate(
-        **{
-            f"can_{action}": permission_expression(Party, action, actor=actor)
-            for action in actions
-        }
-    )
-    if len(ids) <= SCOPE_CTE_CANDIDATE_LIMIT:
-        scope = Party.objects.with_actor(actor).filter(pk__in=ids).scope_cte(
-            actions=actions
-        )
-        rows = scope.attach(rows)
-    parties = {party.pk: party for party in rows}
-    for invoice in page:
-        if invoice.party_id is not None:
-            invoice._state.fields_cache["party"] = parties.get(invoice.party_id)
+scope = Party.objects.with_actor(actor).scope_cte(actions=actions)
+rows = related_party_queryset.annotate(
+    **{
+        f"can_{action}": permission_expression(Party, action, actor=actor)
+        for action in actions
+    }
+)
+invoice_queryset = invoice_queryset.prefetch_related(
+    Prefetch("party", queryset=scope.attach(rows))
+)
+page = list(invoice_queryset)
 ```
 
-Denied rows are cached as `None`, exactly as Django's own prefetch does: a
-related row left out of the cache would otherwise load lazily through the
-unscoped base manager and return the denied row, and in a GraphQL resolver it
-would cost one more statement per denied row.
-
-This is a page-level batch: the root rows are fetched first, then their related
-IDs are known before building the related statement. Both the clean handle
-queryset and the actual related queryset must carry the same mandatory identity
-filter. Extra filters on the actual queryset are allowed. Django's forward-FK
-prefetch adds a multi-row `TupleIn` predicate after the queryset is built;
-that predicate alone is not a containment proof for this contract. For models
-whose `rebac_id_attr` differs from `pk`, filter the handle on that identity
-attribute and map the page's FK values to it. A one-action base-manager
-projection can be larger with an explicit handle than inline; use the shared
-closure for several actions.
+Build the related queryset through the consumer's usual type hook and optimizer.
+Django adds the forward-FK identity predicate after constructing the `Prefetch`;
+the attached handle reads that predicate when the related statement compiles.
+Denied related rows are cached as `None`, as in Django's own prefetch; a
+hand-written batch must cache them the same way to avoid a later unscoped load.
+For a non-PK `rebac_id_attr`, the predicate must constrain that identity field
+to specialize the handle. A one-action base-manager projection can be larger
+with an explicit handle than inline; use the shared closure for several actions.
 
 Boolean combinations require REBAC querysets so empty-query fast paths cannot
 return a plain unscoped manager. Django's bounded primary-key subqueries for

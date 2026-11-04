@@ -1632,6 +1632,16 @@ def scope_candidate_ids(
     return _known_identities(model, lhs, query.where, using)
 
 
+def statement_candidate_ids(
+    model: type[models.Model], query: Any, using: str
+) -> tuple[int, ...] | None:
+    """Prove a bounded identity set on the final statement's own row alias."""
+    if query.model._meta.concrete_model is not model._meta.concrete_model:
+        return None
+    lhs = F(resource_id_attr(model)).resolve_expression(query)
+    return _known_identities(model, lhs, query.where, using)
+
+
 def _permission_leaves(
     expr: PermExpr, bound: Bound, found: dict[tuple[PermExpr, Bound], int]
 ) -> None:
@@ -1989,19 +1999,22 @@ def _known_identities(
             continue
         column = node.lhs
         value = node.rhs
+        values = (value,)
         if type(node) is TupleIn:
             if (
                 type(column) is not ColPairs
                 or len(column.targets) != 1
                 or len(column.sources) != 1
                 or type(value) not in (list, tuple)
-                or len(value) != 1
+                or not 0 < len(value) <= _CANDIDATE_LIMIT
             ):
                 continue
-            [value] = value
-            if type(value) not in (list, tuple) or len(value) != 1:
+            if any(type(row) not in (list, tuple) or len(row) != 1 for row in value):
                 continue
-            [value] = value
+            # Django omits rows holding NULL from the rendered TupleIn.
+            values = tuple(row[0] for row in value if row[0] is not None)
+            if not values:
+                continue
             [column] = column.get_cols()
         if (
             type(column) is not Col
@@ -2013,9 +2026,7 @@ def _known_identities(
         if type(node) in (In, _BoundIn):
             if type(value) not in (list, tuple) or not 0 < len(value) <= _CANDIDATE_LIMIT:
                 continue
-            values = value
-        else:
-            values = (value,)
+            values = tuple(value)
         if any(type(item) is not int for item in values) or len(set(values)) != len(values):
             continue
         try:
@@ -2144,7 +2155,9 @@ class _Scope(Expression):
             return f"EXISTS {point.sql}", tuple(operation.bound(point.params, wire))
         if identities is not None:
             shared_scope = matching_shared_scope(compiler.query, self, connection.alias)
-            if shared_scope is not None and shared_scope.closure is not None:
+            if shared_scope is not None and (
+                shared_scope.closure is not None or shared_scope.candidates is not None
+            ):
                 member = In(
                     self.lhs,
                     shared_scope.queryset().values(resource_id_attr(self.model)),
