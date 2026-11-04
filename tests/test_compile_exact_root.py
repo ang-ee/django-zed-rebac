@@ -1,7 +1,5 @@
 """Resolved mandatory identities use candidate-root SQL without a separate check."""
 
-import re
-
 import pytest
 from django.contrib.auth import get_user_model
 from django.db import connection
@@ -622,8 +620,30 @@ def test_distinct_candidate_lists_do_not_churn_the_shared_statement_cache(record
     assert len(read._statements) == before
 
 
+def test_candidate_ids_bind_as_one_postgres_array_or_bounded_in(records):
+    _local, allowed, denied, _grant = records
+    ids = [allowed.pk, denied.pk]
+    statements = []
+
+    def capture(execute, sql, params, many, context):
+        statements.append((sql, params))
+        return execute(sql, params, many, context)
+
+    with connection.execute_wrapper(capture):
+        assert list(
+            Post.objects.with_actor(ALICE).filter(pk__in=ids).values_list("pk", flat=True)
+        ) == [allowed.pk]
+    sql, params = statements[-1]
+    if connection.vendor == "postgresql":
+        assert "= ANY(%s)" in sql
+        assert sum(isinstance(param, list) and param == ids for param in params) == 1
+    else:
+        assert "= ANY(%s)" not in sql
+        assert all(not isinstance(param, list) for param in params)
+
+
 @pytest.mark.parametrize("storage", ["denormalized", "registry"])
-def test_shared_union_references_its_owner_plan_for_bounded_operands(storage):
+def test_bounded_union_operands_take_candidate_proof_before_shared_plan(storage, monkeypatch):
     schema = """
     definition auth/user {}
     definition auth/group { relation member: auth/user | auth/group#member }
@@ -657,15 +677,32 @@ def test_shared_union_references_its_owner_plan_for_bounded_operands(storage):
         rows = Post.objects.with_actor(ALICE)
         first = [post.pk for post in posts[:10]]
         second = [post.pk for post in posts[10:]]
+        candidates = []
+        candidate_sql = []
+        original = read._scope_statement
+
+        def observed(operation, model, key, *args, **kwargs):
+            compiled = original(operation, model, key, *args, **kwargs)
+            if model is Post and kwargs.get("candidates") is not None:
+                candidates.append(kwargs["candidates"])
+                if not isinstance(compiled, bool):
+                    candidate_sql.append(compiled.sql)
+            return compiled
+
+        monkeypatch.setattr(read, "_scope_statement", observed)
         union = share_scoped_definitions(
             rows.filter(pk__in=first)
             .values_list("pk", flat=True)
             .union(rows.filter(pk__in=second).values_list("pk", flat=True))
         )
-        with CaptureQueriesContext(connection) as queries:
+        executed = []
+
+        def capture(execute, sql, params, many, context):
+            executed.append(sql)
+            return execute(sql, params, many, context)
+
+        with connection.execute_wrapper(capture):
             assert sorted(union) == [post.pk for post in posts]
-        sql = queries[-1]["sql"]
-        cte_names = set(re.findall(r'"(rebac_[a-z_]+_[0-9a-f]+[a-z0-9_]*)" AS \(', sql))
-        assert cte_names
-        assert all(sql.count(f'"{name}"') >= 2 for name in cte_names)
-        assert len(sql.encode()) < 12_000
+        assert tuple(first) in candidates and tuple(second) in candidates
+        assert len(candidate_sql) == 2
+        assert all(part in executed[-1] for part in candidate_sql)

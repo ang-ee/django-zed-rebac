@@ -64,12 +64,20 @@ pre-1.0; breaking changes within a minor version are explicitly called out.
 - A scoped queryset with mandatory native `pk=` or `pk__in` identities now
   proves access inside the candidate root set, including singleton reads and
   `held()` chunks. Sets above 256 IDs use the general scope to bound SQL size
-  and database work. Candidate lists are not kept in the statement cache;
-  shared union operands retain their union plan. The selecting query still
-  applies its original filter. Inside `decision_scope()`, bounded reads reuse
-  witnessed target decisions across candidate sets and respect write and
-  savepoint invalidation. `held_many()` retains 500-ID chunks, whose full
+  and database work. Candidate lists bind as one PostgreSQL array or bounded
+  Django `IN` and are not kept in the statement cache. An exact or bounded
+  identity proof takes precedence over a shared union plan. The selecting
+  query still applies its original filter. Inside `decision_scope()`, bounded
+  reads reuse witnessed target decisions across candidate sets and respect
+  write and savepoint invalidation. `held_many()` retains 500-ID chunks, whose full
   chunks use the general scope.
+- Decided ID membership binds one PostgreSQL array per list with `= ANY`;
+  row lists use a statement-local CTE shared by the predicate and witness.
+  SQLite and MySQL use Django `IN`. Model identity sets use
+  native IDs instead of one guarded equality per member. Stored actor-set
+  decisions use a 2,048 byte witness ceiling (about four short support edges)
+  and use the inline closure above it. Evaluator-memoized row witnesses carry
+  their own CTEs. Permission answers are unchanged.
 - Actor resolution, sudo validation and bypass emission now share one owner
   each. Ambient `sudo()` covers related reads when no actor is pinned; an
   instance or queryset sudo pin still does not cross a relation. The private

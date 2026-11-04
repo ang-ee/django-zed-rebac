@@ -1879,10 +1879,11 @@ integer identities uses a bounded candidate-root statement. Larger sets take
 the general scope: above about 300 ids the candidate statement can exceed the
 general statement's byte size and PostgreSQL can choose a costly plan with
 stale statistics; the cap also keeps SQLite below its bind-variable limit.
-The selecting
-query keeps its original filter; inside the permission statement the root
-model is filtered to those same identities before its lower-bound permission
-predicate is applied. This evaluates membership only for the supplied rows,
+The selecting query keeps its original filter; inside the permission statement
+the root model is filtered to those same identities with one PostgreSQL
+`= ANY` array parameter or a bounded Django `IN` list on other vendors,
+before its lower-bound permission predicate is applied. This evaluates
+membership only for the supplied rows,
 without producing the actor's full accessible root set. It uses the inline
 predicate, policy-generation fence and statement-time tuple/backing reads, so
 conditional or depth-uncertain rows remain absent and revocations remain
@@ -1896,11 +1897,11 @@ supported writes invalidate the reachable decisions and rolled-back
 savepoints retire decisions first made within them. Outside a decision scope,
 the candidate-root predicate remains inline.
 Only mandatory, positive, resolved native identity leaves qualify;
-a subquery, custom
-lookup, null, duplicate, expression or unproved identity keeps the general
+a subquery, custom lookup, null, duplicate, expression or unproved identity keeps the general
 scope. The candidate list is bound to the one statement and is never retained
 as queryset authority across clones or actor changes, or as a kept statement
-cache key. A shared union owner retains its shared plan for bounded operands.
+cache key. An exact or bounded identity proof takes precedence over a shared
+union plan; unbounded operands retain the shared plan.
 
 A model column is never converted. Where a tuple column meets a model column,
 the tuple column is converted with `identity_codec(...).to_column()` inside
@@ -1937,7 +1938,7 @@ alternative. Its subject admits the actor when the subject is:
   subject set itself.
 
 The third case is the arrow mechanism applied to a relation. Stored subject
-sets are decided to a fixed point when they fit the 256-member budget;
+sets are decided to a fixed point when their witness fits the 2,048 byte budget;
 otherwise their recursive CTE remains inline. Backed subject sets use
 model-backed row decisions when they fit, otherwise the inline predicate.
 
@@ -1986,11 +1987,13 @@ bounds select the same objects.
   expression's depth through its subqueries, and a chain of `AND` is
   left-deep.
 
-No raw SQL, trigger, database function or hand-written statement is used,
-with two deliberate exceptions, in both of which the SQL is Django's own:
+No raw SQL, trigger, database function or hand-written statement is used, with
+three deliberate runtime exceptions below and migration `0005`'s legacy
+uninstall routine:
 
-1. **Compiled id sets and kept statements.** An uncorrelated id set is
-   compiled by Django once, through the queryset's own `Query.as_sql()`, and
+1. **Compiled id sets and kept statements.**
+   An uncorrelated id set is compiled by Django once, through the queryset's
+   own `Query.as_sql()`, and
    embedded as text by a custom expression. Django resolves an embedded
    queryset again inside every enclosing `filter()`, which makes the cost of
    building a nested statement grow with its depth times its size; an
@@ -1998,12 +2001,23 @@ with two deliberate exceptions, in both of which the SQL is Django's own:
    the same SQL the nested resolution would. A whole statement is kept the
    same way (see [Kept statements and the policy fence](#kept-statements-and-the-policy-fence)).
 2. **The identity conversion's guard.** `codec.to_wire()` and
-   `codec.to_column()` wrap an expression in a validity check that reads it
+   `codec.to_column()` wrap an expression in a validity
+   check that reads it
    about ten times and depends only on the identity field, the direction and
    the connection. Django compiles that guard once around a placeholder; each
    use compiles its own expression once and takes the placeholder's
    positions. `tests/test_codec_cache.py` pins the cached SQL and parameters
    equal to the uncached ones for integer, text and UUID identities.
+3. **PostgreSQL decided-ID membership.** The custom lookups write the
+   `= ANY(%s)` operator when no CTE is shared, including preparation, set
+   traversal and the model-identity bridge. Decided row lists shared with a
+   witness write `= ANY((SELECT ids FROM <statement-local CTE>)::<type>[])`.
+   Django builds the CTE from a typed array `Value` and the policy generation
+   row. The array appears once in the parameters per scope occurrence; the
+   predicate and its witness reference the same CTE. With default psycopg
+   client-side binding, its literal still appears once per occurrence in the
+   wire SQL, growing by roughly the encoded ID length plus a delimiter per ID.
+   SQLite and MySQL use Django `IN` lookups.
 
 #### Prepared permission scopes
 
@@ -2015,13 +2029,35 @@ oversized sets retain the recursive CTE closure, including cycles and nested
 groups. Other recursive paths retain `REBAC_DEPTH_LIMIT`. The statement
 witnesses every decision it binds in its own database snapshot.
 
+Decided native ID membership uses one PostgreSQL array parameter. A decided
+row list shared by a predicate and witness uses a statement-local CTE; other
+lookups use direct `= ANY(%s)`. SQLite and MySQL use Django `IN`. A decided set at a
+model identity
+converts canonical wire IDs to native values before
+rendering membership, so it does not add a guarded conversion expression per
+member. A noncanonical wire ID cannot match a model identity. The decision
+witness remains in the same statement and sees the same database snapshot.
+Stored actor sets are decided only while their estimated statement witness is
+within a 2,048 byte budget; larger sets use the inline closure. The estimate
+charges 386 bytes of fixed SQL per support edge, plus each encoded edge value
+and decided-set ID exactly once. That base comes from measured short-ID slopes
+of 412–423 bytes on PostgreSQL and about 432 bytes on SQLite, less about 44
+bytes of values in the M1 and M8 probes. The M8 model-identity probe crosses
+the inline form near five memberships on PostgreSQL and seven on SQLite; this
+budget admits about four short edges. The crossover depends on schema shape,
+so the budget is a conservative witness ceiling, not a guarantee that every
+decided statement is smaller. It also keeps SQLite's expression tree below
+its limit for large memberships. The inline closure has no membership cap.
+
 A union owner prepares one set of bounded row, actor-set and fixed-fact
 decisions for all compatible operands. The same fresh compiler builds their
-predicates and decision witnesses. A decided actor set stays an ID list and
-needs no subject CTE. Each residual inline subject set uses one named CTE per
+predicates and decision witnesses when an operand has no mandatory bounded
+identity proof. Operands with such a proof use the candidate-root statement
+above. A decided actor set stays an ID list and needs no subject CTE. Each
+residual inline subject set uses one named CTE per
 permission or relation and bound in that owner's actor, policy and database
-alias. One owner gate checks the witnesses for all
-operands. Its query holds the plan and definitions
+alias. One owner gate checks the witnesses for operands using the shared plan.
+Its query holds the plan and definitions
 together through `Query.clone()`; a new plan never mutates a compiler retained
 by a sibling clone. The union's parts are cloned before their CTEs are moved
 to the owner with stock `with_cte()`. Stock django-cte 5.x has no move method,
@@ -2083,7 +2119,7 @@ decides a root when another operand reaches it as an arrow target. Polymorphic
 generic-FK targets stay inline. Bulk point checks
 keep actor memberships in their shared SQL bounds instead of expanding each
 actor separately. `_Operation._decide_sets` follows stored actor-set membership to
-a fixed point before compilation when it fits 256 members. `_Facts` decides
+a fixed point before compilation when its witness fits the byte budget. `_Facts` decides
 fixed-object permissions used by constant backings when one fixed object is
 reachable. Several independent fixed objects stay inline to avoid one
 preparation read per object. Point statements prepare only the decisions they
@@ -3753,7 +3789,7 @@ no scale suite at the moment. Drivers, environment and release gates are in
 | Watch map and identities | `tests/test_watch.py`, `tests/test_codec.py`, `tests/test_codec_cache.py` | The watched columns of every backing kind, resolved from metadata without reading rows; canonical identity conversion for integer, text and UUID fields, with an invalid wire id matching nothing; the cached conversion guard equal to the uncached one. |
 | Policy checks | `tests/test_policy_checks.py` | System checks for settings, schemas and models, and what the library refuses as a policy. |
 | Transactions and concurrency | `tests/test_write_effects.py`, `tests/test_compile_read.py` | Deterministic PostgreSQL tests: concurrent revoke and link insertion, concurrent tuple writes. Outer and savepoint rollback. A policy revision that changes while a lazy scope is compiled cannot replace the policy the scope was built for. |
-| Structural | `tests/test_scope_depth.py` and others | The scope statement of a recursive permission has the same size and parse depth whatever the depth of the data. Fresh SQLite/PostgreSQL migrations install no REBAC trigger or function, and end with no table that holds a row per application row. No library raw SQL, triggers or database functions exist outside migration `0005`'s legacy uninstall routine; the two documented exceptions embed SQL that Django compiled. |
+| Structural | `tests/test_scope_depth.py` and others | The scope statement of a recursive permission has the same size and parse depth whatever the depth of the data. Fresh SQLite/PostgreSQL migrations install no REBAC trigger or function, and end with no table that holds a row per application row. No library raw SQL, triggers or database functions exist outside migration `0005`'s legacy uninstall routine and the three documented runtime exceptions in Statement shape: compiled id sets and kept statements, the compiled identity guard, and PostgreSQL `= ANY` lookups. |
 | Vendors | `schema_vendors` | SQLite and PostgreSQL CI; an opt-in MySQL 8.4 suite must pass before release, including the schema write owners, the upgrade path and identity codec bounds for unsigned integers. |
 | Security pins | `tests/test_security_*.py` | The gates' rules, unchanged. The strict expected failures for proposals 0011 and 0013 stay pinned. |
 

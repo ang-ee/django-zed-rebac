@@ -51,7 +51,8 @@ def test_stored_set_relation_is_detected():
     assert CompileProgram.build(parse_zed(SCHEMA)).stored_sets == {("auth/group", "member")}
 
 
-def test_actor_set_decision_reaches_fixed_point_through_cycle():
+def test_actor_set_decision_reaches_fixed_point_through_cycle(monkeypatch):
+    monkeypatch.setattr(read, "_SET_WITNESS_BUDGET", 10**9)
     local = install_schema(SCHEMA)
     names = [f"g{index}" for index in range(12)]
     local.write_relationships(
@@ -103,9 +104,12 @@ def test_decided_actor_set_does_not_also_define_subject_cte():
     )
     assert compiler.statement_ctes() == ()
     predicate = compiler.holds(("blog/folder", "member"), read._model_at(model), Bound.LOWER)
-    matching = Folder._base_manager.filter(predicate)
+    matching = compiler.with_subject_ctes(Folder._base_manager.filter(predicate))
     _sql, params = matching.query.sql_with_params()
-    assert str(folder.pk) in {str(param) for param in params}
+    if connection.vendor == "postgresql":
+        assert any(folder.pk in param for param in params if isinstance(param, list))
+    else:
+        assert str(folder.pk) in {str(param) for param in params}
     assert list(matching.values_list("pk", flat=True)) == [folder.pk]
 
 
@@ -186,6 +190,111 @@ def test_nested_sets_and_cycles_are_decided_once(monkeypatch):
     inline = len(inline_queries[-1]["sql"].encode())
     print(f"sets SQL bytes: decided={decided}, inline={inline}")
     assert decided < inline, (decided, inline)
+
+
+@pytest.mark.pg_delta
+def test_actor_set_witness_byte_budget_and_model_identity_boundary(monkeypatch):
+    local = install_schema("""
+        definition auth/user {}
+        definition blog/folder {
+            relation member: auth/user | blog/folder#member
+        }
+        definition blog/post {
+            relation folder: blog/folder // rebac:field=folder
+            permission read = folder->member
+        }
+    """)
+    with sudo(reason="set size fixture"):
+        folders = Folder.objects.bulk_create([Folder(name=f"f{i}") for i in range(205)])
+        posts = Post.objects.bulk_create(
+            [Post(title=f"p{i}", folder=folder) for i, folder in enumerate(folders)]
+        )
+    key = ("blog/post", "read")
+
+    def measure(count):
+        local.write_relationships(
+            [
+                RelationshipTuple(ObjectRef("blog/folder", str(folder.pk)), "member", ACTOR)
+                for folder in folders[:count]
+            ]
+        )
+        read.reset()
+        operation = read._Operation.begin(local, ACTOR, "default")
+        sets = operation.sets(operation.verdicts(key))
+        with CaptureQueriesContext(connection) as queries:
+            found = list(Post.objects.with_actor(ACTOR).values_list("pk", flat=True))
+        sql = queries[-1]["sql"]
+        return sets, found, len(sql.encode()), sql
+
+    one, found_one, one_bytes, _ = measure(1)
+    below, found_below, below_bytes, below_sql = measure(4)
+    above, found_above, above_bytes, _ = measure(5)
+    large, found_large, large_bytes, _ = measure(200)
+    assert one is not None and below is not None
+    assert above is None and large is None
+    assert found_one == [posts[0].pk]
+    assert found_below == [post.pk for post in posts[:4]]
+    assert found_above == [post.pk for post in posts[:5]]
+    assert found_large == [post.pk for post in posts[:200]]
+    assert 350 < (below_bytes - one_bytes) / 3 < 500
+    assert (large_bytes - above_bytes) / 195 < 16
+    assert large_bytes < 10_000
+    assert "CASE WHEN" not in below_sql
+    with monkeypatch.context() as patcher:
+        patcher.setattr(read._Operation, "sets", lambda self, verdicts: None)
+        read.reset()
+        assert list(Post.objects.with_actor(ACTOR).values_list("pk", flat=True)) == found_large
+    with monkeypatch.context() as patcher:
+        patcher.setattr(read, "_SET_WITNESS_BUDGET", 10**9)
+        read.reset()
+        lifted, lifted_rows, lifted_bytes, lifted_sql = measure(200)
+        assert lifted is not None
+        assert lifted_rows == found_large
+        assert lifted_sql.count("CASE WHEN") == 0
+        assert lifted_bytes < 95_000
+
+
+@pytest.mark.pg_delta
+def test_noncanonical_decided_model_identity_matches_inline(monkeypatch):
+    monkeypatch.setattr(read, "_SET_WITNESS_BUDGET", 10**9)
+    local = install_schema("""
+        definition auth/user {}
+        definition blog/folder { relation member: auth/user | blog/folder#member }
+        definition blog/post {
+            relation folder: blog/folder // rebac:field=folder
+            permission read = folder->member
+        }
+    """)
+    with sudo(reason="noncanonical set fixture"):
+        folder = Folder.objects.create(name="canonical")
+        Post.objects.create(title="linked", folder=folder)
+
+    def measure(count):
+        local.write_relationships(
+            [
+                RelationshipTuple(
+                    ObjectRef("blog/folder", f"{'0' * n}{folder.pk}"), "member", ACTOR
+                )
+                for n in range(1, count + 1)
+            ]
+        )
+        read.reset()
+        operation = read._Operation.begin(local, ACTOR, "default")
+        assert operation.sets(operation.verdicts(("blog/post", "read"))) is not None
+        with CaptureQueriesContext(connection) as queries:
+            found = list(Post.objects.with_actor(ACTOR).values_list("pk", flat=True))
+        return found, max(len(query["sql"].encode()) for query in queries), len(queries)
+
+    _, short_bytes, short_statements = measure(1)
+    decided, long_bytes, long_statements = measure(10)
+    assert short_statements == long_statements
+    assert (long_bytes - short_bytes) / 9 < 100
+    assert long_bytes < 4_000
+    with monkeypatch.context() as patcher:
+        patcher.setattr(read._Operation, "sets", lambda self, verdicts: None)
+        read.reset()
+        inline = list(Post.objects.with_actor(ACTOR).values_list("pk", flat=True))
+    assert decided == inline == []
 
 
 def test_revoked_membership_changes_next_statement():
