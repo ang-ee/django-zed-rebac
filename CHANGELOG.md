@@ -21,6 +21,15 @@ pre-1.0; breaking changes within a minor version are explicitly called out.
 
 ### Added
 
+- `rebac.signals.collected_for_delete` delivers each collected model batch after
+  resource gates and before per-row deletion signals, once per model per
+  5,000-key part of a gated queryset delete and once per model for a bypassed
+  or unwatched queryset delete or an instance delete (one unbounded batch). Receivers see the instances, alias,
+  origin and actor scope; `rebac.mixins.batch_delivered()` lets a consumer skip
+  its per-row policy when its batch receiver covers the same senders. Later
+  through-row gates, per-row receivers or database constraints may still refuse
+  the delete and roll back receivers' database writes. Fast-deleted rows and
+  delete overrides outside the owner send no batch.
 - `scope_cte(actions=("read", "write", ...))` shares a statement-local
   permission-leaf closure across several projections on one resource model.
   The scope may be filtered to one native bounded identity set; each attached
