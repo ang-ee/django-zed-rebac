@@ -245,6 +245,35 @@ class _Compiled(Expression):
         return cached
 
 
+class _BoundIn(In):
+    """Bind a decided ID list as one PostgreSQL array or a Django IN lookup."""
+
+    def as_sql(self, compiler: Any, connection: Any) -> tuple[str, tuple[Any, ...]]:
+        if connection.vendor == "postgresql" and self.rhs_is_direct_value():
+            lhs_sql, lhs_params = self.process_lhs(compiler, connection)
+            _, prepared = self.get_db_prep_lookup(self.rhs, connection)
+            return f"{lhs_sql} = ANY(%s)", (*lhs_params, list(prepared))
+        sql, values = super().as_sql(compiler, connection)
+        return sql, tuple(values)
+
+
+class _ArrayMember(Exact):
+    """PostgreSQL membership against a Django-built array CTE."""
+
+    def as_sql(self, compiler: Any, connection: Any) -> tuple[str, tuple[Any, ...]]:
+        lhs_sql, lhs_params = self.process_lhs(compiler, connection)
+        rhs_sql, rhs_params = self.process_rhs(compiler, connection)
+        array_type = self.rhs.output_field.db_type(connection)
+        return f"{lhs_sql} = ANY(({rhs_sql})::{array_type})", (*lhs_params, *rhs_params)
+
+
+def _bound_in(expr: BaseExpression | F | OuterRef, values: Collection[Any]) -> Q:
+    """Two-valued membership for a decided set."""
+    if not values:
+        return _FALSE
+    return _not_null(expr) & Q(_BoundIn(expr, tuple(values)))
+
+
 def _one_object(ref: Any) -> bool:
     """The reference is a statement constant: a value or a bound parameter."""
     return isinstance(ref, (Value, _Param))
@@ -465,6 +494,7 @@ class Compiler:
         self._reached_ctes: dict[tuple[Key, Any, Bound, bool], CTE] = {}
         self._path_ctes: dict[tuple[Key, Bound, bool], CTE] = {}
         self._closure_ctes: dict[tuple[Key, Bound, bool], CTE] = {}
+        self._decided_arrays: dict[tuple[str, tuple[Any, ...]], CTE] = {}
         self._statement_ctes: list[CTE] = []
         actor_tag = hashlib.blake2s(
             f"{actor.subject_type}:{actor.subject_id}:{actor.optional_relation}".encode(),
@@ -520,8 +550,57 @@ class Compiler:
         fork._reached_ctes = self._reached_ctes
         fork._path_ctes = self._path_ctes
         fork._closure_ctes = self._closure_ctes
+        fork._decided_arrays = self._decided_arrays
         fork._statement_ctes = self._statement_ctes
         return fork
+
+    def decided_member(
+        self,
+        expr: BaseExpression | F | OuterRef,
+        values: Collection[Any],
+        field: models.Field[Any, Any],
+    ) -> Q:
+        """Reuse one array parameter across a statement's decided memberships."""
+        if not values:
+            return _FALSE
+        if connections[self.using].vendor != "postgresql" or not self._share_subject_rows:
+            return _bound_in(expr, values)
+        _, cte = self.decided_array(values, field)
+        rhs = Subquery(cte.queryset().values("_rebac_ids"))
+        return _not_null(expr) & Q(_ArrayMember(expr, rhs))
+
+    def decided_array(
+        self, values: Collection[Any], field: models.Field[Any, Any]
+    ) -> tuple[tuple[str, tuple[Any, ...]], CTE]:
+        """Build or reuse the typed array CTE for a decided list."""
+        from django.contrib.postgres.fields import ArrayField
+
+        from ..models.generation import SchemaGeneration
+
+        ids = tuple(values)
+        key = (field.db_type(connections[self.using]) or field.get_internal_type(), ids)
+        cte = self._decided_arrays.get(key)
+        if cte is None:
+            array_field = ArrayField(field)
+            selected = (
+                SchemaGeneration.objects.using(self.using)
+                .filter(pk=1)
+                .annotate(_rebac_ids=Value(list(ids), output_field=array_field))
+                .order_by()
+                .values("_rebac_ids")
+            )
+            digest = hashlib.blake2s(repr(key).encode(), digest_size=10).hexdigest()
+            # Content addressing avoids collisions across independently built
+            # witnesses and statement owners.
+            cte = CTE(selected, name=f"rebac_decided_{digest}")
+            self._decided_arrays[key] = cte
+            self._statement_ctes.append(cte)
+        return key, cte
+
+    def adopt_decided_array(self, key: tuple[str, tuple[Any, ...]], cte: CTE) -> None:
+        if key not in self._decided_arrays:
+            self._decided_arrays[key] = cte
+            self._statement_ctes.append(cte)
 
     def _subject_cte(
         self,
@@ -773,10 +852,26 @@ class Compiler:
         if not ids:
             return _FALSE
         if at.key is not None:
-            return _or(*(self._wire_equal(at, wire_id) for wire_id in ids))
+            model = self.model_index.resource(at.resource_type)
+            if model is None:
+                return _FALSE
+            identity = resource_id_attr(model)
+            codec = identity_codec(model, identity)
+            _, canonical = model_identity_fields(model, identity)
+            natives = tuple(
+                canonical.to_python(wire_id)
+                for wire_id in ids
+                if codec.is_canonical(wire_id, using=self.using)
+            )
+            if not natives:
+                return _FALSE
+            if at.key is canonical:
+                return self.decided_member(at.ref, natives, canonical)
+            bridge = model._base_manager.using(self.using).filter(_bound_in(F(identity), natives))
+            return _in(at.ref, bridge.order_by().values(at.key.name))
         if isinstance(at.ref, Value):
             return _truth(at.ref.value in ids)
-        return _not_null(at.ref) & Q(In(at.ref, ids))
+        return self.decided_member(at.ref, ids, models.TextField())
 
     def sets_step(
         self,
@@ -821,7 +916,7 @@ class Compiler:
                 elif allowed.relation:
                     inside = sorted(members.get((allowed.type, allowed.relation), ()))
                     member = _or(
-                        Q(subject_id__in=inside) if inside else _FALSE,
+                        _bound_in(F("subject_id"), inside),
                         _and(_truth(itself), named),
                     )
                 else:
@@ -844,7 +939,8 @@ class Compiler:
         """A tuple's resource is one of the member sets."""
         return _or(
             *(
-                Q(resource_type=type_, relation=name, resource_id__in=sorted(ids))
+                Q(resource_type=type_, relation=name)
+                & self.decided_member(F("resource_id"), sorted(ids), models.TextField())
                 for (type_, name), ids in sorted(members.items())
                 if ids
             )
@@ -1914,10 +2010,12 @@ class Compiler:
             source_q = Q(**{f"{target_path}__isnull": False})
             through_rows = False
         elif isinstance(subjects, Decided) and resolved.keeps_target(self.using):
-            source_q = Q(**{f"{target_path}__in": list(subjects)})
+            _, field = model_identity_fields(resolved.target_model, resolved.target_id_attr)
+            source_q = self.decided_member(F(target_path), subjects, field)
         elif isinstance(subjects, Decided):
+            _, field = model_identity_fields(resolved.target_model, resolved.target_id_attr)
             targets = resolved.target_model._base_manager.using(self.using).filter(
-                **{f"{resolved.target_id_attr}__in": list(subjects)}
+                self.decided_member(F(resolved.target_id_attr), subjects, field)
             )
             source_q = Q(
                 **{
@@ -2033,7 +2131,8 @@ class Compiler:
             return _FALSE
         every = resolved.target_model._base_manager.using(self.using)
         if isinstance(found, Decided):
-            found = every.filter(**{f"{resolved.target_id_attr}__in": list(found)})
+            _, field = model_identity_fields(resolved.target_model, resolved.target_id_attr)
+            found = every.filter(self.decided_member(F(resolved.target_id_attr), found, field))
         subjects = (every if found is True else found).filter(Q(**resolved.filters))
         if resolved.resource is not None:
             subjects = subjects.filter(resolved.value_filter(resolved.value))

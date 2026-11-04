@@ -23,6 +23,13 @@ pre-1.0; breaking changes within a minor version are explicitly called out.
 
 ### Changed
 
+- Decided ID membership binds one PostgreSQL array per list with `= ANY`;
+  row lists use a statement-local CTE shared by the predicate and witness.
+  SQLite and MySQL use Django `IN`. Model identity sets use
+  native IDs instead of one guarded equality per member. Stored actor-set
+  decisions use a 2,048 byte witness ceiling (about four short support edges)
+  and use the inline closure above it. Evaluator-memoized row witnesses carry
+  their own CTEs. Permission answers are unchanged.
 - Actor resolution, sudo validation and bypass emission now share one owner
   each. Ambient `sudo()` covers related reads when no actor is pinned; an
   instance or queryset sudo pin still does not cross a relation. The private

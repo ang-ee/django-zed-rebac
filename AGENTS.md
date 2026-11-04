@@ -448,11 +448,12 @@ access via `rebac.backend()`.
 - Migrations must run on PostgreSQL 15+, MySQL 8.4+, SQLite (test only).
   Data migrations use the Django ORM in bounded batches (`0008` fills
   `caveat_key` 1,000 rows at a time). No raw SQL, triggers or database
-  functions, in migrations or at run time; migration `0005`'s existing legacy
-  uninstall routine is the only raw-SQL exception. One documented exception
-  covers SQL text that Django's own compiler produced: compiled id sets, kept
-  statements and the identity conversion's guard are embedded as that text
-  (ARCHITECTURE.md § Statement shape). No statement is written by hand.
+  functions, in migrations or at run time, except migration `0005`'s legacy
+  uninstall routine and the three narrow runtime exceptions in
+  ARCHITECTURE.md § Statement shape: SQL text produced by Django's compiler
+  for compiled id sets and kept statements; the compiled identity conversion
+  guard; and hand-written PostgreSQL `= ANY` operator lookups for bound
+  decided ID lists. No whole statement is written by hand.
   CI runs SQLite and PostgreSQL; the opt-in MySQL 8.4 vendor suite
   is a release gate.
 
@@ -503,7 +504,8 @@ by a create check belongs in save() or proposed_relationships.
 Multi-valued joins: one `.filter(Q(...) & Q(...))` per join,
 `Exists`/`OuterRef` for correlation; never chain `.filter()`/`.exclude()`
 on the same multi-valued path. Use existing Django/stdlib/library APIs before
-writing helpers; no raw SQL, triggers or database functions.
+writing helpers; no raw SQL, triggers or database functions beyond the three
+documented Statement shape exceptions.
 
 ### Don't import models in `apps.py` at module level
 `AppRegistryNotReady`. Import inside `ready()` or inside the function that

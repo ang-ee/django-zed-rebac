@@ -62,6 +62,7 @@ from .predicate import (
     Fact,
     Support,
     _and,
+    _bound_in,
     _Compiled,
     _not,
     _Param,
@@ -81,7 +82,14 @@ _MANUAL_REVISION = object()
 _RESOURCE_WIRE = object()
 _LIMIT = 512
 _ROW_LIMIT = 5000
-_SET_LIMIT = 256
+# The M8 field-backed model-identity probe crosses the inline form around
+# five memberships on PostgreSQL and seven on SQLite. Four short support
+# edges stay under this ceiling; larger sets use the inline closure.
+_SET_WITNESS_BUDGET = 2_048
+# M1/M8 short-ID probes grew by 412-423 B per edge on PostgreSQL and about
+# 432 B on SQLite. Subtracting about 44 B of encoded edge and set IDs leaves
+# this fixed SQL cost; the actual encoded values are charged below exactly once.
+_SET_SUPPORT_EDGE_BASE_BYTES = 386
 _EDGE = (
     "resource_type",
     "resource_id",
@@ -255,6 +263,7 @@ class _Decision:
     witness: Q
     uses: tuple[_Decision, ...] = ()
     sets: ActorSets | None = None
+    array: tuple[tuple[str, tuple[Any, ...]], CTE] | None = None
 
 
 def _decision_closure(decisions: Iterable[_Decision]) -> tuple[_Decision, ...]:
@@ -368,7 +377,7 @@ class _Facts(Mapping[Fact, bool]):
             rows=self.operation.rows(self.verdicts),
             sets=self.operation.sets(self.verdicts),
         )
-        if (shared := self.operation.rows(self.verdicts).shared_compiler) is not None:
+        if (shared := self.operation.rows(self.verdicts).render_compiler) is not None:
             compiler = shared.fork_shared()
             compiler.facts = None
         parts = []
@@ -392,7 +401,7 @@ class _Rows:
         self.root = root
         self._found: dict[Key, _Decision | None] = {}
         self._pending: set[Key] = set()
-        self.shared_compiler: Compiler | None = None
+        self.render_compiler: Compiler | None = None
 
     @property
     def room(self) -> int:
@@ -455,6 +464,10 @@ class _Rows:
             evaluator._row_decisions.move_to_end(name)
             found = cast("_Decision | None", evaluator._row_decisions[name])
             if found is not None and self._fits(found):
+                if self.render_compiler is not None:
+                    for decision in _decision_closure((found,)):
+                        if decision.array is not None:
+                            self.render_compiler.adopt_decided_array(*decision.array)
                 return found
         found = self._decide(key)
         if evaluator is not None and eligible and found is not None:
@@ -473,6 +486,10 @@ class _Rows:
 
     def witness(self, used: Iterable[Key], *, witnessed_sets: ActorSets | None = None) -> Q:
         decisions = _decision_closure(self._dependencies(used))
+        if self.render_compiler is not None:
+            for found in decisions:
+                if found.array is not None:
+                    self.render_compiler.adopt_decided_array(*found.array)
         parts = [found.witness for found in decisions]
         seen_sets = {id(witnessed_sets)} if witnessed_sets is not None else set()
         for found in decisions:
@@ -481,8 +498,8 @@ class _Rows:
                 continue
             seen_sets.add(id(sets))
             compiler = (
-                self.shared_compiler.fork_shared()
-                if self.shared_compiler is not None
+                self.render_compiler.fork_shared()
+                if self.render_compiler is not None
                 else self.operation.compiler(self.verdicts, sets=sets)
             )
             compiler.sets = sets
@@ -522,15 +539,17 @@ class _Rows:
             return None
         if not ids:
             return _Decision((), _and(), self._dependencies(compiler.used_rows), sets)
+        # Evaluator-memoized decisions can outlive this statement. Their
+        # witnesses must carry their own subject, set and closure CTEs.
+        shared_witness = self.render_compiler is not None and bool(operation._shared_keys)
         later = (
-            self.shared_compiler.fork_shared()
-            if self.shared_compiler is not None
+            self.render_compiler.fork_shared()
+            if shared_witness and self.render_compiler is not None
             else operation.compiler(self.verdicts, share_subject_rows=True, rows=self, sets=sets)
         )
-        if self.shared_compiler is not None:
-            # A witness must recheck fixed-object facts. The owner's decided
-            # value cannot serve as its own proof after a revocation.
-            later.facts = None
+        # A witness must recheck fixed-object facts. The owner's decided
+        # value cannot serve as its own proof after a revocation.
+        later.facts = None
         held = later.holds(key, _model_at(model), Bound.LOWER)
         if len(ids) > self.room:
             abandon()
@@ -539,14 +558,23 @@ class _Rows:
             return _Decision(
                 ids, _and(), self._dependencies(compiler.used_rows | later.used_rows), sets
             )
-        failing = source.filter(**{f"{identity}__in": ids}).filter(_not(held))
-        if self.shared_compiler is None:
+        array = None
+        if self.render_compiler is not None:
+            _, identity_field = model_identity_fields(model, identity)
+            member_ids = self.render_compiler.decided_member(F(identity), ids, identity_field)
+            if connections[operation.using].vendor == "postgresql":
+                array = self.render_compiler.decided_array(ids, identity_field)
+        else:
+            member_ids = _bound_in(F(identity), ids)
+        failing = source.filter(member_ids).filter(_not(held))
+        if not shared_witness:
             failing = later.with_subject_ctes(failing)
         return _Decision(
             ids,
             ~Q(Exists(failing)),
             self._dependencies(compiler.used_rows | later.used_rows),
             sets,
+            array,
         )
 
 
@@ -736,7 +764,27 @@ class _Operation:
                                 own,
                             )
                         )
-                if sum(len(ids) for ids in members.values()) > _SET_LIMIT:
+                support_bytes = sum(
+                    _SET_SUPPORT_EDGE_BASE_BYTES
+                    + sum(
+                        len(value.encode())
+                        for value in (
+                            edge.key[0],
+                            edge.key[1],
+                            edge.resource_id,
+                            edge.subject_type,
+                            edge.subject_id,
+                            edge.subject_relation,
+                            edge.caveat_name,
+                            edge.caveat_key,
+                        )
+                    )
+                    for edge in support
+                )
+                set_bytes = sum(
+                    len(value.encode()) + 8 for values in members.values() for value in values
+                )
+                if support_bytes + set_bytes > _SET_WITNESS_BUDGET:
                     return None
             decided[bound] = {found: frozenset(ids) for found, ids in members.items()}
         return ActorSets(keys, decided[Bound.LOWER], decided[Bound.UPPER], tuple(support))
@@ -887,6 +935,8 @@ def _point_statement(
         compiler = operation.compiler(
             verdicts, share_subject_rows=True, sets=sets, rows=decider, facts=facts
         )
+        if decider is not None:
+            decider.render_compiler = compiler
         if which == "depth":
             condition = compiler.depth_unknown(key, at)
         else:
@@ -1239,6 +1289,8 @@ def _scope_statement(
         compiler = operation.compiler(
             verdicts, share_subject_rows=True, rows=decider, sets=sets, facts=facts
         )
+        if decider is not None:
+            decider.render_compiler = compiler
         predicate = compiler.holds(key, _model_at(model), Bound.LOWER)
         if is_false(predicate):
             return False
@@ -1430,7 +1482,7 @@ def share_combined_scopes(query: Any) -> bool | None:
         facts=facts,
         cte_owner=token_hex(8),
     )
-    rows.shared_compiler = compiler
+    rows.render_compiler = compiler
     predicates: list[tuple[_Scope, Q]] = []
     for scope in scopes:
         key = (cast(str, model_resource_type(scope.model)), scope.action)
