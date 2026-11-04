@@ -2490,7 +2490,25 @@ enclosing owner, leaving one durable row.
   gated as a backed edge, and reads are closed.
 - **One transaction.** `rebac.watch.model_write(model=, using=, names=)` is
   the transaction an owned write runs in. It yields whether the installed
-  policy reads a column the write can change.
+  policy reads a column the write can change. The owner holds one schema
+  operation pin across its gate, nested writes, hooks and delete receivers;
+  a warm stored policy needs one revision read for the owner. A collector is
+  built inside that owner. Each collected resource model is gated as a
+  bounded candidate set before deletion, and covered rows skip the per-row
+  `pre_delete` gate. A row outside that collector or with no matching owner
+  retains its per-row gate. A denied collected row refuses the whole delete
+  before consumer `pre_delete` handlers run.
+- **Generation invalidation.** Within an owned write, each changed row advances
+  an operation-local generation so a later decision in that operation cannot
+  reuse a stale row memo. An operation marker also prevents a pre-operation
+  memo from being reused inside the owner, so the first in-owner decision may
+  cost another read. When the outermost owner for a database alias succeeds,
+  it publishes one process generation bump for each affected model lineage,
+  even if a collector deleted many rows of that model. It publishes when that
+  owner exits, before an enclosing caller transaction commits. A rolled-back
+  owner publishes no bump for writes it rolls back; a write already committed
+  on another alias keeps its own invalidation. Writes with no owner keep their
+  direct signal invalidation.
 - **Inserts** are authorized by `check_new` per candidate, including
   `proposed_relationships()`; a query over existing rows cannot authorize a
   row that is not there.
@@ -2506,8 +2524,14 @@ enclosing owner, leaving one durable row.
   `delete()` on a model the policy reads selects those of all its rows. They
   gate exactly those rows (from their stored values when the write changes
   a column the policy reads) and write exactly those rows by key, 5,000 keys
-  per statement. A row that starts matching the caller's filter in between
-  is neither gated nor written. A denied row denies the whole statement.
+  per statement. Scalar-key chunks use one PostgreSQL array parameter for
+  their selection, stored-row capture and queryset update; SQLite and MySQL,
+  and composite primary keys on every backend, use Django's `IN` lookup.
+  The bounded candidate proof still applies to chunks of at most 256 native
+  IDs. Collector root `DELETE`, `SET NULL` updates and tuple cleanup retain
+  Django's literal key lists. A row that starts matching the caller's filter
+  in between is neither gated nor written. A denied row denies the whole
+  statement.
 - **Database-level deletes.** Django 6.1's `DB_CASCADE`, `DB_SET_NULL` and
   `DB_SET_DEFAULT` run inside the database: the collector skips the dependent
   rows, which therefore send no `pre_delete` / `post_delete` and pass no gate.

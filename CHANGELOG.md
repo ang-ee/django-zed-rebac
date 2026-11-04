@@ -95,6 +95,16 @@ pre-1.0; breaking changes within a minor version are explicitly called out.
   model as a candidate set rather than point-checking every cascaded row. A
   depth-uncertain cascaded row now raises `GateDenied` before consumer
   `pre_delete` receivers run.
+- Owned writes now publish one row-generation bump per affected model lineage
+  when the outermost owner for that alias succeeds, including multi-row
+  cascades. Decisions made within the owner still observe each row's change
+  through an operation-local generation. A committed write on another alias
+  keeps its own invalidation even if the first owner rolls back.
+- Scalar key chunks in queryset writes bind one PostgreSQL array for their
+  selection, stored-row capture and queryset update instead of expanding up
+  to 5,000 literal IDs. Composite primary keys retain Django's `IN` lookup;
+  collector root deletes, `SET NULL` updates and tuple cleanup still use
+  Django's literal key lists.
 - A scoped queryset with mandatory native `pk=` or `pk__in` identities now
   proves access inside the candidate root set, including singleton reads and
   `held()` chunks. Sets above 256 IDs use the general scope to bound SQL size
