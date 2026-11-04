@@ -482,6 +482,18 @@ class TextIdentityFolder(RebacMixin, models.Model):
         rebac_id_attr = "public_id"
 
 
+class IntegerIdentityFolder(RebacMixin, models.Model):
+    """A native integer REBAC identity distinct from the Django primary key."""
+
+    external_id = models.IntegerField(unique=True)
+    name = models.CharField(max_length=100)
+
+    class Meta:
+        app_label = "testapp"
+        rebac_resource_type = "blog/integeridentityfolder"
+        rebac_id_attr = "external_id"
+
+
 class CodedFolder(RebacMixin, models.Model):
     """A hierarchy whose parent column names a row by a nullable unique column."""
 

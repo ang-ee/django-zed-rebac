@@ -62,6 +62,7 @@ from .errors import (
     SchemaError,
 )
 from .evaluator import PermissionEvaluator, current_evaluator, decision_scope, evaluator_scope
+from .limits import SCOPE_CTE_CANDIDATE_LIMIT
 from .preflight import check_new
 from .types import (
     CheckItem,
@@ -146,6 +147,7 @@ def __getattr__(name: str) -> Any:
 
 __all__ = [
     "__version__",
+    "SCOPE_CTE_CANDIDATE_LIMIT",
     "resource_id_attr",
     "subject_id_attr",
     # types
