@@ -1801,17 +1801,17 @@ remain in the SQL predicate. A point check does not read source rows into
 Python before compiling its authority statement. Each backing retains its
 own target validation, including the existence of a generic target row.
 
-A queryset whose current resolved Django predicates require one resource identity
-uses the existing point lower-bound statement as an `EXISTS` condition, with
-the canonical identity bound as a parameter. The caller's predicates remain in
-the selecting statement; this is neither a separate permission check nor a
-queryset hint. Recognition happens after aliases and fields resolve, before
-scope SQL renders, and is never retained on a queryset or scope expression.
+A queryset whose current resolved Django predicates require resource identities
+uses the candidate-root lower-bound statement described below. The caller's
+predicates remain in the selecting statement; this is neither a separate
+permission check nor a queryset hint. Recognition happens after aliases and
+fields resolve, before scope SQL renders, and is never retained on a queryset
+or scope expression. Standalone point checks still use the point statement.
 
 Only globally mandatory, positive `AND` paths of native `WhereNode` are
 inspected. Eligible leaves are the exact native `Exact`, `IntegerFieldExact`
 and `RelatedExact` classes, or native `In` with a prepared list/tuple containing
-exactly one non-null canonical integer. Native `TupleIn` is eligible only with
+one or more distinct non-null canonical integers. Native `TupleIn` is eligible only with
 an exact native one-column `ColPairs` and one direct list/tuple row containing
 one such integer, as Django constructs for a singleton forward-FK prefetch.
 Its native `get_cols()` column must pass the same identity proof; composite,
@@ -1824,10 +1824,40 @@ expressions, other aliases/columns, negation, OR/XOR branches, and unproved
 identity shapes keep the general scope path. No boolean factoring, collection
 normalization or inference from raw filter arguments takes place.
 
-This specialization reuses the inline point predicate and policy generation
-fence. Field/clause/projection gates still surround the
+Field/clause/projection gates still surround the
 query. Schema changes, cloning, actor/database changes and alias relabeling
 therefore obey the same live authorization contract as a general scope.
+
+#### Bounded identity-set scopes
+
+`Model.objects.with_actor(actor).filter(pk=id)` and
+`Model.objects.with_actor(actor).filter(pk__in=ids)` are the queryset
+contracts. One or more mandatory native integer identities use the same
+candidate-root statement. Django's prepared `In` RHS is inspected, so sets,
+generators and numeric strings that prepare to canonical native integers
+qualify as well as lists and tuples.
+
+A mandatory native `pk__in` prepared RHS of up to 256 distinct canonical
+integer identities uses a bounded candidate-root statement. Larger sets take
+the general scope: above about 300 ids the candidate statement can exceed the
+general statement's byte size and PostgreSQL can choose a costly plan with
+stale statistics; the cap also keeps SQLite below its bind-variable limit.
+The selecting
+query keeps its original filter; inside the permission statement the root
+model is filtered to those same identities before its lower-bound permission
+predicate is applied. This evaluates membership only for the supplied rows,
+without producing the actor's full accessible root set. It uses the inline
+predicate, policy-generation fence and statement-time tuple/backing reads, so
+conditional or depth-uncertain rows remain absent and revocations remain
+visible. The bound applies to root rows; arrow targets keep their inline
+lowering, which PostgreSQL can candidate-probe but SQLite may materialize.
+`LocalBackend.held()` uses this statement for chunks up to the cap.
+Only mandatory, positive, resolved native identity leaves qualify;
+a subquery, custom
+lookup, null, duplicate, expression or unproved identity keeps the general
+scope. The candidate list is bound to the one statement and is never retained
+as queryset authority across clones or actor changes, or as a kept statement
+cache key. A shared union owner retains its shared plan for bounded operands.
 
 A model column is never converted. Where a tuple column meets a model column,
 the tuple column is converted with `identity_codec(...).to_column()` inside
@@ -2019,8 +2049,9 @@ use.
 `.scoped()` installs the scope and pins its actor without preparing bounded
 decisions. First evaluation or embedding prepares on the selected database
 alias, including from `_RebacQuery.resolve_expression` for an embedded queryset.
-The resolved WHERE selects the point plan when a native identity is mandatory,
-otherwise the population plan. A combinator
+The resolved WHERE selects the candidate-root plan for up to 256 mandatory
+native identities, otherwise the population plan. Standalone point checks
+retain the point plan. A combinator
 operand Django renders without its queryset owner prepares on first render
 and retains that result for another render. An unprepared ordinary queryset
 or standalone scope expression renders its inline form without a decision read;
@@ -2067,7 +2098,9 @@ cacheable predicate used, but no
 membership lists or row decisions; statements with decisions are compiled for
 that operation. Inline `permission_expression()` and `accessible()` statements
 have their own cache keys. Actor id, the
-application clock, point resource id, and manual-schema revision are bound parameters. Statements
+application clock, point resource id, and manual-schema revision are bound parameters.
+Candidate-root statements are compiled per use rather than kept under literal
+candidate lists. Statements
 whose caveat verdicts vary are compiled at each use.
 
 Every statement carries the `SchemaGeneration` revision fence. A scope built

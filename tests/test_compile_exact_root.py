@@ -1,17 +1,24 @@
-"""Resolved mandatory identity predicates reuse point SQL without a separate check."""
+"""Resolved mandatory identities use candidate-root SQL without a separate check."""
+
+import re
 
 import pytest
 from django.contrib.auth import get_user_model
+from django.db import connection
 from django.db.models import Exists, OuterRef, Prefetch, Q, Subquery, Value
 from django.db.models.expressions import ColPairs
 from django.db.models.fields.tuple_lookups import TupleIn
 from django.db.models.lookups import Exact, In
+from django.test import override_settings
+from django.test.utils import CaptureQueriesContext
 
 from rebac import ObjectRef, RelationshipTuple, SubjectRef, sudo, to_object_ref
 from rebac.compile import read
 from rebac.errors import SchemaError
+from rebac.managers import share_scoped_definitions
 from rebac.schema import parse_zed
 from rebac.testing import install_schema
+from rebac.types import RelationshipFilter
 from tests.testapp.models import EncodedPrimaryPost, Folder, Post, TextIdentityPrimaryPost
 
 pytestmark = [pytest.mark.django_db, pytest.mark.pg_delta]
@@ -47,7 +54,7 @@ def records():
 @pytest.fixture
 def paths(monkeypatch):
     """Observe which native statement owns the queried model's row decision."""
-    calls = {"point": [], "scope": []}
+    calls = {"point": [], "scope": [], "candidates": []}
     point, scope = read._point_statement, read._scope_statement
 
     def point_statement(operation, key, *args, **kwargs):
@@ -56,6 +63,7 @@ def paths(monkeypatch):
 
     def scope_statement(operation, model, key, *args, **kwargs):
         calls["scope"].append(key)
+        calls["candidates"].append(kwargs.get("candidates"))
         return scope(operation, model, key, *args, **kwargs)
 
     monkeypatch.setattr(read, "_point_statement", point_statement)
@@ -71,7 +79,7 @@ def _tuple_in(model, rhs):
 @pytest.mark.parametrize(
     "shape", ["pk", "id", "exact", "in", "in_tuple", "tuple_in", "tuple_in_lists", "and", "chain"]
 )
-def test_native_identity_selectors_use_point_sql_and_preserve_denial(records, paths, shape):
+def test_native_identity_selectors_use_candidate_sql_and_preserve_denial(records, paths, shape):
     _local, allowed, denied, _grant = records
     for row in (allowed, denied):
         rows = Post.objects.with_actor(ALICE)
@@ -92,8 +100,10 @@ def test_native_identity_selectors_use_point_sql_and_preserve_denial(records, pa
         assert list(selected.values_list("pk", flat=True)) == (
             [allowed.pk] if row is allowed else []
         )
-    assert ("blog/post", "read") in paths["point"]
-    assert ("blog/post", "read") not in paths["scope"]
+    assert ("blog/post", "read") not in paths["point"]
+    assert ("blog/post", "read") in paths["scope"]
+    assert (allowed.pk,) in paths["candidates"]
+    assert (denied.pk,) in paths["candidates"]
 
 
 @pytest.mark.parametrize("operation", ["get", "exists", "count", "in_bulk"])
@@ -108,8 +118,9 @@ def test_ordinary_queryset_terminals_keep_their_native_contract(records, paths, 
         assert rows.filter(pk=allowed.pk).count() == 1
     else:
         assert set(rows.in_bulk([allowed.pk])) == {allowed.pk}
-    assert ("blog/post", "read") in paths["point"]
-    assert ("blog/post", "read") not in paths["scope"]
+    assert ("blog/post", "read") not in paths["point"]
+    assert ("blog/post", "read") in paths["scope"]
+    assert (allowed.pk,) in paths["candidates"]
 
 
 class CustomExact(Exact):
@@ -135,7 +146,7 @@ class CustomIn(In):
         "multiple_with_null",
     ],
 )
-def test_unproved_predicates_keep_the_general_scope(records, paths, shape):
+def test_non_point_predicates_use_a_scope_statement(records, paths, shape):
     _local, allowed, denied, _grant = records
     rows = Post.objects.with_actor(ALICE)
     selectors = {
@@ -153,6 +164,7 @@ def test_unproved_predicates_keep_the_general_scope(records, paths, shape):
     assert list(rows.filter(selectors[shape]).values_list("pk", flat=True)) == [allowed.pk]
     assert ("blog/post", "read") not in paths["point"]
     assert ("blog/post", "read") in paths["scope"]
+    assert paths["candidates"][-1] == ((allowed.pk, denied.pk) if shape == "multi" else None)
 
 
 def test_clones_reprove_the_selected_identity_and_actor(records, paths):
@@ -183,57 +195,59 @@ def test_relabelled_subquery_aliases_keep_the_exact_inner_scope(
         result = outer.filter(pk=Subquery(inner.values("pk")[:1]))
     assert list(result.values_list("pk", flat=True)) == [allowed.pk]
     assert denied.pk != allowed.pk
-    assert ("blog/post", "read") in paths["point"]
+    assert (allowed.pk,) in paths["candidates"]
 
 
 @pytest.mark.parametrize("selector", ["exact", "tuple_in"])
-def test_point_scope_keeps_the_original_query_predicates(records, selector):
+def test_candidate_scope_keeps_the_original_query_predicates(records, selector):
     _local, allowed, denied, _grant = records
     predicate = Q(pk=allowed.pk) if selector == "exact" else Q(_tuple_in(Post, [(allowed.pk,)]))
     assert not Post.objects.with_actor(ALICE).filter(predicate, title=denied.title).exists()
 
 
 @pytest.mark.parametrize("selector", ["exact", "tuple_in"])
-def test_revocation_after_point_compilation_is_witnessed_by_selecting_sql(
+def test_revocation_after_candidate_compilation_is_witnessed_by_selecting_sql(
     records, monkeypatch, selector
 ):
     local, allowed, _denied, grant = records
-    compile_point = read._point_statement
+    compile_scope = read._scope_statement
     changed = []
 
-    def revoke(operation, key, *args, **kwargs):
-        compiled = compile_point(operation, key, *args, **kwargs)
-        if key == ("blog/post", "read") and not changed:
+    def revoke(operation, model, key, *args, **kwargs):
+        compiled = compile_scope(operation, model, key, *args, **kwargs)
+        if key == ("blog/post", "read") and kwargs.get("candidates") and not changed:
             changed.append(True)
             local.delete_relationship(grant)
         return compiled
 
-    monkeypatch.setattr(read, "_point_statement", revoke)
+    monkeypatch.setattr(read, "_scope_statement", revoke)
     predicate = Q(pk=allowed.pk) if selector == "exact" else Q(_tuple_in(Post, [(allowed.pk,)]))
     assert not Post.objects.with_actor(ALICE).filter(predicate).exists()
     assert changed
 
 
-def test_policy_replacement_during_point_compile_cannot_open_a_closed_scope(records, monkeypatch):
+def test_policy_replacement_during_candidate_compile_cannot_open_a_closed_scope(
+    records, monkeypatch
+):
     local, allowed, _denied, _grant = records
     local.set_schema(
         parse_zed("definition auth/user {} definition blog/post { permission read = nil }")
     )
     rows = Post.objects.with_actor(ALICE).filter(pk=allowed.pk)
-    compile_point = read._point_statement
+    compile_scope = read._scope_statement
     changed = []
 
-    def replace(operation, key, *args, **kwargs):
-        if key == ("blog/post", "read") and not changed:
+    def replace(operation, model, key, *args, **kwargs):
+        if key == ("blog/post", "read") and kwargs.get("candidates") and not changed:
             changed.append(True)
             local.set_schema(
                 parse_zed(
                     "definition auth/user {} definition blog/post { permission read = authenticated }"
                 )
             )
-        return compile_point(operation, key, *args, **kwargs)
+        return compile_scope(operation, model, key, *args, **kwargs)
 
-    monkeypatch.setattr(read, "_point_statement", replace)
+    monkeypatch.setattr(read, "_scope_statement", replace)
     assert list(rows) == []
     assert changed
 
@@ -266,7 +280,7 @@ def test_text_and_custom_integer_identity_fields_keep_general_scope(paths, model
 
 
 @pytest.mark.parametrize("change", ["revoke_viewer", "add_banned"])
-def test_stored_set_changes_after_point_compilation_are_witnessed(records, monkeypatch, change):
+def test_stored_set_changes_after_candidate_compilation_are_witnessed(records, monkeypatch, change):
     local, allowed, _denied, direct = records
     local.delete_relationship(direct)
     viewers = ObjectRef("auth/group", "viewers")
@@ -283,12 +297,12 @@ def test_stored_set_changes_after_point_compilation_are_witnessed(records, monke
             ),
         ]
     )
-    compile_point = read._point_statement
+    compile_scope = read._scope_statement
     changed = []
 
-    def mutate(operation, key, *args, **kwargs):
-        statement = compile_point(operation, key, *args, **kwargs)
-        if key == ("blog/post", "read") and not changed:
+    def mutate(operation, model, key, *args, **kwargs):
+        statement = compile_scope(operation, model, key, *args, **kwargs)
+        if key == ("blog/post", "read") and kwargs.get("candidates") and not changed:
             changed.append(True)
             if change == "revoke_viewer":
                 local.delete_relationship(member)
@@ -296,7 +310,7 @@ def test_stored_set_changes_after_point_compilation_are_witnessed(records, monke
                 local.write_relationships([RelationshipTuple(banned, "member", ALICE)])
         return statement
 
-    monkeypatch.setattr(read, "_point_statement", mutate)
+    monkeypatch.setattr(read, "_scope_statement", mutate)
     assert not Post.objects.with_actor(ALICE).filter(pk=allowed.pk).exists()
     assert changed
 
@@ -325,7 +339,7 @@ def prefetch_records(request, settings):
     return request.getfixturevalue("records")
 
 
-def test_native_forward_fk_prefetch_uses_singleton_point_and_preserves_denial(
+def test_native_forward_fk_prefetch_uses_singleton_candidate_and_preserves_denial(
     prefetch_records, paths
 ):
     local, allowed, _denied, _grant = prefetch_records
@@ -340,8 +354,9 @@ def test_native_forward_fk_prefetch_uses_singleton_point_and_preserves_denial(
             assert row.folder.pk == allowed.folder_id
         else:
             assert row.folder is None
-    assert ("blog/folder", "read") in paths["point"]
-    assert ("blog/folder", "read") not in paths["scope"]
+    assert ("blog/folder", "read") not in paths["point"]
+    assert ("blog/folder", "read") in paths["scope"]
+    assert (allowed.folder_id,) in paths["candidates"]
 
 
 class CustomTupleIn(TupleIn):
@@ -416,4 +431,241 @@ def test_unproved_tuple_identity_shapes_keep_general_proof(records, shape):
     elif shape == "xor":
         predicate ^= Q(pk=denied.pk)
     query = Post._base_manager.filter(predicate).query
-    assert read._exact_identity(Post, field.get_col(alias), query.where, "default") is None
+    assert read._known_identities(Post, field.get_col(alias), query.where, "default") is None
+
+
+@pytest.mark.parametrize("storage", ["denormalized", "registry"])
+def test_recursive_identity_sets_have_candidate_bounded_bytes_and_statements(storage, monkeypatch):
+    schema = """
+    definition auth/user {}
+    definition blog/folder {
+        relation parent: blog/folder // rebac:field=parent
+        relation viewer: auth/user
+        permission read = viewer + parent->read
+    }
+    definition blog/post {
+        relation folder: blog/folder // rebac:field=folder
+        permission read = folder->read
+    }
+    """
+    with override_settings(REBAC_LOCAL_BACKEND_STORAGE=storage):
+        local = install_schema(schema)
+        with sudo(reason="test.fixture"):
+            allowed_root = Folder.objects.create(name="allowed")
+            denied_root = Folder.objects.create(name="denied")
+            allowed_child = Folder.objects.create(name="allowed child", parent=allowed_root)
+            denied_child = Folder.objects.create(name="denied child", parent=denied_root)
+            allowed_leaf = Folder.objects.create(name="allowed leaf", parent=allowed_child)
+            denied_leaf = Folder.objects.create(name="denied leaf", parent=denied_child)
+            posts = Post.objects.bulk_create(
+                [
+                    Post(
+                        title=f"post {index}",
+                        folder=allowed_leaf if index % 2 == 0 else denied_leaf,
+                    )
+                    for index in range(100)
+                ]
+            )
+        local.write_relationships([RelationshipTuple(to_object_ref(allowed_root), "viewer", ALICE)])
+
+        bounded = []
+        original = read._scope_statement
+
+        def observed(operation, model, key, *args, **kwargs):
+            if model is Post and kwargs.get("candidates") is not None:
+                bounded.append(kwargs["candidates"])
+            return original(operation, model, key, *args, **kwargs)
+
+        monkeypatch.setattr(read, "_scope_statement", observed)
+        sizes: dict[int, tuple[int, int, int, int]] = {}
+        for size in (1, 5, 50):
+            ids = [post.pk for post in posts[:size]]
+            expected = [post.pk for post in posts[:size:2]]
+            with CaptureQueriesContext(connection) as point_queries:
+                for index, post in enumerate(posts[:size]):
+                    assert list(
+                        Post.objects.with_actor(ALICE)
+                        .filter(pk=post.pk)
+                        .values_list("pk", flat=True)
+                    ) == ([post.pk] if index % 2 == 0 else [])
+            with CaptureQueriesContext(connection) as set_queries:
+                assert (
+                    list(
+                        Post.objects.with_actor(ALICE)
+                        .filter(pk__in=ids)
+                        .order_by("pk")
+                        .values_list("pk", flat=True)
+                    )
+                    == expected
+                )
+            sizes[size] = (
+                len(point_queries),
+                sum(len(item["sql"].encode()) for item in point_queries),
+                len(set_queries),
+                len(set_queries[-1]["sql"].encode()),
+            )
+            assert bounded[-1] == tuple(ids)
+
+        # N separate points cost N statements/proofs. The one candidate-set
+        # proof adds only identity literals, not another policy graph per
+        # candidate or the collection's accessible-set enumeration.
+        assert sizes[5][0] == 5 * sizes[1][0]
+        assert sizes[50][0] == 50 * sizes[1][0]
+        assert abs(sizes[5][1] - 5 * sizes[1][1]) <= 100 * 5
+        assert abs(sizes[50][1] - 50 * sizes[1][1]) <= 100 * 50
+        assert sizes[1][2] == sizes[5][2] == sizes[50][2] == 1
+        assert 0 <= sizes[5][3] - sizes[1][3] <= 32 * (5 - 1)
+        assert 0 < sizes[50][3] - sizes[5][3] <= 32 * (50 - 5)
+
+        # The same candidate statement still observes a revocation on its
+        # next execution, including rows reached through the recursive parent.
+        local.delete_relationships(
+            RelationshipFilter(resource_type="blog/folder", resource_id=str(allowed_root.pk))
+        )
+        assert (
+            not Post.objects.with_actor(ALICE)
+            .filter(pk__in=[post.pk for post in posts[:5]])
+            .exists()
+        )
+
+
+@pytest.mark.parametrize("storage", ["denormalized", "registry"])
+def test_candidate_sql_bytes_do_not_follow_collection_or_group_count(storage):
+    schema = """
+    definition auth/user {}
+    definition auth/group { relation member: auth/user }
+    definition blog/folder {
+        relation parent: blog/folder // rebac:field=parent
+        relation viewer: auth/group#member
+        permission read = viewer + parent->read
+    }
+    definition blog/post {
+        relation folder: blog/folder // rebac:field=folder
+        permission read = folder->read
+    }
+    """
+    with override_settings(REBAC_LOCAL_BACKEND_STORAGE=storage):
+        local = install_schema(schema)
+        with sudo(reason="test.fixture"):
+            root = Folder.objects.create(name="root")
+            child = Folder.objects.create(name="child", parent=root)
+            posts = Post.objects.bulk_create(
+                [Post(title=f"p{i}", folder=child) for i in range(100)]
+            )
+        ids = [post.pk for post in posts[:50]]
+        sizes: dict[str, list[tuple[int, int]]] = {
+            "point": [],
+            "set1": [],
+            "set5": [],
+            "set50": [],
+        }
+        for stage in (0, 1, 2):
+            local.write_relationships(
+                [
+                    item
+                    for group_id in range(stage * 20, (stage + 1) * 20)
+                    for item in (
+                        RelationshipTuple(ObjectRef("auth/group", f"g{group_id}"), "member", ALICE),
+                        RelationshipTuple(
+                            to_object_ref(root),
+                            "viewer",
+                            SubjectRef.of("auth/group", f"g{group_id}", "member"),
+                        ),
+                    )
+                ]
+            )
+            if stage:
+                with sudo(reason="test.fixture"):
+                    Post.objects.bulk_create(
+                        [Post(title=f"extra {stage} {index}", folder=child) for index in range(200)]
+                    )
+            for shape, selected in (
+                ("point", ids[:1]),
+                ("set1", ids[:1]),
+                ("set5", ids[:5]),
+                ("set50", ids),
+            ):
+                scope = Post.objects.with_actor(ALICE)
+                scope = (
+                    scope.filter(pk=selected[0])
+                    if shape == "point"
+                    else scope.filter(pk__in=selected)
+                )
+                with CaptureQueriesContext(connection) as queries:
+                    assert list(scope.order_by("pk").values_list("pk", flat=True)) == selected
+                sizes[shape].append((len(queries), len(queries[-1]["sql"].encode())))
+        for measurements in sizes.values():
+            assert [statements for statements, _bytes in measurements] == [1, 1, 1]
+            assert measurements[0][1] == measurements[1][1] == measurements[2][1]
+
+
+@pytest.mark.parametrize("size", [read._CANDIDATE_LIMIT, read._CANDIDATE_LIMIT + 1, 17_000])
+def test_candidate_limit_falls_back_before_large_lists_double_bind(records, paths, size):
+    _local, allowed, _denied, _grant = records
+    ids = [allowed.pk, *range(allowed.pk + 2, allowed.pk + size + 1)]
+    assert list(Post.objects.with_actor(ALICE).filter(pk__in=ids).values_list("pk", flat=True)) == [
+        allowed.pk
+    ]
+    assert paths["candidates"][-1] == (tuple(ids) if size <= read._CANDIDATE_LIMIT else None)
+
+
+def test_distinct_candidate_lists_do_not_churn_the_shared_statement_cache(records):
+    _local, _allowed, _denied, _grant = records
+    read.reset()
+    before = len(read._statements)
+    for index in range(200):
+        list(
+            Post.objects.with_actor(ALICE)
+            .filter(pk__in=[index + 1, index + 1001])
+            .values_list("pk", flat=True)
+        )
+    assert len(read._statements) == before
+
+
+@pytest.mark.parametrize("storage", ["denormalized", "registry"])
+def test_shared_union_references_its_owner_plan_for_bounded_operands(storage):
+    schema = """
+    definition auth/user {}
+    definition auth/group { relation member: auth/user | auth/group#member }
+    definition blog/folder {
+        relation viewer: auth/group#member
+        permission read = viewer
+    }
+    definition blog/post {
+        relation folder: blog/folder // rebac:field=folder
+        permission read = folder->read
+    }
+    """
+    with override_settings(REBAC_LOCAL_BACKEND_STORAGE=storage):
+        local = install_schema(schema)
+        with sudo(reason="test.fixture"):
+            folder = Folder.objects.create(name="container")
+            posts = Post.objects.bulk_create(
+                [Post(title=f"post {index}", folder=folder) for index in range(20)]
+            )
+        group = ObjectRef("auth/group", "readers")
+        local.write_relationships(
+            [
+                RelationshipTuple(group, "member", ALICE),
+                RelationshipTuple(
+                    to_object_ref(folder),
+                    "viewer",
+                    SubjectRef.of("auth/group", "readers", "member"),
+                ),
+            ]
+        )
+        rows = Post.objects.with_actor(ALICE)
+        first = [post.pk for post in posts[:10]]
+        second = [post.pk for post in posts[10:]]
+        union = share_scoped_definitions(
+            rows.filter(pk__in=first)
+            .values_list("pk", flat=True)
+            .union(rows.filter(pk__in=second).values_list("pk", flat=True))
+        )
+        with CaptureQueriesContext(connection) as queries:
+            assert sorted(union) == [post.pk for post in posts]
+        sql = queries[-1]["sql"]
+        cte_names = set(re.findall(r'"(rebac_[a-z_]+_[0-9a-f]+[a-z0-9_]*)" AS \(', sql))
+        assert cte_names
+        assert all(sql.count(f'"{name}"') >= 2 for name in cte_names)
+        assert len(sql.encode()) < 12_000
