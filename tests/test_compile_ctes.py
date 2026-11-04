@@ -6,7 +6,7 @@ import re
 import pytest
 from django.contrib.contenttypes.models import ContentType
 from django.db import connection, models
-from django.db.models import F, Q, Subquery
+from django.db.models import Exists, F, OuterRef, Prefetch, Q, Subquery
 from django.test.utils import CaptureQueriesContext
 
 from rebac import (
@@ -14,6 +14,7 @@ from rebac import (
     ObjectRef,
     RelationshipTuple,
     SubjectRef,
+    decision_scope,
     sudo,
     to_object_ref,
 )
@@ -664,7 +665,7 @@ def test_shared_scope_keeps_point_and_literal_id_set_paths(shared_scope_rows):
         attached = handle.attach(inline)
         sql = str(attached.query)
         [name] = re.findall(r'"(rebac_scope_[^\"]+)" AS \(', sql)
-        assert sql.count(f'"{name}"') == 1
+        assert sql.count(f'"{name}"') > 1
         assert (
             list(attached.values_list("pk", flat=True))
             == list(inline.values_list("pk", flat=True))
@@ -948,6 +949,364 @@ def test_scope_cte_candidate_limit_and_empty_set_are_explicit():
         Folder.objects.with_actor(actor).filter(
             pk__in=list(range(1, SCOPE_CTE_CANDIDATE_LIMIT + 2))
         ).scope_cte()
+
+
+@pytest.fixture
+def late_shared_rows():
+    local = install_schema("""
+        definition auth/user {}
+        definition blog/folder {
+            relation owner: auth/user
+            relation viewer: auth/user
+            relation banned: auth/user
+            permission read = owner + viewer
+            permission write = owner
+            permission share = owner - banned
+        }
+    """)
+    actor = SubjectRef.of("auth/user", "late-shared")
+    with sudo(reason="late shared fixture"):
+        folders = [Folder.objects.create(name=f"late-{index}") for index in range(4)]
+        posts = [
+            Post.objects.create(title=f"late-{index}", folder=folder)
+            for index, folder in enumerate(folders)
+        ]
+    local.write_relationships(
+        [
+            RelationshipTuple(to_object_ref(folders[0]), "owner", actor),
+            RelationshipTuple(to_object_ref(folders[1]), "viewer", actor),
+            RelationshipTuple(to_object_ref(folders[2]), "owner", actor),
+            RelationshipTuple(to_object_ref(folders[2]), "banned", actor),
+        ]
+    )
+    return actor, folders, posts
+
+
+@pytest.fixture
+def late_reference_rows():
+    local = install_schema("""
+        definition auth/user {}
+        definition blog/folder {
+            relation owner: auth/user
+            relation viewer: auth/user
+            relation banned: auth/user
+            permission read = owner + viewer
+            permission write = owner
+            permission share = owner - banned
+        }
+    """)
+    actor = SubjectRef.of("auth/user", "late-reference")
+    with sudo(reason="late reference fixture"):
+        roots = [Folder.objects.create(name=f"root-{index}") for index in range(3)]
+        children = [
+            Folder.objects.create(name=f"child-{index}", parent=root)
+            for index, root in enumerate(roots)
+        ]
+    local.write_relationships(
+        [
+            *(RelationshipTuple(to_object_ref(root), "viewer", actor) for root in roots),
+            RelationshipTuple(to_object_ref(children[0]), "owner", actor),
+            RelationshipTuple(to_object_ref(children[1]), "viewer", actor),
+        ]
+    )
+    return actor, roots, children
+
+
+@pytest.mark.pg_delta
+@pytest.mark.parametrize("actions", [(), ("read", "write", "share")])
+@pytest.mark.parametrize("shape", ["exists", "in", "union", "aggregate"])
+def test_late_handle_reference_keeps_unbounded_definition(late_reference_rows, actions, shape):
+    actor, roots, children = late_reference_rows
+    handle = Folder.objects.with_actor(actor).scope_cte(actions=actions)
+    if shape == "exists":
+        outer = (
+            Folder._base_manager.filter(pk__in=[child.pk for child in children])
+            .annotate(parent_readable=Exists(handle.queryset().filter(pk=OuterRef("parent_id"))))
+            .order_by("pk")
+        )
+        expected = [(child.pk, True) for child in children]
+        fields = ("pk", "parent_readable")
+    elif shape == "in":
+        outer = Folder._base_manager.filter(
+            pk__in=[child.pk for child in children],
+            parent__in=handle.queryset().values("pk"),
+        ).order_by("pk")
+        expected = [(child.pk,) for child in children]
+        fields = ("pk",)
+    elif shape == "union":
+        first = Folder._base_manager.filter(pk=roots[0].pk).values("pk")
+        second = Folder._base_manager.filter(
+            pk__in=handle.queryset().values("pk"), name__startswith="child-"
+        ).values("pk")
+        outer = first.union(second)
+        expected = [(roots[0].pk,), (children[0].pk,), (children[1].pk,)]
+        fields = ("pk",)
+    else:
+        readable_children = Subquery(
+            Folder._base_manager.filter(
+                parent=OuterRef("pk"), pk__in=handle.queryset().values("pk")
+            )
+            .order_by()
+            .values("parent")
+            .annotate(n=models.Count("pk"))
+            .values("n")[:1]
+        )
+        outer = (
+            Folder._base_manager.filter(pk__in=[root.pk for root in roots])
+            .annotate(n=readable_children)
+            .order_by("pk")
+        )
+        expected = [(roots[0].pk, 1), (roots[1].pk, 1), (roots[2].pk, None)]
+        fields = ("pk", "n")
+    attached = handle.attach(outer)
+    sql = str(attached.query)
+    plan = next(
+        plan for plan in attached.query._rebac_shared_scopes if plan.cte.name == handle._name
+    )
+    assert plan.candidates is None
+    assert len(re.findall(rf'"{handle._name}" AS \(', sql)) == 1
+    assert list(attached.values_list(*fields)) == expected
+
+
+@pytest.mark.pg_delta
+@pytest.mark.parametrize("shape", ["pk_in", "none", "over_limit", "embedded"])
+def test_unbounded_handle_uses_final_statement_candidates(late_shared_rows, shape):
+    actor, folders, _posts = late_shared_rows
+    actions = ("read", "write", "share")
+    handle = Folder.objects.with_actor(actor).scope_cte(actions=actions)
+    outer = Folder._base_manager.annotate(
+        **{
+            f"can_{action}": permission_expression(Folder, action, actor=actor)
+            for action in actions
+        }
+    )
+    if shape == "embedded":
+        inner = Folder.objects.with_actor(actor).scoped_for_aggregate().filter(pk=OuterRef("pk"))
+        outer = outer.annotate(
+            admitted=Exists(inner),
+            admitted_id=Subquery(inner.order_by().values("pk")[:1]),
+        )
+    base = outer
+    attached = handle.attach(outer)
+    if shape in ("pk_in", "embedded"):
+        ids = [folders[0].pk, folders[3].pk]
+        attached = attached.filter(pk__in=ids)
+        outer = outer.filter(pk__in=ids)
+    elif shape == "over_limit":
+        ids = list(range(1, SCOPE_CTE_CANDIDATE_LIMIT + 2))
+        attached = attached.filter(pk__in=ids)
+        outer = outer.filter(pk__in=ids)
+    fields = ("pk", *(f"can_{action}" for action in actions))
+    if shape == "embedded":
+        fields += ("admitted", "admitted_id")
+    sql = str(attached.query)
+    plan = next(
+        plan for plan in attached.query._rebac_shared_scopes if plan.cte.name == handle._name
+    )
+    assert plan.candidates == (tuple(ids) if shape in ("pk_in", "embedded") else None)
+    assert len(re.findall(r'"rebac_scope_[^\"]+_closure" AS \(', sql)) == 1
+    assert list(attached.order_by("pk").values_list(*fields)) == list(
+        outer.order_by("pk").values_list(*fields)
+    )
+    if shape in ("pk_in", "embedded"):
+        denied = next(
+            row for row in attached.order_by("pk").values_list(*fields) if row[0] == folders[3].pk
+        )
+        assert denied[1:4] == (False, False, False)
+    if shape == "pk_in":
+        sibling = handle.attach(base.filter(pk=folders[2].pk))
+        assert list(sibling.values_list(*fields)) == list(
+            base.filter(pk=folders[2].pk).values_list(*fields)
+        )
+        str(sibling.query)
+        sibling_plan = next(
+            plan for plan in sibling.query._rebac_shared_scopes if plan.cte.name == handle._name
+        )
+        assert sibling_plan.candidates == (folders[2].pk,)
+        assert plan.candidates == tuple(ids)
+
+
+@pytest.mark.pg_delta
+def test_prefetch_tuple_in_specializes_handle_built_before_parent_rows(
+    late_shared_rows, monkeypatch
+):
+    actor, folders, posts = late_shared_rows
+    actions = ("read", "write", "share")
+    seen = []
+    original = read.attached_permission_plan
+
+    def record(*args):
+        seen.append(args[6])
+        return original(*args)
+
+    monkeypatch.setattr(read, "attached_permission_plan", record)
+
+    def related():
+        return Folder.objects.with_actor(actor).annotate(
+            **{
+                f"can_{action}": permission_expression(Folder, action, actor=actor)
+                for action in actions
+            }
+        )
+
+    roots = Post._base_manager.filter(pk__in=[posts[index].pk for index in (0, 1, 3)]).order_by(
+        "pk"
+    )
+    handle = Folder.objects.with_actor(actor).scope_cte(actions=actions)
+    attached = handle.attach(related())
+    assert seen == [None]
+
+    def prefetch(queryset):
+        with CaptureQueriesContext(connection) as captured:
+            page = list(roots.prefetch_related(Prefetch("folder", queryset=queryset)))
+        verdicts = [
+            (
+                getattr(post._state.fields_cache.get("folder"), "pk", None),
+                *(
+                    getattr(post._state.fields_cache.get("folder"), f"can_{action}", None)
+                    for action in actions
+                ),
+            )
+            for post in page
+        ]
+        return verdicts, captured.captured_queries[-1]["sql"]
+
+    expected, _ = prefetch(related())
+    actual, sql = prefetch(attached)
+    assert actual == expected
+    assert actual[-1] == (None, None, None, None)
+    assert tuple(folders[index].pk for index in (0, 1, 3)) in seen
+    assert len(re.findall(r'"rebac_scope_[^\"]+_closure" AS \(', sql)) == 1
+
+
+@pytest.mark.pg_delta
+def test_prefetch_tuple_in_ignores_null_foreign_keys(late_shared_rows, monkeypatch):
+    actor, folders, posts = late_shared_rows
+    with sudo(reason="nullable prefetch fixture"):
+        null_post = Post.objects.create(title="null-folder", folder=None)
+    seen = []
+    original = read.attached_permission_plan
+
+    def record(*args):
+        seen.append(args[6])
+        return original(*args)
+
+    monkeypatch.setattr(read, "attached_permission_plan", record)
+    handle = Folder.objects.with_actor(actor).scope_cte(actions=("read", "write", "share"))
+    related = handle.attach(
+        Folder.objects.with_actor(actor).annotate(
+            can_read=permission_expression(Folder, "read", actor=actor)
+        )
+    )
+    roots = Post._base_manager.filter(pk__in=[posts[0].pk, posts[3].pk, null_post.pk]).order_by(
+        "pk"
+    )
+    with CaptureQueriesContext(connection) as captured:
+        page = list(roots.prefetch_related(Prefetch("folder", queryset=related)))
+    assert len(captured) == 2
+    assert [(post.folder_id, post._state.fields_cache["folder"]) for post in page][-1] == (
+        None,
+        None,
+    )
+    assert page[0].folder.can_read is True
+    assert page[1].folder is None
+    assert (folders[0].pk, folders[3].pk) in seen
+
+
+@pytest.mark.pg_delta
+def test_single_action_prefetch_uses_shared_bounded_scope_bytes(late_shared_rows):
+    actor, _folders, posts = late_shared_rows
+    roots = Post._base_manager.filter(pk__in=[post.pk for post in posts]).order_by("pk")
+
+    def run(shared):
+        related = Folder.objects.with_actor(actor).annotate(
+            can_read=permission_expression(Folder, "read", actor=actor)
+        )
+        if shared:
+            related = Folder.objects.with_actor(actor).scope_cte().attach(related)
+        with CaptureQueriesContext(connection) as captured:
+            page = list(roots.prefetch_related(Prefetch("folder", queryset=related)))
+        return captured, [(post.pk, post.folder and post.folder.can_read) for post in page]
+
+    inline_queries, expected = run(False)
+    shared_queries, actual = run(True)
+    assert actual == expected
+    assert len(inline_queries) == len(shared_queries) == 2
+    assert len(shared_queries[-1]["sql"].encode()) < len(inline_queries[-1]["sql"].encode())
+
+
+@pytest.mark.pg_delta
+def test_single_action_handle_uses_final_statement_candidates(late_shared_rows):
+    actor, folders, _posts = late_shared_rows
+    handle = Folder.objects.with_actor(actor).scope_cte()
+    outer = Folder._base_manager.annotate(
+        can_read=permission_expression(Folder, "read", actor=actor)
+    )
+    ids = [folders[0].pk, folders[3].pk]
+    attached = handle.attach(outer).filter(pk__in=ids)
+    sql = str(attached.query)
+    plan = next(
+        plan for plan in attached.query._rebac_shared_scopes if plan.cte.name == handle._name
+    )
+    assert plan.candidates == tuple(ids)
+    assert len(re.findall(r'"rebac_scope_[^\"]+" AS \(', sql)) == 1
+    assert list(attached.order_by("pk").values_list("pk", "can_read")) == list(
+        outer.filter(pk__in=ids).order_by("pk").values_list("pk", "can_read")
+    )
+    assert (folders[3].pk, False) in list(attached.values_list("pk", "can_read"))
+
+
+@pytest.mark.pg_delta
+def test_late_bounded_closure_keeps_embedded_decisions_self_contained():
+    local = install_schema("""
+        definition auth/user {}
+        definition auth/group { relation member: auth/user | auth/group#member }
+        definition blog/folder {
+            relation viewer: auth/group#member
+            permission read = viewer
+        }
+        definition blog/post {
+            relation folder: blog/folder // rebac:field=folder
+            relation viewer: auth/user
+            permission read = folder->read
+            permission write = viewer
+        }
+    """)
+    actor = SubjectRef.of("auth/user", "late-embedded")
+    group = ObjectRef("auth/group", "late-embedded")
+    with sudo(reason="late embedded fixture"):
+        folder = Folder.objects.create(name="late-embedded")
+        post = Post.objects.create(title="late-embedded", folder=folder)
+    local.write_relationships(
+        [
+            RelationshipTuple(group, "member", actor),
+            RelationshipTuple(to_object_ref(folder), "viewer", SubjectRef(group, "member")),
+            RelationshipTuple(to_object_ref(post), "viewer", actor),
+        ]
+    )
+    handle = Post.objects.with_actor(actor).scope_cte(actions=("read", "write"))
+    inner = Post.objects.with_actor(actor).scoped_for_aggregate().filter(pk=OuterRef("pk"))
+    outer = Post._base_manager.annotate(
+        can_read=permission_expression(Post, "read", actor=actor),
+        can_write=permission_expression(Post, "write", actor=actor),
+        admitted=Exists(inner),
+        admitted_id=Subquery(inner.order_by().values("pk")[:1]),
+    )
+    with decision_scope():
+        assert list(Post.objects.with_actor(actor).values_list("pk", flat=True)) == [post.pk]
+        attached = handle.attach(outer).filter(pk__in=[post.pk])
+        with CaptureQueriesContext(connection) as captured:
+            actual = list(
+                attached.values_list("pk", "can_read", "can_write", "admitted", "admitted_id")
+            )
+    sql = captured.captured_queries[-1]["sql"]
+    assert actual == [(post.pk, True, True, True, post.pk)]
+    assert len(re.findall(r'"rebac_scope_[^\"]+_closure" AS \(', sql)) == 1
+    decided = set(re.findall(r'"(rebac_decided_[^\"]+)"', sql))
+    defined = set(re.findall(r'"(rebac_decided_[^\"]+)" AS \(', sql))
+    assert decided <= defined
+    if connection.vendor == "postgresql":
+        assert "= ANY(" in sql
 
 
 @pytest.mark.pg_delta
@@ -1352,3 +1711,58 @@ def test_policy_revision_mismatch_compiles_each_union_scope_self_contained():
     unioned = share_scoped_definitions(old.union(current, all=True))
     assert getattr(unioned.query, "_rebac_subject_plan", None) is None
     assert list(unioned.values_list("pk", flat=True)) == [post.pk]
+
+
+_UNION_OPERAND_SCHEMA = """
+definition auth/user {}
+definition blog/folder {
+  relation owner: auth/user
+  relation viewer: auth/user
+  relation banned: auth/user
+  permission read = owner + viewer
+  permission write = owner
+  permission share = owner - banned
+}
+"""
+
+
+@pytest.mark.django_db
+@pytest.mark.pg_delta
+def test_union_owner_keeps_an_attached_operand_from_re_specializing():
+    """A union whose other operand reads ``handle.queryset()`` stays unbounded.
+
+    The union owner decides for its operands: the attached first operand must not
+    carry its late scope into the compound statement, which rendered a nested
+    ``WITH`` on SQLite and would narrow the reference's rows on both backends.
+    """
+
+    actor = SubjectRef.of("auth/user", "union-operand")
+    actions = ("read", "write", "share")
+    local = install_schema(_UNION_OPERAND_SCHEMA)
+    with sudo(reason="test.union_operand"):
+        tops = [Folder.objects.create(name=f"t{n}") for n in range(3)]
+        mids = [Folder.objects.create(name=f"m{n}", parent=tops[n]) for n in range(3)]
+        kids = [Folder.objects.create(name=f"k{n}", parent=mids[n]) for n in range(3)]
+    local.write_relationships(
+        [RelationshipTuple(to_object_ref(folder), "viewer", actor) for folder in tops]
+        + [
+            RelationshipTuple(to_object_ref(mids[0]), "owner", actor),
+            RelationshipTuple(to_object_ref(mids[1]), "viewer", actor),
+            RelationshipTuple(to_object_ref(kids[0]), "owner", actor),
+        ]
+    )
+    readable = set(Folder.objects.with_actor(actor).values_list("pk", flat=True))
+    kid_ids = [kid.pk for kid in kids]
+    handle = Folder.objects.with_actor(actor).scope_cte(actions=actions)
+    reference = handle.queryset()
+    projected = Folder._base_manager.filter(pk__in=kid_ids).annotate(
+        **{
+            f"can_{action}": permission_expression(Folder, action, actor=actor)
+            for action in actions
+        }
+    )
+    other = Folder._base_manager.filter(
+        pk__in=reference.values("pk"), name__startswith="m"
+    ).values_list("pk", flat=True)
+    got = sorted(handle.attach(projected).values_list("pk", flat=True).union(other))
+    assert got == sorted(set(kid_ids) | {mid.pk for mid in mids if mid.pk in readable})

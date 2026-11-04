@@ -29,6 +29,7 @@ from django.db.models.sql import Query
 from django.db.models.sql.subqueries import UpdateQuery
 from django.db.models.sql.where import ExtraWhere, NothingNode, WhereNode
 from django_cte import CTE, with_cte
+from django_cte.jitmixin import jit_mixin
 
 from ._id import resource_id_attr
 from .actors import (
@@ -102,13 +103,43 @@ class SharedScope[M: models.Model]:
         """Attach one fresh definition to a read statement, leaving its input untouched."""
         if outer_queryset.db != self._using:
             raise ValueError("A shared scope and its statement must use the same database alias")
-        if self._actions:
-            return self._attach_permissions(outer_queryset)
-        return self._attach_single_action(outer_queryset)
+        result = outer_queryset.all()
+        ctes, plan = self._definition(self._candidates)
+        _replace_shared_definition(result.query, ctes, plan)
+        if self._candidates is None:
+            query = cast(Any, result.query)
+            query._rebac_late_scopes = (
+                *tuple(
+                    scope
+                    for scope in getattr(query, "_rebac_late_scopes", ())
+                    if scope._name != self._name
+                ),
+                self,
+            )
+            jit_mixin(query, _LateSharedScopeQuery)
+        return result
 
-    def _attach_single_action[T: models.Model](
-        self, outer_queryset: models.QuerySet[T]
-    ) -> models.QuerySet[T]:
+    def _definition(self, candidates: tuple[int, ...] | None) -> tuple[tuple[CTE, ...], Any]:
+        if self._actions:
+            from .compile.read import attached_permission_plan
+
+            built = attached_permission_plan(
+                self._model,
+                self._actor,
+                self._actions,
+                self._using,
+                self._backend,
+                self._columns,
+                candidates,
+                self._name,
+            )
+            if built is not None:
+                return built
+        return self._single_action_definition(candidates)
+
+    def _single_action_definition(
+        self, candidates: tuple[int, ...] | None
+    ) -> tuple[tuple[CTE, ...], Any]:
         from .compile.read import attached_scope_plan
 
         body: models.QuerySet[Any] = (
@@ -119,8 +150,8 @@ class SharedScope[M: models.Model]:
             .order_by()
             .values(*self._columns)
         )
-        if self._candidates is not None:
-            body = body.filter(**{f"{resource_id_attr(self._model)}__in": self._candidates})
+        if candidates is not None:
+            body = body.filter(**{f"{resource_id_attr(self._model)}__in": candidates})
         from .evaluator import current_evaluator
 
         evaluator = current_evaluator()
@@ -140,63 +171,77 @@ class SharedScope[M: models.Model]:
             self._using,
             self._backend,
             self._columns,
-            self._candidates,
+            candidates,
         )
-        result = outer_queryset.all()
-        query = result.query
-        if not any(existing.name == self._name for existing in getattr(query, "_with_ctes", ())):
-            result = with_cte(cte, select=result)
-            query = result.query
-        else:
-            cast(Any, query)._with_ctes = tuple(
-                cte if existing.name == self._name else existing
-                for existing in cast(Any, query)._with_ctes
-            )
-        scopes = tuple(getattr(query, "_rebac_shared_scopes", ()))
-        scopes = (*tuple(scope for scope in scopes if scope.cte.name != self._name), plan)
-        _isolate_statement_queries(query, scopes, self._name)
-        return result
+        return (cte,), plan
 
-    def _attach_permissions[T: models.Model](
-        self, outer_queryset: models.QuerySet[T]
-    ) -> models.QuerySet[T]:
-        from .compile.read import attached_permission_plan
 
-        built = attached_permission_plan(
-            self._model,
-            self._actor,
-            self._actions,
-            self._using,
-            self._backend,
-            self._columns,
-            self._candidates,
-            self._name,
+def _replace_shared_definition(query: Query, ctes: tuple[CTE, ...], plan: Any) -> None:
+    old_scopes: tuple[Any, ...] = tuple(getattr(query, "_rebac_shared_scopes", ()))
+    old_owned = {
+        name
+        for scope in old_scopes
+        if scope.cte.name == plan.cte.name
+        for name in (*scope.owned_ctes, scope.cte.name)
+    }
+    names = {cte.name for cte in ctes} | old_owned
+    if not hasattr(query, "_with_ctes"):
+        with_cte(*ctes, select=models.QuerySet(model=query.model, query=query))
+    else:
+        cast(Any, query)._with_ctes = (
+            tuple(cte for cte in cast(Any, query)._with_ctes if cte.name not in names) + ctes
         )
-        if built is None:
-            return self._attach_single_action(outer_queryset)
-        ctes, plan = built
-        result = outer_queryset.all()
-        query = result.query
-        existing = tuple(getattr(query, "_with_ctes", ()))
-        old_scopes: tuple[Any, ...] = tuple(getattr(query, "_rebac_shared_scopes", ()))
-        old_owned = {
-            name
-            for scope in old_scopes
-            if scope.cte.name == self._name
-            for name in scope.owned_ctes
-        }
-        names = {cte.name for cte in ctes} | old_owned
-        if not any(cte.name == self._name for cte in existing):
-            result = with_cte(*ctes, select=result)
-            query = result.query
-        else:
-            cast(Any, query)._with_ctes = (
-                tuple(cte for cte in existing if cte.name not in names) + ctes
-            )
-        scopes = tuple(getattr(query, "_rebac_shared_scopes", ()))
-        scopes = (*tuple(scope for scope in scopes if scope.cte.name != self._name), plan)
-        _isolate_statement_queries(query, scopes, tuple(names))
-        return result
+    scopes = (*tuple(scope for scope in old_scopes if scope.cte.name != plan.cte.name), plan)
+    _isolate_statement_queries(query, scopes, tuple(names))
+
+
+def _references_cte(query: Query, name: str) -> bool:
+    """Whether a caller-built reference reads this CTE in the statement."""
+    for part in (query, *_nested_queries(query)):
+        if any(getattr(join, "table_name", None) == name for join in part.alias_map.values()):
+            return True
+    return False
+
+
+class _LateSharedScopeQuery:
+    """Specialize an unbounded handle from the final statement predicate."""
+
+    _jit_mixin_prefix = "RebacLate"
+
+    def get_compiler(self, *args: Any, **kwargs: Any) -> Any:
+        from .compile.read import statement_candidate_ids
+
+        connection = kwargs.get("connection")
+        using = kwargs.get("using") or (args[0] if args else None)
+        if using is None and connection is not None:
+            using = connection.alias
+        owned = {handle._name for handle in getattr(self, "_rebac_late_scopes", ())}
+        for part in getattr(self, "combined_queries", ()):
+            # The union owner decides for its operands; an operand never re-specializes.
+            late = getattr(part, "_rebac_late_scopes", ())
+            if late:
+                part._rebac_late_scopes = tuple(h for h in late if h._name not in owned)
+        if using is not None:
+            for handle in getattr(self, "_rebac_late_scopes", ()):
+                if using != handle._using:
+                    continue
+                candidates = (
+                    None
+                    if _references_cte(cast(Query, self), handle._name)
+                    else statement_candidate_ids(handle._model, self, using)
+                )
+                plan = next(
+                    (
+                        item
+                        for item in getattr(self, "_rebac_shared_scopes", ())
+                        if item.cte.name == handle._name
+                    ),
+                    None,
+                )
+                if plan is not None and plan.candidates != candidates:
+                    ctes, replacement = handle._definition(candidates)
+                    _replace_shared_definition(cast(Query, self), ctes, replacement)
+        return cast(Any, super()).get_compiler(*args, **kwargs)
 
 
 def share_scoped_definitions[T: models.Model](

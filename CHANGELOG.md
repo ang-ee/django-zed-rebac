@@ -78,6 +78,17 @@ pre-1.0; breaking changes within a minor version are explicitly called out.
 
 ### Changed
 
+- An unfiltered `scope_cte()` handle now binds its attached definition to a
+  mandatory native identity predicate found on the final statement, including
+  Django's multi-row forward-FK prefetch `TupleIn`. NULL FK values are ignored,
+  matching Django's rendered lookup. The same 256-ID limit and
+  canonical-integer proof apply. Statements without a bounded proof, or with
+  a caller reference to the handle's identity CTE, keep the existing unbounded
+  definition; explicit bounded handles keep their original validation. This
+  lets a prefetch queryset attach a single- or multi-action handle before
+  its parent rows are fetched. The TupleIn proof also applies to ordinary
+  scoped forward-FK prefetches: the related read can take the candidate-root
+  path, reducing the measured 5/50-row page from four statements to two.
 - Embedded `sudo()` and `system_context()` querysets now emit one bypass audit
   row per distinct `(entry, reason)` pair per enclosing statement execution.
   Reusing an entry in several subqueries no longer multiplies rows; later

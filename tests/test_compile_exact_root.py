@@ -75,7 +75,19 @@ def _tuple_in(model, rhs):
 
 
 @pytest.mark.parametrize(
-    "shape", ["pk", "id", "exact", "in", "in_tuple", "tuple_in", "tuple_in_lists", "and", "chain"]
+    "shape",
+    [
+        "pk",
+        "id",
+        "exact",
+        "in",
+        "in_tuple",
+        "tuple_in",
+        "tuple_in_lists",
+        "tuple_in_multi",
+        "and",
+        "chain",
+    ],
 )
 def test_native_identity_selectors_use_candidate_sql_and_preserve_denial(records, paths, shape):
     _local, allowed, denied, _grant = records
@@ -89,6 +101,7 @@ def test_native_identity_selectors_use_candidate_sql_and_preserve_denial(records
             "in_tuple": Q(pk__in=(row.pk,)),
             "tuple_in": Q(_tuple_in(Post, [(row.pk,)])),
             "tuple_in_lists": Q(_tuple_in(Post, ([row.pk],))),
+            "tuple_in_multi": Q(_tuple_in(Post, [(allowed.pk,), (denied.pk,)])),
             "and": Q(pk=row.pk) & (Q(title="allowed") | Q(title="denied")),
             "chain": Q(title=row.title),
         }
@@ -96,12 +109,15 @@ def test_native_identity_selectors_use_candidate_sql_and_preserve_denial(records
         if shape == "chain":
             selected = selected.filter(pk=row.pk)
         assert list(selected.values_list("pk", flat=True)) == (
-            [allowed.pk] if row is allowed else []
+            [allowed.pk] if shape == "tuple_in_multi" or row is allowed else []
         )
     assert ("blog/post", "read") not in paths["point"]
     assert ("blog/post", "read") in paths["scope"]
-    assert (allowed.pk,) in paths["candidates"]
-    assert (denied.pk,) in paths["candidates"]
+    if shape == "tuple_in_multi":
+        assert (allowed.pk, denied.pk) in paths["candidates"]
+    else:
+        assert (allowed.pk,) in paths["candidates"]
+        assert (denied.pk,) in paths["candidates"]
 
 
 @pytest.mark.parametrize("operation", ["get", "exists", "count", "in_bulk"])
@@ -386,7 +402,7 @@ class CustomColPairs(ColPairs):
         "xor",
     ],
 )
-def test_unproved_tuple_identity_shapes_keep_general_proof(records, shape):
+def test_tuple_identity_shapes_use_only_proven_candidates(records, shape):
     _local, allowed, denied, _grant = records
     field = Post._meta.pk
     alias = Post._meta.db_table
@@ -429,7 +445,8 @@ def test_unproved_tuple_identity_shapes_keep_general_proof(records, shape):
     elif shape == "xor":
         predicate ^= Q(pk=denied.pk)
     query = Post._base_manager.filter(predicate).query
-    assert read._known_identities(Post, field.get_col(alias), query.where, "default") is None
+    found = read._known_identities(Post, field.get_col(alias), query.where, "default")
+    assert found == ((allowed.pk, denied.pk) if shape == "multirow" else None)
 
 
 @pytest.mark.parametrize("storage", ["denormalized", "registry"])
