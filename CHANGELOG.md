@@ -15,6 +15,15 @@ pre-1.0; breaking changes within a minor version are explicitly called out.
 
 ### Added
 
+- `RebacQuerySet.scope_cte() -> SharedScope` provides a statement-local
+  identity CTE for an unfiltered actor scope. `SharedScope.queryset()` returns
+  plain Django identity rows for repeated filters, annotations, `Exists`
+  guards and aggregates; `SharedScope.attach(queryset)` defines the scope once
+  on a read statement's owner (the union owner for unions), without changing
+  the input queryset. Each attachment gets a fresh policy and caveat pin;
+  matching permission projections and nested scope guards reuse the definition
+  only with the same shareable policy and verdicts. Exact identities retain
+  their point form; literal ID sets remain eligible for bounded compilation.
 - Exported `is_sudo()` from `rebac` to report the ambient sudo scope.
 - `LocalBackend.held()` checks a bounded set of candidate IDs through the
   compiled read path. Absent canonical IDs are point-checked in one batch;

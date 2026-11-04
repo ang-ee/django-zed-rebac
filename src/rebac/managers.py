@@ -16,7 +16,9 @@ from __future__ import annotations
 import re
 from collections import Counter
 from collections.abc import AsyncIterator, Collection, Iterable, Iterator
+from copy import copy
 from enum import Enum, auto
+from secrets import token_hex
 from typing import TYPE_CHECKING, Any, ClassVar, Self, TypeVar, cast, overload
 
 from asgiref.sync import sync_to_async
@@ -24,6 +26,7 @@ from django.db import connections, models
 from django.db.models.expressions import Col, RawSQL
 from django.db.models.sql import Query
 from django.db.models.sql.where import ExtraWhere, NothingNode, WhereNode
+from django_cte import CTE, with_cte
 
 from ._id import resource_id_attr
 from .actors import (
@@ -54,7 +57,80 @@ from .types import FieldDenyMode, SubjectRef
 _M = TypeVar("_M", bound=models.Model)
 
 if TYPE_CHECKING:
+    from .backends.local import LocalBackend
     from .mixins import RebacMixin
+
+
+class SharedScope[M: models.Model]:
+    """One actor scope defined once and referenced within an ORM statement."""
+
+    def __init__(
+        self,
+        model: type[M],
+        actor: SubjectRef,
+        action: str,
+        using: str,
+        backend: LocalBackend,
+        columns: tuple[str, ...],
+    ) -> None:
+        self._model = model
+        self._actor = actor
+        self._action = action
+        self._using = using
+        self._backend = backend
+        self._columns = columns
+        self._name = f"rebac_scope_{token_hex(8)}"
+        # This CTE supplies column metadata to references. Its query is never
+        # attached or resolved; each attach builds a fresh authorized body.
+        self._reference = CTE(
+            models.QuerySet(model=model, using=using).values(*columns), name=self._name
+        )
+
+    def queryset(self) -> models.QuerySet[Any]:
+        """Return a plain values queryset of authorized row identities."""
+        from .compile.read import identity_cte_queryset
+
+        return identity_cte_queryset(self._reference, self._model, self._using, self._columns)
+
+    def attach[T: models.Model](self, outer_queryset: models.QuerySet[T]) -> models.QuerySet[T]:
+        """Attach one fresh definition to a read statement, leaving its input untouched."""
+        from .compile.read import attached_scope_plan
+
+        if outer_queryset.db != self._using:
+            raise ValueError("A shared scope and its statement must use the same database alias")
+        body: models.QuerySet[Any] = (
+            RebacQuerySet(model=self._model, using=self._using)
+            .with_actor(self._actor)
+            .with_action(self._action)
+            .scoped_for_aggregate()
+            .order_by()
+            .values(*self._columns)
+        )
+        cte = CTE(body, name=self._name)
+        plan = attached_scope_plan(
+            cte,
+            body,
+            self._model,
+            self._actor,
+            self._action,
+            self._using,
+            self._backend,
+            self._columns,
+        )
+        result = outer_queryset.all()
+        query = result.query
+        if not any(existing.name == self._name for existing in getattr(query, "_with_ctes", ())):
+            result = with_cte(cte, select=result)
+            query = result.query
+        else:
+            cast(Any, query)._with_ctes = tuple(
+                cte if existing.name == self._name else existing
+                for existing in cast(Any, query)._with_ctes
+            )
+        scopes = tuple(getattr(query, "_rebac_shared_scopes", ()))
+        scopes = (*tuple(scope for scope in scopes if scope.cte.name != self._name), plan)
+        _isolate_statement_queries(query, scopes, self._name)
+        return result
 
 
 def share_scoped_definitions[T: models.Model](
@@ -221,6 +297,57 @@ def _nested_queries(expression: Any, *, boolean_operands_only: bool = False) -> 
             yield part
         if part is not None:
             yield from _nested_queries(part, boolean_operands_only=boolean_operands_only)
+
+
+def _isolate_statement_queries(query: Query, plans: tuple[Any, ...], shared_name: str) -> None:
+    """Clone nested queries before adding statement-local sharing metadata.
+
+    Django clones WHERE leaves and annotations shallowly. Replacing those
+    leaves here keeps the input queryset and sibling statements independent.
+    A nested use of the same handle references the outer WITH definition.
+    """
+    nested = tuple({id(part): part for part in _nested_queries(query)}.values())
+    clones = {id(part): (part, part.clone()) for part in nested}
+
+    class Replacements:
+        def __bool__(self) -> bool:
+            return bool(clones)
+
+        def get(self, value: Any) -> Any:
+            found = clones.get(id(value))
+            return found[1] if found is not None and found[0] is value else None
+
+    replacements = Replacements()
+
+    def replace(value: Any) -> Any:
+        method = getattr(value, "replace_expressions", None)
+        return method(replacements) if callable(method) else value
+
+    for part in (*reversed(tuple(clone for _original, clone in clones.values())), query):
+        part.where = replace(part.where)
+        part.annotations = {name: replace(value) for name, value in part.annotations.items()}
+        part.select = tuple(replace(value) for value in part.select)
+        part.order_by = tuple(replace(value) for value in part.order_by)
+        if isinstance(part.group_by, tuple):
+            part.group_by = tuple(replace(value) for value in part.group_by)
+        for alias, join in tuple(part.alias_map.items()):
+            relation = getattr(join, "filtered_relation", None)
+            condition = getattr(relation, "resolved_condition", None)
+            if condition is not None:
+                new_join = copy(join)
+                new_relation = cast(Any, copy(relation))
+                new_relation.resolved_condition = replace(condition)
+                new_join.filtered_relation = new_relation
+                part.alias_map[alias] = new_join
+        if part.combined_queries:
+            part.combined_queries = tuple(
+                replacements.get(child) or child for child in part.combined_queries
+            )
+        if part is not query and hasattr(part, "_with_ctes"):
+            cast(Any, part)._with_ctes = tuple(
+                cte for cte in cast(Any, part)._with_ctes if cte.name != shared_name
+            )
+        cast(Any, part)._rebac_shared_scopes = plans
 
 
 class _Readable(models.Case):
@@ -1166,6 +1293,28 @@ class RebacQuerySet(TrackedQuerySet[_M]):
         clone._rebac_aggregate_scope = True
         clone._reset_scope()
         return clone.scoped()
+
+    def scope_cte(self) -> SharedScope[_M]:
+        """Make a statement-local CTE of this unfiltered actor scope's identities."""
+        from .backends import backend
+
+        unscoped = _without_query_scope(self.query)
+        if (
+            unscoped.where.children
+            or unscoped.annotations
+            or unscoped.combined_queries
+            or unscoped.is_sliced
+        ):
+            raise ValueError("scope_cte() requires an unfiltered, unsliced queryset")
+        actor, bypass = self.effective_actor(strict=True)
+        if bypass or actor is None:
+            raise ValueError("scope_cte() requires an actor scope")
+        action = str(
+            self._rebac_action or getattr(self.model._meta, "rebac_default_action", "read")
+        )
+        identity = resource_id_attr(self.model)
+        columns = tuple(dict.fromkeys(("pk", identity)))
+        return SharedScope(self.model, actor, action, self.db, backend(), columns)
 
     def _reset_scope(self) -> None:
         # QuerySet.query's public setter switches values_list() to ValuesIterable
@@ -2205,6 +2354,8 @@ class RebacManager[M: models.Model](_RebacManagerBase[M]):  # pyright: ignore[re
         def scoped(self) -> RebacQuerySet[M]: ...
 
         def scoped_for_aggregate(self) -> RebacQuerySet[M]: ...
+
+        def scope_cte(self) -> SharedScope[M]: ...
 
         def actor(self) -> SubjectRef | None: ...
 

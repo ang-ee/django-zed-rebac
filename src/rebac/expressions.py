@@ -25,8 +25,10 @@ def permission_expression(
     the query's model, its physical proxy equivalent, or an MTI ancestor.
     Denied, conditional and SQL NULL answers are false. No rows are fetched at
     construction. Normally the policy binds during SQL compilation. A
-    compatible union owner prepares this projection earlier under its pinned
-    policy. This differs from the early-pinned ``queryset_filter`` API.
+    compatible union owner may prepare this projection earlier. An attached
+    shared scope is reused only when its policy and caveat state match the
+    projection at compilation. This differs from the early-pinned
+    ``queryset_filter`` API.
     """
     if not action:
         raise ValueError("permission_expression() requires an action")
@@ -90,6 +92,7 @@ class _Permission(models.Expression):
 
     def as_sql(self, compiler: Any, connection: Any) -> Any:
         from .backends import backend
+        from .compile.read import matching_shared_scope
         from .managers import RebacQuerySet
 
         if self.row_model is None:
@@ -104,15 +107,21 @@ class _Permission(models.Expression):
                 else None
             )
             condition: BaseExpression | None = shared
-            if condition is None:
-                active = backend()
-                if self.row_model._meta.concrete_model is self.model._meta.concrete_model:
-                    condition = active.permission_expression(
-                        model=self.model,
-                        subject=self.actor,
-                        action=self.action,
-                        using=using,
-                        identity=self.identity,
+            if (
+                condition is None
+                and self.row_model._meta.concrete_model is self.model._meta.concrete_model
+            ):
+                condition = backend().permission_expression(
+                    model=self.model,
+                    subject=self.actor,
+                    action=self.action,
+                    using=using,
+                    identity=self.identity,
+                )
+                shared_scope = matching_shared_scope(compiler.query, condition, using)
+                if shared_scope is not None:
+                    condition = models.Exists(
+                        shared_scope.queryset().filter(pk=models.OuterRef("pk"))
                     )
             if condition is None:
                 rows = self.model._default_manager.all().using(using)

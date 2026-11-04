@@ -1663,6 +1663,26 @@ actors continue to override ambient sudo. Cloning or changing actor/action must
 never retain a stale scope predicate. Boolean and SQL set combinations retain
 the left queryset actor/action policy across all operands; rebinding replaces
 the restriction on each operand without mutating the original querysets.
+
+`RebacQuerySet.scope_cte()` requires an unfiltered actor-scoped queryset and
+returns a `SharedScope` handle. `SharedScope.queryset()` is a plain Django
+`values()` queryset over the scope's identity CTE, suitable for repeated
+filters, `Exists` guards, annotations and aggregates. `SharedScope.attach(outer_queryset)`
+attaches a fresh definition once to a read statement and returns a clone without
+changing the input. Attach after constructing references and before execution;
+for a union, attach to the union owner rather than an operand. Matching
+`permission_expression()` projections and nested queryset scope guards read
+the CTE's identity set only when actor, action, resource model, alias, backend,
+policy and caveat verdicts agree and the scope has no render-time caveat or
+clock decision. Otherwise they keep their own inline predicates. Exact
+identities retain their point form; literal ID sets stay on the compiler's
+identity path so the bounded form can take precedence when available. The CTE
+captures
+policy and caveat verdicts afresh at each `attach()`; its row and relationship
+checks execute in the statement. Only identity
+columns are available from its plain reference queryset; field projection and
+join authorization remain the caller's responsibility.
+
 Boolean combinations require REBAC querysets so empty-query fast paths cannot
 return a plain unscoped manager. Django's bounded primary-key subqueries for
 sliced Boolean operands inherit the combination's actor/action, including on
@@ -1970,12 +1990,32 @@ reach, and the global backend is the scopes' backend. At render, the database
 alias must also equal the owner's alias. A shared projection uses the owner's
 pinned policy, decided sets and witness gate. Other permission expressions bind
 during SQL compilation; their late scopes cannot join an already emitted
-`WITH` clause and compile self-contained predicates.
-Separate nested queries retain separate definitions. A plain Django union can
+`WITH` clause and compile self-contained predicates unless the caller attached
+a compatible `SharedScope` before compilation. Without that explicit owner,
+separate nested queries retain separate definitions. A plain Django union can
 explicitly hoist compatible prepared operands with
 `share_scoped_definitions()`. No connection-wide registry is involved. Empty
 subject sets fold to false before a CTE is attached, so an empty negated arm
 cannot empty the enclosing statement.
+
+For ordinary statements, `scope_cte()` gives the caller an explicit CTE owner.
+Its references carry only the identity set, so each reference contributes a
+small membership or `Exists` expression rather than another permission proof.
+The owner registers matching projections and resolved nested scope guards on
+isolated query clones in the statement. The fresh CTE body has the same inline
+scope proof and revision fence as an unattached queryset; a nested resolution
+may prepare bounded decisions and their witnesses for that statement. Reusing
+the handle in another statement builds another body. Sharing does not cross
+statement or database boundaries.
+
+```python
+scope = Folder.objects.with_actor(actor).scope_cte()
+ids = scope.queryset().values("pk")
+rows = Post._base_manager.filter(folder_id__in=ids).annotate(
+    folder_readable=Exists(scope.queryset().filter(pk=OuterRef("folder_id"))),
+)
+rows = scope.attach(rows)
+```
 
 Queryset scopes pin the policy and caveat verdicts when the scope is built.
 Rendering a prepared scope therefore performs no decision read, including
@@ -1987,8 +2027,10 @@ when reachable. CEL verdicts cannot run in SQL.
 
 `permission_expression()` binds its policy and caveat verdicts at SQL
 compilation by its existing late-binding contract. Its point or population
-plan stays inline, so rendering does not read bounded row, set, or fact
-decisions. Caveat verdicts retain their existing late read. An embedded sudo
+plan stays inline unless an attached scope with identical shareable policy and
+verdicts supplies its identity set. Rendering an unmatched expression does not
+read bounded row, set, or fact decisions. Caveat verdicts retain their existing
+late read. An embedded sudo
 queryset's audit write also remains outside the prepared-queryset-scope contract.
 `accessible()` prepares its inline model-row scope before that query renders.
 
@@ -2426,7 +2468,8 @@ raises `PermissionDenied`. A policy-revision mismatch leaves each scope
 self-contained without sharing. The helper reads the union's
 `combined_queries` and attaches each distinct shareable definition once to
 the outer query. Late permission expressions and nested scoped subqueries
-remain self-contained. Other SQL shapes retain their independent predicates.
+remain self-contained unless a compatible `SharedScope` is attached to the
+outer read statement. Other SQL shapes retain their independent predicates.
 
 ```python
 ActorLike = Union[SubjectRef, User, Group, "AnyRebacSubject"]
@@ -2437,11 +2480,16 @@ ActorLike = Union[SubjectRef, User, Group, "AnyRebacSubject"]
 #   - a SubjectRef passed through unchanged   (covers agents/grant, agents/agent,
 #                                              auth/apikey, custom)
 
+class SharedScope:  # from rebac.managers
+    def queryset(self) -> models.QuerySet: ...
+    def attach(self, outer_queryset: models.QuerySet) -> models.QuerySet: ...
+
 class RebacManager:
     def get_queryset(self) -> RebacQuerySet: ...
 
     # Primary, generic actor scoping. Accepts any ActorLike.
     def with_actor(self, actor: ActorLike) -> RebacQuerySet: ...
+    def scope_cte(self) -> SharedScope: ...
 
     # Typed shorthands — all eventually call with_actor() internally.
     def as_user(self, user) -> RebacQuerySet: ...
@@ -2459,6 +2507,7 @@ class RebacManager:
     def effective_actor(self, *, strict: bool = False) -> tuple[SubjectRef | None, bool]: ...
 
 class RebacQuerySet:
+    def scope_cte(self) -> SharedScope: ...
     def with_actor(self, actor: ActorLike) -> Self: ...
     def as_user(self, user) -> Self: ...
     def as_agent(self, agent, *, on_behalf_of=None) -> Self: ...
