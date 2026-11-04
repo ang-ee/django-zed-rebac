@@ -5,6 +5,12 @@ pre-1.0; breaking changes within a minor version are explicitly called out.
 
 ## [Unreleased]
 
+### Fixed
+
+- An actor-scoped gate that admits every row now carries the CTEs referenced by
+  its decision witnesses, including PostgreSQL decided-ID arrays. Independently
+  shared plans now namespace decided-array CTE names to avoid collisions.
+
 ### Removed
 
 - **Breaking:** Removed the unimplemented `SpiceDBBackend`, the `Backend` ABC,

@@ -590,9 +590,9 @@ class Compiler:
                 .values("_rebac_ids")
             )
             digest = hashlib.blake2s(repr(key).encode(), digest_size=10).hexdigest()
-            # Content addressing avoids collisions across independently built
-            # witnesses and statement owners.
-            cte = CTE(selected, name=f"rebac_decided_{digest}")
+            # The digest deduplicates lists within one owner; the plan
+            # namespace separates independent owners combined by Django.
+            cte = CTE(selected, name=self._cte_name(f"rebac_decided_{digest}"))
             self._decided_arrays[key] = cte
             self._statement_ctes.append(cte)
         return key, cte

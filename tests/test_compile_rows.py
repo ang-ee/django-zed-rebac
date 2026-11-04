@@ -5,6 +5,7 @@ import re
 import pytest
 from django.contrib.contenttypes.models import ContentType
 from django.db import connection, models, transaction
+from django.db.models import Exists, OuterRef, Prefetch, Q, Subquery
 from django.test.utils import CaptureQueriesContext, isolate_apps
 
 from rebac import (
@@ -38,6 +39,17 @@ ACTOR = SubjectRef.of("auth/user", "alice")
 
 def visible(model):
     return set(model.objects.with_actor(ACTOR).values_list("pk", flat=True))
+
+
+def assert_rebac_ctes_defined(queries):
+    tables = set(connection.introspection.table_names())
+    for query in queries:
+        sql = query["sql"]
+        references = set(re.findall(r'(?:FROM|JOIN) "(rebac_[a-z0-9_]+)"', sql)) - tables
+        definitions = set(
+            re.findall(r'"(rebac_[a-z0-9_]+)" AS (?:NOT MATERIALIZED |MATERIALIZED )?\(', sql)
+        )
+        assert references <= definitions, (references - definitions, sql)
 
 
 SCHEMA = """
@@ -90,6 +102,199 @@ def test_small_hierarchy_binds_ids_and_keeps_statement_bounded(tree):
     else:
         assert f'"folder_id" IN ({child.pk}, {leaf.pk})' in sql
     assert len(sql) < 25_000
+
+
+@pytest.mark.pg_delta
+@pytest.mark.parametrize("memberships", [2, 12])
+@pytest.mark.parametrize(
+    "shape",
+    [
+        "exists",
+        "subquery",
+        "related",
+        "union",
+        "aggregate",
+        "distinct_count",
+        "sliced_count",
+        "sliced_prefetch",
+    ],
+)
+def test_embedded_decided_scope_defines_every_reference(memberships, shape):
+    local = install_schema("""
+        definition auth/user {}
+        definition auth/group {
+            relation member: auth/user
+        }
+        definition blog/folder {
+            relation viewer: auth/group#member
+            permission read = viewer
+        }
+        definition blog/post {
+            relation folder: blog/folder // rebac:field=folder
+            permission read = folder->read
+        }
+    """)
+    with sudo(reason="embedded decided scope fixture"):
+        folders = Folder.objects.bulk_create([Folder(name=f"folder-{i}") for i in range(14)])
+        Post.objects.bulk_create(
+            [Post(title=f"post-{i}", folder=folder) for i, folder in enumerate(folders)]
+        )
+    local.write_relationships(
+        [
+            RelationshipTuple(ObjectRef("auth/group", f"group-{i}"), "member", ACTOR)
+            for i in range(memberships)
+        ]
+        + [
+            RelationshipTuple(
+                to_object_ref(folder),
+                "viewer",
+                SubjectRef.of("auth/group", f"group-{i}", "member"),
+            )
+            for i, folder in enumerate(folders[:memberships])
+        ]
+    )
+    with CaptureQueriesContext(connection) as preparation:
+        scoped = Post.objects.with_actor(ACTOR).scoped()
+        correlated = scoped.filter(folder_id=OuterRef("pk"))
+        if shape == "exists":
+            outer = Folder._base_manager.filter(Exists(correlated))
+        elif shape == "subquery":
+            outer = Folder._base_manager.filter(pk=Subquery(correlated.values("folder_id")[:1]))
+        elif shape == "related":
+            outer = Folder._base_manager.filter(posts__in=scoped).distinct()
+        elif shape == "union":
+            arm = Folder._base_manager.filter(Exists(correlated)).values_list("pk", flat=True)
+            outer = arm.union(
+                Folder._base_manager.filter(pk=-1).values_list("pk", flat=True), all=True
+            )
+        else:
+            outer = None
+    with CaptureQueriesContext(connection) as queries:
+        if shape == "aggregate":
+            result = Folder._base_manager.aggregate(
+                total=models.Count("pk", filter=Q(Exists(correlated)))
+            )["total"]
+            assert result == memberships
+        elif shape == "distinct_count":
+            assert Post.objects.with_actor(ACTOR).distinct().count() == memberships
+        elif shape == "sliced_count":
+            assert Post.objects.with_actor(ACTOR)[:1000].count() == memberships
+        elif shape == "sliced_prefetch":
+            prefetched = Folder._base_manager.order_by("pk").prefetch_related(
+                Prefetch(
+                    "posts",
+                    queryset=Post.objects.with_actor(ACTOR).order_by("pk")[:2],
+                    to_attr="seen",
+                )
+            )
+            assert [folder.pk for folder in prefetched if folder.seen] == [
+                folder.pk for folder in folders[:memberships]
+            ]
+        else:
+            assert outer is not None
+            assert sorted(outer.values_list("pk", flat=True)) == sorted(
+                folder.pk for folder in folders[:memberships]
+            )
+    assert_rebac_ctes_defined([*preparation, *queries])
+    if shape == "exists":
+        assert len(preparation) + len(queries) == (4 if memberships == 2 else 3)
+
+
+@pytest.mark.pg_delta
+def test_owned_decided_scope_defines_array_cte():
+    local = install_schema("""
+        definition auth/user {}
+        definition blog/folder {
+            relation viewer: auth/user
+            permission read = viewer
+        }
+        definition blog/post {
+            relation folder: blog/folder // rebac:field=folder
+            permission read = folder->read
+        }
+    """)
+    with sudo(reason="owned decided scope fixture"):
+        folder = Folder.objects.create(name="allowed")
+        post = Post.objects.create(title="allowed", folder=folder)
+    local.write_relationships([RelationshipTuple(to_object_ref(folder), "viewer", ACTOR)])
+    with CaptureQueriesContext(connection) as queries:
+        assert list(Post.objects.with_actor(ACTOR).values_list("pk", flat=True)) == [post.pk]
+    assert_rebac_ctes_defined(queries)
+    if connection.vendor == "postgresql":
+        assert any('FROM "rebac_decided_' in query["sql"] for query in queries)
+
+
+@pytest.mark.pg_delta
+@pytest.mark.django_db(transaction=True)
+def test_memoized_decided_witness_stays_defined_when_embedded(tree):
+    _local, _child, leaf, post = tree
+    with evaluator_scope() as evaluator:
+        assert list(Post.objects.with_actor(ACTOR).values_list("pk", flat=True)) == [post.pk]
+        assert evaluator.stats()["row_decision_entries"] > 0
+        scoped = Post.objects.with_actor(ACTOR).scoped()
+        outer = Folder._base_manager.filter(Exists(scoped.filter(folder_id=OuterRef("pk"))))
+        with CaptureQueriesContext(connection) as queries:
+            assert list(outer.values_list("pk", flat=True)) == [leaf.pk]
+    assert_rebac_ctes_defined(queries)
+    if connection.vendor == "postgresql":
+        assert any('FROM "rebac_decided_' in query["sql"] for query in queries)
+
+
+@pytest.mark.pg_delta
+@pytest.mark.parametrize("shape", ["standalone", "pk_in", "exists"])
+def test_every_row_gate_carries_decided_witness_ctes(shape):
+    local = install_schema("""
+        definition auth/user {}
+        definition org/role {
+            relation member: auth/user
+        }
+        definition blog/folder {
+            relation viewer: auth/user
+            permission read = viewer
+        }
+        definition blog/post {
+            relation folder: blog/folder // rebac:field=folder
+            relation admin: org/role // rebac:const=admin
+            permission read = folder->read + admin->member
+        }
+    """)
+    admin = SubjectRef.of("auth/user", "admin")
+    with sudo(reason="every row gate fixture"):
+        folders = Folder.objects.bulk_create([Folder(name=f"folder-{i}") for i in range(6)])
+        posts = Post.objects.bulk_create(
+            [Post(title=f"post-{i}", folder=folder) for i, folder in enumerate(folders)]
+        )
+    local.write_relationships(
+        [RelationshipTuple(ObjectRef("org/role", "admin"), "member", admin)]
+        + [RelationshipTuple(to_object_ref(folder), "viewer", admin) for folder in folders[:2]]
+    )
+
+    with CaptureQueriesContext(connection) as queries:
+        if shape == "standalone":
+            result = sorted(Post.objects.with_actor(admin).values_list("pk", flat=True))
+            expected = sorted(post.pk for post in posts)
+        elif shape == "pk_in":
+            with decision_scope():
+                result = sorted(
+                    Post.objects.with_actor(admin)
+                    .filter(pk__in={posts[0].pk, posts[3].pk})
+                    .values_list("pk", flat=True)
+                )
+            expected = sorted([posts[0].pk, posts[3].pk])
+        else:
+            scoped = Post.objects.with_actor(admin).scoped()
+            result = sorted(
+                Folder._base_manager.filter(
+                    Exists(scoped.filter(folder_id=OuterRef("pk")))
+                ).values_list("pk", flat=True)
+            )
+            expected = sorted(folder.pk for folder in folders)
+    assert result == expected
+    assert_rebac_ctes_defined(queries)
+    if connection.vendor == "postgresql":
+        assert any('FROM "rebac_decided_' in query["sql"] for query in queries)
+    if shape == "exists":
+        assert len(queries) == 3
 
 
 @pytest.mark.pg_delta
