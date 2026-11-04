@@ -7,6 +7,8 @@ pre-1.0; breaking changes within a minor version are explicitly called out.
 
 ### Fixed
 
+- Shared identity and multi-action closure queries clear model default ordering
+  internally, preserving ordered caller statements and valid SQL for ordered models.
 - An actor-scoped gate that admits every row now carries the CTEs referenced by
   its decision witnesses, including PostgreSQL decided-ID arrays. Independently
   shared plans now namespace decided-array CTE names to avoid collisions.

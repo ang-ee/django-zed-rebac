@@ -90,7 +90,7 @@ class SharedScope[M: models.Model]:
         # This CTE supplies column metadata to references. Its query is never
         # attached or resolved; each attach builds a fresh authorized body.
         self._reference = CTE(
-            models.QuerySet(model=model, using=using).values(*columns), name=self._name
+            models.QuerySet(model=model, using=using).order_by().values(*columns), name=self._name
         )
 
     def queryset(self) -> models.QuerySet[Any]:

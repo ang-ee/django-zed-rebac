@@ -1548,7 +1548,11 @@ def identity_cte_queryset(
 ) -> models.QuerySet[Any]:
     """A plain, identity-only queryset over a CTE reference."""
     reference = cte.queryset()
-    return models.QuerySet(model=model, query=reference.query.clone(), using=using).values(*columns)
+    return (
+        models.QuerySet(model=model, query=reference.query.clone(), using=using)
+        .order_by()
+        .values(*columns)
+    )
 
 
 def attached_scope_plan(
@@ -1681,7 +1685,7 @@ def _closure_verdict(
             return Q(Exact(Value(1), Value(0)))
         if isinstance(expr, (PermRef, PermArrow)):
             ordinal = leaves[(expr, bound)]
-            return Q(pk__in=rows.filter(_rebac_arm=ordinal).values("pk"))
+            return Q(pk__in=rows.filter(_rebac_arm=ordinal).order_by().values("pk"))
         if isinstance(expr, PermBinOp):
             left = verdict(expr.left, bound)
             right = verdict(expr.right, bound.opposite() if expr.op == "-" else bound)
@@ -1763,7 +1767,7 @@ def attached_permission_plan(
         arms.append(arm)
     if not arms:
         return None
-    closure = CTE(arms[0].union(*arms[1:], all=True), name=f"{name}_closure")
+    closure = CTE(arms[0].union(*arms[1:], all=True).order_by(), name=f"{name}_closure")
     body: models.QuerySet[Any] = model._base_manager.using(using)
     if candidates is not None:
         body = body.filter(_bound_in(F(resource_id_attr(model)), candidates))

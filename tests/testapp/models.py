@@ -37,6 +37,14 @@ class Folder(RebacMixin, models.Model):
         rebac_resource_type = "blog/folder"
 
 
+class OrderedFolder(Folder):
+    class Meta:
+        app_label = "testapp"
+        proxy = True
+        ordering = ("kind", "-id")
+        rebac_resource_type = "blog/folder"
+
+
 class RoleAnchor(RebacMixin, models.Model):
     """A resource type whose objects exist only in relationships: it has no table."""
 
