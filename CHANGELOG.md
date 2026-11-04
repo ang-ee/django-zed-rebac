@@ -20,6 +20,20 @@ pre-1.0; breaking changes within a minor version are explicitly called out.
   compiled read path. Absent canonical IDs are point-checked in one batch;
   non-canonical and empty IDs are denied. `LocalBackend.accessible()` remains
   the enumeration API.
+- `LocalBackend.held_many(subject, actions, resource_type, ids, context=None,
+  using=None)` returns held candidate IDs per action. Equal unmodified field
+  permissions share one bounded decision; distinct permissions take one
+  statement per 500 stored IDs. Field visibility now uses it for materialised
+  batches. `PermissionEvaluator` memoises each field answer for the same actor,
+  model, permission and row identities until scope exit or a library-owned
+  write, within an entry and total-ID LRU budget. The memo follows the check
+  cache's eligibility: it is off for live field- or attribute-backed types,
+  expiring relations, override deadlines and every atomic block (including
+  `ATOMIC_REQUESTS`, GraphQL actions, Django `TestCase` and pytest-django's
+  default `db` fixture). Any caveat anywhere in the schema disables it for
+  every type. An evaluator is
+  not a single consistent read: row statements see new commits, while an
+  eligible memo may retain an answer after an untracked tuple write.
 
 ### Changed
 

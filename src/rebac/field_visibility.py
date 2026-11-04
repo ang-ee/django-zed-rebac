@@ -151,20 +151,30 @@ def visible_id_sets(
         from .backends import backend
 
         active_backend = backend()
-    candidates = tuple(resource_ids)
-    visible: dict[str, frozenset[str]] = {}
-    for field_name in fields:
-        action = f"read__{field_name}"
-        visible[field_name] = frozenset(
-            held_ids(
-                active_backend,
-                subject=actor,
-                action=action,
-                model=model,
-                resource_ids=candidates,
-            )
+    from .evaluator import current_evaluator
+
+    candidates = tuple(dict.fromkeys(resource_ids))
+    actions = tuple(f"read__{name}" for name in sorted(fields))
+    evaluator = current_evaluator()
+    if evaluator is None:
+        answers = active_backend.held_many(
+            subject=actor,
+            actions=actions,
+            resource_type=rebac_type,
+            ids=candidates,
+            using=read_alias(model),
         )
-    return visible
+    else:
+        answers = evaluator._held_many(
+            active_backend,
+            subject=actor,
+            model=model,
+            resource_type=rebac_type,
+            actions=actions,
+            ids=candidates,
+            using=read_alias(model),
+        )
+    return {name: frozenset(answers[f"read__{name}"]) for name in fields}
 
 
 def apply_field_visibility(

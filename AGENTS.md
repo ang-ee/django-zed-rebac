@@ -92,11 +92,13 @@ permissions / caveats / Zookies) mirror SpiceDB. The runtime has one backend,
 
 - **Don't** add `LocalBackend`-only conveniences without a SpiceDB equivalent
   (for example, a cross-resource-type "all permissions for this user" RPC).
-  The documented exceptions are `held()` and the ORM integration methods
-  `queryset_filter()`, `permission_expression()` and `grants_all()`.
+  The documented exceptions are `held()`, `held_many()` and the ORM integration
+  methods `queryset_filter()`, `permission_expression()` and `grants_all()`.
   `held()` checks bounded candidate IDs through the compiled read path and
   corresponds to a batched `CheckBulkPermissions` for one subject, action and
-  resource type. The three ORM methods predate this recovery and have no
+  resource type. `held_many()` batches `CheckBulkPermissions` for one subject
+  and resource type across several permissions and bounded candidate IDs.
+  The three ORM methods predate this recovery and have no
   SpiceDB RPC equivalents.
 - **Do** mirror `authzed.api.v1` method names in `LocalBackend` (snake_case
   wrappers around `CheckPermission`, `CheckBulkPermissions`, `LookupResources`,

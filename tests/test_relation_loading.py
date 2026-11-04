@@ -727,18 +727,14 @@ def test_materialized_field_visibility_checks_only_fetched_ids(
     for post in (readable, unrelated):
         _grant("blog/authoredpost", post.pk, "owner", alice)
     active = backend()
-    import rebac.field_visibility as visibility
-    import rebac.relation_loading as loading
-
-    original = visibility.held_ids
+    original = active.held_many
     requested = []
 
-    def membership(active_backend, **kwargs):
-        requested.append((kwargs["action"], tuple(kwargs["resource_ids"])))
-        return original(active_backend, **kwargs)
+    def membership(**kwargs):
+        requested.append((tuple(kwargs["actions"]), tuple(kwargs["ids"])))
+        return original(**kwargs)
 
-    monkeypatch.setattr(loading, "held_ids", membership)
-    monkeypatch.setattr(visibility, "held_ids", membership)
+    monkeypatch.setattr(active, "held_many", membership)
     monkeypatch.setattr(active, "accessible", lambda **kwargs: pytest.fail("unbounded enumeration"))
     monkeypatch.setattr(
         active, "grants_all", lambda **kwargs: pytest.fail("bounded rows need no universal proof")
@@ -749,7 +745,7 @@ def test_materialized_field_visibility_checks_only_fetched_ids(
         .filter(pk__in=(readable.pk, denied.pk))
     )
     assert {row.pk: row.title for row in rows} == {readable.pk: "visible", denied.pk: None}
-    assert requested == [("read__title", (str(readable.pk), str(denied.pk)))]
+    assert requested == [(("read__title",), (str(readable.pk), str(denied.pk)))]
 
 
 @pytest.mark.django_db

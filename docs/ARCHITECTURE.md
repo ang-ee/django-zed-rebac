@@ -1353,6 +1353,12 @@ class LocalBackend:
     ) -> set[str]:
         """Which candidate ids hold the action; depth-uncertain ids do not hold."""
 
+    def held_many(
+        self, *, subject, actions, resource_type, ids,
+        context=None, using=None,
+    ) -> dict[str, set[str]]:
+        """Held candidate ids for each action; equal unmodified expressions share a decision."""
+
     def lookup_subjects(
         self, *,
         resource:     ObjectRef,
@@ -1399,6 +1405,13 @@ class LocalBackend:
 path. A depth-uncertain candidate counts as not held rather than raising as
 `check_access()` does; other candidates retain their answers. Queryset scoping
 uses `queryset_filter()` and its compiled predicate.
+`LocalBackend.held_many()` accepts an iterable of actions and one bounded ID
+set. It returns an entry for each action, including an empty set for a denied
+action. Equal, unmodified permission expressions share a decision; override
+arms with action-specific sites stay separate. Each distinct decision uses
+one statement per 500 stored candidate IDs, independent of the number of
+rows in that chunk. Absent and non-canonical IDs retain `held()`'s fail-closed
+fallback. This is the multi-action form of bounded bulk permission checks.
 
 `CheckResult` carries the three-state result, missing caveat parameters and an
 optional `reason`. Unknown resource types and actions preserve their diagnostic
@@ -2918,12 +2931,16 @@ that a joined multi-table child inherits from its parent's table
 (`values("child__name")`) is returned: the guard does not know which model
 the join came through.
 
-The engine computes visibility per row, not with a blanket `.defer()`. For each
-declared `read__<field>`, it asks the backend for
-`accessible(subject, action="read__<field>", resource_type=...)` through the
-ambient `PermissionEvaluator` when one is open. A row whose resource id is not
-in that set has the field redacted. This preserves cases where Alice may read
-`title` on her own row but not on Bob's row in the same queryset.
+The engine computes visibility per row, not with a blanket `.defer()`. The
+materialisation pass calls `LocalBackend.held_many()` with the fetched IDs and
+all declared `read__<field>` actions. Fields backed by one unchanged permission
+expression share its bounded decision; distinct expressions get separate
+decisions, each constant in the number of fetched rows within a 500-ID chunk.
+An ambient `PermissionEvaluator` reuses eligible answers when the same rows are
+materialised again in that scope; live-backed types are re-asked. A row whose
+resource ID is not in a field's held set has that field redacted. This preserves
+cases where Alice may read `title` on her own row but not on Bob's row in the
+same queryset.
 
 Projection querysets that would return gated fields directly, such as
 `.values("salary")`, `.values_list("salary", flat=True)`, or bare `.values()`,
@@ -3020,6 +3037,19 @@ the [Decided rows](#decided-rows) invalidation key. Conditional results
 (`CONDITIONAL_PERMISSION(missing=[...])`) are NOT cached — the missing caveat
 params are part of the answer and the next call may supply them. Per-call
 explicit `consistency` / `at_zookie` also bypass the cache.
+Field visibility has its own memo keyed by backend, policy generation, actor,
+model, action, database alias and the exact candidate row identities. Its LRU
+limits both entries and the total candidate IDs to `REBAC_EVALUATOR_CACHE_SIZE`.
+It is cleared at evaluator scope exit or `invalidate()` and re-asked after a
+library-owned row or relationship write. Eligibility follows the backend's
+check-cache rule: live field- or attribute-backed types, expiring relations,
+override deadlines and every atomic block bypass it. This includes
+`ATOMIC_REQUESTS`, GraphQL actions, Django `TestCase` and pytest-django's
+default `db` fixture. A caveat anywhere in the schema also disables this memo
+for every type. An evaluator
+is not a single consistent read: each row statement sees its own database
+snapshot, while an eligible cached field answer can survive an untracked tuple
+write until invalidation or scope exit.
 
 Cache keys include backend instance identity, including reentrant checks through
 different backends. Context keys preserve scalar types (`True`, `1`, and `1.0` differ).

@@ -706,6 +706,31 @@ class LocalBackend:
         )
 
     @_schema_operation
+    def held_many(
+        self,
+        *,
+        subject: SubjectRef,
+        actions: Iterable[str],
+        resource_type: str,
+        ids: Iterable[str],
+        context: dict[str, Any] | None = None,
+        using: str | None = None,
+    ) -> dict[str, set[str]]:
+        """Return held candidate IDs per action, sharing equal field gates."""
+        from ..compile.read import held_many
+        from ..models import active_relationship_model
+
+        return held_many(
+            backend=self,
+            resource_type=resource_type,
+            actions=actions,
+            actor=subject,
+            ids=ids,
+            using=using or read_alias(active_relationship_model()),
+            context=context,
+        )
+
+    @_schema_operation
     def grants_all(
         self,
         *,
