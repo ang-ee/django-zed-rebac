@@ -2121,6 +2121,7 @@ fixed-object facts. Bounded stored subject sets are decided to a fixed point;
 oversized sets retain the recursive CTE closure, including cycles and nested
 groups. Other recursive paths retain `REBAC_DEPTH_LIMIT`. The statement
 witnesses every decision it binds in its own database snapshot.
+A gate that admits every row carries the CTEs referenced by its decision witnesses.
 
 Decided native ID membership uses one PostgreSQL array parameter. A decided
 row list shared by a predicate and witness uses a statement-local CTE; other

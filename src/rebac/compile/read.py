@@ -1430,7 +1430,7 @@ def _scope_statement(
             )
         )
         if is_true(predicate):
-            return gate.values("pk"), True
+            return compiler.with_subject_ctes(gate.values("pk")), True
         # The row predicate goes last: it holds the nested subqueries.
         rows = model._base_manager.using(operation.using)
         if candidates is not None:
