@@ -7,6 +7,8 @@ pre-1.0; breaking changes within a minor version are explicitly called out.
 
 ### Fixed
 
+- Recursive path CTE unions clear a resource model's default ordering, so
+  multi-hop field-backed permissions compile for ordered models.
 - Shared identity and multi-action closure queries clear model default ordering
   internally, preserving ordered caller statements and valid SQL for ordered models.
 - An actor-scoped gate that admits every row now carries the CTEs referenced by
