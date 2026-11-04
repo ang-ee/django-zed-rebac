@@ -15,6 +15,18 @@ pre-1.0; breaking changes within a minor version are explicitly called out.
 
 ### Added
 
+- `RebacQuerySet.scope_cte() -> SharedScope` provides a statement-local
+  identity CTE for an unfiltered actor scope. `SharedScope.queryset()` returns
+  plain Django identity rows for repeated filters, annotations, `Exists`
+  guards and aggregates; `SharedScope.attach(queryset)` defines the scope once
+  on a read statement's owner (the union owner for unions), without changing
+  the input queryset. Each attachment gets a fresh policy and caveat pin;
+  matching permission projections and nested scope guards reuse the definition
+  only with the same shareable policy and verdicts. Exact late projections
+  retain their point form; queryset identity proofs retain the candidate-root
+  form, including bounded literal ID sets.
+  Inside `decision_scope()`, each attachment prepares a witnessed body using
+  eligible transaction-memoized decisions.
 - `decision_scope(*, using="default")` opens one atomic transaction with a
   transaction-bound evaluator. Warm stored schemas read their revision once
   for that scope; bounded row, fact and actor-set decisions are reused until

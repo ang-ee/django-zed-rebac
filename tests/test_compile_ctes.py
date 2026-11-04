@@ -339,7 +339,8 @@ def test_shared_decided_set_projection_has_no_target_subject_cte():
     assert list(shared.values_list("pk", "can_check")) == [(post.pk, True)] * 3
 
 
-def test_late_nested_set_scopes_compile_self_contained():
+@pytest.mark.pg_delta
+def test_late_nested_set_scopes_share_one_statement_definition():
     local = install_schema("""
         definition auth/user {}
         definition auth/group {
@@ -364,19 +365,299 @@ def test_late_nested_set_scopes_compile_self_contained():
             ),
         ]
     )
-    scopes = [
-        local.permission_expression(
-            model=Post, subject=actor, action="read", using="default", identity=F("pk")
+    shared = Post.objects.with_actor(actor).scope_cte()
+    sizes = []
+    inline_sizes = []
+    for count in (1, 3):
+        scopes = [
+            local.permission_expression(
+                model=Post, subject=actor, action="read", using="default", identity=F("pk")
+            )
+            for _ in range(count)
+        ]
+        inline = Post._base_manager.filter(Q(*scopes))
+        with CaptureQueriesContext(connection) as queries:
+            inline_sql = str(inline.query)
+        assert len(queries) == 0
+        assert len(re.findall(r'"rebac_[^\"]+" AS \(', inline_sql)) == count
+        inline_sizes.append(len(inline_sql.encode()))
+        inline_rows = list(inline.values_list("pk", flat=True))
+        rows = shared.attach(inline)
+        with CaptureQueriesContext(connection) as queries:
+            sql = str(rows.query)
+        assert len(queries) == 0
+        assert len(re.findall(r'"rebac_scope_[^\"]+" AS \(', sql)) == 1
+        assert len(re.findall(r'"rebac_sets_[^\"]+" AS \(', sql)) == 1
+        sizes.append(len(sql.encode()))
+        assert list(rows.values_list("pk", flat=True)) == inline_rows == [post.pk]
+    assert 0 < sizes[1] - sizes[0] < 400
+    assert inline_sizes[1] - inline_sizes[0] > 2_000
+
+
+@pytest.mark.pg_delta
+def test_shared_scope_filter_projection_and_exists_guard():
+    local = install_schema("""
+        definition auth/user {}
+        definition auth/group {
+            relation member: auth/user | auth/group#member
+        }
+        definition blog/folder {
+            relation viewer: auth/group#member
+            permission read = viewer
+            permission write = nil
+        }
+    """)
+    actor = SubjectRef.of("auth/user", "mixed-scope")
+    with sudo(reason="shared scope fixture"):
+        allowed = Folder.objects.create(name="allowed")
+        Folder.objects.create(name="denied")
+    group = ObjectRef("auth/group", "mixed-scope")
+    local.write_relationships(
+        [
+            RelationshipTuple(group, "member", actor),
+            RelationshipTuple(to_object_ref(allowed), "viewer", SubjectRef(group, "member")),
+        ]
+    )
+    shared = Folder.objects.with_actor(actor).scope_cte()
+    base = Folder._base_manager.filter(pk__in=shared.queryset().values("pk"))
+    baseline = shared.attach(base)
+    mixed = shared.attach(
+        base.annotate(
+            projected=permission_expression(Folder, "read", actor=actor),
+            guarded=models.Exists(
+                Folder.objects.with_actor(actor)
+                .scoped_for_aggregate()
+                .filter(pk=models.OuterRef("pk"))
+                .values("pk")
+            ),
+            referenced=models.Exists(shared.queryset().filter(pk=models.OuterRef("pk"))),
         )
-        for _ in range(4)
+    )
+    base_sql = str(baseline.query)
+    mixed_sql = str(mixed.query)
+    assert len(re.findall(r'"rebac_scope_[^\"]+" AS \(', mixed_sql)) == 1
+    assert len(re.findall(r'"rebac_sets_[^\"]+" AS \(', mixed_sql)) == 1
+    assert 0 < len(mixed_sql.encode()) - len(base_sql.encode()) < 1200
+    assert len(re.findall(r'"rebac_scope_[^\"]+" AS \(', str(shared.attach(mixed).query))) == 1
+    assert list(mixed.values_list("pk", "projected", "guarded", "referenced")) == [
+        (allowed.pk, True, True, True)
     ]
-    rows = Post._base_manager.filter(Q(*scopes))
-    with CaptureQueriesContext(connection) as queries:
-        sql = str(rows.query)
-    assert len(queries) == 0
-    assert len(re.findall(r'"rebac_[^\"]+" AS \(', sql)) == 4
-    assert len(re.findall(r'"rebac_sets_[^\"]+" AS \(', sql)) == 4
-    assert list(rows.values_list("pk", flat=True)) == [post.pk]
+    assert mixed.aggregate(total=models.Count("pk")) == {"total": 1}
+    inline = Folder._base_manager.filter(
+        pk__in=Folder.objects.with_actor(actor).scoped_for_aggregate().values("pk")
+    ).annotate(
+        projected=permission_expression(Folder, "read", actor=actor),
+        guarded=models.Exists(
+            Folder.objects.with_actor(actor)
+            .scoped_for_aggregate()
+            .filter(pk=models.OuterRef("pk"))
+            .values("pk")
+        ),
+        referenced=models.Exists(
+            Folder.objects.with_actor(actor).scoped_for_aggregate().filter(pk=models.OuterRef("pk"))
+        ),
+    )
+    assert list(mixed.values_list("pk", "projected", "guarded", "referenced")) == list(
+        inline.values_list("pk", "projected", "guarded", "referenced")
+    )
+    assert mixed.count() == inline.count()
+    assert mixed.exists() == inline.exists()
+    assert mixed.aggregate(total=models.Count("pk")) == inline.aggregate(total=models.Count("pk"))
+    other_action = Folder._base_manager.annotate(
+        projected=permission_expression(Folder, "write", actor=actor)
+    )
+    assert list(shared.attach(other_action).values_list("projected", flat=True)) == list(
+        other_action.values_list("projected", flat=True)
+    )
+    other = SubjectRef.of("auth/user", "other-mixed-scope")
+    mismatch = shared.attach(
+        Folder._base_manager.annotate(projected=permission_expression(Folder, "read", actor=other))
+    )
+    assert list(mismatch.order_by("pk").values_list("projected", flat=True)) == [False, False]
+
+
+@pytest.fixture
+def shared_scope_rows():
+    local = install_schema("""
+        definition auth/user {}
+        definition auth/group { relation member: auth/user | auth/group#member }
+        definition blog/folder {
+            relation viewer: auth/user | auth/group#member
+            permission read = viewer
+        }
+        definition blog/post {
+            relation folder: blog/folder // rebac:field=folder
+            permission read = folder->read
+        }
+    """)
+    actor = SubjectRef.of("auth/user", "shared-scope-regression")
+    with sudo(reason="shared scope regression fixture"):
+        allowed = Folder.objects.create(name="allowed")
+        denied = Folder.objects.create(name="denied")
+    group = ObjectRef("auth/group", "shared-scope-regression")
+    local.write_relationships(
+        [
+            RelationshipTuple(group, "member", actor),
+            RelationshipTuple(to_object_ref(allowed), "viewer", SubjectRef(group, "member")),
+        ]
+    )
+    return local, actor, allowed, denied
+
+
+@pytest.mark.pg_delta
+def test_shared_scope_attach_preserves_input_and_sibling_statements(shared_scope_rows):
+    _local, actor, allowed, denied = shared_scope_rows
+    inner = (
+        Folder.objects.with_actor(actor)
+        .scoped_for_aggregate()
+        .filter(pk=models.OuterRef("pk"))
+        .values("pk")
+    )
+    base = Folder._base_manager.annotate(guarded=models.Exists(inner)).order_by("pk")
+    original = list(base.values_list("pk", "guarded"))
+    first = Folder.objects.with_actor(actor).scope_cte().attach(base)
+    second = Folder.objects.with_actor(actor).scope_cte().attach(base.filter(pk__gt=0))
+    assert list(base.values_list("pk", "guarded")) == original
+    assert list(first.values_list("pk", "guarded")) == original
+    assert list(second.values_list("pk", "guarded")) == original
+    assert original == [(allowed.pk, True), (denied.pk, False)]
+
+
+@pytest.mark.pg_delta
+def test_shared_scope_rechecks_caveats_written_after_handle_creation():
+    local = install_schema("""
+        caveat flag(enabled bool) { enabled }
+        definition auth/user {}
+        definition blog/folder {
+            relation viewer: auth/user with flag
+            permission read = viewer
+        }
+    """)
+    actor = SubjectRef.of("auth/user", "late-caveat")
+    with sudo(reason="late caveat fixture"):
+        folder = Folder.objects.create(name="caveated")
+    handle = Folder.objects.with_actor(actor).scope_cte()
+    local.write_relationships(
+        [
+            RelationshipTuple(
+                to_object_ref(folder),
+                "viewer",
+                actor,
+                caveat_name="flag",
+                caveat_context={"enabled": True},
+            )
+        ]
+    )
+    projected = Folder._base_manager.annotate(
+        can_read=permission_expression(Folder, "read", actor=actor)
+    )
+    assert (
+        list(handle.attach(projected).values_list("pk", "can_read"))
+        == list(projected.values_list("pk", "can_read"))
+        == [(folder.pk, True)]
+    )
+    scoped = Folder.objects.with_actor(actor)
+    assert (
+        list(handle.attach(scoped).values_list("pk", flat=True))
+        == list(scoped.values_list("pk", flat=True))
+        == [folder.pk]
+    )
+
+
+@pytest.mark.pg_delta
+def test_shared_scope_rechecks_policy_revision_after_handle_creation(shared_scope_rows):
+    _local, actor, allowed, denied = shared_scope_rows
+    handle = Folder.objects.with_actor(actor).scope_cte()
+    revised = install_schema("""
+        definition auth/user {}
+        definition blog/folder {
+            relation viewer: auth/user
+            permission read = viewer
+        }
+    """)
+    revised.write_relationships([RelationshipTuple(to_object_ref(denied), "viewer", actor)])
+    projected = Folder._base_manager.annotate(
+        can_read=permission_expression(Folder, "read", actor=actor)
+    ).order_by("pk")
+    assert (
+        list(handle.attach(projected).values_list("pk", "can_read"))
+        == list(projected.values_list("pk", "can_read"))
+        == [(allowed.pk, False), (denied.pk, True)]
+    )
+
+
+@pytest.mark.pg_delta
+def test_shared_scope_reuse_after_nested_resolution_gets_fresh_body(shared_scope_rows):
+    local, actor, allowed, denied = shared_scope_rows
+    with sudo(reason="nested shared scope fixture"):
+        Post.objects.create(title="nested", folder=allowed)
+    handle = Folder.objects.with_actor(actor).scope_cte()
+    inner = handle.attach(Folder._base_manager.filter(pk__in=handle.queryset().values("pk")))
+    list(Post._base_manager.filter(folder__in=inner.values("pk")))
+    local.write_relationships([RelationshipTuple(to_object_ref(denied), "viewer", actor)])
+    attached = handle.attach(Folder._base_manager.filter(pk__in=handle.queryset().values("pk")))
+    assert (
+        sorted(attached.values_list("pk", flat=True))
+        == sorted(Folder.objects.with_actor(actor).values_list("pk", flat=True))
+        == [allowed.pk, denied.pk]
+    )
+
+
+@pytest.mark.pg_delta
+def test_nested_shared_scope_attachment_defines_cte_once(shared_scope_rows):
+    _local, actor, allowed, _denied = shared_scope_rows
+    with sudo(reason="nested attachment fixture"):
+        post = Post.objects.create(title="nested", folder=allowed)
+    handle = Folder.objects.with_actor(actor).scope_cte()
+    inner = handle.attach(Folder._base_manager.filter(pk__in=handle.queryset().values("pk")))
+    outer = handle.attach(
+        Post._base_manager.filter(folder__in=inner.values("pk")).annotate(
+            readable=models.Exists(handle.queryset().filter(pk=models.OuterRef("folder_id")))
+        )
+    )
+    assert len(re.findall(r'"rebac_scope_[^\"]+" AS \(', str(outer.query))) == 1
+    assert list(outer.values_list("pk", "readable")) == [(post.pk, True)]
+
+
+@pytest.mark.pg_delta
+def test_shared_scope_union_owner_and_refusals(shared_scope_rows):
+    _local, actor, allowed, _denied = shared_scope_rows
+    handle = Folder.objects.with_actor(actor).scope_cte()
+    arm = Folder._base_manager.filter(pk__in=handle.queryset().values("pk")).values("pk")
+    attached = handle.attach(arm.union(arm, all=True))
+    inline_arm = Folder._base_manager.filter(
+        pk__in=Folder.objects.with_actor(actor).scoped_for_aggregate().values("pk")
+    ).values("pk")
+    assert (
+        list(attached.values_list("pk", flat=True))
+        == list(inline_arm.union(inline_arm, all=True).values_list("pk", flat=True))
+        == [allowed.pk, allowed.pk]
+    )
+    with pytest.raises(ValueError, match="unfiltered"):
+        Folder.objects.with_actor(actor).filter(name="allowed").scope_cte()
+    with pytest.raises(ValueError, match="unsliced"):
+        Folder.objects.with_actor(actor)[:1].scope_cte()
+    with pytest.raises(ValueError, match="actor scope"):
+        Folder.objects.sudo(reason="shared scope refusal").scope_cte()
+    with pytest.raises(ValueError, match="same database alias"):
+        handle.attach(Folder._base_manager.using("selected"))
+
+
+@pytest.mark.pg_delta
+def test_shared_scope_keeps_point_and_literal_id_set_paths(shared_scope_rows):
+    _local, actor, allowed, denied = shared_scope_rows
+    handle = Folder.objects.with_actor(actor).scope_cte()
+    for filter_args in ({"pk": allowed.pk}, {"pk__in": [allowed.pk, denied.pk]}):
+        inline = Folder.objects.with_actor(actor).filter(**filter_args).scoped()
+        attached = handle.attach(inline)
+        sql = str(attached.query)
+        [name] = re.findall(r'"(rebac_scope_[^\"]+)" AS \(', sql)
+        assert sql.count(f'"{name}"') == 1
+        assert (
+            list(attached.values_list("pk", flat=True))
+            == list(inline.values_list("pk", flat=True))
+            == [allowed.pk]
+        )
 
 
 @pytest.fixture

@@ -1512,6 +1512,97 @@ def _shareable_scope(scope: _Scope) -> bool:
     )
 
 
+@dataclass(frozen=True)
+class SharedScopePlan:
+    """A CTE and the exact permission state pinned by one attached statement."""
+
+    cte: CTE
+    model: type[models.Model]
+    actor: SubjectRef
+    action: str
+    using: str
+    backend: LocalBackend
+    columns: tuple[str, ...]
+    policy: _Policy
+    verdicts: CaveatVerdicts
+    shareable: bool
+
+    def queryset(self) -> models.QuerySet[Any]:
+        return identity_cte_queryset(self.cte, self.model, self.using, self.columns)
+
+
+def identity_cte_queryset(
+    cte: CTE,
+    model: type[models.Model],
+    using: str,
+    columns: tuple[str, ...],
+) -> models.QuerySet[Any]:
+    """A plain, identity-only queryset over a CTE reference."""
+    reference = cte.queryset()
+    return models.QuerySet(model=model, query=reference.query.clone(), using=using).values(*columns)
+
+
+def attached_scope_plan(
+    cte: CTE,
+    body: models.QuerySet[Any],
+    model: type[models.Model],
+    actor: SubjectRef,
+    action: str,
+    using: str,
+    backend: LocalBackend,
+    columns: tuple[str, ...],
+) -> SharedScopePlan:
+    """Read the fresh CTE body's pinned policy and caveat verdicts."""
+
+    def scopes(node: Any) -> Iterator[_Scope]:
+        if isinstance(node, _Scope):
+            yield node
+        elif isinstance(node, WhereNode):
+            for child in node.children:
+                yield from scopes(child)
+        else:
+            source = getattr(node, "get_source_expressions", None)
+            if callable(source):
+                for child in cast(Iterable[Any], source()):
+                    if child is not None:
+                        yield from scopes(child)
+
+    scope = next(scopes(body.query.where))
+    return SharedScopePlan(
+        cte,
+        model,
+        actor,
+        action,
+        using,
+        backend,
+        columns,
+        scope.policy,
+        scope.verdicts,
+        _shareable_scope(scope),
+    )
+
+
+def matching_shared_scope(query: Any, scope: Any, using: str) -> SharedScopePlan | None:
+    """Match only the same identity and pinned, shareable permission state."""
+    if not isinstance(scope, _Scope):
+        return None
+    for plan in getattr(query, "_rebac_shared_scopes", ()):
+        if (
+            plan.shareable
+            and plan.model._meta.concrete_model is scope.model._meta.concrete_model
+            and model_resource_type(plan.model) == model_resource_type(scope.model)
+            and resource_id_attr(plan.model) == resource_id_attr(scope.model)
+            and plan.actor == scope.actor
+            and plan.action == scope.action
+            and plan.using == using == scope.using
+            and plan.backend is scope.backend
+            and plan.policy.key == scope.policy.key
+            and plan.verdicts == scope.verdicts
+        ):
+            return cast(SharedScopePlan, plan)
+    return None
+
+
 def share_combined_scopes(query: Any) -> bool | None:
     """Hoist common subject sets from scoped UNION operands to their owner."""
 
@@ -1727,6 +1818,27 @@ def _known_identities(
     return None
 
 
+def _has_literal_identity_set(lhs: Any, where: Any) -> bool:
+    """Leave native ID-set lookups to the point/bounded compiler path."""
+    if type(lhs) is not Col:
+        return False
+    pending = [where]
+    while pending:
+        node = pending.pop()
+        if isinstance(node, WhereNode):
+            pending.extend(node.children)
+        elif (
+            type(node) is In
+            and type(node.lhs) is Col
+            and node.lhs.alias == lhs.alias
+            and node.lhs.target is lhs.target
+            and type(node.rhs) in (list, tuple)
+            and bool(node.rhs)
+        ):
+            return True
+    return False
+
+
 class _Scope(Expression):
     """A queryset scope with policy and caveat verdicts pinned when built.
 
@@ -1844,8 +1956,20 @@ class _Scope(Expression):
             inline = _scope_statement(
                 operation, self.model, key, decide=decide, candidates=identities
             )
-        elif shared is None and self._render_fallback and self._prepared is None:
-            self.prepare(connection.alias)
+        else:
+            shared_scope = (
+                matching_shared_scope(compiler.query, self, connection.alias)
+                if not _has_literal_identity_set(self.lhs, compiler.query.where)
+                else None
+            )
+            if shared_scope is not None:
+                member = In(
+                    self.lhs,
+                    shared_scope.queryset().values(resource_id_attr(self.model)),
+                ).resolve_expression(compiler.query)
+                return cast(tuple[str, tuple[Any, ...]], compiler.compile(member))
+            if shared is None and self._render_fallback and self._prepared is None:
+                self.prepare(connection.alias)
         if shared is None and self._prepared is None and inline is None:
             operation = _Operation.begin(self.backend, self.actor, connection.alias, policy=policy)
             key = resource_type, self.action

@@ -111,7 +111,7 @@ def test_held_many_statements_do_not_emit_bypass_audits_inside_decision_scope():
         post = Post.objects.create(title="p")
     baseline = PermissionAuditEvent.objects.filter(kind="sudo.bypass").count()
 
-    with decision_scope():
+    with decision_scope(), CaptureQueriesContext(connection) as queries:
         assert local.held_many(
             subject=ACTOR,
             actions=("read__title", "read__body"),
@@ -119,6 +119,7 @@ def test_held_many_statements_do_not_emit_bypass_audits_inside_decision_scope():
             ids=(str(post.pk),),
         ) == {"read__title": set(), "read__body": set()}
         assert PermissionAuditEvent.objects.filter(kind="sudo.bypass").count() == baseline
+    assert all("rebac_scope_" not in query["sql"] for query in queries.captured_queries)
 
 
 def test_decision_scope_reuses_one_revision_and_one_preparation_for_twenty_checks():
@@ -233,6 +234,111 @@ def test_bounded_decision_scope_memo_is_shared_and_savepoint_safe():
             assert visible(posts[0].pk) == set()
             raise RuntimeError("rollback")
         assert visible(posts[0].pk) == {posts[0].pk}
+
+
+@pytest.mark.pg_delta
+def test_attached_shared_scope_reuses_witnessed_decisions_across_savepoints():
+    local = install_schema(ARROW_SCHEMA)
+    with sudo(reason="shared decision fixture"):
+        folder = Folder.objects.create(name="f")
+        posts = [Post.objects.create(title=f"p{i}", folder=folder) for i in range(2)]
+    relation = RelationshipTuple(to_object_ref(folder), "viewer", ACTOR)
+    local.write_relationships([relation])
+    shared = Post.objects.with_actor(ACTOR).scope_cte()
+
+    def visible():
+        rows = Post._base_manager.filter(pk__in=shared.queryset().values("pk"))
+        return set(shared.attach(rows).values_list("pk", flat=True))
+
+    with decision_scope() as evaluator:
+        with CaptureQueriesContext(connection) as cold:
+            assert visible() == {post.pk for post in posts}
+        keys = set(evaluator._row_decisions)
+        assert keys
+        with CaptureQueriesContext(connection) as warm:
+            assert visible() == {post.pk for post in posts}
+        assert set(evaluator._row_decisions) == keys
+        assert len(warm) < len(cold)
+
+        with pytest.raises(RuntimeError), transaction.atomic():
+            local.delete_relationship(relation)
+            assert visible() == set()
+            raise RuntimeError("rollback")
+        assert visible() == {post.pk for post in posts}
+
+
+@pytest.mark.pg_delta
+def test_attached_shared_scope_plain_outer_audits_embedded_bypass_once():
+    local = install_schema(ARROW_SCHEMA)
+    with sudo(reason="shared bypass fixture"):
+        folder = Folder.objects.create(name="f")
+        post = Post.objects.create(title="p", folder=folder)
+    local.write_relationships([RelationshipTuple(to_object_ref(folder), "viewer", ACTOR)])
+    shared = Post.objects.with_actor(ACTOR).scope_cte()
+    reason = "shared plain outer bypass"
+    bypass = Post.objects.system_context(reason=reason).values("pk")
+    rows = Post._base_manager.filter(pk__in=shared.queryset().values("pk"))
+    rows = rows.filter(pk__in=bypass).filter(pk__in=bypass)
+    attached = shared.attach(rows)
+    audits = PermissionAuditEvent.objects.filter(kind="sudo.bypass", reason=reason)
+
+    with decision_scope():
+        assert list(attached.values_list("pk", flat=True)) == [post.pk]
+        assert audits.count() == 1
+        assert list(attached.values_list("pk", flat=True)) == [post.pk]
+        assert audits.count() == 2
+
+
+@pytest.mark.pg_delta
+@pytest.mark.parametrize("memberships", [1, 20])
+def test_attached_shared_body_respects_set_budget_and_binds_decided_ids(memberships):
+    local = install_schema(
+        """
+        definition auth/user {}
+        definition auth/group { relation member: auth/user | auth/group#member }
+        definition blog/folder {
+            relation viewer: auth/group#member
+            permission read = viewer
+        }
+        definition blog/post {
+            relation folder: blog/folder // rebac:field=folder
+            permission read = folder->read
+        }
+        """
+    )
+    actor = SubjectRef.of("auth/user", "shared-budget")
+    with sudo(reason="shared budget fixture"):
+        folder = Folder.objects.create(name="f")
+        post = Post.objects.create(title="p", folder=folder)
+    local.write_relationships(
+        [
+            relation
+            for index in range(memberships)
+            for relation in (
+                RelationshipTuple(ObjectRef("auth/group", f"g{index}"), "member", actor),
+                RelationshipTuple(
+                    to_object_ref(folder),
+                    "viewer",
+                    SubjectRef.of("auth/group", f"g{index}", "member"),
+                ),
+            )
+        ]
+    )
+    shared = Post.objects.with_actor(actor).scope_cte()
+    with decision_scope() as evaluator:
+        with CaptureQueriesContext(connection) as queries:
+            attached = shared.attach(
+                Post._base_manager.filter(pk__in=shared.queryset().values("pk"))
+            )
+            assert list(attached.values_list("pk", flat=True)) == [post.pk]
+        assert evaluator._row_decisions
+        sql = queries.captured_queries[-1]["sql"]
+        _, params = attached.query.sql_with_params()
+    assert ("rebac_sets_" in sql) is (memberships == 20)
+    if connection.vendor == "postgresql":
+        assert "rebac_decided_" in sql
+        assert "= ANY(" in sql
+        assert any(isinstance(param, list) for param in params)
 
 
 def test_plain_savepoint_rollback_discards_inner_row_memo():
