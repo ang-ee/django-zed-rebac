@@ -915,7 +915,7 @@ class TrackedQuerySet[T: models.Model](models.QuerySet[T]):
             return written
 
     def delete(self) -> tuple[int, dict[str, int]]:
-        from .mixins import deletion_owner
+        from .mixins import delete_collected, deletion_owner
         from .signals import _gate_backed_rows, audit_denials
         from .watch import by_key, model_write, statement_keys
 
@@ -932,7 +932,9 @@ class TrackedQuerySet[T: models.Model](models.QuerySet[T]):
             self._guard_rows(_WriteStep.DELETE_CLAUSE, actor, bypass)
             if bypass or (not watched and not self._actor_scoped_writes):
                 with deletion_owner(self, self.db, actor, bypass):
-                    return models.QuerySet.delete(self)
+                    result = delete_collected(self, origin=self, using=self.db)
+                self._result_cache = None
+                return result
             rows = self._write_rows(actor, _WriteStep.DELETE)
             keys = statement_keys(rows)
             # Django's collector forwards each part as pre_delete's origin.
@@ -946,7 +948,7 @@ class TrackedQuerySet[T: models.Model](models.QuerySet[T]):
             deleted: Counter[str] = Counter()
             for part in parts:
                 with deletion_owner(part, self.db, actor, bypass):
-                    deleted.update(models.QuerySet.delete(part)[1])
+                    deleted.update(delete_collected(part, origin=part, using=self.db)[1])
             self._result_cache = None
             return sum(deleted.values()), dict(deleted)
 

@@ -685,14 +685,17 @@ def test_no_read_gates_do_not_add_field_accessible_calls(alice, monkeypatch):
     assert len(row_queries) == 1
 
 
+@pytest.mark.pg_delta
 @override_settings(REBAC_FIELD_READ_MODE="redact")
-def test_two_field_gates_use_one_candidate_statement_each(alice):
+def test_equal_field_gates_share_one_candidate_statement(alice):
     install_schema(
         backend(),
         parse_zed(
             SCHEMA_TEXT.replace(
                 "permission read__title = owner",
-                "permission read__title = owner\n    permission read__body = owner",
+                "permission read_private = owner\n"
+                "    permission read__title = read_private\n"
+                "    permission read__body = read_private",
             )
         ),
     )
@@ -707,7 +710,66 @@ def test_two_field_gates_use_one_candidate_statement_each(alice):
         (None, None),
         (None, None),
     ]
-    assert len(queries) == 3
+    # One row statement and one permission statement for both fields.
+    assert len(queries) == 2
+
+
+@pytest.mark.pg_delta
+@pytest.mark.parametrize("field_count", (1, 2, 3))
+@pytest.mark.parametrize("row_count", (1, 5))
+def test_field_visibility_statement_growth_is_per_distinct_permission(
+    alice, field_count, row_count
+):
+    from rebac.field_visibility import visible_id_sets
+
+    fields = ("title", "body", "folder")[:field_count]
+    expressions = ("owner", "editor", "viewer")[:field_count]
+    gates = "\n    ".join(
+        f"permission read__{field} = {expression}"
+        for field, expression in zip(fields, expressions, strict=True)
+    )
+    install_schema(
+        backend(),
+        parse_zed(SCHEMA_TEXT.replace("permission read__title = owner", gates)),
+    )
+    posts = [_post(title=f"post {index}") for index in range(row_count)]
+    for post in posts:
+        _grant(post.pk, alice, "viewer")
+    ids = tuple(str(post.pk) for post in posts)
+    actor = SubjectRef.of("auth/user", str(alice.pk))
+    with CaptureQueriesContext(connection) as queries:
+        visible = visible_id_sets(
+            model=Post, actor=actor, fields=frozenset(fields), resource_ids=ids
+        )
+    assert set(visible) == set(fields)
+    assert len(queries) == field_count  # 1, 2, 3 permissions; constant in row_count.
+
+
+@pytest.mark.pg_delta
+@pytest.mark.parametrize("field_count", (1, 2, 3))
+def test_field_visibility_equal_permissions_share_one_statement(alice, field_count):
+    from rebac.field_visibility import visible_id_sets
+
+    fields = ("title", "body", "folder")[:field_count]
+    gates = "\n    ".join(f"permission read__{field} = read_private" for field in fields)
+    install_schema(
+        backend(),
+        parse_zed(
+            SCHEMA_TEXT.replace(
+                "permission read__title = owner",
+                f"permission read_private = owner\n    {gates}",
+            )
+        ),
+    )
+    posts = [_post(title=f"post {index}") for index in range(5)]
+    actor = SubjectRef.of("auth/user", str(alice.pk))
+    ids = tuple(str(post.pk) for post in posts)
+    with CaptureQueriesContext(connection) as queries:
+        visible = visible_id_sets(
+            model=Post, actor=actor, fields=frozenset(fields), resource_ids=ids
+        )
+    assert all(not allowed for allowed in visible.values())
+    assert len(queries) == 1  # Constant in the number of fields sharing read_private.
 
 
 @override_settings(REBAC_FIELD_READ_MODE="redact")

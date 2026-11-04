@@ -27,7 +27,7 @@ task does not leak back to the parent.
 from __future__ import annotations
 
 from collections import OrderedDict
-from collections.abc import Hashable, Iterator
+from collections.abc import Hashable, Iterable, Iterator
 from contextlib import contextmanager
 from contextvars import ContextVar
 from typing import TYPE_CHECKING, Any
@@ -36,6 +36,8 @@ from .schema.cache import SchemaScope, schema_operation
 from .types import CheckResult, Consistency, ObjectRef, PermissionResult, SubjectRef, Zookie
 
 if TYPE_CHECKING:  # pragma: no cover
+    from django.db import models
+
     from .backends.local import LocalBackend
 
 
@@ -95,12 +97,15 @@ class PermissionEvaluator:
 
     __slots__ = (
         "_check_cache",
+        "_decision_connection",
         "_fact_decisions",
         "_max_size",
         "_row_decision_ids",
         "_row_decisions",
         "_schema_scope",
         "_set_decisions",
+        "_visibility_decision_ids",
+        "_visibility_decisions",
     )
 
     def __init__(self, *, max_size: int = 10_000) -> None:
@@ -110,7 +115,10 @@ class PermissionEvaluator:
         self._row_decision_ids = 0
         self._set_decisions: OrderedDict[tuple[Any, ...], Any] = OrderedDict()
         self._fact_decisions: OrderedDict[tuple[Any, ...], bool] = OrderedDict()
+        self._visibility_decisions: OrderedDict[tuple[Any, ...], frozenset[str]] = OrderedDict()
+        self._visibility_decision_ids = 0
         self._schema_scope = SchemaScope()
+        self._decision_connection: Any = None
 
     # ----- public API -----
 
@@ -174,7 +182,89 @@ class PermissionEvaluator:
         self._row_decision_ids = 0
         self._set_decisions.clear()
         self._fact_decisions.clear()
+        self._visibility_decisions.clear()
+        self._visibility_decision_ids = 0
         self._schema_scope.clear()
+
+    @schema_operation
+    def _held_many(
+        self,
+        backend: LocalBackend,
+        *,
+        subject: SubjectRef,
+        model: type[models.Model],
+        resource_type: str,
+        actions: Iterable[str],
+        ids: Iterable[str],
+        using: str,
+    ) -> dict[str, set[str]]:
+        """Memoise field visibility for one actor, model, action and row batch."""
+        from .compile.read import _memo_eligible, _row_dependency_key
+        from .database import database_context
+
+        names = tuple(dict.fromkeys(actions))
+        candidates = tuple(sorted(set(ids)))
+        if not names:
+            return {}
+        if not candidates:
+            return {name: set() for name in names}
+        with database_context(using):
+            eligible = len(candidates) <= self._max_size and _memo_eligible(
+                backend, resource_type, using=using, witnessed=False
+            )
+            backend_key = _backend_cache_key(backend, resource_type) if eligible else None
+        if backend_key is None:
+            return backend.held_many(
+                subject=subject,
+                actions=names,
+                resource_type=resource_type,
+                ids=candidates,
+                using=using,
+            )
+        base_key = (
+            *backend_key,
+            subject,
+            model,
+            resource_type,
+            candidates,
+            using,
+        )
+        answers: dict[str, set[str]] = {}
+        missing: list[str] = []
+        keys = {
+            name: (
+                *base_key,
+                name,
+                _row_dependency_key(backend, (resource_type, name), using=using),
+            )
+            for name in names
+        }
+        for name in names:
+            key = keys[name]
+            if key in self._visibility_decisions:
+                self._visibility_decisions.move_to_end(key)
+                answers[name] = set(self._visibility_decisions[key])
+            else:
+                missing.append(name)
+        if missing:
+            found = backend.held_many(
+                subject=subject,
+                actions=missing,
+                resource_type=resource_type,
+                ids=candidates,
+                using=using,
+            )
+            for name in missing:
+                answers[name] = found[name]
+                self._visibility_decisions[keys[name]] = frozenset(found[name])
+                self._visibility_decision_ids += len(candidates)
+                while (
+                    len(self._visibility_decisions) > self._max_size
+                    or self._visibility_decision_ids > self._max_size
+                ):
+                    oldest, _ = self._visibility_decisions.popitem(last=False)
+                    self._visibility_decision_ids -= len(oldest[5])
+        return answers
 
     # ----- introspection (for tests + debugging) -----
 
@@ -185,6 +275,8 @@ class PermissionEvaluator:
             "row_decision_ids": self._row_decision_ids,
             "set_decision_entries": len(self._set_decisions),
             "fact_decision_entries": len(self._fact_decisions),
+            "visibility_entries": len(self._visibility_decisions),
+            "visibility_ids": self._visibility_decision_ids,
             "max_size": self._max_size,
         }
 
@@ -247,6 +339,8 @@ def evaluator_scope(
             evaluator._row_decision_ids = 0
             evaluator._set_decisions.clear()
             evaluator._fact_decisions.clear()
+            evaluator._visibility_decisions.clear()
+            evaluator._visibility_decision_ids = 0
         try:
             _current_evaluator.reset(token)
         except ValueError:
@@ -258,3 +352,22 @@ def evaluator_scope(
             # real error being unwound (the ContextVar is discarded with its
             # context, so nothing leaks).
             pass
+
+
+@contextmanager
+def decision_scope(*, using: str = "default") -> Iterator[PermissionEvaluator]:
+    """Open one transaction with a transaction-bound decision and schema memo.
+
+    The memo dies before the atomic block exits, including on rollback. A
+    supported write advances its dependency generation within the block.
+    """
+    from django.db import connections, transaction
+
+    from .database import database_context
+
+    with database_context(using), transaction.atomic(using=using), evaluator_scope() as evaluator:
+        evaluator._decision_connection = connections[using]
+        try:
+            yield evaluator
+        finally:
+            evaluator._decision_connection = None

@@ -257,6 +257,7 @@ class DeleteScope:
     unscoped: bool
     identities: set[ObjectRef] = dataclass_field(default_factory=set)
     root_pks: frozenset[Any] = frozenset()
+    covered_pks: dict[type[models.Model], set[Any]] = dataclass_field(default_factory=dict)
 
 
 _delete_scopes: ContextVar[tuple[DeleteScope, ...]] = ContextVar("rebac_delete_scopes", default=())
@@ -297,6 +298,94 @@ def deletion_owner(
         cleanup_identities(scope.identities, using=using)
     finally:
         _delete_scopes.reset(token)
+
+
+def delete_collected(
+    rows: Any, *, origin: Any, using: str, keep_parents: bool = False
+) -> tuple[int, dict[str, int]]:
+    """Collect once, then authorize each collected resource model as one set."""
+    from django.db.models.deletion import Collector
+
+    from .backends import backend
+    from .errors import MissingActorError
+
+    scope = delete_scope(origin, using)
+    assert scope is not None
+    if isinstance(rows, models.Model) and not cast(Any, rows)._is_pk_set():
+        raise ValueError(
+            f"{rows._meta.object_name} object can't be deleted because its "
+            f"{rows._meta.pk.attname} attribute is set to None."
+        )
+    collector = Collector(using=using, origin=origin)
+    if isinstance(rows, models.QuerySet):
+        cast(Any, rows)._not_support_combined_queries("delete")
+        if rows.query.is_sliced:
+            raise TypeError("Cannot use 'limit' or 'offset' with delete().")
+        if rows.query.distinct_fields:
+            raise TypeError("Cannot call delete() after .distinct(*fields).")
+        if cast(Any, rows)._fields is not None:
+            raise TypeError("Cannot call delete() after .values() or .values_list()")
+        del_query = cast(Any, rows)._chain()
+        del_query._for_write = True
+        query = del_query.query
+        query.select_for_update = False
+        query.select_related = False
+        query.clear_ordering(force=True)
+        collector.collect(del_query)
+    else:
+        collector.collect(cast(Any, [rows]), keep_parents=keep_parents)
+    for model, instances in collector.data.items():
+        if not issubclass(model, RebacMixin):
+            continue
+        resource_type = model_resource_type(model)
+        if resource_type is None:
+            continue
+        covered = scope.covered_pks.setdefault(model, set())
+        if model is type(origin) and not isinstance(origin, models.QuerySet):
+            covered.add(origin.pk)
+        if isinstance(origin, models.QuerySet) and model is origin.model:
+            covered.update(scope.root_pks)
+        candidates = [instance for instance in instances if instance.pk not in covered]
+        if not candidates:
+            continue
+        if scope.unscoped:
+            covered.update(instance.pk for instance in candidates)
+            continue
+        if scope.actor is None:
+            raise MissingActorError("Cascaded delete has no actor.")
+        identities = {
+            str(getattr(instance, resource_id_attr(model))): instance.pk for instance in candidates
+        }
+        granted = backend().held(
+            subject=scope.actor,
+            action="delete",
+            resource_type=resource_type,
+            ids=identities,
+            using=using,
+        )
+        denied = sorted(set(identities) - granted)
+        if denied:
+            resource = ObjectRef(resource_type, denied[0])
+            raise GateDenied(
+                f"Denied: {scope.actor} cannot delete {resource}",
+                scope.actor,
+                "delete",
+                resource,
+            )
+        covered.update(identities.values())
+    result = collector.delete()
+    if isinstance(rows, models.QuerySet):
+        rows._result_cache = None
+    return result
+
+
+def _next_delete_is_model(instance: models.Model, owner: type[models.Model]) -> bool:
+    """Retain the collector fast path only for Django's own next delete."""
+    lineage = type(instance).__mro__
+    for base in lineage[lineage.index(owner) + 1 :]:
+        if "delete" in base.__dict__:
+            return base is models.Model
+    return False
 
 
 @contextmanager
@@ -410,6 +499,8 @@ class RebacTrackedMixin(models.Model, metaclass=RebacModelBase):
 
         alias = write_alias(type(self), using=using, instance=self)
         if delete_scope(self, alias) is not None:
+            if _next_delete_is_model(self, RebacTrackedMixin):
+                return delete_collected(self, origin=self, using=alias, keep_parents=keep_parents)
             return super().delete(using=alias, keep_parents=keep_parents)
         actor, unscoped = resolve(mode="ambient", strict=False, subject_label=type(self).__name__)
         with audit_denials(using=alias), model_write(model=type(self), using=alias):
@@ -417,6 +508,10 @@ class RebacTrackedMixin(models.Model, metaclass=RebacModelBase):
 
             _gate_backed_field_change(type(self), self, alias, None, deleting=True)
             with deletion_owner(self, alias, actor, unscoped):
+                if _next_delete_is_model(self, RebacTrackedMixin):
+                    return delete_collected(
+                        self, origin=self, using=alias, keep_parents=keep_parents
+                    )
                 return super().delete(using=alias, keep_parents=keep_parents)
 
 
