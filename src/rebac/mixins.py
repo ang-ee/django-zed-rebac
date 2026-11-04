@@ -258,6 +258,7 @@ class DeleteScope:
     identities: set[ObjectRef] = dataclass_field(default_factory=set)
     root_pks: frozenset[Any] = frozenset()
     covered_pks: dict[type[models.Model], set[Any]] = dataclass_field(default_factory=dict)
+    delivered_models: set[type[models.Model]] = dataclass_field(default_factory=set)
 
 
 _delete_scopes: ContextVar[tuple[DeleteScope, ...]] = ContextVar("rebac_delete_scopes", default=())
@@ -275,6 +276,12 @@ def delete_scope(origin: Any, using: str) -> DeleteScope | None:
         ),
         None,
     )
+
+
+def batch_delivered(origin: Any, using: str, model: type[models.Model]) -> bool:
+    """Whether this owner's admitted model batch has reached its receiver."""
+    scope = delete_scope(origin, using)
+    return scope is not None and model in scope.delivered_models
 
 
 @contextmanager
@@ -308,6 +315,7 @@ def delete_collected(
 
     from .backends import backend
     from .errors import MissingActorError
+    from .signals import collected_for_delete
 
     scope = delete_scope(origin, using)
     assert scope is not None
@@ -373,6 +381,16 @@ def delete_collected(
                 resource,
             )
         covered.update(identities.values())
+    for model, instances in collector.data.items():
+        scope.delivered_models.add(model)
+        collected_for_delete.send(
+            sender=model,
+            instances=tuple(instances),
+            using=using,
+            origin=origin,
+            actor=scope.actor,
+            unscoped=scope.unscoped,
+        )
     result = collector.delete()
     if isinstance(rows, models.QuerySet):
         rows._result_cache = None

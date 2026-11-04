@@ -20,7 +20,7 @@ from django.db.models.signals import (
     pre_delete,
     pre_save,
 )
-from django.dispatch import receiver
+from django.dispatch import Signal, receiver
 
 from .actors import model_can_resolve_subject, model_identities
 from .conf import app_settings
@@ -28,6 +28,10 @@ from .database import database_context
 from .errors import GateDenied, PermissionDenied
 from .resources import model_resource_type, to_object_ref
 from .types import ObjectRef, SubjectRef
+
+# Sent by the delete owner once per admitted model batch, before Django's
+# per-row pre_delete signals. See ARCHITECTURE.md, CRUD enforcement matrix.
+collected_for_delete = Signal()
 
 # Weak sets retain no isolated app registry after its classes disappear.
 _owned: WeakSet[type[Model]] = WeakSet()

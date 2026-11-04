@@ -551,6 +551,8 @@ from rebac.schema import parse_zed, validate_schema   # for tooling
 from rebac.memberships import grant, revoke, members_of, containers_of   # direct `member` tuples
 from rebac.roles  import grant, revoke, roles_of, members_of   # role-as-namespace helpers
 from rebac.testing import install_schema   # test helper: make a schema and backend current
+from rebac.signals import collected_for_delete  # one admitted collector batch per model
+from rebac.mixins import batch_delivered        # batch marker for per-row pre_delete receivers
 ```
 
 For an operation without a pinned actor, `is_sudo()` answers whether ambient
@@ -2943,6 +2945,68 @@ mutation and checks each collected REBAC resource model in one scoped
 candidate-set statement per 500 collected rows of that model. Those rows are
 marked covered, so their `pre_delete` receivers do not issue point checks.
 Root and cascade gates share one schema operation.
+After the collected REBAC resource gates pass, the owner sends
+`rebac.signals.collected_for_delete` once for each model in `collector.data`,
+including models without REBAC resource types, before `collector.delete()`.
+The sender is the collected instance's own class, including a proxy root or
+multi-table parent, as in Django's `pre_delete`. Receivers get `sender=model`,
+`instances=tuple(collector.data[model])`, `using` (the database alias),
+`origin` (the same object forwarded to Django's per-row `pre_delete`),
+`actor` (`SubjectRef | None`) and `unscoped` (`bool`). The signal runs inside
+the owner's transaction and pinned schema operation; a receiver exception
+aborts the delete. Delivery does not mean every write gate has passed:
+declared `through=` rows are gated individually during `collector.delete()`,
+after all batches have been sent. A denial there, a consumer `pre_delete`
+refusal, or a database constraint error at deletion aborts the operation and
+rolls back receivers' database writes. Receivers must defer non-transactional
+effects with `transaction.on_commit()`.
+
+`rebac.mixins.batch_delivered(origin, using, model)` is true from delivery
+until that owner's scope exits. It means the model's batch was sent, not that
+a particular policy handled it. A consumer may use it to skip a per-row
+`pre_delete` policy only when that policy's batch receiver is connected to
+exactly the same sender set, including proxies and multi-table parents. For
+example, bind both receivers with `sender=model` for each model the policy
+covers, and keep the per-row receiver as the fallback outside the owner.
+
+```python
+from django.db.models.signals import pre_delete
+from rebac.mixins import batch_delivered
+from rebac.signals import collected_for_delete
+
+def row_policy(sender, instance, origin, using, **kwargs):
+    if batch_delivered(origin, using, sender):
+        return
+    handle_one(instance)
+
+def batch_policy(sender, instances, origin, using, actor, unscoped, **kwargs):
+    handle_many(instances)
+
+for model in policy_models:  # include every proxy and multi-table parent the policy covers
+    pre_delete.connect(row_policy, sender=model, dispatch_uid=f"policy.row.{model._meta.label}")
+    collected_for_delete.connect(
+        batch_policy, sender=model, dispatch_uid=f"policy.batch.{model._meta.label}"
+    )
+```
+
+The predicate is false for other models, origins, aliases, and deletes outside
+an owner. A gated (actor-scoped) queryset delete is split into 5,000-key parts
+and sends once per model per part, each part with its own origin; a bypassed or
+unwatched queryset delete and an instance delete run one owner over the whole
+collection and send one batch per model, with no upper bound on its size, so a
+receiver chunks a large batch itself. Nested deletes likewise have their own
+origins and batches.
+Consumers that do not subscribe retain their per-row receiver behavior.
+
+Only rows in Django's `collector.data` are delivered. A batch receiver alone
+does not prevent Django from fast-deleting a model, whose rows then receive no
+batch or per-row signal. Consumers must keep an explicit-sender per-row delete
+receiver on every model whose batch they need. A model whose `delete()` override
+sits after the mixin in the class order and takes a path outside
+`delete_collected()` also sends no batch; its per-row receivers retain their
+usual behavior when Django collects its rows. Database-level `DB_CASCADE`,
+`DB_SET_NULL`, and `DB_SET_DEFAULT` rows remain outside Django's collector and
+this signal (proposal 0011).
 A forward related-manager call from a multi-table child of the declaring model
 is not gated (proposal 0013). Through gates use the changed FK pairs and their
 source rows rather than the whole through table.
