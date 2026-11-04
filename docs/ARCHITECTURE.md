@@ -1727,6 +1727,8 @@ policy and caveat verdicts afresh at each `attach()`; its row and relationship
 checks execute in the statement. Only identity
 columns are available from its plain reference queryset; field projection and
 join authorization remain the caller's responsibility.
+Derived identity and closure querysets carry no model ordering; the caller's
+outer ordering is preserved.
 
 `RebacQuerySet.scope_cte(actions=(...))` also accepts a queryset whose only
 caller filter is one mandatory native exact or bounded `__in` lookup on its
