@@ -23,6 +23,16 @@ pre-1.0; breaking changes within a minor version are explicitly called out.
 
 ### Changed
 
+- Embedded `sudo()` and `system_context()` querysets now emit one bypass audit
+  row per distinct `(entry, reason)` pair per enclosing statement execution.
+  Reusing an entry in several subqueries no longer multiplies rows; later
+  embedded executions still audit an entry previously used directly. Hooked
+  statements write after successful execution, while compile-only and
+  `EmptyResultSet` statements write none. A plain Django `Query` containing
+  a REBAC subquery swaps to the private `_BypassAuditQuery` class for this
+  hook; query classes without the hook retain render-time audit as a
+  fail-safe. Block bypass timing, recorded reasons and actors, and denial
+  audits retain their contracts.
 - Actor resolution, sudo validation and bypass emission now share one owner
   each. Ambient `sudo()` covers related reads when no actor is pinned; an
   instance or queryset sudo pin still does not cross a relation. The private
