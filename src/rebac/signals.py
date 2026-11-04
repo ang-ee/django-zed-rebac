@@ -756,7 +756,7 @@ def _gate_backed_rows(
         return
     changed_names = set(names) if names is not None else None
     materialized = list(rows)
-    from .watch import gate_policy
+    from .watch import gate_policy, key_filter
 
     program = gate_policy(using)
     if program is None:
@@ -783,7 +783,7 @@ def _gate_backed_rows(
         )
         if not columns:
             continue
-        for values in _stored(model, using).filter(pk__in=pks).values("pk", *columns):
+        for values in _stored(model, using).filter(key_filter(model, pks)).values("pk", *columns):
             stored[(model, values["pk"])] = values
     through_pairs: ThroughPairs = {}
     last_row: Model | None = None

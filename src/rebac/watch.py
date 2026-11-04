@@ -8,11 +8,11 @@ can be gated; ``model_write`` is the one transaction such a write runs in.
 from __future__ import annotations
 
 from collections import OrderedDict
-from collections.abc import Iterable, Iterator, Mapping, Sequence
+from collections.abc import Collection, Iterable, Iterator, Mapping, Sequence
 from contextlib import contextmanager, nullcontext
 from contextvars import ContextVar
 from dataclasses import dataclass
-from itertools import batched
+from itertools import batched, count
 from threading import Lock
 from types import MappingProxyType
 from typing import TYPE_CHECKING, Any
@@ -39,25 +39,77 @@ _row_generation_lock = Lock()
 _row_generation = 0
 _model_generations: dict[tuple[str, str], int] = {}
 _unknown_generation = 0
+_operation_serial = count(1)
 
 
-def row_generation() -> int:
+@dataclass
+class _PendingGenerations:
+    connection: Any
+    serial: int
+    epoch: int
+    counts: dict[tuple[str, str], int]
+    open: bool = True
+
+
+_pending_generations: ContextVar[Mapping[str, _PendingGenerations]] = ContextVar(
+    "rebac_pending_model_generations", default=MappingProxyType({})
+)
+
+
+def _active_generations(using: str) -> _PendingGenerations | None:
+    pending = _pending_generations.get().get(using)
+    connection = connections[using]
+    return (
+        pending
+        if pending is not None
+        and pending.open
+        and pending.connection is connection
+        and connection.in_atomic_block
+        else None
+    )
+
+
+def row_generation(*, using: str = "default") -> int:
     """Process-local invalidation token for bounded row decisions."""
     with _row_generation_lock:
-        return _row_generation
+        generation = _row_generation
+    pending = _active_generations(using)
+    if pending is None:
+        return generation
+    # A unique local epoch cannot alias a later owner even after rollback.
+    # Pairing with the global generation also observes another owner's bump.
+    total = generation + pending.epoch
+    return -1 - (total * (total + 1) // 2 + pending.epoch)
 
 
 def row_generations(labels: Iterable[str], *, using: str) -> tuple[tuple[str, int], ...]:
     """Version only the model tables a decided node reads."""
+    pending = _active_generations(using)
+    operation = (("@operation", pending.serial),) if pending is not None else ()
     with _row_generation_lock:
         return (
             ("*", _unknown_generation),
-            *((label, _model_generations.get((using, label), 0)) for label in sorted(set(labels))),
+            *operation,
+            *(
+                (
+                    label,
+                    _model_generations.get((using, label), 0)
+                    + (pending.counts.get((using, label), 0) if pending is not None else 0),
+                )
+                for label in sorted(set(labels))
+            ),
         )
 
 
 def bump_row_generation(model: type[models.Model] | None = None, *, using: str = "default") -> None:
     global _row_generation, _unknown_generation
+    pending = _active_generations(using) if model is not None else None
+    if model is not None and pending is not None:
+        pending.epoch = next(_operation_serial)
+        for member in model_lineage(model):
+            key = using, member._meta.label_lower
+            pending.counts[key] = pending.counts.get(key, 0) + 1
+        return
     with _row_generation_lock:
         _row_generation += 1
         if model is None:
@@ -66,6 +118,16 @@ def bump_row_generation(model: type[models.Model] | None = None, *, using: str =
             for member in model_lineage(model):
                 key = using, member._meta.label_lower
                 _model_generations[key] = _model_generations.get(key, 0) + 1
+
+
+def _publish_model_generations(pending: _PendingGenerations) -> None:
+    global _row_generation
+    if not pending.counts:
+        return
+    with _row_generation_lock:
+        _row_generation += 1
+        for key in sorted(pending.counts):
+            _model_generations[key] = _model_generations.get(key, 0) + 1
 
 
 @dataclass(frozen=True)
@@ -409,23 +471,61 @@ def model_write(
     from .schema.cache import schema_operation_scope
 
     with schema_operation_scope(), database_context(using):
+        generations = _pending_generations.get()
+        connection = connections[using]
+        active = generations.get(using)
+        generation_token = None
+        if (
+            active is None
+            or not active.open
+            or active.connection is not connection
+            or not connection.in_atomic_block
+        ):
+            serial = next(_operation_serial)
+            active = _PendingGenerations(connection, serial, serial, {})
+            generation_token = _pending_generations.set({**generations, using: active})
+        starting_counts = active.counts.copy()
         held = _open.get()
-        policy = gate_policy(using)
-        token = _open.set({**held, using: policy}) if using not in held else None
-        watched = policy is not None and model_is_watched(policy.watched, model, names)
+        token = None
+        watched = False
         succeeded = False
         try:
+            policy = gate_policy(using)
+            token = _open.set({**held, using: policy}) if using not in held else None
+            watched = policy is not None and model_is_watched(policy.watched, model, names)
             with transaction.atomic(using=using):
                 yield watched
-            succeeded = True
+                if watched:
+                    bump_row_generation(model, using=using)
+                succeeded = True
         finally:
-            if watched and succeeded:
-                bump_row_generation(model, using=using)
+            if not succeeded:
+                # A nested owner's savepoint may roll back while its parent
+                # continues. Forget only that owner's row changes, and retire
+                # any queryset prepared while those uncommitted rows existed.
+                active.counts = starting_counts
+                active.epoch = next(_operation_serial)
             if token is not None:
                 _open.reset(token)
+            if generation_token is not None:
+                active.open = False
+                _pending_generations.reset(generation_token)
+                if succeeded:
+                    _publish_model_generations(active)
 
 
 KEY_CHUNK = 5000
+
+
+def key_filter(model: type[models.Model], keys: Collection[Any]) -> models.Q:
+    """Bind scalar keys as one array, leaving composite keys to Django's TupleIn."""
+    if len(model._meta.pk_fields) != 1:
+        return models.Q(pk__in=tuple(keys))
+    from django.db.models import F
+
+    from .compile.predicate import _bound_in
+
+    return _bound_in(F("pk"), keys)
 
 
 def statement_keys(queryset: models.QuerySet[Any]) -> list[Any]:
@@ -441,6 +541,6 @@ def statement_keys(queryset: models.QuerySet[Any]) -> list[Any]:
 def by_key[Rows: models.QuerySet[Any]](rows: Rows, keys: Sequence[Any]) -> Iterator[Rows]:
     """``rows`` restricted to ``keys``, in parts that fit one statement each."""
     for chunk in batched(keys, KEY_CHUNK, strict=False):
-        yield rows.filter(pk__in=chunk)
+        yield rows.filter(key_filter(rows.model, chunk))
     if not keys:
         yield rows.filter(pk__in=())

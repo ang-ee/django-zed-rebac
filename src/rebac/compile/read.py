@@ -66,6 +66,7 @@ from .predicate import (
     Support,
     _and,
     _bound_in,
+    _BoundIn,
     _Compiled,
     _not,
     _Param,
@@ -1984,7 +1985,7 @@ def _known_identities(
             if node.connector == "AND" and not node.negated:
                 pending.extend(node.children)
             continue
-        if type(node) not in (Exact, IntegerFieldExact, RelatedExact, In, TupleIn):
+        if type(node) not in (Exact, IntegerFieldExact, RelatedExact, In, _BoundIn, TupleIn):
             continue
         column = node.lhs
         value = node.rhs
@@ -2009,7 +2010,7 @@ def _known_identities(
             or (column.output_field is not field and column.output_field is not scalar)
         ):
             continue
-        if type(node) is In:
+        if type(node) in (In, _BoundIn):
             if type(value) not in (list, tuple) or not 0 < len(value) <= _CANDIDATE_LIMIT:
                 continue
             values = value
@@ -2036,7 +2037,7 @@ def _has_literal_identity_set(lhs: Any, where: Any) -> bool:
         if isinstance(node, WhereNode):
             pending.extend(node.children)
         elif (
-            type(node) is In
+            type(node) in (In, _BoundIn)
             and type(node.lhs) is Col
             and node.lhs.alias == lhs.alias
             and node.lhs.target is lhs.target

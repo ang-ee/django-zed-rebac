@@ -1679,7 +1679,7 @@ class RebacQuerySet(TrackedQuerySet[_M]):
         from .backends import local
         from .watch import row_generation
 
-        generation = (local._relationship_generation, row_generation())
+        generation = (local._relationship_generation, row_generation(using=self.db))
         if self._rebac_scope_applied:
             if self._rebac_scope_generation == generation:
                 if prepare:
