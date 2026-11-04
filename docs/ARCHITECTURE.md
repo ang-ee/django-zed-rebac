@@ -466,6 +466,7 @@ from rebac import (
     CheckResult, Consistency, Zookie,
     ObjectRef, SubjectRef, RelationshipTuple,
     CheckItem,                          # one item of check_bulk_permissions()
+    SCOPE_CTE_CANDIDATE_LIMIT,          # maximum explicit bounded identity set
 
     # Errors
     PermissionDenied, MissingActorError, CaveatUnsupportedError,
@@ -1701,7 +1702,8 @@ never retain a stale scope predicate. Boolean and SQL set combinations retain
 the left queryset actor/action policy across all operands; rebinding replaces
 the restriction on each operand without mutating the original querysets.
 
-`RebacQuerySet.scope_cte()` requires an unfiltered actor-scoped queryset and
+`RebacQuerySet.scope_cte()` requires an actor-scoped queryset that is unfiltered
+or filtered only to a bounded native identity set, and
 returns a `SharedScope` handle. `SharedScope.queryset()` is a plain Django
 `values()` queryset over the scope's identity CTE, suitable for repeated
 filters, `Exists` guards, annotations and aggregates. `SharedScope.attach(outer_queryset)`
@@ -1713,13 +1715,83 @@ the CTE's identity set only when actor, action, resource model, alias, backend,
 policy and caveat verdicts agree and the scope has no render-time caveat or
 clock decision. Otherwise they keep their own inline predicates. Exact
 late projections retain their point form; queryset scopes with exact or
-bounded native identities use the candidate-root form before a shared plan.
+bounded native identities use the candidate-root form before an ordinary
+single-action shared plan. A multi-action plan shares its first action's
+identity CTE with the outer row scope when that scope proves an identity set
+that is a subset of the handle's candidates.
 Other literal ID sets stay on the compiler's general scope path. The CTE
 captures
 policy and caveat verdicts afresh at each `attach()`; its row and relationship
 checks execute in the statement. Only identity
 columns are available from its plain reference queryset; field projection and
 join authorization remain the caller's responsibility.
+
+`RebacQuerySet.scope_cte(actions=(...))` also accepts a queryset whose only
+caller filter is one mandatory native exact or bounded `__in` lookup on its
+resource identity attribute (`rebac_id_attr`, normally `pk`). The IDs must be
+distinct canonical native integers, with `1` to
+`SCOPE_CTE_CANDIDATE_LIMIT` (`256`) members. An empty set or a larger set raises
+`ValueError`; unlike the candidate-root path, this explicit handle does not
+silently fall back to an unbounded scope. Callers may branch to inline
+projections or chunk their work.
+The handle keeps those candidates in its attached body; references still expose
+row identities. The first action is the handle's identity scope action, and
+the tuple must contain distinct action names. An action may name a permission
+or a relation; an unknown action has the `nil` verdict. An explicit multi-action
+handle defines one statement-local closure CTE of distinct permission leaves
+over the candidate rows. Leaves include relation and permission references,
+arrows, and the `authenticated` and `anonymous` builtins, with lower
+and upper bounds kept separately for exclusion. Each projected action is a
+Boolean verdict over references to this closure. The identity CTE uses the
+first verdict. `permission_expression()` for any listed action shares the
+closure only when actor, resource, alias, backend, policy and caveat verdicts
+match and the projection's resolved query proves that its mandatory native
+identity set is a subset of the handle's candidates. A broader projection
+keeps its inline predicate. Sharing is all-or-nothing for the listed actions:
+recursion in any listed action, an expiring relation anywhere in the schema,
+any override tag, caveat deadline, or caveated tuple reachable by any listed
+action makes the entire multi-action closure ineligible. Those projections
+keep their inline proofs. Attachment always rebuilds and pins the plan for that statement;
+candidate IDs never become authority for a different statement.
+
+```python
+actions = ("read", "write", "share", "delete")
+page = list(invoice_queryset)  # fetch the root page before building this batch
+ids = {invoice.party_id for invoice in page if invoice.party_id is not None}
+if ids:
+    # Keep the actual related queryset's type hook and optimizer projections.
+    rows = related_party_queryset.filter(pk__in=ids).annotate(
+        **{
+            f"can_{action}": permission_expression(Party, action, actor=actor)
+            for action in actions
+        }
+    )
+    if len(ids) <= SCOPE_CTE_CANDIDATE_LIMIT:
+        scope = Party.objects.with_actor(actor).filter(pk__in=ids).scope_cte(
+            actions=actions
+        )
+        rows = scope.attach(rows)
+    parties = {party.pk: party for party in rows}
+    for invoice in page:
+        if invoice.party_id is not None:
+            invoice._state.fields_cache["party"] = parties.get(invoice.party_id)
+```
+
+Denied rows are cached as `None`, exactly as Django's own prefetch does: a
+related row left out of the cache would otherwise load lazily through the
+unscoped base manager and return the denied row, and in a GraphQL resolver it
+would cost one more statement per denied row.
+
+This is a page-level batch: the root rows are fetched first, then their related
+IDs are known before building the related statement. Both the clean handle
+queryset and the actual related queryset must carry the same mandatory identity
+filter. Extra filters on the actual queryset are allowed. Django's forward-FK
+prefetch adds a multi-row `TupleIn` predicate after the queryset is built;
+that predicate alone is not a containment proof for this contract. For models
+whose `rebac_id_attr` differs from `pk`, filter the handle on that identity
+attribute and map the page's FK values to it. A one-action base-manager
+projection can be larger with an explicit handle than inline; use the shared
+closure for several actions.
 
 Boolean combinations require REBAC querysets so empty-query fast paths cannot
 return a plain unscoped manager. Django's bounded primary-key subqueries for
@@ -2115,10 +2187,12 @@ The owner registers matching projections and resolved nested scope guards on
 isolated query clones in the statement. The fresh CTE body has the same inline
 scope proof and revision fence as an unattached queryset; a nested resolution
 may prepare bounded decisions and their witnesses for that statement. Inside
-`decision_scope()`, attachment prepares the body's bounded decisions through
-the transaction memo and embeds their witnesses in the CTE; subsequent
-attachments reuse eligible decisions until a dependency write or rolled-back
-savepoint invalidates them. Reusing
+`decision_scope()`, an ordinary single-action attachment prepares the body's
+bounded decisions through the transaction memo and embeds their witnesses in
+the CTE; subsequent ordinary attachments reuse eligible decisions until a
+dependency write or rolled-back savepoint invalidates them. Multi-action
+closures do not consult that memo; when ineligible, they use the ordinary
+single-action attachment path for the identity body. Reusing
 the handle in another statement builds another body. Sharing does not cross
 statement or database boundaries.
 
@@ -2595,6 +2669,7 @@ outer read statement. Other SQL shapes retain their independent predicates.
 
 ```python
 ActorLike = Union[SubjectRef, User, Group, "AnyRebacSubject"]
+SCOPE_CTE_CANDIDATE_LIMIT = 256
 # Anything that can resolve to a <type>:<id> SubjectRef:
 #   - django.contrib.auth User instance       → auth/user:<id>
 #   - django.contrib.auth Group instance      → auth/group:<id>#member
@@ -2611,7 +2686,7 @@ class RebacManager:
 
     # Primary, generic actor scoping. Accepts any ActorLike.
     def with_actor(self, actor: ActorLike) -> RebacQuerySet: ...
-    def scope_cte(self) -> SharedScope: ...
+    def scope_cte(self, *, actions: tuple[str, ...] = ()) -> SharedScope: ...
 
     # Typed shorthands — all eventually call with_actor() internally.
     def as_user(self, user) -> RebacQuerySet: ...
@@ -2629,7 +2704,7 @@ class RebacManager:
     def effective_actor(self, *, strict: bool = False) -> tuple[SubjectRef | None, bool]: ...
 
 class RebacQuerySet:
-    def scope_cte(self) -> SharedScope: ...
+    def scope_cte(self, *, actions: tuple[str, ...] = ()) -> SharedScope: ...
     def with_actor(self, actor: ActorLike) -> Self: ...
     def as_user(self, user) -> Self: ...
     def as_agent(self, agent, *, on_behalf_of=None) -> Self: ...

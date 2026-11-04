@@ -9,7 +9,14 @@ from django.db import connection, models
 from django.db.models import F, Q, Subquery
 from django.test.utils import CaptureQueriesContext
 
-from rebac import ObjectRef, RelationshipTuple, SubjectRef, sudo, to_object_ref
+from rebac import (
+    SCOPE_CTE_CANDIDATE_LIMIT,
+    ObjectRef,
+    RelationshipTuple,
+    SubjectRef,
+    sudo,
+    to_object_ref,
+)
 from rebac.compile import read
 from rebac.errors import PermissionDenied
 from rebac.expressions import permission_expression
@@ -17,7 +24,7 @@ from rebac.managers import share_scoped_definitions
 from rebac.models import active_relationship_model
 from rebac.schema import parse_zed
 from rebac.testing import install_schema
-from tests.testapp.models import Attachment, Folder, Post
+from tests.testapp.models import Attachment, Folder, IntegerIdentityFolder, Post
 
 pytestmark = pytest.mark.django_db
 
@@ -635,6 +642,10 @@ def test_shared_scope_union_owner_and_refusals(shared_scope_rows):
     )
     with pytest.raises(ValueError, match="unfiltered"):
         Folder.objects.with_actor(actor).filter(name="allowed").scope_cte()
+    with pytest.raises(ValueError, match="bounded identity"):
+        Folder.objects.with_actor(actor).filter(pk__in=range(257)).scope_cte()
+    with pytest.raises(ValueError, match="distinct"):
+        Folder.objects.with_actor(actor).scope_cte(actions=("read", "read"))
     with pytest.raises(ValueError, match="unsliced"):
         Folder.objects.with_actor(actor)[:1].scope_cte()
     with pytest.raises(ValueError, match="actor scope"):
@@ -658,6 +669,344 @@ def test_shared_scope_keeps_point_and_literal_id_set_paths(shared_scope_rows):
             == list(inline.values_list("pk", flat=True))
             == [allowed.pk]
         )
+
+
+@pytest.mark.pg_delta
+def test_identity_filtered_scope_cte_keeps_only_candidate_rows(shared_scope_rows):
+    _local, actor, allowed, denied = shared_scope_rows
+    handle = Folder.objects.with_actor(actor).filter(pk__in=[allowed.pk, denied.pk]).scope_cte()
+    rows = handle.attach(
+        Folder._base_manager.filter(pk__in=handle.queryset().values("pk")).order_by("pk")
+    )
+    assert list(rows.values_list("pk", flat=True)) == [allowed.pk]
+
+
+@pytest.mark.pg_delta
+@pytest.mark.parametrize("count", [1, 5, 50])
+def test_bounded_multi_action_projection_shares_one_closure(count):
+    from rebac import decision_scope
+
+    local = install_schema("""
+        definition auth/user {}
+        definition auth/group {
+            relation member: auth/user | auth/group#member
+        }
+        definition blog/folder {
+            relation owner: auth/user
+            relation viewer: auth/user | auth/group#member
+            relation editor: auth/user | auth/group#member
+            relation banned: auth/user
+            permission read = owner + viewer + editor
+            permission write = owner + editor
+            permission share = (owner + editor) - banned
+            permission delete = owner - banned
+        }
+    """)
+    actor = SubjectRef.of("auth/user", "four-actions")
+    with sudo(reason="four-action fixture"):
+        folders = [Folder.objects.create(name=f"four-{n}") for n in range(count)]
+    group = ObjectRef("auth/group", "four-actions")
+    relationships = [RelationshipTuple(group, "member", actor)]
+    for index, folder in enumerate(folders):
+        relation = "owner" if index % 3 == 0 else "editor" if index % 3 == 1 else "viewer"
+        subject = actor if relation == "owner" else SubjectRef(group, "member")
+        relationships.append(RelationshipTuple(to_object_ref(folder), relation, subject))
+        if index % 4 == 0:
+            relationships.append(RelationshipTuple(to_object_ref(folder), "banned", actor))
+    local.write_relationships(relationships)
+    ids = [folder.pk for folder in folders]
+    actions = ("read", "write", "share", "delete")
+
+    def projections():
+        return (
+            Folder._base_manager.filter(pk__in=ids)
+            .order_by("pk")
+            .annotate(
+                **{
+                    f"can_{action}": permission_expression(Folder, action, actor=actor)
+                    for action in actions
+                }
+            )
+        )
+
+    inline = projections()
+    expected = list(inline.values_list("pk", *(f"can_{action}" for action in actions)))
+    handle = Folder.objects.with_actor(actor).filter(pk__in=ids).scope_cte(actions=actions)
+    shared = handle.attach(projections())
+    sql = str(shared.query)
+    assert len(re.findall(r'"rebac_scope_[^\"]+_closure" AS \(', sql)) == 1
+    with CaptureQueriesContext(connection) as executed:
+        actual = list(shared.values_list("pk", *(f"can_{action}" for action in actions)))
+    assert len(executed) == 1
+    assert actual == expected
+    if count == 5:
+        scoped_outer = (
+            Folder.objects.with_actor(actor)
+            .filter(pk__in=ids)
+            .order_by("pk")
+            .annotate(
+                **{
+                    f"can_{action}": permission_expression(Folder, action, actor=actor)
+                    for action in actions
+                }
+            )
+        )
+        scoped_shared = handle.attach(scoped_outer)
+        assert (
+            list(scoped_shared.values_list("pk", *(f"can_{action}" for action in actions)))
+            == expected
+        )
+        assert len(str(scoped_shared.query).encode()) - len(sql.encode()) < 1_000
+    again = handle.attach(shared)
+    assert len(re.findall(r'"rebac_scope_[^\"]+_closure" AS \(', str(again.query))) == 1
+    assert list(again.values_list("pk", *(f"can_{action}" for action in actions))) == expected
+    assert (
+        list(
+            handle.attach(projections()).values_list("pk", *(f"can_{action}" for action in actions))
+        )
+        == expected
+    )
+    with decision_scope():
+        assert (
+            list(
+                handle.attach(projections()).values_list(
+                    "pk", *(f"can_{action}" for action in actions)
+                )
+            )
+            == expected
+        )
+        if count == 5:
+            decided = {
+                action: set(
+                    Folder.objects.with_actor(actor)
+                    .with_action(action)
+                    .filter(pk__in=ids)
+                    .values_list("pk", flat=True)
+                )
+                for action in actions
+            }
+            assert all(
+                verdict == (pk in decided[action])
+                for pk, *verdicts in expected
+                for action, verdict in zip(actions, verdicts, strict=True)
+            )
+    if count == 50:
+        assert len(sql.encode()) < len(str(inline.query).encode())
+        small_ids = ids[:5]
+        small = Folder.objects.with_actor(actor).filter(pk__in=small_ids).scope_cte(actions=actions)
+        small_rows = Folder._base_manager.filter(pk__in=small_ids).annotate(
+            **{
+                f"can_{action}": permission_expression(Folder, action, actor=actor)
+                for action in actions
+            }
+        )
+        assert 0 < len(sql.encode()) - len(str(small.attach(small_rows).query).encode()) < 2_000
+
+
+@pytest.mark.pg_delta
+@pytest.mark.parametrize(
+    ("first", "second"),
+    [("read", "owner"), ("owner", "read"), ("none", "read"), ("undefined", "read")],
+)
+def test_multi_action_relation_and_false_first_match_inline(first, second):
+    local = install_schema("""
+        definition auth/user {}
+        definition blog/folder {
+            relation owner: auth/user
+            permission read = owner
+            permission none = nil
+        }
+    """)
+    actor = SubjectRef.of("auth/user", "relation-action")
+    with sudo(reason="relation action fixture"):
+        allowed = Folder.objects.create(name="relation-allowed")
+        denied = Folder.objects.create(name="relation-denied")
+    local.write_relationships([RelationshipTuple(to_object_ref(allowed), "owner", actor)])
+    ids = [allowed.pk, denied.pk]
+    actions = (first, second)
+    inline = (
+        Folder._base_manager.filter(pk__in=ids)
+        .order_by("pk")
+        .annotate(
+            **{
+                f"can_{action}": permission_expression(Folder, action, actor=actor)
+                for action in actions
+            }
+        )
+    )
+    handle = (
+        Folder.objects.with_actor(actor)
+        .with_action(first)
+        .filter(pk__in=ids)
+        .scope_cte(actions=actions)
+    )
+    shared = handle.attach(inline)
+    fields = ("pk", *(f"can_{action}" for action in actions))
+    assert "_closure" in str(shared.query)
+    assert list(shared.values_list(*fields)) == list(inline.values_list(*fields))
+
+
+@pytest.mark.pg_delta
+def test_multi_action_with_no_surviving_arm_keeps_outer_rows():
+    install_schema("""
+        definition auth/user {}
+        definition auth/apikey {}
+        definition blog/folder {
+            relation owner: auth/user
+            permission read = owner
+            permission write = owner
+        }
+    """)
+    actor = SubjectRef.of("auth/apikey", "unadmitted")
+    with sudo(reason="unadmitted actor fixture"):
+        folders = [Folder.objects.create(name=f"unadmitted-{n}") for n in range(3)]
+    ids = [folder.pk for folder in folders]
+    actions = ("read", "write")
+    inline = (
+        Folder._base_manager.filter(pk__in=ids)
+        .order_by("pk")
+        .annotate(
+            **{
+                f"can_{action}": permission_expression(Folder, action, actor=actor)
+                for action in actions
+            }
+        )
+    )
+    handle = Folder.objects.with_actor(actor).filter(pk__in=ids).scope_cte(actions=actions)
+    shared = handle.attach(inline)
+    assert "_closure" not in str(shared.query)
+    assert list(shared.values_list("pk", "can_read", "can_write")) == [
+        (folder.pk, False, False) for folder in folders
+    ]
+    assert list(shared.values_list("pk", "can_read", "can_write")) == list(
+        inline.values_list("pk", "can_read", "can_write")
+    )
+
+
+@pytest.mark.pg_delta
+@pytest.mark.parametrize("actions", [(), ("read", "preview"), ("read", "write")])
+def test_bounded_scope_cte_uses_non_pk_integer_identity(actions):
+    local = install_schema("""
+        caveat flag(enabled bool) { enabled }
+        definition auth/user {}
+        definition blog/integeridentityfolder {
+            relation viewer: auth/user
+            relation editor: auth/user
+            relation gated: auth/user with flag
+            permission read = viewer + editor
+            permission write = editor
+            permission preview = gated
+        }
+    """)
+    actor = SubjectRef.of("auth/user", "integer-identity")
+    with sudo(reason="integer identity fixture"):
+        folders = [
+            IntegerIdentityFolder.objects.create(external_id=101 + n, name=f"ext-{n}")
+            for n in range(3)
+        ]
+    relationships = [RelationshipTuple(to_object_ref(folders[0]), "viewer", actor)]
+    if "preview" in actions:
+        relationships.append(
+            RelationshipTuple(
+                to_object_ref(folders[2]),
+                "gated",
+                actor,
+                caveat_name="flag",
+                caveat_context={"enabled": True},
+            )
+        )
+    local.write_relationships(relationships)
+    candidates = [folders[0].external_id, folders[1].external_id]
+    handle = (
+        IntegerIdentityFolder.objects.with_actor(actor)
+        .filter(external_id__in=candidates)
+        .scope_cte(actions=actions)
+    )
+    expected = list(
+        IntegerIdentityFolder.objects.with_actor(actor)
+        .filter(external_id__in=candidates)
+        .values_list("pk", flat=True)
+    )
+    actual = list(
+        handle.attach(
+            IntegerIdentityFolder._base_manager.filter(
+                pk__in=handle.queryset().values("pk")
+            ).order_by("pk")
+        ).values_list("pk", flat=True)
+    )
+    assert actual == expected == [folders[0].pk]
+
+
+@pytest.mark.pg_delta
+def test_scope_cte_candidate_limit_and_empty_set_are_explicit():
+    actor = SubjectRef.of("auth/user", "bounded-limit")
+    assert SCOPE_CTE_CANDIDATE_LIMIT == 256
+    with pytest.raises(ValueError, match="bounded identity"):
+        Folder.objects.with_actor(actor).filter(pk__in=[]).scope_cte()
+    with pytest.raises(ValueError, match="bounded identity"):
+        Folder.objects.with_actor(actor).filter(
+            pk__in=list(range(1, SCOPE_CTE_CANDIDATE_LIMIT + 2))
+        ).scope_cte()
+
+
+@pytest.mark.pg_delta
+def test_multi_action_caveat_verdict_falls_back_to_inline():
+    local = install_schema("""
+        caveat flag(enabled bool) { enabled }
+        definition auth/user {}
+        definition blog/folder {
+            relation viewer: auth/user with flag
+            relation banned: auth/user
+            permission read = viewer
+            permission write = viewer - banned
+        }
+    """)
+    actor = SubjectRef.of("auth/user", "caveated-four")
+    with sudo(reason="multi-action caveat fixture"):
+        folder = Folder.objects.create(name="caveated-four")
+    local.write_relationships(
+        [
+            RelationshipTuple(
+                to_object_ref(folder),
+                "viewer",
+                actor,
+                caveat_name="flag",
+                caveat_context={"enabled": True},
+            ),
+        ]
+    )
+    actions = ("read", "write")
+    handle = Folder.objects.with_actor(actor).filter(pk=folder.pk).scope_cte(actions=actions)
+    inline = Folder._base_manager.annotate(
+        can_read=permission_expression(Folder, "read", actor=actor),
+        can_write=permission_expression(Folder, "write", actor=actor),
+    )
+    shared = handle.attach(inline)
+    assert "_closure" not in str(shared.query)
+    assert (
+        list(shared.values_list("pk", "can_read", "can_write"))
+        == list(inline.values_list("pk", "can_read", "can_write"))
+        == [(folder.pk, True, True)]
+    )
+    local.write_relationships([RelationshipTuple(to_object_ref(folder), "banned", actor)])
+    assert list(handle.attach(inline).values_list("pk", "can_read", "can_write")) == [
+        (folder.pk, True, False)
+    ]
+
+
+@pytest.mark.pg_delta
+def test_bounded_projection_does_not_narrow_broader_outer_query(shared_scope_rows):
+    local, actor, allowed, denied = shared_scope_rows
+    local.write_relationships([RelationshipTuple(to_object_ref(denied), "viewer", actor)])
+    handle = Folder.objects.with_actor(actor).filter(pk=allowed.pk).scope_cte(actions=("read",))
+    outer = Folder._base_manager.annotate(
+        can_read=permission_expression(Folder, "read", actor=actor)
+    ).order_by("pk")
+    assert (
+        list(handle.attach(outer).values_list("pk", "can_read"))
+        == list(outer.values_list("pk", "can_read"))
+        == [(allowed.pk, True), (denied.pk, True)]
+    )
 
 
 @pytest.fixture
@@ -687,6 +1036,29 @@ def shared_arrow_rows():
 
 def _plain(rows):
     return models.QuerySet(model=rows.model, query=rows.query.clone(), using=rows.db).values("pk")
+
+
+@pytest.mark.pg_delta
+def test_bounded_multi_action_arrow_projections_match_inline(shared_arrow_rows):
+    _local, actor, post = shared_arrow_rows
+    actions = ("once", "many")
+    inline = Post._base_manager.filter(pk=post.pk).annotate(
+        can_once=permission_expression(Post, "once", actor=actor),
+        can_many=permission_expression(Post, "many", actor=actor),
+    )
+    handle = (
+        Post.objects.with_actor(actor)
+        .with_action("once")
+        .filter(pk=post.pk)
+        .scope_cte(actions=actions)
+    )
+    shared = handle.attach(inline)
+    assert "_closure" in str(shared.query)
+    assert (
+        list(shared.values_list("pk", "can_once", "can_many"))
+        == list(inline.values_list("pk", "can_once", "can_many"))
+        == [(post.pk, True, True)]
+    )
 
 
 def test_late_permission_expression_on_scoped_queryset_is_self_contained(shared_arrow_rows):

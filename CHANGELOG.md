@@ -15,8 +15,23 @@ pre-1.0; breaking changes within a minor version are explicitly called out.
 
 ### Added
 
+- `scope_cte(actions=("read", "write", ...))` shares a statement-local
+  permission-leaf closure across several projections on one resource model.
+  The scope may be filtered to one native bounded identity set; each attached
+  closure visits those candidate rows and its identity references remain row
+  IDs. Listed `permission_expression()` actions read small verdicts over that
+  closure when policy and caveat pins allow sharing, including upper-bound
+  exclusion leaves; a bounded outer row scope uses the same closure for its
+  first action. Otherwise the projections retain their inline proof.
+  The closure is all-or-nothing across listed actions and requires no
+  recursive action, expiring relation, override tag, caveat deadline or
+  reachable caveated tuple. Relation names are valid actions; unknown names
+  have the `nil` verdict. False arms and false first actions preserve enclosing
+  rows. The public `SCOPE_CTE_CANDIDATE_LIMIT` is `256`; an empty or larger
+  explicit candidate set raises `ValueError`.
 - `RebacQuerySet.scope_cte() -> SharedScope` provides a statement-local
-  identity CTE for an unfiltered actor scope. `SharedScope.queryset()` returns
+  identity CTE for an unfiltered or bounded identity-filtered actor scope.
+  `SharedScope.queryset()` returns
   plain Django identity rows for repeated filters, annotations, `Exists`
   guards and aggregates; `SharedScope.attach(queryset)` defines the scope once
   on a read statement's owner (the union owner for unions), without changing
@@ -25,8 +40,9 @@ pre-1.0; breaking changes within a minor version are explicitly called out.
   only with the same shareable policy and verdicts. Exact late projections
   retain their point form; queryset identity proofs retain the candidate-root
   form, including bounded literal ID sets.
-  Inside `decision_scope()`, each attachment prepares a witnessed body using
-  eligible transaction-memoized decisions.
+  Inside `decision_scope()`, ordinary single-action attachments prepare a
+  witnessed body using eligible transaction-memoized decisions. Multi-action
+  closures do not use that memo; ineligible closures use the ordinary body.
 - `decision_scope(*, using="default")` opens one atomic transaction with a
   transaction-bound evaluator. Warm stored schemas read their revision once
   for that scope; bounded row, fact and actor-set decisions are reused until

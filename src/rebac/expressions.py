@@ -5,6 +5,7 @@ from __future__ import annotations
 from typing import Any, cast
 
 from django.db import models
+from django.db.models import Q
 from django.db.models.expressions import BaseExpression
 from django.utils.functional import cached_property
 
@@ -92,7 +93,7 @@ class _Permission(models.Expression):
 
     def as_sql(self, compiler: Any, connection: Any) -> Any:
         from .backends import backend
-        from .compile.read import matching_shared_scope
+        from .compile.read import matching_shared_permission, matching_shared_scope
         from .managers import RebacQuerySet
 
         if self.row_model is None:
@@ -106,7 +107,7 @@ class _Permission(models.Expression):
                 and self.row_model._meta.concrete_model is self.model._meta.concrete_model
                 else None
             )
-            condition: BaseExpression | None = shared
+            condition: BaseExpression | Q | None = shared
             if (
                 condition is None
                 and self.row_model._meta.concrete_model is self.model._meta.concrete_model
@@ -118,11 +119,15 @@ class _Permission(models.Expression):
                     using=using,
                     identity=self.identity,
                 )
-                shared_scope = matching_shared_scope(compiler.query, condition, using)
-                if shared_scope is not None:
-                    condition = models.Exists(
-                        shared_scope.queryset().filter(pk=models.OuterRef("pk"))
-                    )
+                shared_condition = matching_shared_permission(compiler.query, condition, using)
+                if shared_condition is not None:
+                    condition = shared_condition
+                else:
+                    shared_scope = matching_shared_scope(compiler.query, condition, using)
+                    if shared_scope is not None:
+                        condition = models.Exists(
+                            shared_scope.queryset().filter(pk=models.OuterRef("pk"))
+                        )
             if condition is None:
                 rows = self.model._default_manager.all().using(using)
                 if not isinstance(rows, RebacQuerySet):
