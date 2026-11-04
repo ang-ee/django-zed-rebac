@@ -36,6 +36,7 @@ from .actors import (
     current_actor,
     grant_subject_ref,
     is_anonymous_actor,
+    is_sudo,
     rebac_subject,
     set_current_actor,
     sudo,
@@ -184,6 +185,7 @@ __all__ = [
     # actors
     "ActorLike",
     "current_actor",
+    "is_sudo",
     "set_current_actor",
     "actor_context",
     "sudo",

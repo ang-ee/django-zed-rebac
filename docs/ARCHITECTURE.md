@@ -473,7 +473,7 @@ from rebac import (
 
     # Actor types & resolution
     ActorLike,                          # SubjectRef | User | Group | AnonymousUser | <@rebac_subject-registered>
-    current_actor, set_current_actor,
+    current_actor, is_sudo, set_current_actor,
     actor_context,                      # context-manager form, mirrors sudo()
     sudo,                               # request-path bypass; gated by REBAC_ALLOW_SUDO
     system_context,                     # framework-job bypass; NOT gated by REBAC_ALLOW_SUDO
@@ -550,6 +550,10 @@ from rebac.memberships import grant, revoke, members_of, containers_of   # direc
 from rebac.roles  import grant, revoke, roles_of, members_of   # role-as-namespace helpers
 from rebac.testing import install_schema   # test helper: make a schema and backend current
 ```
+
+For an operation without a pinned actor, `is_sudo()` answers whether ambient
+`sudo()` or `system_context()` is active; it does not account for pinned actor
+precedence on a queryset or instance.
 
 ### Database selection
 

@@ -15,6 +15,7 @@ pre-1.0; breaking changes within a minor version are explicitly called out.
 
 ### Added
 
+- Exported `is_sudo()` from `rebac` to report the ambient sudo scope.
 - `LocalBackend.held()` checks a bounded set of candidate IDs through the
   compiled read path. Absent canonical IDs are point-checked in one batch;
   non-canonical and empty IDs are denied. `LocalBackend.accessible()` remains
