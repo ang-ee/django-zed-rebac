@@ -18,6 +18,7 @@ from rebac import (
     sudo,
 )
 from rebac.backends import reset_backend
+from rebac.compile import read
 from rebac.testing import install_schema
 from tests.backend_setup import atomic_source_write
 from tests.testapp.models import Post
@@ -193,7 +194,7 @@ def test_visibility_memo_budget_counts_candidate_ids():
 
 @pytest.mark.pg_delta
 @pytest.mark.django_db(transaction=True)
-def test_held_many_chunks_after_500_ids_with_linear_sql_bytes():
+def test_held_many_chunks_after_500_ids_with_linear_sql_bytes(monkeypatch):
     reset_backend()
     active = backend()
     install_schema(
@@ -218,16 +219,29 @@ def test_held_many_chunks_after_500_ids_with_linear_sql_bytes():
         actions=("read__title", "read__body"),
         resource_type="blog/post",
     )
+    candidates = []
+    original_scope_statement = read._scope_statement
+
+    def observed_scope_statement(operation, model, key, **kwargs):
+        candidates.append(kwargs.get("candidates"))
+        return original_scope_statement(operation, model, key, **kwargs)
+
+    monkeypatch.setattr(read, "_scope_statement", observed_scope_statement)
     with CaptureQueriesContext(connection) as first:
         at_500 = active.held_many(**arguments, ids=ids[:500])
+    assert candidates == [None]  # 500 IDs exceed the candidate-root cap.
+    candidates.clear()
     with CaptureQueriesContext(connection) as second:
         at_501 = active.held_many(**arguments, ids=ids)
+    assert len(candidates) == 2 and candidates[0] is None
+    assert candidates[1] is not None and len(candidates[1]) == 1
     first_bytes = sum(len(query["sql"].encode()) for query in first)
     second_bytes = sum(len(query["sql"].encode()) for query in second)
     assert len(first) == 1 and len(second) == 2
     assert at_500 == {"read__title": {ids[0]}, "read__body": {ids[0]}}
     assert at_501 == at_500
     assert first_bytes < 10_000
-    assert second_bytes < first_bytes + 2_000  # One short remainder statement, no repeated scope.
+    # The one-row remainder now has its own candidate-root proof.
+    assert second_bytes < first_bytes + 4_000
     with pytest.raises(TypeError, match="bare string"):
         active.held_many(subject=actor, actions="read__title", resource_type="blog/post", ids=ids)

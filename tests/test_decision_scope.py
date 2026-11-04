@@ -74,6 +74,27 @@ def test_embedded_bypass_audits_once_per_execution_inside_decision_scope():
 
 
 @pytest.mark.pg_delta
+def test_bounded_read_collects_embedded_bypass_once_per_execution():
+    local = install_schema(ARROW_SCHEMA)
+    with sudo(reason="bounded audit fixture"):
+        folder = Folder.objects.create(name="f")
+        post = Post.objects.create(title="p", folder=folder)
+    local.write_relationships([RelationshipTuple(to_object_ref(folder), "viewer", ACTOR)])
+    reason = "embedded bounded bypass"
+    inner = Post.objects.system_context(reason=reason).values("pk")
+    outer = (
+        Post.objects.with_actor(ACTOR).filter(pk=post.pk).filter(pk__in=inner).filter(pk__in=inner)
+    )
+    audits = PermissionAuditEvent.objects.filter(kind="sudo.bypass", reason=reason)
+
+    with decision_scope():
+        assert list(outer.values_list("pk", flat=True)) == [post.pk]
+        assert audits.count() == 1
+        assert list(outer.values_list("pk", flat=True)) == [post.pk]
+        assert audits.count() == 2
+
+
+@pytest.mark.pg_delta
 def test_held_many_statements_do_not_emit_bypass_audits_inside_decision_scope():
     local = install_schema(
         """
@@ -182,6 +203,36 @@ def test_decision_scope_observes_arrow_revocation_after_row_memo():
         assert evaluator.stats()["row_decision_entries"] > 0
         local.delete_relationship(relation)
         assert set(Post.objects.with_actor(ACTOR).values_list("pk", flat=True)) == set()
+
+
+@pytest.mark.pg_delta
+def test_bounded_decision_scope_memo_is_shared_and_savepoint_safe():
+    local = install_schema(ARROW_SCHEMA)
+    with sudo(reason="bounded memo fixture"):
+        folder = Folder.objects.create(name="f")
+        posts = [Post.objects.create(title=f"p{i}", folder=folder) for i in range(2)]
+    relation = RelationshipTuple(to_object_ref(folder), "viewer", ACTOR)
+    local.write_relationships([relation])
+
+    def visible(*ids):
+        return set(Post.objects.with_actor(ACTOR).filter(pk__in=ids).values_list("pk", flat=True))
+
+    with decision_scope() as evaluator:
+        with CaptureQueriesContext(connection) as cold:
+            assert visible(posts[0].pk) == {posts[0].pk}
+        keys = set(evaluator._row_decisions)
+        assert keys
+        with CaptureQueriesContext(connection) as warm:
+            assert visible(posts[1].pk) == {posts[1].pk}
+        # The target decision is reused across different root candidate sets.
+        assert set(evaluator._row_decisions) == keys
+        assert len(cold) > len(warm)
+
+        with pytest.raises(RuntimeError), transaction.atomic():
+            local.delete_relationship(relation)
+            assert visible(posts[0].pk) == set()
+            raise RuntimeError("rollback")
+        assert visible(posts[0].pk) == {posts[0].pk}
 
 
 def test_plain_savepoint_rollback_discards_inner_row_memo():

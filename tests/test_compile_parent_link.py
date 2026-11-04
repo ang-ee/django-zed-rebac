@@ -83,18 +83,18 @@ def test_bulk_checks_agree(branches):
 @pytest.mark.parametrize("selector", ["exact", "in"])
 def test_parent_link_identity_uses_only_proven_lookup_shapes(branches, monkeypatch, selector):
     _local, rows, _notes = branches
-    original = read._point_statement
+    original = read._scope_statement
     compiled = []
 
-    def point(operation, key, *args, **kwargs):
-        compiled.append(key)
-        return original(operation, key, *args, **kwargs)
+    def scope(operation, model, key, *args, **kwargs):
+        compiled.append((key, kwargs.get("candidates")))
+        return original(operation, model, key, *args, **kwargs)
 
-    monkeypatch.setattr(read, "_point_statement", point)
+    monkeypatch.setattr(read, "_scope_statement", scope)
     for name in ("region", "other"):
         row = rows[name]
         query = NativeParentLinkedBranch.objects.with_actor(ALICE).with_action("write")
         query = query.filter(pk=row.pk) if selector == "exact" else query.filter(pk__in=[row.pk])
         assert list(query.values_list("pk", flat=True)) == ([row.pk] if name == "region" else [])
     # Native RelatedExact is admitted; RelatedIn is deliberately not native In.
-    assert (("test/nativeparentlinkedbranch", "write") in compiled) is (selector == "exact")
+    assert any(candidates is not None for _key, candidates in compiled) is (selector == "exact")

@@ -82,6 +82,7 @@ _RESOURCE_WIRE = object()
 _LIMIT = 512
 _ROW_LIMIT = 5000
 _SET_LIMIT = 256
+_CANDIDATE_LIMIT = 256
 _EDGE = (
     "resource_type",
     "resource_id",
@@ -1338,7 +1339,12 @@ def _check_chunk(
 
 
 def _scope_statement(
-    operation: _Operation, model: type[models.Model], key: Key, *, decide: bool = True
+    operation: _Operation,
+    model: type[models.Model],
+    key: Key,
+    *,
+    decide: bool = True,
+    candidates: tuple[int, ...] | None = None,
 ) -> _Kept | bool:
     """The ids of ``model`` the actor holds ``key`` on, as SQL.
 
@@ -1371,11 +1377,19 @@ def _scope_statement(
         if is_true(predicate):
             return gate.values("pk"), True
         # The row predicate goes last: it holds the nested subqueries.
-        rows = model._base_manager.using(operation.using).filter(Q(Exists(gate)) & predicate)
+        rows = model._base_manager.using(operation.using)
+        if candidates is not None:
+            rows = rows.filter(**{f"{resource_id_attr(model)}__in": candidates})
+        rows = rows.filter(Q(Exists(gate)) & predicate)
         return compiler.with_subject_ctes(rows.order_by().values(resource_id_attr(model))), False
 
     return operation.statement(
-        ("scope", label, key), verdicts, build, signature=signature, facts=facts
+        ("scope", label, key),
+        verdicts,
+        build,
+        cache=candidates is None,
+        signature=signature,
+        facts=facts,
     )
 
 
@@ -1590,8 +1604,10 @@ def share_combined_scopes(query: Any) -> bool | None:
     return True
 
 
-def _exact_identity(model: type[models.Model], lhs: Any, where: Any, using: str) -> str | None:
-    """A native identity equality mandatory in this resolved query, or no proof.
+def _known_identities(
+    model: type[models.Model], lhs: Any, where: Any, using: str
+) -> tuple[int, ...] | None:
+    """Native literal identities mandatory in this resolved query, or no proof.
 
     Only positive AND paths are traversed. Unknown fields, lookups and expression
     shapes keep the general scope; the original Django predicates are untouched.
@@ -1643,14 +1659,19 @@ def _exact_identity(model: type[models.Model], lhs: Any, where: Any, using: str)
         ):
             continue
         if type(node) is In:
-            if type(value) not in (list, tuple) or len(value) != 1:
+            if type(value) not in (list, tuple) or not 0 < len(value) <= _CANDIDATE_LIMIT:
                 continue
-            [value] = value
-        if type(value) is int:
-            try:
-                return codec.wire(value, using=using)
-            except SchemaError:
-                pass
+            values = value
+        else:
+            values = (value,)
+        if any(type(item) is not int for item in values) or len(set(values)) != len(values):
+            continue
+        try:
+            for item in values:
+                codec.wire(item, using=using)
+        except SchemaError:
+            continue
+        return tuple(values)
     return None
 
 
@@ -1683,7 +1704,6 @@ class _Scope(Expression):
         self.decide = decide
         self.lhs: Any = F(resource_id_attr(model))
         self._prepared: _Kept | bool | None = None
-        self._point_prepared: _Kept | bool | None = None
         # Only an unprepared combinator operand needs a render-time decision.
         # Ordinary queryset rendering can use the undecided inline statement.
         self._render_fallback = False
@@ -1710,24 +1730,6 @@ class _Scope(Expression):
         self._prepared = _scope_statement(operation, self.model, key, decide=self.decide)
         self._plans[token] = self._prepared
 
-    def prepare_point(self, using: str) -> None:
-        """Prepare the narrower point form when the caller has a mandatory ID."""
-        if self._point_prepared is not None:
-            return
-        token = using, "point"
-        if token in self._plans:
-            self._point_prepared = self._plans[token]
-            return
-        resource_type = model_resource_type(self.model)
-        if resource_type is None:
-            self._point_prepared = False
-            return
-        key = resource_type, self.action
-        operation = _Operation.begin(self.backend, self.actor, using, policy=self.policy)
-        operation.adopt(key, self.verdicts)
-        self._point_prepared = _point_statement(operation, key, "lower", decide=self.decide)
-        self._plans[token] = self._point_prepared
-
     def get_source_expressions(self) -> list[Any]:
         return [self.lhs]
 
@@ -1740,7 +1742,7 @@ class _Scope(Expression):
         policy = self.policy
         if resource_type is None:
             return "(1 = 0)", ()
-        resource_id = _exact_identity(self.model, self.lhs, compiler.query.where, self.using)
+        identities = _known_identities(self.model, self.lhs, compiler.query.where, self.using)
         plan: Any = getattr(compiler.query, "_rebac_subject_plan", ((), (), {}, None))
         shared = (
             next(
@@ -1754,40 +1756,54 @@ class _Scope(Expression):
             if plan[0]
             else None
         )
+        if identities is not None and len(identities) == 1 and not self.decide and shared is None:
+            # Late permission projections keep their existing point predicate.
+            # Queryset scopes (decide=True) use the candidate-root statement.
+            operation = _Operation.begin(self.backend, self.actor, connection.alias, policy=policy)
+            key = resource_type, self.action
+            operation.adopt(key, self.verdicts)
+            point = _point_statement(operation, key, "lower", decide=False)
+            if isinstance(point, bool):
+                return "(1 = 0)", ()
+            wire = identity_codec(self.model, resource_id_attr(self.model)).wire(
+                identities[0], using=self.using
+            )
+            return f"EXISTS {point.sql}", tuple(operation.bound(point.params, wire))
         # A combinator operand may reach the compiler without its queryset
         # owner. Keep that first-render preparation for later renders. Other
         # unprepared expressions compile inline without reading the database;
         # evaluation can still prepare their decided plan later.
-        if (
-            shared is None
-            and self._render_fallback
-            and resource_id is not None
-            and self._point_prepared is None
-            and self._prepared is None
-        ):
-            self.prepare_point(connection.alias)
-        elif (
-            shared is None
-            and self._render_fallback
-            and resource_id is None
-            and self._prepared is None
-        ):
-            self.prepare(connection.alias)
         inline: _Kept | bool | None = None
-        if shared is None and self._prepared is None and self._point_prepared is None:
+        if identities is not None and shared is None:
+            # The root query inside this proof visits only candidate rows.
+            # A decision scope may memoise bounded arrow targets, with their
+            # witnesses in the statement; otherwise keep the inline predicate.
+            from rebac.evaluator import current_evaluator
+
+            evaluator = current_evaluator()
+            decide = bool(
+                self.decide
+                and evaluator is not None
+                and evaluator._decision_connection is connections[connection.alias]
+            )
             operation = _Operation.begin(self.backend, self.actor, connection.alias, policy=policy)
             key = resource_type, self.action
             operation.adopt(key, self.verdicts)
-            inline = (
-                _point_statement(operation, key, "lower", decide=False)
-                if resource_id is not None
-                else _scope_statement(operation, self.model, key, decide=False)
+            inline = _scope_statement(
+                operation, self.model, key, decide=decide, candidates=identities
             )
+        elif shared is None and self._render_fallback and self._prepared is None:
+            self.prepare(connection.alias)
+        if shared is None and self._prepared is None and inline is None:
+            operation = _Operation.begin(self.backend, self.actor, connection.alias, policy=policy)
+            key = resource_type, self.action
+            operation.adopt(key, self.verdicts)
+            inline = _scope_statement(operation, self.model, key, decide=False)
         compiled: _Kept | bool | None = (
             shared
             if shared is not None
-            else self._point_prepared
-            if resource_id is not None and self._point_prepared is not None
+            else inline
+            if identities is not None and inline is not None
             else self._prepared
             if self._prepared is not None
             else inline
@@ -1797,10 +1813,8 @@ class _Scope(Expression):
             return "(1 = 0)", ()
         assert compiled is not None
         operation = _Operation.begin(self.backend, self.actor, self.using, policy=policy)
-        params = operation.bound(compiled.params, resource_id)
-        if (
-            resource_id is not None and (compiled is self._point_prepared or inline is not None)
-        ) or compiled.every:
+        params = operation.bound(compiled.params)
+        if compiled.every:
             return f"EXISTS {compiled.sql}", tuple(params)
         lhs_sql, lhs_params = compiler.compile(self.lhs)
         return f"({lhs_sql} IN {compiled.sql})", (*lhs_params, *params)
@@ -1829,9 +1843,7 @@ def prepare_resolved_filter(
     if isinstance(restriction, _Scope):
         restriction._render_fallback = fallback
         if prepare:
-            if _exact_identity(restriction.model, restriction.lhs, where, using) is not None:
-                restriction.prepare_point(using)
-            else:
+            if _known_identities(restriction.model, restriction.lhs, where, using) is None:
                 restriction.prepare(using)
         return
     children = getattr(restriction, "children", None)
@@ -2195,6 +2207,7 @@ def held_many(
                 ids=candidates,
                 using=using,
                 context=context,
+                chunk_size=500,
             )
         answers[name] = set(decisions[key])
     return answers
@@ -2209,6 +2222,7 @@ def _held(
     ids: Iterable[str],
     using: str,
     context: Mapping[str, Any] | None,
+    chunk_size: int = _CANDIDATE_LIMIT,
 ) -> set[str]:
     pending = set(ids)
     pending.discard("")
@@ -2237,8 +2251,8 @@ def _held(
                 default=models.Value(False),
                 output_field=models.BooleanField(),
             )
-            for start in range(0, len(values), 500):
-                chunk = values[start : start + 500]
+            for start in range(0, len(values), chunk_size):
+                chunk = values[start : start + chunk_size]
                 for value, allowed in rows.filter(**{f"{identity}__in": chunk}).values_list(
                     identity, verdict
                 ):

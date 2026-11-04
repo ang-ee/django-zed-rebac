@@ -61,6 +61,15 @@ pre-1.0; breaking changes within a minor version are explicitly called out.
   model as a candidate set rather than point-checking every cascaded row. A
   depth-uncertain cascaded row now raises `GateDenied` before consumer
   `pre_delete` receivers run.
+- A scoped queryset with mandatory native `pk=` or `pk__in` identities now
+  proves access inside the candidate root set, including singleton reads and
+  `held()` chunks. Sets above 256 IDs use the general scope to bound SQL size
+  and database work. Candidate lists are not kept in the statement cache;
+  shared union operands retain their union plan. The selecting query still
+  applies its original filter. Inside `decision_scope()`, bounded reads reuse
+  witnessed target decisions across candidate sets and respect write and
+  savepoint invalidation. `held_many()` retains 500-ID chunks, whose full
+  chunks use the general scope.
 - Actor resolution, sudo validation and bypass emission now share one owner
   each. Ambient `sudo()` covers related reads when no actor is pinned; an
   instance or queryset sudo pin still does not cross a relation. The private
