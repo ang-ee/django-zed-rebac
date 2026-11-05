@@ -5,6 +5,22 @@ pre-1.0; breaking changes within a minor version are explicitly called out.
 
 ## [Unreleased]
 
+### Changed
+
+- Queryset scopes use witnessed decisions both inside and outside evaluator
+  scopes. Decided statements compile once per request and are not kept across
+  requests; row IDs and support values are literal parameters. Candidate,
+  caveat, and bulk statements still reuse compiled SQL when value-independent.
+- Candidate-root and value-independent caveat-verdict statements now bind
+  per-read values and reuse compiled SQL across actor IDs, clocks and
+  candidate sets. The compiled statement cache has a 64 MiB default byte
+  budget in addition to its entry cap, exposed through
+  `REBAC_STATEMENT_CACHE_BYTES`. Decidable point checks
+  still compile on each call; bulk and undecided point statements are kept.
+- Compiled permission unions retain the `UNION` of identity sets measured in
+  proposal 0015 gate G1. An `OR` of large `IN` arms can exceed statement
+  timeouts at default PostgreSQL work memory.
+
 ### Fixed
 
 - Recursive path CTE unions clear a resource model's default ordering, so
@@ -133,12 +149,11 @@ pre-1.0; breaking changes within a minor version are explicitly called out.
   proves access inside the candidate root set, including singleton reads and
   `held()` chunks. Sets above 256 IDs use the general scope to bound SQL size
   and database work. Candidate lists bind as one PostgreSQL array or bounded
-  Django `IN` and are not kept in the statement cache. An exact or bounded
+  parameterized `IN`; eligible shapes are kept in the statement cache. An exact or bounded
   identity proof takes precedence over a shared union plan. The selecting
   query still applies its original filter. Inside `decision_scope()`, bounded
   reads reuse witnessed target decisions across candidate sets and respect
-  write and savepoint invalidation. `held_many()` retains 500-ID chunks, whose full
-  chunks use the general scope.
+  write and savepoint invalidation. `held_many()` uses 256-ID candidate-root chunks.
 - Decided ID membership binds one PostgreSQL array per list with `= ANY`;
   row lists use a statement-local CTE shared by the predicate and witness.
   SQLite and MySQL use Django `IN`. Model identity sets use

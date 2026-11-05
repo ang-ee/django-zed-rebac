@@ -1,6 +1,7 @@
 """Bounded row decisions and inline overflow follow live permission data."""
 
 import re
+from contextlib import nullcontext
 
 import pytest
 from django.contrib.contenttypes.models import ContentType
@@ -33,8 +34,21 @@ from tests.testapp.models import (
     VirtualFolder,
 )
 
-pytestmark = pytest.mark.django_db
+pytestmark = [pytest.mark.django_db, pytest.mark.pg_delta]
 ACTOR = SubjectRef.of("auth/user", "alice")
+
+
+@pytest.fixture(params=["inline", "decided"])
+def plan(request, monkeypatch):
+    if request.param == "inline":
+        original = read._scope_statement
+
+        def inline(operation, model, key, *, decide=True, candidates=None):
+            return original(operation, model, key, decide=False, candidates=candidates)
+
+        monkeypatch.setattr(read, "_scope_statement", inline)
+    with evaluator_scope() if request.param == "decided" else nullcontext():
+        yield request.param
 
 
 def visible(model):
@@ -78,7 +92,7 @@ def tree():
     return local, child, leaf, post
 
 
-def test_hierarchy_and_arrow_scope_prepares_at_first_evaluation(tree):
+def test_hierarchy_and_arrow_scope_prepares_at_first_evaluation(tree, plan):
     _local, child, leaf, post = tree
     with CaptureQueriesContext(connection) as construction:
         scope = Post.objects.with_actor(ACTOR).scoped()
@@ -92,15 +106,13 @@ def test_hierarchy_and_arrow_scope_prepares_at_first_evaluation(tree):
     assert list(scope.values_list("pk", flat=True)) == [post.pk]
 
 
-def test_small_hierarchy_binds_ids_and_keeps_statement_bounded(tree):
-    _local, child, leaf, post = tree
+def test_small_hierarchy_scope_statement_stays_bounded(tree, plan):
+    _local, _child, _leaf, post = tree
     with CaptureQueriesContext(connection) as queries:
         assert list(Post.objects.with_actor(ACTOR).values_list("pk", flat=True)) == [post.pk]
     sql = queries[-1]["sql"]
-    if connection.vendor == "postgresql":
-        assert '"folder_id" = ANY(' in sql
-    else:
-        assert f'"folder_id" IN ({child.pk}, {leaf.pk})' in sql
+    assert len(queries) == (1 if plan == "inline" else 2)
+    assert ('"folder_id" IN (SELECT' in sql) == (plan == "inline")
     assert len(sql) < 25_000
 
 
@@ -119,7 +131,7 @@ def test_small_hierarchy_binds_ids_and_keeps_statement_bounded(tree):
         "sliced_prefetch",
     ],
 )
-def test_embedded_decided_scope_defines_every_reference(memberships, shape):
+def test_embedded_decided_scope_defines_every_reference(memberships, shape, plan):
     local = install_schema("""
         definition auth/user {}
         definition auth/group {
@@ -197,11 +209,13 @@ def test_embedded_decided_scope_defines_every_reference(memberships, shape):
             )
     assert_rebac_ctes_defined([*preparation, *queries])
     if shape == "exists":
-        assert len(preparation) + len(queries) == (4 if memberships == 2 else 3)
+        if plan == "inline":
+            assert len(preparation) == 0
+        assert len(queries) == 1
 
 
 @pytest.mark.pg_delta
-def test_owned_decided_scope_defines_array_cte():
+def test_owned_decided_scope_defines_array_cte(plan):
     local = install_schema("""
         definition auth/user {}
         definition blog/folder {
@@ -221,7 +235,9 @@ def test_owned_decided_scope_defines_array_cte():
         assert list(Post.objects.with_actor(ACTOR).values_list("pk", flat=True)) == [post.pk]
     assert_rebac_ctes_defined(queries)
     if connection.vendor == "postgresql":
-        assert any('FROM "rebac_decided_' in query["sql"] for query in queries)
+        assert any('FROM "rebac_decided_' in query["sql"] for query in queries) == (
+            plan == "decided"
+        )
 
 
 @pytest.mark.pg_delta
@@ -340,8 +356,10 @@ def test_decided_row_ids_have_bounded_statement_bytes_per_member():
         assert "= ANY(" in small_sql and "= ANY(" in large_sql
         assert len(re.findall(r'"rebac_decided_[^\"]+" AS \(', small_sql)) == 1
         assert len(re.findall(r'"rebac_decided_[^\"]+" AS \(', large_sql)) == 1
-        assert sum(isinstance(param, list) for param in small_params) == 1
-        assert sum(isinstance(param, list) for param in large_params) == 1
+        # One decided row array; the empty array is the caveat verdict array
+        # emitted by every parametric PostgreSQL statement.
+        assert sorted(len(param) for param in small_params if isinstance(param, list)) == [0, 10]
+        assert sorted(len(param) for param in large_params if isinstance(param, list)) == [0, 200]
 
 
 @pytest.mark.pg_delta
@@ -429,7 +447,7 @@ def _statement_bytes(model, monkeypatch, *, inline=False):
             patcher.setattr(read._Operation, "sets", lambda self, verdicts: None)
             patcher.setattr(read, "const_facts", lambda *args: ())
             read.reset()
-        with CaptureQueriesContext(connection) as queries:
+        with evaluator_scope(), CaptureQueriesContext(connection) as queries:
             model.objects.with_actor(ACTOR).count()
     return len(queries[-1]["sql"].encode())
 
@@ -707,12 +725,15 @@ def test_kept_row_ids_obey_evaluator_budget():
         assert evaluator.stats()["row_decision_ids"] <= 1
 
 
-def test_decided_rows_are_not_kept_outside_evaluator_scope(tree):
+def test_decided_scope_statement_is_request_local(tree):
     _local, _child, _leaf, post = tree
     read.reset()
     assert visible(Post) == {post.pk}
-    assert current_evaluator() is None
-    assert not read._statements
+    first = read.statement_cache_stats()
+    assert first["entries"] == 0
+    assert visible(Post) == {post.pk}
+    second = read.statement_cache_stats()
+    assert second == first  # decided SQL compiles for each request
 
 
 @pytest.mark.django_db(transaction=True)
@@ -829,7 +850,8 @@ def test_revocation_after_decision_fails_witness(tree, monkeypatch):
         return found
 
     monkeypatch.setattr(read._Rows, "_decide", decide_then_revoke)
-    assert not Post.objects.with_actor(ACTOR).exists()
+    with evaluator_scope():
+        assert not Post.objects.with_actor(ACTOR).exists()
     assert changed
 
 
@@ -904,7 +926,7 @@ def test_tuple_write_is_visible_to_next_statement_in_evaluator_scope(tree):
         assert list(Post.objects.with_actor(ACTOR).values_list("pk", flat=True)) == [post.pk]
 
 
-def test_dangling_unconstrained_fk_does_not_grant(tree, monkeypatch):
+def test_dangling_unconstrained_fk_does_not_grant(tree, monkeypatch, plan):
     _local, child, leaf, post = tree
     monkeypatch.setattr(Post._meta.get_field("folder"), "db_constraint", False)
     with sudo(reason="unconstrained FK fixture"):
@@ -1040,7 +1062,7 @@ definition blog/post {
 
 
 @pytest.mark.parametrize("model", [Folder, Post])
-def test_inline_exclusion_respects_depth_limit(settings, model):
+def test_inline_exclusion_respects_depth_limit(settings, model, plan):
     settings.REBAC_DEPTH_LIMIT = 1
     local = install_schema(BANNED)
     with sudo(reason="test.fixture"):

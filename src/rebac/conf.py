@@ -17,6 +17,7 @@ _DEFAULTS: dict[str, Any] = {
     "REBAC_RELATIONSHIP_MODEL": "rebac.Relationship",
     "REBAC_SCHEMA_DIR": None,  # resolves to <cwd>/rebac at use site
     "REBAC_DEPTH_LIMIT": 8,
+    "REBAC_STATEMENT_CACHE_BYTES": 64 * 1024 * 1024,
     "REBAC_DEFAULT_CONSISTENCY": "minimize_latency",
     "REBAC_CACHE_ALIAS": "default",
     "REBAC_LOOKUP_CACHE_TTL": 60,

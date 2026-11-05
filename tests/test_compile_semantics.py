@@ -1,5 +1,6 @@
 """Permission semantics against source facts, the reference model, and the walker."""
 
+from contextlib import nullcontext
 from datetime import timedelta
 from unittest.mock import patch
 
@@ -14,6 +15,7 @@ from rebac import (
     SchemaError,
     SubjectRef,
     backend,
+    evaluator_scope,
     sudo,
 )
 from rebac.backends import reset_backend
@@ -1338,7 +1340,14 @@ def test_model_level_check_of_a_type_level_exclusion_ignores_concrete_bans(insta
     assert _check(doc(""), "read", user("alice")).allowed
 
 
-def test_subject_enumeration_lists_named_subjects_and_nobody_by_class(install):
+@pytest.mark.parametrize("plan", ["inline", "decided"])
+def test_subject_enumeration_lists_named_subjects_and_nobody_by_class(install, plan):
+    context = evaluator_scope() if plan == "decided" else nullcontext()
+    with context:
+        _subject_enumeration_lists_named_subjects_and_nobody_by_class(install)
+
+
+def _subject_enumeration_lists_named_subjects_and_nobody_by_class(install):
     active = install("""
         definition auth/user {}
         definition auth/anonymous {}

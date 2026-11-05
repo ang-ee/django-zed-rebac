@@ -121,7 +121,7 @@ def test_r2_conditional_deny_membership(context, expected):
     )
 
 
-def test_r3_type_level_constant_minus_concrete_ban():
+def test_type_level_constant_minus_concrete_ban():
     schema = schema_for("constant - r2")
     tuples = [row("r2", ALICE)]
     assert compare(schema, tuples) == CheckResult.no()

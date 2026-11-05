@@ -1,10 +1,12 @@
 """Candidate-root reads agree with the unbounded scoped predicate."""
 
+from contextlib import nullcontext
+
 import pytest
 from django.db.models import Count, Exists, OuterRef, Q
 from django.test import override_settings
 
-from rebac import ObjectRef, RelationshipTuple, SubjectRef, sudo, to_object_ref
+from rebac import ObjectRef, RelationshipTuple, SubjectRef, evaluator_scope, sudo, to_object_ref
 from rebac.compile import read
 from rebac.managers import share_scoped_definitions
 from rebac.testing import install_schema
@@ -30,6 +32,14 @@ definition blog/post {
     permission read = (viewer + folder->read) - banned
 }
 """
+
+
+@pytest.fixture(params=["inline", "decided"])
+def plan(request, monkeypatch):
+    if request.param == "inline":
+        monkeypatch.setattr(read, "_scope_decide", lambda *_args, **_kwargs: False)
+    with evaluator_scope() if request.param == "decided" else nullcontext():
+        yield request.param
 
 
 def _general_identities(_model, _lhs, _where, _using):
@@ -162,7 +172,7 @@ def _shapes(posts, folders):
         for name in _shapes([Post(pk=i) for i in range(90)], [Folder(pk=i) for i in range(9)])
     ],
 )
-def test_bounded_equals_unbounded_intersection(world, shape):
+def test_bounded_equals_unbounded_intersection(world, shape, plan):
     _local, folders, posts, calls, monkeypatch = world
     with override_settings(REBAC_DEPTH_LIMIT=4):
         full = set(_ids(Post.objects.with_actor(A)))
@@ -204,7 +214,7 @@ def test_bounded_equals_unbounded_intersection(world, shape):
         "folders_root",
     ],
 )
-def test_terminals_and_embeddings(world, terminal):
+def test_terminals_and_embeddings(world, terminal, plan):
     _local, folders, posts, calls, monkeypatch = world
     p = [x.pk for x in posts]
     a, b = p[:20], p[30:60]

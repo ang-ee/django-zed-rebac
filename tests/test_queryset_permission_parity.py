@@ -32,7 +32,7 @@ from rebac.schema import parse_zed
 from tests.backend_setup import STORAGE_TIERS, atomic_source_write, ensure_policy, install_schema
 from tests.testapp.models import AuthoredPost, Folder, Post
 
-pytestmark = pytest.mark.django_db(transaction=True)
+pytestmark = [pytest.mark.django_db(transaction=True), pytest.mark.pg_delta]
 
 ALICE = SubjectRef.of("auth/user", "alice")
 BOB = SubjectRef.of("auth/user", "bob")
@@ -465,12 +465,8 @@ def test_field_owner_sql_cost_is_independent_of_visible_row_count(active, corpus
     # changes only with the compiler; recursive CTE lowering raises the fixed count.
     # Django 6.1 compares the top-level boolean scope predicate with True (one
     # parameter) where the backend has no native boolean type.
-    # .scoped() defers preparation, so this pre-evaluation SQL render uses the
-    # inline form. SQLite's lowering adds six fixed parameters versus the
-    # decided form; PostgreSQL retains its previous fixed count.
-    assert large_cost[1] == 93 + 6 * (connection.vendor == "sqlite") + (
-        not connection.features.has_native_boolean_field
-    )
+    # The unprepared render is inline, with one boolean parameter omitted on SQLite.
+    assert large_cost[1] == 101 - (connection.vendor == "sqlite")
 
 
 def test_stored_arrow_resolves_virtual_targets_without_row_multiplication(active):

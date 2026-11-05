@@ -1,4 +1,4 @@
-"""Prepared permission scopes render SQL without database reads."""
+"""Unprepared permission scopes render inline SQL without decision reads."""
 
 from __future__ import annotations
 
@@ -16,7 +16,7 @@ from rebac.expressions import permission_expression
 from rebac.testing import install_schema
 from tests.testapp.models import Attachment, Folder, Post
 
-pytestmark = pytest.mark.django_db
+pytestmark = [pytest.mark.django_db, pytest.mark.pg_delta]
 ACTOR = SubjectRef.of("auth/user", "inline-render")
 SCHEMAS = {
     "direct": """
@@ -183,7 +183,11 @@ def test_accessible_uses_prepared_inline_scope(scoped, request):
 def test_standalone_scope_renders_inline_without_reads(scoped):
     local, row, _rows = scoped
     expression = read.scope_expression(
-        backend=local, model=type(row), action="read", actor=ACTOR, using="default"
+        backend=local,
+        model=type(row),
+        action="read",
+        actor=ACTOR,
+        using="default",
     )
     statement = models.QuerySet(model=type(row)).filter(expression)
     with CaptureQueriesContext(connection) as first:

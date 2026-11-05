@@ -1180,6 +1180,7 @@ All settings prefixed `REBAC_`. No nested dict. Read via the public `app_setting
 | `REBAC_LOCAL_BACKEND_REGISTRY_BATCH_SIZE` | `5000` | `int` | Batch size for `python manage.py rebac migrate-storage`. |
 | `REBAC_SCHEMA_DIR` | `BASE_DIR / "rebac"` | `Path` \| `str` | Where `build-zed` writes `effective.zed`. |
 | `REBAC_DEPTH_LIMIT` | `8` | `int` | Number of levels to which a recursive permission is unrolled in a compiled statement, and the cap on the permission walker (`check_new`). Within the bound a point check answers; one that cannot be decided within it raises `PermissionDepthExceeded`; a queryset scope includes only rows provable within it. Choose it to cover the deepest recursive chain in the data; statement size grows linearly with it. See [Recursion](#recursion). |
+| `REBAC_STATEMENT_CACHE_BYTES` | `67108864` | `int` | Maximum approximate bytes of compiled SQL and parameters retained process-wide, alongside the 512-entry cap. |
 | `REBAC_TRACKED_MODELS` | `[]` | `list[str]` | Third-party backing models (`"app_label.ModelName"`), gated by explicit-sender receivers. User and Group are automatically tracked. |
 | `REBAC_DEFAULT_CONSISTENCY` | `"minimize_latency"` | `str` | Default `Consistency` for checks. |
 | `REBAC_CACHE_ALIAS` | `"default"` | `str` | Django cache backend name for `accessible()` cache. |
@@ -1428,14 +1429,12 @@ uses `queryset_filter()` and its compiled predicate.
 set. It returns an entry for each action, including an empty set for a denied
 action. Equal, unmodified permission expressions share a decision; override
 arms with action-specific sites stay separate. Each distinct decision uses
-one statement per 500 stored candidate IDs, independent of the number of
+one statement per 256 stored candidate IDs, independent of the number of
 rows in that chunk. Absent and non-canonical IDs retain `held()`'s fail-closed
 fallback. This is the multi-action form of bounded bulk permission checks.
-For stored rows without explicit caveat context, these 500-ID chunks exceed
-the 256-ID candidate-root cap, so each full chunk uses the general scope
-statement: the selecting query restricts the chunk, while the permission
-subquery evaluates the general root population. A final chunk of at most 256
-IDs uses the candidate-root path. `held()` uses 256-ID chunks on this path.
+For stored rows without explicit caveat context, every chunk stays within
+the 256-ID candidate-root cap. The selecting query and permission subquery
+both restrict to that bounded candidate set. `held()` uses the same chunk size.
 Its authorization statements use the compiled read path and emit no bypass
 audit rows; an enclosing explicit queryset bypass is audited by its own
 execution hook.
@@ -1982,7 +1981,7 @@ general statement's byte size and PostgreSQL can choose a costly plan with
 stale statistics; the cap also keeps SQLite below its bind-variable limit.
 The selecting query keeps its original filter; inside the permission statement
 the root model is filtered to those same identities with one PostgreSQL
-`= ANY` array parameter or a bounded Django `IN` list on other vendors,
+`= ANY` array parameter or a bounded, parameterized `IN` list on other vendors,
 before its lower-bound permission predicate is applied. This evaluates
 membership only for the supplied rows,
 without producing the actor's full accessible root set. It uses the inline
@@ -2109,31 +2108,39 @@ uninstall routine:
    use compiles its own expression once and takes the placeholder's
    positions. `tests/test_codec_cache.py` pins the cached SQL and parameters
    equal to the uncached ones for integer, text and UUID identities.
-3. **PostgreSQL decided-ID membership.** The custom lookups write the
-   `= ANY(%s)` operator when no CTE is shared, including preparation, set
-   traversal and the model-identity bridge. Decided row lists shared with a
+3. **Bound membership.** Custom expressions write PostgreSQL `= ANY(%s)`
+   for candidate IDs and caveat verdict keys, and padded `IN (%s, …)` on
+   SQLite and MySQL. Decided-ID lookups also write PostgreSQL `= ANY(%s)`
+   when no CTE is shared, including preparation, set traversal and the
+   model-identity bridge. Decided row lists shared with a
    witness write `= ANY((SELECT ids FROM <statement-local CTE>)::<type>[])`.
    Django builds the CTE from a typed array `Value` and the policy generation
    row. The array appears once in the parameters per scope occurrence; the
    predicate and its witness reference the same CTE. With default psycopg
    client-side binding, its literal still appears once per occurrence in the
    wire SQL, growing by roughly the encoded ID length plus a delimiter per ID.
-   SQLite and MySQL use Django `IN` lookups.
+   SQLite and MySQL use Django `IN` lookups for decided row and set IDs.
 
 #### Prepared permission scopes
 
-A queryset scope is one SQL predicate. Bounded field- and attribute-backed
-arrow targets are bound as native ID lists. Oversized targets retain their
-correlated or uncorrelated inline subqueries. Constant arrows use prepared
-fixed-object facts. Bounded stored subject sets are decided to a fixed point;
-oversized sets retain the recursive CTE closure, including cycles and nested
-groups. Other recursive paths retain `REBAC_DEPTH_LIMIT`. The statement
-witnesses every decision it binds in its own database snapshot.
+A queryset scope is one SQL predicate. Ordinary querysets and scopes inside
+`evaluator_scope()` or `decision_scope()` use the witnessed decision plan:
+bounded field- and attribute-backed
+arrow targets are bound as native ID lists; oversized targets retain inline
+subqueries; bounded stored subject sets are decided to a fixed point. This
+preserves the evaluator's fail-closed behavior when a raw write adds a grant
+after its first decision. Other recursive paths retain `REBAC_DEPTH_LIMIT`.
 A gate that admits every row carries the CTEs referenced by its decision witnesses.
+A PostgreSQL 17 consumer profile found decided statements 2–3.4 times
+smaller for non-admin actors and about 3 KB for admin outcomes. Its inline
+plan was sensitive to stale planner statistics on a 205-row fixture; the
+decided plan completed the same read in milliseconds. The plan trial remains
+open for other schemas and workloads.
 
 Decided native ID membership uses one PostgreSQL array parameter. A decided
 row list shared by a predicate and witness uses a statement-local CTE; other
-lookups use direct `= ANY(%s)`. SQLite and MySQL use Django `IN`. A decided set at a
+lookups use direct `= ANY(%s)`. SQLite and MySQL use Django `IN` for decided IDs.
+A decided set at a
 model identity
 converts canonical wire IDs to native values before
 rendering membership, so it does not add a guarded conversion expression per
@@ -2256,7 +2263,9 @@ preparation read per object. Point statements prepare only the decisions they
 use.
 
 `.scoped()` installs the scope and pins its actor without preparing bounded
-decisions. First evaluation or embedding prepares on the selected database
+decisions. Outside an evaluator scope, first evaluation compiles a witnessed
+decided plan for that request. Inside an evaluator,
+first evaluation or embedding prepares decisions on the selected database
 alias, including from `_RebacQuery.resolve_expression` for an embedded queryset.
 The resolved WHERE selects the candidate-root plan for up to 256 mandatory
 native identities, otherwise the population plan. Standalone point checks
@@ -2301,21 +2310,22 @@ confirmation query.
 
 #### Kept statements and the policy fence
 
-Django keeps compiled undecided inline statements for a policy revision, actor
-shape, model, action, database alias and vendor. The cache lookup precedes
-predicate construction. `_policies` retains parsed
-policies and `_statements` retains Django-compiled SQL text, both with bounded
-least-recently-used eviction. Statement keys contain values only for facts a
-cacheable predicate used, but no
-membership lists or row decisions; statements with decisions are compiled for
-that operation. Inline `permission_expression()` and `accessible()` statements
-have their own cache keys. Actor id, the
-application clock, point resource id, and manual-schema revision are bound parameters.
-Candidate-root statements are compiled per use rather than kept under literal
-candidate lists. Their bounded decisions, when enabled by `decision_scope()`,
-share the same witnessed memo and savepoint validity rules as general scopes;
-the candidate list is never memoised. Statements
-whose caveat verdicts vary are compiled at each use.
+Django keeps value-independent compiled statements across requests by policy revision,
+override digest and deadline epoch; environment, actor shape, statement and candidate
+shape complete the key. Decided scopes are compiled per request and are never
+kept: row IDs and support values are literal parameters in that request's SQL.
+Actor IDs, caveat keys and the application clock remain bound in kept plans.
+The count in an evaluator scope uses its decision memo, so it adds no preparation.
+For value-independent statements, the cache lookup precedes predicate construction.
+`_policies` retains parsed policies and `_statements` retains compiled SQL text.
+The latter has both a 512-entry and a 64 MiB default byte limit, with hit,
+miss and eviction counters. The four most recently observed revisions per alias
+remain available; older revisions are purged. Actor id, application clock, point resource id, caveat verdict keys
+and PostgreSQL candidate arrays bind when the statement executes. Other
+vendors use a bounded candidate-arity shape. Padded candidate and caveat
+slots repeat a real value, never `NULL`, so negated membership remains
+two-valued. A changed grant or revoke is read in the next preparation;
+the newly compiled witness checks the current database snapshot.
 
 Every statement carries the `SchemaGeneration` revision fence. A scope built
 for an older revision admits no rows after a supported policy write publishes
@@ -4016,7 +4026,7 @@ no scale suite at the moment. Drivers, environment and release gates are in
 | Watch map and identities | `tests/test_watch.py`, `tests/test_codec.py`, `tests/test_codec_cache.py` | The watched columns of every backing kind, resolved from metadata without reading rows; canonical identity conversion for integer, text and UUID fields, with an invalid wire id matching nothing; the cached conversion guard equal to the uncached one. |
 | Policy checks | `tests/test_policy_checks.py` | System checks for settings, schemas and models, and what the library refuses as a policy. |
 | Transactions and concurrency | `tests/test_write_effects.py`, `tests/test_compile_read.py` | Deterministic PostgreSQL tests: concurrent revoke and link insertion, concurrent tuple writes. Outer and savepoint rollback. A policy revision that changes while a lazy scope is compiled cannot replace the policy the scope was built for. |
-| Structural | `tests/test_scope_depth.py` and others | The scope statement of a recursive permission has the same size and parse depth whatever the depth of the data. Fresh SQLite/PostgreSQL migrations install no REBAC trigger or function, and end with no table that holds a row per application row. No library raw SQL, triggers or database functions exist outside migration `0005`'s legacy uninstall routine and the three documented runtime exceptions in Statement shape: compiled id sets and kept statements, the compiled identity guard, and PostgreSQL `= ANY` lookups. |
+| Structural | `tests/test_scope_depth.py` and others | The scope statement of a recursive permission has the same size and parse depth whatever the depth of the data. Fresh SQLite/PostgreSQL migrations install no REBAC trigger or function, and end with no table that holds a row per application row. No library raw SQL, triggers or database functions exist outside migration `0005`'s legacy uninstall routine and the three documented runtime exceptions in Statement shape: compiled id sets and kept statements, the compiled identity guard, and bound membership operators. |
 | Vendors | `schema_vendors` | SQLite and PostgreSQL CI; an opt-in MySQL 8.4 suite must pass before release, including the schema write owners, the upgrade path and identity codec bounds for unsigned integers. |
 | Security pins | `tests/test_security_*.py` | The gates' rules, unchanged. The strict expected failures for proposals 0011 and 0013 stay pinned. |
 
@@ -4175,7 +4185,7 @@ routing. Candidate projection uses the write alias. Arbitrary cross-database
 authorization remains unsupported; explicit alias handling is not a distributed
 transaction or permission join.
 
-9. **Query plans at scale.** Compiled statements have not been verified on PostgreSQL tables of tens of millions of rows. A trial on a consumer database is in progress ([proposal 0015](./proposals/0015-permissions-compiled-to-queries.md), gate G1). The shape under test is the one of [Statement shape](#statement-shape): a disjunction as a union of id sets.
+9. **Query plans at scale.** Compiled statements have not been verified on PostgreSQL tables of tens of millions of rows. A trial on a consumer database is in progress ([proposal 0015](./proposals/0015-permissions-compiled-to-queries.md), gate G1). G1 measured `UNION` of independent id sets; `OR` over large `IN` subqueries did not finish under the measured work memory and is not emitted.
 
 10. **Recursion deeper than the bound.** `REBAC_DEPTH_LIMIT` is the only mechanism: a deployment with deeper chains raises it and pays one level of SQL per unit. A closure table for one recursive relation, or a recursive common table expression, would remove the bound (proposal 0015 § 8); neither is planned, and a recursive CTE needs SQL the project does not write by hand.
 

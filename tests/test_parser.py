@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import copy
+import pickle
 from collections.abc import Sequence
 
 import pytest
@@ -27,6 +29,30 @@ def _relations(schema: Schema, resource_type: str) -> Sequence[Relation]:
     definition = schema.get_definition(resource_type)
     assert definition is not None
     return definition.relations
+
+
+def test_schema_definition_index_survives_copy_pickle_and_assignment():
+    from dataclasses import asdict, astuple, fields
+
+    schema = parse_zed("definition blog/post { relation viewer: auth/user }")
+    assert schema.get_definition("blog/post") is not None
+    assert [item.name for item in fields(schema)] == [
+        "definitions",
+        "caveats",
+        "directives",
+        "headers",
+    ]
+    assert asdict(schema)["definitions"][0] == asdict(schema.definitions[0])
+    assert astuple(schema)[0][0] == astuple(schema.definitions[0])
+    assert type(pickle.loads(pickle.dumps(schema.definitions))) is list
+    for copied in (copy.copy(schema), copy.deepcopy(schema), pickle.loads(pickle.dumps(schema))):
+        assert copied.get_definition("blog/post") == schema.get_definition("blog/post")
+        copied.definitions.clear()
+        assert copied.get_definition("blog/post") is None
+        assert schema.get_definition("blog/post") is not None
+    replacement = parse_zed("definition blog/post { relation owner: auth/user }")
+    schema.definitions = replacement.definitions
+    assert [relation.name for relation in schema.all_relations("blog/post")] == ["owner"]
 
 
 SAMPLE = """
