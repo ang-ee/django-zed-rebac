@@ -55,7 +55,7 @@ pre-1.0; breaking changes within a minor version are explicitly called out.
 
 ### Removed
 
-- **Breaking (DC cleanup):** Removed `decision_scope()` and the `as_user()` / `as_agent()` queryset and instance aliases. Use `with_actor(user)`, `with_actor(agent)` or `with_actor(grant_subject_ref(agent, user))` for actor pinning. Use `evaluator_scope()` for per-request caching; `scope_cte(actions=...)` remains the statement-local owner for multi-action projections. `evaluator_scope()` never pins an atomic transaction; each operation in a transaction validates its own schema snapshot. Removed the inert `REBAC_RELATIONSHIP_MODEL`, `REBAC_DEFAULT_CONSISTENCY`, `REBAC_CACHE_ALIAS`, `REBAC_LOOKUP_CACHE_TTL`, and `REBAC_GC_INTERVAL_SECONDS` settings.
+- **Breaking:** Removed `decision_scope()` and the `as_user()` / `as_agent()` queryset and instance aliases. Use `with_actor(user)`, `with_actor(agent)` or `with_actor(grant_subject_ref(agent, user))` for actor pinning. Use `evaluator_scope()` for per-request caching; `scope_cte(actions=...)` remains the statement-local owner for multi-action projections. `evaluator_scope()` never pins an atomic transaction; each operation in a transaction validates its own schema snapshot. Removed the inert `REBAC_RELATIONSHIP_MODEL`, `REBAC_DEFAULT_CONSISTENCY`, `REBAC_CACHE_ALIAS`, `REBAC_LOOKUP_CACHE_TTL`, and `REBAC_GC_INTERVAL_SECONDS` settings.
 - **Breaking:** Removed the unimplemented `SpiceDBBackend`, the `Backend` ABC,
   the `spicedb` extra, and four `REBAC_SPICEDB_*` settings. `REBAC_BACKEND`
   accepts only `"local"`; `rebac.E002` and `rebac.W101` no longer apply.
