@@ -181,7 +181,7 @@ def test_override_deadline_rekeys_compiled_scope(monkeypatch, decide):
     for expected in (1, 2):
         operation = read._Operation.begin(backend, actor, "default")
         read._scope_statement(operation, Post, ("blog/post", "read"), decide=decide)
-        assert read.statement_cache_stats()["misses"] == (0 if decide else expected)
+        assert read.statement_cache_stats()["misses"] == expected
         clock["now"] = deadline
 
 

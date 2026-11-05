@@ -725,15 +725,19 @@ def test_kept_row_ids_obey_evaluator_budget():
         assert evaluator.stats()["row_decision_ids"] <= 1
 
 
-def test_decided_scope_statement_is_request_local(tree):
+def test_decided_scope_statement_reuses_matching_outcome(tree):
     _local, _child, _leaf, post = tree
     read.reset()
     assert visible(Post) == {post.pk}
     first = read.statement_cache_stats()
-    assert first["entries"] == 0
+    assert first["entries"] == 1
+    native = tuple(read._native_outcomes.values())
+    assert native
     assert visible(Post) == {post.pk}
     second = read.statement_cache_stats()
-    assert second == first  # decided SQL compiles for each request
+    assert second["hits"] == first["hits"] + 1
+    assert second["misses"] == first["misses"]
+    assert tuple(read._native_outcomes.values()) == native
 
 
 @pytest.mark.django_db(transaction=True)

@@ -7,6 +7,13 @@ pre-1.0; breaking changes within a minor version are explicitly called out.
 
 ### Changed
 
+- Decided queryset statements now reuse compiled SQL across requests with the
+  same witnessed outcome and native inline/shared choice. Decided IDs and
+  support values bind at execution; revisions, override deadlines, settings
+  and model registration still rekey or invalidate the cache. Evaluator page
+  counts continue to share one preparation. Matching outcomes skip witness
+  construction and native render probes; scalar decided-ID slots use padded
+  arity classes so nearby cardinalities share SQL.
 - Tuple-to-model identity conversions share one guarded native projection per
   statement boundary according to its rendered use count; single-use
   boundaries keep the guarded conversion inline. PostgreSQL boundaries with
@@ -17,9 +24,8 @@ pre-1.0; breaking changes within a minor version are explicitly called out.
   independently combined owners are rebuilt or relabeled on copied operands
   to keep names distinct.
 - Queryset scopes use witnessed decisions both inside and outside evaluator
-  scopes. Decided statements compile once per request and are not kept across
-  requests; row IDs and support values are literal parameters. Candidate,
-  caveat, and bulk statements still reuse compiled SQL when value-independent.
+  scopes. Candidate, caveat and bulk statements reuse compiled SQL when
+  value-independent.
 - Candidate-root and value-independent caveat-verdict statements now bind
   per-read values and reuse compiled SQL across actor IDs, clocks and
   candidate sets. The compiled statement cache has a 64 MiB default byte

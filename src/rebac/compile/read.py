@@ -1,9 +1,8 @@
 """Execute compiled LocalBackend predicates.
 
 A statement is compiled from a policy, permission and actor shape into
-Django SQL. Queryset scopes decide bounded values before rendering; decided
-statements compile per request and are never kept. Value-independent statements
-are kept with bound parameters.
+Django SQL. Queryset scopes decide bounded values before rendering. Both
+inline and decided shapes are kept with request values bound at execution.
 """
 
 from __future__ import annotations
@@ -64,6 +63,8 @@ from .conditions import CaveatVerdicts, VerdictSlot, _verdict_class
 from .evaluate import named_subjects, residual
 from .predicate import (
     ActorSets,
+    Decided,
+    DecidedSlot,
     Fact,
     Support,
     _and,
@@ -159,6 +160,9 @@ def _candidate_class(using: str, count: int) -> str | int:
 _policies: OrderedDict[tuple[Any, ...], _Policy] = OrderedDict()
 _statements: OrderedDict[tuple[Any, ...], _Kept | bool] = OrderedDict()
 _fact_uses: OrderedDict[tuple[Any, ...], tuple[Fact, ...]] = OrderedDict()
+_decision_recipes: OrderedDict[tuple[Any, ...], _DecisionRecipe] = OrderedDict()
+_native_outcomes: OrderedDict[tuple[Any, ...], tuple[Any, ...]] = OrderedDict()
+_recipe_serial = 0
 _statement_bytes = 0
 _statement_hits = 0
 _statement_misses = 0
@@ -175,6 +179,7 @@ def _bound_params(
     resource_id: str | None = None,
     candidates: tuple[Any, ...] | None = None,
     verdicts: CaveatVerdicts | None = None,
+    operation: _Operation | None = None,
 ) -> list[Any]:
     result: list[Any] = []
     verdict_keys = (
@@ -182,6 +187,9 @@ def _bound_params(
         if verdicts is not None
         else None
     )
+    prepared_decisions: dict[
+        tuple[tuple[Any, ...], models.Field[Any, Any] | None], Sequence[Any]
+    ] = {}
     for param in bind(params, actor, connections[using]):
         if param is _MANUAL_REVISION:
             result.append(backend._manual_schema_revision())
@@ -204,6 +212,68 @@ def _bound_params(
             result.append(
                 values if param.index is None else values[min(param.index, len(values) - 1)]
             )
+        elif isinstance(param, DecidedSlot):
+            if operation is None or verdicts is None:
+                raise ValueError("decided slot requires the prepared operation")
+            source = param.source
+            binding = (source, param.field)
+            decided_values = prepared_decisions.get(binding)
+            if decided_values is None:
+                if source[0] == "row":
+                    rows = operation.rows(verdicts)
+                    found_values = next(
+                        (
+                            decision.ids
+                            for decision in _decision_closure(
+                                found for found in rows._found.values() if found is not None
+                            )
+                            if decision.key == source[1]
+                        ),
+                        None,
+                    )
+                    if found_values is None:
+                        found_values = rows.rows(source[1])
+                    if found_values is None:
+                        raise ValueError("decided row slot has no bounded decision")
+                    decided_values = found_values
+                elif source[0] == "set":
+                    sets = operation.sets(verdicts)
+                    if sets is None:
+                        raise ValueError("decided set slot has no decision")
+                    _, key, bound, kind, *rest = source
+                    decided_values = sorted(sets.ids(key, bound))
+                    if kind == "native":
+                        model = operation.model_index.resource(rest[0])
+                        if model is None:
+                            raise ValueError("decided native slot has no model")
+                        identity = resource_id_attr(model)
+                        codec = identity_codec(model, identity)
+                        _, canonical = model_identity_fields(model, identity)
+                        decided_values = [
+                            canonical.to_python(value)
+                            for value in decided_values
+                            if codec.is_canonical(value, using=using)
+                        ]
+                elif source[0] == "support":
+                    sets = operation.sets(verdicts)
+                    if sets is None:
+                        raise ValueError("decided support slot has no decision")
+                    decided_values = (getattr(sets.support[source[1]], source[2]),)
+                else:
+                    raise ValueError("unknown decided slot")
+                if param.field is not None:
+                    decided_values = [
+                        param.field.get_db_prep_value(value, connections[using], False)
+                        for value in decided_values
+                    ]
+                prepared_decisions[binding] = decided_values
+            result.append(
+                decided_values[0]
+                if source[0] == "support"
+                else list(decided_values)
+                if param.index is None
+                else decided_values[min(param.index, len(decided_values) - 1)]
+            )
         else:
             result.append(param)
     return result
@@ -221,18 +291,21 @@ def statement_cache_stats() -> dict[str, int]:
         }
 
 
-def _statement_size(compiled: _Kept | bool) -> int:
+def _statement_size(key: tuple[Any, ...], compiled: _Kept | bool) -> int:
+    key_bytes = len(repr(key).encode())
     if isinstance(compiled, bool):
-        return 1
-    return len(compiled.sql.encode()) + sum(
-        len(value) if isinstance(value, bytes | str) else 32 for value in compiled.params
+        return key_bytes + 1
+    return (
+        key_bytes
+        + len(compiled.sql.encode())
+        + sum(len(value) if isinstance(value, bytes | str) else 32 for value in compiled.params)
     )
 
 
 def _evict_statement() -> None:
     global _statement_bytes, _statement_evictions
-    _, old = _statements.popitem(last=False)
-    _statement_bytes -= _statement_size(old)
+    old_key, old = _statements.popitem(last=False)
+    _statement_bytes -= _statement_size(old_key, old)
     _statement_evictions += 1
 
 
@@ -245,6 +318,8 @@ def reset() -> None:
         _policies.clear()
         _statements.clear()
         _fact_uses.clear()
+        _decision_recipes.clear()
+        _native_outcomes.clear()
         _seen_revisions.clear()
         _statement_bytes = _statement_hits = _statement_misses = _statement_evictions = 0
     evaluator = current_evaluator()
@@ -315,7 +390,7 @@ def _policy(backend: LocalBackend, using: str) -> _Policy:
                 global _statement_bytes, _statement_evictions
                 for stale in tuple(_statements):
                     if stale[0][0] == using and stale[0][1] == retired:
-                        _statement_bytes -= _statement_size(_statements.pop(stale))
+                        _statement_bytes -= _statement_size(stale, _statements.pop(stale))
                         _statement_evictions += 1
                 for stale in tuple(_policies):
                     if stale[0] == using and stale[1] == retired:
@@ -323,6 +398,12 @@ def _policy(backend: LocalBackend, using: str) -> _Policy:
                 for stale in tuple(_fact_uses):
                     if stale[0][0] == using and stale[0][1] == retired:
                         del _fact_uses[stale]
+                for stale in tuple(_decision_recipes):
+                    if stale[0] == using and stale[1] == retired:
+                        serial = _decision_recipes.pop(stale).serial
+                        for native_key in tuple(_native_outcomes):
+                            if native_key[0] == serial:
+                                del _native_outcomes[native_key]
         kept = _policies.get(key)
         if kept is not None and kept.snapshot.schema is snapshot.schema:
             _policies.move_to_end(key)
@@ -417,6 +498,87 @@ class _Decision:
     uses: tuple[_Decision, ...] = ()
     sets: ActorSets | None = None
     array: tuple[tuple[str, tuple[Any, ...]], CTE] | None = None
+    key: Key | None = None
+    deferred: bool = False
+
+
+@dataclass(frozen=True)
+class _DecisionRecipe:
+    rows: tuple[Key, ...] = ()
+    sets: bool = False
+    facts: tuple[Fact, ...] = ()
+    memberships: tuple[tuple[Key, Bound, Any], ...] = ()
+    serial: int = 0
+
+
+def _decision_outcome(
+    operation: _Operation, verdicts: CaveatVerdicts, recipe: _DecisionRecipe, facts: _Facts | None
+) -> tuple[Any, ...]:
+    def extent(count: int) -> int:
+        return (
+            int(count > 0)
+            if connections[operation.using].vendor == "postgresql"
+            else int(_candidate_class(operation.using, count))
+        )
+
+    rows = operation.rows(verdicts)
+    for key in recipe.rows:
+        rows.rows(key)
+    decided = {
+        decision.key: extent(len(decision.ids))
+        for decision in _decision_closure(
+            found for found in rows._found.values() if found is not None
+        )
+        if decision.key is not None
+    }
+    row_shape = (
+        tuple((key, decided.get(key)) for key in recipe.rows),
+        tuple(sorted(decided.items())),
+    )
+    sets = operation.sets(verdicts) if recipe.sets else None
+    set_shape: tuple[Any, ...] | None = None
+    if sets is not None:
+        set_shape = (
+            tuple(
+                (
+                    key,
+                    extent(len(sets.ids(key, Bound.LOWER))),
+                    extent(len(sets.ids(key, Bound.UPPER))),
+                )
+                for key in sorted(sets.keys)
+            ),
+            tuple(
+                (
+                    key,
+                    bound,
+                    extent(
+                        sum(
+                            identity_codec(model, resource_id_attr(model)).is_canonical(
+                                value, using=operation.using
+                            )
+                            for value in sets.ids(key, bound)
+                        )
+                    ),
+                )
+                for key in sorted(sets.keys)
+                for bound in (Bound.LOWER, Bound.UPPER)
+                if (model := operation.model_index.resource(key[0])) is not None
+            ),
+            tuple(
+                (edge.key, edge.subject_type, edge.subject_relation, edge.caveat_name, edge.own)
+                for edge in sets.support
+            ),
+        )
+    return (
+        row_shape,
+        set_shape,
+        tuple((fact, facts[fact]) for fact in recipe.facts) if facts is not None else (),
+        tuple(
+            (key, bound, value in sets.ids(key, bound)) for key, bound, value in recipe.memberships
+        )
+        if sets is not None
+        else (),
+    )
 
 
 def _decision_closure(decisions: Iterable[_Decision]) -> tuple[_Decision, ...]:
@@ -641,6 +803,7 @@ class _Rows:
         self._found: dict[Key, _Decision | None] = {}
         self._pending: set[Key] = set()
         self.render_compiler: Compiler | None = None
+        self.defer_witness = False
 
     @property
     def room(self) -> int:
@@ -671,7 +834,7 @@ class _Rows:
             finally:
                 self._pending.remove(key)
         found = self._found[key]
-        return found.ids if found is not None else None
+        return Decided(found.ids, ("row", key)) if found is not None else None
 
     def _memoized_decision(self, key: Key) -> _Decision | None:
         from rebac.backends import local
@@ -740,6 +903,31 @@ class _Rows:
 
     def witness(self, used: Iterable[Key], *, witnessed_sets: ActorSets | None = None) -> Q:
         decisions = _decision_closure(self._dependencies(used))
+        if self.defer_witness:
+            # The preparation's row IDs are enough to find a kept statement.
+            # Only a miss needs fresh witness expressions for SQL rendering.
+            pending = list(decisions)
+            seen: set[Key] = set()
+            while pending:
+                found = pending.pop()
+                if found.key is not None:
+                    if found.key in seen:
+                        continue
+                    seen.add(found.key)
+                    current = self._found.get(found.key, found)
+                    if current is not None and current.deferred:
+                        current = self._materialize(current)
+                        self._found[found.key] = current
+                    if current is not None:
+                        self._found.setdefault(found.key, current)
+                        pending.extend(current.uses)
+                else:
+                    pending.extend(found.uses)
+            decisions = tuple(
+                current_found
+                for key in sorted(seen)
+                if (current_found := self._found.get(key)) is not None
+            )
         if self.render_compiler is not None:
             for found in decisions:
                 if found.array is not None:
@@ -784,40 +972,88 @@ class _Rows:
             abandon()
             return None
         if is_false(member):
-            return _Decision((), _and(), self._dependencies(compiler.used_rows), sets)
+            return _Decision((), _and(), self._dependencies(compiler.used_rows), sets, key=key)
         gate = Q(Exists(operation.gate(parametric=False)))
-        selected = compiler.with_subject_ctes(source.filter(gate & member))
+        # This query only prepares IDs. Native CTE sharing changes its plan,
+        # not its answer, so keep it inline without a render probe.
+        selected = compiler.with_subject_ctes(source.filter(gate & member), probe_native=False)
         ids = tuple(selected.values_list(identity, flat=True)[: self.room + 1])
         if len(ids) > self.room:
             abandon()
             return None
         if not ids:
-            return _Decision((), _and(), self._dependencies(compiler.used_rows), sets)
+            return _Decision((), _and(), self._dependencies(compiler.used_rows), sets, key=key)
+        found = _Decision(
+            ids,
+            _and(),
+            self._dependencies(compiler.used_rows),
+            sets,
+            key=key,
+            deferred=True,
+        )
+        return found if self.defer_witness else self._materialize(found)
+
+    def _materialize(self, found: _Decision) -> _Decision:
+        """Build a missed statement's live recheck for one prepared row set."""
+        assert found.key is not None
+        key = found.key
+        ids = found.ids
+        model = self.operation.model_index.resource(key[0])
+        assert model is not None
+        operation = self.operation
+        source = model._base_manager.using(operation.using).order_by()
+        identity = resource_id_attr(model)
+        sets = operation.sets(self.verdicts)
+        compiler_used = {part.key for part in found.uses if part.key is not None}
         # Evaluator-memoized decisions can outlive this statement. Their
         # witnesses must carry their own subject, set and closure CTEs.
         shared_witness = self.render_compiler is not None and bool(operation._shared_keys)
         later = (
             self.render_compiler.fork_shared()
             if shared_witness and self.render_compiler is not None
-            else operation.compiler(self.verdicts, share_subject_rows=True, rows=self, sets=sets)
+            else operation.compiler(
+                self.verdicts,
+                share_subject_rows=True,
+                rows=self,
+                sets=sets,
+                bind_decisions=(
+                    self.render_compiler.bind_decisions
+                    if self.render_compiler is not None
+                    else False
+                ),
+            )
         )
+        if self.render_compiler is not None and later is not self.render_compiler:
+            later._value_memberships = self.render_compiler._value_memberships
         # A witness must recheck fixed-object facts. The owner's decided
         # value cannot serve as its own proof after a revocation.
         later.facts = None
-        held = later.holds(key, _model_at(model), Bound.LOWER)
-        if len(ids) > self.room:
-            abandon()
-            return None
+        # While rebuilding this key, its prepared IDs cannot prove their own
+        # membership. Treat the key as pending so holds() compiles its live arm.
+        previous = self._found.pop(key, None)
+        was_pending = key in self._pending
+        self._pending.add(key)
+        try:
+            held = later.holds(key, _model_at(model), Bound.LOWER)
+        finally:
+            if previous is not None:
+                self._found[key] = previous
+            if not was_pending:
+                self._pending.remove(key)
         if is_true(held):
             return _Decision(
-                ids, _and(), self._dependencies(compiler.used_rows | later.used_rows), sets
+                ids, _and(), self._dependencies(compiler_used | later.used_rows), sets, key=key
             )
         array = None
         if self.render_compiler is not None:
             _, identity_field = model_identity_fields(model, identity)
-            member_ids = self.render_compiler.decided_member(F(identity), ids, identity_field)
+            member_ids = self.render_compiler.decided_member(
+                F(identity), Decided(ids, ("row", key)), identity_field
+            )
             if connections[operation.using].vendor == "postgresql":
-                array = self.render_compiler.decided_array(ids, identity_field)
+                array = self.render_compiler.decided_array(
+                    Decided(ids, ("row", key)), identity_field
+                )
         else:
             member_ids = _bound_in(F(identity), ids)
         failing = source.filter(member_ids).filter(_not(held))
@@ -826,9 +1062,10 @@ class _Rows:
         return _Decision(
             ids,
             ~Q(Exists(failing)),
-            self._dependencies(compiler.used_rows | later.used_rows),
+            self._dependencies(compiler_used | later.used_rows),
             sets,
             array,
+            key,
         )
 
 
@@ -1092,6 +1329,7 @@ class _Operation:
         sets: ActorSets | None = None,
         facts: Mapping[Fact, bool] | None = None,
         cte_owner: str | None = None,
+        bind_decisions: bool = False,
     ) -> Compiler:
         return Compiler(
             self.policy.schema,
@@ -1107,6 +1345,7 @@ class _Operation:
             sets=sets,
             facts=facts,
             cte_owner=cte_owner,
+            bind_decisions=bind_decisions,
         )
 
     def gate(self, *, parametric: bool = True) -> models.QuerySet[Any]:
@@ -1121,12 +1360,13 @@ class _Operation:
         cache: bool = True,
         signature: tuple[Any, ...] = (),
         facts: _Facts | None = None,
+        compiler_state: list[Compiler] | None = None,
     ) -> _Kept | bool:
         """Compile and cache SQL whose only varying values are bound parameters.
 
         The cache switch is used by the before/after benchmark's no-cache phase.
         """
-        global _statement_bytes, _statement_hits, _statement_misses
+        global _statement_bytes, _statement_hits, _statement_misses, _recipe_serial
         keep = cache
         base = (
             *self.shape,
@@ -1136,20 +1376,35 @@ class _Operation:
             _verdict_class(len(verdicts.false_keys), self.using),
         )
         decided_scope = bool(key and key[0] == "scope" and signature and signature[0] == "decided")
-        keep = keep and not decided_scope
+        outcome: tuple[Any, ...] | None = None
+        native: tuple[Any, ...] | None = None
+        if keep and decided_scope:
+            with _lock:
+                recipe = _decision_recipes.get(base)
+                if recipe is not None:
+                    _decision_recipes.move_to_end(base)
+            if recipe is not None:
+                outcome = _decision_outcome(self, verdicts, recipe, facts)
+                with _lock:
+                    native_key = (recipe.serial, outcome)
+                    native = _native_outcomes.get(native_key)
+                    if native is not None:
+                        _native_outcomes.move_to_end(native_key)
         used: tuple[Fact, ...] | None = () if facts is None else None
-        if keep and facts is not None:
+        if keep and facts is not None and not decided_scope:
             with _lock:
                 used = _fact_uses.get(base)
                 if used is not None:
                     _fact_uses.move_to_end(base)
-        full = (
-            (*base, tuple((fact, facts[fact]) for fact in used))
-            if facts is not None and used is not None
-            else base
-            if facts is None
-            else None
-        )
+        full: tuple[Any, ...] | None
+        if decided_scope:
+            full = (*base, outcome, native) if outcome is not None and native is not None else None
+        elif facts is None:
+            full = base
+        elif used is not None:
+            full = (*base, tuple((fact, facts[fact]) for fact in used))
+        else:
+            full = None
         if keep and full is not None:
             with _lock:
                 kept = _statements.get(full)
@@ -1167,7 +1422,59 @@ class _Operation:
             or any(value is not None for value in self._sets.values())
         ):
             keep = False
-        if keep and facts is not None:
+        if keep and decided_scope:
+            found_rows = {
+                key for rows in self._rows.values() for key in rows._found if key != rows.root
+            }
+            observed = tuple(
+                (key, bound, value)
+                for compiler in compiler_state or ()
+                for key, bound, value, _present in compiler._value_memberships
+            )
+            with _lock:
+                previous = _decision_recipes.get(base, _DecisionRecipe())
+                if previous.serial == 0:
+                    _recipe_serial += 1
+                recipe = _DecisionRecipe(
+                    tuple(sorted(set(previous.rows) | found_rows)),
+                    previous.sets or bool(self._sets),
+                    tuple(
+                        sorted(set(previous.facts) | set(facts._decided if facts else ()), key=str)
+                    ),
+                    tuple(dict.fromkeys((*previous.memberships, *observed))),
+                    previous.serial or _recipe_serial,
+                )
+                _decision_recipes[base] = recipe
+                _decision_recipes.move_to_end(base)
+                while len(_decision_recipes) > _LIMIT:
+                    _, old_recipe = _decision_recipes.popitem(last=False)
+                    for old_native_key in tuple(_native_outcomes):
+                        if old_native_key[0] == old_recipe.serial:
+                            del _native_outcomes[old_native_key]
+            outcome = _decision_outcome(self, verdicts, recipe, facts)
+            native = tuple(
+                sorted(
+                    (
+                        (
+                            slot[0]._meta.label_lower,
+                            slot[1],
+                            slot[2],
+                            slot[3],
+                            shared,
+                        )
+                        for compiler in compiler_state or ()
+                        for slot, shared in compiler._native_decisions.items()
+                    )
+                )
+            )
+            full = (*base, outcome, native)
+            with _lock:
+                native_key = (recipe.serial, outcome)
+                _native_outcomes[native_key] = native
+                _native_outcomes.move_to_end(native_key)
+                while len(_native_outcomes) > _LIMIT:
+                    _native_outcomes.popitem(last=False)
+        if keep and facts is not None and not decided_scope:
             used = tuple(sorted(facts._decided, key=str))
             full = (*base, tuple((fact, facts[fact]) for fact in used))
             with _lock:
@@ -1189,12 +1496,12 @@ class _Operation:
                 compiled = _Kept(sql, params, every)
         if keep and full is not None:
             with _lock:
-                size = _statement_size(compiled)
+                size = _statement_size(full, compiled)
                 budget = max(0, int(app_settings.REBAC_STATEMENT_CACHE_BYTES))
                 if size <= budget:
                     old = _statements.pop(full, None)
                     if old is not None:
-                        _statement_bytes -= _statement_size(old)
+                        _statement_bytes -= _statement_size(full, old)
                     _statements[full] = compiled
                     _statement_bytes += size
                     while len(_statements) > _LIMIT or _statement_bytes > budget:
@@ -1216,6 +1523,7 @@ class _Operation:
             resource_id=resource_id,
             candidates=candidates,
             verdicts=verdicts,
+            operation=self,
         )
 
 
@@ -1256,7 +1564,12 @@ def _point_statement(
         decider = operation.rows(verdicts) if decide and one_object else None
         at = At(key[0], _Param(_RESOURCE_WIRE, models.TextField()), None, False)
         compiler = operation.compiler(
-            verdicts, share_subject_rows=True, sets=sets, rows=decider, facts=facts
+            verdicts,
+            share_subject_rows=True,
+            sets=sets,
+            rows=decider,
+            facts=facts,
+            bind_decisions=decider is not None,
         )
         if decider is not None:
             decider.render_compiler = compiler
@@ -1621,19 +1934,34 @@ def _scope_statement(
     one_object = len({fact[:3] for fact in known}) <= 1
     facts = _Facts(operation, key, verdicts) if decide and one_object else None
     signature = ("decided",) if decide else ("inline",)
+    compiler_state: list[Compiler] = []
+    prepared_compiler: Compiler | None = None
+    if decide:
+        sets = operation.sets(verdicts)
+        decider = operation.rows(verdicts) if one_object else None
+        prepared_compiler = operation.compiler(
+            verdicts,
+            share_subject_rows=True,
+            rows=decider,
+            sets=sets,
+            facts=facts,
+            bind_decisions=True,
+        )
+        compiler_state.append(prepared_compiler)
+        if decider is not None:
+            decider.render_compiler = prepared_compiler
+            decider.defer_witness = True
 
     def build() -> bool | tuple[models.QuerySet[Any], bool]:
         sets = operation.sets(verdicts) if decide else None
         decider = operation.rows(verdicts) if decide and one_object else None
-        compiler = operation.compiler(
+        compiler = prepared_compiler or operation.compiler(
             verdicts,
             share_subject_rows=True,
             rows=decider,
             sets=sets,
             facts=facts,
         )
-        if decider is not None:
-            decider.render_compiler = compiler
         predicate = compiler.holds(key, _model_at(model), Bound.LOWER)
         if is_false(predicate):
             return False
@@ -1670,6 +1998,7 @@ def _scope_statement(
             _candidate_class(operation.using, len(candidates)) if candidates is not None else None,
         ),
         facts=facts,
+        compiler_state=compiler_state if decide else None,
     )
 
 
@@ -2473,6 +2802,7 @@ class _Scope(Expression):
             using=self.using,
             candidates=identities,
             verdicts=self.verdicts,
+            operation=self._operation(connection.alias),
         )
         if compiled.every:
             return f"EXISTS {compiled.sql}", tuple(params)

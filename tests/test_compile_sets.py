@@ -105,7 +105,8 @@ def test_decided_actor_set_does_not_also_define_subject_cte():
     assert compiler.statement_ctes() == ()
     predicate = compiler.holds(("blog/folder", "member"), read._model_at(model), Bound.LOWER)
     matching = compiler.with_subject_ctes(Folder._base_manager.filter(predicate))
-    _sql, params = matching.query.sql_with_params()
+    _sql, placeholders = matching.query.sql_with_params()
+    params = operation.bound(placeholders, verdicts=verdicts)
     if connection.vendor == "postgresql":
         assert any(folder.pk in param for param in params if isinstance(param, list))
     else:

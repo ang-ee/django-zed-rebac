@@ -113,8 +113,21 @@ class DecidedRows(Protocol):
 class Decided(tuple[Any, ...]):
     """Native IDs read before a statement and rechecked by its witness."""
 
-    def __new__(cls, values: Collection[Any]) -> Decided:
-        return super().__new__(cls, values)
+    slot: tuple[Any, ...] | None
+
+    def __new__(cls, values: Collection[Any], slot: tuple[Any, ...] | None = None) -> Decided:
+        result = super().__new__(cls, values)
+        result.slot = slot
+        return result
+
+
+@dataclass(frozen=True, slots=True)
+class DecidedSlot:
+    """A value prepared for this read, addressed without its actor or IDs."""
+
+    source: tuple[Any, ...]
+    index: int | None = None
+    field: models.Field[Any, Any] | None = None
 
 
 @dataclass(frozen=True)
@@ -269,6 +282,45 @@ class _BoundIn(In):
             return f"{lhs_sql} = ANY(%s)", (*lhs_params, list(prepared))
         sql, values = super().as_sql(compiler, connection)
         return sql, tuple(values)
+
+
+class _DecidedIn(Expression):
+    """A decided membership whose values are rebound after a cache hit."""
+
+    def __init__(
+        self,
+        lhs: BaseExpression | F | OuterRef,
+        values: Decided,
+        field: models.Field[Any, Any],
+    ) -> None:
+        super().__init__(output_field=models.BooleanField())
+        self.lhs = lhs
+        self.count = 1 << (len(values) - 1).bit_length()
+        self.slot = values.slot
+        self.value_field = field
+
+    def get_source_expressions(self) -> list[BaseExpression | F | OuterRef]:
+        return [self.lhs]
+
+    def set_source_expressions(self, exprs: Sequence[Combinable | Expression]) -> None:
+        self.lhs = cast(BaseExpression | F | OuterRef, exprs[0])
+
+    def as_sql(self, compiler: Any, connection: Any) -> tuple[str, tuple[Any, ...]]:
+        assert self.slot is not None
+        lhs, params = compiler.compile(self.lhs)
+        if connection.vendor == "postgresql":
+            return f"{lhs} = ANY(%s)", (*params, DecidedSlot(self.slot, field=self.value_field))
+        placeholders = ", ".join("%s" for _ in range(self.count))
+        return (
+            f"{lhs} IN ({placeholders})",
+            (
+                *params,
+                *(
+                    DecidedSlot(self.slot, index=i, field=self.value_field)
+                    for i in range(self.count)
+                ),
+            ),
+        )
 
 
 class _ArrayMember(Exact):
@@ -530,6 +582,7 @@ class Compiler:
         sets: ActorSets | None = None,
         facts: Mapping[Fact, bool] | None = None,
         cte_owner: str | None = None,
+        bind_decisions: bool = False,
     ) -> None:
         self.model_index = model_index if model_index is not None else _ModelIndex.capture()
         self.schema = tagged.schema if tagged is not None else schema
@@ -553,6 +606,7 @@ class Compiler:
         self._memo: dict[tuple[Any, ...], Q] = {}
         self._own_identity = self.model_index.subject(actor.subject_type)
         self._share_subject_rows = share_subject_rows
+        self.bind_decisions = bind_decisions
         self.rows = rows
         self.sets = sets
         self.facts = facts
@@ -567,6 +621,7 @@ class Compiler:
         self._native_ctes: dict[tuple[type[models.Model], str, str, str], CTE] = {}
         self._native_state = _NativeState()
         self._native_decisions = self._native_state.decisions
+        self._value_memberships: list[tuple[Key, Bound, Any, bool]] = []
         self._const_ctes: dict[tuple[Key, str, Bound], CTE] = {}
         self._statement_ctes: list[CTE] = []
         actor_tag = hashlib.blake2s(
@@ -595,8 +650,9 @@ class Compiler:
         selected = cte.queryset()
         return QuerySet(model=selected.model, query=selected.query, using=self.using)
 
-    def with_subject_ctes(self, rows: QuerySet[Any]) -> QuerySet[Any]:
-        self.decide_native(rows)
+    def with_subject_ctes(self, rows: QuerySet[Any], *, probe_native: bool = True) -> QuerySet[Any]:
+        if probe_native:
+            self.decide_native(rows)
         ctes = self.statement_ctes()
         return with_cte(*ctes, select=rows) if ctes else rows
 
@@ -661,6 +717,7 @@ class Compiler:
             rows=self.rows,
             sets=self.sets,
             facts=self.facts,
+            bind_decisions=self.bind_decisions,
         )
         fork._cte_namespace = self._cte_namespace
         fork._subject_ctes = self._subject_ctes
@@ -672,6 +729,7 @@ class Compiler:
         fork._native_ctes = self._native_ctes
         fork._native_state = self._native_state
         fork._native_decisions = self._native_decisions
+        fork._value_memberships = self._value_memberships
         fork._const_ctes = self._const_ctes
         fork._statement_ctes = self._statement_ctes
         return fork
@@ -685,6 +743,12 @@ class Compiler:
         """Reuse one array parameter across a statement's decided memberships."""
         if not values:
             return _FALSE
+        if self.bind_decisions and isinstance(values, Decided) and values.slot is not None:
+            if connections[self.using].vendor != "postgresql" or not self._share_subject_rows:
+                return _not_null(expr) & Q(_DecidedIn(expr, values, field))
+            _, cte = self.decided_array(values, field)
+            rhs = Subquery(cte.queryset().values("_rebac_ids"))
+            return _not_null(expr) & Q(_ArrayMember(expr, rhs))
         if connections[self.using].vendor != "postgresql" or not self._share_subject_rows:
             return _bound_in(expr, values)
         _, cte = self.decided_array(values, field)
@@ -702,20 +766,28 @@ class Compiler:
         from ..models.generation import SchemaGeneration
 
         ids = tuple(values)
-        key = (field.db_type(connections[self.using]) or field.get_internal_type(), ids)
+        source = values.slot if isinstance(values, Decided) and self.bind_decisions else None
+        key = (
+            field.db_type(connections[self.using]) or field.get_internal_type(),
+            source if source is not None else ids,
+        )
         cte = self._decided_arrays.get(key)
         if cte is None:
             array_field = ArrayField(field)
             selected = (
                 SchemaGeneration.objects.using(self.using)
                 .filter(pk=1)
-                .annotate(_rebac_ids=Value(list(ids), output_field=array_field))
+                .annotate(
+                    _rebac_ids=(
+                        _Param(DecidedSlot(source, field=field), array_field)
+                        if source is not None
+                        else Value(list(ids), output_field=array_field)
+                    )
+                )
                 .order_by()
                 .values("_rebac_ids")
             )
-            # Decided statements are request-local, so the CTE name may
-            # reflect the IDs of this operation.
-            name_key = (key[0], ids)
+            name_key = (key[0], source if source is not None else ids)
             digest = hashlib.blake2s(repr(name_key).encode(), digest_size=10).hexdigest()
             # The digest deduplicates lists within one owner; the plan
             # namespace separates independent owners combined by Django.
@@ -994,13 +1066,22 @@ class Compiler:
             )
             if not natives:
                 return _FALSE
+            selected = Decided(natives, ("set", key, bound, "native", at.resource_type))
             if at.key is canonical:
-                return self.decided_member(at.ref, natives, canonical)
-            bridge = model._base_manager.using(self.using).filter(_bound_in(F(identity), natives))
+                return self.decided_member(at.ref, selected, canonical)
+            bridge = model._base_manager.using(self.using).filter(
+                self.decided_member(F(identity), selected, canonical)
+                if self.bind_decisions
+                else _bound_in(F(identity), natives)
+            )
             return _in(at.ref, bridge.order_by().values(at.key.name))
         if isinstance(at.ref, Value):
-            return _truth(at.ref.value in ids)
-        return self.decided_member(at.ref, ids, models.TextField())
+            present = at.ref.value in ids
+            self._value_memberships.append((key, bound, at.ref.value, present))
+            return _truth(present)
+        return self.decided_member(
+            at.ref, Decided(ids, ("set", key, bound, "wire")), models.TextField()
+        )
 
     def sets_step(
         self,
@@ -1044,8 +1125,17 @@ class Compiler:
                     )
                 elif allowed.relation:
                     inside = sorted(members.get((allowed.type, allowed.relation), ()))
+                    selected = (
+                        Decided(inside, ("set", (allowed.type, allowed.relation), bound, "wire"))
+                        if self.bind_decisions
+                        and self.sets is not None
+                        and members is self.sets.upper
+                        else inside
+                    )
                     member = _or(
-                        _bound_in(F("subject_id"), inside),
+                        self.decided_member(F("subject_id"), selected, models.TextField())
+                        if isinstance(selected, Decided)
+                        else _bound_in(F("subject_id"), selected),
                         _and(_truth(itself), named),
                     )
                 else:
@@ -1071,7 +1161,9 @@ class Compiler:
                 Q(resource_type=type_, relation=name)
                 & self.decided_member(
                     F("resource_id"),
-                    sorted(ids),
+                    Decided(sorted(ids), ("set", (type_, name), bound, "wire"))
+                    if self.bind_decisions and self.sets is not None and members is self.sets.upper
+                    else sorted(ids),
                     models.TextField(),
                 )
                 for (type_, name), ids in sorted(members.items())
@@ -1092,7 +1184,7 @@ class Compiler:
             return _TRUE
         tuples = self._tuples()
         parts = []
-        for edge in sets.support:
+        for index, edge in enumerate(sets.support):
             definition = self.schema.get_definition(edge.key[0])
             assert definition is not None
             relation = next(r for r in definition.relations if r.name == edge.key[1])
@@ -1102,13 +1194,31 @@ class Compiler:
                         tuples.filter(
                             self._live_q(relation, Bound.LOWER),
                             resource_type=edge.key[0],
-                            resource_id=edge.resource_id,
+                            resource_id=_Param(
+                                DecidedSlot(("support", index, "resource_id")), models.TextField()
+                            )
+                            if self.bind_decisions
+                            else edge.resource_id,
                             relation=edge.key[1],
                             subject_type=edge.subject_type,
-                            subject_id=self._wire() if edge.own else edge.subject_id,
+                            subject_id=(
+                                self._wire()
+                                if edge.own
+                                else _Param(
+                                    DecidedSlot(("support", index, "subject_id")),
+                                    models.TextField(),
+                                )
+                                if self.bind_decisions
+                                else edge.subject_id
+                            ),
                             subject_relation=edge.subject_relation,
                             caveat_name=edge.caveat_name,
-                            caveat_key=edge.caveat_key,
+                            caveat_key=_Param(
+                                DecidedSlot(("support", index, "caveat_key")),
+                                models.TextField(),
+                            )
+                            if self.bind_decisions
+                            else edge.caveat_key,
                         )
                     )
                 )
@@ -1392,7 +1502,12 @@ class Compiler:
         if own_row:
             decided = self._decided(key, model, identity, bound, depth_possible)
             if decided is not None:
-                return _bound_in(at.ref, decided)
+                _, field = model_identity_fields(model, identity)
+                return (
+                    self.decided_member(at.ref, decided, field)
+                    if self.bind_decisions
+                    else _bound_in(at.ref, decided)
+                )
         # The holders are looked up by key, a row and its ancestors at a time,
         # so their base is a plain disjunction of inline arms.
         base_row = _or(*base_at(row_at))
@@ -2050,7 +2165,9 @@ class Compiler:
                 else None
             )
             if decided is not None:
-                return Decided(decided) if decided else False
+                if not decided:
+                    return False
+                return decided if isinstance(decided, Decided) else Decided(decided)
             shared = self._subject_cte(
                 (allowed_type, name), model, identity, bound, visits, depth_possible
             )

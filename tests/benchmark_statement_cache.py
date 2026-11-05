@@ -36,6 +36,7 @@ definition blog/post {
 
 
 @pytest.mark.django_db(transaction=True)
+@pytest.mark.slow
 def test_statement_cache_benchmark(monkeypatch: pytest.MonkeyPatch) -> None:
     backend = install_schema(SCHEMA)
     actor = SubjectRef.of("auth/user", "alice")
@@ -99,6 +100,7 @@ def test_statement_cache_benchmark(monkeypatch: pytest.MonkeyPatch) -> None:
 
     original = read._Operation.statement
     original_probe = Compiler.decide_native_render
+    original_holds = Compiler.holds
 
     def track_probe(probe_times):
         def timed_probe(self, render):
@@ -112,6 +114,13 @@ def test_statement_cache_benchmark(monkeypatch: pytest.MonkeyPatch) -> None:
             return original_probe(self, timed_render)
 
         return timed_probe
+
+    def track_holds(holds_calls):
+        def counted_holds(self, *args, **kwargs):
+            holds_calls.append(1)
+            return original_holds(self, *args, **kwargs)
+
+        return counted_holds
 
     results = {}
     for name, fn in (
@@ -132,6 +141,7 @@ def test_statement_cache_benchmark(monkeypatch: pytest.MonkeyPatch) -> None:
         for phase in ("before_no_cache", "after_cache"):
             builds = [0]
             probe_times: list[float] = []
+            holds_calls: list[int] = []
 
             def counted(self, key, verdicts, build, *, phase=phase, builds=builds, **kwargs):
                 def tracked():
@@ -146,19 +156,26 @@ def test_statement_cache_benchmark(monkeypatch: pytest.MonkeyPatch) -> None:
             with monkeypatch.context() as patcher:
                 patcher.setattr(read._Operation, "statement", counted)
                 patcher.setattr(Compiler, "decide_native_render", track_probe(probe_times))
+                patcher.setattr(Compiler, "holds", track_holds(holds_calls))
                 requests = []
                 for _ in range(2):
                     before = builds[0]
                     probe_times.clear()
+                    holds_calls.clear()
                     started = perf_counter()
                     with CaptureQueriesContext(connection) as queries:
                         fn()
+                    elapsed_ms = (perf_counter() - started) * 1000
+                    db_ms = sum(float(query["time"]) * 1000 for query in queries)
                     requests.append(
                         {
                             "compiles": builds[0] - before,
-                            "ms": round((perf_counter() - started) * 1000, 2),
+                            "ms": round(elapsed_ms, 2),
+                            "python_ms": round(max(0.0, elapsed_ms - db_ms), 2),
+                            "db_ms": round(db_ms, 2),
                             "queries": len(queries),
                             "probe_renders": len(probe_times),
+                            "holds": len(holds_calls),
                             "probe_render_ms": round(sum(probe_times), 2),
                             "max_sql_bytes": max(
                                 (len(query["sql"].encode()) for query in queries), default=0
@@ -169,16 +186,20 @@ def test_statement_cache_benchmark(monkeypatch: pytest.MonkeyPatch) -> None:
             phases[phase] = {
                 "requests": requests,
                 "hit_ratio": round(stats["hits"] / max(1, stats["hits"] + stats["misses"]), 3),
+                "cache_bytes": stats["bytes"],
+                "hits": stats["hits"],
+                "misses": stats["misses"],
             }
         results[name] = phases
-        expected_compiles = 1 if "decided" in name or name == "caveated_scope" else 0
-        if name.endswith("decided_page"):
-            expected_compiles = 2
-        assert phases["after_cache"]["requests"][1]["compiles"] == expected_compiles, name
+        assert phases["after_cache"]["requests"][1]["compiles"] == 0, name
     for prefix in ("evaluator", "admin"):
         list_queries = results[f"{prefix}_decided_list"]["after_cache"]["requests"][1]["queries"]
         page_queries = results[f"{prefix}_decided_page"]["after_cache"]["requests"][1]["queries"]
         assert page_queries == list_queries + 1  # count uses the evaluator's preparation
+        for suffix in ("list", "page"):
+            warm = results[f"{prefix}_decided_{suffix}"]["after_cache"]["requests"][1]
+            assert warm["probe_renders"] == 0
+            assert warm["compiles"] == 0
     other = SubjectRef.of("auth/user", "other")
     with sudo(reason="cross-actor statement-cache benchmark fixture"):
         other_folder = Folder.objects.create(name="other-allowed")
@@ -197,11 +218,12 @@ def test_statement_cache_benchmark(monkeypatch: pytest.MonkeyPatch) -> None:
     after = read.statement_cache_stats()
     assert cached == {post.pk for post in other_posts}
     assert cached.isdisjoint({post.pk for post in posts})
-    assert after == before  # cross-actor decided SQL is compiled for each request
+    assert after["hits"] == before["hits"] + 1
+    assert after["misses"] == before["misses"]
     with patch.object(read._Operation, "statement", autospec=True) as uncached:
         uncached.side_effect = lambda self, key, verdicts, build, **kwargs: original(
             self, key, verdicts, build, **{**kwargs, "cache": False}
         )
         assert visible(other) == cached
-    results["cross_actor"] = {"cached_hits": 0, "rows": len(cached)}
+    results["cross_actor"] = {"cached_hits": after["hits"] - before["hits"], "rows": len(cached)}
     print("STATEMENT_CACHE_BENCH " + json.dumps(results, sort_keys=True))

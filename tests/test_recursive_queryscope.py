@@ -154,7 +154,7 @@ def test_recursive_chain_parity(storage, shape, backing, depth):
 
 @pytest.mark.parametrize("storage", ["denormalized", "registry"])
 @pytest.mark.parametrize("backing", ["tuple", "field"])
-def test_recursive_alias_decided_statement_is_not_kept(storage, backing):
+def test_recursive_alias_decided_statement_rebinds_actor(storage, backing):
     with schema_context(storage, "folder", backing) as (active, member, hop, _action):
         actors = [SubjectRef.of("auth/user", f"cache-actor-{index}") for index in range(2)]
         chains = []
@@ -186,12 +186,10 @@ def test_recursive_alias_decided_statement_is_not_kept(storage, backing):
 
         read.reset()
         assert visible(actors[0]) == {row.pk for row in chains[0]}
-        # A decided recursive statement can contain actor-specific literals,
-        # so it must never be retained for the next actor.
-        assert not read._statements
+        assert read._statements
         expected = {row.pk for row in chains[1]}
         assert visible(actors[1]) == expected
-        assert not read._statements
+        assert read.statement_cache_stats()["hits"] >= 1
         original = read._Operation.statement
 
         def uncached(self, key, verdicts, build, **kwargs):

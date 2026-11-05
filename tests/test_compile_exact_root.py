@@ -27,6 +27,7 @@ from rebac import (
     to_object_ref,
 )
 from rebac.compile import read
+from rebac.compile.predicate import Compiler
 from rebac.errors import SchemaError
 from rebac.managers import share_scoped_definitions
 from rebac.schema import parse_zed
@@ -715,7 +716,6 @@ def test_statement_cache_evicts_by_bytes(records):
         stats = read.statement_cache_stats()
         assert stats["entries"] == 1
         assert stats["bytes"] <= first_size + 100
-        assert stats["evictions"] == 0  # the range is decided and never enters the cache
 
 
 def test_alternating_revisions_keep_recent_statements(records, monkeypatch):
@@ -771,15 +771,265 @@ def test_decided_row_cache_rebinds_actor_and_grant_changes():
     cold = read.statement_cache_stats()
     assert visible(BOB) == [second.pk]
     warm = read.statement_cache_stats()
-    assert warm == cold  # decided scopes compile afresh and are not kept
+    assert warm["hits"] == cold["hits"] + 1
+    assert warm["misses"] == cold["misses"]
     local.delete_relationship(first_grant)
     assert visible(ALICE) == []
     empty = read.statement_cache_stats()
-    assert empty == warm
+    assert empty["misses"] == warm["misses"] + 1
     moved = RelationshipTuple(to_object_ref(second_folder), "viewer", ALICE)
     local.write_relationships([moved])
     assert visible(ALICE) == [second.pk]
-    assert read.statement_cache_stats() == empty
+    assert read.statement_cache_stats()["hits"] == empty["hits"] + 1
+
+
+def test_decided_row_cache_reuses_nonempty_array_shape():
+    local = install_schema("""
+        definition auth/user {}
+        definition blog/folder {
+            relation viewer: auth/user
+            permission read = viewer
+        }
+        definition blog/post {
+            relation folder: blog/folder // rebac:field=folder
+            permission read = folder->read
+        }
+    """)
+    with sudo(reason="decided array cache fixture"):
+        folders = [Folder.objects.create(name=f"folder-{index}") for index in range(3)]
+        posts = [
+            Post.objects.create(title=f"post-{index}", folder=folder)
+            for index, folder in enumerate(folders)
+        ]
+    local.write_relationships(
+        [
+            RelationshipTuple(to_object_ref(folders[0]), "viewer", ALICE),
+            RelationshipTuple(to_object_ref(folders[1]), "viewer", BOB),
+            RelationshipTuple(to_object_ref(folders[2]), "viewer", BOB),
+        ]
+    )
+
+    def visible(actor):
+        with evaluator_scope():
+            return set(Post.objects.with_actor(actor).values_list("pk", flat=True))
+
+    read.reset()
+    assert visible(ALICE) == {posts[0].pk}
+    before = read.statement_cache_stats()
+    assert visible(BOB) == {posts[1].pk, posts[2].pk}
+    after = read.statement_cache_stats()
+    if connection.vendor == "postgresql":
+        assert after["hits"] == before["hits"] + 1
+        assert after["misses"] == before["misses"]
+    else:
+        assert after["misses"] == before["misses"] + 1
+
+
+@pytest.mark.slow
+def test_decided_row_cache_buckets_forty_actor_outcomes():
+    """The review's 1..40 folder grants share seven padded SQL shapes."""
+    local = install_schema("""
+        definition auth/user {}
+        definition blog/folder {
+            relation viewer: auth/user
+            permission read = viewer
+        }
+        definition blog/post {
+            relation folder: blog/folder // rebac:field=folder
+            permission read = folder->read
+        }
+    """)
+    with sudo(reason="bucketed decided cache fixture"):
+        folders = [Folder.objects.create(name=f"folder-{index}") for index in range(40)]
+        posts = [
+            Post.objects.create(title=f"post-{index}", folder=folder)
+            for index, folder in enumerate(folders[:4])
+        ]
+    actors = [SubjectRef.of("auth/user", f"bucket-{index}") for index in range(40)]
+    local.write_relationships(
+        [
+            RelationshipTuple(to_object_ref(folder), "viewer", actor)
+            for index, actor in enumerate(actors)
+            for folder in folders[: index + 1]
+        ]
+    )
+    read.reset()
+    for index, actor in enumerate(actors):
+        with evaluator_scope():
+            visible = set(Post.objects.with_actor(actor).values_list("pk", flat=True))
+        assert visible == {post.pk for post in posts[: index + 1]}
+    stats = read.statement_cache_stats()
+    print(
+        "DECIDED_BUCKET_STATS",
+        connection.vendor,
+        stats,
+        "max_key_bytes",
+        max(len(repr(key).encode()) for key in read._statements),
+    )
+    if connection.vendor == "postgresql":
+        assert (stats["entries"], stats["hits"], stats["misses"]) == (1, 39, 1)
+    else:
+        assert (stats["entries"], stats["hits"], stats["misses"]) == (7, 33, 7)
+    assert stats["bytes"] == sum(
+        read._statement_size(key, value) for key, value in read._statements.items()
+    )
+    assert all(
+        read._statement_size(key, value) >= len(repr(key).encode())
+        for key, value in read._statements.items()
+    )
+
+
+def test_decided_warm_hit_skips_render_probes_and_compilation(monkeypatch):
+    local = install_schema("""
+        definition auth/user {}
+        definition blog/folder {
+            relation viewer: auth/user
+            permission read = viewer
+        }
+        definition blog/post {
+            relation folder: blog/folder // rebac:field=folder
+            permission read = folder->read
+        }
+    """)
+    with sudo(reason="warm decided cache fixture"):
+        folders = [Folder.objects.create(name=f"folder-{index}") for index in range(2)]
+        posts = [
+            Post.objects.create(title=f"post-{index}", folder=folder)
+            for index, folder in enumerate(folders)
+        ]
+    local.write_relationships(
+        [
+            RelationshipTuple(to_object_ref(folders[0]), "viewer", ALICE),
+            RelationshipTuple(to_object_ref(folders[1]), "viewer", BOB),
+        ]
+    )
+    calls = {"probes": 0, "compiles": 0, "holds": 0}
+    original_probe = Compiler.decide_native_render
+    original_holds = Compiler.holds
+    original_statement = read._Operation.statement
+
+    def probe(self, render):
+        calls["probes"] += 1
+        return original_probe(self, render)
+
+    def holds(self, *args, **kwargs):
+        calls["holds"] += 1
+        return original_holds(self, *args, **kwargs)
+
+    def statement(self, key, verdicts, build, **kwargs):
+        def counted():
+            calls["compiles"] += 1
+            return build()
+
+        return original_statement(self, key, verdicts, counted, **kwargs)
+
+    monkeypatch.setattr(Compiler, "decide_native_render", probe)
+    monkeypatch.setattr(Compiler, "holds", holds)
+    monkeypatch.setattr(read._Operation, "statement", statement)
+
+    def visible(actor):
+        with evaluator_scope():
+            return list(Post.objects.with_actor(actor).values_list("pk", flat=True))
+
+    read.reset()
+    assert visible(ALICE) == [posts[0].pk]
+    assert calls["probes"] > 0 and calls["compiles"] == 1
+    calls.update(probes=0, compiles=0, holds=0)
+    before = read.statement_cache_stats()
+    assert visible(BOB) == [posts[1].pk]
+    after = read.statement_cache_stats()
+    assert after["hits"] == before["hits"] + 1
+    assert calls["holds"] > 0
+    assert calls["probes"] == calls["compiles"] == 0
+
+
+def test_point_row_compiler_binds_decisions_before_evaluator_list(monkeypatch):
+    local = install_schema("""
+        definition auth/user {}
+        definition blog/folder {
+            relation viewer: auth/user
+            permission read = viewer
+        }
+        definition blog/post {
+            relation folder: blog/folder // rebac:field=folder
+            permission read = folder->read
+        }
+    """)
+    with sudo(reason="point decided binding fixture"):
+        folder = Folder.objects.create(pk=84_000_001, name="allowed")
+        post = Post.objects.create(pk=84_000_002, title="allowed", folder=folder)
+    local.write_relationships([RelationshipTuple(to_object_ref(folder), "viewer", ALICE)])
+    original = read._Operation.compiler
+    point_compilers = []
+
+    def compiler(self, verdicts, **kwargs):
+        if kwargs.get("rows") is not None and kwargs.get("parametric", True):
+            point_compilers.append(kwargs.get("bind_decisions", False))
+        return original(self, verdicts, **kwargs)
+
+    monkeypatch.setattr(read._Operation, "compiler", compiler)
+    read.reset()
+    with evaluator_scope():
+        assert local.check_access(
+            subject=ALICE, action="read", resource=to_object_ref(post)
+        ).allowed
+        assert list(Post.objects.with_actor(ALICE).values_list("pk", flat=True)) == [post.pk]
+    assert point_compilers and all(point_compilers)
+    for kept in read._statements.values():
+        if isinstance(kept, read._Kept):
+            assert str(folder.pk) not in kept.sql
+            assert str(folder.pk) not in map(str, kept.params)
+
+
+@pytest.mark.parametrize("point_first", [False, True])
+def test_decided_warm_hit_rechecks_revoked_grant(monkeypatch, point_first):
+    """A grant revoked after preparation cannot survive the kept witness."""
+    local = install_schema("""
+        definition auth/user {}
+        definition blog/folder {
+            relation viewer: auth/user
+            permission read = viewer
+        }
+        definition blog/post {
+            relation folder: blog/folder // rebac:field=folder
+            permission read = folder->read
+        }
+    """)
+    with sudo(reason="warm revocation fixture"):
+        folders = [Folder.objects.create(name=f"folder-{index}") for index in range(2)]
+        posts = [
+            Post.objects.create(title=f"post-{index}", folder=folder)
+            for index, folder in enumerate(folders)
+        ]
+    second_grant = RelationshipTuple(to_object_ref(folders[1]), "viewer", BOB)
+    local.write_relationships(
+        [RelationshipTuple(to_object_ref(folders[0]), "viewer", ALICE), second_grant]
+    )
+    read.reset()
+    with evaluator_scope():
+        if point_first:
+            assert local.check_access(
+                subject=ALICE, action="read", resource=to_object_ref(posts[0])
+            ).allowed
+        assert list(Post.objects.with_actor(ALICE).values_list("pk", flat=True)) == [posts[0].pk]
+    before = read.statement_cache_stats()
+    original = read._Rows._decide
+    changed = []
+
+    def decide_then_revoke(self, key):
+        found = original(self, key)
+        if key == ("blog/folder", "read") and self.operation.actor == BOB and not changed:
+            changed.append(True)
+            local.delete_relationship(second_grant)
+        return found
+
+    monkeypatch.setattr(read._Rows, "_decide", decide_then_revoke)
+    with evaluator_scope():
+        assert not Post.objects.with_actor(BOB).exists()
+    after = read.statement_cache_stats()
+    assert changed
+    assert after["hits"] == before["hits"] + 1
+    assert after["misses"] == before["misses"]
 
 
 def test_decided_set_cache_rebinds_support_and_member_ids():
@@ -816,7 +1066,34 @@ def test_decided_set_cache_rebinds_support_and_member_ids():
     cold = read.statement_cache_stats()
     assert visible(BOB) == [second.pk]
     warm = read.statement_cache_stats()
-    assert warm == cold  # decided scopes do not enter the statement cache
+    assert warm["hits"] == cold["hits"] + 1
+    assert warm["misses"] == cold["misses"]
+    local.delete_relationship(RelationshipTuple(first_group, "member", ALICE))
+    assert visible(ALICE) == []
+    empty = read.statement_cache_stats()
+    assert empty["misses"] == warm["misses"] + 1
+    local.write_relationships([RelationshipTuple(second_group, "member", ALICE)])
+    assert visible(ALICE) == [second.pk]
+    assert read.statement_cache_stats()["hits"] == empty["hits"] + 1
+
+
+def test_decided_native_projection_choice_is_pinned_on_hit(records):
+    _local, allowed, _denied, _grant = records
+    read.reset()
+
+    def visible():
+        with evaluator_scope():
+            return list(Post.objects.with_actor(ALICE).values_list("pk", flat=True))
+
+    assert visible() == [allowed.pk]
+    native = tuple(read._native_outcomes.values())
+    assert native and any(native)
+    first = read.statement_cache_stats()
+    assert visible() == [allowed.pk]
+    second = read.statement_cache_stats()
+    assert second["hits"] == first["hits"] + 1
+    assert second["misses"] == first["misses"]
+    assert tuple(read._native_outcomes.values()) == native
 
 
 @pytest.mark.parametrize(
@@ -912,10 +1189,7 @@ def test_cached_statement_has_no_first_actor_literals_and_matches_uncached(shape
     expected = {posts[0][0].pk} if shape == "point" else {post.pk for post in posts[0]}
     assert first == ((expected, 2) if shape == "evaluator_page" else expected)
     kept = [value for value in read._statements.values() if isinstance(value, read._Kept)]
-    if shape in {"point", "bounded"}:
-        assert kept
-    # The loop is vacuous for request-local decided scopes. It remains the
-    # literal-value guard for a future decided-statement cache.
+    assert kept
     first_ids = {folders[0].pk, *(post.pk for post in posts[0])}
     first_strings = {actors[0].subject_id, "cache-group-0"}
     for statement in kept:
@@ -932,11 +1206,8 @@ def test_cached_statement_has_no_first_actor_literals_and_matches_uncached(shape
     before = read.statement_cache_stats()
     cached = visible(1)
     after = read.statement_cache_stats()
-    if shape in {"point", "bounded"}:
-        assert after["hits"] > before["hits"]
-        assert after["misses"] == before["misses"]
-    else:
-        assert after == before
+    assert after["hits"] > before["hits"]
+    assert after["misses"] == before["misses"]
     original = read._Operation.statement
 
     def uncached(self, key, verdicts, build, **kwargs):
@@ -956,12 +1227,12 @@ def test_decided_scope_rekeys_on_depth_setting(records):
     with evaluator_scope():
         assert list(Post.objects.with_actor(ALICE).values_list("pk", flat=True)) == [allowed.pk]
     old_shape = read._Operation.begin(local, ALICE, "default").shape
-    assert read.statement_cache_stats()["entries"] == 0
+    assert read.statement_cache_stats()["entries"] == 1
     with override_settings(REBAC_DEPTH_LIMIT=7):
         assert read._Operation.begin(local, ALICE, "default").shape != old_shape
         with evaluator_scope():
             assert list(Post.objects.with_actor(ALICE).values_list("pk", flat=True)) == [allowed.pk]
-        assert read.statement_cache_stats()["entries"] == 0
+        assert read.statement_cache_stats()["entries"] == 2
 
 
 @isolate_apps("tests.testapp")
@@ -981,7 +1252,7 @@ def test_late_resource_model_preparation_rebuilds_model_index(records, monkeypat
     assert len(captures) == 1
     with evaluator_scope():
         list(Post.objects.with_actor(ALICE).values_list("pk", flat=True))
-    assert read.statement_cache_stats()["entries"] == 0
+    assert read.statement_cache_stats()["entries"] == 1
 
     class LateResource(RebacMixin):
         name = models.CharField(max_length=20)
@@ -1043,7 +1314,8 @@ def test_caveat_verdict_values_bind_into_reused_scope():
     )
     assert list(Post.objects.with_actor(ALICE).values_list("pk", flat=True)) == [second.pk]
     second_stats = read.statement_cache_stats()
-    assert second_stats == first_stats  # the caveated scope is decided per request
+    assert second_stats["hits"] == first_stats["hits"] + 1
+    assert second_stats["misses"] == first_stats["misses"]
 
 
 @pytest.mark.parametrize("false_bans", range(6))

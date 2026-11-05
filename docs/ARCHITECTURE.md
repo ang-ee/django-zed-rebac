@@ -2340,22 +2340,41 @@ confirmation query.
 
 #### Kept statements and the policy fence
 
-Django keeps value-independent compiled statements across requests by policy revision,
-override digest and deadline epoch; environment, actor shape, statement and candidate
-shape complete the key. Decided scopes are compiled per request and are never
-kept: row IDs and support values are literal parameters in that request's SQL.
-Actor IDs, caveat keys and the application clock remain bound in kept plans.
-The count in an evaluator scope uses its decision memo, so it adds no preparation.
-For value-independent statements, the cache lookup precedes predicate construction.
+Django keeps compiled statements across requests by policy revision, override
+digest and deadline epoch; environment, actor shape, statement and candidate
+shape complete the base key. A decided scope first prepares the row, stored-set
+and fixed-fact decisions on each request. Its additional key records which
+reached rows are empty, nonempty or inline, the padded power-of-two ID arity on vendors
+with scalar `IN` parameters, stored-set support shape, fixed-fact truth values,
+and the caveat verdict arity class. It never records decided IDs or the actor ID.
+The first compilation also records the native render probe's inline/shared
+choices in the key. A matching outcome reuses that SQL and its pinned choices
+without building row witnesses, compiling a predicate or running any native
+render probe. Preparation queries use the inline native form; a cache miss
+builds the live row witnesses and probes the final statement. Decided
+row IDs, set IDs and support values, actor ID, caveat keys and the application
+clock bind on every execution. The count in an evaluator scope uses its
+decision memo, so it adds no preparation. Inline and other value-independent
+statements retain their existing lookup before predicate construction.
 `_policies` retains parsed policies and `_statements` retains compiled SQL text.
-The latter has both a 512-entry and a 64 MiB default byte limit, with hit,
-miss and eviction counters. The four most recently observed revisions per alias
-remain available; older revisions are purged. Actor id, application clock, point resource id, caveat verdict keys
+`_decision_recipes` retains the bounded shape needed to recompute an outcome;
+`_native_outcomes` maps a recipe serial and outcome to its native choice without
+duplicating the policy and statement base key. Each table has a 512-entry limit.
+The statement table has both a 512-entry and a 64 MiB default byte limit, with hit,
+miss and eviction counters. Its byte accounting includes the UTF-8 representation
+of each key, compiled SQL bytes and parameter payload estimates; it excludes the
+separately bounded recipe and native-choice tables. The four most recently observed
+revisions per alias remain available; older revisions and their statement, fact,
+recipe and native-choice entries are purged. Actor id, application clock, point resource id, caveat verdict keys
 and PostgreSQL candidate arrays bind when the statement executes. Other
 vendors use a bounded candidate-arity shape. Padded candidate and caveat
 slots repeat a real value, never `NULL`, so negated membership remains
-two-valued. A changed grant or revoke is read in the next preparation;
-the newly compiled witness checks the current database snapshot.
+two-valued. A changed grant or revoke is read in the next preparation; the
+rebound witness checks the current database snapshot even on a cache hit.
+The revision fence still executes on every read. A new published revision,
+override deadline epoch, setting or late registered model changes the key or
+clears the cache before a new statement can reuse it. Older revision entries
+remain subject to the four-revision retirement rule.
 
 Every statement carries the `SchemaGeneration` revision fence. A scope built
 for an older revision admits no rows after a supported policy write publishes

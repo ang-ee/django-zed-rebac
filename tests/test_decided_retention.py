@@ -1,4 +1,4 @@
-"""Decided statements remain request-local across revisions and cache pressure."""
+"""Outcome-keyed decided statements respect revisions and cache pressure."""
 
 import pytest
 from django.test import override_settings
@@ -38,15 +38,24 @@ def test_alternating_and_cycling_revisions(records, monkeypatch):  # noqa: F811
     for step in range(6):
         read_as(real if step % 2 == 0 else "pinned-old")
     alternating = read.statement_cache_stats()
+    retired_serials = {
+        recipe.serial
+        for base, recipe in read._decision_recipes.items()
+        if base[1] in {real, "pinned-old"}
+    }
     # Cycle through five more distinct revisions: the oldest observed must retire.
     for name in ("r2", "r3", "r4", "r5"):
         read_as(name)
     cycled = read.statement_cache_stats()
     assert alternating["evictions"] == 0
-    assert alternating["entries"] == alternating["misses"] == 0
+    assert alternating["entries"] == 2
+    assert alternating["hits"] >= 4
     # the real revision answers; fake revisions are fenced (revision mismatch at run time)
     assert trace[0][1] == [allowed.pk] and trace[1][1] == []
-    assert cycled["entries"] == 0  # decided statements never enter the cache
+    assert cycled["entries"] <= 4
+    assert cycled["evictions"] >= 1
+    assert all(base[1] not in {real, "pinned-old"} for base in read._decision_recipes)
+    assert all(key[0] not in retired_serials for key in read._native_outcomes)
 
 
 def test_byte_bound_and_eviction_during_use(records):  # noqa: F811
@@ -63,8 +72,7 @@ def test_byte_bound_and_eviction_during_use(records):  # noqa: F811
         list(Post.objects.with_actor(ALICE).filter(pk__in=[allowed.pk, denied.pk]))
         stats = read.statement_cache_stats()
         assert stats["bytes"] <= one + 10
-        assert stats["evictions"] == 0
-        # A request-local decided statement stays usable by its holder.
+        # An evicted compiled statement stays usable by its holder.
         from django.db import connection
 
         from rebac.compile.read import _bound_params
@@ -75,6 +83,7 @@ def test_byte_bound_and_eviction_during_use(records):  # noqa: F811
             actor=ALICE,
             using="default",
             verdicts=operation.verdicts(("blog/post", "read")),
+            operation=operation,
         )
         sql = f"SELECT id FROM testapp_post WHERE id IN {held.sql}"
         with connection.cursor() as cursor:
