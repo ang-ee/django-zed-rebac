@@ -7,6 +7,15 @@ pre-1.0; breaking changes within a minor version are explicitly called out.
 
 ### Changed
 
+- Tuple-to-model identity conversions share one guarded native projection per
+  statement boundary according to its rendered use count; single-use
+  boundaries keep the guarded conversion inline. PostgreSQL boundaries with
+  fewer than nine uses and independently combined union owners stay inline
+  after a shared-plan cost probe. Repeated
+  nonrecursive fixed-object const targets share one definition per bound.
+  Statement-local CTE owners and reached-object names are deterministic;
+  independently combined owners are rebuilt or relabeled on copied operands
+  to keep names distinct.
 - Queryset scopes use witnessed decisions both inside and outside evaluator
   scopes. Decided statements compile once per request and are not kept across
   requests; row IDs and support values are literal parameters. Candidate,

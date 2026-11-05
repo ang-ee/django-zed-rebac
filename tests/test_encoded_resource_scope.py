@@ -242,8 +242,8 @@ def test_encoded_owner_corpus_is_not_enumerated_for_sparse_tuple_grants(
     # with the compiler; recursive CTE lowering raises the fixed parameter count.
     # Django 6.1 compares the top-level boolean scope predicate with True (one
     # parameter) where the backend has no native boolean type.
-    # Prepared target decisions reduce this lane's fixed parameter count.
-    assert large_cost[1] == 39 + (not connection.features.has_native_boolean_field)
+    # PostgreSQL keeps this low-reuse conversion inline; SQLite shares it.
+    assert large_cost[1] == (40 if connection.vendor == "postgresql" else 29)
 
 
 @pytest.mark.parametrize("active", STORAGE_TIERS, indirect=True)

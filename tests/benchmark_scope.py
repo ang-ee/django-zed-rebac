@@ -51,7 +51,7 @@ def test_benchmark_scope() -> None:
     def statements(fn):
         with CaptureQueriesContext(connection) as queries:
             fn()
-        return len(queries)
+        return len(queries), max((len(query["sql"].encode()) for query in queries), default=0)
 
     def scoped_sql(subject):
         return Post.objects.with_actor(subject).scoped().query.sql_with_params()
@@ -76,6 +76,9 @@ def test_benchmark_scope() -> None:
     rows_ms, found = measure(rows)
     check_ms, decision = measure(check)
     assert len(found) == ROWS and decision.allowed
+    rows_statements, rows_sql_bytes = statements(rows)
+    check_statements, check_sql_bytes = statements(check)
+    assert max(rows_sql_bytes, check_sql_bytes) <= 994
     print(
         "SCOPE_BENCH "
         + json.dumps(
@@ -86,12 +89,15 @@ def test_benchmark_scope() -> None:
                 "cold_scoped_ms": cold_ms,
                 "new_actor_ms": new_actor_ms,
                 "sql_chars": len(sql),
+                "max_sql_bytes": max(rows_sql_bytes, check_sql_bytes),
+                "rows_sql_bytes": rows_sql_bytes,
+                "check_sql_bytes": check_sql_bytes,
                 "params": len(params),
                 "exists": sql.upper().count("EXISTS"),
                 "rows_ms": rows_ms,
-                "rows_statements": statements(rows),
+                "rows_statements": rows_statements,
                 "check_ms": check_ms,
-                "check_statements": statements(check),
+                "check_statements": check_statements,
             },
             sort_keys=True,
         )

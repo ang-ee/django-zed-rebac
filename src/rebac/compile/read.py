@@ -13,7 +13,6 @@ from collections.abc import Callable, Hashable, Iterable, Iterator, Mapping, Seq
 from dataclasses import dataclass, field
 from datetime import datetime
 from itertools import batched
-from secrets import token_hex
 from threading import RLock
 from typing import TYPE_CHECKING, Any, cast
 
@@ -1976,7 +1975,7 @@ def attached_permission_plan(
         verdicts[actions[0]],
         parametric=False,
         share_subject_rows=True,
-        cte_owner=token_hex(8),
+        cte_owner="0",
     )
     gate = operation.gate(parametric=False)
     arms: list[models.QuerySet[Any]] = []
@@ -2004,7 +2003,9 @@ def attached_permission_plan(
         arms.append(arm)
     if not arms:
         return None
-    closure = CTE(arms[0].union(*arms[1:], all=True).order_by(), name=f"{name}_closure")
+    closure_rows = arms[0].union(*arms[1:], all=True).order_by()
+    compiler.decide_native(closure_rows)
+    closure = CTE(closure_rows, name=f"{name}_closure")
     body: models.QuerySet[Any] = model._base_manager.using(using)
     if candidates is not None:
         body = body.filter(_bound_in(F(resource_id_attr(model)), candidates))
@@ -2063,10 +2064,11 @@ def matching_shared_permission(query: Any, scope: Any, using: str) -> Q | None:
     return None
 
 
-def share_combined_scopes(query: Any) -> bool | None:
+def share_combined_scopes(query: Any, *, cte_owner: str = "0") -> bool | None:
     """Hoist common subject sets from scoped UNION operands to their owner."""
 
     from rebac.expressions import _Permission
+    from rebac.managers import _replace_query_ctes
 
     def in_permissions(node: Any) -> Iterator[_Permission]:
         if isinstance(node, _Permission):
@@ -2135,7 +2137,7 @@ def share_combined_scopes(query: Any) -> bool | None:
     }
     for part in (*query.combined_queries, query):
         if hasattr(part, "_with_ctes"):
-            part._with_ctes = tuple(cte for cte in part._with_ctes if id(cte) not in old_ctes)
+            _replace_query_ctes(part, remove_ids=old_ctes)
     operation = _Operation.begin(first.backend, first.actor, first.using, policy=first.policy)
     scope_keys = frozenset(
         (cast(str, model_resource_type(scope.model)), scope.action) for scope in scopes
@@ -2164,7 +2166,7 @@ def share_combined_scopes(query: Any) -> bool | None:
         rows=rows,
         sets=sets,
         facts=facts,
-        cte_owner=token_hex(8),
+        cte_owner=cte_owner,
     )
     rows.render_compiler = compiler
     predicates: list[tuple[_Scope, Q]] = []
@@ -2190,6 +2192,7 @@ def share_combined_scopes(query: Any) -> bool | None:
         fence = CTE(gate.values("pk"), name=compiler._cte_name("rebac_gate"))
         compiler._statement_ctes.append(fence)
         gate = compiler._cte_queryset(fence)
+
     members: list[tuple[_Scope, _Kept | bool]] = []
     for scope, condition in predicates:
         members.append((scope, _shared_scope_statement(operation, scope.model, condition, gate)))

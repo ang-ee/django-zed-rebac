@@ -12,6 +12,7 @@ from django.test.utils import CaptureQueriesContext
 
 from rebac import CheckItem, ObjectRef, RelationshipTuple, SubjectRef, sudo, to_object_ref
 from rebac.compile import read
+from rebac.compile.predicate import Compiler
 from rebac.evaluator import evaluator_scope
 from rebac.testing import install_schema
 from tests.testapp.models import Folder, Post
@@ -97,6 +98,21 @@ def test_statement_cache_benchmark(monkeypatch: pytest.MonkeyPatch) -> None:
         return read.check_many(backend=backend, items=bulk, using="default")
 
     original = read._Operation.statement
+    original_probe = Compiler.decide_native_render
+
+    def track_probe(probe_times):
+        def timed_probe(self, render):
+            def timed_render():
+                started = perf_counter()
+                try:
+                    return render()
+                finally:
+                    probe_times.append((perf_counter() - started) * 1000)
+
+            return original_probe(self, timed_render)
+
+        return timed_probe
+
     results = {}
     for name, fn in (
         ("pk", point),
@@ -115,6 +131,7 @@ def test_statement_cache_benchmark(monkeypatch: pytest.MonkeyPatch) -> None:
         phases = {}
         for phase in ("before_no_cache", "after_cache"):
             builds = [0]
+            probe_times: list[float] = []
 
             def counted(self, key, verdicts, build, *, phase=phase, builds=builds, **kwargs):
                 def tracked():
@@ -128,9 +145,11 @@ def test_statement_cache_benchmark(monkeypatch: pytest.MonkeyPatch) -> None:
             read.reset()
             with monkeypatch.context() as patcher:
                 patcher.setattr(read._Operation, "statement", counted)
+                patcher.setattr(Compiler, "decide_native_render", track_probe(probe_times))
                 requests = []
                 for _ in range(2):
                     before = builds[0]
+                    probe_times.clear()
                     started = perf_counter()
                     with CaptureQueriesContext(connection) as queries:
                         fn()
@@ -139,6 +158,8 @@ def test_statement_cache_benchmark(monkeypatch: pytest.MonkeyPatch) -> None:
                             "compiles": builds[0] - before,
                             "ms": round((perf_counter() - started) * 1000, 2),
                             "queries": len(queries),
+                            "probe_renders": len(probe_times),
+                            "probe_render_ms": round(sum(probe_times), 2),
                             "max_sql_bytes": max(
                                 (len(query["sql"].encode()) for query in queries), default=0
                             ),

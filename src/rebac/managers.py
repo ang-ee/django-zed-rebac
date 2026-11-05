@@ -13,13 +13,13 @@ loaded instance (it is not visible inside `from_db()`).
 
 from __future__ import annotations
 
+import hashlib
 import re
 from collections import Counter
 from collections.abc import AsyncIterator, Collection, Iterable, Iterator
 from contextvars import ContextVar
-from copy import copy
+from copy import copy, deepcopy
 from enum import Enum, auto
-from secrets import token_hex
 from typing import TYPE_CHECKING, Any, ClassVar, Self, TypeVar, cast, overload
 
 from asgiref.sync import sync_to_async
@@ -86,7 +86,19 @@ class SharedScope[M: models.Model]:
         self._columns = columns
         self._candidates = candidates
         self._actions = actions
-        self._name = f"rebac_scope_{token_hex(8)}"
+        owner = (
+            model._meta.label_lower,
+            actor.subject_type,
+            actor.subject_id,
+            actor.optional_relation,
+            action,
+            using,
+            columns,
+            candidates,
+            actions,
+        )
+        digest = hashlib.blake2s(repr(owner).encode(), digest_size=8).hexdigest()
+        self._name = f"rebac_scope_{digest}"
         # This CTE supplies column metadata to references. Its query is never
         # attached or resolved; each attach builds a fresh authorized body.
         self._reference = CTE(
@@ -117,6 +129,8 @@ class SharedScope[M: models.Model]:
                 self,
             )
             jit_mixin(query, _LateSharedScopeQuery)
+        if type(result) is models.QuerySet:
+            result.__class__ = _OwnedScopesQuerySet
         return result
 
     def _definition(self, candidates: tuple[int, ...] | None) -> tuple[tuple[CTE, ...], Any]:
@@ -180,14 +194,33 @@ def _replace_shared_definition(query: Query, ctes: tuple[CTE, ...], plan: Any) -
         for name in (*scope.owned_ctes, scope.cte.name)
     }
     names = {cte.name for cte in ctes} | old_owned
-    if not hasattr(query, "_with_ctes"):
-        with_cte(*ctes, select=models.QuerySet(model=query.model, query=query))
-    else:
-        cast(Any, query)._with_ctes = (
-            tuple(cte for cte in cast(Any, query)._with_ctes if cte.name not in names) + ctes
-        )
+    _replace_query_ctes(query, ctes, remove_names=names)
     scopes = (*tuple(scope for scope in old_scopes if scope.cte.name != plan.cte.name), plan)
     _isolate_statement_queries(query, scopes, tuple(names))
+
+
+def _replace_query_ctes(
+    query: Query,
+    ctes: tuple[CTE, ...] = (),
+    *,
+    remove_names: Collection[str] = (),
+    remove_ids: Collection[int] = (),
+) -> None:
+    """Move django-cte definitions at the library's statement attachment seam.
+
+    This is the sole direct write to django-cte's private ``_with_ctes``;
+    django-cte exposes attachment through ``with_cte()`` but no detach API.
+    """
+    remaining = tuple(
+        cte
+        for cte in getattr(query, "_with_ctes", ())
+        if cte.name not in remove_names and id(cte) not in remove_ids
+    )
+    # django-cte 5.x has no public detach operation. Its with_cte() is the
+    # attachment API; removing moved definitions must precede that call.
+    vars(query)["_with_ctes"] = remaining
+    if ctes:
+        with_cte(*ctes, select=models.QuerySet(model=query.model, query=query))
 
 
 def _references_cte(query: Query, name: str) -> bool:
@@ -255,7 +288,113 @@ def share_scoped_definitions[T: models.Model](
         return result
     if share_combined_scopes(query) is False:
         raise PermissionDenied("Union operands must have compatible prepared REBAC scopes")
+    if type(result) is models.QuerySet:
+        result.__class__ = _OwnedScopesQuerySet
     return result
+
+
+def _relabel_owned_ctes(query: Query, names: dict[str, str]) -> None:
+    """Relabel a copied owner's definitions and every query that reads them."""
+    from .compile.predicate import _Compiled
+
+    seen: set[int] = set()
+
+    def visit_expression(expression: Any) -> None:
+        if isinstance(expression, _Compiled):
+            visit(expression.rows.query)
+            expression._sql.clear()
+            return
+        if isinstance(expression, Query):
+            visit(expression)
+            return
+        sources = getattr(expression, "get_source_expressions", None)
+        if callable(sources):
+            for source in cast(Iterable[Any], sources()):
+                if source is not None:
+                    visit_expression(source)
+
+    def visit(part: Query) -> None:
+        if id(part) in seen:
+            return
+        seen.add(id(part))
+        for old, new in names.items():
+            if old in part.alias_map and part.alias_map[old].table_name == old:
+                part.table_map[new] = part.table_map.pop(old)
+                part.alias_map[old].table_name = new
+                part.change_aliases({old: new})
+            for join in part.alias_map.values():
+                if join.table_name == old:
+                    join.table_name = new
+        for cte in getattr(part, "_with_ctes", ()):
+            cte.name = names.get(cte.name, cte.name)
+            visit(cte.query)
+        group_by = part.group_by if isinstance(part.group_by, tuple) else ()
+        for expression in (
+            part.where,
+            *part.annotations.values(),
+            *part.select,
+            *part.order_by,
+            *group_by,
+        ):
+            visit_expression(expression)
+        for nested in _nested_queries(part):
+            visit(nested)
+
+    visit(query)
+
+
+def _relabel_combined_owners(query: Query, other_qs: tuple[Any, ...]) -> tuple[Any, ...]:
+    """Give independently prepared operands distinct statement CTE names."""
+    occupied = {cte.name for cte in getattr(query, "_with_ctes", ())}
+    prepared = []
+    for ordinal, other in enumerate(other_qs, 1):
+        names = {cte.name for cte in getattr(other.query, "_with_ctes", ())}
+        if occupied & names:
+            suffix = ordinal
+            if getattr(other.query, "_rebac_combined_ctes_shared", None) is not None:
+                from .compile.read import share_combined_scopes
+
+                while True:
+                    clone = other._clone()
+                    clone.query = deepcopy(other.query)
+                    plan = getattr(clone.query, "_rebac_subject_plan", None)
+                    if plan is not None:
+                        owned = {cte.name for cte in plan[1]}
+                        _replace_query_ctes(clone.query, remove_names=owned)
+                        for part in clone.query.combined_queries:
+                            if hasattr(part, "_rebac_subject_plan"):
+                                del part._rebac_subject_plan
+                        del clone.query._rebac_subject_plan
+                    del clone.query._rebac_combined_ctes_shared
+                    if share_combined_scopes(clone.query, cte_owner=str(suffix)) is not True:
+                        raise PermissionDenied("Could not reprepare a combined scope owner")
+                    names = {cte.name for cte in getattr(clone.query, "_with_ctes", ())}
+                    if not occupied.intersection(names):
+                        other = clone
+                        break
+                    suffix += 1
+            else:
+                clone = other._clone()
+                clone.query = deepcopy(other.query)
+                while True:
+                    replacements = {name: f"{name}_owner{suffix}" for name in sorted(names)}
+                    if not occupied.intersection(replacements.values()):
+                        break
+                    suffix += 1
+                _relabel_owned_ctes(clone.query, replacements)
+                other = clone
+                names = set(replacements.values())
+        occupied.update(names)
+        prepared.append(other)
+    return tuple(prepared)
+
+
+class _OwnedScopesQuerySet[T: models.Model](models.QuerySet[T]):
+    """Relabel independently prepared operands before a plain combination."""
+
+    def _combinator_query(self, combinator: str, *other_qs: Any, all: bool = False) -> Any:
+        prepared = _relabel_combined_owners(self.query, other_qs)
+        return super()._combinator_query(combinator, *prepared, all=all)  # type: ignore[misc]
 
 
 class _ScopeWhere(WhereNode):
@@ -584,9 +723,7 @@ def _isolate_statement_queries(
             )
         if part is not query and hasattr(part, "_with_ctes"):
             owned = {shared_name} if isinstance(shared_name, str) else set(shared_name)
-            cast(Any, part)._with_ctes = tuple(
-                cte for cte in cast(Any, part)._with_ctes if cte.name not in owned
-            )
+            _replace_query_ctes(part, remove_names=owned)
         cast(Any, part)._rebac_shared_scopes = plans
 
 
@@ -653,8 +790,7 @@ def _without_query_scope(query: Query) -> Query:
     if plan is not None:
         owned = {id(cte) for cte in plan[1]}
         if hasattr(clone, "_with_ctes"):
-            cloned_ctes = cast(Any, clone)._with_ctes
-            cast(Any, clone)._with_ctes = tuple(cte for cte in cloned_ctes if id(cte) not in owned)
+            _replace_query_ctes(clone, remove_ids=owned)
         delattr(clone, "_rebac_subject_plan")
     if hasattr(clone, "_rebac_combined_ctes_shared"):
         delattr(clone, "_rebac_combined_ctes_shared")
@@ -1906,6 +2042,7 @@ class RebacQuerySet(TrackedQuerySet[_M]):
     def _combinator_query(
         self, combinator: str, *other_qs: Any, all: bool = False
     ) -> RebacQuerySet[_M]:
+        other_qs = _relabel_combined_owners(self.query, other_qs)
         combined: RebacQuerySet[_M] = super()._combinator_query(combinator, *other_qs, all=all)  # type: ignore[misc]
         combined._refresh_scope()
         if combined._rebac_scope_applied and combined.query.combined_queries:

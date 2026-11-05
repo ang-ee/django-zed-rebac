@@ -20,7 +20,8 @@ Three rules shape every statement:
 from __future__ import annotations
 
 import hashlib
-from collections.abc import Collection, Iterable, Mapping, Sequence
+from collections.abc import Callable, Collection, Iterable, Mapping, Sequence
+from contextvars import ContextVar
 from dataclasses import dataclass
 from datetime import datetime
 from enum import StrEnum
@@ -30,7 +31,7 @@ from django.apps import apps
 from django.core.exceptions import EmptyResultSet, FieldDoesNotExist
 from django.db import connections, models
 from django.db.models import Exists, Expression, F, OuterRef, Q, QuerySet, Subquery, Value
-from django.db.models.expressions import BaseExpression, Col
+from django.db.models.expressions import BaseExpression, Col, Combinable
 from django.db.models.fields.related_lookups import RelatedExact, RelatedIn
 from django.db.models.lookups import Exact, In, IntegerFieldExact, IsNull, LessThan
 from django_cte import CTE, with_cte
@@ -237,6 +238,10 @@ class _Compiled(Expression):
         self._sql: dict[str, tuple[str, tuple[Any, ...]]] = {}
 
     def as_sql(self, compiler: Any, connection: Any) -> tuple[str, tuple[Any, ...]]:
+        probe_sets = _probe_compiled_sets.get()
+        if probe_sets is not None and self not in probe_sets:
+            probe_sets.add(self)
+            self._sql.clear()
         cached = self._sql.get(connection.alias)
         if cached is None:
             query = self.rows.query.clone()
@@ -247,6 +252,11 @@ class _Compiled(Expression):
             sql, params = query.as_sql(compiler, connection)
             cached = self._sql[connection.alias] = sql, tuple(params)
         return cached
+
+
+_probe_compiled_sets: ContextVar[set[_Compiled] | None] = ContextVar(
+    "rebac_probe_compiled_sets", default=None
+)
 
 
 class _BoundIn(In):
@@ -445,6 +455,52 @@ def _multi_valued(model: type[models.Model], lookup: str) -> bool:
     return False
 
 
+class _NativeState:
+    decisions: dict[tuple[Any, ...], bool]
+    counts: dict[tuple[Any, ...], int]
+    probing: bool
+
+    def __init__(self) -> None:
+        self.decisions = {}
+        self.counts = {}
+        self.probing = False
+
+
+class _NativeProjection(Expression):
+    """Choose the statement's native-ID boundary after its uses are known."""
+
+    def __init__(
+        self,
+        inline: Combinable | Expression,
+        shared: Combinable | Expression,
+        state: _NativeState,
+        slot: tuple[Any, ...],
+        field: models.Field[Any, Any],
+    ) -> None:
+        super().__init__(output_field=field)
+        self.inline = inline
+        self.shared = shared
+        self.state = state
+        self.slot = slot
+
+    def get_source_expressions(self) -> list[Combinable | Expression]:
+        return [self.inline, self.shared]
+
+    def set_source_expressions(self, exprs: Sequence[Combinable | Expression]) -> None:
+        self.inline, self.shared = exprs
+
+    def as_sql(self, compiler: Any, connection: Any) -> tuple[str, tuple[Any, ...]]:
+        if self.state.probing:
+            self.state.counts[self.slot] = self.state.counts.get(self.slot, 0) + 1
+        selected = (
+            self.shared
+            if not self.state.probing and self.state.decisions.get(self.slot, False)
+            else self.inline
+        )
+        sql, params = compiler.compile(selected)
+        return sql, tuple(params)
+
+
 class Compiler:
     """One predicate compiler for scopes and point membership.
 
@@ -508,6 +564,10 @@ class Compiler:
         self._path_ctes: dict[tuple[Key, Bound, bool], CTE] = {}
         self._closure_ctes: dict[tuple[Key, Bound, bool], CTE] = {}
         self._decided_arrays: dict[tuple[str, tuple[Any, ...]], CTE] = {}
+        self._native_ctes: dict[tuple[type[models.Model], str, str, str], CTE] = {}
+        self._native_state = _NativeState()
+        self._native_decisions = self._native_state.decisions
+        self._const_ctes: dict[tuple[Key, str, Bound], CTE] = {}
         self._statement_ctes: list[CTE] = []
         actor_tag = hashlib.blake2s(
             f"{actor.subject_type}:{actor.subject_id}:{actor.optional_relation}".encode(),
@@ -536,10 +596,55 @@ class Compiler:
         return QuerySet(model=selected.model, query=selected.query, using=self.using)
 
     def with_subject_ctes(self, rows: QuerySet[Any]) -> QuerySet[Any]:
-        return with_cte(*self._statement_ctes, select=rows) if self._statement_ctes else rows
+        self.decide_native(rows)
+        ctes = self.statement_ctes()
+        return with_cte(*ctes, select=rows) if ctes else rows
+
+    def decide_native(self, rows: QuerySet[Any]) -> None:
+        """Fix each boundary from actual references in the completed statement."""
+        if self._native_ctes:
+            probe = rows.all()
+            native = {id(cte) for cte in self._native_ctes.values()}
+            others = tuple(cte for cte in self._statement_ctes if id(cte) not in native)
+            if others:
+                with_cte(*others, select=probe)
+            self.decide_native_render(lambda: probe.query.get_compiler(using=self.using).as_sql())
+
+    def decide_native_render(self, render: Callable[[], Any]) -> None:
+        """Count a completed owner's rendered references before final SQL."""
+        if not self._native_ctes:
+            return
+        self._native_state.counts.clear()
+        self._native_state.probing = True
+        probe_sets: set[_Compiled] = set()
+        token = _probe_compiled_sets.set(probe_sets)
+        try:
+            render()
+        except EmptyResultSet:
+            pass
+        finally:
+            _probe_compiled_sets.reset(token)
+            self._native_state.probing = False
+            for compiled in probe_sets:
+                compiled._sql.clear()
+        for slot in self._native_ctes:
+            self._native_decisions[slot] = (
+                self._native_state.counts.get(slot, 0) >= self._native_share_threshold()
+            )
+
+    def _native_share_threshold(self) -> int:
+        # The PostgreSQL 3,000-row exclusion plan adds an indexed scalar
+        # probe per outer row at eight references. Keep that measured shape
+        # inline; a boundary with nine or more uses can amortize the probe.
+        return 9 if connections[self.using].vendor == "postgresql" else 2
 
     def statement_ctes(self) -> tuple[CTE, ...]:
-        return tuple(self._statement_ctes)
+        native = {id(cte): slot for slot, cte in self._native_ctes.items()}
+        return tuple(
+            cte
+            for cte in self._statement_ctes
+            if id(cte) not in native or self._native_decisions.get(native[id(cte)], False)
+        )
 
     def fork_shared(self, *, parametric: bool | None = None) -> Compiler:
         """A fresh predicate memo using this statement's CTE definitions."""
@@ -564,6 +669,10 @@ class Compiler:
         fork._path_ctes = self._path_ctes
         fork._closure_ctes = self._closure_ctes
         fork._decided_arrays = self._decided_arrays
+        fork._native_ctes = self._native_ctes
+        fork._native_state = self._native_state
+        fork._native_decisions = self._native_decisions
+        fork._const_ctes = self._const_ctes
         fork._statement_ctes = self._statement_ctes
         return fork
 
@@ -1629,8 +1738,21 @@ class Compiler:
                 slot = key, at.ref, bound, depth_possible
                 cte = self._reached_ctes.get(slot) if self._share_subject_rows else None
                 if cte is None:
+                    # ``_Param`` has the default object repr, which includes
+                    # its address. Only Value and _Param reach this point.
+                    ref_key = (
+                        ("value", repr(at.ref.value))
+                        if isinstance(at.ref, Value)
+                        else (
+                            "param",
+                            "actor" if cast(_Param, at.ref).marker is ACTOR_WIRE else "resource",
+                        )
+                    )
+                    slot_tag = hashlib.blake2s(
+                        repr((key, ref_key, bound.value, depth_possible)).encode(), digest_size=4
+                    ).hexdigest()
                     name = (
-                        f"rebac_reached_{self._subject_ordinals[key]}_{bound.value}_{int(depth_possible)}_{len(self._reached_ctes)}"
+                        f"rebac_reached_{self._subject_ordinals[key]}_{bound.value}_{int(depth_possible)}_{slot_tag}"
                         if self._share_subject_rows
                         else "rebac_reached"
                     )
@@ -2103,13 +2225,45 @@ class Compiler:
                 self.used_facts.add(fact)
                 target_q = _truth(self.facts[fact])
             else:
-                target_q = self._holds(
-                    target_key,
-                    At(allowed.type, Value(resolved.target_id), None, False),
-                    bound,
-                    visits,
-                    depth_possible=depth_possible,
+                slot = target_key, resolved.target_id, bound
+                share = (
+                    self._share_subject_rows
+                    and depth_possible
+                    and not self.has_recursion(target_key)
+                    and not any(
+                        visits.get(member) for member in self.program.components.get(target_key, ())
+                    )
                 )
+                cte = self._const_ctes.get(slot) if share else None
+                if cte is not None:
+                    target_q = Q(Exists(self._cte_queryset(cte)))
+                else:
+                    target_q = self._holds(
+                        target_key,
+                        At(allowed.type, Value(resolved.target_id), None, False),
+                        bound,
+                        visits,
+                        depth_possible=depth_possible,
+                    )
+                    if share and target_q is not _FALSE and target_q is not _TRUE:
+                        from ..models.generation import SchemaGeneration
+
+                        ordinal = self._subject_ordinals[target_key]
+                        object_tag = hashlib.blake2s(
+                            resolved.target_id.encode(), digest_size=4
+                        ).hexdigest()
+                        name = self._cte_name(f"rebac_const_{ordinal}_{object_tag}_{bound.value}")
+                        selected = (
+                            SchemaGeneration.objects.using(self.using)
+                            .filter(pk=1)
+                            .filter(target_q)
+                            .order_by()
+                            .values("pk")
+                        )
+                        cte = CTE(selected, name=name)
+                        self._const_ctes[slot] = cte
+                        self._statement_ctes.append(cte)
+                        target_q = Q(Exists(self._cte_queryset(cte)))
         else:
             target_q = _truth(
                 self.shape.type == allowed.type
@@ -2306,9 +2460,10 @@ class Compiler:
             return rows.order_by().values("resource_id")
         assert identity is not None
         _, identity_field = model_identity_fields(model, identity)
-        converted = rows.annotate(
-            _rebac_native_id=identity_codec(model, identity).to_column("resource_id")
-        ).exclude(_rebac_native_id__isnull=True)
+        native = self._native_reference(
+            model, identity, cast(Expression, F("resource_id")), at.resource_type
+        )
+        converted = rows.annotate(_rebac_native_id=native).exclude(_rebac_native_id__isnull=True)
         if last is not None:
             converted = converted.filter(last)
         if at.key is identity_field:
@@ -2329,7 +2484,9 @@ class Compiler:
         if at.key is None:
             # The model column remains native. Convert a wire reference when
             # the identity originates in a tuple or a constant.
-            converted = identity_codec(model, identity).to_column(cast(Expression, at.ref))
+            converted = self._native_reference(
+                model, identity, cast(Expression, at.ref), at.resource_type
+            )
             if _one_object(at.ref):
                 # One object: look its row up by key instead of building the set.
                 return Q(Exists(rows.order_by().filter(**{identity: converted})))
@@ -2341,6 +2498,51 @@ class Compiler:
             **{f"{identity}__in": _Compiled(native)}
         )
         return _in(at.ref, bridge.order_by().values(at.key.name))
+
+    def _native_reference(
+        self, model: type[models.Model], identity: str, ref: Expression, resource_type: str
+    ) -> Expression:
+        """Read a tuple wire ID through one guarded conversion per source column."""
+        name = vars(ref).get("name") if isinstance(ref, (F, OuterRef)) else None
+        if not self._share_subject_rows or name not in ("resource_id", "subject_id"):
+            return identity_codec(model, identity).to_column(ref)
+        wire_column = cast(str, name)
+        slot = model, identity, wire_column, resource_type
+        cte = self._native_ctes.get(slot)
+        if cte is None:
+            type_column = "resource_type" if wire_column == "resource_id" else "subject_type"
+            rows = (
+                self._tuples()
+                .filter(**{type_column: resource_type})
+                .annotate(_rebac_native_id=identity_codec(model, identity).to_column(wire_column))
+            )
+            selected = rows.order_by().values(wire_column, "_rebac_native_id")
+            boundary = (model._meta.label_lower, identity, wire_column, resource_type)
+            label = hashlib.blake2s(repr(boundary).encode(), digest_size=8).hexdigest()
+            # PostgreSQL inlines repeated references so an outer wire-ID
+            # predicate can use the relationship index.
+            cte = CTE(
+                selected,
+                name=self._cte_name(f"rebacnative_{label}"),
+                materialized=False if connections[self.using].vendor == "postgresql" else None,
+            )
+            self._native_ctes[slot] = cte
+            self._statement_ctes.append(cte)
+        _, field = model_identity_fields(model, identity)
+        shared = Subquery(
+            self._cte_queryset(cte)
+            .filter(**{wire_column: _one_level_out(ref)})
+            .order_by()
+            .values("_rebac_native_id")[:1],
+            output_field=field,
+        )
+        return _NativeProjection(
+            identity_codec(model, identity).to_column(ref),
+            shared,
+            self._native_state,
+            slot,
+            field,
+        )
 
     def _wire_equal(self, at: At, wire_id: str) -> Q:
         if at.key is None:

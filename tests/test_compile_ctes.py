@@ -8,6 +8,7 @@ import pytest
 from django.contrib.contenttypes.models import ContentType
 from django.db import connection, models
 from django.db.models import Exists, F, OuterRef, Prefetch, Q, Subquery
+from django.test import override_settings
 from django.test.utils import CaptureQueriesContext
 
 from rebac import (
@@ -1494,10 +1495,98 @@ def test_independently_shared_operands_have_distinct_cte_names(shared_arrow_rows
 
     left = shared_pair()
     right = shared_pair()
+    assert str(left.query) == str(right.query)
     together = left.union(right, all=True)
     names = re.findall(r'"(rebac_[^\"]+)" AS \(', str(together.query))
     assert len(names) == len(set(names))
     assert list(together.values_list("pk", flat=True)) == [post.pk] * 4
+    chained = together.union(shared_pair(), all=True)
+    chained_names = re.findall(r'"(rebac_[^\"]+)" AS \(', str(chained.query))
+    assert len(chained_names) == len(set(chained_names))
+    assert list(chained.values_list("pk", flat=True)) == [post.pk] * 6
+
+
+@pytest.mark.parametrize("storage", ["denormalized", "registry"])
+def test_shared_rebac_union_keeps_actor_scope_and_stamps_instances(storage):
+    with override_settings(REBAC_LOCAL_BACKEND_STORAGE=storage):
+        local = install_schema("""
+            definition auth/user {}
+            definition blog/post {
+                relation viewer: auth/user
+                permission read = viewer
+            }
+        """)
+        actor = SubjectRef.of("auth/user", "shared-union-reader")
+        with sudo(reason="shared union hidden rows fixture"):
+            posts = Post.objects.bulk_create([Post(title=f"post-{i}") for i in range(12)])
+        visible = posts[::2]
+        local.write_relationships(
+            [RelationshipTuple(to_object_ref(post), "viewer", actor) for post in visible]
+        )
+        rows = Post.objects.with_actor(actor)
+        union = share_scoped_definitions(
+            rows.filter(pk__in=[post.pk for post in posts[:6]]).union(
+                rows.filter(pk__in=[post.pk for post in posts[6:]])
+            )
+        )
+        result = list(union.order_by("pk"))
+        assert [post.pk for post in result] == [post.pk for post in visible]
+        assert all(post._rebac_actor == actor for post in result)
+
+
+@pytest.mark.parametrize("storage", ["denormalized", "registry"])
+def test_nonidentical_shared_owners_relabel_compiled_references(storage):
+    with override_settings(REBAC_LOCAL_BACKEND_STORAGE=storage):
+        local = install_schema("""
+            definition auth/user {}
+            definition blog/folder {
+                relation viewer: auth/user
+                relation editor: auth/user
+                permission read = viewer
+                permission edit = editor
+            }
+            definition blog/post {
+                relation folder: blog/folder // rebac:field=folder
+                permission once = folder->read
+                permission many = folder->read
+                permission read = folder->edit
+                permission view = folder->edit
+            }
+        """)
+        actor = SubjectRef.of("auth/user", "independent-owner-reader")
+        with sudo(reason="independent owner fixture"):
+            first_folder = Folder.objects.create(name="first")
+            second_folder = Folder.objects.create(name="second")
+            first = Post.objects.create(title="first", folder=first_folder)
+            second = Post.objects.create(title="second", folder=second_folder)
+        local.write_relationships(
+            [
+                RelationshipTuple(to_object_ref(first_folder), "viewer", actor),
+                RelationshipTuple(to_object_ref(second_folder), "editor", actor),
+            ]
+        )
+
+        def pair(left, right):
+            first_operand = _plain(Post.objects.with_actor(actor).with_action(left).scoped())
+            second_operand = _plain(Post.objects.with_actor(actor).with_action(right).scoped())
+            return share_scoped_definitions(first_operand.union(second_operand))
+
+        left = pair("once", "many")
+        right = pair("read", "view")
+        assert {cte.name for cte in left.query._with_ctes} & {
+            cte.name for cte in right.query._with_ctes
+        }
+        assert list(left.values_list("pk", flat=True)) == [first.pk]
+        assert list(right.values_list("pk", flat=True)) == [second.pk]
+        for operation, expected in (
+            ("union", {first.pk, second.pk}),
+            ("intersection", set()),
+            ("difference", {first.pk}),
+        ):
+            combined = getattr(left, operation)(right)
+            assert set(combined.values_list("pk", flat=True)) == expected
+            names = re.findall(r'"(rebac_[^\"]+)" AS \(', str(combined.query))
+            assert len(names) == len(set(names))
 
 
 def test_constant_arrow_shares_used_reached_relation_and_rechecks_fact():
@@ -1679,12 +1768,10 @@ def test_three_operand_union_prepares_once_and_stays_near_inline(monkeypatch):
 
 @pytest.mark.pg_delta
 @pytest.mark.parametrize("count", [32, pytest.param(300, marks=pytest.mark.slow)])
-def test_live_unions_keep_distinct_names_after_owner_queries_are_collected(
-    shared_arrow_rows, count
-):
+def test_live_unions_relabel_names_after_owner_queries_are_collected(shared_arrow_rows, count):
     _local, actor, post = shared_arrow_rows
     live = []
-    names_seen = set()
+    first_names = None
     for _ in range(count):
         first = _plain(Post.objects.with_actor(actor).with_action("once").scoped())
         second = _plain(Post.objects.with_actor(actor).with_action("many").scoped())
@@ -1692,12 +1779,17 @@ def test_live_unions_keep_distinct_names_after_owner_queries_are_collected(
         clone = owner.order_by()
         names = tuple(sorted(re.findall(r'"(rebac_[^\"]+)" AS \(', str(clone.query))))
         assert names
-        assert names not in names_seen
-        names_seen.add(names)
+        if first_names is None:
+            first_names = names
+        else:
+            assert names == first_names
         live.append(clone)
         del owner
         gc.collect()
-    assert list(live[0].union(live[-1], all=True).values_list("pk", flat=True)) == [post.pk] * 4
+    combined = live[0].union(live[-1], all=True)
+    names = re.findall(r'"(rebac_[^\"]+)" AS \(', str(combined.query))
+    assert len(names) == len(set(names))
+    assert list(combined.values_list("pk", flat=True)) == [post.pk] * 4
 
 
 def test_policy_revision_mismatch_compiles_each_union_scope_self_contained():

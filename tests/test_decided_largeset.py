@@ -60,12 +60,12 @@ def test_large_decided_set_uses_inline_closure_by_default(monkeypatch):
     large, found_large, large_bytes, _ = measure(200)
     assert one is not None and below is not None
     assert above is None and large is None
-    assert found_one == [posts[0].pk]
-    assert found_below == [post.pk for post in posts[:4]]
-    assert found_above == [post.pk for post in posts[:5]]
+    assert sorted(found_one) == sorted(post.pk for post in posts[:1])
+    assert sorted(found_below) == sorted(post.pk for post in posts[:4])
+    assert sorted(found_above) == sorted(post.pk for post in posts[:5])
     assert 350 < (below_bytes - one_bytes) / 3 < 500
     assert above_bytes < 10_000
-    assert found_large == [post.pk for post in posts[:200]]
+    assert sorted(found_large) == sorted(post.pk for post in posts[:200])
     assert (large_bytes - above_bytes) / 195 < 16
     assert large_bytes < 10_000
     assert "CASE WHEN" not in below_sql
@@ -74,6 +74,6 @@ def test_large_decided_set_uses_inline_closure_by_default(monkeypatch):
         read.reset()
         lifted, lifted_rows, lifted_bytes, lifted_sql = measure(200)
         assert lifted is not None
-        assert lifted_rows == [post.pk for post in posts[:200]]
+        assert sorted(lifted_rows) == sorted(post.pk for post in posts[:200])
         assert lifted_sql.count("CASE WHEN") == 0
         assert lifted_bytes < 95_000

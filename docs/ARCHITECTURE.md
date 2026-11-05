@@ -2108,6 +2108,18 @@ uninstall routine:
    use compiles its own expression once and takes the placeholder's
    positions. `tests/test_codec_cache.py` pins the cached SQL and parameters
    equal to the uncached ones for integer, text and UUID identities.
+   A compiled tuple-to-model boundary is counted from the completed
+   statement's rendered references. A boundary used at least twice shares
+   one guarded native projection in a statement-local CTE keyed by model
+   identity, wire column and resource type; a boundary used once stays inline.
+   PostgreSQL keeps boundaries with fewer than nine references inline: on the
+   3,000-row exclusion and union fixtures, the shared `NOT MATERIALIZED`
+   definition adds a correlated indexed `Limit` per outer row and takes over
+   twice the execution time, with no planning gain. Independently combined
+   union owners keep the inline form for the same measured reason. The projection
+   reads only tuples of that type; references select its native column by wire
+   ID. Invalid wire IDs still project `NULL`. The enclosing relation filters,
+   caveat conditions and expiry checks remain on their original rows.
 3. **Bound membership.** Custom expressions write PostgreSQL `= ANY(%s)`
    for candidate IDs and caveat verdict keys, and padded `IN (%s, …)` on
    SQLite and MySQL. Decided-ID lookups also write PostgreSQL `= ANY(%s)`
@@ -2173,10 +2185,28 @@ to the owner with stock `with_cte()`. Stock django-cte 5.x has no move method,
 so relocation reads and replaces the cloned parts' `_with_ctes` tuples.
 Recursive stored-set, reached-object, self-path and closure relations are
 keyed in the owner plan as well; bounded recursive keys also include whether
-a depth proof is possible. Their names include a random per-plan tag and the
-actor, so independently shared operands can be combined without name clashes
-even after an earlier owner query is collected. The tag keeps the SQL shape
-stable while making each live plan's names distinct.
+a depth proof is possible. Their names include a deterministic owner ordinal
+and actor tag. A new union owner starts at ordinal zero; combining independently
+prepared union owners rebuilds the copied later operand with the first unused
+owner ordinal at or after its position in that statement. Other independently
+owned CTEs on a copied later operand receive an `_owner{n}` suffix, with the
+first unused suffix at or after that position. This preserves distinct CTE names
+after earlier owner queries are collected while giving repeated compiles the
+same owner names. Literal IDs,
+revision fences and clocks can still vary in the statement text. Reached-object
+CTEs use a stable digest of their recursion slot rather
+than compile order. An explicit `scope_cte()` handle uses a digest of its
+model, actor, action, database alias, selected columns, exact candidate IDs and
+requested actions: callers can build references in
+separate query operands before attaching the definition, so its name must
+already be stable then.
+
+A nonrecursive fixed-object const target that cannot use a prepared fact is
+defined once per target object and lower or upper bound in its statement
+owner. Each use reads the target CTE; the relation's local filters remain at
+the original use. A target reached through an active cycle or without a depth
+proof stays inline. The target CTE retains caveat and expiration conditions
+and override deadlines, and subtraction still requests the opposite bound.
 
 Sharing applies at recursion-free points when the prepared scopes have one
 policy and actor and need no render-time caveat verdict or clock. Caveated,

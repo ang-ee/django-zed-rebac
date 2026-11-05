@@ -465,8 +465,9 @@ def test_field_owner_sql_cost_is_independent_of_visible_row_count(active, corpus
     # changes only with the compiler; recursive CTE lowering raises the fixed count.
     # Django 6.1 compares the top-level boolean scope predicate with True (one
     # parameter) where the backend has no native boolean type.
-    # The unprepared render is inline, with one boolean parameter omitted on SQLite.
-    assert large_cost[1] == 101 - (connection.vendor == "sqlite")
+    # PostgreSQL keeps this measured low-reuse shape inline to avoid a
+    # correlated lookup per row; SQLite shares its repeated boundary.
+    assert large_cost[1] == (101 if connection.vendor == "postgresql" else 53)
 
 
 def test_stored_arrow_resolves_virtual_targets_without_row_multiplication(active):

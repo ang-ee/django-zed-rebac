@@ -234,10 +234,10 @@ def test_actor_set_witness_byte_budget_and_model_identity_boundary(monkeypatch):
     large, found_large, large_bytes, _ = measure(200)
     assert one is not None and below is not None
     assert above is None and large is None
-    assert found_one == [posts[0].pk]
-    assert found_below == [post.pk for post in posts[:4]]
-    assert found_above == [post.pk for post in posts[:5]]
-    assert found_large == [post.pk for post in posts[:200]]
+    assert sorted(found_one) == [posts[0].pk]
+    assert sorted(found_below) == sorted(post.pk for post in posts[:4])
+    assert sorted(found_above) == sorted(post.pk for post in posts[:5])
+    assert sorted(found_large) == sorted(post.pk for post in posts[:200])
     assert (large_bytes - above_bytes) / 195 < 16
     assert large_bytes < 10_000
     assert 350 < (below_bytes - one_bytes) / 3 < 500
