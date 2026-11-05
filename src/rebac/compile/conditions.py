@@ -59,11 +59,9 @@ class _VerdictIn(Expression):
 def _verdict_class(count: int, using: str) -> int | str:
     from django.db import connections
 
-    return (
-        "array"
-        if connections[using].vendor == "postgresql"
-        else (0 if count == 0 else 1 << (count - 1).bit_length())
-    )
+    if count == 0:
+        return 0
+    return "array" if connections[using].vendor == "postgresql" else 1 << (count - 1).bit_length()
 
 
 def reachable_relations(schema: Schema, key: Key) -> frozenset[Key]:

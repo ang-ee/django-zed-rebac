@@ -991,7 +991,13 @@ class _Rows:
             key=key,
             deferred=True,
         )
-        return found if self.defer_witness else self._materialize(found)
+        if self.defer_witness:
+            return found
+        materialized = self._materialize(found)
+        if not self._fits(materialized):
+            abandon()
+            return None
+        return materialized
 
     def _materialize(self, found: _Decision) -> _Decision:
         """Build a missed statement's live recheck for one prepared row set."""

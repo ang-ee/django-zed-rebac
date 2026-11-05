@@ -744,7 +744,11 @@ class Compiler:
         if not values:
             return _FALSE
         if self.bind_decisions and isinstance(values, Decided) and values.slot is not None:
-            if connections[self.using].vendor != "postgresql" or not self._share_subject_rows:
+            if (
+                connections[self.using].vendor != "postgresql"
+                or not self._share_subject_rows
+                or values.slot[0] == "set"
+            ):
                 return _not_null(expr) & Q(_DecidedIn(expr, values, field))
             _, cte = self.decided_array(values, field)
             rhs = Subquery(cte.queryset().values("_rebac_ids"))

@@ -356,10 +356,9 @@ def test_decided_row_ids_have_bounded_statement_bytes_per_member():
         assert "= ANY(" in small_sql and "= ANY(" in large_sql
         assert len(re.findall(r'"rebac_decided_[^\"]+" AS \(', small_sql)) == 1
         assert len(re.findall(r'"rebac_decided_[^\"]+" AS \(', large_sql)) == 1
-        # One decided row array; the empty array is the caveat verdict array
-        # emitted by every parametric PostgreSQL statement.
-        assert sorted(len(param) for param in small_params if isinstance(param, list)) == [0, 10]
-        assert sorted(len(param) for param in large_params if isinstance(param, list)) == [0, 200]
+        # The row array is the only array: zero verdict keys add no term.
+        assert sorted(len(param) for param in small_params if isinstance(param, list)) == [10]
+        assert sorted(len(param) for param in large_params if isinstance(param, list)) == [200]
 
 
 @pytest.mark.pg_delta
@@ -526,6 +525,14 @@ def test_decided_three_level_chain_stays_near_inline(chain, monkeypatch):
         assert decided <= inline + 800, (decided, inline)
     else:
         assert decided < inline, (decided, inline)
+
+
+def test_no_caveat_keys_render_no_verdict_array_term(chain):
+    with evaluator_scope(), CaptureQueriesContext(connection) as queries:
+        Attachment.objects.with_actor(ACTOR).count()
+    sql = queries[-1]["sql"]
+    assert '"caveat_name"' in sql
+    assert not re.search(r'"caveat_key"\s*=\s*ANY\(', sql)
 
 
 def test_the_row_limit_is_what_one_statement_may_bind(chain, monkeypatch):
