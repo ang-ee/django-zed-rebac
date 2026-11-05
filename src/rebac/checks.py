@@ -29,8 +29,7 @@ def _schema_for_checks() -> Schema | None:
     from .backends import backend
 
     if app_settings.REBAC_BACKEND != "local":
-        return None
-
+        return None  # E001 owns invalid selection; schema checks need a backend.
     try:
         try:
             return backend().schema()
@@ -54,10 +53,10 @@ def _schema_for_checks() -> Schema | None:
 def check_backend_setting(app_configs: Any = None, **kwargs: Any) -> list[checks.CheckMessage]:
     issues: list[checks.CheckMessage] = []
     backend = app_settings.REBAC_BACKEND
-    if backend not in ("local", "spicedb"):
+    if backend != "local":
         issues.append(
             checks.Error(
-                f"REBAC_BACKEND={backend!r} (expected 'local' or 'spicedb')",
+                f"REBAC_BACKEND={backend!r} (expected 'local')",
                 id="rebac.E001",
             )
         )
@@ -88,30 +87,6 @@ def check_backend_setting(app_configs: Any = None, **kwargs: Any) -> list[checks
                 ),
             )
         )
-    if backend == "spicedb":
-        from importlib.util import find_spec
-
-        if find_spec("authzed") is None:
-            issues.append(
-                checks.Error(
-                    "REBAC_BACKEND='spicedb' requires the authzed client package",
-                    id="rebac.E002",
-                )
-            )
-        if not app_settings.REBAC_SPICEDB_ENDPOINT:
-            issues.append(
-                checks.Error(
-                    "REBAC_SPICEDB_ENDPOINT must be set when REBAC_BACKEND='spicedb'",
-                    id="rebac.E002",
-                )
-            )
-        if not app_settings.REBAC_SPICEDB_TOKEN:
-            issues.append(
-                checks.Error(
-                    "REBAC_SPICEDB_TOKEN must be set when REBAC_BACKEND='spicedb'",
-                    id="rebac.E002",
-                )
-            )
     return issues
 
 
@@ -150,14 +125,11 @@ def _schema_on_alias(using: str) -> Schema | None:
     from django.db.migrations.executor import MigrationExecutor
 
     from .backends import backend
-    from .backends.local import LocalBackend
 
     try:
         active = backend()
     except ValueError:
         # E001 reports an invalid backend setting; this check needs a backend.
-        return None
-    if not isinstance(active, LocalBackend):
         return None
     try:
         try:
@@ -400,20 +372,6 @@ def _attribute_collation_warnings(schema: Any) -> list[checks.CheckMessage]:
                     id="rebac.W009",
                 )
             )
-    return issues
-
-
-@checks.register("rebac", deploy=True)
-def check_production_settings(app_configs: Any = None, **kwargs: Any) -> list[checks.CheckMessage]:
-    issues: list[checks.CheckMessage] = []
-    if app_settings.REBAC_BACKEND == "spicedb" and not app_settings.REBAC_SPICEDB_TLS:
-        issues.append(
-            checks.Warning(
-                "REBAC_SPICEDB_TLS=False in production. Set to True for "
-                "non-localhost SpiceDB endpoints.",
-                id="rebac.W101",
-            )
-        )
     return issues
 
 
@@ -779,6 +737,42 @@ def check_default_managers(app_configs: Any = None, **kwargs: Any) -> list[check
 
 
 @checks.register("rebac")
+def check_tracked_default_managers(
+    app_configs: Any = None, **kwargs: Any
+) -> list[checks.CheckMessage]:
+    """E025: a tracked model's default manager must carry related owners."""
+    from django.apps import apps
+
+    from .managers import RebacManager, TrackedManager
+    from .mixins import RebacTrackedMixin
+
+    configs = apps.get_app_configs() if app_configs is None else app_configs
+    issues: list[checks.CheckMessage] = []
+    for config in configs:
+        for model in config.get_models():
+            if not issubclass(model, RebacTrackedMixin) or isinstance(
+                model._default_manager, TrackedManager | RebacManager
+            ):
+                continue
+            issues.append(
+                checks.Error(
+                    f"{model._meta.label}: the default manager "
+                    f"{model._meta.default_manager_name!r} is a "
+                    f"{type(model._default_manager).__name__}, not a rebac.TrackedManager "
+                    "or rebac.RebacManager subclass.",
+                    hint=(
+                        "Related managers must carry their owner into write gates. "
+                        "Derive the default manager from TrackedManager or RebacManager "
+                        "(including their from_queryset(...) forms)."
+                    ),
+                    obj=model,
+                    id="rebac.E025",
+                )
+            )
+    return issues
+
+
+@checks.register("rebac")
 def check_stale_override_references(
     app_configs: Any = None, **kwargs: Any
 ) -> list[checks.CheckMessage]:
@@ -786,19 +780,15 @@ def check_stale_override_references(
     from django.db import DEFAULT_DB_ALIAS, connections
 
     from .backends import backend
-    from .backends.local import LocalBackend
     from .composition import split_stale_overrides
-    from .conf import app_settings
     from .models import SchemaOverride
 
-    if app_settings.REBAC_BACKEND != "local":
-        return []
     try:
         active = backend()
     except ValueError:
         # E001 reports an invalid backend setting; this check needs a backend.
         return []
-    if not isinstance(active, LocalBackend) or active._schema_is_manual:
+    if active._schema_is_manual:
         return []
     try:
         if active._read_schema_revision(connections[DEFAULT_DB_ALIAS]) is None:

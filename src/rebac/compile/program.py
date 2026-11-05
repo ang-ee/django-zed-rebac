@@ -7,7 +7,8 @@ the set of nodes one statement may have to unroll together.
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
+from typing import Any
 
 from django.core import checks
 
@@ -83,6 +84,12 @@ class CompileProgram:
     recursive: frozenset[Key]
     alias_cycles: frozenset[Key]
     stored_sets: frozenset[Key]
+    _reachable_cache: dict[Key, frozenset[Key]] = field(
+        default_factory=dict, init=False, repr=False, compare=False
+    )
+    _facts_cache: dict[Key, tuple[Any, ...]] = field(
+        default_factory=dict, init=False, repr=False, compare=False
+    )
 
     @classmethod
     def build(cls, schema: Schema) -> CompileProgram:
@@ -143,6 +150,9 @@ class CompileProgram:
         )
 
     def reachable(self, root: Key) -> frozenset[Key]:
+        cached = self._reachable_cache.get(root)
+        if cached is not None:
+            return cached
         result: set[Key] = set()
         pending = [root]
         while pending:
@@ -152,16 +162,13 @@ class CompileProgram:
             result.add(key)
             pending.extend(dep.target for dep in self.dependencies.get(key, ()))
             pending.extend(self.via_dependencies.get(key, ()))
-        return frozenset(result)
+        found = frozenset(result)
+        self._reachable_cache[root] = found
+        return found
 
 
 def _stored_sets(schema: Schema) -> frozenset[Key]:
-    """The relations used as subject sets whose membership tuples alone decide.
-
-    A relation qualifies when it is stored and every subject set it admits
-    qualifies too: the sets an actor belongs to are then a closure over the
-    tuple table, with no model column involved.
-    """
+    """Subject-set relations whose closure depends only on stored tuples."""
     relations = {
         (definition.resource_type, relation.name): relation
         for definition in schema.definitions

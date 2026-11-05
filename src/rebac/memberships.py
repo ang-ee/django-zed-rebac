@@ -10,9 +10,10 @@ from __future__ import annotations
 from collections.abc import Iterator, Mapping
 from typing import TYPE_CHECKING, Any, cast
 
-from django.db import router, transaction
+from django.db import transaction
 
 from .actors import ActorLike, to_subject_ref
+from .database import read_alias, write_alias
 from .resources import to_object_ref
 from .types import ObjectRef, RelationshipTuple, SubjectRef
 
@@ -51,7 +52,7 @@ def grant(
         caveat_name=caveat_name,
         caveat_context=dict(caveat_context or {}),
     )
-    alias = router.db_for_write(relationship_model)
+    alias = write_alias(relationship_model)
     with transaction.atomic(using=alias):
         write_relationships([tuple_])
         row = relationship_model.objects.using(alias).get(
@@ -85,7 +86,7 @@ def revoke(
         subject=subject_ref,
         caveat_name=caveat_name,
     )
-    alias = router.db_for_write(relationship_model)
+    alias = write_alias(relationship_model)
     with transaction.atomic(using=alias):
         exists = (
             relationship_model.objects.using(alias)
@@ -109,7 +110,8 @@ def members_of(container: Any) -> Iterator[SubjectRef]:
     from .models import active_relationship_model
 
     container_ref = _container_ref(container)
-    rows = active_relationship_model().objects.filter(
+    model = active_relationship_model()
+    rows = model.objects.using(read_alias(model)).filter(
         resource_type=container_ref.resource_type,
         resource_id=container_ref.resource_id,
         relation=MEMBER_RELATION,
@@ -129,7 +131,8 @@ def containers_of(subject: ActorLike, **container_lookups: Any) -> Iterator[Obje
     from .models import active_relationship_model
 
     subject_ref = to_subject_ref(subject)
-    rows = active_relationship_model().objects.filter(
+    model = active_relationship_model()
+    rows = model.objects.using(read_alias(model)).filter(
         relation=MEMBER_RELATION,
         subject_type=subject_ref.subject_type,
         subject_id=subject_ref.subject_id,

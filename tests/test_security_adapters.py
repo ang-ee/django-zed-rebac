@@ -134,7 +134,7 @@ def test_drf_object_permission_denies_instance_with_redacted_id() -> None:
     with sudo(reason="test.fixture"):
         SluggedPost.objects.create(slug="hidden-id", title="t")
     _grant(ObjectRef("blog/sluggedpost", "hidden-id"), "viewer", subject)
-    instance = SluggedPost.objects.as_user(user).get()
+    instance = SluggedPost.objects.with_actor(user).get()
     assert instance.slug is None
     assert not backend().has_access(
         subject=subject, action="delete", resource=ObjectRef("blog/sluggedpost", "hidden-id")

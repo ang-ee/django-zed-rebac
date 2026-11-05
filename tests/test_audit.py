@@ -11,6 +11,7 @@ Covers:
 
 from __future__ import annotations
 
+import pickle
 from collections.abc import Callable
 
 import pytest
@@ -28,8 +29,10 @@ from rebac import (
     write_relationships,
 )
 from rebac.backends import reset_backend
+from rebac.errors import GateDenied
 from rebac.models import PermissionAuditEvent
 from rebac.schema import parse_zed
+from rebac.signals import BackedEdgeDenied
 from rebac.types import RelationshipFilter
 from tests.backend_setup import install_schema
 
@@ -48,6 +51,28 @@ definition blog/post {
     permission create = owner
 }
 """
+
+
+class _OtherGateDenied(GateDenied):
+    pass
+
+
+@pytest.mark.parametrize("denial_type", [GateDenied, _OtherGateDenied, BackedEdgeDenied])
+def test_gate_denial_survives_pickle(denial_type):
+    actor = SubjectRef.of("auth/user", "alice")
+    resource = ObjectRef("blog/post", "1")
+    if issubclass(denial_type, BackedEdgeDenied):
+        denied = denial_type("denied", actor, resource)
+    else:
+        denied = denial_type("denied", actor, "write", resource)
+    restored = pickle.loads(pickle.dumps(denied))
+    assert type(restored) is denial_type
+    assert (str(restored), restored.actor, restored.action, restored.resource) == (
+        "denied",
+        actor,
+        "write",
+        resource,
+    )
 
 
 @pytest.fixture(autouse=True)
@@ -271,6 +296,49 @@ def test_denial_audited_when_setting_enabled(settings):
     assert rows[0].actor_subject_type == "auth/user"
     assert rows[0].actor_subject_id == "bob"
     assert rows[0].reason.startswith("denied:")
+
+
+@pytest.mark.django_db
+def test_cascade_delete_denial_audits_the_child_resource(settings):
+    from rebac.conf import app_settings as _app_settings
+    from tests.testapp.models import Folder
+
+    settings.REBAC_AUDIT_DENIALS = True
+    _app_settings.reset()
+    install_schema(
+        backend(),
+        parse_zed(
+            """
+            definition auth/user {}
+            definition blog/folder {
+                relation owner: auth/user
+                permission read = owner
+                permission delete = owner
+            }
+            """
+        ),
+    )
+    with sudo(reason="test.fixture"):
+        root = Folder.objects.create(name="root")
+        child = Folder.objects.create(name="child", parent=root)
+    alice = SubjectRef.of("auth/user", "alice")
+    bob = SubjectRef.of("auth/user", "bob")
+    write_relationships(
+        [
+            RelationshipTuple(ObjectRef("blog/folder", str(root.pk)), "owner", alice),
+            RelationshipTuple(ObjectRef("blog/folder", str(child.pk)), "owner", bob),
+        ]
+    )
+    PermissionAuditEvent.objects.all().delete()
+
+    with actor_context(alice), pytest.raises(PermissionDenied):
+        Folder.objects.with_actor(alice).get(pk=root.pk).delete()
+
+    denials = list(PermissionAuditEvent.objects.filter(reason__startswith="denied:"))
+    assert len(denials) == 1
+    assert denials[0].target_repr == f"blog/folder:{child.pk}#delete"
+    assert Folder._base_manager.filter(pk=root.pk).exists()
+    assert Folder._base_manager.filter(pk=child.pk).exists()
 
 
 # ---------- aemit (async) ----------

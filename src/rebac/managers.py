@@ -13,29 +13,41 @@ loaded instance (it is not visible inside `from_db()`).
 
 from __future__ import annotations
 
+import hashlib
 import re
 from collections import Counter
 from collections.abc import AsyncIterator, Collection, Iterable, Iterator
-from typing import Any, Self, TypeVar, cast, overload
+from contextvars import ContextVar
+from copy import copy, deepcopy
+from enum import Enum, auto
+from typing import TYPE_CHECKING, Any, ClassVar, Self, TypeVar, cast, overload
 
 from asgiref.sync import sync_to_async
 from django.db import connections, models
 from django.db.models.expressions import Col, RawSQL
 from django.db.models.sql import Query
+from django.db.models.sql.subqueries import UpdateQuery
 from django.db.models.sql.where import ExtraWhere, NothingNode, WhereNode
+from django_cte import CTE, with_cte
+from django_cte.jitmixin import jit_mixin
 
 from ._id import resource_id_attr
-from .actors import ActorLike, current_sudo_reason, grant_subject_ref, to_subject_ref
+from .actors import (
+    ActorLike,
+    current_sudo_reason,
+    require_sudo_allowed,
+    resolve,
+    to_subject_ref,
+)
 from .actors import current_actor as _current_actor
 from .actors import is_sudo as _is_sudo_ambient
-from .conf import app_settings
+from .database import database_context
 from .errors import MissingActorError, PermissionDenied
 from .field_visibility import (
-    accessible_ids,
     apply_field_visibility,
-    backend_grants_all,
     effective_field_deny_mode,
     gated_read_fields,
+    held_ids,
     runtime_field_deny_mode,
     validate_field_deny_mode,
     warn_raise_mode_degrades,
@@ -46,12 +58,470 @@ from .types import FieldDenyMode, SubjectRef
 
 _M = TypeVar("_M", bound=models.Model)
 
+if TYPE_CHECKING:
+    from .backends.local import LocalBackend
+    from .mixins import RebacMixin
+
+
+class SharedScope[M: models.Model]:
+    """One actor scope defined once and referenced within an ORM statement."""
+
+    def __init__(
+        self,
+        model: type[M],
+        actor: SubjectRef,
+        action: str,
+        using: str,
+        backend: LocalBackend,
+        columns: tuple[str, ...],
+        candidates: tuple[int, ...] | None = None,
+        actions: tuple[str, ...] = (),
+    ) -> None:
+        self._model = model
+        self._actor = actor
+        self._action = action
+        self._using = using
+        self._backend = backend
+        self._columns = columns
+        self._candidates = candidates
+        self._actions = actions
+        owner = (
+            model._meta.label_lower,
+            actor.subject_type,
+            actor.subject_id,
+            actor.optional_relation,
+            action,
+            using,
+            columns,
+            candidates,
+            actions,
+        )
+        digest = hashlib.blake2s(repr(owner).encode(), digest_size=8).hexdigest()
+        self._name = f"rebac_scope_{digest}"
+        # This CTE supplies column metadata to references. Its query is never
+        # attached or resolved; each attach builds a fresh authorized body.
+        self._reference = CTE(
+            models.QuerySet(model=model, using=using).order_by().values(*columns), name=self._name
+        )
+
+    def queryset(self) -> models.QuerySet[Any]:
+        """Return a plain values queryset of authorized row identities."""
+        from .compile.read import identity_cte_queryset
+
+        return identity_cte_queryset(self._reference, self._model, self._using, self._columns)
+
+    def attach[T: models.Model](self, outer_queryset: models.QuerySet[T]) -> models.QuerySet[T]:
+        """Attach one fresh definition to a read statement, leaving its input untouched."""
+        if outer_queryset.db != self._using:
+            raise ValueError("A shared scope and its statement must use the same database alias")
+        result = outer_queryset.all()
+        ctes, plan = self._definition(self._candidates)
+        _replace_shared_definition(result.query, ctes, plan)
+        if self._candidates is None:
+            query = cast(Any, result.query)
+            query._rebac_late_scopes = (
+                *tuple(
+                    scope
+                    for scope in getattr(query, "_rebac_late_scopes", ())
+                    if scope._name != self._name
+                ),
+                self,
+            )
+            jit_mixin(query, _LateSharedScopeQuery)
+        if type(result) is models.QuerySet:
+            result.__class__ = _OwnedScopesQuerySet
+        return result
+
+    def _definition(self, candidates: tuple[int, ...] | None) -> tuple[tuple[CTE, ...], Any]:
+        if self._actions:
+            from .compile.read import attached_permission_plan
+
+            built = attached_permission_plan(
+                self._model,
+                self._actor,
+                self._actions,
+                self._using,
+                self._backend,
+                self._columns,
+                candidates,
+                self._name,
+            )
+            if built is not None:
+                return built
+        return self._single_action_definition(candidates)
+
+    def _single_action_definition(
+        self, candidates: tuple[int, ...] | None
+    ) -> tuple[tuple[CTE, ...], Any]:
+        from .compile.read import attached_scope_plan
+
+        body: models.QuerySet[Any] = (
+            RebacQuerySet(model=self._model, using=self._using)
+            .with_actor(self._actor)
+            .with_action(self._action)
+            .scoped_for_aggregate()
+            .order_by()
+            .values(*self._columns)
+        )
+        if candidates is not None:
+            body = body.filter(**{f"{resource_id_attr(self._model)}__in": candidates})
+        from .compile.read import _scope_decide
+
+        if isinstance(body, RebacQuerySet) and _scope_decide(True, self._using, candidates=True):
+            body._prepare_applied_scope()
+        cte = CTE(body, name=self._name)
+        plan = attached_scope_plan(
+            cte,
+            body,
+            self._model,
+            self._actor,
+            self._action,
+            self._using,
+            self._backend,
+            self._columns,
+            candidates,
+        )
+        return (cte,), plan
+
+
+def _replace_shared_definition(query: Query, ctes: tuple[CTE, ...], plan: Any) -> None:
+    old_scopes: tuple[Any, ...] = tuple(getattr(query, "_rebac_shared_scopes", ()))
+    old_owned = {
+        name
+        for scope in old_scopes
+        if scope.cte.name == plan.cte.name
+        for name in (*scope.owned_ctes, scope.cte.name)
+    }
+    names = {cte.name for cte in ctes} | old_owned
+    _replace_query_ctes(query, ctes, remove_names=names)
+    scopes = (*tuple(scope for scope in old_scopes if scope.cte.name != plan.cte.name), plan)
+    _isolate_statement_queries(query, scopes, tuple(names))
+
+
+def _replace_query_ctes(
+    query: Query,
+    ctes: tuple[CTE, ...] = (),
+    *,
+    remove_names: Collection[str] = (),
+    remove_ids: Collection[int] = (),
+) -> None:
+    """Move django-cte definitions at the library's statement attachment seam.
+
+    This is the sole direct write to django-cte's private ``_with_ctes``;
+    django-cte exposes attachment through ``with_cte()`` but no detach API.
+    """
+    remaining = tuple(
+        cte
+        for cte in getattr(query, "_with_ctes", ())
+        if cte.name not in remove_names and id(cte) not in remove_ids
+    )
+    # django-cte 5.x has no public detach operation. Its with_cte() is the
+    # attachment API; removing moved definitions must precede that call.
+    vars(query)["_with_ctes"] = remaining
+    if ctes:
+        with_cte(*ctes, select=models.QuerySet(model=query.model, query=query))
+
+
+def _references_cte(query: Query, name: str) -> bool:
+    """Whether a caller-built reference reads this CTE in the statement."""
+    for part in (query, *_nested_queries(query)):
+        if any(getattr(join, "table_name", None) == name for join in part.alias_map.values()):
+            return True
+    return False
+
+
+class _LateSharedScopeQuery:
+    """Specialize an unbounded handle from the final statement predicate."""
+
+    _jit_mixin_prefix = "RebacLate"
+
+    def get_compiler(self, *args: Any, **kwargs: Any) -> Any:
+        from .compile.read import statement_candidate_ids
+
+        connection = kwargs.get("connection")
+        using = kwargs.get("using") or (args[0] if args else None)
+        if using is None and connection is not None:
+            using = connection.alias
+        owned = {handle._name for handle in getattr(self, "_rebac_late_scopes", ())}
+        for part in getattr(self, "combined_queries", ()):
+            # The union owner decides for its operands; an operand never re-specializes.
+            late = getattr(part, "_rebac_late_scopes", ())
+            if late:
+                part._rebac_late_scopes = tuple(h for h in late if h._name not in owned)
+        if using is not None:
+            for handle in getattr(self, "_rebac_late_scopes", ()):
+                if using != handle._using:
+                    continue
+                candidates = (
+                    None
+                    if _references_cte(cast(Query, self), handle._name)
+                    else statement_candidate_ids(handle._model, self, using)
+                )
+                plan = next(
+                    (
+                        item
+                        for item in getattr(self, "_rebac_shared_scopes", ())
+                        if item.cte.name == handle._name
+                    ),
+                    None,
+                )
+                if plan is not None and plan.candidates != candidates:
+                    ctes, replacement = handle._definition(candidates)
+                    _replace_shared_definition(cast(Query, self), ctes, replacement)
+        return cast(Any, super()).get_compiler(*args, **kwargs)
+
+
+def share_scoped_definitions[T: models.Model](
+    outer_queryset: models.QuerySet[T],
+) -> models.QuerySet[T]:
+    """Share CTE definitions across a plain union of prepared REBAC operands.
+
+    Scoped operands must use one actor, policy and database alias. Unscoped
+    operands pass through. The returned queryset leaves the input untouched.
+    """
+    from .compile.read import share_combined_scopes
+
+    result = outer_queryset.all()
+    query = result.query
+    if query.combinator != "union" or len(query.combined_queries) < 2:
+        return result
+    if share_combined_scopes(query) is False:
+        raise PermissionDenied("Union operands must have compatible prepared REBAC scopes")
+    if type(result) is models.QuerySet:
+        result.__class__ = _OwnedScopesQuerySet
+    return result
+
+
+def _relabel_owned_ctes(query: Query, names: dict[str, str]) -> None:
+    """Relabel a copied owner's definitions and every query that reads them."""
+    from .compile.predicate import _Compiled
+
+    seen: set[int] = set()
+
+    def visit_expression(expression: Any) -> None:
+        if isinstance(expression, _Compiled):
+            visit(expression.rows.query)
+            expression._sql.clear()
+            return
+        if isinstance(expression, Query):
+            visit(expression)
+            return
+        sources = getattr(expression, "get_source_expressions", None)
+        if callable(sources):
+            for source in cast(Iterable[Any], sources()):
+                if source is not None:
+                    visit_expression(source)
+
+    def visit(part: Query) -> None:
+        if id(part) in seen:
+            return
+        seen.add(id(part))
+        for old, new in names.items():
+            if old in part.alias_map and part.alias_map[old].table_name == old:
+                part.table_map[new] = part.table_map.pop(old)
+                part.alias_map[old].table_name = new
+                part.change_aliases({old: new})
+            for join in part.alias_map.values():
+                if join.table_name == old:
+                    join.table_name = new
+        for cte in getattr(part, "_with_ctes", ()):
+            cte.name = names.get(cte.name, cte.name)
+            visit(cte.query)
+        group_by = part.group_by if isinstance(part.group_by, tuple) else ()
+        for expression in (
+            part.where,
+            *part.annotations.values(),
+            *part.select,
+            *part.order_by,
+            *group_by,
+        ):
+            visit_expression(expression)
+        for nested in _nested_queries(part):
+            visit(nested)
+
+    visit(query)
+
+
+def _relabel_combined_owners(query: Query, other_qs: tuple[Any, ...]) -> tuple[Any, ...]:
+    """Give independently prepared operands distinct statement CTE names."""
+    occupied = {cte.name for cte in getattr(query, "_with_ctes", ())}
+    prepared = []
+    for ordinal, other in enumerate(other_qs, 1):
+        names = {cte.name for cte in getattr(other.query, "_with_ctes", ())}
+        if occupied & names:
+            suffix = ordinal
+            if getattr(other.query, "_rebac_combined_ctes_shared", None) is not None:
+                from .compile.read import share_combined_scopes
+
+                while True:
+                    clone = other._clone()
+                    clone.query = deepcopy(other.query)
+                    plan = getattr(clone.query, "_rebac_subject_plan", None)
+                    if plan is not None:
+                        owned = {cte.name for cte in plan[1]}
+                        _replace_query_ctes(clone.query, remove_names=owned)
+                        for part in clone.query.combined_queries:
+                            if hasattr(part, "_rebac_subject_plan"):
+                                del part._rebac_subject_plan
+                        del clone.query._rebac_subject_plan
+                    del clone.query._rebac_combined_ctes_shared
+                    if share_combined_scopes(clone.query, cte_owner=str(suffix)) is not True:
+                        raise PermissionDenied("Could not reprepare a combined scope owner")
+                    names = {cte.name for cte in getattr(clone.query, "_with_ctes", ())}
+                    if not occupied.intersection(names):
+                        other = clone
+                        break
+                    suffix += 1
+            else:
+                clone = other._clone()
+                clone.query = deepcopy(other.query)
+                while True:
+                    replacements = {name: f"{name}_owner{suffix}" for name in sorted(names)}
+                    if not occupied.intersection(replacements.values()):
+                        break
+                    suffix += 1
+                _relabel_owned_ctes(clone.query, replacements)
+                other = clone
+                names = set(replacements.values())
+        occupied.update(names)
+        prepared.append(other)
+    return tuple(prepared)
+
+
+class _OwnedScopesQuerySet[T: models.Model](models.QuerySet[T]):
+    """Relabel independently prepared operands before a plain combination."""
+
+    def _combinator_query(self, combinator: str, *other_qs: Any, all: bool = False) -> Any:
+        prepared = _relabel_combined_owners(self.query, other_qs)
+        return super()._combinator_query(combinator, *prepared, all=all)  # type: ignore[misc]
+
 
 class _ScopeWhere(WhereNode):
     """A removable authorization restriction, separate from caller predicates."""
 
 
-class _RebacQuery(Query):
+class _CompileOnly(Enum):
+    ACTIVE = auto()
+
+
+_executing_bypass_audits: ContextVar[dict[tuple[object, str], None] | _CompileOnly | None] = (
+    ContextVar("rebac_executing_bypass_audits", default=None)
+)
+
+
+def _emit_executed_bypasses(reasons: dict[tuple[object, str], None], using: str) -> None:
+    if not reasons:
+        return
+    from .audit import emit_bypass
+
+    with database_context(using):
+        for _, reason in reasons:
+            emit_bypass(reason, actor=_current_actor())
+
+
+class _BypassAuditCompilerMixin:
+    """Observe the final compiler method, including a later CTE mixin."""
+
+    _rebac_audit_top_level: bool
+    _rebac_audit_rendered_sql: bool
+
+    def __getattribute__(self, name: str) -> Any:
+        method = super().__getattribute__(name)
+        if name == "as_sql":
+
+            def audited_as_sql(*args: Any, **kwargs: Any) -> Any:
+                compile_only = (
+                    self._rebac_audit_top_level and _executing_bypass_audits.get() is None
+                )
+                marker = _executing_bypass_audits.set(_CompileOnly.ACTIVE) if compile_only else None
+                try:
+                    sql = method(*args, **kwargs)
+                    self._rebac_audit_rendered_sql = bool(sql[0])
+                    return sql
+                finally:
+                    if marker is not None:
+                        _executing_bypass_audits.reset(marker)
+
+            return audited_as_sql
+        if name == "execute_sql":
+
+            def audited_execute_sql(*args: Any, **kwargs: Any) -> Any:
+                self._rebac_audit_rendered_sql = False
+                reasons: dict[tuple[object, str], None] = {}
+                token = _executing_bypass_audits.set(reasons)
+                try:
+                    result = method(*args, **kwargs)
+                finally:
+                    _executing_bypass_audits.reset(token)
+                if self._rebac_audit_rendered_sql:
+                    _emit_executed_bypasses(reasons, self.connection.alias)
+                return result
+
+            return audited_execute_sql
+        return method
+
+
+_audit_compiler_types: dict[type[Any], type[Any]] = {}
+
+
+class _BypassAuditQuery(Query):
+    """Collect embedded bypasses during SQL rendering, emit after execution."""
+
+    def chain(self, klass: Any = None) -> Any:
+        chained = super().chain(klass)
+        if klass is UpdateQuery:
+            # QuerySet.update() switches its Query to UpdateQuery before the
+            # write executes. Keep the audit hook on that compiled statement.
+            chained.__class__ = _BypassAuditUpdateQuery
+        return chained
+
+    def get_compiler(self, *args: Any, **kwargs: Any) -> Any:
+        compiler = super().get_compiler(*args, **kwargs)
+        if not isinstance(compiler, _BypassAuditCompilerMixin):
+            base = type(compiler)
+            mixed = _audit_compiler_types.get(base)
+            if mixed is None:
+                mixed = type(
+                    f"RebacAudit{base.__name__}",
+                    (_BypassAuditCompilerMixin, base),
+                    {"__slots__": ()},
+                )
+                _audit_compiler_types[base] = mixed
+            compiler.__class__ = mixed
+        # Query.as_sql() creates a compiler with connection= for a subquery.
+        # Only a top-level, compile-only call may suppress the render fallback.
+        compiler._rebac_audit_top_level = (
+            bool(args and args[0] is not None) or kwargs.get("using") is not None
+        )
+        compiler._rebac_audit_rendered_sql = False
+        return compiler
+
+    def get_aggregation(self, using: str, aggregate_exprs: Any) -> Any:
+        # Django can wrap a sliced/distinct COUNT in a plain AggregateQuery.
+        # That outer compiler does not inherit this query's execution hook.
+        reasons: dict[tuple[object, str], None] = {}
+        token = _executing_bypass_audits.set(reasons)
+        try:
+            result = super().get_aggregation(using, aggregate_exprs)
+        finally:
+            _executing_bypass_audits.reset(token)
+        _emit_executed_bypasses(reasons, using)
+        return result
+
+
+class _BypassAuditUpdateQuery(_BypassAuditQuery, UpdateQuery):
+    """UpdateQuery with the embedded-bypass execution hook."""
+
+
+def _audit_query_when_executed(query: Any) -> None:
+    # A plain Django queryset can hold a REBAC subquery. Its Query must own
+    # the same execution hook; changing this one Query instance preserves
+    # Django's clone semantics without changing the queryset's public type.
+    if type(query) is Query:
+        query.__class__ = _BypassAuditQuery
+
+
+class _RebacQuery(_BypassAuditQuery):
     """Cover expressions which copy QuerySet.query without resolving the QS."""
 
     _rebac_state: dict[str, Any]
@@ -59,9 +529,9 @@ class _RebacQuery(Query):
     # querysets. They inherit the combination's policy, not a separate actor.
     _rebac_boolean_operand = False
 
-    # The bypass reason of an embedded queryset, audited when the statement it
-    # was resolved into is compiled for execution, never when it is built.
-    _rebac_pending_bypass_audit: str | None = None
+    # Clones of one bypass entry share its identity, so one statement may use
+    # it in several expressions while producing only one audit row.
+    _rebac_pending_bypass_audit: tuple[object, str] | None = None
 
     # Django constructs a query of this class itself only as a piece of the
     # statement it is building: the NOT EXISTS of an exclude() across a to-many
@@ -78,11 +548,22 @@ class _RebacQuery(Query):
     def as_sql(self, compiler: Any, connection: Any) -> Any:
         # Compiled before the statement that holds it was checked (its
         # queryset is not a rebac one, or no check ran): checked now.
-        _check_subquery(self)
-        reason = self._rebac_pending_bypass_audit
-        if reason is not None:
-            _emit_bypass_audit(reason)
-        return super().as_sql(compiler, connection)
+        with database_context(connection.alias):
+            _check_subquery(self)
+            sql = super().as_sql(compiler, connection)
+            pending = self._rebac_pending_bypass_audit
+            state = _executing_bypass_audits.get()
+            if pending is not None:
+                if isinstance(state, dict):
+                    state.setdefault(pending, None)
+                elif state is None:
+                    # An unhooked outer Query (including a collector's raw
+                    # delete) must retain the old render-time audit rather
+                    # than silently run an elevated read with no event.
+                    from .audit import emit_bypass
+
+                    emit_bypass(pending[1], actor=_current_actor())
+            return sql
 
     # A resolved actor-scoped subquery carries what checking it needs, and
     # is checked once: with the statement that holds it, when that statement
@@ -105,7 +586,6 @@ class _RebacQuery(Query):
         )
         for name, value in state.items():
             setattr(queryset, name, value)
-        applied_here = not queryset._rebac_scope_applied
         # Building an expression runs no query, so it must write no audit row
         # (annotations are built at import time, during app initialisation).
         queryset._apply_scope_in_place(audit=False)
@@ -113,7 +593,8 @@ class _RebacQuery(Query):
         # evaluated under actor_context() may be embedded after it has closed.
         decision = queryset._rebac_scope_decision
         actor, bypass = decision if decision is not None else queryset.effective_actor(strict=True)
-        pending = queryset._bypass_audit_reason() if applied_here and bypass else None
+        reason = queryset._bypass_audit_reason() if bypass else None
+        pending = (queryset._rebac_bypass_entry, reason) if reason is not None else None
 
         # A set combination has one actor policy, owned by its root queryset.
         # _scope_query already applied it to each operand (or the root bypass
@@ -145,6 +626,8 @@ class _RebacQuery(Query):
             resolved._rebac_check = (queryset, actor)
         if pending is not None:
             resolved._rebac_pending_bypass_audit = pending
+            parent = args[0] if args else kwargs.get("query")
+            _audit_query_when_executed(parent)
         return resolved
 
 
@@ -189,6 +672,58 @@ def _nested_queries(expression: Any, *, boolean_operands_only: bool = False) -> 
             yield part
         if part is not None:
             yield from _nested_queries(part, boolean_operands_only=boolean_operands_only)
+
+
+def _isolate_statement_queries(
+    query: Query, plans: tuple[Any, ...], shared_name: str | tuple[str, ...]
+) -> None:
+    """Clone nested queries before adding statement-local sharing metadata.
+
+    Django clones WHERE leaves and annotations shallowly. Replacing those
+    leaves here keeps the input queryset and sibling statements independent.
+    A nested use of the same handle references the outer WITH definition.
+    """
+    nested = tuple({id(part): part for part in _nested_queries(query)}.values())
+    clones = {id(part): (part, part.clone()) for part in nested}
+
+    class Replacements:
+        def __bool__(self) -> bool:
+            return bool(clones)
+
+        def get(self, value: Any) -> Any:
+            found = clones.get(id(value))
+            return found[1] if found is not None and found[0] is value else None
+
+    replacements = Replacements()
+
+    def replace(value: Any) -> Any:
+        method = getattr(value, "replace_expressions", None)
+        return method(replacements) if callable(method) else value
+
+    for part in (*reversed(tuple(clone for _original, clone in clones.values())), query):
+        part.where = replace(part.where)
+        part.annotations = {name: replace(value) for name, value in part.annotations.items()}
+        part.select = tuple(replace(value) for value in part.select)
+        part.order_by = tuple(replace(value) for value in part.order_by)
+        if isinstance(part.group_by, tuple):
+            part.group_by = tuple(replace(value) for value in part.group_by)
+        for alias, join in tuple(part.alias_map.items()):
+            relation = getattr(join, "filtered_relation", None)
+            condition = getattr(relation, "resolved_condition", None)
+            if condition is not None:
+                new_join = copy(join)
+                new_relation = cast(Any, copy(relation))
+                new_relation.resolved_condition = replace(condition)
+                new_join.filtered_relation = new_relation
+                part.alias_map[alias] = new_join
+        if part.combined_queries:
+            part.combined_queries = tuple(
+                replacements.get(child) or child for child in part.combined_queries
+            )
+        if part is not query and hasattr(part, "_with_ctes"):
+            owned = {shared_name} if isinstance(shared_name, str) else set(shared_name)
+            _replace_query_ctes(part, remove_names=owned)
+        cast(Any, part)._rebac_shared_scopes = plans
 
 
 class _Readable(models.Case):
@@ -238,20 +773,6 @@ class _Readable(models.Case):
         return resolved
 
 
-def _emit_bypass_audit(reason: str) -> None:
-    from .audit import emit
-    from .models import PermissionAuditEvent
-
-    actor = _current_actor()
-    emit(
-        PermissionAuditEvent.KIND_SUDO_BYPASS,
-        actor=actor,
-        origin=actor,
-        reason=reason,
-        defer_to_commit=False,
-    )
-
-
 def _without_scope(node: WhereNode) -> WhereNode:
     clone = node.clone()
     clone.children = [
@@ -264,6 +785,14 @@ def _without_scope(node: WhereNode) -> WhereNode:
 
 def _without_query_scope(query: Query) -> Query:
     clone = query.clone()
+    plan = getattr(clone, "_rebac_subject_plan", None)
+    if plan is not None:
+        owned = {id(cte) for cte in plan[1]}
+        if hasattr(clone, "_with_ctes"):
+            _replace_query_ctes(clone, remove_ids=owned)
+        delattr(clone, "_rebac_subject_plan")
+    if hasattr(clone, "_rebac_combined_ctes_shared"):
+        delattr(clone, "_rebac_combined_ctes_shared")
     if isinstance(clone, _RebacQuery) and clone._rebac_boolean_operand:
         clone._rebac_check = None
         clone._rebac_checked = False
@@ -333,8 +862,8 @@ def _hidden_from(
         for name in names
         if actor is None
         or resource_type is None
-        or not backend_grants_all(
-            backend(), subject=actor, action=f"read__{name}", resource_type=resource_type
+        or not backend().grants_all(
+            subject=actor, action=f"read__{name}", resource_type=resource_type
         )
     )
 
@@ -592,19 +1121,301 @@ def _column_relation_path(query: Query, column: Col) -> str:
     return "__".join(reversed(names))
 
 
-class RebacQuerySet(models.QuerySet[_M]):
+class _WriteStep(Enum):
+    UPDATE = auto()
+    UPDATE_CLAUSE = auto()
+    DELETE = auto()
+    DELETE_CLAUSE = auto()
+    CREATE = auto()
+
+
+def _refuse_moving_edges(
+    queryset: TrackedQuerySet[Any], kwargs: dict[str, Any], *, actor_scoped: bool
+) -> None:
+    """Reject a generic edge move at the point chosen by the write owner."""
+    from .actors import current_actor, is_sudo
+    from .watch import gate_policy, refuse_moving_edges
+
+    related_owner = queryset._rebac_related_owner
+    if actor_scoped or (
+        not is_sudo() and (related_owner is not None or current_actor() is not None)
+    ):
+        refuse_moving_edges(gate_policy(queryset.db), queryset.model, kwargs)
+
+
+class TrackedQuerySet[T: models.Model](models.QuerySet[T]):
+    """Own model writes without applying an actor scope to reads."""
+
+    _actor_scoped_writes: ClassVar[bool] = False
+
+    _rebac_related_owner: models.Model | None
+
+    def __init__(self, *args: Any, **kwargs: Any) -> None:
+        super().__init__(*args, **kwargs)
+        self._rebac_related_owner = None
+
+    def __getstate__(self) -> dict[str, Any]:
+        state = super().__getstate__()
+        state["_rebac_related_owner"] = None
+        return state
+
+    def _clone(self, **kwargs: Any) -> Self:
+        clone: Self = cast(Any, super())._clone(**kwargs)
+        clone._rebac_related_owner = self._rebac_related_owner
+        return clone
+
+    def _write_scope(self, step: _WriteStep) -> tuple[SubjectRef | None, bool]:
+        from .actors import is_sudo, resolve
+        from .mixins import RebacMixin
+        from .signals import _edge_actor
+
+        if step is _WriteStep.DELETE:
+            actor, ambient_bypass = resolve(
+                mode="ambient", strict=False, subject_label="Tracked delete"
+            )
+            return actor, issubclass(self.model, RebacMixin) or ambient_bypass
+        if step is _WriteStep.UPDATE:
+            related_owner = self._rebac_related_owner
+            if related_owner is not None:
+                return _edge_actor(related_owner, relation=True)
+        return None, is_sudo()
+
+    def _write_rows(self, actor: SubjectRef | None, step: _WriteStep) -> TrackedQuerySet[T]:
+        return self
+
+    def _guard_rows(
+        self,
+        step: _WriteStep,
+        actor: SubjectRef | None,
+        bypass: bool,
+        *,
+        rows: TrackedQuerySet[T] | None = None,
+        candidates: list[T] | None = None,
+        kwargs: dict[str, Any] | None = None,
+        watched: bool = False,
+        update_conflicts: bool = False,
+        update_fields: Collection[str] | None = None,
+    ) -> None:
+        """Plain tracked rows need only the signal-free create gate."""
+        from .actors import is_sudo
+        from .mixins import RebacMixin
+        from .signals import _gate_backed_rows
+        from .watch import gate_policy
+
+        if step is not _WriteStep.CREATE or issubclass(self.model, RebacMixin):
+            return
+        if candidates is None:
+            raise TypeError("bulk_create requires candidate rows")
+        policy = gate_policy(self.db) if watched else None
+        if update_conflicts and update_fields and not is_sudo() and policy is not None:
+            watch = policy.watched.get(self.model._meta.label_lower)
+            if watch is not None and any(
+                {field.name, field.attname} & set(update_fields) & watch.fields
+                for field in self.model._meta.concrete_fields
+            ):
+                raise PermissionDenied(
+                    "Conflicting bulk create cannot check both sides of a backed edge; "
+                    "use checked saves or sudo."
+                )
+        _gate_backed_rows(candidates, using=self.db, bypass=bypass)
+
+    def update(self, **kwargs: Any) -> int:
+        from .actors import is_sudo
+        from .mixins import RebacMixin
+        from .signals import _gate_backed_rows, audit_denials
+        from .watch import by_key, model_write, statement_keys
+
+        if self.query.combinator or self.query.is_sliced:
+            return models.QuerySet.update(self, **kwargs)
+        self._for_write = True
+        with (
+            audit_denials(using=self.db),
+            model_write(model=self.model, using=self.db, names=kwargs) as watched,
+        ):
+            related_owner = self._rebac_related_owner
+            if self._actor_scoped_writes:
+                actor, bypass = self._write_scope(_WriteStep.UPDATE)
+                if bypass:
+                    return models.QuerySet.update(self, **kwargs)
+                self._guard_rows(_WriteStep.UPDATE_CLAUSE, actor, bypass)
+                backed = watched
+            else:
+                actor, bypass = None, is_sudo()
+                # Tracked roots have no resource gate; a generic edge move
+                # must be refused before resolving a related owner's actor.
+                _refuse_moving_edges(self, kwargs, actor_scoped=False)
+                related_fk_write = any(
+                    isinstance(field, (models.ForeignKey, models.OneToOneField))
+                    and {field.name, field.attname} & kwargs.keys()
+                    for field in self.model._meta.concrete_fields
+                )
+                backed = watched and (
+                    not issubclass(self.model, RebacMixin)
+                    or related_owner is not None
+                    or related_fk_write
+                )
+                if not backed or bypass:
+                    return models.QuerySet.update(self, **kwargs)
+                actor, bypass = self._write_scope(_WriteStep.UPDATE)
+                if bypass:
+                    return models.QuerySet.update(self, **kwargs)
+            rows = self._write_rows(actor, _WriteStep.UPDATE)
+            keys = statement_keys(rows)
+            # QuerySet.update() sends no model signals, so this internal capture
+            # cannot be observed as a signal origin.
+            parts = list(by_key(rows, keys))
+            if backed:
+                for stored in by_key(self.model._base_manager.using(self.db), keys):
+                    _gate_backed_rows(
+                        stored,
+                        using=self.db,
+                        names=kwargs,
+                        proposed=kwargs,
+                        actor=actor,
+                        bypass=bypass,
+                    )
+            if self._actor_scoped_writes:
+                # A backed denial takes precedence on actor-scoped writes.
+                _refuse_moving_edges(self, kwargs, actor_scoped=True)
+            for part in parts:
+                self._guard_rows(_WriteStep.UPDATE, actor, bypass, rows=part, kwargs=kwargs)
+            written = sum(models.QuerySet.update(part, **kwargs) for part in parts)
+            self._result_cache = None
+            return written
+
+    def delete(self) -> tuple[int, dict[str, int]]:
+        from .mixins import delete_collected, deletion_owner
+        from .signals import _gate_backed_rows, audit_denials
+        from .watch import by_key, model_write, statement_keys
+
+        if (
+            self.query.combinator
+            or self.query.is_sliced
+            or self.query.distinct_fields
+            or getattr(self, "_fields", None) is not None
+        ):
+            return models.QuerySet.delete(self)
+        self._for_write = True
+        with audit_denials(using=self.db), model_write(model=self.model, using=self.db) as watched:
+            actor, bypass = self._write_scope(_WriteStep.DELETE)
+            self._guard_rows(_WriteStep.DELETE_CLAUSE, actor, bypass)
+            if bypass or (not watched and not self._actor_scoped_writes):
+                with deletion_owner(self, self.db, actor, bypass):
+                    result = delete_collected(self, origin=self, using=self.db)
+                self._result_cache = None
+                return result
+            rows = self._write_rows(actor, _WriteStep.DELETE)
+            keys = statement_keys(rows)
+            # Django's collector forwards each part as pre_delete's origin.
+            # Preserve the caller's authority on that queryset.
+            parts = list(by_key(self, keys))
+            if watched and not self._actor_scoped_writes:
+                for stored in by_key(self.model._base_manager.using(self.db), keys):
+                    _gate_backed_rows(stored, using=self.db, deleting=True)
+            for part in parts:
+                self._guard_rows(_WriteStep.DELETE, actor, bypass, rows=part)
+            deleted: Counter[str] = Counter()
+            for part in parts:
+                with deletion_owner(part, self.db, actor, bypass):
+                    deleted.update(delete_collected(part, origin=part, using=self.db)[1])
+            self._result_cache = None
+            return sum(deleted.values()), dict(deleted)
+
+    def bulk_create(
+        self,
+        objs: Iterable[T],
+        batch_size: int | None = None,
+        ignore_conflicts: bool = False,
+        update_conflicts: bool = False,
+        update_fields: Collection[str] | None = None,
+        unique_fields: Collection[str] | None = None,
+    ) -> list[T]:
+        from .actors import is_sudo
+        from .signals import audit_denials
+        from .watch import model_write
+
+        self._for_write = True
+        candidates = list(objs)
+        with audit_denials(using=self.db), model_write(model=self.model, using=self.db) as watched:
+            actor, bypass = (
+                self._write_scope(_WriteStep.CREATE)
+                if self._actor_scoped_writes
+                else (None, is_sudo())
+            )
+            self._guard_rows(
+                _WriteStep.CREATE,
+                actor,
+                bypass,
+                candidates=candidates,
+                watched=watched,
+                update_conflicts=update_conflicts,
+                update_fields=update_fields,
+            )
+            result = models.QuerySet.bulk_create(
+                self,
+                candidates,
+                batch_size=batch_size,
+                ignore_conflicts=ignore_conflicts,
+                update_conflicts=update_conflicts,
+                update_fields=update_fields,
+                unique_fields=unique_fields,
+            )
+            if self._actor_scoped_writes and actor is not None and not bypass:
+                for row in result:
+                    row._rebac_actor = actor  # type: ignore[attr-defined]
+                    row._rebac_sudo_reason = None  # type: ignore[attr-defined]
+            return result
+
+    def bulk_update(
+        self, objs: Iterable[T], fields: Iterable[str], batch_size: int | None = None
+    ) -> int:
+        from .signals import audit_denials
+        from .watch import model_write
+
+        self._for_write = True
+        field_names = tuple(fields)
+        with (
+            audit_denials(using=self.db),
+            model_write(model=self.model, using=self.db, names=field_names),
+        ):
+            return models.QuerySet.bulk_update(self, objs, field_names, batch_size=batch_size)
+
+
+_TrackedManagerBase = models.Manager.from_queryset(TrackedQuerySet)
+
+
+def _related_manager_owner(manager: object) -> RebacMixin | None:
+    """Find a REBAC source on a real related manager, never in router hints."""
+    from .mixins import RebacMixin
+
+    owner = getattr(manager, "instance", None)
+    return owner if isinstance(owner, RebacMixin) and hasattr(manager, "core_filters") else None
+
+
+# Keep the same model parameter on Django's generated, generic manager base.
+class TrackedManager[M: models.Model](_TrackedManagerBase[M]):  # pyright: ignore[reportInvalidTypeArguments]
+    """Unfiltered manager whose writes to columns the policy reads are gated."""
+
+    def get_queryset(self) -> TrackedQuerySet[M]:
+        queryset = cast(TrackedQuerySet[M], super().get_queryset())
+        queryset._rebac_related_owner = _related_manager_owner(self)
+        return queryset
+
+
+class RebacQuerySet(TrackedQuerySet[_M]):
     """REBAC-aware queryset.
 
-    Use `.with_actor(actor)`, `.as_user(user)`, `.as_agent(agent, on_behalf_of=u)`,
-    or `.sudo(reason=...)` to scope. Materialising without any of those AND
+    Use `.with_actor(actor)` or `.sudo(reason=...)` to scope. Materialising without any of those AND
     without an ambient actor raises `MissingActorError` when STRICT_MODE is on.
 
     Generic over the model so the actor verbs preserve the concrete row
-    type: ``Post.objects.filter(...).as_user(u).get()`` stays ``Post``.
+    type: ``Post.objects.filter(...).with_actor(u).get()`` stays ``Post``.
     """
 
     # Per-queryset state. Carried through `_clone()`.
     _rebac_actor: SubjectRef | None
+    _rebac_relation_actor: SubjectRef | None
+    _rebac_relation_scope: bool
     _rebac_action: str | None
     _rebac_sudo_reason: str | None
     _rebac_field_deny: FieldDenyMode | None
@@ -615,9 +1426,12 @@ class RebacQuerySet(models.QuerySet[_M]):
         if type(self._query) is Query:
             self._query.__class__ = _RebacQuery
         self._rebac_actor = None
+        self._rebac_relation_actor = None
+        self._rebac_relation_scope = False
         self._rebac_action = None
         self._rebac_sudo_reason = None
         self._rebac_sudo_audited = False
+        self._rebac_bypass_entry = object()
         self._rebac_internal_bypass = False
         self._rebac_ambient_bypass = False
         self._rebac_field_deny = None
@@ -625,6 +1439,7 @@ class RebacQuerySet(models.QuerySet[_M]):
         self._rebac_eager_scope = False
         self._rebac_aggregate_scope = False
         self._rebac_visibility_applied = False
+        self._rebac_scope_generation: tuple[int, int] | None = None
 
     def __getstate__(self) -> dict[str, Any]:
         """Do not transport actor or sudo authority through a pickle."""
@@ -634,11 +1449,16 @@ class RebacQuerySet(models.QuerySet[_M]):
         # authorization-sensitive query merely to pickle an inert query.
         state = {**self.__dict__, "_django_version": django.__version__}
         state["_rebac_actor"] = None
+        state["_rebac_relation_actor"] = None
+        state["_rebac_relation_scope"] = False
+        state["_rebac_related_owner"] = None
         state["_rebac_sudo_reason"] = None
         state["_rebac_sudo_audited"] = False
+        state["_rebac_bypass_entry"] = object()
         state["_rebac_internal_bypass"] = False
         state["_rebac_ambient_bypass"] = False
         state["_rebac_scope_applied"] = False
+        state["_rebac_scope_generation"] = None
         state["_rebac_scope_decision"] = None
         state["_rebac_eager_scope"] = False
         state["_rebac_visibility_applied"] = False
@@ -650,7 +1470,15 @@ class RebacQuerySet(models.QuerySet[_M]):
             query._rebac_state = {
                 name: value
                 for name, value in getattr(query, "_rebac_state", {}).items()
-                if name not in {"_rebac_actor", "_rebac_sudo_reason"}
+                if name
+                not in {
+                    "_rebac_actor",
+                    "_rebac_relation_actor",
+                    "_rebac_relation_scope",
+                    "_rebac_related_owner",
+                    "_rebac_sudo_reason",
+                    "_rebac_bypass_entry",
+                }
             }
             state["_query"] = query
         return state
@@ -658,7 +1486,8 @@ class RebacQuerySet(models.QuerySet[_M]):
     def raw(
         self, raw_query: Any, params: Any = (), translations: Any = None, using: Any = None
     ) -> Any:
-        _, bypass = self._resolve_effective_actor()
+        _, bypass = self.effective_actor(strict=True)
+        self._audit_bypass_once()
         if not bypass:
             raise PermissionDenied("raw() cannot be actor-scoped; use sudo or system_context")
         raw_method = super().raw
@@ -695,25 +1524,26 @@ class RebacQuerySet(models.QuerySet[_M]):
             # operand's actor. Its own actor, bypass and audit do not apply,
             # and an operand without an actor is not an error here.
             return cast(Query, super(RebacQuerySet, clone).resolve_expression(*args, **kwargs))
-        # Resolution builds an expression; the bypass is exercised, and
-        # audited, when the statement it lands in is compiled for execution.
+        # Resolution builds an expression; the bypass is audited only when
+        # the enclosing statement executes.
         # The query's own resolution checks what it selects, filters and
         # orders on.
         clone._apply_scope_in_place(audit=False)
-        pending = clone._bypass_audit_reason()
+        reason = clone._bypass_audit_reason()
+        pending = (clone._rebac_bypass_entry, reason) if reason is not None else None
         resolved = cast(Query, super(RebacQuerySet, clone).resolve_expression(*args, **kwargs))
         if pending is not None and isinstance(resolved, _RebacQuery):
             resolved._rebac_pending_bypass_audit = pending
+            parent = args[0] if args else kwargs.get("query")
+            _audit_query_when_executed(parent)
         return resolved
 
     def explain(self, *, format: str | None = None, **options: Any) -> str:
         scoped = self._clone()
         scoped._apply_scope_in_place()
-        scoped._guard_clause_field_reads(*scoped._resolve_effective_actor())
+        scoped._audit_bypass_once()
+        scoped._guard_clause_field_reads(*scoped.effective_actor(strict=True))
         return super(RebacQuerySet, scoped).explain(format=format, **options)
-
-    # Note: a second `_clone` override below combines the actor + scope-flag
-    # propagation; this stub kept for readability.
 
     # ----- Actor verbs -----
 
@@ -724,18 +1554,15 @@ class RebacQuerySet(models.QuerySet[_M]):
         clone._rebac_actor = ref
         clone._rebac_sudo_reason = None
         clone._rebac_sudo_audited = False
+        clone._rebac_bypass_entry = object()
         clone._rebac_internal_bypass = False
         clone._rebac_ambient_bypass = False
+        from .relation_loading import rebind_prefetch_actor
+
+        prefetches = cast(Any, clone)._prefetch_related_lookups
+        cast(Any, clone)._prefetch_related_lookups = rebind_prefetch_actor(prefetches, ref)
         clone._refresh_scope()
         return clone
-
-    def as_user(self, user: Any) -> Self:
-        """Typed shorthand: scope to a Django User."""
-        return self.with_actor(to_subject_ref(user))
-
-    def as_agent(self, agent: Any, *, on_behalf_of: Any | None = None) -> Self:
-        """Typed shorthand: scope to an agent acting via a Grant."""
-        return self.with_actor(grant_subject_ref(agent, on_behalf_of))
 
     def with_action(self, action: str) -> Self:
         """Pin the REBAC permission used for queryset read scoping."""
@@ -789,7 +1616,7 @@ class RebacQuerySet(models.QuerySet[_M]):
         output_field = cast("models.Field[Any, Any]", model_field).clone()
         output_field.null = True
         actor, bypass = self.effective_actor(strict=True)
-        if bypass or actor is None or field not in gated_read_fields(self.model):
+        if bypass or actor is None or field not in self._gated_read_fields():
             return models.ExpressionWrapper(models.F(field), output_field=output_field)
         readers = (
             type(self)(model=self.model, using=self.db)
@@ -824,7 +1651,7 @@ class RebacQuerySet(models.QuerySet[_M]):
             clone._rebac_internal_bypass = True
             clone._rebac_ambient_bypass = True
         clone._rebac_eager_scope = True
-        clone._apply_scope_in_place()
+        clone._apply_scope_in_place(prepare=False)
         return clone
 
     def scoped_for_aggregate(self) -> Self:
@@ -839,6 +1666,37 @@ class RebacQuerySet(models.QuerySet[_M]):
         clone._reset_scope()
         return clone.scoped()
 
+    def scope_cte(self, *, actions: tuple[str, ...] = ()) -> SharedScope[_M]:
+        """Make a statement-local identity scope, optionally sharing action leaves."""
+        from .backends import backend
+        from .compile.read import scope_candidate_ids
+
+        unscoped = _without_query_scope(self.query)
+        if unscoped.annotations or unscoped.combined_queries or unscoped.is_sliced:
+            raise ValueError(
+                "scope_cte() requires an unfiltered or identity-filtered, unsliced queryset"
+            )
+        candidates = None
+        if unscoped.where.children:
+            candidates = scope_candidate_ids(self.model, unscoped, self.db)
+            if candidates is None:
+                raise ValueError(
+                    "scope_cte() requires an unfiltered or bounded identity-filtered queryset"
+                )
+        actor, bypass = self.effective_actor(strict=True)
+        if bypass or actor is None:
+            raise ValueError("scope_cte() requires an actor scope")
+        action = str(
+            self._rebac_action or getattr(self.model._meta, "rebac_default_action", "read")
+        )
+        if actions and (actions[0] != action or len(set(actions)) != len(actions)):
+            raise ValueError("scope_cte() actions must be distinct and start with the scope action")
+        identity = resource_id_attr(self.model)
+        columns = tuple(dict.fromkeys(("pk", identity)))
+        return SharedScope(
+            self.model, actor, action, self.db, backend(), columns, candidates, actions
+        )
+
     def _reset_scope(self) -> None:
         # QuerySet.query's public setter switches values_list() to ValuesIterable
         # when values_select is populated. This is an internal SQL replacement;
@@ -846,6 +1704,7 @@ class RebacQuerySet(models.QuerySet[_M]):
         self._query = _without_query_scope(self.query)
         self._rebac_scope_applied = False
         self._rebac_scope_decision = None
+        self._rebac_scope_generation = None
 
     def _refresh_scope(self) -> None:
         self._reset_scope()
@@ -863,18 +1722,12 @@ class RebacQuerySet(models.QuerySet[_M]):
         return self._bypass(reason=reason, allow_when_sudo_disabled=True, internal=True)
 
     def _bypass(self, *, reason: str, allow_when_sudo_disabled: bool, internal: bool) -> Self:
-        from .errors import SudoNotAllowedError, SudoReasonRequiredError
-
-        if not allow_when_sudo_disabled and not app_settings.REBAC_ALLOW_SUDO:
-            raise SudoNotAllowedError("sudo() denied: REBAC_ALLOW_SUDO is False")
-        if app_settings.REBAC_REQUIRE_SUDO_REASON and not reason:
-            raise SudoReasonRequiredError(
-                "sudo() requires reason= when REBAC_REQUIRE_SUDO_REASON=True"
-            )
+        require_sudo_allowed(reason, allow_when_disabled=allow_when_sudo_disabled)
         clone = self._clone()
         clone._rebac_actor = None
         clone._rebac_sudo_reason = reason
         clone._rebac_sudo_audited = False
+        clone._rebac_bypass_entry = object()
         clone._rebac_internal_bypass = internal
         clone._rebac_ambient_bypass = False
         clone._refresh_scope()
@@ -891,18 +1744,26 @@ class RebacQuerySet(models.QuerySet[_M]):
         return self._rebac_sudo_reason
 
     def _audit_bypass_once(self) -> None:
-        from .audit import save_check
+        with database_context(self.db):
+            if self._rebac_sudo_audited:
+                return
+            reason = self._bypass_audit_reason()
+            if reason is None:
+                return
+            from .audit import emit_bypass
 
-        if self._rebac_sudo_audited or save_check.get() is not None:
-            return
-        reason = self._bypass_audit_reason()
-        if reason is None:
-            return
-        _emit_bypass_audit(reason)
-        self._rebac_sudo_audited = True
+            emit_bypass(reason, actor=_current_actor())
+            self._rebac_sudo_audited = True
 
     def actor(self) -> SubjectRef | None:
         return self._rebac_actor
+
+    def action(self) -> str:
+        """Return the permission used to scope this queryset's rows."""
+        return self._action_for_model(self.model)
+
+    def _action_for_model(self, model: type[models.Model]) -> str:
+        return str(self._rebac_action or getattr(model._meta, "rebac_default_action", "read"))
 
     def is_sudo(self) -> bool:
         return self._rebac_sudo_reason is not None
@@ -934,12 +1795,12 @@ class RebacQuerySet(models.QuerySet[_M]):
         """``prefetch_related`` with actor-scoped querysets for protected targets."""
         if lookups == (None,):
             return self.prefetch_related(None)
-        from .relation_loading import relation_actor, scope_prefetch_lookups
+        from .relation_loading import scope_prefetch_lookups
 
         scoped = scope_prefetch_lookups(
             self.model,
             lookups,
-            actor=relation_actor(self),
+            actor=self._rebac_actor,
             mode=self._rebac_field_deny,
         )
         return self.prefetch_related(*scoped)
@@ -949,169 +1810,140 @@ class RebacQuerySet(models.QuerySet[_M]):
     def effective_actor(self, *, strict: bool = False) -> tuple[SubjectRef | None, bool]:
         """Return ``(actor_ref, is_unscoped)`` for this queryset.
 
-        ``is_unscoped`` is true when evaluation should bypass row scoping:
-        explicit queryset sudo, ambient sudo with no pinned actor, or
-        ``REBAC_STRICT_MODE=False`` with no actor. In observer mode
-        (``strict=False``), a strict-mode no-actor state returns
-        ``(None, False)`` instead of raising.
+        A related manager transfers its source instance's actor pin to a fresh
+        queryset. Django's shared database-router hints carry no authority.
+        The instance's sudo pin does not propagate. A queryset's own actor or sudo
+        pin remains authoritative. ``scoped_for_aggregate()`` fails closed
+        without an actor in either strict mode. In observer mode (``strict=False``),
+        a strict-mode no-actor state returns ``(None, False)`` instead of raising.
 
-        Resolution order: per-queryset sudo → per-queryset actor →
-        ambient sudo → ambient actor → strict-mode fallback.
+        Resolution order: queryset sudo → queryset actor → related instance
+        actor → ambient sudo → ambient actor → mode-specific fallback.
         """
-        if self._rebac_sudo_reason is not None:
-            return (None, True)
-        if self._rebac_actor is not None:
-            return (self._rebac_actor, False)
-        if _is_sudo_ambient():
-            return (None, True)
-        ambient = _current_actor()
-        if ambient is not None:
-            return (ambient, False)
-        if self._rebac_aggregate_scope:
-            return (None, False)
-        if app_settings.REBAC_STRICT_MODE:
-            if strict:
-                raise MissingActorError(
-                    f"Queryset on {self.model.__name__} materialised without an actor. "
-                    f"Use .with_actor(actor), .as_user(user), "
-                    f".as_agent(agent, on_behalf_of=user), "
-                    f"or .sudo(reason='...'). Or set REBAC_STRICT_MODE=False "
-                    f"(NOT recommended)."
-                )
-            return (None, False)
-        # STRICT_MODE=False: fall through unscoped.
-        return (None, True)
-
-    def _resolve_effective_actor(self, *, audit: bool = True) -> tuple[SubjectRef | None, bool]:
-        """Deprecated private wrapper for :meth:`effective_actor`.
-
-        Removal target: 0.14. Use ``effective_actor(strict=True)`` for
-        gate/materialisation paths or ``effective_actor()`` for observer
-        paths.
-        """
-        result = self.effective_actor(strict=True)
-        if audit:
-            self._audit_bypass_once()
-        return result
+        own_sudo = self.is_sudo()
+        pinned_actor = self._rebac_actor
+        if pinned_actor is None:
+            pinned_actor = self._rebac_relation_actor
+        return resolve(
+            pinned_actor=pinned_actor,
+            pinned_sudo=own_sudo,
+            mode="relation" if self._rebac_relation_scope and not own_sudo else "row",
+            strict=strict,
+            subject_label=f"Queryset on {self.model.__name__}",
+            fail_closed=self._rebac_aggregate_scope,
+        )
 
     _rebac_scope_applied: bool = False
     # ``(actor, bypass)`` as the scope was applied.
     _rebac_scope_decision: tuple[SubjectRef | None, bool] | None = None
 
-    def _apply_scope_in_place(self, *, audit: bool = True) -> None:
-        """Inject ``<id_attr>__in=<accessible>`` onto the query's WHERE clause.
+    def _apply_scope_in_place(self, *, audit: bool = True, prepare: bool = True) -> None:
+        """Add the compiled permission predicate to this query's WHERE clause.
 
-        ``id_attr`` defaults to ``"pk"`` but can be flipped per-model via
-        ``Meta.rebac_id_attr`` or globally via ``REBAC_RESOURCE_ID_ATTR``.
-
-        Avoids ``self.filter(...)`` because ``.get()`` pre-slices the
-        queryset and ``.filter()`` rejects post-slice. ``Q.add_q``
-        operates at the SQL level and bypasses the slice check.
-
-        ``backend().accessible()`` is memoised per-actor + action +
-        resource_type via the ambient ``_accessible_cache`` ContextVar
-        (``rebac.actors``). A single GraphQL request that materialises
-        the same scoped queryset multiple times (aggregate primary
-        + ``totalCount`` + per-measure resolvers, paginated lookups,
-        nested edges) collapses to one ``accessible()`` graph walk —
-        the underlying relationship SQL is bounded by the schema's
-        depth, not by the number of resolvers fired.
+        The predicate checks each selected row on the queryset's database
+        alias. Adding it to the underlying Query also works after ``.get()``
+        slices the queryset, when ``.filter()`` would be rejected. Prepared
+        decisions are invalidated when tracked relationships or backing rows
+        change.
         """
+        from .backends import local
+        from .watch import row_generation
+
+        generation = (local._relationship_generation, row_generation(using=self.db))
         if self._rebac_scope_applied:
-            return
-        actor, sudo = self._resolve_effective_actor(audit=audit)
+            if self._rebac_scope_generation == generation:
+                if prepare:
+                    self._prepare_applied_scope()
+                return
+            # A tracked write can invalidate a prepared lower bound. Rebuild
+            # before compilation; raw SQL writes are still checked by witnesses.
+            self._reset_scope()
+        actor, sudo = self.effective_actor(strict=True)
+        if audit:
+            self._audit_bypass_once()
         self._rebac_scope_applied = True
         self._rebac_scope_decision = (actor, sudo)
+        self._rebac_scope_generation = generation
         if sudo:
             return
-        self._scope_query(self.query, actor)
+        self._scope_query(
+            self.query, actor, prepare=prepare and not bool(self.query.combined_queries)
+        )
+        if self.query.combined_queries:
+            from .compile.read import prepare_resolved_filter, share_combined_scopes
+
+            if share_combined_scopes(self.query) is not True:
+                if prepare:
+                    for part in self.query.combined_queries:
+                        prepare_resolved_filter(part.where, part.where, self.db)
+
+    def _prepare_applied_scope(self) -> None:
+        from .compile.read import prepare_resolved_filter
+
+        if getattr(self.query, "_rebac_subject_plan", None) is not None:
+            return
+        parts = self.query.combined_queries or (self.query,)
+        for part in parts:
+            prepare_resolved_filter(part.where, part.where, self.db)
 
     @schema_operation
-    def _scope_query(self, query: Query, actor: SubjectRef | None) -> None:
-        for operand in _nested_queries(query.where, boolean_operands_only=True):
-            self._scope_query(operand, actor)
-            if isinstance(operand, _RebacQuery):
-                operand._rebac_check = (self, actor)
-                operand._rebac_checked = False
-        if query.combined_queries:
-            for part in query.combined_queries:
-                self._scope_query(part, actor)
-            return
-        model = query.model
-        if model is None:
-            return
-        rebac_type = model_resource_type(model)
-        if not rebac_type:
-            return
-        if actor is None:
-            # Aggregate projection is fail-closed regardless of strict mode.
-            query.where = WhereNode([query.where, _ScopeWhere(children=[NothingNode()])])
-            return
-        from django.db.models import Q
+    def _scope_query(
+        self,
+        query: Query,
+        actor: SubjectRef | None,
+        *,
+        prepare: bool = True,
+        fallback: bool = False,
+    ) -> None:
+        with database_context(self.db):
+            for operand in _nested_queries(query.where, boolean_operands_only=True):
+                self._scope_query(operand, actor, prepare=prepare, fallback=fallback)
+                if isinstance(operand, _RebacQuery):
+                    operand._rebac_check = (self, actor)
+                    operand._rebac_checked = False
+            if query.combined_queries:
+                for part in query.combined_queries:
+                    self._scope_query(part, actor, prepare=False, fallback=True)
+                return
+            model = query.model
+            if model is None:
+                return
+            rebac_type = model_resource_type(model)
+            if not rebac_type:
+                return
+            if actor is None:
+                # Aggregate projection is fail-closed regardless of strict mode.
+                query.where = WhereNode([query.where, _ScopeWhere(children=[NothingNode()])])
+                return
+            from .backends import backend
 
-        from .backends import backend
-
-        action = str(self._rebac_action or getattr(model._meta, "rebac_default_action", "read"))
-        active_backend = backend()
-        predicate = active_backend.queryset_filter(
-            model=model, subject=actor, action=action, using=self.db
-        )
-        if predicate is not None:
-            restriction = query.build_where(predicate)
-            query.where = WhereNode([query.where, _ScopeWhere(children=[restriction])])
-            return
-        if backend_grants_all(
-            active_backend,
-            subject=actor,
-            action=action,
-            resource_type=rebac_type,
-        ):
-            return
-        ids: list[Any] = list(
-            accessible_ids(
-                active_backend,
-                subject=actor,
-                action=action,
-                resource_type=rebac_type,
+            action = self._action_for_model(model)
+            active_backend = backend()
+            predicate = active_backend.queryset_filter(
+                model=model, subject=actor, action=action, using=self.db
             )
-        )
-        attr = resource_id_attr(model)
-        if attr == "pk":
-            # Coerce to ints when the PK is integer-typed; leave as
-            # strings for UUID/Char PKs. Only relevant for the pk path
-            # — non-pk attrs (sqid, public_id, slug) are always
-            # string-valued and pass through unchanged.
-            try:
-                pk_field = model._meta.pk
-                if pk_field is not None and pk_field.get_internal_type() in (
-                    "AutoField",
-                    "BigAutoField",
-                    "IntegerField",
-                    "BigIntegerField",
-                    "SmallIntegerField",
-                    "PositiveIntegerField",
-                    "PositiveBigIntegerField",
-                    "PositiveSmallIntegerField",
-                ):
-                    ids = [int(i) for i in ids]
-            except ValueError:
-                pass
-            except TypeError:
-                pass
-        # ``Q.add_q`` works even on sliced queries.
-        restriction = query.build_where(Q(**{f"{attr}__in": ids}))
-        # Keep the authorization clause identifiable, including in Django's
-        # cloned/combined WHERE trees, so changing actor cannot intersect stale
-        # permission IDs with the new actor's scope.
-        query.where = WhereNode([query.where, _ScopeWhere(children=[restriction])])
+            # `_apply_scope_in_place`, including its embedded-queryset
+            # path in `_RebacQuery.resolve_expression`, owns preparation
+            # on this resolved alias. The expression keeps the result.
+            from .compile.read import prepare_resolved_filter
+
+            assert predicate is not None
+            restriction = query.build_where(predicate)
+            prepare_resolved_filter(
+                restriction, query.where, self.db, prepare=prepare, fallback=fallback
+            )
+            query.where = WhereNode([query.where, _ScopeWhere(children=[restriction])])
 
     def _clone(self, **kwargs: Any) -> Self:
         # Django's private clone hook; not in django-stubs.
         clone: Self = cast(Any, super())._clone(**kwargs)
         clone._rebac_actor = self._rebac_actor
+        clone._rebac_relation_actor = self._rebac_relation_actor
+        clone._rebac_relation_scope = self._rebac_relation_scope
         clone._rebac_action = self._rebac_action
         clone._rebac_sudo_reason = self._rebac_sudo_reason
         clone._rebac_sudo_audited = self._rebac_sudo_audited
+        clone._rebac_bypass_entry = self._rebac_bypass_entry
         clone._rebac_internal_bypass = self._rebac_internal_bypass
         clone._rebac_ambient_bypass = self._rebac_ambient_bypass
         clone._rebac_field_deny = self._rebac_field_deny
@@ -1120,6 +1952,7 @@ class RebacQuerySet(models.QuerySet[_M]):
         clone._rebac_aggregate_scope = self._rebac_aggregate_scope
         clone._rebac_scope_applied = self._rebac_scope_applied
         clone._rebac_scope_decision = self._rebac_scope_decision
+        clone._rebac_scope_generation = self._rebac_scope_generation
         if not self._rebac_eager_scope:
             clone._reset_scope()
         return clone
@@ -1149,6 +1982,8 @@ class RebacQuerySet(models.QuerySet[_M]):
         if isinstance(query, _RebacQuery):
             query._rebac_boolean_operand = False
         clone._rebac_actor = self._rebac_actor
+        clone._rebac_relation_actor = self._rebac_relation_actor
+        clone._rebac_relation_scope = self._rebac_relation_scope
         clone._rebac_action = self._rebac_action
         clone._rebac_sudo_reason = self._rebac_sudo_reason
         clone._rebac_eager_scope = self._rebac_eager_scope
@@ -1201,9 +2036,18 @@ class RebacQuerySet(models.QuerySet[_M]):
     def _combinator_query(
         self, combinator: str, *other_qs: Any, all: bool = False
     ) -> RebacQuerySet[_M]:
+        other_qs = _relabel_combined_owners(self.query, other_qs)
         combined: RebacQuerySet[_M] = super()._combinator_query(combinator, *other_qs, all=all)  # type: ignore[misc]
         combined._refresh_scope()
+        if combined._rebac_scope_applied and combined.query.combined_queries:
+            from .compile.read import share_combined_scopes
+
+            share_combined_scopes(combined.query)
         return combined
+
+    def _gated_read_fields(self) -> frozenset[str]:
+        with database_context(self.db):
+            return gated_read_fields(self.model)
 
     def _effective_field_mode(self) -> FieldDenyMode:
         return effective_field_deny_mode(self._rebac_field_deny)
@@ -1218,74 +2062,77 @@ class RebacQuerySet(models.QuerySet[_M]):
         query: Query | None = None,
         clears_ordering: bool | None = None,
     ) -> None:
-        query = self.query if query is None else query
-        self._guard_clause_field_reads(actor, sudo, query=query, clears_ordering=clears_ordering)
-        selected = dict(query.annotation_select)
-        if expressions:
-            selected.update(expressions)
-        # Root bypass never carries across the protected relation boundary.
-        self._guard_projected_related_reads(selected, query=query)
-        if actor is None or sudo:
-            return
-        if runtime_field_deny_mode(self._effective_field_mode()) == "allow":
-            return
-        for part in _selections(query):
-            if part.model is None:
-                continue
-            if part is not query:
-                computed = dict(part.annotation_select)
-                columns: Iterable[Any] = part.select
-                literal = _hand_written_selection(part, self.db)
-            elif query.combinator:
-                # A combination runs its operands; of its own it adds only
-                # the values computed over their rows.
-                computed, columns, literal = dict(expressions or {}), (), False
-            else:
-                computed, columns = selected, query.select
-                literal = _hand_written_selection(query, self.db)
-            if literal or any(_has_opaque_write_expression(v) for v in computed.values()):
-                raise PermissionDenied(
-                    f"Cannot select hand-written SQL on {part.model.__name__} under an actor: "
-                    "it can read any column, so field read gates cannot be checked. "
-                    "Read it under sudo(reason=...), or select the columns through "
-                    "ORM expressions."
-                )
-            if part is not query and query.selected is None and part.selected is None:
-                # The rows of an operand become instances of the first
-                # operand's model column by column, so a gated value can land
-                # in a field that is not redacted.  No layout is worked out
-                # here: the operands load every field of that one model.
-                plain = (
-                    part.model._meta.concrete_model is self.model._meta.concrete_model
-                    and part.deferred_loading == _EVERY_FIELD
-                    and query.deferred_loading == _EVERY_FIELD
-                )
-                related = bool(part.select_related or query.select_related)
-                if (not plain or related) and (
-                    related or gated_read_fields(self.model) or gated_read_fields(part.model)
-                ):
-                    raise PermissionDenied(
-                        f"Cannot combine {part.model.__name__} rows into "
-                        f"{self.model.__name__} instances under field read enforcement: "
-                        "the operands of a combination that returns model instances must "
-                        "load every field of one model, without only(), defer() or "
-                        "select_related(). Combine values() projections instead."
-                    )
-            for model, requested in sorted(
-                _selected_gated(
-                    part.model, (*columns, *computed.values()), query, reader=actor
-                ).items(),
-                key=lambda item: item[0]._meta.label_lower,
-            ):
-                hidden = _hidden_from(actor, model, requested)
-                if not hidden:
+        with database_context(self.db):
+            query = self.query if query is None else query
+            self._guard_clause_field_reads(
+                actor, sudo, query=query, clears_ordering=clears_ordering
+            )
+            selected = dict(query.annotation_select)
+            if expressions:
+                selected.update(expressions)
+            # Root bypass never carries across the protected relation boundary.
+            self._guard_projected_related_reads(selected, query=query)
+            if actor is None or sudo:
+                return
+            if runtime_field_deny_mode(self._effective_field_mode()) == "allow":
+                return
+            for part in _selections(query):
+                if part.model is None:
                     continue
-                names = ", ".join(f"read__{name}" for name in hidden)
-                raise PermissionDenied(
-                    f"Cannot project gated field(s) {names} on {model.__name__}: "
-                    "field read enforcement requires model-instance materialisation "
-                    "or a projection that omits gated fields."
-                )
+                if part is not query:
+                    computed = dict(part.annotation_select)
+                    columns: Iterable[Any] = part.select
+                    literal = _hand_written_selection(part, self.db)
+                elif query.combinator:
+                    # A combination runs its operands; of its own it adds only
+                    # the values computed over their rows.
+                    computed, columns, literal = dict(expressions or {}), (), False
+                else:
+                    computed, columns = selected, query.select
+                    literal = _hand_written_selection(query, self.db)
+                if literal or any(_has_opaque_write_expression(v) for v in computed.values()):
+                    raise PermissionDenied(
+                        f"Cannot select hand-written SQL on {part.model.__name__} under an actor: "
+                        "it can read any column, so field read gates cannot be checked. "
+                        "Read it under sudo(reason=...), or select the columns through "
+                        "ORM expressions."
+                    )
+                if part is not query and query.selected is None and part.selected is None:
+                    # The rows of an operand become instances of the first
+                    # operand's model column by column, so a gated value can land
+                    # in a field that is not redacted.  No layout is worked out
+                    # here: the operands load every field of that one model.
+                    plain = (
+                        part.model._meta.concrete_model is self.model._meta.concrete_model
+                        and part.deferred_loading == _EVERY_FIELD
+                        and query.deferred_loading == _EVERY_FIELD
+                    )
+                    related = bool(part.select_related or query.select_related)
+                    if (not plain or related) and (
+                        related or gated_read_fields(self.model) or gated_read_fields(part.model)
+                    ):
+                        raise PermissionDenied(
+                            f"Cannot combine {part.model.__name__} rows into "
+                            f"{self.model.__name__} instances under field read enforcement: "
+                            "the operands of a combination that returns model instances must "
+                            "load every field of one model, without only(), defer() or "
+                            "select_related(). Combine values() projections instead."
+                        )
+                for model, requested in sorted(
+                    _selected_gated(
+                        part.model, (*columns, *computed.values()), query, reader=actor
+                    ).items(),
+                    key=lambda item: item[0]._meta.label_lower,
+                ):
+                    hidden = _hidden_from(actor, model, requested)
+                    if not hidden:
+                        continue
+                    names = ", ".join(f"read__{name}" for name in hidden)
+                    raise PermissionDenied(
+                        f"Cannot project gated field(s) {names} on {model.__name__}: "
+                        "field read enforcement requires model-instance materialisation "
+                        "or a projection that omits gated fields."
+                    )
 
     @schema_operation
     def _guard_clause_field_reads(
@@ -1306,126 +2153,149 @@ class RebacQuerySet(models.QuerySet[_M]):
         reveal it.  An actor whose permission on the field does not depend on
         the row reads it everywhere and is not refused.
         """
-        for nested in _nested_queries(self.query if query is None else query):
-            _check_subquery(nested)
-        if actor is None or sudo:
-            return
-        if runtime_field_deny_mode(self._effective_field_mode()) == "allow":
-            return
-        query = self.query if query is None else query
-        if query.model is None:
-            return
-        expressions, literal = _clause_expressions(query, self.db, clears_ordering=clears_ordering)
-        if literal:
-            raise PermissionDenied(
-                f"Cannot filter or order by hand-written SQL on {query.model.__name__} under an "
-                "actor: it can read any column, so field read gates cannot be checked. Run it "
-                "under sudo(reason=...), or filter through ORM expressions."
+        with database_context(self.db):
+            for nested in _nested_queries(self.query if query is None else query):
+                _check_subquery(nested)
+            if actor is None or sudo:
+                return
+            if runtime_field_deny_mode(self._effective_field_mode()) == "allow":
+                return
+            query = self.query if query is None else query
+            if query.model is None:
+                return
+            expressions, literal = _clause_expressions(
+                query, self.db, clears_ordering=clears_ordering
             )
-        for model, requested in sorted(
-            _selected_gated(query.model, expressions, query, reader=actor).items(),
-            key=lambda item: item[0]._meta.label_lower,
-        ):
-            hidden = _hidden_from(actor, model, requested)
-            if hidden:
-                names = ", ".join(f"read__{name}" for name in hidden)
+            if literal:
                 raise PermissionDenied(
-                    f"Cannot filter or order by gated field(s) {names} on {model.__name__} under "
-                    "an actor: the rows matched, their number and their order would reveal the "
-                    "values. Filter on another column, or run it under sudo(reason=...)."
+                    f"Cannot filter or order by hand-written SQL on {query.model.__name__} under an "
+                    "actor: it can read any column, so field read gates cannot be checked. Run it "
+                    "under sudo(reason=...), or filter through ORM expressions."
                 )
+            for model, requested in sorted(
+                _selected_gated(query.model, expressions, query, reader=actor).items(),
+                key=lambda item: item[0]._meta.label_lower,
+            ):
+                hidden = _hidden_from(actor, model, requested)
+                if hidden:
+                    names = ", ".join(f"read__{name}" for name in hidden)
+                    raise PermissionDenied(
+                        f"Cannot filter or order by gated field(s) {names} on {model.__name__} under "
+                        "an actor: the rows matched, their number and their order would reveal the "
+                        "values. Filter on another column, or run it under sudo(reason=...)."
+                    )
 
     def _guard_projected_related_reads(self, expressions: dict[str, Any], *, query: Query) -> None:
-        if not self._rebac_select_related_guards:
-            return
-        from .relation_loading import protected_lookup_prefixes
+        with database_context(self.db):
+            if not self._rebac_select_related_guards:
+                return
+            from .relation_loading import _relation_scope, protected_lookup_prefixes
 
-        paths = {
-            path
-            for guard in self._rebac_select_related_guards
-            for path, _ in protected_lookup_prefixes(self.model, guard)
-        }
-        guarded = tuple(f"{path}__" for path in sorted(paths))
-        raw_fields = getattr(self, "_fields", None)
-        related = {
-            field
-            for field in raw_fields or ()
-            if isinstance(field, str) and any(field.startswith(prefix) for prefix in guarded)
-        }
-        for name, expression in expressions.items():
-            for column in _expression_columns(expression):
-                path = _column_relation_path(query, column)
-                if path in paths or any(path.startswith(prefix) for prefix in guarded):
-                    related.add(name)
-        if not related:
-            return
-        names = ", ".join(sorted(related)[:5])
-        raise PermissionDenied(
-            f"Cannot project related field(s) {names}: rebac_select_related() "
-            "enforcement requires model-instance materialisation."
-        )
+            if _relation_scope(self)[1]:
+                return
+
+            paths = {
+                path
+                for guard in self._rebac_select_related_guards
+                for path, _ in protected_lookup_prefixes(self.model, guard)
+            }
+            guarded = tuple(f"{path}__" for path in sorted(paths))
+            raw_fields = getattr(self, "_fields", None)
+            related = {
+                field
+                for field in raw_fields or ()
+                if isinstance(field, str) and any(field.startswith(prefix) for prefix in guarded)
+            }
+            for name, expression in expressions.items():
+                for column in _expression_columns(expression):
+                    path = _column_relation_path(query, column)
+                    if path in paths or any(path.startswith(prefix) for prefix in guarded):
+                        related.add(name)
+            if not related:
+                return
+            names = ", ".join(sorted(related)[:5])
+            raise PermissionDenied(
+                f"Cannot project related field(s) {names}: rebac_select_related() "
+                "enforcement requires model-instance materialisation."
+            )
 
     @schema_operation
     def _fetch_all(self) -> None:
         """Keep guards, SQL compilation and nested prefetches in one evaluation."""
-        fetching = self._result_cache is None
-        if fetching:
-            self._apply_scope_in_place()
-        actor, sudo = self._resolve_effective_actor()
-        if fetching:
-            # Rows already held were guarded by the evaluation that read them.
+        with database_context(self.db):
+            native = cast(Any, self)
+            fetching = self._result_cache is None
+            if fetching:
+                self._apply_scope_in_place()
+            # Django prefetch caches reuse a population's already-audited read.
+            actor, sudo = self.effective_actor(strict=True)
+            if fetching:
+                self._audit_bypass_once()
+                # Rows already held were guarded by the evaluation that read them.
+                self._guard_projected_field_reads(actor, sudo)
+                self._result_cache = list(native._iterable_class(self))
+            if self._result_cache is not None and not self._rebac_visibility_applied:
+                if actor is not None and not sudo:
+                    for inst in self._result_cache:
+                        if isinstance(inst, models.Model):
+                            inst._rebac_actor = actor  # type: ignore[attr-defined]
+                            inst._rebac_field_deny = self._rebac_field_deny  # type: ignore[attr-defined]
+            if native._prefetch_related_lookups and not native._prefetch_done:
+                native._prefetch_related_objects()
+            if self._result_cache is not None and not self._rebac_visibility_applied:
+                if actor is not None and not sudo:
+                    apply_field_visibility(
+                        self._result_cache,
+                        model=self.model,
+                        actor=actor,
+                        mode=self._effective_field_mode(),
+                        using=self.db,
+                    )
+                self._guard_selected_related_reads()
+                self._rebac_visibility_applied = True
+
+    @schema_operation
+    def iterator(self, *args: Any, **kwargs: Any) -> Any:
+        with database_context(self.db):
+            if self._result_cache is None:
+                self._apply_scope_in_place()
+            actor, sudo = self.effective_actor(strict=True)
+            self._audit_bypass_once()
             self._guard_projected_field_reads(actor, sudo)
-        super()._fetch_all()
-        if self._result_cache is not None and not self._rebac_visibility_applied:
+            rows = list(super().iterator(*args, **kwargs))
             if actor is not None and not sudo:
-                for inst in self._result_cache:
+                for inst in rows:
                     if isinstance(inst, models.Model):
                         inst._rebac_actor = actor  # type: ignore[attr-defined]
                         inst._rebac_field_deny = self._rebac_field_deny  # type: ignore[attr-defined]
                 apply_field_visibility(
-                    self._result_cache,
+                    rows,
                     model=self.model,
                     actor=actor,
                     mode=self._effective_field_mode(),
+                    using=self.db,
                 )
-            self._guard_selected_related_reads()
-            self._rebac_visibility_applied = True
-
-    @schema_operation
-    def iterator(self, *args: Any, **kwargs: Any) -> Any:
-        if self._result_cache is None:
-            self._apply_scope_in_place()
-        actor, sudo = self._resolve_effective_actor()
-        self._guard_projected_field_reads(actor, sudo)
-        rows = list(super().iterator(*args, **kwargs))
-        if actor is not None and not sudo:
-            for inst in rows:
-                if isinstance(inst, models.Model):
-                    inst._rebac_actor = actor  # type: ignore[attr-defined]
-                    inst._rebac_field_deny = self._rebac_field_deny  # type: ignore[attr-defined]
-            apply_field_visibility(
-                rows,
-                model=self.model,
-                actor=actor,
-                mode=self._effective_field_mode(),
-            )
-        self._guard_selected_related_reads(rows)
-        return iter(rows)
+            self._guard_selected_related_reads(rows)
+            return iter(rows)
 
     def _guard_selected_related_reads(self, rows: Iterable[Any] | None = None) -> None:
-        if not self._rebac_select_related_guards:
-            return
-        from .relation_loading import guard_selected_related_instances, relation_actor
+        with database_context(self.db):
+            if not self._rebac_select_related_guards:
+                return
+            from .relation_loading import _relation_scope, guard_selected_related_instances
 
-        if rows is None:
-            rows = self._result_cache or ()
-        guard_selected_related_instances(
-            rows,
-            root_model=self.model,
-            paths=self._rebac_select_related_guards,
-            actor=relation_actor(self),
-            mode=self._effective_field_mode(),
-        )
+            if rows is None:
+                rows = self._result_cache or ()
+            actor, bypass = _relation_scope(self)
+            guard_selected_related_instances(
+                rows,
+                root_model=self.model,
+                paths=self._rebac_select_related_guards,
+                actor=actor,
+                bypass=bypass,
+                mode=self._effective_field_mode(),
+                using=self.db,
+            )
 
     # ----- Async iteration: Django's aiterator bypasses the sync overrides -----
 
@@ -1450,14 +2320,15 @@ class RebacQuerySet(models.QuerySet[_M]):
         """
         if self._result_cache is None:
             await sync_to_async(self._apply_scope_in_place)()
-        actor, sudo = self._resolve_effective_actor()
+        actor, sudo = self.effective_actor(strict=True)
+        self._audit_bypass_once()
         # DB-backed schemas refresh at operation boundaries. Field discovery
         # and projection guards therefore need the same worker thread as the
         # scope/visibility checks, even when the schema was loaded just above.
         await sync_to_async(self._guard_projected_field_reads)(actor, sudo)
         field_mode = self._effective_field_mode()
         redact = runtime_field_deny_mode(field_mode) != "allow" and bool(
-            await sync_to_async(gated_read_fields)(self.model)
+            await sync_to_async(self._gated_read_fields)()
         )
         guard_related = bool(self._rebac_select_related_guards)
         async for inst in super().aiterator(*args, **kwargs):
@@ -1466,7 +2337,7 @@ class RebacQuerySet(models.QuerySet[_M]):
                 inst._rebac_field_deny = self._rebac_field_deny  # type: ignore[attr-defined]
                 if redact:
                     await sync_to_async(apply_field_visibility)(
-                        [inst], model=self.model, actor=actor, mode=field_mode
+                        [inst], model=self.model, actor=actor, mode=field_mode, using=self.db
                     )
             if guard_related:
                 await sync_to_async(self._guard_selected_related_reads)([inst])
@@ -1479,14 +2350,16 @@ class RebacQuerySet(models.QuerySet[_M]):
             return len(self._result_cache)
         self._apply_scope_in_place()
         # Django keeps the ordering of a sliced query.
-        self._guard_counted_reads(*self._resolve_effective_actor(), clears_ordering=False)
+        self._audit_bypass_once()
+        self._guard_counted_reads(*self.effective_actor(strict=True), clears_ordering=False)
         return super().count()
 
     def exists(self) -> bool:
         if self._result_cache is not None:
             return bool(self._result_cache)
         self._apply_scope_in_place()
-        self._guard_counted_reads(*self._resolve_effective_actor(), clears_ordering=True)
+        self._audit_bypass_once()
+        self._guard_counted_reads(*self.effective_actor(strict=True), clears_ordering=True)
         return super().exists()
 
     def _guard_counted_reads(
@@ -1494,24 +2367,26 @@ class RebacQuerySet(models.QuerySet[_M]):
     ) -> None:
         """A count or an existence test reads what the query filters on, and the
         selected values only when its rows are distinct, grouped or combined."""
-        query = self.query
-        if query.distinct or query.group_by is not None or query.combinator:
-            self._guard_projected_field_reads(actor, sudo, clears_ordering=clears_ordering)
-        else:
-            self._guard_clause_field_reads(actor, sudo, clears_ordering=clears_ordering)
+        with database_context(self.db):
+            query = self.query
+            if query.distinct or query.group_by is not None or query.combinator:
+                self._guard_projected_field_reads(actor, sudo, clears_ordering=clears_ordering)
+            else:
+                self._guard_clause_field_reads(actor, sudo, clears_ordering=clears_ordering)
 
     def aggregate(self, *args: Any, **kwargs: Any) -> dict[str, Any]:
         """Aggregate over the actor's scope, not the whole table.
 
         Django computes ``aggregate`` against ``self.query`` directly, so it
         never triggers ``_fetch_all`` / ``iterator``. Without scoping the WHERE
-        clause first, ``SomeModel.objects.as_user(u).aggregate(Count("pk"))``
+        clause first, ``SomeModel.objects.with_actor(u).aggregate(Count("pk"))``
         would summarise rows ``u`` cannot read (and ``aaggregate`` — a
         ``sync_to_async`` wrapper around this method — would leak the same way).
         Applying scope here fixes both surfaces.
         """
         self._apply_scope_in_place()
-        actor, sudo = self._resolve_effective_actor()
+        actor, sudo = self.effective_actor(strict=True)
+        self._audit_bypass_once()
         if self._rebac_select_related_guards or (
             actor is not None
             and not sudo
@@ -1572,293 +2447,107 @@ class RebacQuerySet(models.QuerySet[_M]):
             )
         from .mixins import insertion_scope
 
-        actor, unscoped = self._resolve_effective_actor()
+        actor, unscoped = self.effective_actor(strict=True)
+        self._audit_bypass_once()
         obj._rebac_actor = actor  # type: ignore[attr-defined]
         obj._rebac_sudo_reason = None  # type: ignore[attr-defined]
         with insertion_scope(obj, actor, unscoped):
             obj.save(force_insert=True, using=self.db)
         return obj
 
-    def bulk_create(
+    _actor_scoped_writes: ClassVar[bool] = True
+
+    def _write_scope(self, step: _WriteStep) -> tuple[SubjectRef | None, bool]:
+        actor, bypass = self.effective_actor(strict=True)
+        self._audit_bypass_once()
+        return actor, bypass
+
+    def _write_rows(self, actor: SubjectRef | None, step: _WriteStep) -> RebacQuerySet[_M]:
+        action = "delete" if step is _WriteStep.DELETE else "update"
+        return self._rows_in_scope(self._writing_actor(actor), reason=f"rebac.{action}.rows")
+
+    def _guard_rows(
         self,
-        objs: Iterable[_M],
-        batch_size: int | None = None,
-        ignore_conflicts: bool = False,
+        step: _WriteStep,
+        actor: SubjectRef | None,
+        bypass: bool,
+        *,
+        rows: TrackedQuerySet[_M] | None = None,
+        candidates: list[_M] | None = None,
+        kwargs: dict[str, Any] | None = None,
+        watched: bool = False,
         update_conflicts: bool = False,
         update_fields: Collection[str] | None = None,
-        unique_fields: Collection[str] | None = None,
-    ) -> list[_M]:
-        from .signals import audit_backed_denials
-        from .watch import model_write
-
-        self._for_write = True
-        with audit_backed_denials(), model_write(model=self.model, using=self.db):
-            return self._rebac_bulk_create(
-                list(objs),
-                batch_size,
-                ignore_conflicts,
-                update_conflicts,
-                update_fields,
-                unique_fields,
-            )
-
-    def _rebac_bulk_create(
-        self,
-        objs: Iterable[_M],
-        batch_size: int | None = None,
-        ignore_conflicts: bool = False,
-        update_conflicts: bool = False,
-        update_fields: Collection[str] | None = None,
-        unique_fields: Collection[str] | None = None,
-    ) -> list[_M]:
-        """Authorize inserts before Django's signal-free bulk path runs."""
-        self._for_write = True
-        candidates = list(objs)
-        for candidate in candidates:
-            if type(candidate) is not self.model:
-                raise TypeError(
-                    f"{self.model.__name__}.bulk_create() accepts only exact "
-                    f"{self.model.__name__} instances; got {type(candidate).__name__}."
-                )
-        actor, unscoped = self._resolve_effective_actor()
+    ) -> None:
+        from .preflight import _check_new_model
         from .signals import _gate_backed_rows
 
-        _gate_backed_rows(candidates, using=self.db, actor=actor, bypass=unscoped)
-        rebac_type = model_resource_type(self.model)
-        if not unscoped and rebac_type:
-            if actor is None:
-                raise MissingActorError(
-                    f"{self.model.__name__}.bulk_create() called with no actor."
-                )
-            from .preflight import _check_new_model
-
-            for candidate in candidates:
-                result = _check_new_model(candidate, subject=actor, using=self.db)
-                if not result.allowed:
-                    raise PermissionDenied(
-                        f"Denied: {actor} cannot create a proposed {rebac_type} row."
-                    )
-        if update_conflicts and not unscoped and model_resource_type(self.model):
-            raise PermissionDenied(
-                "Actor-scoped bulk_create(update_conflicts=True) cannot check write "
-                "permissions on conflicting rows. Use checked saves or explicit sudo."
-            )
-        rows = super().bulk_create(
-            candidates,
-            batch_size=batch_size,
-            ignore_conflicts=ignore_conflicts,
-            update_conflicts=update_conflicts,
-            update_fields=update_fields,
-            unique_fields=unique_fields,
-        )
-        if actor is not None and not unscoped:
-            for row in rows:
-                row._rebac_actor = actor  # type: ignore[attr-defined]
-                row._rebac_sudo_reason = None  # type: ignore[attr-defined]
-        return rows
-
-    def update(self, **kwargs: Any) -> int:
-        from .signals import _gate_backed_rows, audit_backed_denials
-        from .watch import by_key, model_write, statement_keys
-
-        if self.query.combinator or self.query.is_sliced:
-            # Django refuses these before it reads a row.
-            return super().update(**kwargs)
-        self._for_write = True
-        with (
-            audit_backed_denials(),
-            model_write(model=self.model, using=self.db, names=kwargs) as watched,
-        ):
-            actor, bypass = self._resolve_effective_actor()
-            if bypass or not (watched or model_resource_type(self.model)):
-                return self._rebac_update(**kwargs)
+        if step is _WriteStep.UPDATE_CLAUSE:
             if self.query.distinct_fields:
-                # Django's UPDATE writes every matching row; DISTINCT ON would
-                # select one per value, so the rows checked would not be the
-                # rows written.  Django refuses it for delete() as well.
                 raise TypeError("Cannot call update() after .distinct(*fields) under an actor.")
-            # Before any row is selected: a refusal must not depend on a match.
             self._guard_clause_field_reads(actor, bypass, query=self._update_query())
-            # The statement acts on the rows the actor's scope admits: exactly
-            # those are gated and written, by key.
-            keys = statement_keys(
-                self._rows_in_scope(self._writing_actor(actor), reason="rebac.write.rows")
-            )
-            if watched:
-                for rows in by_key(self.model._base_manager.using(self.db), keys):
-                    _gate_backed_rows(
-                        rows,
-                        using=self.db,
-                        names=kwargs,
-                        proposed=kwargs,
-                        actor=actor,
-                        bypass=bypass,
+        elif step is _WriteStep.DELETE_CLAUSE:
+            self._guard_clause_field_reads(actor, bypass, clears_ordering=True)
+        elif step is _WriteStep.UPDATE or step is _WriteStep.DELETE:
+            if not isinstance(rows, RebacQuerySet):
+                raise TypeError("An actor-scoped write requires a RebacQuerySet.")
+            if actor is None or not model_resource_type(self.model):
+                return
+            rows._guard_bulk_action(actor, "write" if step is _WriteStep.UPDATE else "delete")
+            if step is _WriteStep.UPDATE and kwargs is not None:
+                rows._guard_bulk_field_writes(actor, kwargs)
+                rows._guard_bulk_expression_reads(actor, kwargs)
+        elif step is _WriteStep.CREATE:
+            if candidates is None:
+                raise TypeError("bulk_create requires candidate rows")
+            for candidate in candidates:
+                if type(candidate) is not self.model:
+                    raise TypeError(
+                        f"{self.model.__name__}.bulk_create() accepts only exact "
+                        f"{self.model.__name__} instances; got {type(candidate).__name__}."
                     )
-            written = sum(rows._rebac_update(**kwargs) for rows in by_key(self, keys))
-            self._result_cache = None
-            return written
-
-    def bulk_update(
-        self, objs: Iterable[_M], fields: Iterable[str], batch_size: int | None = None
-    ) -> int:
-        from .signals import audit_backed_denials
-        from .watch import model_write
-
-        self._for_write = True
-        # Django dispatches batches through update(); this outer owner keeps
-        # all batches in one transaction.
-        field_names = tuple(fields)
-        with (
-            audit_backed_denials(),
-            model_write(model=self.model, using=self.db, names=field_names),
-        ):
-            return super().bulk_update(objs, field_names, batch_size=batch_size)
+            _gate_backed_rows(candidates, using=self.db, actor=actor, bypass=bypass)
+            rebac_type = model_resource_type(self.model)
+            if not bypass and rebac_type:
+                if actor is None:
+                    raise MissingActorError(
+                        f"{self.model.__name__}.bulk_create() called with no actor."
+                    )
+                for candidate in candidates:
+                    if not _check_new_model(candidate, subject=actor, using=self.db).allowed:
+                        raise PermissionDenied(
+                            f"Denied: {actor} cannot create a proposed {rebac_type} row."
+                        )
+            if update_conflicts and not bypass and rebac_type:
+                raise PermissionDenied(
+                    "Actor-scoped bulk_create(update_conflicts=True) cannot check write "
+                    "permissions on conflicting rows. Use checked saves or explicit sudo."
+                )
 
     def _update_query(self) -> Query:
-        """The query an ``UPDATE`` reads: an explicit ordering stays (MySQL emits
-        it, so the order of the writes, and which one fails a unique constraint
-        first, follows it); a model's default ordering does not."""
+        """The query an UPDATE reads without model default ordering."""
         query = self.query.clone()
         query.default_ordering = False
         return query
 
-    def _rebac_update(self, **kwargs: Any) -> int:
-        from .watch import gate_policy, refuse_moving_edges
-
-        actor, sudo = self._resolve_effective_actor()
-        if sudo:
-            return super().update(**kwargs)
-        refuse_moving_edges(gate_policy(self.db), self.model, kwargs)
-        self._guard_clause_field_reads(actor, sudo, query=self._update_query())
-        rebac_type = model_resource_type(self.model)
-        if rebac_type:
-            from .compile.read import deciding_afresh
-
-            # A write gate decides afresh, never through rows a scope kept.
-            with deciding_afresh():
-                self._guard_bulk_action(actor, "write")  # type: ignore[arg-type]
-                # Per-field write gates — same all-or-nothing semantics as the
-                # resource-level write check above. For each kwarg whose field
-                # has a ``write__<f>`` permission declared, every affected row
-                # must also pass that check.
-                self._guard_bulk_field_writes(actor, kwargs)  # type: ignore[arg-type]
-                self._guard_bulk_expression_reads(actor, kwargs)  # type: ignore[arg-type]
-        return super().update(**kwargs)
-
-    def delete(self) -> tuple[int, dict[str, int]]:
-        from .watch import by_key, model_write, statement_keys
-
-        if (
-            self.query.combinator
-            or self.query.is_sliced
-            or self.query.distinct_fields
-            or getattr(self, "_fields", None) is not None
-        ):
-            # Django refuses these before it reads a row.
-            return super().delete()
-        self._for_write = True
-        with model_write(model=self.model, using=self.db):
-            from .mixins import deletion_owner
-
-            actor, unscoped = self._resolve_effective_actor()
-            self._guard_clause_field_reads(actor, unscoped, clears_ordering=True)
-            if unscoped or not model_resource_type(self.model):
-                with deletion_owner(self, self.db, actor, unscoped):
-                    return super().delete()
-            from .compile.read import deciding_afresh
-
-            # The statement acts on the rows the actor's scope admits: exactly
-            # those are checked and deleted, by key.  A cascade that reaches
-            # another row checks it as an instance delete does.
-            actor = self._writing_actor(actor)
-            keys = statement_keys(self._rows_in_scope(actor, reason="rebac.delete.rows"))
-            parts = list(by_key(self, keys))
-            with deciding_afresh():
-                for rows in parts:
-                    rows._guard_bulk_action(actor, "delete")
-            deleted: Counter[str] = Counter()
-            for rows in parts:
-                with deletion_owner(rows, self.db, actor, unscoped):
-                    deleted.update(models.QuerySet.delete(rows)[1])
-            self._result_cache = None
-            return sum(deleted.values()), dict(deleted)
-
     def _guard_bulk_action(self, actor: SubjectRef, action: str) -> None:
-        from .backends import backend
+        with database_context(self.db):
+            from .backends import backend
 
-        rebac_type = model_resource_type(self.model)
-        if not rebac_type:
-            return
-        # Pre-fetch ids in scope, intersect with allowed.
-        affected = self._affected_resource_ids_for_guard()
-        if not affected:
-            return
-        allowed = set(backend().accessible(subject=actor, action=action, resource_type=rebac_type))
-        denied = affected - allowed
-        if denied:
-            raise PermissionDenied(
-                f"Bulk {action}: row outside actor scope. Bulk operations are all-or-nothing."
-            )
-
-    def _guard_bulk_field_writes(self, actor: SubjectRef, kwargs: dict[str, Any]) -> None:
-        """Per-field write enforcement for bulk ``QuerySet.update()``.
-
-        Mirrors the per-field gate run in ``RebacMixin.save_base``: for each
-        ``f`` in ``kwargs`` whose resource type declares a permission
-        named ``write__<f>``, every row in the current scope must pass
-        that check too — same all-or-nothing semantics as the
-        resource-level check. Any denied row aborts the whole update.
-
-        Backends without an in-process schema accessor (i.e. SpiceDB
-        once 0.5 lands) skip this — they'll route per-field checks
-        through their own server-side schema. The resource-level
-        ``write`` check already ran before we got here.
-        """
-        from .backends import backend
-        from .schema.ast import Schema
-        from .schema.walker import field_gated_actions
-
-        rebac_type = model_resource_type(self.model)
-        if not rebac_type:
-            return
-        accessor = getattr(backend(), "schema", None)
-        if not callable(accessor):
-            return
-        try:
-            schema = accessor()
-        except Exception:
-            return
-        if not isinstance(schema, Schema):
-            return
-        definition = schema.get_definition(rebac_type)
-        if definition is None:
-            return
-        declared = field_gated_actions(definition, "write")
-        if not declared:
-            return
-
-        affected = self._affected_resource_ids_for_guard()
-        if not affected:
-            return
-
-        meta = self.model._meta
-        for raw_name in kwargs.keys():
-            # Normalise FK attname → field.name so ``write__folder`` matches
-            # an ``update(folder_id=...)`` call.
-            try:
-                field = meta.get_field(raw_name)
-                field_name = field.name
-            except Exception:
-                field_name = raw_name
-            action = f"write__{field_name}"
-            if action not in declared:
-                continue
+            rebac_type = model_resource_type(self.model)
+            if not rebac_type:
+                return
+            # Pre-fetch ids in scope, intersect with allowed.
+            affected = self._affected_resource_ids_for_guard()
+            if not affected:
+                return
             allowed = set(
-                accessible_ids(
+                held_ids(
                     backend(),
                     subject=actor,
                     action=action,
-                    resource_type=rebac_type,
+                    model=self.model,
+                    resource_ids=affected,
                 )
             )
             denied = affected - allowed
@@ -1867,48 +2556,110 @@ class RebacQuerySet(models.QuerySet[_M]):
                     f"Bulk {action}: row outside actor scope. Bulk operations are all-or-nothing."
                 )
 
-    def _guard_bulk_expression_reads(self, actor: SubjectRef, kwargs: dict[str, Any]) -> None:
-        gated = gated_read_fields(self.model)
-        if gated and any(_has_opaque_write_expression(value) for value in kwargs.values()):
-            raise PermissionDenied(
-                "Write expression has opaque SQL over a model with gated fields."
-            )
-        if runtime_field_deny_mode(self._effective_field_mode()) == "allow":
-            return
-        from .backends import backend
+    def _guard_bulk_field_writes(self, actor: SubjectRef, kwargs: dict[str, Any]) -> None:
+        """Per-field write enforcement for bulk ``QuerySet.update()``.
 
-        query = self.query.clone()
-        required: set[str] = set()
-        for value in kwargs.values():
-            resolver = getattr(value, "resolve_expression", None)
-            if not callable(resolver):
-                continue
-            resolved = resolver(query)
-            if _has_gated_subquery(resolved):
-                raise PermissionDenied("Write expression reads a subquery over gated fields.")
-            required.update(
-                column.target.name
-                for column in _expression_columns(resolved)
-                if _column_on_model_lineage(column, self.model) and column.target.name in gated
-            )
-        if not required:
-            return
-        affected = self._affected_resource_ids_for_guard()
-        rebac_type = model_resource_type(self.model)
-        assert rebac_type is not None
-        for field_name in sorted(required):
-            allowed = set(
-                accessible_ids(
-                    backend(),
-                    subject=actor,
-                    action=f"read__{field_name}",
-                    resource_type=rebac_type,
+        Mirrors the per-field gate run in ``RebacMixin``'s save gate: for each
+        ``f`` in ``kwargs`` whose resource type declares a permission
+        named ``write__<f>``, every row in the current scope must pass
+        that check too — same all-or-nothing semantics as the
+        resource-level check. Any denied row aborts the whole update.
+
+        The resource-level ``write`` check already ran before this gate.
+        """
+        with database_context(self.db):
+            from .backends import backend
+            from .schema.walker import field_gated_actions
+
+            rebac_type = model_resource_type(self.model)
+            if not rebac_type:
+                return
+            try:
+                schema = backend().schema()
+            except Exception:
+                return
+            definition = schema.get_definition(rebac_type)
+            if definition is None:
+                return
+            declared = field_gated_actions(definition, "write")
+            if not declared:
+                return
+
+            affected = self._affected_resource_ids_for_guard()
+            if not affected:
+                return
+
+            meta = self.model._meta
+            for raw_name in kwargs.keys():
+                # Normalise FK attname → field.name so ``write__folder`` matches
+                # an ``update(folder_id=...)`` call.
+                try:
+                    field = meta.get_field(raw_name)
+                    field_name = field.name
+                except Exception:
+                    field_name = raw_name
+                action = f"write__{field_name}"
+                if action not in declared:
+                    continue
+                allowed = set(
+                    held_ids(
+                        backend(),
+                        subject=actor,
+                        action=action,
+                        model=self.model,
+                        resource_ids=affected,
+                    )
                 )
-            )
-            if affected - allowed:
+                denied = affected - allowed
+                if denied:
+                    raise PermissionDenied(
+                        f"Bulk {action}: row outside actor scope. Bulk operations are all-or-nothing."
+                    )
+
+    def _guard_bulk_expression_reads(self, actor: SubjectRef, kwargs: dict[str, Any]) -> None:
+        with database_context(self.db):
+            gated = gated_read_fields(self.model)
+            if gated and any(_has_opaque_write_expression(value) for value in kwargs.values()):
                 raise PermissionDenied(
-                    f"Bulk write expression reads denied field read__{field_name}."
+                    "Write expression has opaque SQL over a model with gated fields."
                 )
+            if runtime_field_deny_mode(self._effective_field_mode()) == "allow":
+                return
+            from .backends import backend
+
+            query = self.query.clone()
+            required: set[str] = set()
+            for value in kwargs.values():
+                resolver = getattr(value, "resolve_expression", None)
+                if not callable(resolver):
+                    continue
+                resolved = resolver(query)
+                if _has_gated_subquery(resolved):
+                    raise PermissionDenied("Write expression reads a subquery over gated fields.")
+                required.update(
+                    column.target.name
+                    for column in _expression_columns(resolved)
+                    if _column_on_model_lineage(column, self.model) and column.target.name in gated
+                )
+            if not required:
+                return
+            affected = self._affected_resource_ids_for_guard()
+            rebac_type = model_resource_type(self.model)
+            assert rebac_type is not None
+            for field_name in sorted(required):
+                allowed = set(
+                    held_ids(
+                        backend(),
+                        subject=actor,
+                        action=f"read__{field_name}",
+                        model=self.model,
+                        resource_ids=affected,
+                    )
+                )
+                if affected - allowed:
+                    raise PermissionDenied(
+                        f"Bulk write expression reads denied field read__{field_name}."
+                    )
 
     def _rows_in_scope(self, actor: SubjectRef, *, reason: str) -> RebacQuerySet[_M]:
         """The statement's rows the queryset's scope admits for ``actor``, read
@@ -1955,225 +2706,50 @@ class RebacManager[M: models.Model](_RebacManagerBase[M]):  # pyright: ignore[re
     model parameter through queryset chains.
     """
 
-    # The actor verbs are declared here as well as copied from the queryset
-    # by ``from_queryset``: pyright has no Django plugin and cannot see the
-    # copies, so without these ``Post.objects.with_actor(...)`` is an
-    # attribute error for every editor user. mypy resolves a
-    # ``from_queryset`` subclass's verbs through the plugin, which keeps a
-    # custom queryset's own type; ``get_queryset`` is deliberately not
-    # declared, so that inference is Django's.
-
-    def _rebac_queryset(self) -> RebacQuerySet[M]:
-        queryset = self.get_queryset()
-        if not isinstance(queryset, RebacQuerySet):
-            raise TypeError(
-                f"{type(self).__name__}.get_queryset() returned {type(queryset).__name__}; "
-                "a RebacManager must return a RebacQuerySet."
-            )
+    def get_queryset(self) -> RebacQuerySet[M]:
+        """Pin a real related manager's fresh queryset to its REBAC source."""
+        queryset = cast(RebacQuerySet[M], super().get_queryset())
+        owner = _related_manager_owner(self)
+        if owner is not None:
+            queryset._rebac_related_owner = owner
+            queryset._rebac_relation_actor = owner.actor()
+            queryset._rebac_relation_scope = True
         return queryset
 
-    def with_actor(self, actor: ActorLike | None) -> RebacQuerySet[M]:
-        return self._rebac_queryset().with_actor(actor)
+    # Static declarations for checkers without Django's from_queryset plugin.
+    # Runtime dispatch remains Django's native generated queryset methods.
+    if TYPE_CHECKING:
 
-    def as_user(self, user: Any) -> RebacQuerySet[M]:
-        return self._rebac_queryset().as_user(user)
+        def with_actor(self, actor: ActorLike | None) -> RebacQuerySet[M]: ...
 
-    def as_agent(self, agent: Any, *, on_behalf_of: Any | None = None) -> RebacQuerySet[M]:
-        return self._rebac_queryset().as_agent(agent, on_behalf_of=on_behalf_of)
+        def with_action(self, action: str) -> RebacQuerySet[M]: ...
 
-    def with_action(self, action: str) -> RebacQuerySet[M]:
-        return self._rebac_queryset().with_action(action)
+        def on_field_deny(self, mode: FieldDenyMode) -> RebacQuerySet[M]: ...
 
-    def on_field_deny(self, mode: FieldDenyMode) -> RebacQuerySet[M]:
-        return self._rebac_queryset().on_field_deny(mode)
+        def for_write(self) -> RebacQuerySet[M]: ...
 
-    def for_write(self) -> RebacQuerySet[M]:
-        return self._rebac_queryset().for_write()
+        def readable(self, field: str) -> models.Expression: ...
 
-    def readable(self, field: str) -> models.Expression:
-        return self._rebac_queryset().readable(field)
+        def rebac_select_related(self, *fields: Any) -> RebacQuerySet[M]: ...
 
-    def rebac_select_related(self, *fields: Any) -> RebacQuerySet[M]:
-        return self._rebac_queryset().rebac_select_related(*fields)
+        def rebac_prefetch_related(self, *lookups: Any) -> RebacQuerySet[M]: ...
 
-    def rebac_prefetch_related(self, *lookups: Any) -> RebacQuerySet[M]:
-        return self._rebac_queryset().rebac_prefetch_related(*lookups)
+        def sudo(self, *, reason: str) -> RebacQuerySet[M]: ...
 
-    def sudo(self, *, reason: str) -> RebacQuerySet[M]:
-        return self._rebac_queryset().sudo(reason=reason)
+        def system_context(self, *, reason: str) -> RebacQuerySet[M]: ...
 
-    def system_context(self, *, reason: str) -> RebacQuerySet[M]:
-        return self._rebac_queryset().system_context(reason=reason)
+        def scoped(self) -> RebacQuerySet[M]: ...
 
-    def scoped(self) -> RebacQuerySet[M]:
-        return self._rebac_queryset().scoped()
+        def scoped_for_aggregate(self) -> RebacQuerySet[M]: ...
 
-    def scoped_for_aggregate(self) -> RebacQuerySet[M]:
-        return self._rebac_queryset().scoped_for_aggregate()
+        def scope_cte(self, *, actions: tuple[str, ...] = ()) -> SharedScope[M]: ...
 
-    def actor(self) -> SubjectRef | None:
-        return self._rebac_queryset().actor()
+        def actor(self) -> SubjectRef | None: ...
 
-    def is_sudo(self) -> bool:
-        return self._rebac_queryset().is_sudo()
+        def action(self) -> str: ...
 
-    def effective_actor(self, *, strict: bool = False) -> tuple[SubjectRef | None, bool]:
-        return self._rebac_queryset().effective_actor(strict=strict)
+        def is_sudo(self) -> bool: ...
 
-    def insert(self, obj: M) -> M:
-        return self._rebac_queryset().insert(obj)
+        def effective_actor(self, *, strict: bool = False) -> tuple[SubjectRef | None, bool]: ...
 
-    def raw(
-        self, raw_query: str, params: Any = (), translations: Any = None, using: Any = None
-    ) -> Any:
-        queryset = self._rebac_queryset()
-        _, bypass = queryset.effective_actor(strict=True)
-        if not bypass:
-            raise PermissionDenied("raw() cannot be actor-scoped; use sudo or system_context")
-        raw_method = queryset.raw
-        return raw_method(raw_query, params=params, translations=translations, using=using)
-
-
-class TrackedQuerySet[T: models.Model](models.QuerySet[T]):
-    """Owning queryset without actor scoping, also used by both base managers."""
-
-    def update(self, **kwargs: Any) -> int:
-        from .actors import current_actor, is_sudo
-        from .mixins import RebacMixin
-        from .signals import _edge_actor, _gate_backed_rows, audit_backed_denials
-        from .watch import by_key, gate_policy, model_write, refuse_moving_edges, statement_keys
-
-        self._for_write = True
-        with (
-            audit_backed_denials(),
-            model_write(model=self.model, using=self.db, names=kwargs) as watched,
-        ):
-            related_owner = cast(Any, self)._hints.get("instance")
-            if not is_sudo() and (related_owner is not None or current_actor() is not None):
-                # A generic related manager re-points edges through here.
-                refuse_moving_edges(gate_policy(self.db), self.model, kwargs)
-            related_fk_write = any(
-                isinstance(field, (models.ForeignKey, models.OneToOneField))
-                and {field.name, field.attname} & kwargs.keys()
-                for field in self.model._meta.concrete_fields
-            )
-            if (
-                not watched
-                or self.query.is_sliced
-                or not (
-                    not issubclass(self.model, RebacMixin)
-                    or related_owner is not None
-                    or related_fk_write
-                )
-            ):
-                return super().update(**kwargs)
-            actor, bypass = (
-                _edge_actor(related_owner, relation=True)
-                if related_owner is not None
-                else (None, is_sudo())
-            )
-            if bypass:
-                return super().update(**kwargs)
-            # The gate decides on the statement's rows, and exactly those rows
-            # are written.
-            keys = statement_keys(self)
-            for rows in by_key(self.model._base_manager.using(self.db), keys):
-                _gate_backed_rows(
-                    rows, using=self.db, names=kwargs, proposed=kwargs, actor=actor, bypass=bypass
-                )
-            return sum(models.QuerySet.update(rows, **kwargs) for rows in by_key(self, keys))
-
-    def delete(self) -> tuple[int, dict[str, int]]:
-        from .actors import current_actor, is_sudo
-        from .conf import app_settings
-        from .mixins import RebacMixin, deletion_owner
-        from .signals import _gate_backed_rows, audit_backed_denials
-        from .watch import by_key, model_write, statement_keys
-
-        self._for_write = True
-        actor = current_actor()
-        # Resource base-manager writes are intentionally unscoped infrastructure
-        # operations. Plain tracked roots retain ambient scope for resource cascades.
-        unscoped = (
-            issubclass(self.model, RebacMixin)
-            or is_sudo()
-            or (actor is None and not app_settings.REBAC_STRICT_MODE)
-        )
-        with audit_backed_denials(), model_write(model=self.model, using=self.db) as watched:
-            if (
-                not watched
-                or issubclass(self.model, RebacMixin)
-                or is_sudo()
-                or self.query.is_sliced
-            ):
-                with deletion_owner(self, self.db, actor, unscoped):
-                    return super().delete()
-            keys = statement_keys(self)
-            for rows in by_key(self.model._base_manager.using(self.db), keys):
-                _gate_backed_rows(rows, using=self.db, deleting=True)
-            deleted: Counter[str] = Counter()
-            for rows in by_key(self, keys):
-                with deletion_owner(rows, self.db, actor, unscoped):
-                    deleted.update(models.QuerySet.delete(rows)[1])
-            return sum(deleted.values()), dict(deleted)
-
-    def bulk_create(
-        self,
-        objs: Iterable[T],
-        batch_size: int | None = None,
-        ignore_conflicts: bool = False,
-        update_conflicts: bool = False,
-        update_fields: Collection[str] | None = None,
-        unique_fields: Collection[str] | None = None,
-    ) -> list[T]:
-        from .actors import is_sudo
-        from .mixins import RebacMixin
-        from .signals import _gate_backed_rows, audit_backed_denials
-        from .watch import gate_policy, model_write
-
-        self._for_write = True
-        candidates = list(objs)
-        with audit_backed_denials(), model_write(model=self.model, using=self.db) as watched:
-            if not issubclass(self.model, RebacMixin):
-                policy = gate_policy(self.db) if watched else None
-                if update_conflicts and update_fields and not is_sudo() and policy is not None:
-                    watch = policy.watched.get(self.model._meta.label_lower)
-                    if watch is not None and any(
-                        {field.name, field.attname} & set(update_fields) & watch.fields
-                        for field in self.model._meta.concrete_fields
-                    ):
-                        raise PermissionDenied(
-                            "Conflicting bulk create cannot check both sides of a backed edge; "
-                            "use checked saves or sudo."
-                        )
-                _gate_backed_rows(candidates, using=self.db, bypass=is_sudo())
-            return super().bulk_create(
-                candidates,
-                batch_size,
-                ignore_conflicts,
-                update_conflicts,
-                update_fields,
-                unique_fields,
-            )
-
-    def bulk_update(
-        self, objs: Iterable[T], fields: Iterable[str], batch_size: int | None = None
-    ) -> int:
-        from .signals import audit_backed_denials
-        from .watch import model_write
-
-        self._for_write = True
-        field_names = tuple(fields)
-        with (
-            audit_backed_denials(),
-            model_write(model=self.model, using=self.db, names=field_names),
-        ):
-            return super().bulk_update(objs, field_names, batch_size=batch_size)
-
-
-_TrackedManagerBase = models.Manager.from_queryset(TrackedQuerySet)
-
-
-# Keep the same model parameter on Django's generated, generic manager base.
-class TrackedManager[M: models.Model](_TrackedManagerBase[M]):  # pyright: ignore[reportInvalidTypeArguments]
-    """Unfiltered manager whose writes to columns the policy reads are gated."""
+        def insert(self, obj: M) -> M: ...

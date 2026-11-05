@@ -3,6 +3,275 @@
 All notable changes to `django-zed-rebac` are tracked here. The project is in
 pre-1.0; breaking changes within a minor version are explicitly called out.
 
+## [Unreleased]
+
+### Changed
+
+- The union owner, point checks, and queryset scopes compile through one
+  statement entry. The multi-action closure uses the same permission compiler
+  and native probes. Row, set, fact, and field-visibility decisions use one
+  bounded memo helper; scope preparation has one plan slot per database alias.
+  `RebacQuerySet.action()` reports its resolved read action, and
+  `rebac.relation_loading.pinned_actor()` reports an explicit row or queryset
+  pin without consulting ambient context.
+- Decided queryset statements now reuse compiled SQL across requests with the
+  same witnessed outcome and native inline/shared choice. Decided IDs and
+  support values bind at execution; revisions, override deadlines, settings
+  and model registration still rekey or invalidate the cache. Evaluator page
+  counts continue to share one preparation. Matching outcomes skip witness
+  construction and native render probes; scalar decided-ID slots use padded
+  arity classes so nearby cardinalities share SQL.
+- Tuple-to-model identity conversions share one guarded native projection per
+  statement boundary according to its rendered use count; single-use
+  boundaries keep the guarded conversion inline. PostgreSQL boundaries with
+  fewer than nine uses and independently combined union owners stay inline
+  after a shared-plan cost probe. Repeated
+  nonrecursive fixed-object const targets share one definition per bound.
+  Statement-local CTE owners and reached-object names are deterministic;
+  independently combined owners are rebuilt or relabeled on copied operands
+  to keep names distinct.
+- Queryset scopes use witnessed decisions both inside and outside evaluator
+  scopes. Candidate, caveat and bulk statements reuse compiled SQL when
+  value-independent.
+- Candidate-root and value-independent caveat-verdict statements now bind
+  per-read values and reuse compiled SQL across actor IDs, clocks and
+  candidate sets. The compiled statement cache has a 64 MiB default byte
+  budget in addition to its entry cap, exposed through
+  `REBAC_STATEMENT_CACHE_BYTES`. Decidable point checks
+  still compile on each call; bulk and undecided point statements are kept.
+- Compiled permission unions retain the `UNION` of identity sets measured in
+  proposal 0015 gate G1. An `OR` of large `IN` arms can exceed statement
+  timeouts at default PostgreSQL work memory.
+
+### Fixed
+
+- Recursive path CTE unions clear a resource model's default ordering, so
+  multi-hop field-backed permissions compile for ordered models.
+- Shared identity and multi-action closure queries clear model default ordering
+  internally, preserving ordered caller statements and valid SQL for ordered models.
+- An actor-scoped gate that admits every row now carries the CTEs referenced by
+  its decision witnesses, including PostgreSQL decided-ID arrays. Independently
+  shared plans now namespace decided-array CTE names to avoid collisions.
+
+### Removed
+
+- **Breaking:** Removed `decision_scope()` and the `as_user()` / `as_agent()` queryset and instance aliases. Use `with_actor(user)`, `with_actor(agent)` or `with_actor(grant_subject_ref(agent, user))` for actor pinning. Use `evaluator_scope()` for per-request caching; `scope_cte(actions=...)` remains the statement-local owner for multi-action projections. `evaluator_scope()` never pins an atomic transaction; each operation in a transaction validates its own schema snapshot. Removed the inert `REBAC_RELATIONSHIP_MODEL`, `REBAC_DEFAULT_CONSISTENCY`, `REBAC_CACHE_ALIAS`, `REBAC_LOOKUP_CACHE_TTL`, and `REBAC_GC_INTERVAL_SECONDS` settings.
+- **Breaking:** Removed the unimplemented `SpiceDBBackend`, the `Backend` ABC,
+  the `spicedb` extra, and four `REBAC_SPICEDB_*` settings. `REBAC_BACKEND`
+  accepts only `"local"`; `rebac.E002` and `rebac.W101` no longer apply.
+- **Breaking:** Removed `PermissionEvaluator.accessible()` and its cache.
+- Removed the unreachable queryset enumeration fallback.
+
+### Added
+
+- `rebac.signals.collected_for_delete` delivers each collected model batch after
+  resource gates and before per-row deletion signals, once per model per
+  5,000-key part of a gated queryset delete and once per model for a bypassed
+  or unwatched queryset delete or an instance delete (one unbounded batch). Receivers see the instances, alias,
+  origin and actor scope; `rebac.mixins.batch_delivered()` lets a consumer skip
+  its per-row policy when its batch receiver covers the same senders. Later
+  through-row gates, per-row receivers or database constraints may still refuse
+  the delete and roll back receivers' database writes. Fast-deleted rows and
+  delete overrides outside the owner send no batch.
+- `scope_cte(actions=("read", "write", ...))` shares a statement-local
+  permission-leaf closure across several projections on one resource model.
+  The scope may be filtered to one native bounded identity set; each attached
+  closure visits those candidate rows and its identity references remain row
+  IDs. Listed `permission_expression()` actions read small verdicts over that
+  closure when policy and caveat pins allow sharing, including upper-bound
+  exclusion leaves; a bounded outer row scope uses the same closure for its
+  first action. Otherwise the projections retain their inline proof.
+  The closure is all-or-nothing across listed actions and requires no
+  recursive action, expiring relation, override tag, caveat deadline or
+  reachable caveated tuple. Relation names are valid actions; unknown names
+  have the `nil` verdict. False arms and false first actions preserve enclosing
+  rows. The public `SCOPE_CTE_CANDIDATE_LIMIT` is `256`; an empty or larger
+  explicit candidate set raises `ValueError`.
+- `RebacQuerySet.scope_cte() -> SharedScope` provides a statement-local
+  identity CTE for an unfiltered or bounded identity-filtered actor scope.
+  `SharedScope.queryset()` returns
+  plain Django identity rows for repeated filters, annotations, `Exists`
+  guards and aggregates; `SharedScope.attach(queryset)` defines the scope once
+  on a read statement's owner (the union owner for unions), without changing
+  the input queryset. Each attachment gets a fresh policy and caveat pin;
+  matching permission projections and nested scope guards reuse the definition
+  only with the same shareable policy and verdicts. Exact late projections
+  retain their point form; queryset identity proofs retain the candidate-root
+  form, including bounded literal ID sets.
+  Multi-action closures use the retained compiler and native probes; ineligible
+  closures use the ordinary single-action identity body.
+- Exported `is_sudo()` from `rebac` to report the ambient sudo scope.
+- `LocalBackend.held()` checks a bounded set of candidate IDs through the
+  compiled read path. Absent canonical IDs are point-checked in one batch;
+  non-canonical and empty IDs are denied. `LocalBackend.accessible()` remains
+  the enumeration API.
+- `LocalBackend.held_many(subject, actions, resource_type, ids, context=None,
+  using=None)` returns held candidate IDs per action. Equal unmodified field
+  permissions share one bounded decision; distinct permissions take one
+  statement per 500 stored IDs. Field visibility now uses it for materialised
+  batches. `PermissionEvaluator` memoises each field answer for the same actor,
+  model, permission and row identities within an entry and total-ID LRU
+  budget. The memo follows the check cache's eligibility: it is off for live
+  field- or attribute-backed types,
+  expiring relations, override deadlines and every atomic block (including
+  `ATOMIC_REQUESTS`, GraphQL actions, Django `TestCase` and pytest-django's
+  default `db` fixture). Its dependency key covers the model lineage reachable
+  from each field permission; watched writes to that lineage, relationship
+  writes, schema publication, scope exit and explicit invalidation retire it.
+  An evaluator is not a single consistent read: row statements see new
+  commits, while an eligible memo may retain an answer after an untracked
+  tuple write.
+
+### Changed
+
+- An unfiltered `scope_cte()` handle now binds its attached definition to a
+  mandatory native identity predicate found on the final statement, including
+  Django's multi-row forward-FK prefetch `TupleIn`. NULL FK values are ignored,
+  matching Django's rendered lookup. The same 256-ID limit and
+  canonical-integer proof apply. Statements without a bounded proof, or with
+  a caller reference to the handle's identity CTE, keep the existing unbounded
+  definition; explicit bounded handles keep their original validation. This
+  lets a prefetch queryset attach a single- or multi-action handle before
+  its parent rows are fetched. The TupleIn proof also applies to ordinary
+  scoped forward-FK prefetches: the related read can take the candidate-root
+  path, reducing the measured 5/50-row page from four statements to two.
+- Embedded `sudo()` and `system_context()` querysets now emit one bypass audit
+  row per distinct `(entry, reason)` pair per enclosing statement execution.
+  Reusing an entry in several subqueries no longer multiplies rows; later
+  embedded executions still audit an entry previously used directly. Hooked
+  statements write after successful execution, while compile-only and
+  `EmptyResultSet` statements write none. A plain Django `Query` containing
+  a REBAC subquery swaps to the private `_BypassAuditQuery` class for this
+  hook; query classes without the hook retain render-time audit as a
+  fail-safe. Block bypass timing, recorded reasons and actors, and denial
+  audits retain their contracts.
+- Row and fact decision memo keys use the decided node's reachable model
+  tables instead of one process-wide row generation; actor-set memos still
+  key by root. Unwatched owned model writes no longer invalidate these memos.
+  Owned deletes share one schema operation and gate each collected resource
+  model as a candidate set rather than point-checking every cascaded row. A
+  depth-uncertain cascaded row now raises `GateDenied` before consumer
+  `pre_delete` receivers run.
+- Owned writes now publish one row-generation bump per affected model lineage
+  when the outermost owner for that alias succeeds, including multi-row
+  cascades. Decisions made within the owner still observe each row's change
+  through an operation-local generation. A committed write on another alias
+  keeps its own invalidation even if the first owner rolls back.
+- Scalar key chunks in queryset writes bind one PostgreSQL array for their
+  selection, stored-row capture and queryset update instead of expanding up
+  to 5,000 literal IDs. Composite primary keys retain Django's `IN` lookup;
+  collector root deletes, `SET NULL` updates and tuple cleanup still use
+  Django's literal key lists.
+- A scoped queryset with mandatory native `pk=` or `pk__in` identities now
+  proves access inside the candidate root set, including singleton reads and
+  `held()` chunks. Sets above 256 IDs use the general scope to bound SQL size
+  and database work. Candidate lists bind as one PostgreSQL array or bounded
+  parameterized `IN`; eligible shapes are kept in the statement cache. An exact or bounded
+  identity proof takes precedence over a shared union plan. The selecting
+  query still applies its original filter. `held_many()` uses 256-ID
+  candidate-root chunks.
+- Decided ID membership binds one PostgreSQL array per list with `= ANY`;
+  row lists use a statement-local CTE shared by the predicate and witness.
+  SQLite and MySQL use Django `IN`. Model identity sets use
+  native IDs instead of one guarded equality per member. Stored actor-set
+  decisions use a 2,048 byte witness ceiling (about four short support edges)
+  and use the inline closure above it. Evaluator-memoized row witnesses carry
+  their own CTEs. Permission answers are unchanged.
+- Actor resolution, sudo validation and bypass emission now share one owner
+  each. Ambient `sudo()` covers related reads when no actor is pinned; an
+  instance or queryset sudo pin still does not cross a relation. The private
+  `_resolve_effective_actor` and manager-specific `raw` override
+  were removed; Django supplies `RebacManager.raw` from `RebacQuerySet.raw`.
+- Guarded `rebac_select_related()` fails closed without an actor in both strict
+  modes: `rebac_select_related()` raises for related instances and projections,
+  while ambient sudo permits both. An actor pinned after
+  `rebac_prefetch_related()` also scopes its protected prefetch querysets.
+  This helper inherits the root actor; an unpinned caller-supplied `Prefetch`
+  queryset in plain `prefetch_related()` keeps its own scope.
+- Related-manager reads use the source instance's pinned actor before the
+  ambient actor or ambient sudo, including the current-member read in M2M
+  `set(clear=False)`. The pin is transferred only to a fresh related-manager
+  queryset; shared Django router hints never grant authority to a reused
+  `Prefetch` queryset. Public `relation_actor(queryset)` still returns only a
+  `SubjectRef` or `None`; bypass state stays internal. During queryset
+  evaluation through `_fetch_all`, root
+  instances receive their actor before Django prefetches related rows.
+  `iterator()` and `aiterator()` can prefetch related rows before stamping
+  each root with its pinned actor; expected-failure tests pin that scope gap.
+  Without an actor, ordinary related-manager reads and backed M2M writes keep
+  the non-strict unscoped fallback; guarded `rebac_select_related()` reads
+  remain fail closed.
+- Auto-created M2M related-manager writes are gated by `m2m_changed` on the
+  memberships Django actually changes, including reverse add, remove and clear
+  from a multi-table child of the target model. `set()` no longer requires
+  `write` on unchanged memberships. Denials follow Django's
+  transaction rules; callers that catch them and continue use an `atomic()`
+  block. `REBAC_AUDIT_DENIALS` records nothing for these signal denials,
+  including for transaction-managed callers who catch and continue. Direct
+  writes to auto-created through tables were previously gated and are now
+  unobserved infrastructure writes. Fixture loads with `raw=True`
+  skip the signal gate while still advancing the row generation.
+- An explicit `through=` model inheriting `RebacTrackedMixin` uses its own
+  instance and queryset write gates for saves, deletes, bulk writes,
+  related-manager changes and cascades. Both the M2M owner and each declaring
+  resource require `write` when they declare it. Cascaded through rows use the
+  deleting root's pinned actor; related-manager through writes use the ambient
+  actor, so a pinned-only call needs an ambient actor or sudo.
+- Write gates share the tracked queryset write owner. Resource querysets supply
+  scoping and row checks through three hooks. `RebacTrackedMixin.save_base()`
+  owns one gate and transaction for tracked and resource models. `check_save()`
+  now evaluates the current instance's gates directly; it no longer runs a
+  consumer `save()` override. Validation excludes hidden fields from Django's
+  constraint checks. Gate denials retain the exact actor, action and resource
+  for audit after rollback, including cascaded child deletes. New system check
+  `rebac.E025` rejects a `RebacTrackedMixin` default manager that does not
+  derive from `TrackedManager` or `RebacManager`, because it cannot carry a
+  related owner's authority into write gates.
+- Bounded model-row, actor-set and fixed-fact decisions are prepared before
+  queryset SQL renders and witnessed in each statement that binds them.
+  An evaluator scope reuses decisions until a library-owned write advances
+  the relationship or row generation; outside it, decisions are per operation.
+  Oversized sets retain the inline and recursive CTE fallback. A raw SQL
+  change can hide newly readable rows until scope exit but cannot grant
+  through a stale decision. Rendering a prepared scope issues no queries.
+  Root rows stay in the selecting statement; eager scopes prepare afresh after
+  library-owned writes, and bulk checks keep actor memberships in shared SQL.
+  No connection observer, `execute_wrappers`, `run_on_commit` or confirmation
+  query is used.
+- Stored subject-set membership follows a fixed point in preparation when
+  bounded, or a recursive CTE inside the statement when it exceeds the
+  decision budget; both include cycles and memberships deeper than
+  `REBAC_DEPTH_LIMIT`.
+- Stock `django-cte` 5.x supplies statement-local recursive relations for
+  stored tuple traversal and supported native integer self paths. Bulk point
+  statements also respect the database's parameter limit.
+- Compatible prepared union operands share model-backed targets and recursive
+  closures as statement-local CTEs. Rebac queryset unions hoist common
+  definitions from cloned operands; caveated or time-sensitive policies keep
+  their existing inline form.
+- Added `rebac.managers.share_scoped_definitions()` for owners that combine
+  independently scoped operands in a plain Django union. It shares compatible
+  definitions across that union, passes through sudo and empty operands, and
+  rejects mismatched scoped actors. Late `permission_expression()` scopes
+  compile self-contained because SQL compilation cannot add to an emitted
+  `WITH` clause.
+- Queryset scopes bind the policy and caveat verdicts when built. New caveat
+  instances are excluded from an existing scope's lower bound. Point checks
+  prepare bounded sets and fixed facts as needed before their statement;
+  caveat instances can also require a preparation read.
+- Autocommit evaluator scopes reuse a schema pin. Inside atomic blocks, each
+  permission operation reads the schema revision once and pins only for that
+  operation. Django exposes no rollback-safe transaction-boundary signal
+  without connection introspection, so a pin cannot safely span operations
+  there.
+
+### Known issues
+
+- The pre-existing `_through_candidates` set accumulates migration-history
+  through models. After test-database setup, repeated sender registration can
+  take about 11 ms per `connect_tracked_signals()` call; this buildup predates
+  the M2M recovery.
+
 ## [0.30.0] — 2026-10-28
 
 ### Changed

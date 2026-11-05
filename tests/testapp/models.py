@@ -2,15 +2,13 @@
 
 from __future__ import annotations
 
-from typing import Any
-
 from django.conf import settings
 from django.contrib.auth.base_user import AbstractBaseUser
 from django.contrib.contenttypes.fields import GenericForeignKey, GenericRelation
 from django.contrib.contenttypes.models import ContentType
 from django.db import models
 
-from rebac import RebacMixin, RebacTrackedMixin, TrackedQuerySet, current_actor
+from rebac import RebacMixin, RebacTrackedMixin, TrackedQuerySet
 
 from .fields import (
     ColumnlessIdentityField,
@@ -36,6 +34,14 @@ class Folder(RebacMixin, models.Model):
 
     class Meta:
         app_label = "testapp"
+        rebac_resource_type = "blog/folder"
+
+
+class OrderedFolder(Folder):
+    class Meta:
+        app_label = "testapp"
+        proxy = True
+        ordering = ("kind", "-id")
         rebac_resource_type = "blog/folder"
 
 
@@ -93,15 +99,20 @@ class PinnedPost(RebacMixin, models.Model):
     """A many-to-many relation through a declared model."""
 
     title = models.CharField(max_length=200)
-    folders = models.ManyToManyField(Folder, through="PostPin", related_name="pinned_posts")
+    folders = models.ManyToManyField(
+        Folder, through="PostPin", through_fields=("post", "folder"), related_name="pinned_posts"
+    )
 
     class Meta:
         app_label = "testapp"
         rebac_resource_type = "blog/pinnedpost"
 
 
-class PostPin(models.Model):
+class PostPin(RebacTrackedMixin):
     post = models.ForeignKey(PinnedPost, on_delete=models.CASCADE)
+    referrer = models.ForeignKey(
+        PinnedPost, null=True, blank=True, on_delete=models.SET_NULL, related_name="+"
+    )
     folder = models.ForeignKey(Folder, on_delete=models.CASCADE)
     note = models.CharField(max_length=100, blank=True, default="")
 
@@ -479,6 +490,18 @@ class TextIdentityFolder(RebacMixin, models.Model):
         rebac_id_attr = "public_id"
 
 
+class IntegerIdentityFolder(RebacMixin, models.Model):
+    """A native integer REBAC identity distinct from the Django primary key."""
+
+    external_id = models.IntegerField(unique=True)
+    name = models.CharField(max_length=100)
+
+    class Meta:
+        app_label = "testapp"
+        rebac_resource_type = "blog/integeridentityfolder"
+        rebac_id_attr = "external_id"
+
+
 class CodedFolder(RebacMixin, models.Model):
     """A hierarchy whose parent column names a row by a nullable unique column."""
 
@@ -560,28 +583,6 @@ class GuardedUniqueRow(RebacMixin):
     class Meta:
         app_label = "testapp"
         rebac_resource_type = "validation/unique_row"
-
-
-class OwnerDefaultUniqueRow(RebacMixin):
-    """A consumer model owns its insert default; the engine must evaluate that save."""
-
-    owner = models.ForeignKey(
-        settings.AUTH_USER_MODEL,
-        null=True,
-        blank=True,
-        on_delete=models.CASCADE,
-        related_name="+",
-    )
-    code = models.CharField(max_length=40, unique=True)
-
-    class Meta:
-        app_label = "testapp"
-        rebac_resource_type = "validation/default_row"
-
-    def save(self, *args: Any, **kwargs: Any) -> None:
-        if self._state.adding and self.owner_id is None and (actor := current_actor()) is not None:
-            self.owner_id = actor.subject_id
-        super().save(*args, **kwargs)
 
 
 class GuardedConstraintRow(RebacMixin):

@@ -134,9 +134,9 @@ def test_aget_scopes_to_owner() -> None:
     _grant_owner(alice, post)
 
     async def go() -> tuple[object, object]:
-        got = await Post.objects.as_user(alice).aget(pk=post.pk)
+        got = await Post.objects.with_actor(alice).aget(pk=post.pk)
         with pytest.raises(Post.DoesNotExist):
-            await Post.objects.as_user(bob).aget(pk=post.pk)
+            await Post.objects.with_actor(bob).aget(pk=post.pk)
         return got.pk, "bob-denied"
 
     assert asyncio.run(go()) == (post.pk, "bob-denied")
@@ -151,7 +151,7 @@ def test_async_for_scopes_to_owner() -> None:
     _grant_owner(alice, post)
 
     async def collect(actor) -> list[int]:
-        return [p.pk async for p in Post.objects.as_user(actor)]
+        return [p.pk async for p in Post.objects.with_actor(actor)]
 
     assert asyncio.run(collect(alice)) == [post.pk]
     assert asyncio.run(collect(bob)) == []
@@ -167,10 +167,10 @@ def test_acount_and_aexists_respect_scope() -> None:
 
     async def go() -> tuple[int, int, bool, bool]:
         return (
-            await Post.objects.as_user(alice).acount(),
-            await Post.objects.as_user(bob).acount(),
-            await Post.objects.as_user(alice).filter(pk=post.pk).aexists(),
-            await Post.objects.as_user(bob).filter(pk=post.pk).aexists(),
+            await Post.objects.with_actor(alice).acount(),
+            await Post.objects.with_actor(bob).acount(),
+            await Post.objects.with_actor(alice).filter(pk=post.pk).aexists(),
+            await Post.objects.with_actor(bob).filter(pk=post.pk).aexists(),
         )
 
     assert asyncio.run(go()) == (1, 0, True, False)
@@ -221,7 +221,7 @@ def test_aiterator_respects_scope() -> None:
     _grant_owner(alice, post)
 
     async def collect(actor) -> list[int]:
-        return [p.pk async for p in Post.objects.as_user(actor).aiterator()]
+        return [p.pk async for p in Post.objects.with_actor(actor).aiterator()]
 
     assert asyncio.run(collect(alice)) == [post.pk]
     # Regression: before the aiterator override this leaked the row to bob.
@@ -237,7 +237,7 @@ def test_aiterator_stamps_actor_on_instances() -> None:
     _grant_owner(alice, post)
 
     async def collect() -> list[Post]:
-        return [p async for p in Post.objects.as_user(alice).aiterator()]
+        return [p async for p in Post.objects.with_actor(alice).aiterator()]
 
     rows = asyncio.run(collect())
     assert [r.pk for r in rows] == [post.pk]
@@ -254,7 +254,7 @@ def test_aaggregate_respects_scope() -> None:
     _grant_owner(alice, post)
 
     async def count_for(actor) -> int:
-        return (await Post.objects.as_user(actor).aaggregate(n=Count("pk")))["n"]
+        return (await Post.objects.with_actor(actor).aaggregate(n=Count("pk")))["n"]
 
     assert asyncio.run(count_for(alice)) == 1
     # Regression: before the aggregate override this counted all rows for bob.
@@ -269,9 +269,9 @@ def test_aggregate_respects_scope_sync() -> None:
     alice, bob = _user("alice"), _user("bob")
     _grant_owner(alice, post)
 
-    assert Post.objects.as_user(alice).aggregate(n=Count("pk"))["n"] == 1
+    assert Post.objects.with_actor(alice).aggregate(n=Count("pk"))["n"] == 1
     # The sync hole aaggregate exposed: aggregate now scopes too.
-    assert Post.objects.as_user(bob).aggregate(n=Count("pk"))["n"] == 0
+    assert Post.objects.with_actor(bob).aggregate(n=Count("pk"))["n"] == 0
 
 
 @pytest.mark.django_db
@@ -295,7 +295,7 @@ def test_aupdate_leaves_rows_actor_cannot_read() -> None:
     _grant_owner(alice, post)
 
     async def go() -> int:
-        return await Post.objects.as_user(bob).filter(pk=post.pk).aupdate(title="hijacked")
+        return await Post.objects.with_actor(bob).filter(pk=post.pk).aupdate(title="hijacked")
 
     assert asyncio.run(go()) == 0
     post.refresh_from_db()

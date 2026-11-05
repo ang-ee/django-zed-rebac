@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "django-zed-rebac"
-version = "0.30.0"
+version = "0.31.0.dev0"
 description = "Drop-in REBAC engine for Django, SpiceDB-compatible, with a pure-Django LocalBackend."
 readme = "README.md"
 license = "Apache-2.0"
@@ -23,10 +23,10 @@ classifiers = [
 ]
 dependencies = [
     "django>=6.1,<6.2",
+    "django-cte>=5,<6",
 ]
 
 [project.optional-dependencies]
-spicedb = ["authzed>=0.13"]
 caveats = ["cel-python>=0.1.5"]
 drf = ["djangorestframework>=3.18"]  # 3.17 imports a helper Django 6.1 removed
 # FastMCP adapter (``rebac.mcp.rebac_mcp_tool``). The adapter reads the
@@ -70,6 +70,17 @@ mysql = ["mysqlclient>=2.2"]
 Homepage = "https://github.com/ang-ee/django-zed-rebac"
 Documentation = "https://github.com/ang-ee/django-zed-rebac/tree/main/docs"
 Issues = "https://github.com/ang-ee/django-zed-rebac/issues"
+
+[tool.uv]
+cache-keys = [
+    { file = "pyproject.toml" },
+    { file = "MANIFEST.in" },
+    { file = "README.md" },
+    { file = "LICENSE*" },
+    { file = "src/rebac/**/*.py" },
+    { file = "src/rebac/py.typed" },
+    { git = { commit = true } },
+]
 
 [tool.setuptools.packages.find]
 where = ["src"]
@@ -143,6 +154,7 @@ module = [
     "strawberry.*",
     "strawberry_django.*",
     "channels.*",
+    "django_cte.*",
 ]
 ignore_missing_imports = true
 

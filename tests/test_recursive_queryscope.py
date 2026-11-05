@@ -22,11 +22,12 @@ from rebac import (
     to_object_ref,
 )
 from rebac.backends import reset_backend
+from rebac.compile import read
 from rebac.schema import parse_zed
 from tests.backend_setup import STORAGE_TIERS, install_schema
 from tests.testapp.models import Folder, Post
 
-pytestmark = pytest.mark.django_db
+pytestmark = [pytest.mark.django_db, pytest.mark.pg_delta]
 ACTOR = SubjectRef.of("auth/user", "42")
 OUTSIDER = SubjectRef.of("auth/user", "99")
 ANONYMOUS = SubjectRef.of("auth/anonymous", "*")
@@ -152,6 +153,53 @@ def test_recursive_chain_parity(storage, shape, backing, depth):
 
 
 @pytest.mark.parametrize("storage", ["denormalized", "registry"])
+@pytest.mark.parametrize("backing", ["tuple", "field"])
+def test_recursive_alias_decided_statement_rebinds_actor(storage, backing):
+    with schema_context(storage, "folder", backing) as (active, member, hop, _action):
+        actors = [SubjectRef.of("auth/user", f"cache-actor-{index}") for index in range(2)]
+        chains = []
+        with sudo(reason="cached recursive scope fixture"):
+            for index in range(2):
+                root = Folder.objects.create(pk=81_000_000 + index * 10, name=f"root-{index}")
+                child = Folder.objects.create(
+                    pk=root.pk + 1,
+                    name=f"child-{index}",
+                    parent=root if backing == "field" else None,
+                )
+                chains.append((root, child))
+        if backing == "tuple":
+            active.write_relationships(
+                [
+                    RelationshipTuple(
+                        to_object_ref(child), hop, SubjectRef.of("blog/folder", str(root.pk))
+                    )
+                    for root, child in chains
+                ]
+            )
+        for actor, (root, _child) in zip(actors, chains, strict=True):
+            grant(active, root, member, actor)
+
+        def visible(actor):
+            return set(
+                Folder.objects.with_actor(actor).with_action("alias").values_list("pk", flat=True)
+            )
+
+        read.reset()
+        assert visible(actors[0]) == {row.pk for row in chains[0]}
+        assert read._statements
+        expected = {row.pk for row in chains[1]}
+        assert visible(actors[1]) == expected
+        assert read.statement_cache_stats()["hits"] >= 1
+        original = read._Operation.statement
+
+        def uncached(self, key, verdicts, build, **kwargs):
+            return original(self, key, verdicts, build, **{**kwargs, "cache": False})
+
+        with patch.object(read._Operation, "statement", uncached):
+            assert visible(actors[1]) == expected
+
+
+@pytest.mark.parametrize("storage", ["denormalized", "registry"])
 @pytest.mark.parametrize("shape", ["role", "folder"])
 @pytest.mark.parametrize("backing", ["tuple", "field"])
 @pytest.mark.parametrize("depth", [3, pytest.param(12, marks=pytest.mark.slow)])
@@ -263,27 +311,24 @@ def test_early_grant_and_live_boundary(storage, backing, depth):
 @pytest.mark.parametrize("storage", STORAGE_TIERS)
 @pytest.mark.parametrize("backing", ["tuple", "field"])
 @pytest.mark.parametrize("deep", [3, pytest.param(8, marks=pytest.mark.slow)])
-def test_scope_query_count_is_independent_of_depth(storage, backing, deep):
+@pytest.mark.parametrize("exact", [False, True], ids=["general", "exact"])
+def test_scope_query_count_is_independent_of_depth(storage, backing, deep, exact):
     costs = []
     with schema_context(storage, "folder", backing) as (active, member, hop, action):
         for depth in (1, deep):
             rows = chain(active, hop, backing, depth, prefix=str(depth))
             grant(active, rows[0], member)
+            qs = Folder.objects.with_actor(ACTOR).with_action(action)
             qs = (
-                Folder.objects.with_actor(ACTOR).with_action(action).filter(pk=rows[-1].pk).scoped()
-            )
+                qs.filter(pk=rows[-1].pk)
+                if exact
+                else qs.filter(pk__gte=rows[-1].pk, pk__lte=rows[-1].pk)
+            ).scoped()
             with CaptureQueriesContext(connection) as queries:
                 assert qs.exists()
             costs.append(len(queries))
-    if backing == "tuple":
-        # The actor's stored sets, then the scope.
-        assert costs == [2, 2]
-    else:
-        # A hierarchy over a foreign key is followed from its seeds first: the
-        # seeds, then one statement per level until one finds nothing or the
-        # depth limit is reached.
-        levels = [min(depth + 1, app_settings.REBAC_DEPTH_LIMIT) for depth in (1, deep)]
-        assert costs == [3 + levels[0], 3 + levels[1]]
+    # Candidate roots use one statement; ranges prepare, then render.
+    assert costs == ([1, 1] if exact else [2, 2])
 
 
 @pytest.mark.pg_delta

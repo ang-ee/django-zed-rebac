@@ -38,32 +38,13 @@ import atexit
 import logging
 from collections.abc import Callable
 from concurrent.futures import ThreadPoolExecutor
-from contextvars import ContextVar
 from typing import Any
 
 from asgiref.sync import sync_to_async
 from django.db import transaction
 
+from .database import write_alias
 from .types import SubjectRef
-
-
-class SaveCheck:
-    """A running ``check_save``: the instance it checks, the denial its own
-    save met, and the other instances saved meanwhile (their state is restored
-    after the rollback)."""
-
-    __slots__ = ("denied", "saved", "target")
-
-    def __init__(self, target: Any) -> None:
-        self.target = target
-        self.denied: Exception | None = None
-        self.saved: list[tuple[Any, Any, bool, str | None]] = []
-
-
-# Set while ``check_save`` runs ``save()``.  Everything it does is rolled
-# back, so a bypass taken meanwhile is neither audited nor marked audited
-# (the real save audits it), and no denial is audited.
-save_check: ContextVar[SaveCheck | None] = ContextVar("rebac_save_check", default=None)
 
 logger = logging.getLogger(__name__)
 
@@ -158,7 +139,6 @@ def _row_kwargs(
     """
     actor_type = actor.subject_type if actor is not None else ""
     actor_id = actor.subject_id if actor is not None else ""
-    # TODO(spec): populate origin from middleware impersonation chain when wired.
     # The PermissionAuditEvent model does not currently carry origin_subject_*
     # columns; the `origin` parameter is accepted for API stability, but until
     # the migration grows the column it's discarded.
@@ -183,6 +163,7 @@ def emit(
     after: dict[str, Any] | None = None,
     reason: str = "",
     defer_to_commit: bool = True,
+    using: str | None = None,
 ) -> None:
     """Emit a `PermissionAuditEvent` (sync).
 
@@ -208,8 +189,14 @@ def emit(
             even when not in a transaction) and for permission denials
             (which persist while the would-be save rolls back).
 
+    ``using`` selects an explicit database; otherwise ``database_context`` or
+    the model write router selects it. Deferred callbacks retain that alias.
+
     Async callers should prefer :func:`aemit`.
     """
+    from .models import PermissionAuditEvent
+
+    alias = write_alias(PermissionAuditEvent, using=using)
     _ = origin  # accepted for API stability; column not yet defined.
     kwargs = _row_kwargs(
         kind=kind,
@@ -221,18 +208,28 @@ def emit(
     )
 
     def _write() -> None:
-        # Late import — model loading must not block module import time.
-        from .models import PermissionAuditEvent
-
-        PermissionAuditEvent.objects.create(**kwargs)
+        PermissionAuditEvent.objects.using(alias).create(**kwargs)
 
     if defer_to_commit:
         # `on_commit` runs the callback immediately when called outside an
         # atomic block — that's the correct behaviour for the immediate-write
         # case the caller could have asked for explicitly.
-        transaction.on_commit(_write)
+        transaction.on_commit(_write, using=alias)
     else:
         _write_now(_write)
+
+
+def emit_bypass(reason: str, *, actor: SubjectRef | None) -> None:
+    """Write a synchronous bypass event at the point the bypass takes effect."""
+    from .models import PermissionAuditEvent
+
+    emit(
+        PermissionAuditEvent.KIND_SUDO_BYPASS,
+        actor=actor,
+        origin=actor,
+        reason=reason,
+        defer_to_commit=False,
+    )
 
 
 async def aemit(
@@ -245,6 +242,7 @@ async def aemit(
     after: dict[str, Any] | None = None,
     reason: str = "",
     defer_to_commit: bool = True,
+    using: str | None = None,
 ) -> None:
     """Async sibling of :func:`emit`.
 
@@ -255,6 +253,9 @@ async def aemit(
     on_commit hook itself is sync, but it fires at transaction-commit
     time, which is also when sync code unwinds — no async/sync mismatch).
     """
+    from .models import PermissionAuditEvent
+
+    alias = write_alias(PermissionAuditEvent, using=using)
     _ = origin  # accepted for API stability; column not yet defined.
     kwargs = _row_kwargs(
         kind=kind,
@@ -268,9 +269,7 @@ async def aemit(
     if defer_to_commit:
 
         def _write() -> None:
-            from .models import PermissionAuditEvent
-
-            PermissionAuditEvent.objects.create(**kwargs)
+            PermissionAuditEvent.objects.using(alias).create(**kwargs)
 
         # ``transaction.on_commit`` inspects the current thread's
         # connection (atomic block? autocommit?) and either queues the
@@ -282,12 +281,23 @@ async def aemit(
         # ``on_commit`` sees is consistent, and the eventual ``_write``
         # callback runs in a non-loop context where sync DB calls are
         # legal.
-        await sync_to_async(transaction.on_commit, thread_sensitive=True)(_write)
+        await sync_to_async(transaction.on_commit, thread_sensitive=True)(_write, using=alias)
         return
 
+    await PermissionAuditEvent.objects.using(alias).acreate(**kwargs)
+
+
+async def aemit_bypass(reason: str, *, actor: SubjectRef | None) -> None:
+    """Async bypass emission with the same row shape as :func:`emit_bypass`."""
     from .models import PermissionAuditEvent
 
-    await PermissionAuditEvent.objects.acreate(**kwargs)
+    await aemit(
+        PermissionAuditEvent.KIND_SUDO_BYPASS,
+        actor=actor,
+        origin=actor,
+        reason=reason,
+        defer_to_commit=False,
+    )
 
 
 def _write_now(write_callable: Callable[[], None]) -> None:

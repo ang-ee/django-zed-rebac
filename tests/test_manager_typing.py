@@ -78,8 +78,8 @@ def test_queryset_manager_extensions_keep_native_type_checks(tmp_path: Path) -> 
 
             queryset = PostQuerySet[Post](model=Post)
             assert_type(queryset.with_actor(None), PostQuerySet[Post])
-            assert_type(queryset.as_user(None), PostQuerySet[Post])
-            assert_type(queryset.as_agent(None), PostQuerySet[Post])
+            assert_type(queryset.with_actor(None), PostQuerySet[Post])
+            assert_type(queryset.with_actor(None), PostQuerySet[Post])
             assert_type(queryset.with_action("read"), PostQuerySet[Post])
             assert_type(queryset.on_field_deny("allow"), PostQuerySet[Post])
             assert_type(queryset.for_write(), PostQuerySet[Post])
@@ -105,11 +105,13 @@ def test_queryset_manager_extensions_keep_native_type_checks(tmp_path: Path) -> 
             assert_type(queryset.sudo(reason="typing").get().title, str)
             assert_type(PostManager().answer(), int)
             assert_type(TrackedPostManager().label(), str)
-            # Upstream django-stubs types get_queryset() on a from_queryset
-            # manager as Django's QuerySet; the verbs on the manager itself
-            # keep the custom type (below).
+            assert_type(PostManager().get_queryset(), PostQuerySet[Post])
+            assert_type(TrackedPostManager().get_queryset(), TrackedPostQuerySet[Post])
             assert_type(PostManager().get_queryset().get(), Post)
             assert_type(TrackedPostManager().get_queryset().get(), Post)
+            assert_type(PostManager().sudo(reason="typing"), PostQuerySet[Post])
+            assert_type(PostManager().system_context(reason="typing"), PostQuerySet[Post])
+            assert_type(PostManager().system_context(reason="typing").answer(), int)
             assert_type(PostManager().with_actor(None), PostQuerySet[Post])
             assert_type(PostManager().with_actor(None).answer(), int)
             assert_type(PostManager().get(), Post)
@@ -248,7 +250,7 @@ def test_queryset_scope_clones_keep_concrete_class() -> None:
     actor = SubjectRef("auth/user", "typing")
     for clone in (
         original.with_actor(actor),
-        original.as_user(actor),
+        original.with_actor(actor),
         original.with_action("read"),
         original.on_field_deny("allow"),
         original.for_write(),

@@ -36,6 +36,8 @@ from .testapp.models import (
     NativeParentLinkedResource,
 )
 
+pytestmark = pytest.mark.pg_delta
+
 SCHEMA = """
 definition auth/user {}
 definition test/backingdocument {

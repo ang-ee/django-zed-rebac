@@ -173,9 +173,9 @@ def test_column_changes_are_live_in_same_evaluator_scope(backend):
                 evaluator.check(backend, subject=ACTOR, action="read", resource=ref(folder)).allowed
                 is active
             )
-            assert evaluator.accessible(
-                backend, subject=ACTOR, action="read", resource_type="blog/folder"
-            ) == ((str(folder.pk),) if active else ())
+            assert set(
+                backend.accessible(subject=ACTOR, action="read", resource_type="blog/folder")
+            ) == ({str(folder.pk)} if active else set())
             assert Folder.objects.with_actor(ACTOR).filter(pk=folder.pk).exists() is active
     assert not Relationship.objects.exists()
 
@@ -440,7 +440,7 @@ def test_candidate_column_collation_matches_stored_checks_and_exclusion(
     from django.db import connection, models
     from django.test.utils import isolate_apps
 
-    from rebac import RebacMixin, field_backing
+    from rebac import RebacMixin, resources
 
     if connection.vendor != "sqlite":
         pytest.skip("SQLite's named nocase collation")
@@ -454,12 +454,11 @@ def test_candidate_column_collation_matches_stored_checks_and_exclusion(
                 app_label = "testapp"
                 rebac_resource_type = "test/collatedrow"
 
-        # isolate_apps models are absent from the global model registry used by the resolver.
-        original_resolver = field_backing.model_for_resource_type
+        original_types = resources._model_types
         monkeypatch.setattr(
-            field_backing,
-            "model_for_resource_type",
-            lambda name: CollatedRow if name == "test/collatedrow" else original_resolver(name),
+            resources,
+            "_model_types",
+            lambda prefix: (*original_types(prefix), (f"{prefix}test/collatedrow", CollatedRow)),
         )
         directive = (
             'const={"target_id":"public","filters":{"audience":"PUBLIC"}}'
@@ -607,7 +606,7 @@ def test_unsorted_native_filters_have_canonical_equality(kind):
     assert render_zed(first_schema) == render_zed(second_schema)
 
 
-def test_builtin_intersection_enumeration_and_scope_agree(backend, monkeypatch):
+def test_builtin_intersection_enumeration_and_scope_agree(backend):
     install_schema(
         backend,
         parse_zed(
@@ -622,9 +621,6 @@ def test_builtin_intersection_enumeration_and_scope_agree(backend, monkeypatch):
     assert set(backend.accessible(subject=ACTOR, action="read", resource_type="blog/folder")) == {
         str(folder.pk)
     }
-    assert list(Folder.objects.with_actor(ACTOR)) == [folder]
-    # A backend using the public enumeration fallback retains the same grants.
-    monkeypatch.setattr(backend, "queryset_filter", lambda **kwargs: None)
     assert list(Folder.objects.with_actor(ACTOR)) == [folder]
 
 

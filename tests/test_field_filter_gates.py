@@ -112,8 +112,8 @@ def rows(people):
 
 
 def surfaces(alice):
-    rows = Post.objects.as_user(alice)
-    folders = Folder.objects.as_user(alice)
+    rows = Post.objects.with_actor(alice)
+    folders = Folder.objects.with_actor(alice)
     secret = Q(title__startswith="secret")
     return {
         "filter": lambda: list(rows.filter(secret)),
@@ -251,10 +251,10 @@ def test_a_clause_that_reads_a_gated_column_is_refused(people, rows, mode, surfa
 @pytest.mark.parametrize("_schema", ["denormalized", "registry"], indirect=True)
 @pytest.mark.pg_delta
 def test_sliced_boolean_operand_keeps_gated_ordering_enforcement(people, rows, operation, side):
-    left = Post.objects.as_user(people["alice"]).order_by("title")[:1]
-    right = Post.objects.as_user(people["bob"]).order_by("pk")
+    left = Post.objects.with_actor(people["alice"]).order_by("title")[:1]
+    right = Post.objects.with_actor(people["bob"]).order_by("pk")
     if side == "right":
-        left, right = right.as_user(people["alice"]), left.as_user(people["bob"])
+        left, right = right.with_actor(people["alice"]), left.with_actor(people["bob"])
     with override_settings(REBAC_FIELD_READ_MODE="redact"):
         combined = operation(left, right)
         with pytest.raises(PermissionDenied, match="read__title"):
@@ -268,12 +268,12 @@ def test_sliced_boolean_operand_keeps_gated_ordering_enforcement(people, rows, o
 @override_settings(REBAC_FIELD_READ_MODE="redact")
 def test_the_default_ordering_counts(people, rows, monkeypatch):
     monkeypatch.setattr(Post._meta, "ordering", ["title"])
-    listed = Post.objects.as_user(people["alice"])
+    listed = Post.objects.with_actor(people["alice"])
     with pytest.raises(PermissionDenied):
         list(listed)
     # As a subquery, the ordering counts as Django compiles it: an __in lookup
     # clears an unsliced one and keeps a sliced one.
-    outer = Post.objects.as_user(people["bob"])
+    outer = Post.objects.with_actor(people["bob"])
     assert outer.filter(pk__in=listed).count() == 2
     with pytest.raises(PermissionDenied):
         outer.filter(pk__in=listed.values("pk")[:1]).count()
@@ -287,7 +287,7 @@ def test_the_default_ordering_counts(people, rows, monkeypatch):
 @override_settings(REBAC_FIELD_READ_MODE="redact")
 def test_an_ordering_by_a_relation_is_its_default_ordering(people, rows, monkeypatch):
     monkeypatch.setattr(Folder._meta, "ordering", ["name"])
-    listed = Post.objects.as_user(people["alice"])
+    listed = Post.objects.with_actor(people["alice"])
     with pytest.raises(PermissionDenied, match="read__name"):
         list(listed.order_by("folder"))
     # Its key column is not the related model's default ordering.
@@ -297,7 +297,7 @@ def test_an_ordering_by_a_relation_is_its_default_ordering(people, rows, monkeyp
 @override_settings(REBAC_FIELD_READ_MODE="redact")
 def test_the_rows_a_write_selects_are_guarded_too(people, rows):
     # bob may write both posts and read neither title.
-    edited = Post.objects.as_user(people["bob"])
+    edited = Post.objects.with_actor(people["bob"])
     with pytest.raises(PermissionDenied):
         edited.filter(title="secret plan").update(body="found")
     with pytest.raises(PermissionDenied):
@@ -309,7 +309,7 @@ def test_the_rows_a_write_selects_are_guarded_too(people, rows):
 
 @override_settings(REBAC_FIELD_READ_MODE="redact")
 def test_a_refused_evaluation_does_not_unguard_the_queryset(people, rows):
-    listed = Post.objects.as_user(people["alice"])
+    listed = Post.objects.with_actor(people["alice"])
     inner = listed.filter(pk=OuterRef("pk"), title__startswith="secret")
     with pytest.raises(PermissionDenied):
         listed.filter(title__startswith="secret").exists()
@@ -329,7 +329,7 @@ def test_a_watched_update_is_refused_before_its_rows_are_selected(people, rows):
     # refusal would say whether the title matched.
     with sudo(reason="test.fixture"):
         other = Folder.objects.create(name="other")
-    listed = Post.objects.as_user(people["alice"])
+    listed = Post.objects.with_actor(people["alice"])
     for title in ("secret plan", "no such title"):
         with pytest.raises(PermissionDenied, match="Cannot filter or order by gated field"):
             listed.filter(title=title).update(folder=other)
@@ -337,9 +337,9 @@ def test_a_watched_update_is_refused_before_its_rows_are_selected(people, rows):
 
 @override_settings(REBAC_FIELD_READ_MODE="redact")
 def test_a_subquery_ordered_by_a_reference_to_its_outer_query(people, rows):
-    folders = Folder.objects.as_user(people["alice"]).annotate(
+    folders = Folder.objects.with_actor(people["alice"]).annotate(
         first=Subquery(
-            Post.objects.as_user(people["alice"])
+            Post.objects.with_actor(people["alice"])
             .filter(folder=OuterRef("pk"))
             .annotate(d=Abs(F("pk") - OuterRef("pk")))
             .order_by("d")
@@ -353,7 +353,7 @@ def test_a_subquery_ordered_by_a_reference_to_its_outer_query(people, rows):
 def test_clauses_on_other_columns_and_bypasses_are_not_refused(people, rows):
     folder, own, hidden = rows
     alice = people["alice"]
-    listed = Post.objects.as_user(alice)
+    listed = Post.objects.with_actor(alice)
     assert {post.pk for post in listed.filter(body="").order_by("-pk")} == {own.pk, hidden.pk}
     assert listed.filter(folder=folder).count() == 2
     assert listed.filter(pk=hidden.pk).exists()
@@ -371,7 +371,7 @@ def test_clauses_on_other_columns_and_bypasses_are_not_refused(people, rows):
 @override_settings(REBAC_FIELD_READ_MODE="redact")
 def test_an_actor_who_reads_the_field_on_every_row_is_not_refused(people, rows):
     _folder, _own, hidden = rows
-    admin = Post.objects.as_user(people["carol"])
+    admin = Post.objects.with_actor(people["carol"])
     assert [post.pk for post in admin.filter(title="secret plan")] == [hidden.pk]
     assert [post.title for post in admin.order_by("-title")] == ["secret plan", "alpha memo"]
     assert list(admin.order_by("title").values_list("title", flat=True)) == [
@@ -402,7 +402,7 @@ def test_an_exclusion_on_the_row_is_not_every_row(people, rows):
         ),
     )
     _grant("blog/post", hidden.pk, people["carol"], "blocked")
-    admin = Post.objects.as_user(people["carol"])
+    admin = Post.objects.with_actor(people["carol"])
     assert {post.pk: post.title for post in admin} == {own.pk: "alpha memo", hidden.pk: None}
     with pytest.raises(PermissionDenied):
         list(admin.filter(title="secret plan"))
@@ -415,12 +415,12 @@ def test_a_subquery_does_not_answer_for_the_outer_row(people, rows):
 
     def matching():
         return Exists(
-            Folder.objects.as_user(alice).filter(pk=OuterRef("folder"), kind=OuterRef("title"))
+            Folder.objects.with_actor(alice).filter(pk=OuterRef("folder"), kind=OuterRef("title"))
         )
 
     def selected():
         return Subquery(
-            Folder.objects.as_user(alice)
+            Folder.objects.with_actor(alice)
             .filter(pk=OuterRef("folder"))
             .annotate(o=OuterRef("title"))
             .values("o")[:1]
@@ -433,10 +433,10 @@ def test_a_subquery_does_not_answer_for_the_outer_row(people, rows):
         "secret plan",
     ]
     # carol reads every title; alice's subquery compares the outer row's only.
-    assert Post.objects.as_user(people["carol"]).filter(~matching()).count() == 2
+    assert Post.objects.with_actor(people["carol"]).filter(~matching()).count() == 2
     # Under alice the outer query reads the title she may not filter on.
     with pytest.raises(PermissionDenied):
-        Post.objects.as_user(alice).filter(~matching()).count()
+        Post.objects.with_actor(alice).filter(~matching()).count()
 
 
 @override_settings(REBAC_FIELD_READ_MODE="redact")
@@ -456,7 +456,7 @@ def test_a_scoped_queryset_keeps_the_actor_it_was_scoped_with(people, rows):
 
 @override_settings(REBAC_FIELD_READ_MODE="redact")
 def test_a_count_reads_the_selection_only_of_distinct_or_grouped_rows(people, rows):
-    listed = Post.objects.as_user(people["alice"])
+    listed = Post.objects.with_actor(people["alice"])
     assert listed.values("title").count() == 2
     assert listed.values_list("title").exists()
     with pytest.raises(PermissionDenied):
@@ -467,7 +467,7 @@ def test_a_count_reads_the_selection_only_of_distinct_or_grouped_rows(people, ro
 
 @override_settings(REBAC_FIELD_READ_MODE="redact")
 def test_an_update_reads_its_explicit_ordering(people, rows, monkeypatch):
-    edited = Post.objects.as_user(people["bob"])
+    edited = Post.objects.with_actor(people["bob"])
     with pytest.raises(PermissionDenied, match="Cannot filter or order by gated field"):
         edited.order_by("title").update(body="ordered")
     # A model's default ordering is not part of an UPDATE.
@@ -478,7 +478,7 @@ def test_an_update_reads_its_explicit_ordering(people, rows, monkeypatch):
 @override_settings(REBAC_FIELD_READ_MODE="redact")
 def test_the_readable_value_is_what_redaction_shows(people, rows):
     _folder, own, hidden = rows
-    listed = Post.objects.as_user(people["alice"])
+    listed = Post.objects.with_actor(people["alice"])
     title = listed.readable("title")
     # Filtered, ordered, counted and selected: the hidden title is NULL.
     assert list(listed.alias(t=title).filter(t__startswith="secret")) == []
@@ -492,9 +492,9 @@ def test_the_readable_value_is_what_redaction_shows(people, rows):
     }
     # Built for alice, it is the column in bob's query.
     with pytest.raises(PermissionDenied):
-        list(Post.objects.as_user(people["bob"]).alias(t=title).filter(t="alpha memo"))
+        list(Post.objects.with_actor(people["bob"]).alias(t=title).filter(t="alpha memo"))
     # An actor who reads every title reads every value.
-    admin = Post.objects.as_user(people["carol"])
+    admin = Post.objects.with_actor(people["carol"])
     assert sorted(admin.annotate(t=admin.readable("title")).values_list("t", flat=True)) == [
         "alpha memo",
         "secret plan",
@@ -505,7 +505,7 @@ def test_the_readable_value_is_what_redaction_shows(people, rows):
 def test_the_readable_value_of_an_ungated_field_or_a_bypass_is_the_column(people, rows):
     from django.db.models import ExpressionWrapper
 
-    listed = Post.objects.as_user(people["alice"])
+    listed = Post.objects.with_actor(people["alice"])
     assert isinstance(listed.readable("body"), ExpressionWrapper)
     assert isinstance(Post.objects.sudo(reason="test.bypass").readable("title"), ExpressionWrapper)
     with pytest.raises(ValueError, match="concrete field"):
@@ -518,7 +518,7 @@ def test_the_readable_value_of_an_ungated_field_or_a_bypass_is_the_column(people
 def test_the_readable_value_is_trusted_only_as_built(people, rows):
     from django.contrib.auth import get_user_model
 
-    listed = Post.objects.as_user(people["alice"])
+    listed = Post.objects.with_actor(people["alice"])
     # Changed before use: rebuilt when resolved, so the change reaches nothing.
     title = listed.readable("title")
     title.default = F("title")
@@ -526,7 +526,7 @@ def test_the_readable_value_is_trusted_only_as_built(people, rows):
     assert list(listed.alias(t=title).filter(t__startswith="secret")) == []
     # Another model's query: the same column name would be another column.
     with pytest.raises(ValueError, match="used in a query of Folder"):
-        list(Folder.objects.as_user(people["alice"]).annotate(t=listed.readable("title")))
+        list(Folder.objects.with_actor(people["alice"]).annotate(t=listed.readable("title")))
     with pytest.raises(ValueError, match="used in a query of"):
         get_user_model().objects.annotate(t=listed.readable("title"))
 
@@ -535,7 +535,7 @@ def _users_with_secret_posts(alice):
     from django.contrib.auth import get_user_model
 
     # The outer statement is no rebac queryset: its subquery is checked when compiled.
-    posts = Post.objects.as_user(alice).filter(title__startswith="secret")
+    posts = Post.objects.with_actor(alice).filter(title__startswith="secret")
     return get_user_model().objects.filter(Exists(posts))
 
 
@@ -556,7 +556,7 @@ def test_a_subquery_is_checked_under_any_outer_statement(people, rows, outer):
 
     alice = people["alice"]
     secret = Exists(
-        Post.objects.as_user(alice).filter(pk=OuterRef("pk"), title__startswith="secret")
+        Post.objects.with_actor(alice).filter(pk=OuterRef("pk"), title__startswith="secret")
     )
     run = {
         "a plain model": lambda: list(_users_with_secret_posts(alice)),
@@ -574,3 +574,21 @@ def test_a_subquery_is_checked_under_any_outer_statement(people, rows, outer):
         run()
     with sudo(reason="test.verify"):
         assert not Post.objects.filter(body="found").exists()
+
+
+@pytest.mark.pg_delta
+@pytest.mark.parametrize("clause", ["filter", "order", "projection"])
+def test_exact_identity_does_not_bypass_field_read_gates(people, rows, clause):
+    _folder, _own, hidden = rows
+    query = Post.objects.with_actor(people["alice"]).filter(pk=hidden.pk)
+    with override_settings(REBAC_FIELD_READ_MODE="redact"):
+        with pytest.raises(PermissionDenied, match="read__title"):
+            if clause == "projection":
+                list(query.values_list("title", flat=True))
+            else:
+                query = (
+                    query.filter(title=hidden.title)
+                    if clause == "filter"
+                    else query.order_by("title")
+                )
+                list(query.values_list("pk", flat=True))

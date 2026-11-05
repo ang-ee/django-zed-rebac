@@ -105,7 +105,7 @@ def test_editor_can_update_ungated_field(alice, bob, post):
     _grant(post.pk, alice, "owner")
     _grant(post.pk, bob, "editor")
 
-    instance = Post.objects.as_user(bob).get(pk=post.pk)
+    instance = Post.objects.with_actor(bob).get(pk=post.pk)
     instance.body = "edited by bob"
     instance.save()
 
@@ -121,7 +121,7 @@ def test_editor_denied_on_gated_field(alice, bob, post):
     _grant(post.pk, alice, "owner")
     _grant(post.pk, bob, "editor")
 
-    instance = Post.objects.as_user(bob).get(pk=post.pk)
+    instance = Post.objects.with_actor(bob).get(pk=post.pk)
     instance.title = "hijacked title"
     with pytest.raises(PermissionDenied) as excinfo:
         instance.save()
@@ -136,7 +136,7 @@ def test_owner_can_update_gated_field(alice, post):
 
     _grant(post.pk, alice, "owner")
 
-    instance = Post.objects.as_user(alice).get(pk=post.pk)
+    instance = Post.objects.with_actor(alice).get(pk=post.pk)
     instance.title = "owner-renamed"
     instance.save()
 
@@ -155,7 +155,7 @@ def test_editor_can_save_unchanged_title(alice, bob, post):
     _grant(post.pk, alice, "owner")
     _grant(post.pk, bob, "editor")
 
-    instance = Post.objects.as_user(bob).get(pk=post.pk)
+    instance = Post.objects.with_actor(bob).get(pk=post.pk)
     # Touching only body — title untouched.
     instance.body = "body-only update"
     instance.save()
@@ -174,7 +174,7 @@ def test_editor_save_with_update_fields_only_body(alice, bob, post):
     _grant(post.pk, alice, "owner")
     _grant(post.pk, bob, "editor")
 
-    instance = Post.objects.as_user(bob).get(pk=post.pk)
+    instance = Post.objects.with_actor(bob).get(pk=post.pk)
     instance.title = "stale in-memory only"  # not in update_fields, won't write
     instance.body = "edited via update_fields"
     instance.save(update_fields=["body"])
@@ -194,7 +194,7 @@ def test_editor_save_with_update_fields_includes_gated(alice, bob, post):
     _grant(post.pk, alice, "owner")
     _grant(post.pk, bob, "editor")
 
-    instance = Post.objects.as_user(bob).get(pk=post.pk)
+    instance = Post.objects.with_actor(bob).get(pk=post.pk)
     instance.title = "hijack via update_fields"
     with pytest.raises(PermissionDenied):
         instance.save(update_fields=["title"])
@@ -228,7 +228,7 @@ def test_bulk_update_ungated_field_allowed(alice, bob, post):
     _grant(post.pk, alice, "owner")
     _grant(post.pk, bob, "editor")
 
-    n = Post.objects.as_user(bob).filter(pk=post.pk).update(body="bulk-body")
+    n = Post.objects.with_actor(bob).filter(pk=post.pk).update(body="bulk-body")
     assert n == 1
     with sudo(reason="test.verify"):
         assert Post.objects.get(pk=post.pk).body == "bulk-body"
@@ -242,7 +242,7 @@ def test_bulk_update_gated_field_denied(alice, bob, post):
     _grant(post.pk, alice, "owner")
     _grant(post.pk, bob, "editor")
 
-    qs = Post.objects.as_user(bob).filter(pk=post.pk)
+    qs = Post.objects.with_actor(bob).filter(pk=post.pk)
     with pytest.raises(PermissionDenied) as excinfo:
         qs.update(title="bulk-hijack")
     assert "write__title" in str(excinfo.value)
@@ -257,7 +257,7 @@ def test_bulk_update_gated_field_owner_allowed(alice, post):
 
     _grant(post.pk, alice, "owner")
 
-    n = Post.objects.as_user(alice).filter(pk=post.pk).update(title="owner-bulk")
+    n = Post.objects.with_actor(alice).filter(pk=post.pk).update(title="owner-bulk")
     assert n == 1
     with sudo(reason="test.verify"):
         assert Post.objects.get(pk=post.pk).title == "owner-bulk"

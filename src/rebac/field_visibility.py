@@ -10,13 +10,14 @@ from django.db import models
 
 from ._id import resource_id_attr
 from .conf import app_settings
+from .database import database_context, read_alias
 from .resources import model_resource_type
 from .schema.ast import Schema
 from .schema.walker import field_gated_actions
 from .types import CheckResult, FieldDenyMode, ObjectRef, PermissionResult, SubjectRef
 
 if TYPE_CHECKING:  # pragma: no cover
-    from .backends.base import Backend
+    from .backends.local import LocalBackend
 
 
 FIELD_DENY_MODES = frozenset({"allow", "redact", "omit", "raise"})
@@ -54,62 +55,40 @@ def backend_schema() -> Schema | None:
     """Best-effort schema accessor shared by read and write field gates."""
     from .backends import backend
 
-    accessor = getattr(backend(), "schema", None)
-    if not callable(accessor):
-        return None
     try:
-        result = accessor()
+        return backend().schema()
     except Exception:
         return None
-    return result if isinstance(result, Schema) else None
 
 
-def backend_grants_all(
-    active_backend: Backend,
+def held_ids(
+    active_backend: LocalBackend,
     *,
     subject: SubjectRef,
     action: str,
-    resource_type: str,
-) -> bool:
-    grants_all = getattr(active_backend, "grants_all", None)
-    if not callable(grants_all):
-        return False
-    return bool(grants_all(subject=subject, action=action, resource_type=resource_type))
-
-
-def accessible_ids(
-    active_backend: Backend,
-    *,
-    subject: SubjectRef,
-    action: str,
-    resource_type: str,
+    model: type[models.Model],
+    resource_ids: Iterable[str],
+    using: str | None = None,
 ) -> tuple[str, ...]:
-    """Route ``accessible`` through the ambient evaluator when one exists."""
-    from .evaluator import current_evaluator
-
-    evaluator = current_evaluator()
-    if evaluator is None:
-        return tuple(
-            str(v)
-            for v in active_backend.accessible(
-                subject=subject,
-                action=action,
-                resource_type=resource_type,
-            )
-        )
-    return tuple(
-        str(v)
-        for v in evaluator.accessible(
-            active_backend,
-            subject=subject,
-            action=action,
-            resource_type=resource_type,
-        )
+    """Check an explicitly supplied candidate set with ``LocalBackend.held``."""
+    resource_type = model_resource_type(model)
+    if resource_type is None:
+        return ()
+    ids = tuple(dict.fromkeys(resource_ids))
+    if not ids:
+        return ()
+    allowed = active_backend.held(
+        subject=subject,
+        action=action,
+        resource_type=resource_type,
+        ids=ids,
+        using=read_alias(model, using=using),
     )
+    return tuple(value for value in ids if value in allowed)
 
 
 def check_field_access(
-    active_backend: Backend,
+    active_backend: LocalBackend,
     *,
     subject: SubjectRef,
     action: str,
@@ -161,13 +140,10 @@ def visible_id_sets(
     model: type[models.Model],
     actor: SubjectRef,
     fields: frozenset[str],
-    active_backend: Backend | None = None,
-) -> dict[str, frozenset[str] | None]:
-    """Map each gated field to visible resource ids.
-
-    ``None`` means the field action grants every row of this resource type, so
-    callers should skip per-row redaction for that field.
-    """
+    resource_ids: Iterable[str],
+    active_backend: LocalBackend | None = None,
+) -> dict[str, frozenset[str]]:
+    """Map each gated field to its visible subset of the supplied row ids."""
     rebac_type = model_resource_type(model)
     if not rebac_type or not fields:
         return {}
@@ -175,26 +151,30 @@ def visible_id_sets(
         from .backends import backend
 
         active_backend = backend()
-    visible: dict[str, frozenset[str] | None] = {}
-    for field_name in fields:
-        action = f"read__{field_name}"
-        if backend_grants_all(
+    from .evaluator import current_evaluator
+
+    candidates = tuple(dict.fromkeys(resource_ids))
+    actions = tuple(f"read__{name}" for name in sorted(fields))
+    evaluator = current_evaluator()
+    if evaluator is None:
+        answers = active_backend.held_many(
+            subject=actor,
+            actions=actions,
+            resource_type=rebac_type,
+            ids=candidates,
+            using=read_alias(model),
+        )
+    else:
+        answers = evaluator._held_many(
             active_backend,
             subject=actor,
-            action=action,
+            model=model,
             resource_type=rebac_type,
-        ):
-            visible[field_name] = None
-            continue
-        visible[field_name] = frozenset(
-            accessible_ids(
-                active_backend,
-                subject=actor,
-                action=action,
-                resource_type=rebac_type,
-            )
+            actions=actions,
+            ids=candidates,
+            using=read_alias(model),
         )
-    return visible
+    return {name: frozenset(answers[f"read__{name}"]) for name in fields}
 
 
 def apply_field_visibility(
@@ -203,54 +183,57 @@ def apply_field_visibility(
     model: type[models.Model],
     actor: SubjectRef,
     mode: FieldDenyMode,
+    using: str | None = None,
 ) -> None:
     """Redact/omit denied ``read__<field>`` values on a fetched batch."""
-    runtime_mode = runtime_field_deny_mode(validate_field_deny_mode(mode))
-    if runtime_mode == "allow":
-        return
-    marker = (actor, runtime_mode)
-    batch = [
-        inst
-        for inst in instances
-        if isinstance(inst, models.Model)
-        and getattr(inst, "_rebac_visibility_marker", None) != marker
-    ]
-    if not batch:
-        return
-    fields = gated_read_fields(model)
-    if not fields:
-        return
+    with database_context(read_alias(model, using=using)):
+        runtime_mode = runtime_field_deny_mode(validate_field_deny_mode(mode))
+        if runtime_mode == "allow":
+            return
+        marker = (actor, runtime_mode)
+        batch = [
+            inst
+            for inst in instances
+            if isinstance(inst, models.Model)
+            and getattr(inst, "_rebac_visibility_marker", None) != marker
+        ]
+        if not batch:
+            return
+        fields = gated_read_fields(model)
+        if not fields:
+            return
 
-    from .backends import backend
+        from .backends import backend
 
-    active_backend = backend()
-    visible = visible_id_sets(
-        model=model,
-        actor=actor,
-        fields=fields,
-        active_backend=active_backend,
-    )
-    rebac_type = model_resource_type(model)
-    if not rebac_type:
-        return
+        active_backend = backend()
+        visible = visible_id_sets(
+            model=model,
+            actor=actor,
+            fields=fields,
+            active_backend=active_backend,
+            resource_ids=(_instance_resource_id(inst) for inst in batch),
+        )
+        rebac_type = model_resource_type(model)
+        if not rebac_type:
+            return
 
-    for inst in batch:
-        denied: set[str] = set()
-        resource_id = _instance_resource_id(inst)
-        for field_name in fields:
-            ids = visible.get(field_name)
-            if ids is None or resource_id in ids:
-                continue
-            if _conditional_field_is_visible(
-                active_backend,
-                actor=actor,
-                action=f"read__{field_name}",
-                resource=ObjectRef(rebac_type, resource_id),
-            ):
-                continue
-            denied.add(field_name)
-        mark_denied_fields(inst, denied, mode=runtime_mode)
-        cast(Any, inst)._rebac_visibility_marker = marker
+        for inst in batch:
+            denied: set[str] = set()
+            resource_id = _instance_resource_id(inst)
+            for field_name in fields:
+                ids = visible[field_name]
+                if resource_id in ids:
+                    continue
+                if _conditional_field_is_visible(
+                    active_backend,
+                    actor=actor,
+                    action=f"read__{field_name}",
+                    resource=ObjectRef(rebac_type, resource_id),
+                ):
+                    continue
+                denied.add(field_name)
+            mark_denied_fields(inst, denied, mode=runtime_mode)
+            cast(Any, inst)._rebac_visibility_marker = marker
 
 
 def redacted_fields(instance: models.Model) -> frozenset[str]:
@@ -352,7 +335,7 @@ def _scrub_loaded_value(instance: models.Model, field_name: str) -> None:
 
 
 def _conditional_field_is_visible(
-    active_backend: Backend,
+    active_backend: LocalBackend,
     *,
     actor: SubjectRef,
     action: str,

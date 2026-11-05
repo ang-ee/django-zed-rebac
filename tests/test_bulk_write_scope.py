@@ -89,7 +89,7 @@ def _stored(post):
 
 def test_a_hidden_match_is_not_part_of_an_update(world):
     dave, _mine, _theirs, _own, hidden, _shared = world
-    rows = Post.objects.as_user(dave)
+    rows = Post.objects.with_actor(dave)
     assert rows.filter(body="confidential").count() == 0
     assert rows.filter(body="confidential").update(body="x") == 0
     # Narrowing the hidden value down answers nothing either.
@@ -100,7 +100,7 @@ def test_a_hidden_match_is_not_part_of_an_update(world):
 
 def test_a_hidden_match_is_not_part_of_a_delete(world):
     dave, _mine, _theirs, _own, hidden, _shared = world
-    rows = Post.objects.as_user(dave)
+    rows = Post.objects.with_actor(dave)
     assert rows.filter(body="confidential").delete() == (0, {})
     assert rows.filter(body="nope").delete() == (0, {})
     assert _stored(hidden).title == "carol's"
@@ -108,10 +108,10 @@ def test_a_hidden_match_is_not_part_of_a_delete(world):
 
 def test_the_rows_in_scope_are_written(world):
     dave, _mine, _theirs, own, hidden, _shared = world
-    rows = Post.objects.as_user(dave).filter(body__in=["mine", "confidential"])
+    rows = Post.objects.with_actor(dave).filter(body__in=["mine", "confidential"])
     assert rows.update(title="retitled") == 1
     assert (_stored(own).title, _stored(hidden).title) == ("retitled", "carol's")
-    assert Post.objects.as_user(dave).filter(body__in=["mine", "confidential"]).delete() == (
+    assert Post.objects.with_actor(dave).filter(body__in=["mine", "confidential"]).delete() == (
         1,
         {"testapp.Post": 1},
     )
@@ -120,24 +120,24 @@ def test_the_rows_in_scope_are_written(world):
 
 def test_a_readable_row_the_actor_may_not_write_still_refuses(world):
     dave, _mine, _theirs, own, _hidden, shared = world
-    rows = Post.objects.as_user(dave).filter(body__in=["mine", "shared"])
+    rows = Post.objects.with_actor(dave).filter(body__in=["mine", "shared"])
     with pytest.raises(PermissionDenied, match="all-or-nothing"):
         rows.update(body="x")
     with pytest.raises(PermissionDenied, match="all-or-nothing"):
-        Post.objects.as_user(dave).filter(body__in=["mine", "shared"]).delete()
+        Post.objects.with_actor(dave).filter(body__in=["mine", "shared"]).delete()
     assert (_stored(own).body, _stored(shared).body) == ("mine", "shared")
 
 
 def test_the_scope_is_the_querysets_action(world):
     dave, _mine, _theirs, own, _hidden, shared = world
-    rows = Post.objects.as_user(dave).with_action("write").filter(body__in=["mine", "shared"])
+    rows = Post.objects.with_actor(dave).with_action("write").filter(body__in=["mine", "shared"])
     assert rows.update(body="written") == 1
     assert (_stored(own).body, _stored(shared).body) == ("written", "shared")
 
 
 def test_a_moved_edge_of_a_hidden_row_is_not_gated(world):
     dave, mine, theirs, own, hidden, _shared = world
-    rows = Post.objects.as_user(dave)
+    rows = Post.objects.with_actor(dave)
     assert rows.filter(body="confidential").update(folder=mine) == 0
     assert rows.filter(body__in=["mine", "confidential"]).update(folder=None) == 1
     assert (_stored(own).folder_id, _stored(hidden).folder_id) == (None, theirs.pk)
@@ -153,8 +153,8 @@ def test_a_cascade_still_checks_a_hidden_child(world):
     # The child matches the filter but is not in scope: it is not a root of
     # the delete, and the cascade that reaches it checks it.
     for rows in (
-        Folder.objects.as_user(dave).filter(pk=mine.pk),
-        Folder.objects.as_user(dave).filter(name__startswith="mine"),
+        Folder.objects.with_actor(dave).filter(pk=mine.pk),
+        Folder.objects.with_actor(dave).filter(name__startswith="mine"),
     ):
         with pytest.raises(PermissionDenied):
             rows.delete()
@@ -173,7 +173,7 @@ def test_an_ambient_actor_and_a_related_manager_are_scoped_alike(world):
 
 def test_bulk_update_skips_an_object_the_actor_cannot_read(world):
     dave, _mine, _theirs, own, hidden, _shared = world
-    rows = Post.objects.as_user(dave)
+    rows = Post.objects.with_actor(dave)
     mine = rows.get(pk=own.pk)
     mine.body = "bulk"
     other = Post(pk=hidden.pk, title="carol's", body="bulk")
@@ -187,15 +187,15 @@ def test_a_denial_in_a_later_part_rolls_back_the_whole_write(world, monkeypatch)
     dave, _mine, _theirs, own, _hidden, shared = world
     monkeypatch.setattr(rebac.watch, "KEY_CHUNK", 1)
     with pytest.raises(PermissionDenied):
-        Post.objects.as_user(dave).filter(body__in=["mine", "shared"]).update(body="x")
+        Post.objects.with_actor(dave).filter(body__in=["mine", "shared"]).update(body="x")
     with pytest.raises(PermissionDenied):
-        Post.objects.as_user(dave).filter(body__in=["mine", "shared"]).delete()
+        Post.objects.with_actor(dave).filter(body__in=["mine", "shared"]).delete()
     assert (_stored(own).body, _stored(shared).body) == ("mine", "shared")
 
 
 def test_an_update_clears_the_result_cache(world):
     dave, *_ = world
-    rows = Post.objects.as_user(dave).filter(body="mine")
+    rows = Post.objects.with_actor(dave).filter(body="mine")
     assert [post.body for post in rows] == ["mine"]
     assert rows.update(body="changed") == 1
     assert list(rows) == []
@@ -220,5 +220,5 @@ def test_a_distinct_on_update_is_refused_under_an_actor(world):
     """DISTINCT ON would check one row per value; the UPDATE writes them all."""
     dave, _mine, _theirs, own, _hidden, _shared = world
     with pytest.raises(TypeError, match="distinct"):
-        Post.objects.as_user(dave).filter(body="mine").distinct("title").update(body="x")
+        Post.objects.with_actor(dave).filter(body="mine").distinct("title").update(body="x")
     assert _stored(own).body == "mine"

@@ -49,6 +49,17 @@ def _schema_loads(queries):
     return sum('from "rebac_schemadefinition"' in query["sql"].lower() for query in queries)
 
 
+def test_shared_evaluator_nested_scope_keeps_schema_pin_until_last_exit(persisted_schema):
+    local, _ = persisted_schema
+    with evaluator_scope() as evaluator:
+        first_schema = local.schema()
+        with evaluator_scope(evaluator):
+            assert local.schema() is first_schema
+        with CaptureQueriesContext(connection) as queries:
+            assert local.schema() is first_schema
+        assert len(queries) == 0
+
+
 def _set_permission(permission, expression, writer):
     if writer == "save":
         permission.expression = expression
@@ -206,75 +217,6 @@ def test_manual_transaction_rollback_cannot_retain_schema_grant(persisted_schema
         transaction.set_autocommit(True)
 
 
-def test_schema_observer_is_removed_when_scope_raises(persisted_schema):
-    local, _ = persisted_schema
-    original = tuple(connection.execute_wrappers)
-    with pytest.raises(RuntimeError, match="leave scope"):
-        with evaluator_scope():
-            assert not _allowed(local)
-            raise RuntimeError("leave scope")
-    assert tuple(connection.execute_wrappers) == original
-
-
-def test_scope_cleanup_preserves_other_native_callbacks_and_list_owners(persisted_schema):
-    local, _ = persisted_schema
-    observed = []
-    wrappers = connection.execute_wrappers
-    with transaction.atomic():
-        callbacks = connection.run_on_commit
-        transaction.on_commit(lambda: observed.append("before"))
-        original = tuple(callbacks)
-        with pytest.raises(RuntimeError, match="leave scope"):
-            with evaluator_scope():
-                assert not _allowed(local)
-                assert len(callbacks) == len(original) + 1
-                transaction.on_commit(lambda: observed.append("during"))
-                raise RuntimeError("leave scope")
-        assert connection.execute_wrappers is wrappers
-        assert connection.run_on_commit is callbacks
-        assert tuple(callbacks[: len(original)]) == original
-        assert len(callbacks) == len(original) + 1
-    assert observed == ["before", "during"]
-
-
-def test_lazy_schema_observer_preserves_native_execute_wrapper_lifetime(persisted_schema):
-    local, _ = persisted_schema
-    original = tuple(connection.execute_wrappers)
-    observed = []
-
-    def instrument(execute, sql, params, many, context):
-        observed.append(sql)
-        return execute(sql, params, many, context)
-
-    try:
-        with evaluator_scope():
-            with connection.execute_wrapper(instrument):
-                assert not _allowed(local)
-            assert observed
-            assert instrument not in connection.execute_wrappers
-            assert len(connection.execute_wrappers) == len(original) + 1
-        assert tuple(connection.execute_wrappers) == original
-    finally:
-        # A failed ownership regression must not leak the test's wrapper into
-        # Django's fixture teardown or the next test.
-        connection.execute_wrappers[:] = original
-
-
-def test_shared_evaluator_nested_scope_keeps_observer_until_last_exit(persisted_schema):
-    local, _ = persisted_schema
-    original = tuple(connection.execute_wrappers)
-    with evaluator_scope() as evaluator:
-        first_schema = local.schema()
-        wrappers = tuple(connection.execute_wrappers)
-        with evaluator_scope(evaluator):
-            assert local.schema() is first_schema
-        assert tuple(connection.execute_wrappers) == wrappers
-        with CaptureQueriesContext(connection) as queries:
-            assert local.schema() is first_schema
-        assert len(queries) == 0
-    assert tuple(connection.execute_wrappers) == original
-
-
 def test_copied_evaluator_context_does_not_share_snapshot_between_connections(persisted_schema):
     local, _ = persisted_schema
 
@@ -297,37 +239,3 @@ def test_copied_evaluator_context_does_not_share_snapshot_between_connections(pe
         assert worker_connection is not parent_connection
         assert worker_schema is parent_schema
         assert local.schema() is parent_schema
-
-
-def test_interleaved_scope_exit_removes_only_its_own_observer(persisted_schema):
-    local, permission = persisted_schema
-    first, second = Context(), Context()
-    original = tuple(connection.execute_wrappers)
-    first_scope = first.run(evaluator_scope)
-    second_scope = second.run(evaluator_scope)
-    first.run(first_scope.__enter__)
-    second_open = False
-    first_open = True
-    try:
-        assert not first.run(_allowed, local)
-        first_wrappers = tuple(connection.execute_wrappers)
-        second.run(second_scope.__enter__)
-        second_open = True
-        assert not second.run(_allowed, local)
-        second_observers = tuple(
-            wrapper for wrapper in connection.execute_wrappers if wrapper not in first_wrappers
-        )
-        assert second_observers, "The second evaluator must own its connection observer"
-        first.run(first_scope.__exit__, None, None, None)
-        first_open = False
-        assert tuple(connection.execute_wrappers) == (*original, *second_observers)
-        with transaction.atomic():
-            assert not second.run(_allowed, local)
-            second.run(_set_permission, permission, "viewer", "related")
-            assert second.run(_allowed, local)
-    finally:
-        if first_open:
-            first.run(first_scope.__exit__, None, None, None)
-        if second_open:
-            second.run(second_scope.__exit__, None, None, None)
-    assert tuple(connection.execute_wrappers) == original

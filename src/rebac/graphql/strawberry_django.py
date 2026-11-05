@@ -24,7 +24,6 @@ from strawberry_django.optimizer import (
 from strawberry_django.resolvers import django_fetch
 
 from .._id import resource_id_attr
-from ..actors import current_actor, is_sudo
 from ..relation_loading import related_model_for_lookup, selected_related_paths
 from ..resources import model_resource_type
 
@@ -136,20 +135,18 @@ def _safe_config(config: OptimizerConfig | None) -> OptimizerConfig:
 def _pin_current_actor[M: models.Model](qs: QuerySet[M]) -> QuerySet[M]:
     """Scope an unscoped queryset to the ambient actor before optimizing.
 
-    Skips pinning — leaving the queryset unscoped — when it already carries an
-    actor or sudo reason, or when *ambient* sudo is active (the ContextVar set
-    by ``ActorMiddleware``'s superuser bypass or an explicit ``sudo()`` block).
-    Without the ``is_sudo()`` check a sudo-bracketed read would be silently
-    re-scoped to the actor here, defeating the bypass at the optimizer layer.
+    The queryset's observer owns precedence: a pinned actor remains pinned,
+    and explicit or ambient sudo remains a bypass. Only an ambient actor on
+    an otherwise unpinned queryset is copied into a stable queryset scope.
     """
-    if getattr(qs, "_rebac_actor", None) is not None:
+    effective_actor = getattr(qs, "effective_actor", None)
+    if not callable(effective_actor):
         return qs
-    if getattr(qs, "_rebac_sudo_reason", None) is not None:
+    actor, bypass = cast(Any, effective_actor)()
+    if actor is None or bypass:
         return qs
-    if is_sudo():
-        return qs
-    actor = current_actor()
-    if actor is None:
+    pinned_actor = getattr(qs, "actor", None)
+    if callable(pinned_actor) and pinned_actor() is not None:
         return qs
     with_actor = getattr(qs, "with_actor", None)
     if callable(with_actor):

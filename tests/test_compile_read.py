@@ -128,7 +128,7 @@ def test_residual_marks_recursive_ban_cycle_as_depth_relevant(monkeypatch):
 
 
 @pytest.mark.django_db
-def test_reused_scope_sees_new_caveat_instance_at_statement_execution():
+def test_reused_scope_excludes_new_caveat_instance_until_rebuilt():
     local = install_schema(
         """
         caveat active(flag bool) { flag }
@@ -161,7 +161,12 @@ def test_reused_scope_sees_new_caveat_instance_at_statement_execution():
             )
         ]
     )
-    assert list(rows.values_list("pk", flat=True)) == [post.pk]
+    assert list(rows.values_list("pk", flat=True)) == []
+    assert list(
+        Post._base_manager.filter(
+            scope_q(backend=local, model=Post, action="read", actor=actor, using="default")
+        ).values_list("pk", flat=True)
+    ) == [post.pk]
     assert list(ids) == [str(post.pk)]
 
 
@@ -193,6 +198,29 @@ def test_old_scope_closes_after_policy_revision_changes():
         scope_q(backend=local, model=Post, action="read", actor=actor, using="default")
     )
     assert list(current.values_list("pk", flat=True)) == [post.pk]
+
+
+@pytest.mark.django_db
+def test_kept_scope_statement_checks_revision_when_run():
+    local = install_schema("""
+        definition auth/user {}
+        definition blog/post { permission read = authenticated }
+    """)
+    actor = SubjectRef.of("auth/user", "alice")
+    with sudo(reason="kept scope revision fence fixture"):
+        Post._base_manager.create(title="old grant")
+    old = Post._base_manager.filter(
+        scope_q(backend=local, model=Post, action="read", actor=actor, using="default")
+    )
+    # Render the unprepared inline statement, which is kept; its fence closes it at run time.
+    old.query.sql_with_params()
+    local.set_schema(
+        parse_zed("""
+        definition auth/user {}
+        definition blog/post { permission read = nil }
+    """)
+    )
+    assert not old.exists()
 
 
 @pytest.mark.django_db
@@ -235,7 +263,7 @@ def test_revision_change_during_lazy_compilation_cannot_replace_the_pinned_polic
 
 
 @pytest.mark.django_db
-def test_reused_scope_recompiles_after_override_deadline(monkeypatch):
+def test_reused_scope_stays_closed_after_override_deadline_until_rebuilt(monkeypatch):
     clock = clocks(monkeypatch)
     deadline = clock["app"] + timedelta(minutes=1)
     definition = SchemaDefinition.objects.create(resource_type="blog/post")
@@ -264,7 +292,12 @@ def test_reused_scope_recompiles_after_override_deadline(monkeypatch):
     assert not rows.exists()
 
     clock["sql"] = clock["app"]
-    assert list(rows.values_list("pk", flat=True)) == [post.pk]
+    assert list(rows.values_list("pk", flat=True)) == []
+    assert list(
+        Post._base_manager.filter(
+            scope_q(backend=local, model=Post, action="read", actor=actor, using="default")
+        ).values_list("pk", flat=True)
+    ) == [post.pk]
 
 
 @pytest.mark.django_db

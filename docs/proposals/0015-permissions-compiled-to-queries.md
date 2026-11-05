@@ -489,7 +489,7 @@ measures it on the folder data before reads switch.
 
 | Operation | Implementation |
 |---|---|
-| Queryset scope | `M.filter(holds(node, At(T, identity column, identity field, row=True), LOWER))`, returned by the existing `Backend.queryset_filter()` seam |
+| Queryset scope | `M.filter(holds(node, At(T, identity column, identity field, row=True), LOWER))`, returned by `LocalBackend.queryset_filter()` |
 | Point check | the same predicate at `At(T, Value(id), None, False)`, selected from the fenced `SchemaGeneration` row; one statement may prove `HAS`, with separate uncertainty probes allowed by § 6; no model row required |
 | `accessible()` | the lower bound over each part of the universe: rows, tuple-named ids, constant targets, attribute containers |
 | `lookup_subjects()` | candidates gathered upward from the one resource (tuple subjects, subject-set members, backed holder columns), filtered by `LOWER`; omit uncertain candidates without aborting definite results |
@@ -513,9 +513,10 @@ READ COMMITTED snapshots that never coexisted; SQL remains the allow authority.
 `create()` are reflected in reads the moment they commit, because nothing
 was copied.
 
-**Gates keep their rules and their entry points.** `RebacMixin.save_base`
-and `delete`, the scoped and tracked querysets, the related-manager wrappers,
-the `m2m_changed` receiver and invariant 5d stay. Their mechanics change:
+**Gates keep their rules and their entry points.** `RebacTrackedMixin.save_base`
+with its `RebacMixin` resource hook, `RebacMixin.delete`, the shared tracked
+queryset write owner with scoped hooks, the `m2m_changed` receiver and
+invariant 5d stay. Their mechanics change:
 
 - The gate's reads go through the compiled predicate.
 - **Inserts** keep `check_new` per candidate, including
@@ -568,19 +569,19 @@ Removed by this proposal:
   meaning; D2.
 
 Not removed by this proposal: `RebacTrackedMixin`, `TrackedQuerySet`, the
-injected base manager, the related-manager wrappers and the gate code in
-`signals.py`. They exist for gates now, not for maintenance (§ 13).
+injected base manager and the gate code in `signals.py`. They exist for gates
+now, not for maintenance (§ 13). Related-manager M2M writes reach the
+`m2m_changed` receiver for auto-created throughs or the declared through's
+own write gates.
 
 Added: `rebac/compile/` (the predicate compiler, identity expressions,
 unrolling) and the single-object evaluator for conditional results.
 
 ### 12. Other backends
 
-`queryset_filter()` returning `None` keeps today's fallback to
-`accessible()` id lists, so the `Backend` API is unchanged. A later
-`SpiceDBBackend` can use the same split: Django resolves the structural part
-of a permission and the backend answers for the objects that hold grants,
-instead of one tuple per application row. Not part of this proposal.
+The local runtime's `queryset_filter()` supplies a compiled predicate for
+typed models. A future remote backend needs a separate queryset scoping
+design; this proposal specifies only the local compiler.
 
 ### 13. Follow-up, decided separately: the gates
 

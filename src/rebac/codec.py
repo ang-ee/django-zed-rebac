@@ -6,8 +6,10 @@ the reserved '*' type-level ID cannot reach an integer or UUID cast.
 
 from __future__ import annotations
 
+from collections import OrderedDict
 from collections.abc import Sequence
 from dataclasses import dataclass
+from threading import RLock
 from typing import Any, Protocol
 
 from django.core.exceptions import FieldDoesNotExist, ValidationError
@@ -107,7 +109,9 @@ class _IdentityCodec:
 _CONVERTED: Any = object()
 # (alias, vendor, native uuid, codec, direction) -> the guard's SQL split at the
 # converted expression's positions, and its parameters with _CONVERTED markers.
-_fragments: dict[tuple[Any, ...], tuple[tuple[str, ...], tuple[Any, ...]]] = {}
+_fragments: OrderedDict[tuple[Any, ...], tuple[tuple[str, ...], tuple[Any, ...]]] = OrderedDict()
+_FRAGMENT_LIMIT = 512
+_fragments_lock = RLock()
 
 
 class _Converted(Expression):
@@ -174,11 +178,18 @@ class _Conversion(Func):
             self.codec,
             self.to_wire,
         )
-        fragment = _fragments.get(key)
-        if fragment is None:
-            guard = self._expression(_Converted(), connection).resolve_expression(compiler.query)
-            guard_sql, guard_params = compiler.compile(guard)
-            fragment = _fragments[key] = _chunks(guard_sql, guard_params), tuple(guard_params)
+        with _fragments_lock:
+            fragment = _fragments.get(key)
+            if fragment is None:
+                guard = self._expression(_Converted(), connection).resolve_expression(
+                    compiler.query
+                )
+                guard_sql, guard_params = compiler.compile(guard)
+                fragment = _fragments[key] = _chunks(guard_sql, guard_params), tuple(guard_params)
+                if len(_fragments) > _FRAGMENT_LIMIT:
+                    _fragments.popitem(last=False)
+            else:
+                _fragments.move_to_end(key)
         chunks, guard_params = fragment
         inner_sql, inner_params = compiler.compile(self.get_source_expressions()[0])
         params: list[Any] = []

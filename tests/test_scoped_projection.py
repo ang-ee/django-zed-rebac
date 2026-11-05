@@ -124,6 +124,17 @@ def test_missing_actor_aggregate_fails_closed_and_can_be_rebound(rows, strict):
         assert scoped.with_actor(ALICE).count() == 2
 
 
+@pytest.mark.parametrize("strict", [True, False])
+def test_missing_actor_scoped_count_and_exists_fail_closed_and_can_be_rebound(rows, strict):
+    with override_settings(REBAC_STRICT_MODE=strict):
+        scoped = Post.objects.scoped_for_aggregate()
+        assert scoped.count() == 0
+        assert not scoped.exists()
+        rebound = scoped.with_actor(ALICE)
+        assert rebound.count() == 2
+        assert rebound.exists()
+
+
 def test_anonymous_actor_is_not_missing_actor(rows):
     reset_backend()
     active = backend()

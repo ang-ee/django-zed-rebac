@@ -7,7 +7,7 @@ import pytest
 from django.db import connection
 from django.utils import timezone
 
-from rebac import RelationshipTuple, app_settings, to_object_ref
+from rebac import RelationshipTuple, to_object_ref
 from rebac.schema import parse_zed
 from tests.backend_setup import STORAGE_TIERS, install_schema
 from tests.test_recursive_queryscope import (
@@ -21,7 +21,7 @@ from tests.test_recursive_queryscope import (
 )
 from tests.testapp.models import Folder
 
-pytestmark = pytest.mark.django_db
+pytestmark = [pytest.mark.django_db, pytest.mark.pg_delta]
 
 
 def parse_depth(sql):
@@ -43,7 +43,7 @@ def parse_depth(sql):
     return maximum_selects, maximum_parens
 
 
-def deep_scope_proof(storage, backing, deep):
+def deep_scope_proof(storage, backing, deep, exact):
     measurements = []
     with schema_context(storage, "folder", backing) as (active, member, hop, action):
         for depth in (1, deep):
@@ -52,9 +52,12 @@ def deep_scope_proof(storage, backing, deep):
             assert active.check_access(
                 subject=ACTOR, action=action, resource=to_object_ref(rows[-1])
             ).allowed
+            queryset = Folder.objects.with_actor(ACTOR).with_action(action)
             queryset = (
-                Folder.objects.with_actor(ACTOR).with_action(action).filter(pk=rows[-1].pk).scoped()
-            )
+                queryset.filter(pk=rows[-1].pk)
+                if exact
+                else queryset.filter(pk__gte=rows[-1].pk, pk__lte=rows[-1].pk)
+            ).scoped()
             statements = []
 
             def record(execute, sql, params, many, context, statements=statements):
@@ -62,15 +65,12 @@ def deep_scope_proof(storage, backing, deep):
                 return execute(sql, params, many, context)
 
             with connection.execute_wrapper(record):
+                assert [row.pk for row in queryset] == [rows[-1].pk]
+                # Ranges prepare the decided scope before rendering it.
+                expected_statements = 1 if exact else 2
+                assert len(statements) == expected_statements
                 sql, params = queryset.query.sql_with_params()
-                # Compiling the scope reads the actor's stored sets; a hierarchy
-                # over a foreign key is also followed from its seeds, level by level.
-                decided = len(statements)
-                levels = min(depth + 1, app_settings.REBAC_DEPTH_LIMIT)
-                assert decided == (1 if backing == "tuple" else 2 + levels)
-                assert list(queryset.values_list("pk", flat=True)) == [rows[-1].pk]
-            # Evaluating it decides the same again, then reads the rows.
-            assert len(statements) == 2 * decided + 1
+                assert len(statements) == expected_statements
             measurements.append(
                 (len(sql), len(params), parse_depth(sql))
                 if backing == "tuple"
@@ -92,8 +92,9 @@ def deep_scope_proof(storage, backing, deep):
 @pytest.mark.parametrize("storage", STORAGE_TIERS)
 @pytest.mark.parametrize("backing", ["tuple", "field"])
 @pytest.mark.parametrize("deep", [3, pytest.param(8, marks=pytest.mark.slow)])
-def test_deep_scopes_have_constant_parse_depth(storage, backing, deep):
-    deep_scope_proof(storage, backing, deep)
+@pytest.mark.parametrize("exact", [False, True], ids=["general", "exact"])
+def test_deep_scopes_have_constant_parse_depth(storage, backing, deep, exact):
+    deep_scope_proof(storage, backing, deep, exact)
 
 
 @pytest.mark.parametrize("storage", STORAGE_TIERS)

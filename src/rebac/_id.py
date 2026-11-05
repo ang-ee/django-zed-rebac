@@ -32,6 +32,20 @@ from django.db.models import Q
 
 from .conf import app_settings
 
+# Native query optimizations rely on ordinary Django storage/conversion semantics.
+# A custom subclass may prepare the same apparent integer differently.
+_NATIVE_INTEGER_FIELDS: tuple[type[models.Field[Any, Any]], ...] = (
+    models.AutoField,
+    models.BigAutoField,
+    models.SmallAutoField,
+    models.IntegerField,
+    models.BigIntegerField,
+    models.SmallIntegerField,
+    models.PositiveIntegerField,
+    models.PositiveBigIntegerField,
+    models.PositiveSmallIntegerField,
+)
+
 
 def type_with_prefix(rebac_type: str) -> str:
     """Return the configured wire type for an unprefixed declaration."""

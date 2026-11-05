@@ -81,12 +81,12 @@ def post(db, alice):
 
 
 def test_pickle_strips_pinned_actor(alice, post):
-    """An instance loaded under ``as_user`` carries ``_rebac_actor``;
+    """An instance loaded under ``with_actor`` carries ``_rebac_actor``;
     pickling and unpickling must drop it.
     """
     from tests.testapp.models import Post
 
-    instance = Post.objects.as_user(alice).get(pk=post.pk)
+    instance = Post.objects.with_actor(alice).get(pk=post.pk)
     assert instance._rebac_actor is not None  # baseline
 
     blob = pickle.dumps(instance)
@@ -104,12 +104,25 @@ def test_pickle_strips_pinned_actor(alice, post):
     assert restored.pk == post.pk
 
 
+def test_queryset_pickle_strips_related_owner_from_query_state(alice, post):
+    from tests.testapp.models import Post
+
+    queryset = Post.objects.with_actor(alice).filter(pk=post.pk)
+    queryset._rebac_related_owner = post
+    _ = queryset.query
+    assert queryset._query._rebac_state["_rebac_related_owner"] is post
+
+    restored = pickle.loads(pickle.dumps(queryset))
+    assert restored._rebac_related_owner is None
+    assert "_rebac_related_owner" not in restored._query._rebac_state
+
+
 def test_pickle_strips_sudo_flag(alice, post):
     """Manually setting ``_rebac_sudo_reason`` does not survive pickling
     — the bypass cannot leak past a process boundary."""
     from tests.testapp.models import Post
 
-    instance = Post.objects.as_user(alice).get(pk=post.pk)
+    instance = Post.objects.with_actor(alice).get(pk=post.pk)
     # Simulate code that flipped sudo on the instance for some reason.
     instance._rebac_sudo_reason = "elevated.for.inline.fix"
 
@@ -125,7 +138,7 @@ def test_unpickled_save_raises_missing_actor(alice, post):
     before any save."""
     from tests.testapp.models import Post
 
-    instance = Post.objects.as_user(alice).get(pk=post.pk)
+    instance = Post.objects.with_actor(alice).get(pk=post.pk)
     restored = pickle.loads(pickle.dumps(instance))
 
     restored.title = "post-pickle update"

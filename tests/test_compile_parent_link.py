@@ -1,13 +1,24 @@
 """A hierarchy over a multi-table child: its key is the link to its parent's table."""
 
+from contextlib import nullcontext
+
 import pytest
 
-from rebac import CheckItem, RelationshipTuple, SubjectRef, sudo, to_object_ref
+from rebac import CheckItem, RelationshipTuple, SubjectRef, evaluator_scope, sudo, to_object_ref
 from rebac.compile import read
 from rebac.testing import install_schema
 from tests.testapp.models import NativeParentLinkedBranch, NativeParentLinkedNote
 
 pytestmark = pytest.mark.django_db
+
+
+@pytest.fixture(params=["inline", "decided"])
+def plan(request, monkeypatch):
+    if request.param == "inline":
+        monkeypatch.setattr(read, "_scope_decide", lambda *_args, **_kwargs: False)
+    with evaluator_scope() if request.param == "decided" else nullcontext():
+        yield request.param
+
 
 SCHEMA = """
 definition auth/user {}
@@ -63,12 +74,8 @@ def test_a_point_check_inherits_through_the_self_foreign_key(branches, name):
         assert answer.allowed is held
 
 
-@pytest.mark.parametrize("decided", [True, False], ids=["decided", "inline"])
-def test_a_scope_inherits_through_the_self_foreign_key(branches, monkeypatch, decided):
+def test_a_scope_inherits_through_the_self_foreign_key(branches, plan):
     _local, rows, notes = branches
-    if not decided:
-        # Every set inside the statement: the chain of ancestors is compiled.
-        monkeypatch.setattr(read, "_ROW_LIMIT", 0)
     assert writable(NativeParentLinkedBranch) == {rows["region"].pk, rows["office"].pk}
     assert writable(NativeParentLinkedNote) == {notes["region"].pk, notes["office"].pk}
 
@@ -81,3 +88,24 @@ def test_bulk_checks_agree(branches):
     ]
     answers = local.check_bulk_permissions(items)
     assert [answer.allowed for answer in answers] == [False, True, True, False] * 2
+
+
+@pytest.mark.pg_delta
+@pytest.mark.parametrize("selector", ["exact", "in"])
+def test_parent_link_identity_uses_only_proven_lookup_shapes(branches, monkeypatch, selector, plan):
+    _local, rows, _notes = branches
+    original = read._scope_statement
+    compiled = []
+
+    def scope(operation, model, key, *args, **kwargs):
+        compiled.append((key, kwargs.get("candidates")))
+        return original(operation, model, key, *args, **kwargs)
+
+    monkeypatch.setattr(read, "_scope_statement", scope)
+    for name in ("region", "other"):
+        row = rows[name]
+        query = NativeParentLinkedBranch.objects.with_actor(ALICE).with_action("write")
+        query = query.filter(pk=row.pk) if selector == "exact" else query.filter(pk__in=[row.pk])
+        assert list(query.values_list("pk", flat=True)) == ([row.pk] if name == "region" else [])
+    # Native RelatedExact is admitted; RelatedIn is deliberately not native In.
+    assert any(candidates is not None for _key, candidates in compiled) is (selector == "exact")

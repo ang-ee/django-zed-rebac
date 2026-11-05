@@ -4,6 +4,8 @@ from __future__ import annotations
 
 from django.core.exceptions import PermissionDenied as DjangoPermissionDenied
 
+from .types import ObjectRef, SubjectRef
+
 
 class RebacError(Exception):
     """Base for all rebac errors."""
@@ -15,6 +17,19 @@ class PermissionDenied(DjangoPermissionDenied, RebacError):
     Subclasses Django's `PermissionDenied` so view-layer 403 handlers continue
     to work without rebac-specific wiring.
     """
+
+
+class GateDenied(PermissionDenied):
+    """A denied model write with the exact actor, action, and resource."""
+
+    def __init__(self, message: str, actor: SubjectRef, action: str, resource: ObjectRef) -> None:
+        super().__init__(message)
+        self.actor = actor
+        self.action = action
+        self.resource = resource
+
+    def __reduce__(self) -> tuple[object, tuple[object, ...]]:
+        return (type(self), (str(self), self.actor, self.action, self.resource))
 
 
 class MissingActorError(RebacError):
@@ -32,8 +47,7 @@ class CaveatUnsupportedError(RebacError):
     """Caveat references a CEL feature the active backend cannot evaluate.
 
     For example, the `ipaddress` CEL type is not supported by `cel-python`;
-    `LocalBackend` raises this when checking such a caveat. `SpiceDBBackend`
-    handles it natively.
+    `LocalBackend` raises this when checking such a caveat.
     """
 
 

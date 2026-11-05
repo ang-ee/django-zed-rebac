@@ -10,24 +10,41 @@ from django.core.exceptions import FieldDoesNotExist
 from django.db import models
 from django.db.models import Prefetch, QuerySet
 
-from .actors import current_actor
+from .actors import resolve
 from .backends import backend
 from .errors import MissingActorError, PermissionDenied
 from .field_visibility import (
-    accessible_ids,
     apply_field_visibility,
-    backend_grants_all,
+    held_ids,
 )
 from .resources import model_resource_type
 from .types import FieldDenyMode, SubjectRef
 
 
 def relation_actor(queryset: Any) -> SubjectRef | None:
-    """Return the actor that should guard related resources for ``queryset``."""
-    actor = getattr(queryset, "_rebac_actor", None)
-    if actor is not None:
-        return cast(SubjectRef, actor)
-    return current_actor()
+    """Return the actor for a related read, or ``None`` when none resolves."""
+    actor, _ = _relation_scope(queryset)
+    return actor
+
+
+def pinned_actor(obj_or_qs: Any) -> SubjectRef | None:
+    """Return an explicit row or queryset actor without consulting ambient scope."""
+    actor = getattr(obj_or_qs, "_rebac_actor", None)
+    if actor is None:
+        actor = getattr(obj_or_qs, "_rebac_relation_actor", None)
+    return actor if isinstance(actor, SubjectRef) else None
+
+
+def _relation_scope(queryset: Any) -> tuple[SubjectRef | None, bool]:
+    """Resolve a related guard's actor and bypass without inheriting a sudo pin."""
+    actor = pinned_actor(queryset)
+    return resolve(
+        pinned_actor=actor,
+        mode="relation",
+        strict=False,
+        subject_label="Related read",
+        fail_closed=True,
+    )
 
 
 def selected_related_paths(
@@ -52,10 +69,12 @@ def guard_selected_related_instances(
     root_model: type[models.Model],
     paths: Sequence[str],
     actor: SubjectRef | None,
+    bypass: bool = False,
     mode: FieldDenyMode,
+    using: str | None = None,
 ) -> None:
     """Batch-check selected to-one related objects before callers serialize them."""
-    if not paths:
+    if not paths or bypass:
         return
 
     batches: dict[type[models.Model], dict[str, dict[int, models.Model]]] = {}
@@ -91,32 +110,28 @@ def guard_selected_related_instances(
         # Check IDs once, but stamp and redact every in-memory copy of that ID.
         rows = [row for copies in rows_by_id.values() for row in copies.values()]
 
-        if not backend_grants_all(
-            active_backend,
-            subject=actor,
-            action=action,
-            resource_type=rebac_type,
-        ):
-            allowed = set(
-                accessible_ids(
-                    active_backend,
-                    subject=actor,
-                    action=action,
-                    resource_type=rebac_type,
-                )
+        allowed = set(
+            held_ids(
+                active_backend,
+                subject=actor,
+                action=action,
+                model=model,
+                resource_ids=rows_by_id,
+                using=using,
             )
-            denied = sorted(set(rows_by_id) - allowed)
-            if denied:
-                sample = ", ".join(denied[:5])
-                raise PermissionDenied(
-                    f"select_related({model.__name__}) loaded {len(denied)} "
-                    f"related row(s) outside actor scope (e.g. {sample})."
-                )
+        )
+        denied = sorted(set(rows_by_id) - allowed)
+        if denied:
+            sample = ", ".join(denied[:5])
+            raise PermissionDenied(
+                f"select_related({model.__name__}) loaded {len(denied)} "
+                f"related row(s) outside actor scope (e.g. {sample})."
+            )
 
         for row in rows:
             row._rebac_actor = actor  # type: ignore[attr-defined]
             row._rebac_field_deny = mode  # type: ignore[attr-defined]
-        apply_field_visibility(rows, model=model, actor=actor, mode=mode)
+        apply_field_visibility(rows, model=model, actor=actor, mode=mode, using=using)
 
 
 def scope_prefetch_lookups(
@@ -148,6 +163,7 @@ def scope_prefetch_lookups(
                                 mode=mode,
                             ),
                         ),
+                        inherits_actor=True,
                     )
             _remember_prefetch(scoped, lookup)
             continue
@@ -157,6 +173,9 @@ def scope_prefetch_lookups(
                 final_path = lookup.prefetch_through
                 for path, target in prefixes:
                     if path == final_path:
+                        inherits_actor = lookup.queryset is None or not queryset_has_rebac_scope(
+                            lookup.queryset
+                        )
                         copied = copy.copy(lookup)
                         copied.queryset = _scoped_queryset_for_prefetch(
                             target,
@@ -164,7 +183,7 @@ def scope_prefetch_lookups(
                             actor=actor,
                             mode=mode,
                         )
-                        _remember_prefetch(scoped, copied)
+                        _remember_prefetch(scoped, copied, inherits_actor=inherits_actor)
                     else:
                         _remember_prefetch(
                             scoped,
@@ -177,6 +196,7 @@ def scope_prefetch_lookups(
                                     mode=mode,
                                 ),
                             ),
+                            inherits_actor=True,
                         )
             _remember_prefetch(scoped, lookup)
             continue
@@ -209,7 +229,11 @@ def protected_lookup_prefixes(
     return tuple(prefixes)
 
 
-def _remember_prefetch(scoped: dict[str, Any], lookup: Any) -> None:
+def _remember_prefetch(
+    scoped: dict[str, Any], lookup: Any, *, inherits_actor: bool = False
+) -> None:
+    if inherits_actor and isinstance(lookup, Prefetch):
+        lookup.__dict__["_rebac_inherits_actor"] = True
     if isinstance(lookup, Prefetch):
         key = lookup.prefetch_to
     elif isinstance(lookup, str):
@@ -219,6 +243,21 @@ def _remember_prefetch(scoped: dict[str, Any], lookup: Any) -> None:
     existing = scoped.get(key)
     if existing is None or isinstance(existing, str):
         scoped[key] = lookup
+
+
+def rebind_prefetch_actor(lookups: Sequence[Any], actor: SubjectRef) -> tuple[Any, ...]:
+    """Re-pin protected prefetches whose actor comes from their root queryset."""
+    rebound: list[Any] = []
+    for lookup in lookups:
+        if isinstance(lookup, Prefetch) and getattr(lookup, "_rebac_inherits_actor", False):
+            with_actor = getattr(lookup.queryset, "with_actor", None)
+            if callable(with_actor):
+                copied = copy.copy(lookup)
+                copied.queryset = cast(QuerySet[Any], with_actor(actor))
+                rebound.append(copied)
+                continue
+        rebound.append(lookup)
+    return tuple(rebound)
 
 
 def related_model_for_lookup(

@@ -19,7 +19,7 @@ from typing import TYPE_CHECKING, Any
 try:
     __version__ = version("django-zed-rebac")
 except PackageNotFoundError:
-    __version__ = "0.30.0"
+    __version__ = "0.31.0.dev0"
 
 default_app_config = "rebac.apps.RebacConfig"
 
@@ -36,6 +36,7 @@ from .actors import (
     current_actor,
     grant_subject_ref,
     is_anonymous_actor,
+    is_sudo,
     rebac_subject,
     set_current_actor,
     sudo,
@@ -49,6 +50,7 @@ from .consistency import (
     record_zookie,
     zookie_scope,
 )
+from .database import database_context
 from .errors import (
     CaveatUnsupportedError,
     MissingActorError,
@@ -60,6 +62,7 @@ from .errors import (
     SchemaError,
 )
 from .evaluator import PermissionEvaluator, current_evaluator, evaluator_scope
+from .limits import SCOPE_CTE_CANDIDATE_LIMIT
 from .preflight import check_new
 from .types import (
     CheckItem,
@@ -77,10 +80,11 @@ if TYPE_CHECKING:
     from .actors import model_identities
     from .audit import aemit as aemit_audit_event
     from .audit import emit as emit_audit_event
-    from .backends import Backend, LocalBackend, SpiceDBBackend, backend
+    from .backends import LocalBackend, backend
     from .decorators import check_permission, rebac_resource, require_permission
+    from .expressions import permission_expression
     from .field_backing import GenericTarget, generic_target, proposed_forward_relationships
-    from .managers import RebacManager, RebacQuerySet, TrackedManager, TrackedQuerySet
+    from .managers import RebacManager, RebacQuerySet, SharedScope, TrackedManager, TrackedQuerySet
     from .mcp import default_actor_resolver, get_mcp_actor_resolver, rebac_mcp_tool
     from .mixins import RebacMixin, RebacObjectMeta, RebacTrackedMixin
     from .models.schema_write import schema_changes
@@ -95,10 +99,12 @@ if TYPE_CHECKING:
 
 
 _LAZY = {
+    "permission_expression": ("rebac.expressions", "permission_expression"),
     "RebacTrackedMixin": ("rebac.mixins", "RebacTrackedMixin"),
     "RebacMixin": ("rebac.mixins", "RebacMixin"),
     "RebacManager": ("rebac.managers", "RebacManager"),
     "RebacQuerySet": ("rebac.managers", "RebacQuerySet"),
+    "SharedScope": ("rebac.managers", "SharedScope"),
     "TrackedManager": ("rebac.managers", "TrackedManager"),
     "TrackedQuerySet": ("rebac.managers", "TrackedQuerySet"),
     "RebacObjectMeta": ("rebac.mixins", "RebacObjectMeta"),
@@ -106,9 +112,7 @@ _LAZY = {
         "rebac.permissions_mixin",
         "RebacPermissionsMixin",
     ),
-    "Backend": ("rebac.backends", "Backend"),
     "LocalBackend": ("rebac.backends", "LocalBackend"),
-    "SpiceDBBackend": ("rebac.backends", "SpiceDBBackend"),
     "backend": ("rebac.backends", "backend"),
     "require_permission": ("rebac.decorators", "require_permission"),
     "check_permission": ("rebac.decorators", "check_permission"),
@@ -161,6 +165,8 @@ __all__ = [
     "RebacTrackedMixin",
     "RebacManager",
     "RebacQuerySet",
+    "SharedScope",
+    "SCOPE_CTE_CANDIDATE_LIMIT",
     "TrackedManager",
     "TrackedQuerySet",
     "RebacObjectMeta",
@@ -178,13 +184,12 @@ __all__ = [
     "default_actor_resolver",
     "get_mcp_actor_resolver",
     # backends
-    "Backend",
     "LocalBackend",
-    "SpiceDBBackend",
     "backend",
     # actors
     "ActorLike",
     "current_actor",
+    "is_sudo",
     "set_current_actor",
     "actor_context",
     "sudo",
@@ -214,6 +219,8 @@ __all__ = [
     "SchemaError",
     "RebacError",
     # helpers
+    "database_context",
+    "permission_expression",
     "write_relationships",
     "delete_relationship",
     "delete_relationships",

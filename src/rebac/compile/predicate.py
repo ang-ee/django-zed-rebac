@@ -1,8 +1,9 @@
 """Compile schema permission membership into Django ORM predicates.
 
-No application resource IDs are read into Python.  A predicate evaluates at
-an identity expression, so a tuple-only object can participate in both grants
-and exclusions without a corresponding model row.
+The inline predicate evaluates at an identity expression, so a tuple-only
+object can participate in grants and exclusions without a corresponding model
+row. Decided plans may read bounded application IDs into Python before binding
+them back into a witnessed statement.
 
 Three rules shape every statement:
 
@@ -19,18 +20,24 @@ Three rules shape every statement:
 
 from __future__ import annotations
 
-from collections.abc import Collection, Iterable, Mapping, Sequence
+import hashlib
+from collections.abc import Callable, Collection, Iterable, Mapping, Sequence
+from contextvars import ContextVar
 from dataclasses import dataclass
 from datetime import datetime
 from enum import StrEnum
 from typing import Any, Final, Protocol, cast
 
-from django.core.exceptions import FieldDoesNotExist
-from django.db import models
-from django.db.models import Exists, Expression, F, OuterRef, Q, QuerySet, Value
-from django.db.models.lookups import Exact, In, IsNull, LessThan
+from django.apps import apps
+from django.core.exceptions import EmptyResultSet, FieldDoesNotExist
+from django.db import connections, models
+from django.db.models import Exists, Expression, F, OuterRef, Q, QuerySet, Subquery, Value
+from django.db.models.expressions import BaseExpression, Col, Combinable
+from django.db.models.fields.related_lookups import RelatedExact, RelatedIn
+from django.db.models.lookups import Exact, In, IntegerFieldExact, IsNull, LessThan
+from django_cte import CTE, with_cte
 
-from .._id import model_identity_fields, resource_id_attr
+from .._id import _NATIVE_INTEGER_FIELDS, model_identity_fields, resource_id_attr
 from ..actors import is_anonymous_actor
 from ..codec import identity_codec
 from ..composition import TaggedComposition
@@ -40,14 +47,13 @@ from ..field_backing import (
     ResolvedAttributeBacking,
     ResolvedConstBacking,
     ResolvedFieldBacking,
-    _content_type,
+    _attribute_backing,
+    _const_backing,
+    _field_backing,
+    _relation_path,
     _resolve_field_backing,
-    foreign_key_kept,
-    resolve_attribute_backing,
-    resolve_const_backing,
-    resolve_field_backing,
 )
-from ..resources import model_for_resource_type, model_for_subject_type
+from ..resources import _ModelIndex, stores_rows
 from ..schema.ast import (
     AllowedSubject,
     AttributeBinding,
@@ -87,19 +93,46 @@ class At:
     """
 
     resource_type: str
-    ref: Expression | F | OuterRef
+    ref: BaseExpression | F | OuterRef
     key: models.Field[Any, Any] | None
     row: bool
 
 
-# A fact about a fixed object: the actor holds ``name`` on ``type:id`` at a bound.
 type Fact = tuple[str, str, str, Bound]
 
 
-@dataclass(frozen=True, slots=True)
-class Support:
-    """The tuple that first put the actor into one stored set."""
+class CaveatVerdicts(Protocol):
+    def condition_q(
+        self, prefix: str, bound: Bound, *, using: str, parametric: bool = False
+    ) -> Q: ...
 
+
+class DecidedRows(Protocol):
+    def rows(self, key: Key) -> tuple[Any, ...] | None: ...
+
+
+class Decided(tuple[Any, ...]):
+    """Native IDs read before a statement and rechecked by its witness."""
+
+    slot: tuple[Any, ...] | None
+
+    def __new__(cls, values: Collection[Any], slot: tuple[Any, ...] | None = None) -> Decided:
+        result = super().__new__(cls, values)
+        result.slot = slot
+        return result
+
+
+@dataclass(frozen=True, slots=True)
+class DecidedSlot:
+    """A value prepared for this read, addressed without its actor or IDs."""
+
+    source: tuple[Any, ...]
+    index: int | None = None
+    field: models.Field[Any, Any] | None = None
+
+
+@dataclass(frozen=True)
+class Support:
     key: Key
     resource_id: str
     subject_type: str
@@ -112,73 +145,14 @@ class Support:
 
 @dataclass(frozen=True)
 class ActorSets:
-    """The stored sets the actor belongs to, decided before a statement.
-
-    ``keys`` are the set relations decided; a key absent from ``lower`` or
-    ``upper`` has no member set holding the actor.  ``support`` names, for
-    each member of ``lower`` in the order it was found, the tuple that put it
-    there: a statement that authorizes re-reads them (``Compiler.sets_witness``).
-    """
-
     keys: frozenset[Key]
     lower: Mapping[Key, frozenset[str]]
     upper: Mapping[Key, frozenset[str]]
     support: tuple[Support, ...]
+    root: Key
 
     def ids(self, key: Key, bound: Bound) -> frozenset[str]:
         return (self.lower if bound is Bound.LOWER else self.upper).get(key, frozenset())
-
-    @property
-    def digest(self) -> tuple[Any, ...]:
-        """What of the sets shapes a statement: everything but the actor's own id."""
-
-        def listed(members: Mapping[Key, frozenset[str]]) -> tuple[Any, ...]:
-            return tuple((key, tuple(sorted(ids))) for key, ids in sorted(members.items()) if ids)
-
-        return (
-            tuple(sorted(self.keys)),
-            listed(self.lower),
-            listed(self.upper),
-            tuple(
-                (
-                    edge.key,
-                    edge.resource_id,
-                    edge.subject_type,
-                    "" if edge.own else edge.subject_id,
-                    edge.subject_relation,
-                    edge.caveat_name,
-                    edge.caveat_key,
-                    edge.own,
-                )
-                for edge in self.support
-            ),
-        )
-
-
-class CaveatVerdicts(Protocol):
-    def condition_q(self, prefix: str, bound: Bound) -> Q: ...
-
-
-class DecidedRows(Protocol):
-    """Small sets of model rows on which the actor holds a node, decided before a statement."""
-
-    def rows(self, key: Key) -> tuple[Any, ...] | None:
-        """The identities of the key's model rows in its lower bound, or ``None``
-        when the set is not decided (too large, or not a set of rows)."""
-        ...
-
-
-@dataclass(frozen=True, slots=True)
-class SelfChain:
-    """A permission that recurses over a self foreign key, taken apart."""
-
-    model: type[models.Model]
-    identity: str
-    target: str
-    parent: str
-    base: Q
-    #: The parent column names its row by the identity itself.
-    keyed: bool
 
 
 # ---------- Constants and two-valued connectives ----------
@@ -253,34 +227,7 @@ def _one_level_out(ref: Any) -> Any:
     return moved
 
 
-@dataclass(frozen=True)
-class PointRow:
-    """The content types a point check's row has in its GenericForeignKey columns.
-
-    ``ref`` is the statement's reference to the row; ``types`` maps each
-    content-type column's attname to its value.  An arm backed by one of those
-    columns names a row of its own type only, so on that row the arm of any
-    other type cannot hold and is not compiled.
-    """
-
-    ref: Any
-    types: tuple[tuple[str, Any], ...]
-
-    def may_name(self, resolved: ResolvedFieldBacking, at: At, using: str) -> bool:
-        if resolved.generic is None or at.ref is not self.ref:
-            return True
-        column = resolved.source_model._meta.get_field(resolved.generic.ct_field)
-        stored = dict(self.types).get(cast(Any, column).attname, _ABSENT)
-        if stored is _ABSENT:
-            return True
-        content_type = _content_type(resolved.target_model, using)
-        return content_type is not None and content_type.pk == stored
-
-
-_ABSENT: Any = object()
-
-
-def _not_null(expr: Expression | F | OuterRef) -> Q:
+def _not_null(expr: BaseExpression | F | OuterRef) -> Q:
     return Q(IsNull(expr, False))
 
 
@@ -305,6 +252,10 @@ class _Compiled(Expression):
         self._sql: dict[str, tuple[str, tuple[Any, ...]]] = {}
 
     def as_sql(self, compiler: Any, connection: Any) -> tuple[str, tuple[Any, ...]]:
+        probe_sets = _probe_compiled_sets.get()
+        if probe_sets is not None and self not in probe_sets:
+            probe_sets.add(self)
+            self._sql.clear()
         cached = self._sql.get(connection.alias)
         if cached is None:
             query = self.rows.query.clone()
@@ -317,10 +268,81 @@ class _Compiled(Expression):
         return cached
 
 
-class Decided(tuple[Any, ...]):
-    """The keys of a set of rows decided before the statement."""
+_probe_compiled_sets: ContextVar[set[_Compiled] | None] = ContextVar(
+    "rebac_probe_compiled_sets", default=None
+)
 
-    __slots__ = ()
+
+class _BoundIn(In):
+    """Bind a decided ID list as one PostgreSQL array or a Django IN lookup."""
+
+    def as_sql(self, compiler: Any, connection: Any) -> tuple[str, tuple[Any, ...]]:
+        if connection.vendor == "postgresql" and self.rhs_is_direct_value():
+            lhs_sql, lhs_params = self.process_lhs(compiler, connection)
+            _, prepared = self.get_db_prep_lookup(self.rhs, connection)
+            return f"{lhs_sql} = ANY(%s)", (*lhs_params, list(prepared))
+        sql, values = super().as_sql(compiler, connection)
+        return sql, tuple(values)
+
+
+class _DecidedIn(Expression):
+    """A decided membership whose values are rebound after a cache hit."""
+
+    def __init__(
+        self,
+        lhs: BaseExpression | F | OuterRef,
+        values: Decided,
+        field: models.Field[Any, Any],
+    ) -> None:
+        super().__init__(output_field=models.BooleanField())
+        self.lhs = lhs
+        self.count = 1 << (len(values) - 1).bit_length()
+        self.slot = values.slot
+        self.value_field = field
+
+    def get_source_expressions(self) -> list[BaseExpression | F | OuterRef]:
+        return [self.lhs]
+
+    def set_source_expressions(self, exprs: Sequence[Combinable | Expression]) -> None:
+        self.lhs = cast(BaseExpression | F | OuterRef, exprs[0])
+
+    def as_sql(self, compiler: Any, connection: Any) -> tuple[str, tuple[Any, ...]]:
+        assert self.slot is not None
+        lhs, params = compiler.compile(self.lhs)
+        if connection.vendor == "postgresql":
+            return f"{lhs} = ANY(%s)", (*params, DecidedSlot(self.slot, field=self.value_field))
+        placeholders = ", ".join("%s" for _ in range(self.count))
+        return (
+            f"{lhs} IN ({placeholders})",
+            (
+                *params,
+                *(
+                    DecidedSlot(self.slot, index=i, field=self.value_field)
+                    for i in range(self.count)
+                ),
+            ),
+        )
+
+
+class _ArrayMember(Exact):
+    """PostgreSQL membership against a Django-built array CTE."""
+
+    def as_sql(self, compiler: Any, connection: Any) -> tuple[str, tuple[Any, ...]]:
+        lhs_sql, lhs_params = self.process_lhs(compiler, connection)
+        rhs_sql, rhs_params = self.process_rhs(compiler, connection)
+        array_type = self.rhs.output_field.db_type(connection)
+        return f"{lhs_sql} = ANY(({rhs_sql})::{array_type})", (*lhs_params, *rhs_params)
+
+
+def _bound_in(
+    expr: BaseExpression | F | OuterRef,
+    values: Collection[Any],
+) -> Q:
+    """Two-valued membership for a decided set."""
+    if not values:
+        return _FALSE
+    member = _BoundIn(expr, tuple(values))
+    return _not_null(expr) & Q(member)
 
 
 def _one_object(ref: Any) -> bool:
@@ -328,7 +350,7 @@ def _one_object(ref: Any) -> bool:
     return isinstance(ref, (Value, _Param))
 
 
-def _in(expr: Expression | F | OuterRef, rows: QuerySet[Any]) -> Q:
+def _in(expr: BaseExpression | F | OuterRef, rows: QuerySet[Any]) -> Q:
     """Two-valued membership: a NULL reference is not a member."""
     return _not_null(expr) & Q(In(expr, _Compiled(rows)))
 
@@ -423,6 +445,9 @@ class ActorShape:
 
 
 def named_ids(schema: Schema, type_: str) -> frozenset[str]:
+    cached = schema._named_ids_cache.get(type_)
+    if cached is not None:
+        return cached
     found: set[str] = set()
     for definition in schema.definitions:
         for relation in definition.relations:
@@ -433,11 +458,19 @@ def named_ids(schema: Schema, type_: str) -> frozenset[str]:
                     found.add(allowed.id)
                 if isinstance(relation.backing, ConstBinding):
                     found.add(relation.backing.target_id)
-    return frozenset(found)
+    result = frozenset(found)
+    schema._named_ids_cache[type_] = result
+    return result
 
 
-def actor_shape(schema: Schema, actor: SubjectRef, using: str) -> ActorShape:
-    target = model_for_subject_type(actor.subject_type)
+def actor_shape(
+    schema: Schema,
+    actor: SubjectRef,
+    using: str,
+    model_index: _ModelIndex | None = None,
+) -> ActorShape:
+    model_index = model_index if model_index is not None else _ModelIndex.capture()
+    target = model_index.subject(actor.subject_type)
     canonical = False
     if target is not None:
         try:
@@ -475,6 +508,52 @@ def _multi_valued(model: type[models.Model], lookup: str) -> bool:
     return False
 
 
+class _NativeState:
+    decisions: dict[tuple[Any, ...], bool]
+    counts: dict[tuple[Any, ...], int]
+    probing: bool
+
+    def __init__(self) -> None:
+        self.decisions = {}
+        self.counts = {}
+        self.probing = False
+
+
+class _NativeProjection(Expression):
+    """Choose the statement's native-ID boundary after its uses are known."""
+
+    def __init__(
+        self,
+        inline: Combinable | Expression,
+        shared: Combinable | Expression,
+        state: _NativeState,
+        slot: tuple[Any, ...],
+        field: models.Field[Any, Any],
+    ) -> None:
+        super().__init__(output_field=field)
+        self.inline = inline
+        self.shared = shared
+        self.state = state
+        self.slot = slot
+
+    def get_source_expressions(self) -> list[Combinable | Expression]:
+        return [self.inline, self.shared]
+
+    def set_source_expressions(self, exprs: Sequence[Combinable | Expression]) -> None:
+        self.inline, self.shared = exprs
+
+    def as_sql(self, compiler: Any, connection: Any) -> tuple[str, tuple[Any, ...]]:
+        if self.state.probing:
+            self.state.counts[self.slot] = self.state.counts.get(self.slot, 0) + 1
+        selected = (
+            self.shared
+            if not self.state.probing and self.state.decisions.get(self.slot, False)
+            else self.inline
+        )
+        sql, params = compiler.compile(selected)
+        return sql, tuple(params)
+
+
 class Compiler:
     """One predicate compiler for scopes and point membership.
 
@@ -484,13 +563,6 @@ class Compiler:
 
     ``parametric`` compiles the actor's id as a placeholder (see ``bind``), so
     the statement depends only on the actor's shape and can be kept.
-    ``facts`` supplies decisions about fixed objects; each one used is recorded
-    in ``used_facts`` and must be witnessed by the statement that uses it.
-    ``sets`` supplies the stored sets the actor belongs to; membership in one
-    of them is then a list of ids instead of a closure over the tuple table.
-    ``rows`` supplies small sets of rows on which the actor holds a node; an
-    arrow into one of them is then a list of keys instead of a subquery, and
-    each one used is recorded in ``used_rows`` for the statement's witness.
     """
 
     def __init__(
@@ -505,11 +577,15 @@ class Compiler:
         depth_limit: int | None = None,
         program: CompileProgram | None = None,
         parametric: bool = False,
-        facts: Mapping[Fact, bool] | None = None,
-        sets: ActorSets | None = None,
+        model_index: _ModelIndex | None = None,
+        share_subject_rows: bool = False,
         rows: DecidedRows | None = None,
-        point: PointRow | None = None,
+        sets: ActorSets | None = None,
+        facts: Mapping[Fact, bool] | None = None,
+        cte_owner: str | None = None,
+        bind_decisions: bool = False,
     ) -> None:
+        self.model_index = model_index if model_index is not None else _ModelIndex.capture()
         self.schema = tagged.schema if tagged is not None else schema
         self.actor = actor
         self.using = using
@@ -527,15 +603,250 @@ class Compiler:
         self.depth_limit = app_settings.REBAC_DEPTH_LIMIT if depth_limit is None else depth_limit
         self.program = program if program is not None else CompileProgram.build(self.schema)
         self.parametric = parametric
+        self.shape = actor_shape(self.schema, actor, using, self.model_index)
+        self._memo: dict[tuple[Any, ...], Q] = {}
+        self._own_identity = self.model_index.subject(actor.subject_type)
+        self._share_subject_rows = share_subject_rows
+        self.bind_decisions = bind_decisions
+        self.rows = rows
+        self.sets = sets
         self.facts = facts
         self.used_facts: set[Fact] = set()
-        self.sets = sets
-        self.rows = rows
         self.used_rows: set[Key] = set()
-        self.point = point
-        self.shape = actor_shape(self.schema, actor, using)
-        self._memo: dict[tuple[Any, ...], Q] = {}
-        self._own_identity = model_for_subject_type(actor.subject_type)
+        self._subject_ctes: dict[tuple[Key, Bound], CTE] = {}
+        self._set_ctes: dict[tuple[Key, Bound], CTE] = {}
+        self._reached_ctes: dict[tuple[Key, Any, Bound, bool], CTE] = {}
+        self._path_ctes: dict[tuple[Key, Bound, bool], CTE] = {}
+        self._closure_ctes: dict[tuple[Key, Bound, bool], CTE] = {}
+        self._decided_arrays: dict[tuple[str, tuple[Any, ...]], CTE] = {}
+        self._native_ctes: dict[tuple[type[models.Model], str, str, str], CTE] = {}
+        self._native_state = _NativeState()
+        self._native_decisions = self._native_state.decisions
+        self._value_memberships: list[tuple[Key, Bound, Any, bool]] = []
+        self._const_ctes: dict[tuple[Key, str, Bound], CTE] = {}
+        self._statement_ctes: list[CTE] = []
+        actor_tag = hashlib.blake2s(
+            f"{actor.subject_type}:{actor.subject_id}:{actor.optional_relation}".encode(),
+            digest_size=4,
+        ).hexdigest()
+        self._cte_namespace = f"_{cte_owner}_{actor_tag}" if cte_owner is not None else ""
+        self._subject_ordinals = (
+            {key: ordinal for ordinal, key in enumerate(sorted(self.program.dependencies))}
+            if share_subject_rows
+            else {}
+        )
+        self._cte_tables: set[str] | None = None
+
+    def _cte_name(self, name: str) -> str:
+        name += self._cte_namespace
+        if self._cte_tables is None:
+            self._cte_tables = {
+                owner._meta.db_table for owner in apps.get_models(include_auto_created=True)
+            }
+        while name in self._cte_tables:
+            name += "_"
+        return name
+
+    def _cte_queryset(self, cte: CTE) -> QuerySet[Any]:
+        selected = cte.queryset()
+        return QuerySet(model=selected.model, query=selected.query, using=self.using)
+
+    def with_subject_ctes(self, rows: QuerySet[Any], *, probe_native: bool = True) -> QuerySet[Any]:
+        if probe_native:
+            self.decide_native(rows)
+        ctes = self.statement_ctes()
+        return with_cte(*ctes, select=rows) if ctes else rows
+
+    def decide_native(self, rows: QuerySet[Any]) -> None:
+        """Fix each boundary from actual references in the completed statement."""
+        if self._native_ctes:
+            probe = rows.all()
+            native = {id(cte) for cte in self._native_ctes.values()}
+            others = tuple(cte for cte in self._statement_ctes if id(cte) not in native)
+            if others:
+                with_cte(*others, select=probe)
+            self.decide_native_render(lambda: probe.query.get_compiler(using=self.using).as_sql())
+
+    def decide_native_render(self, render: Callable[[], Any]) -> None:
+        """Count a completed owner's rendered references before final SQL."""
+        if not self._native_ctes:
+            return
+        self._native_state.counts.clear()
+        self._native_state.probing = True
+        probe_sets: set[_Compiled] = set()
+        token = _probe_compiled_sets.set(probe_sets)
+        try:
+            render()
+        except EmptyResultSet:
+            pass
+        finally:
+            _probe_compiled_sets.reset(token)
+            self._native_state.probing = False
+            for compiled in probe_sets:
+                compiled._sql.clear()
+        for slot in self._native_ctes:
+            self._native_decisions[slot] = (
+                self._native_state.counts.get(slot, 0) >= self._native_share_threshold()
+            )
+
+    def _native_share_threshold(self) -> int:
+        # The PostgreSQL 3,000-row exclusion plan adds an indexed scalar
+        # probe per outer row at eight references. Keep that measured shape
+        # inline; a boundary with nine or more uses can amortize the probe.
+        return 9 if connections[self.using].vendor == "postgresql" else 2
+
+    def statement_ctes(self) -> tuple[CTE, ...]:
+        native = {id(cte): slot for slot, cte in self._native_ctes.items()}
+        return tuple(
+            cte
+            for cte in self._statement_ctes
+            if id(cte) not in native or self._native_decisions.get(native[id(cte)], False)
+        )
+
+    def fork_shared(self, *, parametric: bool | None = None) -> Compiler:
+        """A fresh predicate memo using this statement's CTE definitions."""
+        fork = Compiler(
+            self.schema,
+            self.actor,
+            self.using,
+            tagged=self.tagged,
+            verdicts=self.verdicts,
+            program=self.program,
+            model_index=self.model_index,
+            parametric=self.parametric if parametric is None else parametric,
+            share_subject_rows=self._share_subject_rows,
+            rows=self.rows,
+            sets=self.sets,
+            facts=self.facts,
+            bind_decisions=self.bind_decisions,
+        )
+        fork._cte_namespace = self._cte_namespace
+        fork._subject_ctes = self._subject_ctes
+        fork._set_ctes = self._set_ctes
+        fork._reached_ctes = self._reached_ctes
+        fork._path_ctes = self._path_ctes
+        fork._closure_ctes = self._closure_ctes
+        fork._decided_arrays = self._decided_arrays
+        fork._native_ctes = self._native_ctes
+        fork._native_state = self._native_state
+        fork._native_decisions = self._native_decisions
+        fork._value_memberships = self._value_memberships
+        fork._const_ctes = self._const_ctes
+        fork._statement_ctes = self._statement_ctes
+        return fork
+
+    def decided_member(
+        self,
+        expr: BaseExpression | F | OuterRef,
+        values: Collection[Any],
+        field: models.Field[Any, Any],
+    ) -> Q:
+        """Reuse one array parameter across a statement's decided memberships."""
+        if not values:
+            return _FALSE
+        if self.bind_decisions and isinstance(values, Decided) and values.slot is not None:
+            if (
+                connections[self.using].vendor != "postgresql"
+                or not self._share_subject_rows
+                or values.slot[0] == "set"
+            ):
+                return _not_null(expr) & Q(_DecidedIn(expr, values, field))
+            _, cte = self.decided_array(values, field)
+            rhs = Subquery(cte.queryset().values("_rebac_ids"))
+            return _not_null(expr) & Q(_ArrayMember(expr, rhs))
+        if connections[self.using].vendor != "postgresql" or not self._share_subject_rows:
+            return _bound_in(expr, values)
+        _, cte = self.decided_array(values, field)
+        rhs = Subquery(cte.queryset().values("_rebac_ids"))
+        return _not_null(expr) & Q(_ArrayMember(expr, rhs))
+
+    def decided_array(
+        self,
+        values: Collection[Any],
+        field: models.Field[Any, Any],
+    ) -> tuple[tuple[str, tuple[Any, ...]], CTE]:
+        """Build or reuse the typed array CTE for a decided list."""
+        from django.contrib.postgres.fields import ArrayField
+
+        from ..models.generation import SchemaGeneration
+
+        ids = tuple(values)
+        source = values.slot if isinstance(values, Decided) and self.bind_decisions else None
+        key = (
+            field.db_type(connections[self.using]) or field.get_internal_type(),
+            source if source is not None else ids,
+        )
+        cte = self._decided_arrays.get(key)
+        if cte is None:
+            array_field = ArrayField(field)
+            selected = (
+                SchemaGeneration.objects.using(self.using)
+                .filter(pk=1)
+                .annotate(
+                    _rebac_ids=(
+                        _Param(DecidedSlot(source, field=field), array_field)
+                        if source is not None
+                        else Value(list(ids), output_field=array_field)
+                    )
+                )
+                .order_by()
+                .values("_rebac_ids")
+            )
+            name_key = (key[0], source if source is not None else ids)
+            digest = hashlib.blake2s(repr(name_key).encode(), digest_size=10).hexdigest()
+            # The digest deduplicates lists within one owner; the plan
+            # namespace separates independent owners combined by Django.
+            cte = CTE(selected, name=self._cte_name(f"rebac_decided_{digest}"))
+            self._decided_arrays[key] = cte
+            self._statement_ctes.append(cte)
+        return key, cte
+
+    def adopt_decided_array(self, key: tuple[str, tuple[Any, ...]], cte: CTE) -> None:
+        if key not in self._decided_arrays:
+            self._decided_arrays[key] = cte
+            self._statement_ctes.append(cte)
+
+    def _subject_cte(
+        self,
+        key: Key,
+        model: type[models.Model],
+        identity: str,
+        bound: Bound,
+        visits: Mapping[Key, int],
+        depth_possible: bool,
+    ) -> QuerySet[Any] | bool | None:
+        """Share a complete model subject set within this statement."""
+        if (
+            not self._share_subject_rows
+            or not depth_possible
+            or self.model_index.resource(key[0]) is not model
+            or resource_id_attr(model) != identity
+            or not stores_rows(model)
+            # The decided actor set is already a bounded id list. A subject
+            # CTE around that list only repeats a definition in the owner.
+            or (self.sets is not None and key in self.sets.keys)
+            or any(visits.get(node) for node in self.program.recursive)
+        ):
+            return None
+        slot = key, bound
+        cte = self._subject_ctes.get(slot)
+        if cte is None:
+            _, field = model_identity_fields(model, identity)
+            member = self._holds(
+                key, At(key[0], F(identity), field, True), bound, {}, depth_possible=True
+            )
+            if member is _FALSE:
+                return False
+            rows = model._base_manager.using(self.using).filter(member).order_by().values(identity)
+            try:
+                rows.query.get_compiler(using=self.using).as_sql()
+            except EmptyResultSet:
+                return False
+            name = self._cte_name(f"rebac_ids_{self._subject_ordinals[key]}_{bound.value}")
+            cte = CTE(rows, name=name)
+            self._subject_ctes[slot] = cte
+            self._statement_ctes.append(cte)
+        return self._cte_queryset(cte)
 
     # ---------- The actor's id, as a value or as a placeholder ----------
 
@@ -586,9 +897,36 @@ class Compiler:
             raise ValueError(f"{key!r} cannot be evaluated at {at.resource_type!r}")
         return self._holds(key, at, bound, {}, depth_possible=True)
 
+    def _decided(
+        self,
+        key: Key,
+        model: type[models.Model],
+        identity: str,
+        bound: Bound,
+        depth_possible: bool,
+        visits: Mapping[Key, int] | None = None,
+    ) -> tuple[Any, ...] | None:
+        if self.rows is None or bound is not Bound.LOWER or not depth_possible:
+            return None
+        if visits is not None and any(
+            visits.get(member) for member in self.program.components.get(key, ())
+        ):
+            return None
+        if self.model_index.resource(key[0]) is not model or resource_id_attr(model) != identity:
+            return None
+        found = self.rows.rows(key)
+        if found is not None:
+            self.used_rows.add(key)
+        return found
+
     def has_recursion(self, key: Key) -> bool:
-        decided = self.sets.keys if self.sets is not None else frozenset()
-        return bool((self.program.reachable(key) & self.program.recursive) - decided)
+        return bool(self.program.reachable(key) & self.program.recursive)
+
+    def fact_q(self, fact: Fact) -> Q:
+        type_, object_id, name, bound = fact
+        return self._holds(
+            (type_, name), At(type_, Value(object_id), None, False), bound, {}, depth_possible=True
+        )
 
     def depth_unknown(self, key: Key, at: At) -> Q:
         """Whether an undecided case is undecided only because a cycle was cut.
@@ -604,17 +942,6 @@ class Compiler:
         upper_without_depth = self._holds(key, at, Bound.UPPER, {}, depth_possible=False)
         lower_without_depth = self._holds(key, at, Bound.LOWER, {}, depth_possible=False)
         return _or(_not(upper_without_depth), lower_without_depth)
-
-    def fact_q(self, fact: Fact) -> Q:
-        """The inline predicate of a fact, for deciding it and for its witness."""
-        type_, object_id, name, bound = fact
-        return self._holds(
-            (type_, name),
-            At(type_, Value(object_id), None, False),
-            bound,
-            {},
-            depth_possible=True,
-        )
 
     # ---------- Nodes ----------
 
@@ -712,7 +1039,9 @@ class Compiler:
         if relation.with_expiration:
             live |= Q(expires_at__gt=self.now)
         if self.verdicts is not None:
-            return live & self.verdicts.condition_q("", bound)
+            return live & self.verdicts.condition_q(
+                "", bound, using=self.using, parametric=self.parametric
+            )
         if bound is Bound.LOWER:
             return live & Q(caveat_name="")
         return live
@@ -729,10 +1058,35 @@ class Compiler:
         if not ids:
             return _FALSE
         if at.key is not None:
-            return _or(*(self._wire_equal(at, wire_id) for wire_id in ids))
+            model = self.model_index.resource(at.resource_type)
+            if model is None:
+                return _FALSE
+            identity = resource_id_attr(model)
+            codec = identity_codec(model, identity)
+            _, canonical = model_identity_fields(model, identity)
+            natives = tuple(
+                canonical.to_python(wire_id)
+                for wire_id in ids
+                if codec.is_canonical(wire_id, using=self.using)
+            )
+            if not natives:
+                return _FALSE
+            selected = Decided(natives, ("set", key, bound, "native", at.resource_type))
+            if at.key is canonical:
+                return self.decided_member(at.ref, selected, canonical)
+            bridge = model._base_manager.using(self.using).filter(
+                self.decided_member(F(identity), selected, canonical)
+                if self.bind_decisions
+                else _bound_in(F(identity), natives)
+            )
+            return _in(at.ref, bridge.order_by().values(at.key.name))
         if isinstance(at.ref, Value):
-            return _truth(at.ref.value in ids)
-        return _not_null(at.ref) & Q(In(at.ref, ids))
+            present = at.ref.value in ids
+            self._value_memberships.append((key, bound, at.ref.value, present))
+            return _truth(present)
+        return self.decided_member(
+            at.ref, Decided(ids, ("set", key, bound, "wire")), models.TextField()
+        )
 
     def sets_step(
         self,
@@ -776,8 +1130,17 @@ class Compiler:
                     )
                 elif allowed.relation:
                     inside = sorted(members.get((allowed.type, allowed.relation), ()))
+                    selected = (
+                        Decided(inside, ("set", (allowed.type, allowed.relation), bound, "wire"))
+                        if self.bind_decisions
+                        and self.sets is not None
+                        and members is self.sets.upper
+                        else inside
+                    )
                     member = _or(
-                        Q(subject_id__in=inside) if inside else _FALSE,
+                        self.decided_member(F("subject_id"), selected, models.TextField())
+                        if isinstance(selected, Decided)
+                        else _bound_in(F("subject_id"), selected),
                         _and(_truth(itself), named),
                     )
                 else:
@@ -796,11 +1159,18 @@ class Compiler:
             )
         return step
 
-    def sets_within(self, members: Mapping[Key, Collection[str]]) -> Q:
+    def sets_within(self, members: Mapping[Key, Collection[str]], bound: Bound) -> Q:
         """A tuple's resource is one of the member sets."""
         return _or(
             *(
-                Q(resource_type=type_, relation=name, resource_id__in=sorted(ids))
+                Q(resource_type=type_, relation=name)
+                & self.decided_member(
+                    F("resource_id"),
+                    Decided(sorted(ids), ("set", (type_, name), bound, "wire"))
+                    if self.bind_decisions and self.sets is not None and members is self.sets.upper
+                    else sorted(ids),
+                    models.TextField(),
+                )
                 for (type_, name), ids in sorted(members.items())
                 if ids
             )
@@ -819,7 +1189,7 @@ class Compiler:
             return _TRUE
         tuples = self._tuples()
         parts = []
-        for edge in sets.support:
+        for index, edge in enumerate(sets.support):
             definition = self.schema.get_definition(edge.key[0])
             assert definition is not None
             relation = next(r for r in definition.relations if r.name == edge.key[1])
@@ -829,13 +1199,31 @@ class Compiler:
                         tuples.filter(
                             self._live_q(relation, Bound.LOWER),
                             resource_type=edge.key[0],
-                            resource_id=edge.resource_id,
+                            resource_id=_Param(
+                                DecidedSlot(("support", index, "resource_id")), models.TextField()
+                            )
+                            if self.bind_decisions
+                            else edge.resource_id,
                             relation=edge.key[1],
                             subject_type=edge.subject_type,
-                            subject_id=self._wire() if edge.own else edge.subject_id,
+                            subject_id=(
+                                self._wire()
+                                if edge.own
+                                else _Param(
+                                    DecidedSlot(("support", index, "subject_id")),
+                                    models.TextField(),
+                                )
+                                if self.bind_decisions
+                                else edge.subject_id
+                            ),
                             subject_relation=edge.subject_relation,
                             caveat_name=edge.caveat_name,
-                            caveat_key=edge.caveat_key,
+                            caveat_key=_Param(
+                                DecidedSlot(("support", index, "caveat_key")),
+                                models.TextField(),
+                            )
+                            if self.bind_decisions
+                            else edge.caveat_key,
                         )
                     )
                 )
@@ -843,7 +1231,7 @@ class Compiler:
         step = self.sets_step(sets.keys, sets.upper, Bound.UPPER)
         if step is not _FALSE:
             beyond = tuples.filter(step)
-            within = self.sets_within(sets.upper)
+            within = self.sets_within(sets.upper, Bound.UPPER)
             if within is not _FALSE:
                 beyond = beyond.exclude(within)
             parts.append(~Q(Exists(beyond)))
@@ -863,19 +1251,78 @@ class Compiler:
             shape &= Q(subject_id=allowed.id)
         return shape
 
-    def _closure(self, seed: QuerySet[Any], edges: Any, hops: int) -> QuerySet[Any]:
-        """The wire ids within ``hops`` edges of ``seed``, as one nested set.
+    def _closure(
+        self,
+        key: Key,
+        bound: Bound,
+        depth_possible: bool,
+        seed: QuerySet[Any],
+        edges: Any,
+        hops: int,
+    ) -> QuerySet[Any]:
+        """The wire ids within ``hops`` edges of ``seed``, in a finite CTE."""
+        if hops <= 0:
+            return seed
 
-        Each level is the seed united with one more hop from the level below,
-        so the statement grows linearly with the bound and names the seed once
-        per level.
-        """
-        closure = seed
-        for _ in range(hops):
-            closure = seed.union(
-                edges.filter(subject_id__in=_Compiled(closure)).order_by().values("resource_id")
+        def body(cte: CTE) -> QuerySet[Any]:
+            first = seed.annotate(_rebac_depth=Value(0, output_field=models.IntegerField()))
+            depth = models.ExpressionWrapper(
+                cte.col._rebac_depth, output_field=models.IntegerField()
             )
-        return closure
+            step = (
+                cte.join(edges, subject_id=cte.col.resource_id)
+                .order_by()
+                .values("resource_id")
+                .annotate(_rebac_depth=depth + Value(1))
+                .filter(_rebac_depth__lte=hops)
+                .values("resource_id", "_rebac_depth")
+            )
+            return cast(QuerySet[Any], first.union(step))
+
+        slot = key, bound, depth_possible
+        cte = self._closure_ctes.get(slot) if self._share_subject_rows else None
+        if cte is None:
+            name = (
+                f"rebac_closure_{self._subject_ordinals[key]}_{bound.value}_{int(depth_possible)}"
+                if self._share_subject_rows
+                else "rebac_closure"
+            )
+            cte = CTE.recursive(body, name=self._cte_name(name))
+            if self._share_subject_rows:
+                self._closure_ctes[slot] = cte
+                self._statement_ctes.append(cte)
+        if self._share_subject_rows:
+            return self._cte_queryset(cte).values("resource_id")
+        return cast(
+            QuerySet[Any], with_cte(cte, select=self._cte_queryset(cte).values("resource_id"))
+        )
+
+    def _sets_closure(
+        self, key: Key, bound: Bound, seed: QuerySet[Any], edges: Any
+    ) -> QuerySet[Any]:
+        """Actor-side stored subject sets to a fixed point, including cycles."""
+
+        slot = key, bound
+        if self._share_subject_rows and (kept := self._set_ctes.get(slot)) is not None:
+            return self._cte_queryset(kept).values("resource_id")
+
+        def body(cte: CTE) -> QuerySet[Any]:
+            step = cte.join(edges, subject_id=cte.col.resource_id).order_by().values("resource_id")
+            return seed.union(step)
+
+        name = (
+            f"rebac_sets_{self._subject_ordinals[key]}_{bound.value}"
+            if self._share_subject_rows
+            else "rebac_sets"
+        )
+        cte = CTE.recursive(body, name=self._cte_name(name))
+        if self._share_subject_rows:
+            self._set_ctes[slot] = cte
+            self._statement_ctes.append(cte)
+            return self._cte_queryset(cte).values("resource_id")
+        return cast(
+            QuerySet[Any], with_cte(cte, select=self._cte_queryset(cte).values("resource_id"))
+        )
 
     def _not_converged(self, edges: Any, closure: QuerySet[Any], known: Q) -> Q:
         """Whether one more hop reaches an object the closure does not hold.
@@ -981,15 +1428,10 @@ class Compiler:
         ).exclude(subject_id="*")
         if hop.id:
             edges = edges.filter(subject_id=hop.id)
-        closure = self._closure(
-            rows.filter(direct).order_by().values("resource_id"), edges, self.depth_limit
+        closure = self._sets_closure(
+            key, bound, rows.filter(direct).order_by().values("resource_id"), edges
         )
-        result = self._wire_membership(at, every, closure)
-        if bound is Bound.UPPER and depth_possible:
-            result = _or(
-                result, _and(self._not_converged(edges, closure, _FALSE), _not_null(at.ref))
-            )
-        return result
+        return self._wire_membership(at, every, closure)
 
     def _self_fk(
         self, key: Key
@@ -1007,7 +1449,7 @@ class Compiler:
         """The parts of ``p = base + parent->p`` over a self foreign key, if ``key`` is one."""
         definition = self.schema.get_definition(key[0])
         permission = self.schema.get_permission(*key)
-        model = model_for_resource_type(key[0])
+        model = self.model_index.resource(key[0])
         if definition is None or permission is None or model is None:
             return None
         arms = self._union_arms(permission.expression)
@@ -1019,7 +1461,7 @@ class Compiler:
         relation = next((r for r in definition.relations if r.name == recursive_arm.via), None)
         if relation is None or not isinstance(relation.backing, FieldBinding):
             return None
-        resolved = resolve_field_backing(definition, relation)
+        resolved = _field_backing(definition, relation, self.model_index)
         if (
             resolved is None
             or resolved.source_model is not model
@@ -1032,58 +1474,6 @@ class Compiler:
         identity = resource_id_attr(model)
         _, field = model_identity_fields(model, identity)
         return definition, base, resolved, model, identity, field
-
-    def self_chain(self, key: Key) -> SelfChain | None:
-        """A self-foreign-key recursion as its seeds and its edge, for a closure
-        followed from the seeds: the rows that hold the base (lower bound), then
-        the rows whose parent column names a row already found."""
-        parts_of = self._self_fk(key)
-        if parts_of is None:
-            return None
-        definition, base, resolved, model, identity, field = parts_of
-        parent = cast("models.ForeignKey[Any, Any]", resolved.field)
-        if not foreign_key_kept(parent, self.using):
-            # A child may name a parent that is gone: only the parent's own
-            # row shows that the child still inherits.
-            return None
-        row_at = At(key[0], F(identity), field, True)
-        base_row = _or(*self._arms(definition, base, row_at, Bound.LOWER, {key: 1}, True))
-        return SelfChain(
-            model,
-            identity,
-            parent.target_field.name,
-            parent.attname,
-            base_row,
-            parent.target_field is field,
-        )
-
-    def _decided(
-        self,
-        key: Key,
-        model: type[models.Model],
-        identity: str,
-        bound: Bound,
-        depth_possible: bool,
-        visits: Mapping[Key, int] | None = None,
-    ) -> tuple[Any, ...] | None:
-        """The rows decided for ``key``, when it is a lower bound over its own model's rows.
-
-        A decision is the rows that hold ``key`` with the whole depth to
-        spend.  Inside the key's own component (``visits``) part of the depth
-        is spent already, so the set is not used there.
-        """
-        if self.rows is None or bound is not Bound.LOWER or not depth_possible:
-            return None
-        if visits is not None and any(
-            visits.get(member) for member in self.program.components.get(key, ())
-        ):
-            return None
-        if model_for_resource_type(key[0]) is not model or resource_id_attr(model) != identity:
-            return None
-        decided = self.rows.rows(key)
-        if decided is not None:
-            self.used_rows.add(key)
-        return decided
 
     def _flat_self_fk(
         self,
@@ -1111,13 +1501,20 @@ class Compiler:
         def base_at(where: At) -> list[Q]:
             return self._arms(definition, base, where, bound, inside, depth_possible)
 
-        own_row = at.row and model_for_resource_type(at.resource_type) is model and at.key is field
+        own_row = (
+            at.row and self.model_index.resource(at.resource_type) is model and at.key is field
+        )
         if own_row:
             decided = self._decided(key, model, identity, bound, depth_possible)
             if decided is not None:
-                return Q(In(at.ref, list(decided))) if decided else _FALSE
+                _, field = model_identity_fields(model, identity)
+                return (
+                    self.decided_member(at.ref, decided, field)
+                    if self.bind_decisions
+                    else _bound_in(at.ref, decided)
+                )
         # The holders are looked up by key, a row and its ancestors at a time,
-        # so their base is a plain disjunction: each arm is decided once.
+        # so their base is a plain disjunction of inline arms.
         base_row = _or(*base_at(row_at))
         if base_row is _TRUE:
             return _TRUE
@@ -1168,7 +1565,7 @@ class Compiler:
         """
         definition = self.schema.get_definition(key[0])
         permission = self.schema.get_permission(*key)
-        model = model_for_resource_type(key[0])
+        model = self.model_index.resource(key[0])
         if definition is None or permission is None or model is None:
             return None
         arms = self._union_arms(permission.expression)
@@ -1180,7 +1577,7 @@ class Compiler:
         relation = next((r for r in definition.relations if r.name == arm.via), None)
         if relation is None or not isinstance(relation.backing, FieldBinding):
             return None
-        resolved = resolve_field_backing(definition, relation)
+        resolved = _field_backing(definition, relation, self.model_index)
         if (
             resolved is None
             or resolved.generic is not None
@@ -1220,6 +1617,106 @@ class Compiler:
                 .values_list(identity, flat=True)
             )
 
+        query_field, scalar = model_identity_fields(model, identity)
+        finite_path = (
+            bound is Bound.LOWER
+            and self.depth_limit > 1
+            and query_field is model._meta.pk
+            and query_field is scalar
+            and type(scalar) in _NATIVE_INTEGER_FIELDS
+            and identity != "_rebac_depth"
+            and connections[self.using].vendor in ("postgresql", "sqlite")
+        )
+        if finite_path:
+            ordinary_hops = True
+
+            def ordinary_hop(_model: type[models.Model], hop: object, _prefix: str) -> None:
+                nonlocal ordinary_hops
+                ordinary_hops = ordinary_hops and type(hop) in (
+                    models.ForeignKey,
+                    models.OneToOneField,
+                )
+
+            _relation_path(model, resolved.path, visit=ordinary_hop)
+            finite_path = ordinary_hops and resolved.targets_identity_directly()
+        if finite_path:
+            inspected = source.all().query
+            own = inspected.resolve_ref(identity)
+            target = inspected.resolve_ref(target_path)
+            finite_path = False
+            if isinstance(own, Col) and isinstance(target, Col):
+                target_field = target.target
+                finite_path = (
+                    type(own) is Col
+                    and type(target) is Col
+                    and own.target is scalar
+                    and own.output_field is scalar
+                    and (
+                        (target_field is scalar and target.output_field is scalar)
+                        or (
+                            isinstance(target_field, (models.ForeignKey, models.OneToOneField))
+                            and type(target_field) in (models.ForeignKey, models.OneToOneField)
+                            and target_field is resolved.field
+                            and target_field.target_field is scalar
+                            and (
+                                target.output_field is scalar or target.output_field is target_field
+                            )
+                        )
+                    )
+                )
+            if finite_path:
+                compared = target.output_field
+                exact, membership = (
+                    (RelatedExact, RelatedIn)
+                    if isinstance(compared, (models.ForeignKey, models.OneToOneField))
+                    else (IntegerFieldExact, In)
+                )
+                finite_path = (
+                    scalar.get_lookup("exact") is IntegerFieldExact
+                    and scalar.get_lookup("in") is In
+                    and compared.get_lookup("exact") is exact
+                    and compared.get_lookup("in") is membership
+                )
+        if finite_path:
+
+            def path_rows(cte: CTE) -> QuerySet[Any]:
+                first = (
+                    reaching(seed)
+                    .values("pk")
+                    .annotate(_rebac_depth=Value(1, output_field=models.IntegerField()))
+                )
+                previous = models.ExpressionWrapper(cte.col.pk, output_field=scalar)
+                depth = models.ExpressionWrapper(
+                    cte.col._rebac_depth, output_field=models.IntegerField()
+                )
+                step = (
+                    cte.join(source, Q(**resolved.filters), **{target_path: previous})
+                    .values("pk")
+                    .annotate(_rebac_depth=depth + Value(1))
+                    .filter(_rebac_depth__lte=self.depth_limit)
+                    .order_by()
+                    .values("pk", "_rebac_depth")
+                )
+                return cast(QuerySet[Any], first.union(step).order_by())
+
+            slot = key, bound, depth_possible
+            cte = self._path_ctes.get(slot) if self._share_subject_rows else None
+            if cte is None:
+                name = (
+                    f"rebac_path_{self._subject_ordinals[key]}_{bound.value}_{int(depth_possible)}"
+                    if self._share_subject_rows
+                    else "rebac_path"
+                )
+                cte = CTE.recursive(path_rows, name=self._cte_name(name))
+                if self._share_subject_rows:
+                    self._path_ctes[slot] = cte
+                    self._statement_ctes.append(cte)
+            reached = self._cte_queryset(cte).values("pk")
+            members = source.filter(pk__in=_Compiled(reached))
+            if not self._share_subject_rows:
+                members = with_cte(cte, select=members)
+            parts.append(self._model_membership(at, members, model, identity))
+            return self._union(at, parts)
         closure = seed
         for _ in range(self.depth_limit - 1):
             closure = seed.union(reaching(closure))
@@ -1317,12 +1814,85 @@ class Compiler:
         if at.key is None and _one_object(at.ref) and bound is Bound.LOWER:
             # One object: follow the edges from it.  What it reaches is small,
             # each level is one lookup by resource, and the base is named once.
+            holders = edges if seed is _TRUE else edges.filter(seed)
+            if self.depth_limit <= 1:
+                return _or(point, Q(Exists(holders.filter(self._from(at, None)))))
+            recursive_forward = connections[self.using].vendor in ("postgresql", "sqlite")
+            if recursive_forward:
+                columns = tuple(
+                    edges.query.resolve_ref(name) for name in ("resource_id", "subject_id")
+                )
+                recursive_forward = all(
+                    type(column) is Col and column.output_field is column.target
+                    for column in columns
+                )
+                if recursive_forward:
+                    resource_field, subject_field = (column.output_field for column in columns)
+                    recursive_forward = (
+                        type(resource_field) in (models.CharField, models.TextField)
+                        and type(subject_field) in (models.CharField, models.TextField)
+                        and resource_field.db_collation == subject_field.db_collation
+                    )
+            if recursive_forward:
+
+                def reached_rows(cte: CTE) -> QuerySet[Any]:
+                    first = (
+                        edges.filter(resource_id=at.ref)
+                        .order_by()
+                        .values("subject_id")
+                        .annotate(_rebac_depth=Value(1, output_field=models.IntegerField()))
+                    )
+                    depth = models.ExpressionWrapper(
+                        cte.col._rebac_depth, output_field=models.IntegerField()
+                    )
+                    step = (
+                        cte.join(edges, resource_id=cte.col.subject_id)
+                        .order_by()
+                        .values("subject_id")
+                        .annotate(_rebac_depth=depth + Value(1))
+                        .filter(_rebac_depth__lt=self.depth_limit)
+                        .values("subject_id", "_rebac_depth")
+                    )
+                    return cast(QuerySet[Any], first.union(step))
+
+                slot = key, at.ref, bound, depth_possible
+                cte = self._reached_ctes.get(slot) if self._share_subject_rows else None
+                if cte is None:
+                    # ``_Param`` has the default object repr, which includes
+                    # its address. Only Value and _Param reach this point.
+                    ref_key = (
+                        ("value", repr(at.ref.value))
+                        if isinstance(at.ref, Value)
+                        else (
+                            "param",
+                            "actor" if cast(_Param, at.ref).marker is ACTOR_WIRE else "resource",
+                        )
+                    )
+                    slot_tag = hashlib.blake2s(
+                        repr((key, ref_key, bound.value, depth_possible)).encode(), digest_size=4
+                    ).hexdigest()
+                    name = (
+                        f"rebac_reached_{self._subject_ordinals[key]}_{bound.value}_{int(depth_possible)}_{slot_tag}"
+                        if self._share_subject_rows
+                        else "rebac_reached"
+                    )
+                    cte = CTE.recursive(reached_rows, name=self._cte_name(name))
+                    if self._share_subject_rows:
+                        self._reached_ctes[slot] = cte
+                        self._statement_ctes.append(cte)
+                reached_cte = self._cte_queryset(cte).values("subject_id")
+                matched = holders.filter(self._from(at, reached_cte))
+                if not self._share_subject_rows:
+                    matched = with_cte(cte, select=matched)
+                return _or(point, Q(Exists(matched)))
             reached: QuerySet[Any] | None = None
             for _ in range(self.depth_limit - 1):
                 reached = edges.filter(self._from(at, reached)).order_by().values("subject_id")
-            holders = edges if seed is _TRUE else edges.filter(seed)
             return _or(point, Q(Exists(holders.filter(self._from(at, reached)))))
         closure = self._closure(
+            key,
+            bound,
+            depth_possible,
             (edges if seed is _TRUE else edges.filter(seed)).order_by().values("resource_id"),
             edges,
             self.depth_limit - 1,
@@ -1437,20 +2007,9 @@ class Compiler:
         visits: Mapping[Key, int],
         depth_possible: bool,
     ) -> list[Q]:
-        """The arms of a union, compiled until one holds outright.
-
-        Arrows over constants come first: they fold to a decision (a member
-        of the admin role), and when one holds nothing else is compiled.
-        """
-
-        def constant(arm: PermExpr) -> bool:
-            if not isinstance(arm, PermArrow):
-                return isinstance(arm, PermRef) and arm.name in ("authenticated", "anonymous")
-            relation = next((r for r in definition.relations if r.name == arm.via), None)
-            return relation is not None and isinstance(relation.backing, ConstBinding)
-
+        """Compile the arms of a union in schema order."""
         parts: list[Q] = []
-        for arm in sorted(arms, key=lambda arm: not constant(arm)):
+        for arm in arms:
             part = self._expression(
                 definition, arm, at, bound, visits, depth_possible=depth_possible
             )
@@ -1482,7 +2041,7 @@ class Compiler:
             )
         rows: Any
         if at.row:
-            model = model_for_resource_type(at.resource_type)
+            model = self.model_index.resource(at.resource_type)
             if model is None:
                 return _TRUE
             identity = resource_id_attr(model)
@@ -1522,7 +2081,7 @@ class Compiler:
             return _FALSE
         if len(kept) == 1:
             return kept[0]
-        model = model_for_resource_type(at.resource_type)
+        model = self.model_index.resource(at.resource_type)
         if not at.row or model is None:
             return _or(*kept)
         identity = resource_id_attr(model)
@@ -1547,7 +2106,7 @@ class Compiler:
         visits = {**visits, _HOPS: visits.get(_HOPS, 0) + 1}
         if isinstance(relation.backing, FieldBinding):
             try:
-                resolved = _resolve_field_backing(definition, relation)
+                resolved = _resolve_field_backing(definition, relation, self.model_index)
             except ValueError as exc:
                 raise SchemaError(
                     f"Field backing {definition.resource_type}#{relation.name} does not resolve "
@@ -1555,7 +2114,7 @@ class Compiler:
                 ) from exc
             return self._field_relation(resolved, at, bound, visits, target, depth_possible)
         if isinstance(relation.backing, ConstBinding):
-            resolved_const = resolve_const_backing(definition, relation)
+            resolved_const = _const_backing(definition, relation, self.model_index)
             if resolved_const is None:
                 raise SchemaError(
                     f"Constant backing {definition.resource_type}#{relation.name} does not resolve "
@@ -1563,7 +2122,7 @@ class Compiler:
                 )
             return self._const_relation(resolved_const, at, bound, visits, target, depth_possible)
         if isinstance(relation.backing, AttributeBinding):
-            resolved_attr = resolve_attribute_backing(definition, relation)
+            resolved_attr = _attribute_backing(definition, relation, self.model_index)
             if resolved_attr is None:
                 raise SchemaError(
                     f"Attribute backing {definition.resource_type}#{relation.name} does not resolve "
@@ -1586,13 +2145,15 @@ class Compiler:
         bound: Bound,
         visits: Mapping[Key, int],
         depth_possible: bool,
+        *,
+        decide: bool = True,
     ) -> QuerySet[Any] | Decided | bool:
         """The subject-model rows that admit the actor; ``True`` for every row.
 
         With ``name`` (an arrow target or a subject-set relation) a row admits
         the actor when the actor holds it there, or, for a bare subject set,
         when the actor is that very subject set.  Without it the actor must be
-        the row.  A set decided before the statement comes back as its keys.
+        the row. Subject-set membership remains an inline SQL predicate.
         """
         rows = model._base_manager.using(self.using)
         own = self.shape.type == allowed_type and self._canonical(model, identity)
@@ -1603,11 +2164,20 @@ class Compiler:
         _, field = model_identity_fields(model, identity)
         itself = bool(relation_name and own and self.shape.relation == relation_name)
         if not itself:
-            decided = self._decided(
-                (allowed_type, name), model, identity, bound, depth_possible, visits
+            decided = (
+                self._decided((allowed_type, name), model, identity, bound, depth_possible, visits)
+                if decide
+                else None
             )
             if decided is not None:
-                return Decided(decided) if decided else False
+                if not decided:
+                    return False
+                return decided if isinstance(decided, Decided) else Decided(decided)
+            shared = self._subject_cte(
+                (allowed_type, name), model, identity, bound, visits, depth_possible
+            )
+            if shared is not None:
+                return shared
         member = self._holds(
             (allowed_type, name),
             At(allowed_type, F(identity), field, True),
@@ -1632,13 +2202,61 @@ class Compiler:
         target: str | None,
         depth_possible: bool,
     ) -> Q:
-        if self.point is not None and not self.point.may_name(resolved, at, self.using):
-            # The point row names another type: this arm's chain is not built.
-            return _FALSE
         allowed = resolved.relation.allowed_subjects[0]
         if allowed.relation and not self._is_relation(allowed.type, allowed.relation):
             return _FALSE
         target_path = resolved.target_values_path()
+        # Two arms over one multi-valued path must not share its join.
+        single = not _multi_valued(resolved.source_model, resolved.path) and not any(
+            _multi_valued(resolved.source_model, lookup) for lookup in resolved.filters
+        )
+        if (
+            not at.row
+            and at.key is None
+            and _one_object(at.ref)
+            and target is not None
+            and "__" not in resolved.path
+            and single
+        ):
+            source_identity, _ = model_identity_fields(
+                resolved.source_model, resolved.source_id_attr
+            )
+            if source_identity.unique:
+                _, field = model_identity_fields(resolved.target_model, resolved.target_id_attr)
+                kept_fk = (
+                    resolved.generic is None
+                    and isinstance(resolved.field, (models.ForeignKey, models.OneToOneField))
+                    and resolved.targets_identity_directly()
+                    and resolved.keeps_target(self.using)
+                )
+                generic_scalar = (
+                    resolved.generic is not None
+                    and type(resolved.field) in _NATIVE_INTEGER_FIELDS
+                    and type(field) in _NATIVE_INTEGER_FIELDS
+                )
+                if kept_fk or generic_scalar:
+                    # A constrained FK keeps its target. A GFK must prove both
+                    # its content type and target existence in this source query.
+                    source = resolved.source_model._base_manager.using(self.using).filter(
+                        Q(
+                            **{
+                                resolved.source_id_attr: identity_codec(
+                                    resolved.source_model, resolved.source_id_attr
+                                ).to_column(cast(Expression, at.ref))
+                            }
+                        )
+                        & Q(**resolved.filters)
+                        & resolved.generic_q(self.using, exists=True)
+                    )
+                    reference = Subquery(source.order_by().values(target_path), output_field=field)
+                    member = self._holds(
+                        (allowed.type, target),
+                        At(allowed.type, reference, field, False),
+                        bound,
+                        visits,
+                        depth_possible=depth_possible,
+                    )
+                    return _and(_not_null(reference), member)
         name = target if target is not None else (allowed.relation or None)
         subjects = self._subject_rows(
             allowed.type,
@@ -1649,6 +2267,7 @@ class Compiler:
             bound,
             visits,
             depth_possible,
+            decide=resolved.generic is None,
         )
         if subjects is False:
             return _FALSE
@@ -1659,18 +2278,17 @@ class Compiler:
             source_q = Q(**{f"{target_path}__isnull": False})
             through_rows = False
         elif isinstance(subjects, Decided) and resolved.keeps_target(self.using):
-            source_q = Q(**{f"{target_path}__in": list(subjects)})
+            _, field = model_identity_fields(resolved.target_model, resolved.target_id_attr)
+            source_q = self.decided_member(F(target_path), subjects, field)
         elif isinstance(subjects, Decided):
-            # Nothing constrains the reference: a decided key counts only
-            # while its row is there.
-            identity = resolved.target_id_attr
-            rows = resolved.target_model._base_manager.using(self.using)
+            _, field = model_identity_fields(resolved.target_model, resolved.target_id_attr)
+            targets = resolved.target_model._base_manager.using(self.using).filter(
+                self.decided_member(F(resolved.target_id_attr), subjects, field)
+            )
             source_q = Q(
                 **{
                     f"{target_path}__in": _Compiled(
-                        rows.filter(**{f"{identity}__in": list(subjects)})
-                        .order_by()
-                        .values(identity)
+                        targets.order_by().values(resolved.target_id_attr)
                     )
                 }
             )
@@ -1690,11 +2308,7 @@ class Compiler:
         # A GenericForeignKey backing holds the rows of one content type.
         generic = resolved.generic_q(self.using, exists=not through_rows)
         source_q = Q(**resolved.filters) & generic & source_q
-        # Two arms over one multi-valued path must not share its join, so
-        # only a single-valued lookup may be inlined into the caller's filter.
-        single = not _multi_valued(resolved.source_model, resolved.path) and not any(
-            _multi_valued(resolved.source_model, lookup) for lookup in resolved.filters
-        )
+        # Only a single-valued lookup may be inlined into the caller's filter.
         if at.row and single:
             return source_q
         rows = resolved.source_model._base_manager.using(self.using).filter(source_q)
@@ -1715,7 +2329,6 @@ class Compiler:
         if target is not None or allowed.relation:
             name = target if target is not None else allowed.relation
             target_key = (allowed.type, name)
-            fact: Fact = (allowed.type, resolved.target_id, name, bound)
             if (
                 target is None
                 and self.shape.type == allowed.type
@@ -1726,23 +2339,53 @@ class Compiler:
             elif (
                 self.facts is not None
                 and depth_possible
-                and fact in self.facts
+                and (fact := (allowed.type, resolved.target_id, name, bound)) in self.facts
                 and not any(
                     visits.get(member) for member in self.program.components.get(target_key, ())
                 )
             ):
-                # Decided for this statement; its witness keeps the decision
-                # true of the statement's own snapshot.
                 self.used_facts.add(fact)
                 target_q = _truth(self.facts[fact])
             else:
-                target_q = self._holds(
-                    target_key,
-                    At(allowed.type, Value(resolved.target_id), None, False),
-                    bound,
-                    visits,
-                    depth_possible=depth_possible,
+                slot = target_key, resolved.target_id, bound
+                share = (
+                    self._share_subject_rows
+                    and depth_possible
+                    and not self.has_recursion(target_key)
+                    and not any(
+                        visits.get(member) for member in self.program.components.get(target_key, ())
+                    )
                 )
+                cte = self._const_ctes.get(slot) if share else None
+                if cte is not None:
+                    target_q = Q(Exists(self._cte_queryset(cte)))
+                else:
+                    target_q = self._holds(
+                        target_key,
+                        At(allowed.type, Value(resolved.target_id), None, False),
+                        bound,
+                        visits,
+                        depth_possible=depth_possible,
+                    )
+                    if share and target_q is not _FALSE and target_q is not _TRUE:
+                        from ..models.generation import SchemaGeneration
+
+                        ordinal = self._subject_ordinals[target_key]
+                        object_tag = hashlib.blake2s(
+                            resolved.target_id.encode(), digest_size=4
+                        ).hexdigest()
+                        name = self._cte_name(f"rebac_const_{ordinal}_{object_tag}_{bound.value}")
+                        selected = (
+                            SchemaGeneration.objects.using(self.using)
+                            .filter(pk=1)
+                            .filter(target_q)
+                            .order_by()
+                            .values("pk")
+                        )
+                        cte = CTE(selected, name=name)
+                        self._const_ctes[slot] = cte
+                        self._statement_ctes.append(cte)
+                        target_q = Q(Exists(self._cte_queryset(cte)))
         else:
             target_q = _truth(
                 self.shape.type == allowed.type
@@ -1788,7 +2431,8 @@ class Compiler:
             return _FALSE
         every = resolved.target_model._base_manager.using(self.using)
         if isinstance(found, Decided):
-            found = every.filter(**{f"{resolved.target_id_attr}__in": list(found)})
+            _, field = model_identity_fields(resolved.target_model, resolved.target_id_attr)
+            found = every.filter(self.decided_member(F(resolved.target_id_attr), found, field))
         subjects = (every if found is True else found).filter(Q(**resolved.filters))
         if resolved.resource is not None:
             subjects = subjects.filter(resolved.value_filter(resolved.value))
@@ -1925,10 +2569,10 @@ class Compiler:
         expression's depth through its subqueries, and a chain of ANDs is
         left-deep, so a nested subquery must be the final conjunct.
         """
-        model = model_for_resource_type(at.resource_type)
+        model = self.model_index.resource(at.resource_type)
         identity = resource_id_attr(model) if model is not None else None
         if model is None:
-            subject_model = model_for_subject_type(at.resource_type)
+            subject_model = self.model_index.subject(at.resource_type)
             if subject_model is not None:
                 model, identity = subject_model
         if at.key is None or model is None:
@@ -1938,9 +2582,10 @@ class Compiler:
             return rows.order_by().values("resource_id")
         assert identity is not None
         _, identity_field = model_identity_fields(model, identity)
-        converted = rows.annotate(
-            _rebac_native_id=identity_codec(model, identity).to_column("resource_id")
-        ).exclude(_rebac_native_id__isnull=True)
+        native = self._native_reference(
+            model, identity, cast(Expression, F("resource_id")), at.resource_type
+        )
+        converted = rows.annotate(_rebac_native_id=native).exclude(_rebac_native_id__isnull=True)
         if last is not None:
             converted = converted.filter(last)
         if at.key is identity_field:
@@ -1949,17 +2594,6 @@ class Compiler:
             **{f"{identity}__in": _Compiled(converted.order_by().values("_rebac_native_id"))}
         )
         return cast(QuerySet[Any], bridge.order_by().values(at.key.name))
-
-    def point_witness(self, at: At) -> Q:
-        """The point row still has the content types its arms were chosen by."""
-        point = self.point
-        if point is None or at.ref is not point.ref:
-            return _TRUE
-        model = model_for_resource_type(at.resource_type)
-        if model is None:
-            return _TRUE
-        rows = model._base_manager.using(self.using).filter(**dict(point.types))
-        return self._model_membership(at, rows, model, resource_id_attr(model))
 
     def _model_membership(
         self,
@@ -1972,7 +2606,9 @@ class Compiler:
         if at.key is None:
             # The model column remains native. Convert a wire reference when
             # the identity originates in a tuple or a constant.
-            converted = identity_codec(model, identity).to_column(cast(Expression, at.ref))
+            converted = self._native_reference(
+                model, identity, cast(Expression, at.ref), at.resource_type
+            )
             if _one_object(at.ref):
                 # One object: look its row up by key instead of building the set.
                 return Q(Exists(rows.order_by().filter(**{identity: converted})))
@@ -1985,10 +2621,55 @@ class Compiler:
         )
         return _in(at.ref, bridge.order_by().values(at.key.name))
 
+    def _native_reference(
+        self, model: type[models.Model], identity: str, ref: Expression, resource_type: str
+    ) -> Expression:
+        """Read a tuple wire ID through one guarded conversion per source column."""
+        name = vars(ref).get("name") if isinstance(ref, (F, OuterRef)) else None
+        if not self._share_subject_rows or name not in ("resource_id", "subject_id"):
+            return identity_codec(model, identity).to_column(ref)
+        wire_column = cast(str, name)
+        slot = model, identity, wire_column, resource_type
+        cte = self._native_ctes.get(slot)
+        if cte is None:
+            type_column = "resource_type" if wire_column == "resource_id" else "subject_type"
+            rows = (
+                self._tuples()
+                .filter(**{type_column: resource_type})
+                .annotate(_rebac_native_id=identity_codec(model, identity).to_column(wire_column))
+            )
+            selected = rows.order_by().values(wire_column, "_rebac_native_id")
+            boundary = (model._meta.label_lower, identity, wire_column, resource_type)
+            label = hashlib.blake2s(repr(boundary).encode(), digest_size=8).hexdigest()
+            # PostgreSQL inlines repeated references so an outer wire-ID
+            # predicate can use the relationship index.
+            cte = CTE(
+                selected,
+                name=self._cte_name(f"rebacnative_{label}"),
+                materialized=False if connections[self.using].vendor == "postgresql" else None,
+            )
+            self._native_ctes[slot] = cte
+            self._statement_ctes.append(cte)
+        _, field = model_identity_fields(model, identity)
+        shared = Subquery(
+            self._cte_queryset(cte)
+            .filter(**{wire_column: _one_level_out(ref)})
+            .order_by()
+            .values("_rebac_native_id")[:1],
+            output_field=field,
+        )
+        return _NativeProjection(
+            identity_codec(model, identity).to_column(ref),
+            shared,
+            self._native_state,
+            slot,
+            field,
+        )
+
     def _wire_equal(self, at: At, wire_id: str) -> Q:
         if at.key is None:
             return Q(Exact(at.ref, Value(wire_id)))
-        model = model_for_resource_type(at.resource_type)
+        model = self.model_index.resource(at.resource_type)
         if model is None:
             return _FALSE
         _, canonical = model_identity_fields(model, resource_id_attr(model))
@@ -2005,6 +2686,9 @@ class Compiler:
 
 def const_facts(schema: Schema, program: CompileProgram, root: Key) -> tuple[Fact, ...]:
     """Every fact about a fixed object that a statement for ``root`` can use."""
+    cached = program._facts_cache.get(root)
+    if cached is not None:
+        return cast(tuple[Fact, ...], cached)
     types = {key[0] for key in program.reachable(root)}
     found: set[tuple[str, str, str]] = set()
 
@@ -2041,8 +2725,10 @@ def const_facts(schema: Schema, program: CompileProgram, root: Key) -> tuple[Fac
                             arrow.target,
                         )
                     )
-    return tuple(
+    result = tuple(
         (type_, object_id, name, bound)
         for type_, object_id, name in sorted(found)
         for bound in (Bound.LOWER, Bound.UPPER)
     )
+    program._facts_cache[root] = result
+    return result

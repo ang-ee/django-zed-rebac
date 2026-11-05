@@ -19,7 +19,6 @@ from tests.backend_setup import install_schema
 from tests.testapp.models import (
     GuardedConstraintRow,
     GuardedUniqueRow,
-    OwnerDefaultUniqueRow,
     PlainValidationRow,
 )
 
@@ -142,22 +141,7 @@ def test_steps_without_cross_row_rules_do_not_elevate(validation_rows):
         assert PermissionAuditEvent.objects.count() == before + 1
 
 
-def test_owning_save_default_is_used_then_restored_during_validation(validation_rows):
-    with system_context(reason="validation owner default fixture"):
-        OwnerDefaultUniqueRow.objects.create(owner=validation_rows.alice, code="taken")
-    with actor_context(validation_rows.alice):
-        row = OwnerDefaultUniqueRow(code="taken")
-        with pytest.raises(ValidationError) as caught:
-            row.full_clean()
-        assert set(caught.value.message_dict) == {"code"}
-        assert row.owner_id is None
-        row.code = "free"
-        row.full_clean()
-        row.save()
-    assert str(row.owner_id) == str(validation_rows.alice.pk)
-
-
-def test_save_verdict_is_not_kept_between_validation_calls(validation_rows):
+def test_gate_verdict_is_recomputed_between_validation_calls(validation_rows):
     row = GuardedUniqueRow(owner=validation_rows.bob, email="bob@example.com")
     with actor_context(validation_rows.alice):
         row.full_clean()
@@ -167,48 +151,6 @@ def test_save_verdict_is_not_kept_between_validation_calls(validation_rows):
         with pytest.raises(ValidationError) as caught:
             row.full_clean()
     assert set(caught.value.message_dict) == {"email"}
-
-
-@pytest.mark.parametrize(
-    "model,duplicate,available",
-    [
-        (GuardedUniqueRow, {"email": "bob@example.com"}, {"email": "fresh@example.com"}),
-        (GuardedConstraintRow, {"code": "taken"}, {"code": "fresh"}),
-    ],
-)
-def test_nested_consumer_save_validation_preserves_outer_permission_decision(
-    validation_rows,
-    monkeypatch,
-    model,
-    duplicate,
-    available,
-):
-    """A save that calls full_clean cannot hide a duplicate from outer validation."""
-
-    native_save = model.save
-
-    def validating_save(instance, *args, **kwargs):
-        instance.full_clean()
-        return native_save(instance, *args, **kwargs)
-
-    # This test owns these probe models; the override is the consumer lifecycle
-    # check_save must execute, rather than a substitute for native validation.
-    monkeypatch.setattr(model, "save", validating_save)
-    with system_context(reason="nested validation count"):
-        before = model._base_manager.count()
-    rejected = model(owner=validation_rows.alice, **duplicate)
-    with actor_context(validation_rows.alice), pytest.raises(ValidationError):
-        rejected.full_clean()
-    assert rejected.pk is None
-    assert "_rebac_save_verdict" not in rejected.__dict__
-
-    accepted = model(owner=validation_rows.alice, **available)
-    with actor_context(validation_rows.alice):
-        accepted.full_clean()
-    assert accepted.pk is None
-    assert "_rebac_save_verdict" not in accepted.__dict__
-    with system_context(reason="nested validation count"):
-        assert model._base_manager.count() == before
 
 
 def _validating_save(model, monkeypatch):
@@ -236,9 +178,7 @@ def _row_form():
 def test_model_form_reports_a_duplicate_when_the_admitted_save_cleans_again(
     validation_rows, monkeypatch
 ):
-    """ModelForm calls validate_unique() directly, outside full_clean(); that call
-    owns the decision, so the consumer's cleaning save() inside the rehearsal
-    defers to it instead of answering first and hiding the duplicate."""
+    """ModelForm calls validate_unique() directly and sees hidden duplicates after admission."""
     _validating_save(GuardedUniqueRow, monkeypatch)
     form_class = _row_form()
     with actor_context(validation_rows.alice):
@@ -254,7 +194,6 @@ def test_model_form_reports_a_duplicate_when_the_admitted_save_cleans_again(
         )
         assert not hidden.is_valid()
         assert "email" in hidden.errors
-        assert "_rebac_save_verdict" not in hidden.instance.__dict__
 
 
 def test_model_form_for_a_refused_save_learns_nothing_and_the_save_refuses(
@@ -276,11 +215,9 @@ def test_direct_validate_unique_owns_its_decision(validation_rows):
     row = GuardedUniqueRow(owner=validation_rows.alice, email="alice@example.com", code="A5")
     with actor_context(validation_rows.alice), pytest.raises(ValidationError):
         row.validate_unique()
-    assert "_rebac_save_verdict" not in row.__dict__
     refused = GuardedUniqueRow(owner=validation_rows.bob, email="bob@example.com", code="A6")
     with actor_context(validation_rows.alice):
         refused.validate_unique()
-    assert "_rebac_save_verdict" not in refused.__dict__
 
 
 def test_pinned_actor_validates_an_explicit_primary_key_without_ambient_scope(validation_rows):
@@ -317,19 +254,10 @@ def test_a_check_constraint_alone_is_not_a_cross_row_rule():
     assert GuardedConstraintRow(code="x")._rebac_compares_other_rows("validate_constraints", None)
 
 
-def test_the_decision_marker_is_not_pickled(validation_rows):
-    import pickle
-
-    row = GuardedUniqueRow(owner=validation_rows.alice, email="pickled@example.com")
-    row.__dict__["_rebac_save_verdict"] = True
-    copy = pickle.loads(pickle.dumps(row))
-    assert "_rebac_save_verdict" not in copy.__dict__
-
-
 def test_a_multi_table_child_has_no_pk_rule_of_its_parent(validation_rows):
     """Django checks a primary key per the model class that owns the check; a
     saved multi-table child, whose key is the parent link, has no cross-row
-    rule, so no rehearsal and no audit row."""
+    rule, so no cross-row elevation or audit row."""
     from tests.testapp.models import ParentLinkedChild
 
     row = ParentLinkedChild(owner=validation_rows.alice)
@@ -341,18 +269,13 @@ def test_a_multi_table_child_has_no_pk_rule_of_its_parent(validation_rows):
     assert adding._rebac_compares_other_rows("validate_unique", None)
 
 
-def test_check_save_as_the_outermost_call_never_validates_with_more_access(
-    validation_rows, monkeypatch
-):
-    """A consumer save() that cleans runs inside check_save()'s rehearsal with the
-    decision pending: no elevated read, no audit row, and a hidden duplicate
-    stays hidden behind the gate's own verdict."""
+def test_check_save_does_not_run_consumer_validation(validation_rows, monkeypatch):
+    """A direct gate verdict does not run a consumer save override or emit an audit row."""
     _validating_save(GuardedUniqueRow, monkeypatch)
     PermissionAuditEvent.objects.all().delete()
     refused = GuardedUniqueRow(owner=validation_rows.bob, email="bob@example.com", code="C1")
     with actor_context(validation_rows.alice):
         assert not refused.check_save().allowed
-    assert "_rebac_save_verdict" not in refused.__dict__
     assert not PermissionAuditEvent.objects.exists()
 
 
@@ -438,46 +361,3 @@ def test_in_allow_mode_a_refused_save_still_sees_its_readable_duplicate(validati
     hidden = GuardedUniqueRow(owner=validation_rows.bob, email="bob@example.com", code="C8")
     with actor_context(validation_rows.alice):
         hidden.full_clean()
-
-
-def test_a_check_constraint_on_a_gated_field_still_runs_for_a_refused_save(
-    validation_rows, monkeypatch
-):
-    from django.db import models
-    from django.db.models import Q
-
-    monkeypatch.setattr(
-        GuardedUniqueRow._meta,
-        "constraints",
-        [
-            models.CheckConstraint(
-                condition=Q(code__startswith="ok"), name="validation_unique_code_ok"
-            )
-        ],
-    )
-    row = GuardedUniqueRow(owner=validation_rows.bob, email="check@example.com", code="bad")
-    with actor_context(validation_rows.alice), pytest.raises(ValidationError) as caught:
-        row.full_clean()
-    assert "validation_unique_code_ok" in str(caught.value)
-
-
-def test_another_row_cleaned_inside_a_rehearsal_validates_as_the_actor_alone(
-    validation_rows, monkeypatch
-):
-    """A consumer save() that cleans a second row inside check_save()'s
-    rehearsal never elevates there (the audit row could not survive): the
-    second row is validated as the actor, and a hidden duplicate of it does
-    not surface through the first row's check."""
-    native_save = GuardedConstraintRow.save
-
-    def saving_another(instance, *args, **kwargs):
-        other = GuardedConstraintRow(owner=validation_rows.alice, code="taken")
-        other.full_clean()
-        return native_save(instance, *args, **kwargs)
-
-    monkeypatch.setattr(GuardedConstraintRow, "save", saving_another)
-    PermissionAuditEvent.objects.all().delete()
-    row = GuardedConstraintRow(owner=validation_rows.alice, code="fresh-check")
-    with actor_context(validation_rows.alice):
-        assert row.check_save().allowed
-    assert not PermissionAuditEvent.objects.exists()

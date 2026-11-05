@@ -83,7 +83,7 @@ def test_unpickled_system_context_queryset_has_no_bypass(posts):
 
 
 def test_actor_queryset_does_not_cross_pickle_with_its_actor(alice, posts):
-    queryset = Post.objects.as_user(alice)
+    queryset = Post.objects.with_actor(alice)
     try:
         blob = pickle.dumps(queryset)
     except TypeError:

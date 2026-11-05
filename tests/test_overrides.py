@@ -22,6 +22,7 @@ from rebac import (
     SubjectRef,
     evaluator_scope,
 )
+from rebac.compile import read
 from rebac.composition import compose
 from rebac.errors import SchemaError
 from rebac.models import (
@@ -44,6 +45,8 @@ from rebac.schema.ast import (
     Schema,
 )
 from rebac.schema.parser import parse_permission_expression
+
+pytestmark = pytest.mark.pg_delta
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -101,9 +104,7 @@ def _seed_db_schema(resource_type: str, perm_name: str, expr_text: str) -> Schem
 
 @pytest.mark.django_db(transaction=True)
 @pytest.mark.parametrize("warm_cache", [False, True])
-@pytest.mark.parametrize(
-    "surface", ["check", "accessible", "lookup", "grants_all", "evaluator", "evaluator_accessible"]
-)
+@pytest.mark.parametrize("surface", ["check", "accessible", "lookup", "grants_all", "evaluator"])
 def test_expired_override_cannot_grant_access(monkeypatch, warm_cache, surface):
     from django.utils import timezone
 
@@ -139,21 +140,49 @@ def test_expired_override_cannot_grant_access(monkeypatch, warm_cache, surface):
             )
         if surface == "evaluator":
             return evaluator.check(local, subject=viewer, action="read", resource=post).allowed
-        if surface == "evaluator_accessible":
-            return bool(
-                evaluator.accessible(
-                    local, subject=viewer, action="read", resource_type="blog/post"
-                )
-            )
         if surface == "grants_all":
             return local.grants_all(subject=viewer, action="read", resource_type="blog/post")
         return local.check_access(subject=viewer, action="read", resource=post).allowed
 
     with evaluator_scope(evaluator):
+        policy_before = read._policy(local, "default").key
         if warm_cache:
             assert granted()
         clock["now"] = deadline
+        assert read._policy(local, "default").key != policy_before
         assert not granted()
+
+
+@pytest.mark.django_db(transaction=True)
+@pytest.mark.parametrize("decide", [False, True])
+def test_override_deadline_rekeys_compiled_scope(monkeypatch, decide):
+    from django.utils import timezone
+
+    from tests.testapp.models import Post
+
+    now = timezone.now()
+    deadline = now + timedelta(minutes=1)
+    clock = {"now": now}
+    monkeypatch.setattr(timezone, "now", lambda: clock["now"])
+    permission = _seed_db_schema("blog/post", "read", "owner")
+    SchemaDefinition.objects.create(resource_type="auth/user")
+    SchemaOverride.objects.create(
+        kind=SchemaOverride.KIND_LOOSEN,
+        target_ct=ContentType.objects.get_for_model(SchemaPermission),
+        target_pk=permission.pk,
+        expression="viewer",
+        reason="deadline cache probe",
+        expires_at=deadline,
+    )
+    backend = LocalBackend()
+    backend.mark_schema_stale()
+    actor = SubjectRef.of("auth/user", "alice")
+    read.reset()
+    for expected in (1, 2):
+        operation = read._Operation.begin(backend, actor, "default")
+        read._scope_statement(operation, Post, ("blog/post", "read"), decide=decide)
+        assert read.statement_cache_stats()["misses"] == expected
+        clock["now"] = deadline
 
 
 @pytest.mark.django_db(transaction=True)

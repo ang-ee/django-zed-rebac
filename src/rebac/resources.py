@@ -3,7 +3,9 @@
 from __future__ import annotations
 
 import builtins
-from collections.abc import Callable
+from collections.abc import Callable, Iterator, Mapping
+from dataclasses import dataclass
+from types import MappingProxyType
 from typing import Any
 
 from ._id import resource_id_attr, subject_id_attr, type_with_prefix
@@ -47,14 +49,50 @@ def model_resource_type(model_or_instance: Any) -> str | None:
     return type_with_prefix(str(rebac_type))
 
 
-def model_for_resource_type(resource_type: str) -> Any | None:
-    """Return the Django model declaring ``resource_type``, if one exists."""
+def _model_types(prefix: str) -> Iterator[tuple[str, Any]]:
+    """Declared wire types in Django's native model order and default exclusions."""
     from django.apps import apps
 
     for model in apps.get_models():
-        if model_resource_type(model) == resource_type:
+        declaration = getattr(model._meta, "rebac_resource_type", None)
+        if declaration:
+            yield f"{prefix}{declaration}", model
+
+
+def model_for_resource_type(resource_type: str) -> Any | None:
+    """Return the Django model declaring ``resource_type``, if one exists."""
+    for wire_type, model in _model_types(str(app_settings.REBAC_TYPE_PREFIX or "")):
+        if wire_type == resource_type:
             return model
     return None
+
+
+@dataclass(frozen=True)
+class _ModelIndex:
+    """One lowering operation's ordered, first-wins declaration snapshot."""
+
+    models: Mapping[str, Any]
+    user_type: str
+    group_type: str
+
+    @classmethod
+    def capture(cls) -> _ModelIndex:
+        prefix = str(app_settings.REBAC_TYPE_PREFIX or "")
+        models: dict[str, Any] = {}
+        for wire_type, model in _model_types(prefix):
+            models.setdefault(wire_type, model)
+        user_type = f"{prefix}{app_settings.REBAC_USER_TYPE}"
+        group_type = f"{prefix}{app_settings.REBAC_GROUP_TYPE}"
+        return cls(MappingProxyType(models), user_type, group_type)
+
+    def resource(self, resource_type: str) -> Any | None:
+        return self.models.get(resource_type)
+
+    def subject(self, subject_type: str) -> tuple[Any, str] | None:
+        return _subject_model(subject_type, self.resource, self._subject_fallback)
+
+    def _subject_fallback(self, subject_type: str) -> tuple[Any, str] | None:
+        return _subject_fallback(subject_type, self.user_type, self.group_type)
 
 
 def stores_rows(model: Any) -> bool:
@@ -78,15 +116,33 @@ def model_for_subject_type(subject_type: str) -> tuple[Any, str] | None:
     map onto Django's user model and contrib ``Group`` with the actor-side id
     attribute. ``None`` when nothing maps.
     """
-    model = model_for_resource_type(subject_type)
-    if model is not None:
-        return model, resource_id_attr(model)
-    if subject_type == type_with_prefix(app_settings.REBAC_USER_TYPE):
+    return _subject_model(subject_type, model_for_resource_type, _live_subject_fallback)
+
+
+def _subject_model(
+    subject_type: str,
+    resource: Callable[[str], Any | None],
+    fallback: Callable[[str], tuple[Any, str] | None],
+) -> tuple[Any, str] | None:
+    model = resource(subject_type)
+    return (model, resource_id_attr(model)) if model is not None else fallback(subject_type)
+
+
+def _live_subject_fallback(subject_type: str) -> tuple[Any, str] | None:
+    return _subject_fallback(
+        subject_type,
+        type_with_prefix(app_settings.REBAC_USER_TYPE),
+        type_with_prefix(app_settings.REBAC_GROUP_TYPE),
+    )
+
+
+def _subject_fallback(subject_type: str, user_type: str, group_type: str) -> tuple[Any, str] | None:
+    if subject_type == user_type:
         from django.contrib.auth import get_user_model
 
         user_model = get_user_model()
         return user_model, subject_id_attr(user_model)
-    if subject_type == type_with_prefix(app_settings.REBAC_GROUP_TYPE):
+    if subject_type == group_type:
         from django.contrib.auth.models import Group
 
         return Group, subject_id_attr(Group)

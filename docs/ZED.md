@@ -966,9 +966,9 @@ When the agent invokes a tool, the request passes `now` and `model_kind` as runt
 
 #### Querying as an agent
 
-`with_actor(actor)` is the generic verb; `as_agent(agent, on_behalf_of=user)`
+`with_actor(actor)` is the generic verb; `with_actor(grant_subject_ref(agent, user))`
 constructs the conventional `agents/grant:<id>#valid` subject. In schemas using
-that shorthand, `valid` must be a declared relation. The application must
+that subject, `valid` must be a declared relation. The application must
 authorize this subject shape explicitly; constructing it neither impersonates
 the requester nor copies the requester's grants. The user-subject examples
 above illustrate permission arrows, not an automatic mapping from this grant
@@ -979,13 +979,12 @@ Migrate stored grant objects and relationship tuples together before using it.
 
 ```python
 # Common case: HTTP request from a Django user
-Post.objects.as_user(request.user)
+Post.objects.with_actor(request.user)
 # expands to: Post.objects.with_actor(to_subject_ref(request.user))
 #                       → SubjectRef(auth/user:<id>)
 
 # Agent acting on behalf of a user (canonical Grant pattern)
-Post.objects.as_agent(agent, on_behalf_of=request.user)
-# expands to: Post.objects.with_actor(grant_subject_ref(agent, request.user))
+Post.objects.with_actor(grant_subject_ref(agent, request.user))
 #                       → SubjectRef(agents/grant:<grant_id>#valid)
 
 # Or pass any SubjectRef directly:

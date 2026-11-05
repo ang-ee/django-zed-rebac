@@ -6,21 +6,25 @@ Related managers, raw relationship deletes, bulk updates reading gated columns,
 
 from __future__ import annotations
 
+import pickle
 from datetime import timedelta
+from itertools import pairwise
 
 import pytest
 from django.contrib.auth import get_user_model
-from django.db import connection, transaction
-from django.db.models import F, OuterRef, Subquery
+from django.db import connection, models, transaction
+from django.db.models import F, OuterRef, Prefetch, Subquery
 from django.db.models.expressions import RawSQL
+from django.db.models.signals import m2m_changed, post_save
 from django.test import override_settings
-from django.test.utils import CaptureQueriesContext
+from django.test.utils import CaptureQueriesContext, isolate_apps
 from django.utils import timezone
 
 from rebac import (
     MissingActorError,
     ObjectRef,
     PermissionDenied,
+    PermissionDepthExceeded,
     RelationshipTuple,
     SubjectRef,
     actor_context,
@@ -32,6 +36,7 @@ from rebac.backends import reset_backend
 from rebac.models import PermissionAuditEvent, Relationship, RelationshipRegistry
 from rebac.models.resource import RebacResource
 from rebac.schema import parse_zed
+from rebac.signals import BackedEdgeDenied
 from tests.backend_setup import install_schema
 from tests.testapp.models import (
     BackingEntry,
@@ -40,7 +45,9 @@ from tests.testapp.models import (
     Folder,
     LinkedPost,
     NativeParentLinkedChild,
+    PinnedPost,
     Post,
+    PostPin,
     SluggedPost,
 )
 
@@ -153,6 +160,53 @@ def test_reverse_backed_m2m_requires_write_on_folder(direction):
     )
 
 
+@pytest.mark.parametrize("operation", ["add", "remove", "clear"])
+@pytest.mark.django_db(transaction=True)
+def test_reverse_m2m_from_mti_target_checks_post_write(operation):
+    install_schema(backend(), parse_zed(REVERSE_M2M_SCHEMA))
+    with isolate_apps("tests.testapp"):
+
+        class ChildFolder(Folder):
+            extra = models.CharField(max_length=10, default="")
+
+            class Meta:
+                app_label = "testapp"
+                rebac_resource_type = "blog/folder"
+
+        with connection.schema_editor() as editor:
+            editor.create_model(ChildFolder)
+        try:
+            with sudo(reason="test.fixture"):
+                child = ChildFolder.objects.create(name="editor's child")
+                post = Post.objects.create(title="reader's post")
+                if operation != "add":
+                    child.collected_posts.add(post)
+            _grant("blog/folder", child.pk, "owner", EDITOR)
+            _grant("blog/post", post.pk, "owner", READER)
+            raw = ChildFolder._base_manager.get(pk=child.pk)
+
+            with (
+                actor_context(EDITOR),
+                pytest.raises(PermissionDenied) as denied,
+                transaction.atomic(),
+            ):
+                if operation == "add":
+                    raw.collected_posts.add(post)
+                elif operation == "remove":
+                    raw.collected_posts.remove(post)
+                else:
+                    raw.collected_posts.clear()
+            assert "blog/post" in str(denied.value)
+            assert Post.collections.through.objects.filter(
+                post_id=post.pk, folder_id=child.pk
+            ).exists() is (operation != "add")
+        finally:
+            with sudo(reason="test.cleanup"):
+                Post.collections.through.objects.filter(folder_id=child.pk).delete()
+            with connection.schema_editor() as editor:
+                editor.delete_model(ChildFolder)
+
+
 def test_reverse_backed_fk_save_requires_write_on_folder():
     install_schema(backend(), parse_zed(REVERSE_FK_SCHEMA))
     with sudo(reason="test.fixture"):
@@ -178,14 +232,14 @@ def test_instance_sudo_does_not_bypass_m2m_backing_gate():
     _grant("blog/post", post.pk, "owner", EDITOR)
     _grant("blog/folder", folder.pk, "owner", READER)
     post = Post.objects.with_actor(EDITOR).get(pk=post.pk)
-    with pytest.raises(PermissionDenied):
+    with pytest.raises(PermissionDenied), transaction.atomic():
         post.sudo(reason="instance only").collections.add(folder)
     assert not Post.collections.through.objects.exists()
 
 
 @override_settings(REBAC_AUDIT_DENIALS=True)
-@pytest.mark.parametrize("operation", ["update", "m2m", "instance_save"])
-def test_backed_edge_denial_audits_declaring_resource_after_rollback(operation):
+@pytest.mark.parametrize("operation", ["update", "bulk_update", "m2m", "instance_save"])
+def test_backed_edge_denial_audit_follows_owner_transaction(operation):
     install_schema(
         backend(), parse_zed(REVERSE_M2M_SCHEMA if operation == "m2m" else REVERSE_FK_SCHEMA)
     )
@@ -200,7 +254,11 @@ def test_backed_edge_denial_audits_declaring_resource_after_rollback(operation):
         else:
             row = Post.objects.with_actor(EDITOR).get(pk=post.pk)
             if operation == "m2m":
-                row.collections.add(folder)
+                with transaction.atomic():
+                    row.collections.add(folder)
+            elif operation == "bulk_update":
+                row.folder = folder
+                Post.objects.with_actor(EDITOR).bulk_update([row], ["folder"])
             else:
                 row.folder = folder
                 row.save()
@@ -209,7 +267,59 @@ def test_backed_edge_denial_audits_declaring_resource_after_rollback(operation):
             "target_repr", flat=True
         )
     )
-    assert targets == [f"blog/folder:{folder.pk}#write"]
+    assert targets == ([] if operation == "m2m" else [f"blog/folder:{folder.pk}#write"])
+
+
+@override_settings(REBAC_AUDIT_DENIALS=True)
+def test_nested_save_denial_audits_inner_declaring_resource_after_outer_rollback():
+    install_schema(backend(), parse_zed(REVERSE_FK_SCHEMA))
+    with sudo(reason="test.fixture"):
+        outer = Post.objects.create(title="outer")
+        inner = Post.objects.create(title="inner")
+        folder = Folder.objects.create(name="victim")
+    for post in (outer, inner):
+        _grant("blog/post", post.pk, "owner", EDITOR)
+    _grant("blog/folder", folder.pk, "owner", READER)
+    outer = Post.objects.with_actor(EDITOR).get(pk=outer.pk)
+    inner = Post.objects.with_actor(EDITOR).get(pk=inner.pk)
+
+    def save_inner(sender, instance, **kwargs):
+        if instance.pk == outer.pk:
+            inner.folder = folder
+            inner.save()
+
+    post_save.connect(save_inner, sender=Post, weak=False, dispatch_uid="nested-denial-audit")
+    try:
+        outer.title = "changed"
+        with pytest.raises(PermissionDenied):
+            outer.save()
+    finally:
+        post_save.disconnect(sender=Post, dispatch_uid="nested-denial-audit")
+    assert Post._base_manager.get(pk=outer.pk).title == "outer"
+    assert list(
+        PermissionAuditEvent.objects.filter(reason__startswith="denied:").values_list(
+            "target_repr", flat=True
+        )
+    ) == [f"blog/folder:{folder.pk}#write"]
+
+
+def test_unwatched_tracked_related_writes_need_no_actor():
+    with sudo(reason="test.fixture"):
+        round_ = BackingRound.objects.create()
+    user = get_user_model().objects.create_user(username="unwatched related")
+    BackingEntry.objects.create(round=round_, responder=user)
+    assert round_.entries.update(retired_at=timezone.now()) == 1
+    created = round_.entries.bulk_create([BackingEntry(round=round_, responder=user)])
+    assert len(created) == 1
+    assert BackingEntry.objects.filter(round=round_).count() == 2
+
+
+def test_resource_bulk_create_checks_actor_and_create_before_conflict_update():
+    options = {"update_conflicts": True, "update_fields": ["title"], "unique_fields": ["id"]}
+    with pytest.raises(MissingActorError):
+        Post.objects.bulk_create([Post(title="new")], **options)
+    with actor_context(EDITOR), pytest.raises(PermissionDenied, match="cannot create"):
+        Post.objects.bulk_create([Post(title="new")], **options)
 
 
 @override_settings(REBAC_AUDIT_DENIALS=True)
@@ -343,9 +453,9 @@ def test_one_m2m_add_gates_changed_pair_not_whole_through_table(monkeypatch):
     checked = []
     original = signals._check_edge_writes
 
-    def spy(actor, resource_type, ids, *, bulk=False):
+    def spy(actor, resource_type, ids, *, using, bulk=False):
         checked.append((actor, resource_type, set(ids)))
-        return original(actor, resource_type, ids, bulk=bulk)
+        return original(actor, resource_type, ids, using=using, bulk=bulk)
 
     monkeypatch.setattr(signals, "_check_edge_writes", spy)
 
@@ -391,84 +501,125 @@ def test_reverse_clear_of_directed_self_m2m_checks_followers():
     _grant("blog/directedpost", source.pk, "owner", READER)
     _grant("blog/directedpost", target.pk, "owner", EDITOR)
     target = DirectedPost.objects.with_actor(EDITOR).get(pk=target.pk)
-    with pytest.raises(PermissionDenied):
+    with pytest.raises(PermissionDenied), transaction.atomic():
         target.followers.clear()
     assert DirectedPost.follows.through.objects.count() == 1
 
 
-@pytest.mark.parametrize("authorized", [False, True])
-def test_direct_through_bulk_create_checks_write_before_granting_read(authorized):
+def test_auto_through_bulk_create_is_unobserved_infrastructure_write():
     install_schema(backend(), parse_zed(REVERSE_M2M_SCHEMA))
     with sudo(reason="test.fixture"):
         post = Post.objects.create(title="owned")
         folder = Folder.objects.create(name="target")
-    observer = SubjectRef.of("auth/user", "observer")
     _grant("blog/post", post.pk, "owner", EDITOR)
-    _grant("blog/post", post.pk, "owner", observer)
-    _grant("blog/folder", folder.pk, "owner", EDITOR if authorized else READER)
-    resource = ObjectRef("blog/folder", str(folder.pk))
+    _grant("blog/folder", folder.pk, "owner", READER)
     through = Post.collections.through
+
     with actor_context(EDITOR):
-        if authorized:
-            through.objects.bulk_create([through(post_id=post.pk, folder_id=folder.pk)])
+        through.objects.bulk_create([through(post_id=post.pk, folder_id=folder.pk)])
+
+    assert through.objects.filter(post_id=post.pk, folder_id=folder.pk).exists()
+    assert backend().has_access(
+        subject=EDITOR,
+        action="read",
+        resource=ObjectRef("blog/folder", str(folder.pk)),
+    )
+
+
+@pytest.mark.parametrize("operation", ["update", "delete"])
+def test_auto_through_queryset_writes_are_unobserved(operation):
+    install_schema(backend(), parse_zed(REVERSE_M2M_SCHEMA))
+    with sudo(reason="test.fixture"):
+        post = Post.objects.create(title="owned")
+        first = Folder.objects.create(name="first")
+        second = Folder.objects.create(name="second")
+        post.collections.add(first)
+    _grant("blog/post", post.pk, "owner", EDITOR)
+    _grant("blog/folder", first.pk, "owner", READER)
+    _grant("blog/folder", second.pk, "owner", READER)
+    through = Post.collections.through
+
+    with actor_context(EDITOR):
+        rows = through.objects.filter(post_id=post.pk)
+        if operation == "update":
+            rows.update(folder_id=second.pk)
         else:
-            with pytest.raises(PermissionDenied):
-                through.objects.bulk_create([through(post_id=post.pk, folder_id=folder.pk)])
-    assert through.objects.exists() is authorized
-    # The post's owners read the folder only through the stored edge.
-    assert backend().has_access(subject=observer, action="read", resource=resource) is authorized
-    assert backend().has_access(subject=EDITOR, action="read", resource=resource) is authorized
+            rows.delete()
+
+    assert set(through.objects.filter(post_id=post.pk).values_list("folder_id", flat=True)) == (
+        {second.pk} if operation == "update" else set()
+    )
 
 
-def test_direct_through_bulk_gate_batches_changed_rows(monkeypatch):
+def test_m2m_set_gates_only_changed_memberships(monkeypatch):
     import rebac.signals as signals
 
     install_schema(backend(), parse_zed(REVERSE_M2M_SCHEMA))
-    checked = []
-    original = signals._check_edge_writes
+    with sudo(reason="test.fixture"):
+        post = Post.objects.create(title="owned")
+        unchanged = Folder.objects.create(name="unchanged")
+        removed = Folder.objects.create(name="removed")
+        added = Folder.objects.create(name="added")
+        post.collections.set([unchanged, removed])
+    _grant("blog/post", post.pk, "owner", EDITOR)
+    _grant("blog/folder", added.pk, "owner", EDITOR)
+    _grant("blog/folder", unchanged.pk, "owner", READER)
+    _grant("blog/folder", removed.pk, "owner", READER)
+    post = Post.objects.with_actor(EDITOR).get(pk=post.pk)
+    seen = []
+    original = signals._gate_m2m
 
-    def spy(actor, resource_type, ids, *, bulk=False):
-        checked.append((resource_type, set(ids)))
-        return original(actor, resource_type, ids, bulk=bulk)
+    def spy(sender, instance, reverse, model, pk_set, using):
+        seen.append(pk_set)
+        return original(sender, instance, reverse, model, pk_set, using)
 
-    monkeypatch.setattr(signals, "_check_edge_writes", spy)
+    monkeypatch.setattr(signals, "_gate_m2m", spy)
+
+    with actor_context(EDITOR), pytest.raises(PermissionDenied), transaction.atomic():
+        post.collections.set([unchanged, added])
+    assert seen == [{removed.pk}]
+    _grant("blog/folder", removed.pk, "owner", EDITOR)
+
+    with actor_context(EDITOR):
+        post.collections.set([unchanged, added])
+
     through = Post.collections.through
+    assert set(through.objects.filter(post_id=post.pk).values_list("folder_id", flat=True)) == {
+        unchanged.pk,
+        added.pk,
+    }
 
-    def link(count):
-        """One bulk create of ``count`` through rows into a new folder, by their owner."""
-        with sudo(reason="test.fixture"):
-            folder = Folder.objects.create(name="target")
-            posts = Post.objects.bulk_create([Post(title=f"owned {i}") for i in range(count)])
-        write_relationships(
-            [
-                RelationshipTuple(
-                    resource=ObjectRef("blog/folder", str(folder.pk)),
-                    relation="owner",
-                    subject=EDITOR,
-                ),
-                *[
-                    RelationshipTuple(
-                        resource=ObjectRef("blog/post", str(post.pk)),
-                        relation="owner",
-                        subject=EDITOR,
-                    )
-                    for post in posts
-                ],
-            ]
-        )
-        rows = [through(post_id=post.pk, folder_id=folder.pk) for post in posts]
-        checked.clear()
-        with actor_context(EDITOR), CaptureQueriesContext(connection) as queries:
-            through.objects.bulk_create(rows)
-        assert sorted(checked, key=lambda check: check[0]) == [
-            ("blog/folder", {str(folder.pk)}),
-            ("blog/post", {str(post.pk) for post in posts}),
-        ]
-        assert through.objects.filter(folder_id=folder.pk).count() == count
-        return len(queries)
 
-    # Both sizes are above the handful of ids that a gate checks one by one.
-    assert link(6) == link(30)
+def test_raw_m2m_signal_skips_fixture_gate():
+    install_schema(backend(), parse_zed(REVERSE_M2M_SCHEMA))
+    with sudo(reason="test.fixture"):
+        post = Post.objects.create(title="owned")
+        folder = Folder.objects.create(name="target")
+    signal = dict(
+        sender=Post.collections.through,
+        instance=post,
+        action="pre_add",
+        reverse=False,
+        model=Folder,
+        pk_set={folder.pk},
+        using="default",
+    )
+
+    m2m_changed.send(**signal, raw=True)
+    with pytest.raises(MissingActorError):
+        m2m_changed.send(**signal, raw=False)
+
+
+def test_raw_m2m_set_base_bumps_row_generation():
+    from rebac.watch import row_generation
+
+    install_schema(backend(), parse_zed(REVERSE_M2M_SCHEMA))
+    with sudo(reason="test.fixture"):
+        post = Post.objects.create(title="owned")
+        folder = Folder.objects.create(name="target")
+        before = row_generation()
+        post.collections.set_base([folder], raw=True)
+    assert row_generation() > before
 
 
 @pytest.mark.parametrize("operation", ["update", "bulk_update", "bulk_create"])
@@ -582,6 +733,51 @@ def test_backing_filter_column_change_requires_write_on_source(operation):
     assert BackingEntry._base_manager.get(pk=entry.pk).retired_at is not None
 
 
+@pytest.mark.parametrize("hint_source", ["prefetch", "db_manager"])
+def test_tracked_write_ignores_untrusted_router_instance_hint(hint_source):
+    install_schema(
+        backend(),
+        parse_zed("""
+        definition auth/user {}
+        definition test/backinground {
+            relation owner: auth/user
+            relation responders: auth/user // rebac:field={"path":"entries__responder","filters":{"entries__retired_at__isnull":true}}
+            permission read = owner
+            permission write = owner
+        }
+        """),
+    )
+    with sudo(reason="test.fixture"):
+        round_ = BackingRound.objects.create()
+        user = get_user_model().objects.create_user(username="hint responder")
+        entry = BackingEntry.objects.create(round=round_, responder=user, retired_at=timezone.now())
+    _grant("test/backinground", round_.pk, "owner", EDITOR)
+    owner = BackingRound.objects.with_actor(EDITOR).get(pk=round_.pk)
+    if hint_source == "prefetch":
+        caller_qs = BackingEntry.objects.filter(pk=entry.pk)
+        loaded = (
+            BackingRound.objects.with_actor(EDITOR)
+            .filter(pk=round_.pk)
+            .prefetch_related(Prefetch("entries", queryset=caller_qs))
+            .get()
+        )
+        assert caller_qs._hints.get("instance") is loaded
+    else:
+        caller_qs = BackingEntry.objects.db_manager(hints={"instance": owner}).filter(pk=entry.pk)
+    assert caller_qs._rebac_related_owner is None
+    with actor_context(READER), pytest.raises(PermissionDenied):
+        caller_qs.update(retired_at=None)
+    assert BackingEntry._base_manager.get(pk=entry.pk).retired_at is not None
+    # The real related manager still carries its pinned owner through clones.
+    related = owner.entries.filter(pk=entry.pk)
+    assert related._rebac_related_owner is owner
+    restored = pickle.loads(pickle.dumps(related))
+    assert restored._rebac_related_owner is None
+    with actor_context(READER), pytest.raises(PermissionDenied):
+        restored.update(retired_at=None)
+    assert related.update(retired_at=None) == 1
+
+
 def test_attribute_rekey_requires_write_on_old_and_new_containers():
     install_schema(
         backend(),
@@ -601,6 +797,104 @@ def test_attribute_rekey_requires_write_on_old_and_new_containers():
     with actor_context(EDITOR), pytest.raises(PermissionDenied):
         user.save(update_fields=["username"])
     assert get_user_model().objects.get(pk=user.pk).username == "alice"
+
+
+@pytest.mark.parametrize("grant", ["tuple", "authenticated"])
+def test_attribute_rekey_accepts_an_absent_canonical_container(grant):
+    write = "editor" if grant == "tuple" else "authenticated"
+    install_schema(
+        backend(),
+        parse_zed(f"""
+        definition auth/user {{}}
+        definition blog/folder {{
+            permission read = authenticated
+            permission write = authenticated
+        }}
+        definition blog/sluggedpost {{
+            relation editor: auth/user
+            relation member: blog/folder // rebac:attribute={{"field":"name"}}
+            permission write = {write}
+        }}
+        """),
+    )
+    with sudo(reason="test.fixture"):
+        folder = Folder.objects.create(name="previous")
+    if grant == "tuple":
+        for container in ("previous", "absent"):
+            _grant("blog/sluggedpost", container, "editor", EDITOR)
+    folder = Folder.objects.with_actor(EDITOR).get(pk=folder.pk)
+    folder.name = "absent"
+    folder.save(update_fields=["name"])
+    assert Folder._base_manager.get(pk=folder.pk).name == "absent"
+    assert not SluggedPost._base_manager.filter(slug="absent").exists()
+
+
+def test_explicit_pk_create_checks_self_keyed_attribute_before_row_exists():
+    install_schema(
+        backend(),
+        parse_zed("""
+        definition auth/user {}
+        definition blog/folder {
+            relation member: blog/folder // rebac:attribute={"field":"id"}
+            permission create = authenticated
+            permission read = authenticated
+            permission write = authenticated
+        }
+        """),
+    )
+    with actor_context(EDITOR):
+        folder = Folder.objects.create(pk=4321, name="explicit")
+    assert Folder._base_manager.get(pk=folder.pk).name == "explicit"
+
+
+@override_settings(REBAC_AUDIT_DENIALS=True, REBAC_DEPTH_LIMIT=2)
+def test_depth_uncertain_absent_container_is_an_audited_edge_denial():
+    install_schema(
+        backend(),
+        parse_zed("""
+        definition auth/user {}
+        definition blog/folder {
+            permission read = authenticated
+            permission write = authenticated
+        }
+        definition blog/sluggedpost {
+            relation editor: auth/user
+            relation parent: blog/sluggedpost
+            relation member: blog/folder // rebac:attribute={"field":"name"}
+            permission write = editor + parent->write
+        }
+        """),
+    )
+    with sudo(reason="test.fixture"):
+        folder = Folder.objects.create(name="previous")
+    _grant("blog/sluggedpost", "previous", "editor", EDITOR)
+    names = ("absent", "next", "far", "further", "granted")
+    backend().write_relationships(
+        [
+            RelationshipTuple(
+                ObjectRef("blog/sluggedpost", child),
+                "parent",
+                SubjectRef.of("blog/sluggedpost", parent),
+            )
+            for child, parent in pairwise(names)
+        ]
+    )
+    _grant("blog/sluggedpost", "granted", "editor", EDITOR)
+    with pytest.raises(PermissionDepthExceeded):
+        backend().check_access(
+            subject=EDITOR,
+            action="write",
+            resource=ObjectRef("blog/sluggedpost", "absent"),
+        )
+    folder.name = "absent"
+    with actor_context(EDITOR), pytest.raises(PermissionDenied):
+        folder.save(update_fields=["name"])
+    assert Folder._base_manager.get(pk=folder.pk).name == "previous"
+    assert list(
+        PermissionAuditEvent.objects.filter(reason__startswith="denied:").values_list(
+            "target_repr", flat=True
+        )
+    ) == ["blog/sluggedpost:absent#write"]
 
 
 def test_nested_m2m_backing_requires_write_on_source_folder():
@@ -662,6 +956,302 @@ def test_symmetrical_m2m_checks_mirror_resource():
     with pytest.raises(PermissionDenied), transaction.atomic():
         first.peers.add(second)
     assert not LinkedPost.peers.through.objects.exists()
+
+
+def test_symmetrical_m2m_half_pair_checks_unannounced_mirror():
+    install_schema(
+        backend(),
+        parse_zed("""
+        definition auth/user {}
+        definition blog/linkedpost {
+            relation owner: auth/user
+            relation peers: blog/linkedpost // rebac:field=peers
+            permission read = owner + peers->read
+            permission write = owner
+        }
+        """),
+    )
+    with sudo(reason="test.fixture"):
+        first = LinkedPost.objects.create(title="first")
+        second = LinkedPost.objects.create(title="second")
+    _grant("blog/linkedpost", first.pk, "owner", EDITOR)
+    _grant("blog/linkedpost", second.pk, "owner", READER)
+    through = LinkedPost.peers.through
+    through.objects.bulk_create([through(from_linkedpost_id=first.pk, to_linkedpost_id=second.pk)])
+    first = LinkedPost.objects.with_actor(EDITOR).get(pk=first.pk)
+    from rebac.signals import _missing_mirror_ids
+
+    with CaptureQueriesContext(connection) as captured:
+        assert _missing_mirror_ids(through, first, "default") == {second.pk}
+    assert len(captured) == 1
+
+    with pytest.raises(PermissionDenied), transaction.atomic():
+        first.peers.add(second)
+
+    assert through.objects.filter(from_linkedpost_id=first.pk, to_linkedpost_id=second.pk).exists()
+    assert not through.objects.filter(
+        from_linkedpost_id=second.pk, to_linkedpost_id=first.pk
+    ).exists()
+
+
+DECLARED_THROUGH_SCHEMA = """
+definition auth/user {}
+definition blog/pinnedpost {
+    relation owner: auth/user
+    permission read = owner
+    permission write = owner
+    permission delete = owner
+}
+definition blog/folder {
+    relation owner: auth/user
+    relation pins: blog/pinnedpost // rebac:field=pinned_posts
+    permission read = owner + pins->read
+    permission write = owner
+    permission delete = owner
+}
+"""
+
+
+def test_declared_tracked_through_has_no_m2m_receiver():
+    assert not m2m_changed.has_listeners(PostPin)
+
+
+def test_unwatched_declared_through_bulk_create_checks_owner_write():
+    install_schema(
+        backend(),
+        parse_zed("""
+        definition auth/user {}
+        definition blog/pinnedpost {
+            relation owner: auth/user
+            permission read = owner
+            permission write = owner
+        }
+        definition blog/folder {
+            relation owner: auth/user
+            permission read = owner
+            permission write = owner
+        }
+        """),
+    )
+    with sudo(reason="test.fixture"):
+        post = PinnedPost.objects.create(title="another owner's post")
+        folder = Folder.objects.create(name="editor's folder")
+    _grant("blog/folder", folder.pk, "owner", EDITOR)
+
+    with actor_context(EDITOR), pytest.raises(BackedEdgeDenied):
+        PostPin.objects.bulk_create([PostPin(post=post, folder=folder)])
+
+    assert not PostPin.objects.exists()
+
+
+@pytest.mark.parametrize(
+    "operation",
+    ["bulk_create", "update", "delete", "instance_delete", "create", "save", "add", "remove"],
+)
+def test_declared_tracked_through_checks_folder_write(operation):
+    install_schema(backend(), parse_zed(DECLARED_THROUGH_SCHEMA))
+    with sudo(reason="test.fixture"):
+        post = PinnedPost.objects.create(title="owned")
+        allowed = Folder.objects.create(name="allowed")
+        denied = Folder.objects.create(name="denied")
+        if operation in {"update", "delete", "instance_delete", "remove"}:
+            PostPin.objects.create(post=post, folder=allowed if operation == "update" else denied)
+    _grant("blog/pinnedpost", post.pk, "owner", EDITOR)
+    _grant("blog/folder", allowed.pk, "owner", EDITOR)
+    _grant("blog/folder", denied.pk, "owner", READER)
+    before = list(PostPin.objects.values_list("post_id", "folder_id"))
+
+    with actor_context(EDITOR), pytest.raises(PermissionDenied), transaction.atomic():
+        if operation == "bulk_create":
+            PostPin.objects.bulk_create([PostPin(post=post, folder=denied)])
+        elif operation == "update":
+            PostPin.objects.filter(post=post).update(folder=denied)
+        elif operation == "delete":
+            PostPin.objects.filter(post=post).delete()
+        elif operation == "instance_delete":
+            PostPin.objects.get(post=post).delete()
+        elif operation == "create":
+            PostPin.objects.create(post=post, folder=denied)
+        elif operation == "save":
+            PostPin(post=post, folder=denied).save()
+        elif operation == "add":
+            post.folders.add(denied)
+        else:
+            post.folders.remove(denied)
+
+    assert list(PostPin.objects.values_list("post_id", "folder_id")) == before
+    with actor_context(EDITOR):
+        post.folders.add(allowed)
+    assert PostPin.objects.filter(post=post, folder=allowed).exists()
+
+
+@pytest.mark.parametrize(
+    "operation",
+    ["bulk_create", "update", "delete", "instance_delete", "create", "save", "add", "remove"],
+)
+def test_declared_tracked_through_allows_folder_write(operation):
+    install_schema(backend(), parse_zed(DECLARED_THROUGH_SCHEMA))
+    with sudo(reason="test.fixture"):
+        post = PinnedPost.objects.create(title="owned")
+        first = Folder.objects.create(name="first")
+        second = Folder.objects.create(name="second")
+        if operation in {"update", "delete", "instance_delete", "remove"}:
+            PostPin.objects.create(post=post, folder=first)
+    _grant("blog/pinnedpost", post.pk, "owner", EDITOR)
+    for folder in (first, second):
+        _grant("blog/folder", folder.pk, "owner", EDITOR)
+
+    with actor_context(EDITOR):
+        if operation == "bulk_create":
+            PostPin.objects.bulk_create([PostPin(post=post, folder=second)])
+        elif operation == "update":
+            PostPin.objects.filter(post=post).update(folder=second)
+        elif operation == "delete":
+            PostPin.objects.filter(post=post).delete()
+        elif operation == "instance_delete":
+            PostPin.objects.get(post=post).delete()
+        elif operation == "create":
+            PostPin.objects.create(post=post, folder=second)
+        elif operation == "save":
+            PostPin(post=post, folder=second).save()
+        elif operation == "add":
+            post.folders.add(second)
+        else:
+            post.folders.remove(first)
+
+    expected = [] if operation in {"delete", "instance_delete", "remove"} else [second.pk]
+    assert list(PostPin.objects.filter(post=post).values_list("folder_id", flat=True)) == expected
+
+
+@pytest.mark.parametrize("operation", ["add", "remove"])
+def test_declared_through_related_manager_needs_ambient_actor(operation):
+    install_schema(backend(), parse_zed(DECLARED_THROUGH_SCHEMA))
+    with sudo(reason="test.fixture"):
+        post = PinnedPost.objects.create(title="owned")
+        folder = Folder.objects.create(name="allowed")
+        if operation == "remove":
+            PostPin.objects.create(post=post, folder=folder)
+    _grant("blog/pinnedpost", post.pk, "owner", EDITOR)
+    _grant("blog/folder", folder.pk, "owner", EDITOR)
+    pinned = PinnedPost.objects.with_actor(EDITOR).get(pk=post.pk)
+
+    with pytest.raises(MissingActorError), transaction.atomic():
+        if operation == "add":
+            pinned.folders.add(folder)
+        else:
+            pinned.folders.remove(folder)
+    assert PostPin.objects.filter(post=post, folder=folder).exists() is (operation == "remove")
+
+
+def test_declared_through_related_manager_uses_ambient_actor_for_through_write():
+    install_schema(backend(), parse_zed(DECLARED_THROUGH_SCHEMA))
+    with sudo(reason="test.fixture"):
+        post = PinnedPost.objects.create(title="owned")
+        folder = Folder.objects.create(name="allowed")
+    _grant("blog/pinnedpost", post.pk, "owner", EDITOR)
+    _grant("blog/folder", folder.pk, "owner", EDITOR)
+    pinned = PinnedPost.objects.with_actor(EDITOR).get(pk=post.pk)
+
+    with actor_context(READER), pytest.raises(PermissionDenied), transaction.atomic():
+        pinned.folders.add(folder)
+    with actor_context(EDITOR):
+        pinned.folders.add(folder)
+        pinned.folders.remove(folder)
+    assert not PostPin.objects.filter(post=post, folder=folder).exists()
+
+
+def test_declared_through_clear_uses_declared_column_with_extra_fk():
+    install_schema(backend(), parse_zed(DECLARED_THROUGH_SCHEMA))
+    with sudo(reason="test.fixture"):
+        post = PinnedPost.objects.create(title="owned")
+        referrer = PinnedPost.objects.create(title="referrer")
+        folder = Folder.objects.create(name="denied")
+        PostPin.objects.create(post=post, referrer=referrer, folder=folder)
+    _grant("blog/pinnedpost", post.pk, "owner", EDITOR)
+    _grant("blog/folder", folder.pk, "owner", READER)
+
+    with actor_context(EDITOR), pytest.raises(PermissionDenied), transaction.atomic():
+        post.folders.clear()
+    assert PostPin.objects.filter(post=post, folder=folder).exists()
+
+
+@pytest.mark.parametrize("operation", ["create", "add"])
+def test_declared_through_requires_write_on_post_owner(operation):
+    install_schema(backend(), parse_zed(DECLARED_THROUGH_SCHEMA))
+    with sudo(reason="test.fixture"):
+        post = PinnedPost.objects.create(title="editor's post")
+        folder = Folder.objects.create(name="reader's folder")
+    _grant("blog/pinnedpost", post.pk, "owner", EDITOR)
+    _grant("blog/folder", folder.pk, "owner", READER)
+    _grant("blog/folder", folder.pk, "owner", EDITOR)
+
+    with actor_context(READER), pytest.raises(PermissionDenied), transaction.atomic():
+        if operation == "create":
+            PostPin.objects.create(post=post, folder=folder)
+        else:
+            post.folders.add(folder)
+    assert not PostPin.objects.filter(post=post, folder=folder).exists()
+
+    pinned = PinnedPost.objects.with_actor(EDITOR).get(pk=post.pk)
+    with actor_context(EDITOR):
+        pinned.folders.add(folder)
+    pinned.delete()
+    assert not PostPin.objects.filter(post_id=post.pk).exists()
+
+
+def test_declared_through_batch_delete_does_not_regate_each_row():
+    install_schema(backend(), parse_zed(DECLARED_THROUGH_SCHEMA))
+    with sudo(reason="test.fixture"):
+        post = PinnedPost.objects.create(title="owned")
+        folder = Folder.objects.create(name="allowed")
+        PostPin.objects.bulk_create(
+            [PostPin(post=post, folder=folder, note=str(i)) for i in range(50)]
+        )
+    _grant("blog/pinnedpost", post.pk, "owner", EDITOR)
+    _grant("blog/folder", folder.pk, "owner", EDITOR)
+
+    with actor_context(EDITOR), CaptureQueriesContext(connection) as captured:
+        PostPin.objects.filter(post=post).delete()
+    assert len(captured) < 40
+
+
+def test_declared_through_folder_cascade_needs_post_write_under_root_pin():
+    install_schema(backend(), parse_zed(DECLARED_THROUGH_SCHEMA))
+    with sudo(reason="test.fixture"):
+        post = PinnedPost.objects.create(title="someone else's post")
+        folder = Folder.objects.create(name="owned")
+        PostPin.objects.create(post=post, folder=folder)
+    _grant("blog/pinnedpost", post.pk, "owner", READER)
+    _grant("blog/folder", folder.pk, "owner", EDITOR)
+    pinned = Folder.objects.with_actor(EDITOR).get(pk=folder.pk)
+
+    with pytest.raises(PermissionDenied), transaction.atomic():
+        pinned.delete()
+    assert PostPin.objects.filter(folder_id=folder.pk).exists()
+
+    _grant("blog/pinnedpost", post.pk, "owner", EDITOR)
+    pinned.delete()
+    assert not PostPin.objects.filter(folder_id=folder.pk).exists()
+
+
+@pytest.mark.parametrize("folder_actor, denied", [(EDITOR, False), (READER, True)])
+def test_declared_through_post_cascade_uses_root_pin(folder_actor, denied):
+    install_schema(backend(), parse_zed(DECLARED_THROUGH_SCHEMA))
+    with sudo(reason="test.fixture"):
+        post = PinnedPost.objects.create(title="owned")
+        folder = Folder.objects.create(name="folder")
+        PostPin.objects.create(post=post, folder=folder)
+    _grant("blog/pinnedpost", post.pk, "owner", EDITOR)
+    _grant("blog/folder", folder.pk, "owner", folder_actor)
+    pinned = PinnedPost.objects.with_actor(EDITOR).get(pk=post.pk)
+
+    if denied:
+        with pytest.raises(PermissionDenied), transaction.atomic():
+            pinned.delete()
+        assert PostPin.objects.filter(post_id=post.pk).exists()
+    else:
+        pinned.delete()
+        assert not PostPin.objects.filter(post_id=post.pk).exists()
 
 
 @pytest.fixture
@@ -817,6 +1407,59 @@ def test_m2m_set_accepts_objs_keyword_under_actor(world):
     with actor_context(EDITOR), transaction.atomic():
         posts[0].collections.set(objs=[folders[1]])
     assert _stored_collections(world) == {folders[1].pk}
+
+
+@override_settings(REBAC_STRICT_MODE=True)
+def test_m2m_set_uses_pinned_instance_actor_without_ambient(world):
+    alice = get_user_model().objects.create_user(username="m2m_alice")
+    alice_ref = SubjectRef.of("auth/user", str(alice.pk))
+    for folder in world[0]:
+        _grant("blog/folder", folder.pk, "owner", alice_ref)
+    _grant("blog/post", world[1][0].pk, "owner", alice_ref)
+    post = Post.objects.with_actor(alice).get(pk=world[1][0].pk)
+    target = Folder.objects.with_actor(alice).get(pk=world[0][1].pk)
+    assert list(post.collections.using("default").values_list("pk", flat=True)) == [world[0][0].pk]
+
+    with transaction.atomic():
+        post.collections.set([target])
+
+    assert _stored_collections(world) == {target.pk}
+
+
+@override_settings(REBAC_STRICT_MODE=True)
+def test_m2m_set_uses_pinned_instance_actor_over_ambient(world):
+    alice = get_user_model().objects.create_user(username="m2m_alice")
+    bob = get_user_model().objects.create_user(username="m2m_bob")
+    alice_ref = SubjectRef.of("auth/user", str(alice.pk))
+    bob_ref = SubjectRef.of("auth/user", str(bob.pk))
+    for folder in world[0]:
+        _grant("blog/folder", folder.pk, "owner", alice_ref)
+    _grant("blog/post", world[1][0].pk, "owner", alice_ref)
+    _grant("blog/folder", world[0][1].pk, "viewer", bob_ref)
+    post = Post.objects.with_actor(alice).get(pk=world[1][0].pk)
+    target = Folder.objects.with_actor(alice).get(pk=world[0][1].pk)
+
+    with actor_context(bob_ref), transaction.atomic():
+        assert list(post.collections.using("default").values_list("pk", flat=True)) == [
+            world[0][0].pk
+        ]
+        post.collections.set([target])
+
+    assert _stored_collections(world) == {target.pk}
+
+
+@override_settings(REBAC_STRICT_MODE=False)
+def test_backed_m2m_write_without_actor_uses_non_strict_bypass():
+    install_schema(backend(), parse_zed(REVERSE_M2M_SCHEMA))
+    with sudo(reason="test.fixture"):
+        post = Post.objects.create(title="source")
+        folder = Folder.objects.create(name="target")
+
+    post.collections.add(folder)
+
+    assert list(Post.collections.through.objects.values_list("post_id", "folder_id")) == [
+        (post.pk, folder.pk)
+    ]
 
 
 # ---------- relationship rows ----------

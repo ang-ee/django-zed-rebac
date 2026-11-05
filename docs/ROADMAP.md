@@ -9,8 +9,8 @@ strict-by-default scoping, audited bypass, and three test tiers. What is not
 fixed is the layer that connects the engine to Django. That layer attaches to
 each model
 (`RebacMixin`, `RebacTrackedMixin`) and then chases every other way Django
-touches a row: patched related managers, a replaced through-model manager,
-signals on third-party models, collector hooks, twelve `ContextVar`s. Four
+touches a row: explicit-sender M2M and tracked-model signals, collector hooks,
+and context carriers. Four
 fix rounds in 0.24.0 each closed some write paths and opened others, because
 the gate re-implements Django's query semantics in Python and the engine
 never sees the statement Django is about to run. The remaining holes are
@@ -39,9 +39,8 @@ so the storage and identity changes ride with it.
    from the statement's `Query`: frozen rows as a subquery, written values
    evaluated by the database, the backed-edge rule of invariant 5d applied
    once (proposal 0011's rule).
-   Delete the related-manager patches, the through-manager swap, the
-   `_base_manager` injection, the tracked signals, `RebacTrackedMixin`,
-   `REBAC_TRACKED_MODELS` and the write overrides on `RebacMixin` and
+   Delete the `_base_manager` injection, tracked signals no longer needed by
+   compiler-owned writes, `REBAC_TRACKED_MODELS`, and the write overrides on `RebacMixin` and
    `RebacQuerySet`. Each pinned test in
    `test_security_proposal_0011.py` and `_0013.py` turns green as its path
    moves; that is the progress meter. Nothing is maintained after a write, so
@@ -86,7 +85,8 @@ and stay refused under scope.
 
 Set `DATABASES[...]["ENGINE"]` to the REBAC wrapper (a check, `rebac.E022`,
 fails startup if a resource model's database is not wrapped); run the storage
-migration; remove `RebacTrackedMixin` and `REBAC_TRACKED_MODELS`;
+migration; keep `RebacTrackedMixin` for declared through and backing models,
+and remove `REBAC_TRACKED_MODELS`;
 drop `with_actor` from `select_related`/`prefetch_related` workarounds.
 
 ### Measurements that decide it

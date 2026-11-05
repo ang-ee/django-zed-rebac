@@ -13,8 +13,8 @@ permission edge. Changing that column changes who can read what, so the change
 needs an authorization decision. Invariant 5d (added with 0.24.0) states the
 rule for the common paths, and the code gates M2M writes, reverse-FK accessors,
 tracked saves and symmetrical mirror edges. Three groups of paths are still
-ungated or gated against the wrong actor. Each is pinned by a strict expected
-failure in `tests/test_security_proposal_0011.py` naming this proposal.
+ungated or gated against the wrong actor. The unresolved gates are pinned by
+strict expected failures in `tests/test_security_proposal_0011.py`.
 
 1. **Deletes and collector side effects.** `RebacMixin.delete()` and queryset
    `delete()` lift backed edges on another type without checking that type's
@@ -29,17 +29,19 @@ failure in `tests/test_security_proposal_0011.py` naming this proposal.
    even when an actor is pinned, and the moved row's own `write` is never
    checked: a folder viewer can re-parent someone else's post, while
    `bulk=False` denies it.
-3. **Instance-level through-model writes.** `through.objects.create()`,
-   `through(...).save()`, `get_or_create()` and instance `delete()` on an
-   auto-created through model are neither gated nor maintained: the actor
-   gains the edge after the next rebuild or the next legitimate write to the
-   same folder. Queryset writes through the same model are gated.
-4. **The `write` boundary.** The exemption for "subject-only" types is
+3. **The `write` boundary.** The exemption for "subject-only" types is
    implemented as "any type without a permission literally named `write`". A
    resource type that names its write permission `edit`, or declares only
    `read`, is maintained without a gate and without an actor: in strict mode
    with no actor, `BackingEntry.objects.create(...)` grants read on
    `test/backinground`.
+
+Direct writes to auto-created through tables are infrastructure writes under
+the current contract. Django sends no `m2m_changed` signal for their
+`bulk_create` or `update`. The strict instance-level through `create`, `save`
+and `get_or_create` expected failures below remain pinned for that auto-created
+table. An M2M requiring gated bulk and instance writes uses an explicit
+`through=` model inheriting `RebacTrackedMixin`.
 
 The three fix rounds that produced 5d each closed some paths and opened others
 because the rule was applied path by path. This proposal states it once, at the
@@ -66,7 +68,8 @@ the Django API that produced the write:
 - The acting subject is resolved once per write, in the documented order:
   pinned actor on the queryset or instance, then ambient sudo, then
   `current_actor()`, then strict-mode failure. Instance sudo does not reach
-  the gate (5a). A pinned actor outranks a block sudo (5).
+  the gate (5a). A pinned actor outranks a block sudo (5); without that pin,
+  ambient sudo bypasses the relation gate.
 - The row being moved is itself a resource whose edges change, so it is in the
   affected set and is checked like any other.
 - Deletes are writes whose edge changes are removals. The collector's
@@ -82,11 +85,12 @@ the Django API that produced the write:
 2. One gate, `rebac.signals.gate_edge_changes(changes, actor)`, batches the
    check per declaring type with one scoped existence query per type (the
    scoped queryset for the write-class action filtered to the affected ids,
-   compared by count). It emits one denial audit row per denied type after
-   the owner's transaction has unwound.
+   compared by count). A structured gate denial carries the exact declaring
+   resource, actor and action. The owner emits its audit row after the
+   transaction has unwound.
 3. Call sites shrink to: `save_base` (field changes), the collector hook
    (deletes, CASCADE, SET_NULL, in one batch before deletion), `m2m_changed`
-   (through rows), and the related-manager wrappers (reverse-FK `add`,
+   (related-manager changes), and the reverse-FK queryset owners (`add`,
    `remove`, `set`, `clear` in both `bulk` modes). Each computes its change set
    and calls the gate; none decides policy.
 4. The `rebac:write_permission` directive is parsed, validated (`E020` when a

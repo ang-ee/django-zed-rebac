@@ -249,7 +249,7 @@ def test_redaction_is_per_row_not_a_blanket_defer(alice, bob):
     _grant(bob_post.pk, bob, "owner")
     _grant(bob_post.pk, alice, "viewer")
 
-    rows = list(Post.objects.as_user(alice).order_by("pk"))
+    rows = list(Post.objects.with_actor(alice).order_by("pk"))
 
     assert [row.pk for row in rows] == [alice_post.pk, bob_post.pk]
     assert rows[0].title == "alice title"
@@ -265,7 +265,7 @@ def test_on_field_deny_omit_overrides_global_allow_and_survives_clones(alice, bo
     _grant(post.pk, bob, "owner")
     _grant(post.pk, alice, "viewer")
 
-    row = Post.objects.as_user(alice).on_field_deny("omit").filter(pk=post.pk).get()
+    row = Post.objects.with_actor(alice).on_field_deny("omit").filter(pk=post.pk).get()
 
     assert row.title is None
     assert row._rebac_redacted_fields == frozenset({"title"})
@@ -281,20 +281,20 @@ def test_for_write_keeps_row_scope_but_disables_field_redaction(alice, bob):
     _grant(post.pk, alice, "editor")  # can write, but read__title=owner redacts on a normal read
 
     # A normal read redacts the gated field for the non-owner editor.
-    redacted = Post.objects.as_user(alice).get(pk=post.pk)
+    redacted = Post.objects.with_actor(alice).get(pk=post.pk)
     assert redacted.title is None
     assert redacted._rebac_redacted_fields == frozenset({"title"})
 
     # for_write() = on_field_deny("allow"): redaction off so the write target carries
     # every column, while row scope still applies.
-    writable = Post.objects.as_user(alice).for_write().get(pk=post.pk)
+    writable = Post.objects.with_actor(alice).for_write().get(pk=post.pk)
     assert writable.title == "secret title"
     assert getattr(writable, "_rebac_redacted_fields", frozenset()) == frozenset()
 
     # Row scope is preserved: a row the actor cannot access is still not returned.
     unrelated = _post(title="bob only")
     _grant(unrelated.pk, bob, "owner")
-    assert Post.objects.as_user(alice).for_write().filter(pk=unrelated.pk).first() is None
+    assert Post.objects.with_actor(alice).for_write().filter(pk=unrelated.pk).first() is None
 
 
 @override_settings(REBAC_FIELD_READ_MODE="redact")
@@ -306,7 +306,7 @@ def test_values_projection_of_gated_field_fails_closed(alice, bob):
     _grant(post.pk, alice, "viewer")
 
     with pytest.raises(PermissionDenied) as excinfo:
-        list(Post.objects.as_user(alice).values("title"))
+        list(Post.objects.with_actor(alice).values("title"))
     assert "read__" in str(excinfo.value)
     assert "title" in str(excinfo.value)
 
@@ -320,7 +320,7 @@ def test_values_list_projection_of_gated_field_fails_closed(alice, bob):
     _grant(post.pk, alice, "viewer")
 
     with pytest.raises(PermissionDenied):
-        list(Post.objects.as_user(alice).values_list("title", flat=True))
+        list(Post.objects.with_actor(alice).values_list("title", flat=True))
 
 
 @override_settings(REBAC_FIELD_READ_MODE="redact")
@@ -332,7 +332,7 @@ def test_values_without_field_list_fails_closed_when_model_has_read_gates(alice,
     _grant(post.pk, alice, "viewer")
 
     with pytest.raises(PermissionDenied):
-        list(Post.objects.as_user(alice).values())
+        list(Post.objects.with_actor(alice).values())
 
 
 @override_settings(REBAC_FIELD_READ_MODE="redact")
@@ -343,7 +343,7 @@ def test_iterator_materialises_model_instances_with_field_redaction(alice, bob):
     _grant(post.pk, bob, "owner")
     _grant(post.pk, alice, "viewer")
 
-    row = next(Post.objects.as_user(alice).filter(pk=post.pk).iterator())
+    row = next(Post.objects.with_actor(alice).filter(pk=post.pk).iterator())
 
     assert row.title is None
     assert row._rebac_redacted_fields == frozenset({"title"})
@@ -358,7 +358,7 @@ def test_values_iterator_of_gated_field_fails_closed(alice, bob):
     _grant(post.pk, alice, "viewer")
 
     with pytest.raises(PermissionDenied):
-        next(Post.objects.as_user(alice).values_list("title", flat=True).iterator())
+        next(Post.objects.with_actor(alice).values_list("title", flat=True).iterator())
 
 
 @override_settings(REBAC_FIELD_READ_MODE="redact")
@@ -369,7 +369,7 @@ def test_pk_values_projection_remains_allowed_with_read_gates(alice, bob):
     _grant(post.pk, bob, "owner")
     _grant(post.pk, alice, "viewer")
 
-    assert list(Post.objects.as_user(alice).values_list("pk", flat=True)) == [post.pk]
+    assert list(Post.objects.with_actor(alice).values_list("pk", flat=True)) == [post.pk]
 
 
 @override_settings(REBAC_FIELD_READ_MODE="redact")
@@ -379,7 +379,7 @@ def test_annotation_cannot_copy_a_gated_field(alice, project):
 
     post = _post(title="aliased secret")
     _grant(post.pk, alice, "viewer")
-    qs = Post.objects.as_user(alice).annotate(copied_title=F("title"))
+    qs = Post.objects.with_actor(alice).annotate(copied_title=F("title"))
     if project:
         qs = qs.values("id", "copied_title")
 
@@ -393,7 +393,7 @@ def test_projection_of_only_computed_values_names_no_gated_field(alice):
 
     post = _post(title="computed only")
     _grant(post.pk, alice, "viewer")
-    rows = Post.objects.as_user(alice).annotate(marker=Upper(Value("x")))
+    rows = Post.objects.with_actor(alice).annotate(marker=Upper(Value("x")))
 
     # The projection names no model field, and the expression reads none.
     assert list(rows.values_list("marker", flat=True)) == ["X"]
@@ -406,7 +406,7 @@ def test_projection_of_only_a_computed_value_that_reads_a_gated_field_fails_clos
 
     post = _post(title="computed secret")
     _grant(post.pk, alice, "viewer")
-    rows = Post.objects.as_user(alice).annotate(shouted=Upper("title"))
+    rows = Post.objects.with_actor(alice).annotate(shouted=Upper("title"))
 
     with pytest.raises(PermissionDenied) as excinfo:
         list(rows.values_list("shouted", flat=True))
@@ -435,8 +435,8 @@ def test_a_combination_of_instances_loads_every_field_of_one_model(alice, folder
     from tests.testapp.models import Folder, Post
 
     _folder, post = folder_gates
-    rows = Post.objects.as_user(alice)
-    folders = Folder.objects.as_user(alice)
+    rows = Post.objects.with_actor(alice)
+    folders = Folder.objects.with_actor(alice)
     related = rows.rebac_select_related("folder")
     # Rows of an operand become instances of the first operand's model column
     # by column: ``title`` would arrive as ``body``, which nothing redacts.
@@ -469,15 +469,15 @@ def test_a_gated_column_of_a_joined_model_is_guarded(alice, folder_gates):
     from tests.testapp.models import Folder, Post
 
     folder, _post_row = folder_gates
-    rows = Post.objects.as_user(alice)
+    rows = Post.objects.with_actor(alice)
     for attempt in (
         lambda: list(rows.values_list("folder__name", flat=True)),
         lambda: list(rows.annotate(n=F("folder__name")).values_list("n", flat=True)),
         lambda: [row.n for row in rows.annotate(n=F("folder__name"))],
         lambda: list(rows.annotate(f=FilteredRelation("folder")).values_list("f__name")),
-        lambda: list(Folder.objects.as_user(alice).values_list("parent__name", flat=True)),
+        lambda: list(Folder.objects.with_actor(alice).values_list("parent__name", flat=True)),
         lambda: list(
-            rows.values_list("body").union(Folder.objects.as_user(alice).values_list("name"))
+            rows.values_list("body").union(Folder.objects.with_actor(alice).values_list("name"))
         ),
     ):
         with pytest.raises(PermissionDenied) as excinfo:
@@ -495,7 +495,7 @@ def test_an_annotation_an_operand_does_not_select_is_not_refused(alice, bob):
     post = _post(title="hidden annotation")
     _grant(post.pk, bob, "owner")
     _grant(post.pk, alice, "viewer")
-    rows = Post.objects.as_user(alice).annotate(copied=F("title"))
+    rows = Post.objects.with_actor(alice).annotate(copied=F("title"))
     # The combination selects ``pk`` alone, in each operand.
     assert list(rows.union(rows).values_list("pk", flat=True)) == [post.pk]
     with pytest.raises(PermissionDenied):
@@ -541,7 +541,7 @@ def test_a_gated_field_a_joined_child_inherits_is_guarded(alice, bob):
     _grant_ref("test/nativeparentlinkedchild", str(child.pk), bob, "owner")
     _grant_ref("test/nativeparentlinkedchild", str(child.pk), alice, "viewer")
     _grant_ref("test/nativeparentlinkedrecord", str(record.pk), alice, "viewer")
-    rows = NativeParentLinkedRecord.objects.as_user(alice)
+    rows = NativeParentLinkedRecord.objects.with_actor(alice)
     with pytest.raises(PermissionDenied):
         list(rows.values_list("child__name", flat=True))
 
@@ -561,7 +561,7 @@ def test_a_plain_root_keeps_the_scope_of_a_rebac_operand(alice, bob):
     _grant(post.pk, bob, "owner")
     _grant(post.pk, alice, "viewer")
     _post(title="not alice's row")
-    scoped = Post.objects.as_user(alice).values_list("body")
+    scoped = Post.objects.with_actor(alice).values_list("body")
     with sudo(reason="test.fixture"):
         BackingStage.objects.create(hidden=None)
     combined = list(BackingStage.objects.values_list("hidden").union(scoped, all=True))
@@ -579,7 +579,7 @@ def test_hand_written_sql_is_selected_under_sudo_only(alice, bob, schema):
     _grant(post.pk, bob, "owner")
     _grant(post.pk, alice, "viewer")
     column = f'"{Post._meta.db_table}"."title"'
-    rows = Post.objects.as_user(alice)
+    rows = Post.objects.with_actor(alice)
     attempts = (
         lambda: list(rows.annotate(t=RawSQL(column, [])).values_list("t", flat=True)),
         lambda: list(rows.extra(select={"t": column}).values_list("t", flat=True)),
@@ -615,7 +615,7 @@ def test_every_operand_of_a_set_combination_is_guarded(alice, bob, combine):
     post = _post(title="operand secret")
     _grant(post.pk, bob, "owner")
     _grant(post.pk, alice, "viewer")
-    rows = Post.objects.as_user(alice)
+    rows = Post.objects.with_actor(alice)
 
     def combined(left, right):
         if combine == "union_all":
@@ -650,7 +650,7 @@ def test_aggregate_cannot_return_a_gated_field(alice):
 
     post = _post(title="aggregate secret")
     _grant(post.pk, alice, "viewer")
-    qs = Post.objects.as_user(alice)
+    qs = Post.objects.with_actor(alice)
 
     with pytest.raises(PermissionDenied):
         qs.aggregate(secret=Min("title"))
@@ -677,12 +677,99 @@ def test_no_read_gates_do_not_add_field_accessible_calls(alice, monkeypatch):
         override_settings(REBAC_FIELD_READ_MODE="redact"),
         CaptureQueriesContext(connection) as queries,
     ):
-        assert [row.pk for row in Post.objects.as_user(alice)] == [post.pk]
+        assert [row.pk for row in Post.objects.with_actor(alice)] == [post.pk]
 
     assert actions == []
     post_table = connection.ops.quote_name(Post._meta.db_table)
     row_queries = [query["sql"] for query in queries if f"FROM {post_table}" in query["sql"]]
     assert len(row_queries) == 1
+
+
+@pytest.mark.pg_delta
+@override_settings(REBAC_FIELD_READ_MODE="redact")
+def test_equal_field_gates_share_one_candidate_statement(alice):
+    install_schema(
+        backend(),
+        parse_zed(
+            SCHEMA_TEXT.replace(
+                "permission read__title = owner",
+                "permission read_private = owner\n"
+                "    permission read__title = read_private\n"
+                "    permission read__body = read_private",
+            )
+        ),
+    )
+    posts = [_post(title=f"title {index}", body=f"body {index}") for index in range(3)]
+    for post in posts:
+        _grant(post.pk, alice, "viewer")
+    _grant(posts[0].pk, alice, "owner")
+    with CaptureQueriesContext(connection) as queries:
+        rows = list(Post.objects.with_actor(alice).order_by("pk"))
+    assert [(row.title, row.body) for row in rows] == [
+        ("title 0", "body 0"),
+        (None, None),
+        (None, None),
+    ]
+    # One row statement and one permission statement for both fields.
+    assert len(queries) == 2
+
+
+@pytest.mark.pg_delta
+@pytest.mark.parametrize("field_count", (1, 2, 3))
+@pytest.mark.parametrize("row_count", (1, 5))
+def test_field_visibility_statement_growth_is_per_distinct_permission(
+    alice, field_count, row_count
+):
+    from rebac.field_visibility import visible_id_sets
+
+    fields = ("title", "body", "folder")[:field_count]
+    expressions = ("owner", "editor", "viewer")[:field_count]
+    gates = "\n    ".join(
+        f"permission read__{field} = {expression}"
+        for field, expression in zip(fields, expressions, strict=True)
+    )
+    install_schema(
+        backend(),
+        parse_zed(SCHEMA_TEXT.replace("permission read__title = owner", gates)),
+    )
+    posts = [_post(title=f"post {index}") for index in range(row_count)]
+    for post in posts:
+        _grant(post.pk, alice, "viewer")
+    ids = tuple(str(post.pk) for post in posts)
+    actor = SubjectRef.of("auth/user", str(alice.pk))
+    with CaptureQueriesContext(connection) as queries:
+        visible = visible_id_sets(
+            model=Post, actor=actor, fields=frozenset(fields), resource_ids=ids
+        )
+    assert set(visible) == set(fields)
+    assert len(queries) == field_count  # 1, 2, 3 permissions; constant in row_count.
+
+
+@pytest.mark.pg_delta
+@pytest.mark.parametrize("field_count", (1, 2, 3))
+def test_field_visibility_equal_permissions_share_one_statement(alice, field_count):
+    from rebac.field_visibility import visible_id_sets
+
+    fields = ("title", "body", "folder")[:field_count]
+    gates = "\n    ".join(f"permission read__{field} = read_private" for field in fields)
+    install_schema(
+        backend(),
+        parse_zed(
+            SCHEMA_TEXT.replace(
+                "permission read__title = owner",
+                f"permission read_private = owner\n    {gates}",
+            )
+        ),
+    )
+    posts = [_post(title=f"post {index}") for index in range(5)]
+    actor = SubjectRef.of("auth/user", str(alice.pk))
+    ids = tuple(str(post.pk) for post in posts)
+    with CaptureQueriesContext(connection) as queries:
+        visible = visible_id_sets(
+            model=Post, actor=actor, fields=frozenset(fields), resource_ids=ids
+        )
+    assert all(not allowed for allowed in visible.values())
+    assert len(queries) == 1  # Constant in the number of fields sharing read_private.
 
 
 @override_settings(REBAC_FIELD_READ_MODE="redact")
@@ -693,7 +780,7 @@ def test_redaction_scrubs_loaded_value_snapshot(alice, bob):
     _grant(post.pk, bob, "owner")
     _grant(post.pk, alice, "viewer")
 
-    instance = Post.objects.as_user(alice).get(pk=post.pk)
+    instance = Post.objects.with_actor(alice).get(pk=post.pk)
 
     assert instance.title is None
     assert "title" not in instance._rebac_loaded_values
@@ -708,7 +795,7 @@ def test_full_save_excludes_redacted_fields_from_the_update(alice, bob):
     _grant(post.pk, alice, "viewer")
     _grant(post.pk, alice, "editor")
 
-    instance = Post.objects.as_user(alice).get(pk=post.pk)
+    instance = Post.objects.with_actor(alice).get(pk=post.pk)
     assert instance.title is None
     instance.body = "safe update"
     instance.save()
@@ -730,7 +817,7 @@ def test_full_save_uses_dirty_fields_minus_redacted_fields(alice, bob):
     _grant(post.pk, alice, "viewer")
     _grant(post.pk, alice, "editor")
 
-    instance = Post.objects.as_user(alice).get(pk=post.pk)
+    instance = Post.objects.with_actor(alice).get(pk=post.pk)
     assert instance.body is None
     instance.folder = folder
     instance.save()
@@ -751,7 +838,7 @@ def test_bulk_update_still_works_when_read_gates_are_enabled(alice, bob):
     _grant(post.pk, alice, "viewer")
     _grant(post.pk, alice, "editor")
 
-    count = Post.objects.as_user(alice).filter(pk=post.pk).update(body="bulk safe")
+    count = Post.objects.with_actor(alice).filter(pk=post.pk).update(body="bulk safe")
 
     assert count == 1
     with sudo(reason="test.verify"):
@@ -770,7 +857,7 @@ def test_full_save_skips_deferred_fields_when_redaction_narrows_update_fields(al
     _grant(post.pk, alice, "viewer")
     _grant(post.pk, alice, "editor")
 
-    instance = Post.objects.as_user(alice).only("id", "body", "folder").get(pk=post.pk)
+    instance = Post.objects.with_actor(alice).only("id", "body", "folder").get(pk=post.pk)
     assert instance.body is None
     instance.folder = _folder(name="changed folder")
     instance.save()
@@ -791,7 +878,7 @@ def test_django_6_rejects_positional_save_before_redacted_fields_can_write(alice
     _grant(post.pk, alice, "viewer")
     _grant(post.pk, alice, "editor")
 
-    instance = Post.objects.as_user(alice).get(pk=post.pk)
+    instance = Post.objects.with_actor(alice).get(pk=post.pk)
     assert instance.title is None
     instance.body = "safe update"
     with pytest.raises(TypeError):
@@ -812,7 +899,7 @@ def test_pickled_redacted_instance_preserves_write_safety_metadata(alice, bob):
     _grant(post.pk, alice, "viewer")
     _grant(post.pk, alice, "editor")
 
-    instance = Post.objects.as_user(alice).get(pk=post.pk)
+    instance = Post.objects.with_actor(alice).get(pk=post.pk)
     assert instance.title is None
     restored = pickle.loads(pickle.dumps(instance)).with_actor(alice)
     restored.body = "after pickle"
@@ -834,7 +921,7 @@ def test_redacted_resource_id_attr_still_authorizes_writes_against_loaded_id(ali
     _grant_ref("blog/sluggedpost", "visible-id", alice, "viewer")
     _grant_ref("blog/sluggedpost", "visible-id", alice, "editor")
 
-    instance = SluggedPost.objects.as_user(alice).get(pk=post.pk)
+    instance = SluggedPost.objects.with_actor(alice).get(pk=post.pk)
     assert instance.slug is None
     instance.title = "new title"
     instance.save()
@@ -854,7 +941,7 @@ def test_explicit_save_of_redacted_field_fails_closed(alice, bob):
     _grant(post.pk, alice, "viewer")
     _grant(post.pk, alice, "editor")
 
-    instance = Post.objects.as_user(alice).get(pk=post.pk)
+    instance = Post.objects.with_actor(alice).get(pk=post.pk)
     assert instance.title is None
     instance.title = "overwrite"
 
@@ -898,13 +985,13 @@ def test_bulk_conditional_field_reads_fail_closed_by_default_and_can_flip(alice)
     )
 
     with override_settings(REBAC_FIELD_READ_MODE="redact"):
-        assert Post.objects.as_user(alice).get(pk=post.pk).title is None
+        assert Post.objects.with_actor(alice).get(pk=post.pk).title is None
 
     with override_settings(
         REBAC_FIELD_READ_MODE="redact",
         REBAC_FIELD_READ_FAIL_CLOSED_ON_CONDITIONAL=False,
     ):
-        assert Post.objects.as_user(alice).get(pk=post.pk).title == "conditional title"
+        assert Post.objects.with_actor(alice).get(pk=post.pk).title == "conditional title"
 
 
 @override_settings(REBAC_FIELD_READ_MODE="redact")
@@ -929,7 +1016,7 @@ def test_raise_mode_degrades_to_redact_until_descriptor_tier_lands(alice, bob):
     _grant(post.pk, bob, "owner")
     _grant(post.pk, alice, "viewer")
 
-    row = Post.objects.as_user(alice).get(pk=post.pk)
+    row = Post.objects.with_actor(alice).get(pk=post.pk)
 
     assert row.title is None
     assert row._rebac_redacted_fields == frozenset({"title"})
@@ -975,7 +1062,7 @@ def test_bypass_subquery_reading_a_gated_column_does_not_block_the_outer_project
         .values("_blocker")[:1]
     )
     rows = list(
-        Post.objects.as_user(alice)
+        Post.objects.with_actor(alice)
         .annotate(flagged=flagged, blocked=blocker)
         .values("pk", "flagged", "blocked")
     )
@@ -995,7 +1082,7 @@ def test_outer_row_read_of_a_gated_column_inside_a_subquery_fails_closed(alice, 
         Post.objects.sudo(reason="test.leak").annotate(v=OuterRef("title")).values("v")[:1]
     )
     with pytest.raises(PermissionDenied) as excinfo:
-        list(Post.objects.as_user(alice).annotate(x=leak).values("x"))
+        list(Post.objects.with_actor(alice).annotate(x=leak).values("x"))
     assert "read__title" in str(excinfo.value)
 
 
@@ -1010,8 +1097,10 @@ def test_actor_scoped_subquery_projecting_a_gated_column_fails_closed(alice, bob
     _grant(post.pk, bob, "owner")
     _grant(post.pk, alice, "viewer")
     with pytest.raises(PermissionDenied) as excinfo:
-        leak = Subquery(Post.objects.as_user(alice).filter(pk=OuterRef("pk")).values("title")[:1])
-        list(Post.objects.as_user(alice).annotate(x=leak).values("x"))
+        leak = Subquery(
+            Post.objects.with_actor(alice).filter(pk=OuterRef("pk")).values("title")[:1]
+        )
+        list(Post.objects.with_actor(alice).annotate(x=leak).values("x"))
     assert "read__title" in str(excinfo.value)
 
 
@@ -1030,9 +1119,162 @@ def test_the_projection_guard_runs_once_per_evaluation(alice, monkeypatch):
         return guard(self, *args, **kwargs)
 
     monkeypatch.setattr(RebacQuerySet, "_guard_projected_field_reads", counting)
-    rows = Post.objects.as_user(alice)
+    rows = Post.objects.with_actor(alice)
     # ``list()`` asks for the length, then iterates; both read the one result.
     assert [row.pk for row in list(rows)] == [post.pk]
     assert len(rows) == 1
     assert rows
     assert len(calls) == 1
+
+
+@pytest.mark.django_db
+@pytest.mark.parametrize("expression", [False, True])
+@override_settings(REBAC_FIELD_READ_MODE="redact")
+def test_bulk_field_guards_check_only_affected_ids(alice, monkeypatch, expression):
+    install_schema(
+        backend(),
+        parse_zed(
+            SCHEMA_TEXT.replace(
+                "permission read__title = owner",
+                "permission read__title = owner\n permission write__body = owner",
+            )
+        ),
+    )
+    post = _post(title="selected", body="before")
+    unrelated = _post(title="not selected", body="untouched")
+    for row in (post, unrelated):
+        _grant(row.pk, alice, "owner")
+    active = backend()
+    import rebac.managers as managers
+
+    original = managers.held_ids
+    requested = []
+
+    def membership(active_backend, **kwargs):
+        assert kwargs["model"] is Post
+        requested.append((kwargs["action"], tuple(kwargs["resource_ids"])))
+        return original(active_backend, **kwargs)
+
+    monkeypatch.setattr(managers, "held_ids", membership)
+    monkeypatch.setattr(active, "accessible", lambda **kwargs: pytest.fail("unbounded enumeration"))
+    assert (
+        Post.objects.with_actor(alice)
+        .filter(pk=post.pk)
+        .update(body=F("title") if expression else "after")
+        == 1
+    )
+    assert requested == [
+        (action, (str(post.pk),))
+        for action in ("write", "write__body", "read__title")[: 3 if expression else 2]
+    ]
+    with sudo(reason="test.verify"):
+        assert Post.objects.get(pk=post.pk).body == ("selected" if expression else "after")
+        assert Post.objects.get(pk=unrelated.pk).body == "untouched"
+
+
+@pytest.mark.django_db
+@pytest.mark.parametrize("expression", [False, True])
+@override_settings(REBAC_FIELD_READ_MODE="redact")
+def test_bounded_bulk_field_refusal_preserves_the_rows(alice, expression):
+    schema = (
+        SCHEMA_TEXT
+        if expression
+        else SCHEMA_TEXT.replace(
+            "permission read__title = owner",
+            "permission read__title = owner\n permission write__body = owner",
+        )
+    )
+    install_schema(backend(), parse_zed(schema))
+    post = _post(title="private", body="before")
+    _grant(post.pk, alice, "editor")
+    with pytest.raises(PermissionDenied):
+        Post.objects.with_actor(alice).filter(pk=post.pk).update(
+            body=F("title") if expression else "after"
+        )
+    with sudo(reason="test.verify"):
+        assert Post.objects.get(pk=post.pk).body == "before"
+
+
+@pytest.mark.django_db
+@pytest.mark.parametrize("storage", ["denormalized", "registry"])
+def test_bounded_field_visibility_keeps_global_grants_and_fresh_refusals(
+    alice, monkeypatch, settings, storage
+):
+    from rebac.field_visibility import visible_id_sets
+    from rebac.types import RelationshipFilter
+
+    settings.REBAC_LOCAL_BACKEND_STORAGE = storage
+    reset_backend()
+    active = backend()
+    install_schema(
+        active,
+        parse_zed("""
+        definition auth/user {}
+        definition blog/post {
+            permission read = authenticated
+            permission read__title = authenticated
+        }
+        """),
+    )
+    selected = _post(title="selected")
+    unrelated = _post(title="not fetched")
+    actor = SubjectRef.of("auth/user", str(alice.pk))
+    arguments = dict(model=Post, actor=actor, fields=frozenset({"title"}), active_backend=active)
+    monkeypatch.setattr(
+        active, "grants_all", lambda **kwargs: pytest.fail("bounded rows need no universal proof")
+    )
+    assert visible_id_sets(**arguments, resource_ids=(str(selected.pk),)) == {
+        "title": frozenset({str(selected.pk)})
+    }
+    assert visible_id_sets(**arguments, resource_ids=()) == {"title": frozenset()}
+
+    install_schema(active, parse_zed(SCHEMA_TEXT))
+    for row in (selected, unrelated):
+        _grant(row.pk, alice, "owner")
+    assert visible_id_sets(**arguments, resource_ids=(str(selected.pk),)) == {
+        "title": frozenset({str(selected.pk)})
+    }
+    active.delete_relationships(
+        RelationshipFilter(
+            resource_type="blog/post", resource_id=str(selected.pk), relation="owner"
+        )
+    )
+    assert visible_id_sets(**arguments, resource_ids=(str(selected.pk),)) == {"title": frozenset()}
+
+
+@pytest.mark.django_db(transaction=True, databases={"default", "selected"})
+@pytest.mark.parametrize("storage", ["denormalized", "registry"])
+def test_bounded_field_visibility_keeps_selected_database(alice, settings, storage):
+    from django.db import connections
+
+    from rebac import database_context
+    from rebac.field_visibility import visible_id_sets
+
+    settings.REBAC_LOCAL_BACKEND_STORAGE = storage
+    reset_backend()
+    active = backend()
+    actor = SubjectRef.of("auth/user", str(alice.pk))
+    for alias in ("default", "selected"):
+        with database_context(alias):
+            install_schema(active, parse_zed(SCHEMA_TEXT), using=alias)
+            with sudo(reason="test.bounded_field_visibility.fixture"):
+                Post.objects.using(alias).create(pk=771, title=alias)
+            if alias == "selected":
+                _grant(771, alice, "owner")
+    with CaptureQueriesContext(connections["default"]) as default_queries:
+        with database_context("selected"):
+            assert visible_id_sets(
+                model=Post,
+                actor=actor,
+                fields=frozenset({"title"}),
+                active_backend=active,
+                resource_ids=("771",),
+            ) == {"title": frozenset({"771"})}
+    assert not default_queries
+    assert visible_id_sets(
+        model=Post,
+        actor=actor,
+        fields=frozenset({"title"}),
+        active_backend=active,
+        resource_ids=("771",),
+    ) == {"title": frozenset()}

@@ -1,39 +1,46 @@
-"""RebacManager declares every actor verb RebacQuerySet defines, so pyright sees them.
+"""Django's generated manager exposes every public queryset verb.
 
-``from_queryset`` copies the methods at runtime; a checker without the Django
-plugin only sees the declarations. The two lists are kept in step here.
+Static editor declarations are exercised by tests/typing/consumer_sample.py.
 """
 
 from __future__ import annotations
 
 from rebac.managers import RebacManager, RebacQuerySet
 
-# Queryset methods a manager does not re-declare: Django's own queryset API
+# Queryset methods excluded from this actor-verb contract: Django's own queryset API
 # (declared on BaseManager by django-stubs) and per-query mechanics.
 QUERYSET_ONLY = {
+    "adelete",
     "aggregate",
     "aiterator",
-    "bulk_create",
-    "bulk_update",
+    "as_manager",
     "count",
     "create",
-    "delete",
     "exists",
     "explain",
     "iterator",
     "resolve_expression",
-    "update",
 }
 
+WRITE_VERBS = {"bulk_create", "bulk_update", "delete", "update"}
 
-def test_manager_declares_every_queryset_verb() -> None:
+
+def test_manager_exposes_every_queryset_verb() -> None:
     queryset_verbs = {
         name
-        for name, value in vars(RebacQuerySet).items()
-        if not name.startswith("_") and callable(value)
+        for name in dir(RebacQuerySet)
+        if not name.startswith("_") and callable(getattr(RebacQuerySet, name))
     }
-    declared = {name for name in vars(RebacManager) if not name.startswith("_")}
+    declared = {
+        name
+        for name in dir(RebacManager)
+        if not name.startswith("_") and callable(getattr(RebacManager, name))
+    }
     missing = sorted(queryset_verbs - declared - QUERYSET_ONLY)
-    assert missing == [], f"declare on RebacManager or list as queryset-only: {missing}"
+    assert missing == [], f"expose through RebacManager or list as queryset-only: {missing}"
+    assert WRITE_VERBS <= queryset_verbs
+    assert WRITE_VERBS <= declared, (
+        f"inherited writes missing from manager: {WRITE_VERBS - declared}"
+    )
     stale = sorted(QUERYSET_ONLY - queryset_verbs)
-    assert stale == [], f"no longer a RebacQuerySet method: {stale}"
+    assert stale == [], f"no longer a RebacQuerySet method, including inherited: {stale}"

@@ -108,12 +108,12 @@ def test_strict_mode_raises_without_actor(post):
         list(Post.objects.all())
 
 
-def test_as_user_scopes_to_owner(alice, bob, post):
+def test_with_actor_scopes_to_owner(alice, bob, post):
     _grant_owner(alice, post)
     from tests.testapp.models import Post
 
-    assert list(Post.objects.as_user(alice).values_list("pk", flat=True)) == [post.pk]
-    assert list(Post.objects.as_user(bob)) == []
+    assert list(Post.objects.with_actor(alice).values_list("pk", flat=True)) == [post.pk]
+    assert list(Post.objects.with_actor(bob)) == []
 
 
 def test_with_actor_accepts_subject_ref(alice, post):
@@ -141,7 +141,7 @@ def test_save_allowed_for_owner(alice, post):
     _grant_owner(alice, post)
     from tests.testapp.models import Post
 
-    instance = Post.objects.as_user(alice).get(pk=post.pk)
+    instance = Post.objects.with_actor(alice).get(pk=post.pk)
     assert instance._rebac_actor is not None
     instance.title = "renamed"
     instance.save()
@@ -159,38 +159,38 @@ def test_count_respects_scope(alice, bob, post):
     _grant_owner(alice, post)
     from tests.testapp.models import Post
 
-    assert Post.objects.as_user(alice).count() == 1
-    assert Post.objects.as_user(bob).count() == 0
+    assert Post.objects.with_actor(alice).count() == 1
+    assert Post.objects.with_actor(bob).count() == 0
 
 
 def test_exists_respects_scope(alice, bob, post):
     _grant_owner(alice, post)
     from tests.testapp.models import Post
 
-    assert Post.objects.as_user(alice).filter(pk=post.pk).exists() is True
-    assert Post.objects.as_user(bob).filter(pk=post.pk).exists() is False
+    assert Post.objects.with_actor(alice).filter(pk=post.pk).exists() is True
+    assert Post.objects.with_actor(bob).filter(pk=post.pk).exists() is False
 
 
 def test_iterator_respects_scope(alice, bob, post):
     _grant_owner(alice, post)
     from tests.testapp.models import Post
 
-    assert [row.pk for row in Post.objects.as_user(alice).filter(pk=post.pk).iterator()] == [
+    assert [row.pk for row in Post.objects.with_actor(alice).filter(pk=post.pk).iterator()] == [
         post.pk
     ]
-    assert list(Post.objects.as_user(bob).filter(pk=post.pk).iterator()) == []
+    assert list(Post.objects.with_actor(bob).filter(pk=post.pk).iterator()) == []
 
 
-def test_as_agent_scopes_standalone_agent(alice, post):
+def test_grant_actor_scopes_standalone_agent(alice, post):
     from tests.testapp.models import Post
 
     agent = FakeAgent("indexer")
     _grant_owner_subject(SubjectRef.of("agents/agent", "indexer"), post)
 
-    assert list(Post.objects.as_agent(agent).values_list("pk", flat=True)) == [post.pk]
+    assert list(Post.objects.with_actor(agent).values_list("pk", flat=True)) == [post.pk]
 
 
-def test_as_agent_scopes_agent_grant_on_behalf_of_user(alice, bob, post):
+def test_grant_actor_scopes_agent_grant_on_behalf_of_user(alice, bob, post):
     from tests.testapp.models import Post
 
     agent = FakeAgent("assistant")
@@ -199,10 +199,13 @@ def test_as_agent_scopes_agent_grant_on_behalf_of_user(alice, bob, post):
         post,
     )
 
-    assert list(Post.objects.as_agent(agent, on_behalf_of=alice).values_list("pk", flat=True)) == [
-        post.pk
-    ]
-    assert list(Post.objects.as_agent(agent, on_behalf_of=bob).values_list("pk", flat=True)) == []
+    assert list(
+        Post.objects.with_actor(grant_subject_ref(agent, alice)).values_list("pk", flat=True)
+    ) == [post.pk]
+    assert (
+        list(Post.objects.with_actor(grant_subject_ref(agent, bob)).values_list("pk", flat=True))
+        == []
+    )
 
 
 def test_bulk_update_leaves_rows_actor_cannot_read(alice, bob, post):
@@ -210,7 +213,7 @@ def test_bulk_update_leaves_rows_actor_cannot_read(alice, bob, post):
     _grant_owner(alice, post)
     from tests.testapp.models import Post
 
-    assert Post.objects.as_user(bob).filter(pk=post.pk).update(title="hijacked") == 0
+    assert Post.objects.with_actor(bob).filter(pk=post.pk).update(title="hijacked") == 0
 
     post.refresh_from_db()
     assert post.title == "hello"
@@ -220,7 +223,7 @@ def test_bulk_delete_leaves_rows_actor_cannot_read(alice, bob, post):
     _grant_owner(alice, post)
     from tests.testapp.models import Post
 
-    assert Post.objects.as_user(bob).filter(pk=post.pk).delete() == (0, {})
+    assert Post.objects.with_actor(bob).filter(pk=post.pk).delete() == (0, {})
 
     assert Post.objects.sudo(reason="test.check").filter(pk=post.pk).exists()
 
@@ -246,15 +249,17 @@ def test_with_action_changes_queryset_read_scope(alice, bob, post):
     )
     from tests.testapp.models import Post
 
-    assert list(Post.objects.as_user(bob).values_list("pk", flat=True)) == [post.pk]
+    assert list(Post.objects.with_actor(bob).values_list("pk", flat=True)) == [post.pk]
     assert (
         list(
-            Post.objects.with_action("credential_lookup").as_user(bob).values_list("pk", flat=True)
+            Post.objects.with_action("credential_lookup")
+            .with_actor(bob)
+            .values_list("pk", flat=True)
         )
         == []
     )
     assert list(
-        Post.objects.with_action("credential_lookup").as_user(alice).values_list("pk", flat=True)
+        Post.objects.with_action("credential_lookup").with_actor(alice).values_list("pk", flat=True)
     ) == [post.pk]
 
 
@@ -479,7 +484,7 @@ def test_instance_check_access_owner_has_read(alice, post):
     _grant_owner(alice, post)
     from tests.testapp.models import Post
 
-    instance = Post.objects.as_user(alice).get(pk=post.pk)
+    instance = Post.objects.with_actor(alice).get(pk=post.pk)
     result = instance.check_access("read")
     assert result.allowed is True
     assert bool(result) is True
@@ -517,18 +522,18 @@ def test_instance_check_access_under_sudo_short_circuits(alice, post):
     assert result.allowed is True
 
 
-def test_instance_as_user_shorthand_equivalent_to_with_actor(alice, post):
+def test_instance_with_actor_matches_queryset_pin(alice, post):
     _grant_owner(alice, post)
     from tests.testapp.models import Post
 
     with sudo(reason="test.load"):
         instance = Post.objects.get(pk=post.pk)
-    instance.as_user(alice)
+    instance.with_actor(alice)
     assert instance.actor() == SubjectRef.of("auth/user", str(alice.pk))
     assert instance.has_access("read") is True
 
 
-def test_instance_as_agent_shorthand_scopes_agent_grant(alice, bob, post):
+def test_instance_grant_actor_scopes_agent_grant(alice, bob, post):
     from tests.testapp.models import Post
 
     agent = FakeAgent("assistant")
@@ -539,11 +544,11 @@ def test_instance_as_agent_shorthand_scopes_agent_grant(alice, bob, post):
     with sudo(reason="test.load"):
         instance = Post.objects.get(pk=post.pk)
 
-    instance.as_agent(agent, on_behalf_of=alice)
+    instance.with_actor(grant_subject_ref(agent, alice))
     assert instance.actor() == grant_subject_ref(agent, alice)
     assert instance.has_access("read") is True
 
-    instance.as_agent(agent, on_behalf_of=bob)
+    instance.with_actor(grant_subject_ref(agent, bob))
     assert instance.has_access("read") is False
 
 

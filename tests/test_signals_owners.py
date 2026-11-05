@@ -1,6 +1,6 @@
 """Owners-first signal regressions. Authored for the later execution phase."""
 
-from contextlib import contextmanager
+from contextlib import contextmanager, nullcontext
 from unittest.mock import patch
 
 import pytest
@@ -719,3 +719,123 @@ def test_tracked_through_bulk_owners_grant_and_revoke_existing_resource(active):
     with no_ambient_scope():
         BackingEntry.objects.filter(pk=entry.pk).delete()
     assert not active.check_access(subject=actor, action="read", resource=resource).allowed
+
+
+@pytest.mark.pg_delta
+@pytest.mark.parametrize("storage", STORAGE_TIERS)
+@pytest.mark.parametrize("operation", ["save", "update", "m2m", "remove", "set", "clear"])
+@pytest.mark.django_db(transaction=True, databases=["default", "selected"])
+def test_backed_edge_write_uses_producer_grants(settings, storage, operation):
+    from django.db import connections
+
+    from rebac import actor_context, database_context
+    from rebac.models import active_relationship_model
+    from rebac.types import RelationshipFilter
+
+    settings.REBAC_LOCAL_BACKEND_STORAGE = storage
+    settings.REBAC_AUDIT_DENIALS = True
+    local = backend()
+    schema = parse_zed(
+        SCHEMA.replace("permission write = authenticated", "permission write = viewer", 1)
+        .replace("definition blog/post {", "definition blog/post {\n relation editor: auth/user")
+        .replace("permission write = authenticated", "permission write = editor", 1)
+        .replace(
+            "permission read = folder->read + collections->read", "permission read = authenticated"
+        )
+    )
+    alias = "selected"
+    for using in ("default", alias):
+        with database_context(using), sudo(reason="opposed edge fixture"):
+            install_schema(local, schema, using=using)
+            for pk in (101, 102):
+                Folder.objects.using(using).create(pk=pk, name=f"{using}-{pk}")
+            Post.objects.using(using).create(pk=201, title=using, folder_id=101)
+
+    for permitted in (True, False):
+        # Equal identities have opposite grants in the two real stores.
+        for using in ("default", alias):
+            actor = ALICE if permitted == (using == alias) else BOB
+            with database_context(using), sudo(reason="opposed edge grants"):
+                local.delete_relationships(
+                    RelationshipFilter(resource_type="blog/folder", relation="viewer")
+                )
+                local.delete_relationships(
+                    RelationshipFilter(resource_type="blog/post", relation="editor")
+                )
+                local.write_relationships(
+                    [RelationshipTuple(ObjectRef("blog/post", "201"), "editor", actor)]
+                )
+                local.write_relationships(
+                    [
+                        RelationshipTuple(ObjectRef("blog/folder", str(pk)), "viewer", actor)
+                        for pk in (101, 102)
+                    ]
+                )
+        through = Post.collections.through
+        if operation in {"remove", "clear", "set"}:
+            with database_context(alias), sudo(reason="initial collection edge"):
+                through.objects.using(alias).create(
+                    post_id=201, folder_id=101 if operation == "set" else 102
+                )
+        default_audits = list(PermissionAuditEvent.objects.using("default").values())
+        denied_before = (
+            PermissionAuditEvent.objects.using(alias).filter(reason__startswith="denied:").count()
+        )
+        default_rows = list(Post._base_manager.using("default").values())
+        default_edges = list(active_relationship_model().objects.using("default").values())
+        selected = Post._base_manager.using(alias).get(pk=201)
+        before = list(Post._base_manager.using(alias).values())
+        through = Post.collections.through
+        before_links = list(through.objects.using(alias).values())
+        with (
+            database_context(alias) if operation in {"save", "update"} else nullcontext(),
+            actor_context(ALICE),
+            CaptureQueriesContext(connections["default"]) as default_queries,
+        ):
+            try:
+                with (
+                    transaction.atomic(using=alias)
+                    if operation in {"save", "update"}
+                    else nullcontext()
+                ):
+                    if operation == "save":
+                        selected.folder_id = 102
+                        selected.save(using=alias, update_fields=["folder"])
+                    elif operation == "update":
+                        Post.objects.using(alias).filter(pk=201).update(folder_id=102)
+                    elif operation == "m2m":
+                        selected.collections.add(Folder._base_manager.using(alias).get(pk=102))
+                    elif operation == "remove":
+                        selected.collections.remove(102)
+                    elif operation == "clear":
+                        selected.collections.clear()
+                    elif operation == "set":
+                        selected.collections.set([Folder._base_manager.using(alias).get(pk=102)])
+            except PermissionDenied:
+                assert not permitted
+            else:
+                assert permitted
+        assert list(default_queries) == []
+        assert list(PermissionAuditEvent.objects.using("default").values()) == default_audits
+        if operation not in {"save", "update"}:
+            denied_after = (
+                PermissionAuditEvent.objects.using(alias)
+                .filter(reason__startswith="denied:")
+                .count()
+            )
+            assert denied_after == denied_before
+        assert list(Post._base_manager.using("default").values()) == default_rows
+        assert list(active_relationship_model().objects.using("default").values()) == default_edges
+        if permitted:
+            if operation in {"save", "update"}:
+                assert Post._base_manager.using(alias).get(pk=201).folder_id == 102
+            elif operation in {"remove", "clear"}:
+                assert not through.objects.using(alias).filter(post_id=201).exists()
+            else:
+                assert through.objects.using(alias).filter(post_id=201, folder_id=102).exists()
+        if not permitted:
+            assert list(Post._base_manager.using(alias).values()) == before
+            assert list(through.objects.using(alias).values()) == before_links
+        with database_context(alias), sudo(reason="reset edge fixture"):
+            Post.objects.using(alias).filter(pk=201).update(folder_id=101)
+            through.objects.using(alias).all().delete()

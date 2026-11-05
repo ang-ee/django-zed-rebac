@@ -22,7 +22,11 @@ from rebac import (
 )
 from rebac.backends import backend
 from rebac.backends.local import LocalBackend
-from rebac.checks import check_declared_base_managers, check_default_managers
+from rebac.checks import (
+    check_declared_base_managers,
+    check_default_managers,
+    check_tracked_default_managers,
+)
 from rebac.mixins import RebacModelBase
 from rebac.schema import parse_zed
 from rebac.testing import install_schema
@@ -318,6 +322,34 @@ def test_check_reports_a_default_manager_that_is_not_scoped():
 
 def test_check_accepts_the_shipped_default_managers():
     assert check_default_managers() == []
+
+
+def test_check_requires_a_tracked_default_manager_to_carry_related_owners():
+    with isolate_apps("tests.testapp") as apps:
+
+        class Loose(RebacTrackedMixin, models.Model):
+            objects = models.Manager.from_queryset(PolicyQuerySet)()  # type: ignore[assignment]
+
+            class Meta:
+                app_label = "testapp"
+
+        class Derived(RebacTrackedMixin, models.Model):
+            objects = TrackedManager.from_queryset(PolicyQuerySet)()
+
+            class Meta:
+                app_label = "testapp"
+
+        issues = check_tracked_default_managers(app_configs=apps.get_app_configs())
+
+    assert [issue.id for issue in issues] == ["rebac.E025"]
+    assert isinstance(issues[0], checks.Error)
+    assert issues[0].obj is Loose
+    assert "ManagerFromPolicyQuerySet" in issues[0].msg
+    assert isinstance(Derived._default_manager, TrackedManager)
+
+
+def test_check_accepts_the_shipped_tracked_default_managers():
+    assert check_tracked_default_managers() == []
 
 
 @pytest.fixture

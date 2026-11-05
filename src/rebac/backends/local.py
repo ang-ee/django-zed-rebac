@@ -18,6 +18,7 @@ from django.core.signals import setting_changed
 from django.db import models
 from django.db.backends.base.base import BaseDatabaseWrapper
 
+from ..database import database_context, read_alias, write_alias
 from ..errors import SchemaError
 from ..field_backing import (
     resolve_field_backing,
@@ -51,7 +52,6 @@ from ..types import (
     SubjectRef,
     Zookie,
 )
-from .base import Backend
 
 _backend_registry_lock = Lock()
 _db_loaded_backends: WeakSet[LocalBackend] = WeakSet()
@@ -99,10 +99,30 @@ def _enforced_schema_errors(schema: Schema) -> list[str]:
     return backing_errors + subject_relation_errors(schema)
 
 
-class LocalBackend(Backend):
+class LocalBackend:
     """Evaluates permissions as queries over the application's own tables."""
 
     kind = "local"
+
+    def has_access(
+        self,
+        *,
+        subject: SubjectRef,
+        action: str,
+        resource: ObjectRef,
+        context: dict[str, Any] | None = None,
+        consistency: Consistency | None = None,
+        at_zookie: Zookie | None = None,
+    ) -> bool:
+        """Boolean shorthand for the three-state permission check."""
+        return self.check_access(
+            subject=subject,
+            action=action,
+            resource=resource,
+            context=context,
+            consistency=consistency,
+            at_zookie=at_zookie,
+        ).allowed
 
     @staticmethod
     def _validate_consistency(consistency: Consistency | None, at_zookie: Zookie | None) -> None:
@@ -174,7 +194,12 @@ class LocalBackend(Backend):
         with self._schema_lock:
             return self._manual_revision
 
-    def _schema_snapshot(self, known_revision: str | None = None) -> SchemaSnapshot:
+    def _schema_snapshot(
+        self, known_revision: str | None = None, *, using: str | None = None
+    ) -> SchemaSnapshot:
+        if using is not None:
+            with database_context(using):
+                return self._schema_snapshot(known_revision)
         if known_revision is None:
             return self._load_schema_snapshot()
         return self._load_schema_snapshot(known_revision)
@@ -204,14 +229,16 @@ class LocalBackend(Backend):
                 )
         with self._schema_invalidation_lock:
             invalidation = self._schema_invalidation_generation
-        connection = connections[SchemaDefinition.objects.db]
+        connection = connections[read_alias(SchemaDefinition)]
         evaluator = current_evaluator()
         operation = _schema_operation_scope.get()
-        # Manual transactions have no observable on_commit lifecycle. Keep
-        # their pins operation-local, as before revision caching was added.
-        scoped = connection.get_autocommit() or (
-            connection.in_atomic_block and connection.commit_on_exit
-        )
+        # A rollback has no library-owned notification. Transactional pins
+        # therefore live for one operation, including reused Atomic blocks.
+        scoped = connection.get_autocommit() and not connection.in_atomic_block
+        if evaluator is not None and not scoped:
+            # A transactional read can see a revision that later rolls back.
+            # Refresh the evaluator pin on its next autocommit operation.
+            evaluator._schema_scope.snapshots(connection).clear()
         scope = evaluator._schema_scope if evaluator is not None and scoped else operation
         pins = scope.snapshots(connection) if scope is not None else None
         operation_pins = operation.snapshots(connection) if operation is not None else None
@@ -221,7 +248,14 @@ class LocalBackend(Backend):
                 snapshot is not None
                 and snapshot.invalidation_generation == invalidation
                 and (snapshot.expires_at is None or snapshot.expires_at > timezone.now())
+                and (
+                    snapshot.savepoint_ids is None
+                    or tuple(connection.savepoint_ids[: len(snapshot.savepoint_ids)])
+                    == snapshot.savepoint_ids
+                )
             ):
+                if operation_pins is not None:
+                    operation_pins[self] = snapshot._replace(savepoint_ids=None)
                 return snapshot
 
         # Database I/O and waiting for another loader happen outside the process
@@ -309,9 +343,14 @@ class LocalBackend(Backend):
                 if invalidation != self._schema_invalidation_generation:
                     continue
             if snapshot is not None:
-                pin = snapshot._replace(invalidation_generation=invalidation)
+                pin = snapshot._replace(
+                    invalidation_generation=invalidation,
+                    savepoint_ids=None,
+                )
                 if pins is not None:
                     pins[self] = pin
+                if operation_pins is not None:
+                    operation_pins[self] = pin
                 return pin
         # Do not retain the final fallback, but fence its schema with the
         # revision read on both sides of the load. A loader retry miss alone
@@ -359,8 +398,8 @@ class LocalBackend(Backend):
         from ..models import SchemaDefinition, active_relationship_model
 
         candidates = (
-            connections[active_relationship_model().objects.db],
-            connections[SchemaDefinition.objects.db],
+            connections[read_alias(active_relationship_model())],
+            connections[read_alias(SchemaDefinition)],
         )
         for candidate in candidates:
             if candidate.in_atomic_block or (
@@ -380,7 +419,12 @@ class LocalBackend(Backend):
             for relation in definition.relations
         ):
             return None
-        return snapshot.generation, _relationship_generation
+        return (
+            read_alias(active_relationship_model()),
+            snapshot.using,
+            snapshot.generation,
+            _relationship_generation,
+        )
 
     def _schema_facts(self, snapshot: SchemaSnapshot) -> _SchemaFacts:
         """Whole-schema facts derived once per schema generation."""
@@ -558,21 +602,17 @@ class LocalBackend(Backend):
         at_zookie: Zookie | None = None,
     ) -> CheckResult:
         self._validate_consistency(consistency, at_zookie)
-        from contextlib import nullcontext
-
-        from ..compile.read import check, deciding_afresh
+        from ..compile.read import check
         from ..models import active_relationship_model
 
-        latest = consistency == Consistency.FULLY_CONSISTENT
-        with deciding_afresh() if latest else nullcontext():
-            return check(
-                backend=self,
-                resource=resource,
-                action=action,
-                actor=subject,
-                context=context,
-                using=active_relationship_model().objects.db,
-            )
+        return check(
+            backend=self,
+            resource=resource,
+            action=action,
+            actor=subject,
+            context=context,
+            using=read_alias(active_relationship_model()),
+        )
 
     def check_bulk_permissions(
         self,
@@ -582,16 +622,12 @@ class LocalBackend(Backend):
         at_zookie: Zookie | None = None,
     ) -> list[CheckResult]:
         self._validate_consistency(consistency, at_zookie)
-        from contextlib import nullcontext
-
-        from ..compile.read import check_many, deciding_afresh
+        from ..compile.read import check_many
         from ..models import active_relationship_model
 
-        latest = consistency == Consistency.FULLY_CONSISTENT
-        with deciding_afresh() if latest else nullcontext():
-            return check_many(
-                backend=self, items=list(items), using=active_relationship_model().objects.db
-            )
+        return check_many(
+            backend=self, items=list(items), using=read_alias(active_relationship_model())
+        )
 
     @_schema_operation
     def queryset_filter(
@@ -609,6 +645,28 @@ class LocalBackend(Backend):
         return scope_q(backend=self, model=model, action=action, actor=subject, using=using)
 
     @_schema_operation
+    def permission_expression(
+        self,
+        *,
+        model: type[models.Model],
+        subject: SubjectRef,
+        action: str,
+        using: str,
+        identity: models.Expression,
+    ) -> models.Expression:
+        from ..compile.read import scope_expression
+
+        return scope_expression(
+            backend=self,
+            model=model,
+            action=action,
+            actor=subject,
+            using=using,
+            identity=identity,
+            decide=False,
+        )
+
+    @_schema_operation
     def accessible(
         self,
         *,
@@ -619,26 +677,70 @@ class LocalBackend(Backend):
         consistency: Consistency | None = None,
         at_zookie: Zookie | None = None,
     ) -> Iterable[str]:
-        from contextlib import nullcontext
-
-        from ..compile.read import accessible_ids, deciding_afresh
+        from ..compile.read import accessible_ids
         from ..models import active_relationship_model
 
         self._validate_consistency(consistency, at_zookie)
-        # The latest state asked for explicitly is not read through rows an
-        # evaluator scope kept (proposal 0017).
-        latest = consistency == Consistency.FULLY_CONSISTENT
-        with deciding_afresh() if latest else nullcontext():
-            return list(
-                accessible_ids(
-                    backend=self,
-                    resource_type=resource_type,
-                    action=action,
-                    actor=subject,
-                    using=active_relationship_model().objects.db,
-                    context=context,
-                )
+        return list(
+            accessible_ids(
+                backend=self,
+                resource_type=resource_type,
+                action=action,
+                actor=subject,
+                using=read_alias(active_relationship_model()),
+                context=context,
             )
+        )
+
+    @_schema_operation
+    def held(
+        self,
+        *,
+        subject: SubjectRef,
+        action: str,
+        resource_type: str,
+        ids: Iterable[str],
+        context: dict[str, Any] | None = None,
+        using: str | None = None,
+    ) -> set[str]:
+        """Return the candidate ids on which the subject holds the action."""
+        from ..compile.read import held
+        from ..models import active_relationship_model
+
+        return held(
+            backend=self,
+            resource_type=resource_type,
+            action=action,
+            actor=subject,
+            ids=ids,
+            using=using or read_alias(active_relationship_model()),
+            context=context,
+        )
+
+    @_schema_operation
+    def held_many(
+        self,
+        *,
+        subject: SubjectRef,
+        actions: Iterable[str],
+        resource_type: str,
+        ids: Iterable[str],
+        context: dict[str, Any] | None = None,
+        using: str | None = None,
+    ) -> dict[str, set[str]]:
+        """Return held candidate IDs per action, sharing equal field gates."""
+        from ..compile.read import held_many
+        from ..models import active_relationship_model
+
+        return held_many(
+            backend=self,
+            resource_type=resource_type,
+            actions=actions,
+            actor=subject,
+            ids=ids,
+            using=using or read_alias(active_relationship_model()),
+            context=context,
+        )
 
     @_schema_operation
     def grants_all(
@@ -658,7 +760,7 @@ class LocalBackend(Backend):
             resource_type=resource_type,
             action=action,
             actor=subject,
-            using=active_relationship_model().objects.db,
+            using=read_alias(active_relationship_model()),
             context=context,
         )
 
@@ -682,13 +784,13 @@ class LocalBackend(Backend):
             resource=resource,
             action=action,
             subject_type=subject_type,
-            using=active_relationship_model().objects.db,
+            using=read_alias(active_relationship_model()),
             context=context,
         )
 
     @_schema_operation
     def write_relationships(self, writes: Iterable[RelationshipTuple]) -> Zookie:
-        from django.db import router, transaction
+        from django.db import transaction
 
         from ..models import active_relationship_model
         from ..models.relationship import RelationshipRegistry
@@ -697,7 +799,7 @@ class LocalBackend(Backend):
         RelationshipModel = active_relationship_model()
 
         rows = list(writes)
-        using = router.db_for_write(RelationshipModel)
+        using = write_alias(RelationshipModel)
         max_xid = 0
         with transaction.atomic(using=using):
             schema = self._write_schema(using)
@@ -764,12 +866,12 @@ class LocalBackend(Backend):
 
     @_schema_operation
     def delete_relationships(self, filter_: RelationshipFilter) -> Zookie:
-        from django.db import router, transaction
+        from django.db import transaction
 
         from ..models import active_relationship_model
 
         RelationshipModel = active_relationship_model()
-        using = router.db_for_write(RelationshipModel)
+        using = write_alias(RelationshipModel)
         with transaction.atomic(using=using):
             schema = self._write_schema(using)
             backed = self._backed_relation_for_filter(
@@ -789,14 +891,13 @@ class LocalBackend(Backend):
         # values, where ``delete_relationships`` treats them as wildcards).
         # Has no direct SpiceDB equivalent; SpiceDB expresses the same intent
         # via ``WriteRelationships`` with ``OPERATION_DELETE``. Planned to
-        # lower through that path in 0.4 once the ABC takes operation-shaped
-        # updates — see ARCHITECTURE.md.
-        from django.db import router, transaction
+        # lower through that path in the LocalBackend API — see ARCHITECTURE.md.
+        from django.db import transaction
 
         from ..models import active_relationship_model
 
         RelationshipModel = active_relationship_model()
-        using = router.db_for_write(RelationshipModel)
+        using = write_alias(RelationshipModel)
         with transaction.atomic(using=using):
             schema = self._write_schema(using)
             definition = schema.get_definition(tuple_.resource.resource_type)
@@ -830,8 +931,7 @@ class LocalBackend(Backend):
 
     def _write_schema(self, using: str) -> Schema:
         """The effective policy a relationship write is validated against."""
-        del using
-        return self._schema_snapshot().schema
+        return self._schema_snapshot(using=using).schema
 
     def _validate_relationship_tuple(self, tup: RelationshipTuple, *, schema: Schema) -> None:
         from django.conf import settings
@@ -962,8 +1062,11 @@ def mark_relationships_changed() -> None:
     every evaluator scope in this process drops its decisions.
     """
     global _relationship_generation
+    from ..watch import bump_row_generation
+
     with _backend_registry_lock:
         _relationship_generation += 1
+    bump_row_generation()
 
 
 def mark_db_loaded_schemas_stale(**kwargs: Any) -> None:

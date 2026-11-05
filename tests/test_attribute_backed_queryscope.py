@@ -18,6 +18,8 @@ from rebac.schema import parse_zed
 from tests.backend_setup import atomic_source_write, install_schema
 from tests.testapp.models import AuthoredPost, Folder, Post
 
+pytestmark = pytest.mark.pg_delta
+
 SCHEMA = """
 definition auth/user {}
 

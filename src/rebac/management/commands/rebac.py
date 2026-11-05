@@ -18,6 +18,7 @@ from __future__ import annotations
 import hashlib
 import json
 import sys
+from contextlib import nullcontext
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, cast
 
@@ -28,6 +29,7 @@ from django.db.models import Q
 from django.utils import timezone
 
 from ...conf import app_settings
+from ...database import database_context, write_alias
 from ...errors import SchemaError
 from ...models.resource import RebacResource
 from ...schema import Schema, render_zed, resolve_schema_path
@@ -287,110 +289,114 @@ class Command(BaseCommand):
     # ---------- sync ----------
 
     def _handle_sync(self, options: dict[str, Any]) -> None:
-        from django.db import router
 
-        from ...models import SchemaDefinition
-        from ...models.generation import schema_write_atomic
+        with (
+            database_context(options["database"])
+            if options.get("database") is not None
+            else nullcontext()
+        ):
+            from ...models import SchemaDefinition
+            from ...models.generation import schema_write_atomic
 
-        check_only = options["check"]
-        force = options["force_overwrite"]
-        prune_stale = options["prune_stale"]
-        only_package = options.get("package")
-        if (force or prune_stale) and not check_only and not options["yes"]:
-            flag = "--force-overwrite" if force else "--prune-stale"
-            if not sys.stdin.isatty():
-                raise CommandError(f"Non-interactive {flag} requires --yes.")
-            action = (
-                "Overwrite edited schema rows and delete stale policy rows"
-                if force
-                else "Retire stale package-owned policy and its relationships"
+            check_only = options["check"]
+            force = options["force_overwrite"]
+            prune_stale = options["prune_stale"]
+            only_package = options.get("package")
+            if (force or prune_stale) and not check_only and not options["yes"]:
+                flag = "--force-overwrite" if force else "--prune-stale"
+                if not sys.stdin.isatty():
+                    raise CommandError(f"Non-interactive {flag} requires --yes.")
+                action = (
+                    "Overwrite edited schema rows and delete stale policy rows"
+                    if force
+                    else "Retire stale package-owned policy and its relationships"
+                )
+                answer = input(f"{action}? Type 'yes': ")
+                if answer != "yes":
+                    raise CommandError(f"{flag} cancelled; no changes made.")
+
+            sources: list[tuple[Any, Path, Any]] = []
+            installed_schemas: list[Schema] = []
+            source_owners: dict[str, str] | None = {} if prune_stale else None
+            seen_definitions: dict[str, str] = {}
+            seen_caveats: dict[str, str] = {}
+            for app_config in apps.get_app_configs():
+                schema_path = resolve_schema_path(app_config)
+                if schema_path is None:
+                    continue
+                package_name = app_config.name
+                selected = not only_package or only_package == package_name
+
+                text = schema_path.read_text(encoding="utf-8")
+                schema = parse_zed(text)
+                installed_schemas.append(schema)
+                errors = validate_schema(schema)
+                if errors:
+                    for e in errors:
+                        self.stderr.write(self.style.ERROR(f"  {package_name}: {e}"))
+                    raise CommandError(f"Schema validation failed for {package_name}")
+                for definition in schema.definitions:
+                    previous = seen_definitions.get(definition.resource_type)
+                    if previous is not None:
+                        raise CommandError(
+                            f"Duplicate definition {definition.resource_type!r} found in "
+                            f"{previous} and {package_name}"
+                        )
+                    seen_definitions[definition.resource_type] = package_name
+                for caveat in schema.caveats:
+                    previous = seen_caveats.get(caveat.name)
+                    if previous is not None:
+                        raise CommandError(
+                            f"Duplicate caveat {caveat.name!r} found in {previous} and {package_name}"
+                        )
+                    seen_caveats[caveat.name] = package_name
+                if source_owners is not None:
+                    source_owners.update(
+                        (external_id, package_name)
+                        for external_id in sorted(_schema_external_ids(schema))
+                    )
+                if selected:
+                    sources.append((app_config, schema_path, schema))
+
+            effective = Schema(
+                definitions=[
+                    definition for schema in installed_schemas for definition in schema.definitions
+                ],
+                caveats=[caveat for schema in installed_schemas for caveat in schema.caveats],
             )
-            answer = input(f"{action}? Type 'yes': ")
-            if answer != "yes":
-                raise CommandError(f"{flag} cancelled; no changes made.")
+            effective_errors = subject_relation_errors(effective)
+            if effective_errors:
+                for error in effective_errors:
+                    self.stderr.write(self.style.ERROR(f"  effective schema: {error}"))
+                raise CommandError("Effective schema validation failed")
 
-        sources: list[tuple[Any, Path, Any]] = []
-        installed_schemas: list[Schema] = []
-        source_owners: dict[str, str] | None = {} if prune_stale else None
-        seen_definitions: dict[str, str] = {}
-        seen_caveats: dict[str, str] = {}
-        for app_config in apps.get_app_configs():
-            schema_path = resolve_schema_path(app_config)
-            if schema_path is None:
-                continue
-            package_name = app_config.name
-            selected = not only_package or only_package == package_name
-
-            text = schema_path.read_text(encoding="utf-8")
-            schema = parse_zed(text)
-            installed_schemas.append(schema)
-            errors = validate_schema(schema)
-            if errors:
-                for e in errors:
-                    self.stderr.write(self.style.ERROR(f"  {package_name}: {e}"))
-                raise CommandError(f"Schema validation failed for {package_name}")
-            for definition in schema.definitions:
-                previous = seen_definitions.get(definition.resource_type)
-                if previous is not None:
-                    raise CommandError(
-                        f"Duplicate definition {definition.resource_type!r} found in "
-                        f"{previous} and {package_name}"
+            alias = write_alias(SchemaDefinition, using=options.get("database"))
+            if check_only:
+                with schema_write_atomic(alias):
+                    self._apply_schema_sources(
+                        sources,
+                        check_only=True,
+                        force=force,
+                        using=alias,
+                        prune_stale=prune_stale,
+                        only_package=only_package,
+                        source_owners=source_owners,
                     )
-                seen_definitions[definition.resource_type] = package_name
-            for caveat in schema.caveats:
-                previous = seen_caveats.get(caveat.name)
-                if previous is not None:
-                    raise CommandError(
-                        f"Duplicate caveat {caveat.name!r} found in {previous} and {package_name}"
+            else:
+                from ...models.schema_write import schema_index_write
+
+                # One owner: the policy lock is held and the composed policy is
+                # validated once, when every package's rows are written.
+                with schema_index_write(alias):
+                    self._apply_schema_sources(
+                        sources,
+                        check_only=False,
+                        force=force,
+                        using=alias,
+                        prune_stale=prune_stale,
+                        only_package=only_package,
+                        source_owners=source_owners,
                     )
-                seen_caveats[caveat.name] = package_name
-            if source_owners is not None:
-                source_owners.update(
-                    (external_id, package_name)
-                    for external_id in sorted(_schema_external_ids(schema))
-                )
-            if selected:
-                sources.append((app_config, schema_path, schema))
-
-        effective = Schema(
-            definitions=[
-                definition for schema in installed_schemas for definition in schema.definitions
-            ],
-            caveats=[caveat for schema in installed_schemas for caveat in schema.caveats],
-        )
-        effective_errors = subject_relation_errors(effective)
-        if effective_errors:
-            for error in effective_errors:
-                self.stderr.write(self.style.ERROR(f"  effective schema: {error}"))
-            raise CommandError("Effective schema validation failed")
-
-        alias = options.get("database") or router.db_for_write(SchemaDefinition)
-        if check_only:
-            with schema_write_atomic(alias):
-                self._apply_schema_sources(
-                    sources,
-                    check_only=True,
-                    force=force,
-                    using=alias,
-                    prune_stale=prune_stale,
-                    only_package=only_package,
-                    source_owners=source_owners,
-                )
-        else:
-            from ...models.schema_write import schema_index_write
-
-            # One owner: the policy lock is held and the composed policy is
-            # validated once, when every package's rows are written.
-            with schema_index_write(alias):
-                self._apply_schema_sources(
-                    sources,
-                    check_only=False,
-                    force=force,
-                    using=alias,
-                    prune_stale=prune_stale,
-                    only_package=only_package,
-                    source_owners=source_owners,
-                )
 
     def _apply_schema_sources(
         self,
@@ -601,13 +607,19 @@ class Command(BaseCommand):
             # Fresh.
             if check_only:
                 return True
-            obj = model_cls.objects.using(using).create(**natural_key, **payload)
+            values = {**natural_key, **payload}
+            # Native relation IDs avoid routing an unsaved child through a
+            # different default database before .using() saves it.
+            for field in model_cls._meta.fields:
+                if field.is_relation and field.name in values:
+                    values[field.attname] = values.pop(field.name).pk
+            obj = model_cls.objects.using(using).create(**values)
             PackageManagedRecord.objects.using(using).update_or_create(
                 package=package,
                 external_id=external_id,
                 defaults={
                     "schema_revision": 1,
-                    "target_ct": ct,
+                    "target_ct_id": ct.pk,
                     "target_pk": obj.pk,
                     "content_hash": content_hash,
                     "no_update": True,
@@ -645,7 +657,7 @@ class Command(BaseCommand):
                 package=package,
                 external_id=external_id,
                 schema_revision=1,
-                target_ct=ct,
+                target_ct_id=ct.pk,
                 target_pk=existing.pk,
                 content_hash=content_hash,
                 no_update=True,
@@ -845,20 +857,17 @@ class Command(BaseCommand):
     def _stale_relationship_queries(external_ids: set[str], *, using: str) -> dict[str, Any]:
         """One queryset of stored tuples per retired fragment, on the relationship write alias.
 
-        Tuples are stored on ``router.db_for_write`` of the relationship model,
-        which is the alias every other tuple write uses; retirement refuses
-        to run against a policy alias that is not that alias rather than
-        deleting on the wrong database, and skips a database the router
-        does not migrate the model to (as ``cleanup_identities`` does).
+        The explicit sync database owns both policy and retired tuples.
+        Skip databases the router does not migrate the relationship model to.
         """
         from ...models import active_relationship_model
 
         model = active_relationship_model()
-        write_alias = router.db_for_write(model)
-        if write_alias != using:
+        tuple_alias = write_alias(model)
+        if tuple_alias != using:
             raise CommandError(
                 f"--prune-stale writes policy on {using!r} but relationships live on "
-                f"{write_alias!r}; retire them on one database."
+                f"{tuple_alias!r}; retire them on one database."
             )
         if not router.allow_migrate_model(using, model):
             return {}
