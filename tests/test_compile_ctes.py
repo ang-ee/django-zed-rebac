@@ -1767,9 +1767,11 @@ def test_three_operand_union_prepares_once_and_stays_near_inline(monkeypatch):
 
 
 @pytest.mark.pg_delta
-@pytest.mark.parametrize("count", [32, pytest.param(300, marks=pytest.mark.slow)])
+@pytest.mark.parametrize("count", [2, pytest.param(300, marks=pytest.mark.slow)])
 def test_live_unions_relabel_names_after_owner_queries_are_collected(shared_arrow_rows, count):
     _local, actor, post = shared_arrow_rows
+    # Two independent live owners are the minimum that can collide when the
+    # first owner queryset is collected but its cloned query remains live.
     live = []
     first_names = None
     for _ in range(count):
