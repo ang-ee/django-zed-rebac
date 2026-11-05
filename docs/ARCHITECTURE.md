@@ -455,7 +455,8 @@ Your Django project
 ```python
 from rebac import (
     # Mixin and managers
-    RebacMixin, RebacTrackedMixin, RebacManager, RebacQuerySet,
+    RebacMixin, RebacTrackedMixin, RebacManager, RebacQuerySet, SharedScope,
+    SCOPE_CTE_CANDIDATE_LIMIT,          # maximum explicit scope identity set (256)
     TrackedManager, TrackedQuerySet,    # unscoped; own gated writes; the base for a declared base manager
     # RebacQuerySet.action() returns the pinned action or the model's default action
 
@@ -555,13 +556,12 @@ from rebac.signals import collected_for_delete  # one admitted collector batch p
 from rebac.mixins import batch_delivered        # batch marker for per-row pre_delete receivers
 ```
 
-The DC cleanup removes the unused `scope_cte()` handle, `decision_scope()`,
-and the `as_user()` / `as_agent()` aliases. Callers pin an actor with
-`with_actor()`, open request-local reuse with `evaluator_scope()`, and compose
-ordinary actor-scoped querysets with Django expressions. These removals are
-pre-1.0 breaking changes; the authorization and audit contracts continue to
-apply to the retained paths.
-
+The DC cleanup removes `decision_scope()` and the `as_user()` / `as_agent()`
+aliases. `scope_cte(actions=...)` remains the owned statement-local API for
+sharing one permission proof across several action projections on one resource.
+Callers pin the actor with `with_actor()` and may open request-local reuse with
+`evaluator_scope()`; each operation in a transaction validates its own schema
+snapshot.
 
 For an operation without a pinned actor, `is_sudo()` answers whether ambient
 `sudo()` or `system_context()` is active; it does not account for pinned actor
@@ -1693,6 +1693,31 @@ actors continue to override ambient sudo. Cloning or changing actor/action must
 never retain a stale scope predicate. Boolean and SQL set combinations retain
 the left queryset actor/action policy across all operands; rebinding replaces
 the restriction on each operand without mutating the original querysets.
+
+`RebacQuerySet.scope_cte(actions=("read", "write", ...))` returns a `SharedScope`
+for an actor-scoped, unsliced queryset with no caller filter or one mandatory
+native identity filter. `SharedScope.queryset()` exposes plain identity rows for
+`Exists`, membership and aggregates. `SharedScope.attach(queryset)` clones the
+read statement and owns one fresh CTE definition. Build references before
+attachment; attach a union at its owner. A multi-action handle compiles one
+statement-local closure of distinct permission leaves and projects each listed
+action as a small verdict over that closure. This supports page-level capability
+projections that share one proven read across several permission names.
+
+An explicit candidate filter must contain 1 to `SCOPE_CTE_CANDIDATE_LIMIT`
+(256) distinct canonical native integer IDs on the resource identity attribute;
+an empty or larger set raises `ValueError`. An unfiltered handle may acquire
+that bounded set from a mandatory positive identity lookup on the final
+statement, including a forward-FK prefetch `TupleIn`. A statement referencing
+`SharedScope.queryset()` keeps the unbounded definition because its reference
+may need identities outside the outer row set. Each attachment pins a fresh
+policy and caveat state. Sharing requires matching actor, model, alias, backend,
+policy, verdicts and a candidate subset. Recursion in a listed action, any
+expiring relation, override tag, caveat deadline or reachable caveated tuple
+makes the multi-action closure ineligible; projections then retain their inline
+proofs. Relation names are valid actions, unknown actions are false, and false
+first actions leave the enclosing rows intact. The closure uses the same
+compiler, native probe selection and statement ownership as other read paths.
 
 Boolean combinations require REBAC querysets so empty-query fast paths cannot
 return a plain unscoped manager. Django's bounded primary-key subqueries for

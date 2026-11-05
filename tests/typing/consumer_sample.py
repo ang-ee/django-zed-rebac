@@ -8,11 +8,11 @@ reaching every consumer's editor.
 
 from __future__ import annotations
 
-from typing import assert_type
+from typing import Any, assert_type
 
 from django.db import models
 
-from rebac import RebacManager, RebacQuerySet, SubjectRef, grant_subject_ref
+from rebac import RebacManager, RebacQuerySet, SharedScope, SubjectRef, grant_subject_ref
 from tests.testapp.models import Post
 
 
@@ -41,6 +41,9 @@ def verbs_on_a_model_manager(actor: SubjectRef) -> None:
     assert_type(Post.objects.effective_actor(), tuple[SubjectRef | None, bool])
     assert_type(Post.objects.scoped().get(), Post)
     assert_type(Post.objects.scoped_for_aggregate().get(), Post)
+    scope = Post.objects.with_actor(actor).scope_cte(actions=("read", "write"))
+    assert_type(scope, SharedScope[Post])
+    assert_type(scope.queryset(), models.QuerySet[Any])
 
 
 def verbs_on_a_custom_queryset(actor: SubjectRef) -> None:

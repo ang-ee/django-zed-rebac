@@ -93,6 +93,7 @@ class _Permission(models.Expression):
 
     def as_sql(self, compiler: Any, connection: Any) -> Any:
         from .backends import backend
+        from .compile.read import matching_shared_permission, matching_shared_scope
         from .managers import RebacQuerySet
 
         if self.row_model is None:
@@ -118,6 +119,15 @@ class _Permission(models.Expression):
                     using=using,
                     identity=self.identity,
                 )
+                shared_condition = matching_shared_permission(compiler.query, condition, using)
+                if shared_condition is not None:
+                    condition = shared_condition
+                else:
+                    shared_scope = matching_shared_scope(compiler.query, condition, using)
+                    if shared_scope is not None:
+                        condition = models.Exists(
+                            shared_scope.queryset().filter(pk=models.OuterRef("pk"))
+                        )
             if condition is None:
                 rows = self.model._default_manager.all().using(using)
                 if not isinstance(rows, RebacQuerySet):

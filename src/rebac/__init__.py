@@ -62,6 +62,7 @@ from .errors import (
     SchemaError,
 )
 from .evaluator import PermissionEvaluator, current_evaluator, evaluator_scope
+from .limits import SCOPE_CTE_CANDIDATE_LIMIT
 from .preflight import check_new
 from .types import (
     CheckItem,
@@ -83,7 +84,7 @@ if TYPE_CHECKING:
     from .decorators import check_permission, rebac_resource, require_permission
     from .expressions import permission_expression
     from .field_backing import GenericTarget, generic_target, proposed_forward_relationships
-    from .managers import RebacManager, RebacQuerySet, TrackedManager, TrackedQuerySet
+    from .managers import RebacManager, RebacQuerySet, SharedScope, TrackedManager, TrackedQuerySet
     from .mcp import default_actor_resolver, get_mcp_actor_resolver, rebac_mcp_tool
     from .mixins import RebacMixin, RebacObjectMeta, RebacTrackedMixin
     from .models.schema_write import schema_changes
@@ -103,6 +104,7 @@ _LAZY = {
     "RebacMixin": ("rebac.mixins", "RebacMixin"),
     "RebacManager": ("rebac.managers", "RebacManager"),
     "RebacQuerySet": ("rebac.managers", "RebacQuerySet"),
+    "SharedScope": ("rebac.managers", "SharedScope"),
     "TrackedManager": ("rebac.managers", "TrackedManager"),
     "TrackedQuerySet": ("rebac.managers", "TrackedQuerySet"),
     "RebacObjectMeta": ("rebac.mixins", "RebacObjectMeta"),
@@ -163,6 +165,8 @@ __all__ = [
     "RebacTrackedMixin",
     "RebacManager",
     "RebacQuerySet",
+    "SharedScope",
+    "SCOPE_CTE_CANDIDATE_LIMIT",
     "TrackedManager",
     "TrackedQuerySet",
     "RebacObjectMeta",

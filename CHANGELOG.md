@@ -7,8 +7,9 @@ pre-1.0; breaking changes within a minor version are explicitly called out.
 
 ### Changed
 
-- The remaining union owner, point checks, and queryset scopes compile through
-  one statement entry. Row, set, fact, and field-visibility decisions use one
+- The union owner, point checks, and queryset scopes compile through one
+  statement entry. The multi-action closure uses the same permission compiler
+  and native probes. Row, set, fact, and field-visibility decisions use one
   bounded memo helper; scope preparation has one plan slot per database alias.
   `RebacQuerySet.action()` reports its resolved read action, and
   `rebac.relation_loading.pinned_actor()` reports an explicit row or queryset
@@ -54,7 +55,7 @@ pre-1.0; breaking changes within a minor version are explicitly called out.
 
 ### Removed
 
-- **Breaking (DC cleanup):** Removed `RebacQuerySet.scope_cte()`, its `SharedScope` handle, the multi-action closure and late attachment machinery, `decision_scope()`, and the `as_user()` / `as_agent()` queryset and instance aliases. Use `with_actor(user)`, `with_actor(agent)` or `with_actor(grant_subject_ref(agent, user))` for actor pinning. Use `evaluator_scope()` for per-request caching and ordinary actor-scoped querysets / `permission_expression()` for composition. `evaluator_scope()` never pins an atomic transaction; each operation in a transaction validates its own schema snapshot. Removed the inert `REBAC_RELATIONSHIP_MODEL`, `REBAC_DEFAULT_CONSISTENCY`, `REBAC_CACHE_ALIAS`, `REBAC_LOOKUP_CACHE_TTL`, and `REBAC_GC_INTERVAL_SECONDS` settings.
+- **Breaking (DC cleanup):** Removed `decision_scope()` and the `as_user()` / `as_agent()` queryset and instance aliases. Use `with_actor(user)`, `with_actor(agent)` or `with_actor(grant_subject_ref(agent, user))` for actor pinning. Use `evaluator_scope()` for per-request caching; `scope_cte(actions=...)` remains the statement-local owner for multi-action projections. `evaluator_scope()` never pins an atomic transaction; each operation in a transaction validates its own schema snapshot. Removed the inert `REBAC_RELATIONSHIP_MODEL`, `REBAC_DEFAULT_CONSISTENCY`, `REBAC_CACHE_ALIAS`, `REBAC_LOOKUP_CACHE_TTL`, and `REBAC_GC_INTERVAL_SECONDS` settings.
 - **Breaking:** Removed the unimplemented `SpiceDBBackend`, the `Backend` ABC,
   the `spicedb` extra, and four `REBAC_SPICEDB_*` settings. `REBAC_BACKEND`
   accepts only `"local"`; `rebac.E002` and `rebac.W101` no longer apply.
@@ -97,14 +98,8 @@ pre-1.0; breaking changes within a minor version are explicitly called out.
   only with the same shareable policy and verdicts. Exact late projections
   retain their point form; queryset identity proofs retain the candidate-root
   form, including bounded literal ID sets.
-  Inside `decision_scope()`, ordinary single-action attachments prepare a
-  witnessed body using eligible transaction-memoized decisions. Multi-action
-  closures do not use that memo; ineligible closures use the ordinary body.
-- `decision_scope(*, using="default")` opens one atomic transaction with a
-  transaction-bound evaluator. Warm stored schemas read their revision once
-  for that scope; bounded row, fact and actor-set decisions are reused until
-  an owned dependency write advances their generation. The scope is discarded
-  on commit or rollback.
+  Multi-action closures use the retained compiler and native probes; ineligible
+  closures use the ordinary single-action identity body.
 - Exported `is_sudo()` from `rebac` to report the ambient sudo scope.
 - `LocalBackend.held()` checks a bounded set of candidate IDs through the
   compiled read path. Absent canonical IDs are point-checked in one batch;
@@ -173,9 +168,8 @@ pre-1.0; breaking changes within a minor version are explicitly called out.
   and database work. Candidate lists bind as one PostgreSQL array or bounded
   parameterized `IN`; eligible shapes are kept in the statement cache. An exact or bounded
   identity proof takes precedence over a shared union plan. The selecting
-  query still applies its original filter. Inside `decision_scope()`, bounded
-  reads reuse witnessed target decisions across candidate sets and respect
-  write and savepoint invalidation. `held_many()` uses 256-ID candidate-root chunks.
+  query still applies its original filter. `held_many()` uses 256-ID
+  candidate-root chunks.
 - Decided ID membership binds one PostgreSQL array per list with `= ANY`;
   row lists use a statement-local CTE shared by the predicate and witness.
   SQLite and MySQL use Django `IN`. Model identity sets use

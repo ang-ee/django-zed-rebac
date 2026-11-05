@@ -32,6 +32,7 @@ from rebac.composition import TaggedComposition, compose_tagged, split_stale_ove
 from rebac.conf import app_settings
 from rebac.errors import PermissionDepthExceeded, SchemaError
 from rebac.field_backing import resolve_attribute_backing, resolve_field_backing
+from rebac.limits import SCOPE_CTE_CANDIDATE_LIMIT
 from rebac.models import active_relationship_model
 from rebac.models.generation import SchemaGeneration
 from rebac.resources import (
@@ -45,8 +46,10 @@ from rebac.schema.ast import (
     AttributeBinding,
     ConstBinding,
     FieldBinding,
+    PermArrow,
     PermBinOp,
     PermExpr,
+    PermNil,
     PermRef,
     Schema,
 )
@@ -87,7 +90,7 @@ _RESOURCE_WIRE = object()
 _CANDIDATES = object()
 _LIMIT = 512
 _ROW_LIMIT = 5000
-_CANDIDATE_LIMIT = 256
+_CANDIDATE_LIMIT = SCOPE_CTE_CANDIDATE_LIMIT
 # The M8 field-backed model-identity probe crosses the inline form around
 # five memberships on PostgreSQL and seven on SQLite. Four short support
 # edges stay under this ceiling; larger sets use the inline closure.
@@ -2060,6 +2063,318 @@ def _shareable_scope(scope: _Scope) -> bool:
     )
 
 
+@dataclass(frozen=True)
+class SharedScopePlan:
+    """A CTE and the exact permission state pinned by one attached statement."""
+
+    cte: CTE
+    model: type[models.Model]
+    actor: SubjectRef
+    action: str
+    using: str
+    backend: LocalBackend
+    columns: tuple[str, ...]
+    policy: _Policy
+    verdicts: CaveatVerdicts
+    shareable: bool
+    actions: tuple[str, ...] = ()
+    closure: CTE | None = None
+    leaf_ordinals: Mapping[tuple[PermExpr, Bound], int] = field(default_factory=dict)
+    owned_ctes: tuple[str, ...] = ()
+    candidates: tuple[int, ...] | None = None
+
+    def queryset(self) -> models.QuerySet[Any]:
+        return identity_cte_queryset(self.cte, self.model, self.using, self.columns)
+
+
+def identity_cte_queryset(
+    cte: CTE,
+    model: type[models.Model],
+    using: str,
+    columns: tuple[str, ...],
+) -> models.QuerySet[Any]:
+    """A plain, identity-only queryset over a CTE reference."""
+    reference = cte.queryset()
+    return (
+        models.QuerySet(model=model, query=reference.query.clone(), using=using)
+        .order_by()
+        .values(*columns)
+    )
+
+
+def attached_scope_plan(
+    cte: CTE,
+    body: models.QuerySet[Any],
+    model: type[models.Model],
+    actor: SubjectRef,
+    action: str,
+    using: str,
+    backend: LocalBackend,
+    columns: tuple[str, ...],
+    candidates: tuple[int, ...] | None = None,
+) -> SharedScopePlan:
+    """Read the fresh CTE body's pinned policy and caveat verdicts."""
+
+    def scopes(node: Any) -> Iterator[_Scope]:
+        if isinstance(node, _Scope):
+            yield node
+        elif isinstance(node, WhereNode):
+            for child in node.children:
+                yield from scopes(child)
+        else:
+            source = getattr(node, "get_source_expressions", None)
+            if callable(source):
+                for child in cast(Iterable[Any], source()):
+                    if child is not None:
+                        yield from scopes(child)
+
+    scope = next(scopes(body.query.where))
+    return SharedScopePlan(
+        cte,
+        model,
+        actor,
+        action,
+        using,
+        backend,
+        columns,
+        scope.policy,
+        scope.verdicts,
+        _shareable_scope(scope),
+        candidates=candidates,
+    )
+
+
+def _within_shared_candidates(query: Any, scope: _Scope, plan: SharedScopePlan, using: str) -> bool:
+    if plan.candidates is None:
+        return True
+    found = _known_identities(scope.model, scope.lhs, query.where, using)
+    return found is not None and set(found) <= set(plan.candidates)
+
+
+def matching_shared_scope(query: Any, scope: Any, using: str) -> SharedScopePlan | None:
+    """Match only the same identity and pinned, shareable permission state."""
+    if not isinstance(scope, _Scope):
+        return None
+    for plan in getattr(query, "_rebac_shared_scopes", ()):
+        if (
+            plan.shareable
+            and plan.model._meta.concrete_model is scope.model._meta.concrete_model
+            and model_resource_type(plan.model) == model_resource_type(scope.model)
+            and resource_id_attr(plan.model) == resource_id_attr(scope.model)
+            and plan.actor == scope.actor
+            and plan.action == scope.action
+            and plan.using == using == scope.using
+            and plan.backend is scope.backend
+            and plan.policy.key == scope.policy.key
+            and plan.verdicts == scope.verdicts
+            and _within_shared_candidates(query, scope, plan, using)
+        ):
+            return cast(SharedScopePlan, plan)
+    return None
+
+
+def scope_candidate_ids(
+    model: type[models.Model], query: Any, using: str
+) -> tuple[int, ...] | None:
+    """Accept only one native, mandatory bounded identity lookup on a CTE body."""
+    if len(query.where.children) != 1 or query.where.negated or query.where.connector != "AND":
+        return None
+    lhs = F(resource_id_attr(model)).resolve_expression(query)
+    return _known_identities(model, lhs, query.where, using)
+
+
+def statement_candidate_ids(
+    model: type[models.Model], query: Any, using: str
+) -> tuple[int, ...] | None:
+    """Prove a bounded identity set on the final statement's own row alias."""
+    if query.model._meta.concrete_model is not model._meta.concrete_model:
+        return None
+    lhs = F(resource_id_attr(model)).resolve_expression(query)
+    return _known_identities(model, lhs, query.where, using)
+
+
+def _permission_leaves(
+    expr: PermExpr, bound: Bound, found: dict[tuple[PermExpr, Bound], int]
+) -> None:
+    if isinstance(expr, PermBinOp):
+        _permission_leaves(expr.left, bound, found)
+        _permission_leaves(expr.right, bound.opposite() if expr.op == "-" else bound, found)
+    elif isinstance(expr, (PermRef, PermArrow)):
+        found.setdefault((expr, bound), len(found))
+
+
+def _action_expression(policy: _Policy, resource_type: str, action: str) -> PermExpr:
+    definition = policy.schema.get_definition(resource_type)
+    if definition is None:
+        return PermNil()
+    relation = find_relation(definition, action)
+    if relation is not None:
+        return PermRef(action)
+    permission = policy.schema.get_permission(resource_type, action)
+    return permission.expression if permission is not None else PermNil()
+
+
+def _closure_verdict(
+    closure: CTE,
+    leaves: Mapping[tuple[PermExpr, Bound], int],
+    expression: PermExpr,
+    model: type[models.Model],
+    using: str,
+) -> Q:
+    """Lower-bound permission algebra over one CTE of distinct leaf truths."""
+    reference = closure.queryset()
+    rows: models.QuerySet[Any] = models.QuerySet(
+        model=model, query=reference.query.clone(), using=using
+    )
+
+    def verdict(expr: PermExpr, bound: Bound) -> Q:
+        if isinstance(expr, PermNil):
+            return Q(Exact(Value(1), Value(0)))
+        if isinstance(expr, (PermRef, PermArrow)):
+            ordinal = leaves[(expr, bound)]
+            return Q(pk__in=rows.filter(_rebac_arm=ordinal).order_by().values("pk"))
+        if isinstance(expr, PermBinOp):
+            left = verdict(expr.left, bound)
+            right = verdict(expr.right, bound.opposite() if expr.op == "-" else bound)
+            if expr.op == "+":
+                return left | right
+            if expr.op == "&":
+                return left & right
+            return left & ~right
+        raise TypeError(f"Unknown permission expression {type(expr).__name__}")
+
+    return verdict(expression, Bound.LOWER)
+
+
+def attached_permission_plan(
+    model: type[models.Model],
+    actor: SubjectRef,
+    actions: tuple[str, ...],
+    using: str,
+    backend: LocalBackend,
+    columns: tuple[str, ...],
+    candidates: tuple[int, ...] | None,
+    name: str,
+) -> tuple[tuple[CTE, ...], SharedScopePlan] | None:
+    """Compile one closure and small per-action verdicts for an attached statement."""
+    operation = _Operation.begin(backend, actor, using)
+    resource_type = cast(str, model_resource_type(model))
+    verdicts = {action: operation.verdicts((resource_type, action)) for action in actions}
+    policy = operation.policy
+    shareable = (
+        all(verdict.empty for verdict in verdicts.values())
+        and not policy.caveat_deadlines
+        and not policy.tagged.arms
+        and not policy.tagged.sites
+        and not any(
+            relation.with_expiration
+            for definition in policy.schema.definitions
+            for relation in definition.relations
+        )
+        and all((resource_type, action) not in policy.program.recursive for action in actions)
+    )
+    if not shareable:
+        return None
+    definition = policy.schema.get_definition(resource_type)
+    leaves: dict[tuple[PermExpr, Bound], int] = {}
+    expressions = {action: _action_expression(policy, resource_type, action) for action in actions}
+    for action in actions:
+        _permission_leaves(expressions[action], Bound.LOWER, leaves)
+    if definition is None or not leaves:
+        return None
+    compiler = operation.compiler(
+        verdicts[actions[0]],
+        parametric=False,
+        share_subject_rows=True,
+        cte_owner="0",
+    )
+    gate = operation.gate(parametric=False)
+    arms: list[models.QuerySet[Any]] = []
+    for (leaf, bound), ordinal in leaves.items():
+        predicate = compiler._expression(
+            definition, leaf, _model_at(model), bound, {}, depth_possible=True
+        )
+        rows: models.QuerySet[Any] = model._base_manager.using(using)
+        if candidates is not None:
+            rows = rows.filter(_bound_in(F(resource_id_attr(model)), candidates))
+        if is_false(predicate):
+            continue
+        if not is_true(predicate):
+            rows = rows.filter(predicate)
+        arm = (
+            rows.filter(Exists(gate))
+            .order_by()
+            .annotate(_rebac_arm=Value(ordinal, output_field=models.IntegerField()))
+            .values("pk", "_rebac_arm")
+        )
+        try:
+            arm.query.get_compiler(using=using).as_sql()
+        except EmptyResultSet:
+            continue
+        arms.append(arm)
+    if not arms:
+        return None
+    closure_rows = arms[0].union(*arms[1:], all=True).order_by()
+    compiler.decide_native(closure_rows)
+    closure = CTE(closure_rows, name=f"{name}_closure")
+    body: models.QuerySet[Any] = model._base_manager.using(using)
+    if candidates is not None:
+        body = body.filter(_bound_in(F(resource_id_attr(model)), candidates))
+    body = (
+        body.filter(_closure_verdict(closure, leaves, expressions[actions[0]], model, using))
+        .order_by()
+        .values(*columns)
+    )
+    cte = CTE(body, name=name)
+    plan = SharedScopePlan(
+        cte,
+        model,
+        actor,
+        actions[0],
+        using,
+        backend,
+        columns,
+        policy,
+        verdicts[actions[0]],
+        True,
+        actions,
+        closure,
+        leaves,
+        tuple(item.name for item in (*compiler.statement_ctes(), closure, cte)),
+        candidates,
+    )
+    return (*compiler.statement_ctes(), closure, cte), plan
+
+
+def matching_shared_permission(query: Any, scope: Any, using: str) -> Q | None:
+    if not isinstance(scope, _Scope):
+        return None
+    for plan in getattr(query, "_rebac_shared_scopes", ()):
+        if (
+            plan.closure is not None
+            and scope.action in plan.actions
+            and plan.model._meta.concrete_model is scope.model._meta.concrete_model
+            and model_resource_type(plan.model) == model_resource_type(scope.model)
+            and resource_id_attr(plan.model) == resource_id_attr(scope.model)
+            and plan.actor == scope.actor
+            and plan.using == using == scope.using
+            and plan.backend is scope.backend
+            and plan.policy.key == scope.policy.key
+            and plan.verdicts == scope.verdicts
+            and _within_shared_candidates(query, scope, plan, using)
+        ):
+            return _closure_verdict(
+                plan.closure,
+                plan.leaf_ordinals,
+                _action_expression(
+                    plan.policy, cast(str, model_resource_type(plan.model)), scope.action
+                ),
+                plan.model,
+                plan.using,
+            )
+    return None
+
+
 def _iter_expressions[T](node: Any, kind: type[T]) -> Iterator[T]:
     """Visit Django expression children for a selected permission node type."""
     pending = [node]
@@ -2280,6 +2595,27 @@ def _known_identities(
     return None
 
 
+def _has_literal_identity_set(lhs: Any, where: Any) -> bool:
+    """Leave native ID-set lookups to the point/bounded compiler path."""
+    if type(lhs) is not Col:
+        return False
+    pending = [where]
+    while pending:
+        node = pending.pop()
+        if isinstance(node, WhereNode):
+            pending.extend(node.children)
+        elif (
+            type(node) in (In, _BoundIn)
+            and type(node.lhs) is Col
+            and node.lhs.alias == lhs.alias
+            and node.lhs.target is lhs.target
+            and type(node.rhs) in (list, tuple)
+            and bool(node.rhs)
+        ):
+            return True
+    return False
+
+
 class _Scope(Expression):
     """A queryset scope with policy and caveat verdicts pinned when built.
 
@@ -2367,6 +2703,15 @@ class _Scope(Expression):
             if plan[0]
             else None
         )
+        shared_scope = matching_shared_scope(compiler.query, self, connection.alias)
+        if shared_scope is not None and (
+            identities is not None or not _has_literal_identity_set(self.lhs, compiler.query.where)
+        ):
+            member = In(
+                self.lhs,
+                shared_scope.queryset().values(resource_id_attr(self.model)),
+            ).resolve_expression(compiler.query)
+            return cast(tuple[str, tuple[Any, ...]], compiler.compile(member))
         if identities is not None and len(identities) == 1 and self.point_projection:
             operation = self._operation(connection.alias)
             key = resource_type, self.action

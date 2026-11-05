@@ -14,6 +14,7 @@ from rebac import CheckItem, ObjectRef, RelationshipTuple, SubjectRef, sudo, to_
 from rebac.compile import read
 from rebac.compile.predicate import Compiler
 from rebac.evaluator import evaluator_scope
+from rebac.expressions import permission_expression
 from rebac.testing import install_schema
 from tests.testapp.models import Folder, Post
 
@@ -30,6 +31,8 @@ definition blog/post {
     relation caveated: auth/user with active
     relation admin: auth/group#member
     permission read = folder->read + admin
+    permission view = folder->read
+    permission edit = admin
     permission caveated_read = folder->read + caveated
 }
 """
@@ -86,6 +89,26 @@ def test_statement_cache_benchmark(monkeypatch: pytest.MonkeyPatch) -> None:
             Post.objects.with_actor(actor).with_action("caveated_read").values_list("pk", flat=True)
         )
 
+    def multi_action_scope() -> object:
+        actions = ("read", "view", "edit")
+        handle = Post.objects.with_actor(actor).filter(pk__in=ids).scope_cte(actions=actions)
+        projected = Post._base_manager.filter(pk__in=ids).annotate(
+            **{
+                f"can_{action}": permission_expression(Post, action, actor=actor)
+                for action in actions
+            }
+        )
+        return list(handle.attach(projected).values_list("pk", "can_read", "can_view", "can_edit"))
+
+    def multi_action_caveated() -> object:
+        actions = ("read", "caveated_read")
+        handle = Post.objects.with_actor(actor).filter(pk__in=ids).scope_cte(actions=actions)
+        projected = Post._base_manager.filter(pk__in=ids).annotate(
+            can_read=permission_expression(Post, "read", actor=actor),
+            can_caveated_read=permission_expression(Post, "caveated_read", actor=actor),
+        )
+        return list(handle.attach(projected).values_list("pk", "can_read", "can_caveated_read"))
+
     def evaluator_list() -> object:
         with evaluator_scope():
             return scope()
@@ -135,6 +158,8 @@ def test_statement_cache_benchmark(monkeypatch: pytest.MonkeyPatch) -> None:
         ),
         ("admin_decided_page", lambda: evaluator_page(admin)),
         ("caveated_scope", caveated_scope),
+        ("multi_action_scope", multi_action_scope),
+        ("multi_action_caveated", multi_action_caveated),
         ("bulk_300", bulk_check),
     ):
         phases = {}
@@ -200,6 +225,13 @@ def test_statement_cache_benchmark(monkeypatch: pytest.MonkeyPatch) -> None:
             warm = results[f"{prefix}_decided_{suffix}"]["after_cache"]["requests"][1]
             assert warm["probe_renders"] == 0
             assert warm["compiles"] == 0
+    assert results["caveated_scope"]["after_cache"]["requests"][1]["probe_renders"] == 0
+    assert results["multi_action_scope"]["after_cache"]["requests"][1]["queries"] == 1
+    assert results["multi_action_scope"]["after_cache"]["requests"][1]["probe_renders"] == 1
+    fallback = results["multi_action_caveated"]
+    assert fallback["before_no_cache"]["requests"][1]["compiles"] == 2
+    assert fallback["after_cache"]["requests"][1]["compiles"] == 0
+    assert fallback["after_cache"]["requests"][1]["probe_renders"] == 0
     other = SubjectRef.of("auth/user", "other")
     with sudo(reason="cross-actor statement-cache benchmark fixture"):
         other_folder = Folder.objects.create(name="other-allowed")
