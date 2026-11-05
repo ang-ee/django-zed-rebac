@@ -557,8 +557,7 @@ class RebacMixin(RebacTrackedMixin):
 
       - ``instance.with_actor(actor)`` — pin actor for subsequent
         ``check_access`` / ``has_access`` / ``save()`` / ``delete()`` calls.
-        Mirrors the queryset verb; ``as_user`` / ``as_agent`` are sugar
-        over it.
+        This mutates the instance and returns it; the queryset verb clones.
       - ``instance.sudo(reason="...")`` — bypass REBAC on this instance only.
         Per CLAUDE.md § 5a the flag is non-transitive: FK / reverse-FK / M2M
         accessors must not inherit it. (Today no accessor reads the flag, so
@@ -858,25 +857,6 @@ class RebacMixin(RebacTrackedMixin):
         self._rebac_sudo_reason = None
         self._rebac_sudo_audited = False
         return self
-
-    def as_user(self, user: Any) -> Self:
-        """Typed shorthand: pin a Django ``User`` as the actor.
-
-        Sugar for ``with_actor(to_subject_ref(user))`` — exactly one code
-        path lives in ``with_actor``.
-        """
-        from .actors import to_subject_ref
-
-        return self.with_actor(to_subject_ref(user))
-
-    def as_agent(self, agent: Any, *, on_behalf_of: Any | None = None) -> Self:
-        """Typed shorthand: pin an agent acting via a Grant.
-
-        Sugar for ``with_actor(grant_subject_ref(agent, on_behalf_of))``.
-        """
-        from .actors import grant_subject_ref
-
-        return self.with_actor(grant_subject_ref(agent, on_behalf_of))
 
     def sudo(self, *, reason: str) -> Self:
         """Bypass REBAC on this instance. Mandatory ``reason``.

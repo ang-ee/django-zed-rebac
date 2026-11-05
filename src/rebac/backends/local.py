@@ -235,20 +235,11 @@ class LocalBackend:
         # A rollback has no library-owned notification. Transactional pins
         # therefore live for one operation, including reused Atomic blocks.
         scoped = connection.get_autocommit() and not connection.in_atomic_block
-        decision_scoped = (
-            evaluator is not None
-            and evaluator._decision_connection is connection
-            and connection.in_atomic_block
-        )
-        if evaluator is not None and not (scoped or decision_scoped):
+        if evaluator is not None and not scoped:
             # A transactional read can see a revision that later rolls back.
             # Refresh the evaluator pin on its next autocommit operation.
             evaluator._schema_scope.snapshots(connection).clear()
-        scope = (
-            evaluator._schema_scope
-            if evaluator is not None and (scoped or decision_scoped)
-            else operation
-        )
+        scope = evaluator._schema_scope if evaluator is not None and scoped else operation
         pins = scope.snapshots(connection) if scope is not None else None
         operation_pins = operation.snapshots(connection) if operation is not None else None
         for candidate in (pins, operation_pins):
@@ -264,9 +255,7 @@ class LocalBackend:
                 )
             ):
                 if operation_pins is not None:
-                    operation_pins[self] = snapshot._replace(
-                        savepoint_ids=tuple(connection.savepoint_ids) if decision_scoped else None
-                    )
+                    operation_pins[self] = snapshot._replace(savepoint_ids=None)
                 return snapshot
 
         # Database I/O and waiting for another loader happen outside the process
@@ -356,7 +345,7 @@ class LocalBackend:
             if snapshot is not None:
                 pin = snapshot._replace(
                     invalidation_generation=invalidation,
-                    savepoint_ids=tuple(connection.savepoint_ids) if decision_scoped else None,
+                    savepoint_ids=None,
                 )
                 if pins is not None:
                     pins[self] = pin

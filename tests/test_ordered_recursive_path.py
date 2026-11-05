@@ -6,7 +6,7 @@ from django.db.models import Exists, OuterRef
 from django.test.utils import CaptureQueriesContext, isolate_apps
 
 import rebac.resources
-from rebac import RebacMixin, RelationshipTuple, SubjectRef, decision_scope, sudo, to_object_ref
+from rebac import RebacMixin, RelationshipTuple, SubjectRef, sudo, to_object_ref
 from rebac.testing import install_schema
 
 pytestmark = [pytest.mark.django_db(transaction=True), pytest.mark.pg_delta]
@@ -79,7 +79,7 @@ def ordered_path(monkeypatch):
                 editor.delete_model(OrderedPathNode)
 
 
-@pytest.mark.parametrize("shape", ["list", "pk_in", "exists", "decision_scope", "handle"])
+@pytest.mark.parametrize("shape", ["list", "pk_in", "exists"])
 def test_recursive_path_on_ordered_resource_matches_point_checks(ordered_path, shape):
     local, actor, model, nodes = ordered_path
     truth = {
@@ -111,23 +111,6 @@ def test_recursive_path_on_ordered_resource_matches_point_checks(ordered_path, s
                 ).values_list("pk", "admitted")
             )
             assert dict(rows) == {node.pk: node.pk in truth for node in nodes}
-        elif shape == "decision_scope":
-            with decision_scope():
-                rows = list(
-                    model.objects.with_actor(actor)
-                    .with_action("chain")
-                    .filter(pk__in=candidates)
-                    .values_list("pk", flat=True)
-                )
-            assert set(rows) == truth & set(candidates)
-        else:
-            handle = model.objects.with_actor(actor).with_action("chain").scope_cte()
-            rows = list(
-                handle.attach(model.objects.with_actor(actor).with_action("chain")).values_list(
-                    "pk", flat=True
-                )
-            )
-            assert set(rows) == truth
     path_sql = [query["sql"] for query in captured.captured_queries if "rebac_path" in query["sql"]]
     assert path_sql
     assert path_sql[-1].count("ORDER BY") == 1

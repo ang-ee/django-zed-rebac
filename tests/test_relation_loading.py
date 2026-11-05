@@ -96,14 +96,14 @@ def test_relation_actor_public_result_is_actor_or_none(alice):
     from tests.testapp.models import Post
 
     ref = SubjectRef.of("auth/user", str(alice.pk))
-    pinned = relation_actor(Post.objects.as_user(alice))
+    pinned = relation_actor(Post.objects.with_actor(alice))
     assert isinstance(pinned, SubjectRef)
     assert pinned == ref
     with actor_context(ref):
         assert relation_actor(Post.objects.all()) == ref
         with sudo(reason="test.relation-actor"):
             assert relation_actor(Post.objects.all()) is None
-            assert relation_actor(Post.objects.as_user(alice)) == ref
+            assert relation_actor(Post.objects.with_actor(alice)) == ref
 
 
 @pytest.mark.django_db
@@ -139,7 +139,7 @@ def test_rebac_select_related_preserves_join_and_raises_for_denied_related(alice
     post = _post("visible", folder=folder)
     _grant("blog/post", post.pk, "viewer", alice)
 
-    qs = Post.objects.as_user(alice).rebac_select_related("folder").filter(pk=post.pk)
+    qs = Post.objects.with_actor(alice).rebac_select_related("folder").filter(pk=post.pk)
     assert "JOIN" in str(qs.query)
 
     with pytest.raises(PermissionDenied):
@@ -157,7 +157,7 @@ def test_rebac_select_related_tags_readable_related_without_extra_query(
     _grant("blog/post", post.pk, "viewer", alice)
     _grant("blog/folder", folder.pk, "viewer", alice)
 
-    row = Post.objects.as_user(alice).rebac_select_related("folder").get(pk=post.pk)
+    row = Post.objects.with_actor(alice).rebac_select_related("folder").get(pk=post.pk)
 
     assert row.folder.actor() == SubjectRef.of("auth/user", str(alice.pk))
     with django_assert_num_queries(0):
@@ -187,7 +187,9 @@ def test_rebac_select_related_redacts_and_tags_every_copy_of_shared_related_row(
     for post in posts:
         _grant("blog/post", post.pk, "viewer", alice)
 
-    rows = list(Post.objects.as_user(alice).on_field_deny("redact").rebac_select_related("folder"))
+    rows = list(
+        Post.objects.with_actor(alice).on_field_deny("redact").rebac_select_related("folder")
+    )
 
     assert len(rows) == 2
     assert rows[0].folder is not rows[1].folder
@@ -255,7 +257,7 @@ def test_rebac_select_related_preserves_globally_readable_targets(alice):
     post = _post("visible", folder=folder)
     _grant("blog/post", post.pk, "viewer", alice)
 
-    row = Post.objects.as_user(alice).rebac_select_related("folder").get(pk=post.pk)
+    row = Post.objects.with_actor(alice).rebac_select_related("folder").get(pk=post.pk)
 
     assert row.folder.name == "globally readable"
 
@@ -270,7 +272,7 @@ def test_pinned_actor_select_related_still_guards_inside_ambient_sudo(alice):
 
     with sudo(reason="test.ambient"):
         with pytest.raises(PermissionDenied):
-            Post.objects.as_user(alice).rebac_select_related("folder").get(pk=post.pk)
+            Post.objects.with_actor(alice).rebac_select_related("folder").get(pk=post.pk)
 
 
 @pytest.mark.django_db
@@ -324,7 +326,7 @@ def test_rebac_select_related_rejects_related_field_projection(alice):
     _grant("blog/post", post.pk, "viewer", alice)
 
     with pytest.raises(PermissionDenied):
-        list(Post.objects.as_user(alice).rebac_select_related("folder").values("folder__name"))
+        list(Post.objects.with_actor(alice).rebac_select_related("folder").values("folder__name"))
 
 
 @pytest.mark.django_db
@@ -360,7 +362,7 @@ def test_rebac_prefetch_related_scopes_reverse_relation(alice):
     _grant("blog/folder", folder.pk, "viewer", alice)
     _grant("blog/post", visible.pk, "viewer", alice)
 
-    row = Folder.objects.as_user(alice).rebac_prefetch_related("posts").get(pk=folder.pk)
+    row = Folder.objects.with_actor(alice).rebac_prefetch_related("posts").get(pk=folder.pk)
 
     assert [post.title for post in row.posts.all()] == ["visible"]
     assert hidden.title == "hidden"
@@ -396,7 +398,7 @@ def test_pinned_actor_keeps_prefetched_scope_inside_ambient_sudo(alice):
     _grant("blog/post", visible.pk, "viewer", alice)
 
     with sudo(reason="test.ambient-prefetch"):
-        row = Folder.objects.as_user(alice).rebac_prefetch_related("posts").get(pk=folder.pk)
+        row = Folder.objects.with_actor(alice).rebac_prefetch_related("posts").get(pk=folder.pk)
 
     assert [post.title for post in row.posts.all()] == ["visible"]
 
@@ -414,7 +416,7 @@ def test_actor_pinned_after_prefetch_scopes_related_rows_inside_ambient_sudo(ali
     _grant("blog/post", hidden.pk, "viewer", bob)
 
     with actor_context(SubjectRef.of("auth/user", str(bob.pk))):
-        queryset = Folder.objects.rebac_prefetch_related("posts").as_user(alice)
+        queryset = Folder.objects.rebac_prefetch_related("posts").with_actor(alice)
         with sudo(reason="test.ambient-prefetch"):
             row = queryset.get(pk=folder.pk)
 
@@ -440,7 +442,7 @@ def test_prefetch_does_not_transfer_instance_hint_authority_to_reused_queryset(a
     posts_qs = Post.objects.all()
     with actor_context(bob):
         list(
-            Folder.objects.as_user(alice)
+            Folder.objects.with_actor(alice)
             .filter(pk=folder.pk)
             .prefetch_related(Prefetch("posts", queryset=posts_qs))
         )
@@ -457,7 +459,7 @@ def test_db_manager_instance_hint_does_not_pin_actor(alice):
     from tests.testapp.models import Folder, Post
 
     bob, folder, _alice_post, bob_post = _split_related_posts(alice)
-    pinned_folder = Folder.objects.as_user(alice).get(pk=folder.pk)
+    pinned_folder = Folder.objects.with_actor(alice).get(pk=folder.pk)
     hinted = Post.objects.db_manager(hints={"instance": pinned_folder}).all()
 
     with actor_context(bob):
@@ -471,7 +473,7 @@ def test_plain_prefetched_related_manager_uses_root_instance_pin(alice):
     bob, folder, alice_post, _bob_post = _split_related_posts(alice)
     with actor_context(bob):
         [loaded] = list(
-            Folder.objects.as_user(alice).filter(pk=folder.pk).prefetch_related("posts")
+            Folder.objects.with_actor(alice).filter(pk=folder.pk).prefetch_related("posts")
         )
         assert [post.pk for post in loaded.posts.all()] == [alice_post.pk]
 
@@ -488,7 +490,7 @@ def test_iterator_prefetched_related_manager_uses_pinned_root_actor(alice):
     bob, folder, alice_post, _bob_post = _split_related_posts(alice)
     with actor_context(bob):
         rows = list(
-            Folder.objects.as_user(alice)
+            Folder.objects.with_actor(alice)
             .filter(pk=folder.pk)
             .prefetch_related("posts")
             .iterator(chunk_size=1)
@@ -506,7 +508,7 @@ def test_aiterator_prefetched_related_manager_uses_pinned_root_actor(alice):
     from tests.testapp.models import Folder
 
     bob, folder, alice_post, _bob_post = _split_related_posts(alice)
-    queryset = Folder.objects.as_user(alice).filter(pk=folder.pk).prefetch_related("posts")
+    queryset = Folder.objects.with_actor(alice).filter(pk=folder.pk).prefetch_related("posts")
 
     async def collect():
         return [row async for row in queryset.aiterator(chunk_size=1)]
@@ -528,7 +530,7 @@ def test_rebac_prefetch_related_scopes_nested_protected_prefix(alice):
     _post("child post", folder=hidden_child)
     _grant("blog/folder", root.pk, "viewer", alice)
 
-    row = Folder.objects.as_user(alice).rebac_prefetch_related("children__posts").get(pk=root.pk)
+    row = Folder.objects.with_actor(alice).rebac_prefetch_related("children__posts").get(pk=root.pk)
 
     assert list(row.children.all()) == []
 
@@ -560,7 +562,7 @@ def test_rebac_prefetch_preserves_unprotected_tail(
 
     folder, visible = authored_folder
     row = (
-        Folder.objects.as_user(alice)
+        Folder.objects.with_actor(alice)
         .rebac_prefetch_related(f"authored_posts__{tail}")
         .get(pk=folder.pk)
     )
@@ -585,7 +587,7 @@ def test_rebac_prefetch_preserves_unprotected_custom_queryset_and_to_attr(
     folder, _ = authored_folder
     author_queryset = get_user_model().objects.filter(username="author-0")
     lookup = Prefetch("authored_posts__author", queryset=author_queryset, to_attr="selected_author")
-    row = Folder.objects.as_user(alice).rebac_prefetch_related(lookup).get(pk=folder.pk)
+    row = Folder.objects.with_actor(alice).rebac_prefetch_related(lookup).get(pk=folder.pk)
 
     assert lookup.queryset is author_queryset
     assert lookup.prefetch_to == "authored_posts__selected_author"
@@ -604,7 +606,7 @@ def test_rebac_prefetch_protected_terminal_keeps_scoped_custom_queryset(
     folder, visible = authored_folder
     queryset = AuthoredPost.objects.filter(title__in=["post-0", "post-2"])
     lookup = Prefetch("authored_posts", queryset=queryset, to_attr="selected_posts")
-    row = Folder.objects.as_user(alice).rebac_prefetch_related(lookup).get(pk=folder.pk)
+    row = Folder.objects.with_actor(alice).rebac_prefetch_related(lookup).get(pk=folder.pk)
 
     assert lookup.queryset is queryset
     assert queryset.actor() is None
@@ -637,7 +639,7 @@ def test_rebac_prefetch_tail_preserves_each_protected_prefix_and_field_gate(
     # native autocommit to measure the prefetched graph within one request scope.
     with evaluator_scope():
         row = (
-            Folder.objects.as_user(alice)
+            Folder.objects.with_actor(alice)
             .on_field_deny("redact")
             .rebac_prefetch_related("children__authored_posts__author__groups")
             .get(pk=root.pk)
@@ -702,7 +704,7 @@ def test_selected_related_checks_only_distinct_joined_ids(alice, monkeypatch, se
     monkeypatch.setattr(
         active, "grants_all", lambda **kwargs: pytest.fail("bounded rows need no universal proof")
     )
-    rows = list(Post.objects.as_user(alice).rebac_select_related("folder"))
+    rows = list(Post.objects.with_actor(alice).rebac_select_related("folder"))
     assert len(rows) == 2
     assert requested == [("read", (str(folder.pk),))]
     assert all(row.folder.name == "selected" for row in rows)
@@ -740,7 +742,7 @@ def test_materialized_field_visibility_checks_only_fetched_ids(
         active, "grants_all", lambda **kwargs: pytest.fail("bounded rows need no universal proof")
     )
     rows = list(
-        AuthoredPost.objects.as_user(alice)
+        AuthoredPost.objects.with_actor(alice)
         .on_field_deny("redact")
         .filter(pk__in=(readable.pk, denied.pk))
     )
@@ -858,8 +860,8 @@ def test_sql_scope_combination_uses_each_operand_model(alice, operation):
         post = Post.objects.create(pk=771, title="readable")
     assert folder.pk == post.pk
     _grant("blog/post", post.pk, "viewer", alice)
-    posts = Post.objects.as_user(alice).values_list("pk", flat=True)
-    folders = Folder.objects.as_user(alice).values_list("pk", flat=True)
+    posts = Post.objects.with_actor(alice).values_list("pk", flat=True)
+    folders = Folder.objects.with_actor(alice).values_list("pk", flat=True)
     rows = (
         posts.union(folders, all=True)
         if operation == "union"

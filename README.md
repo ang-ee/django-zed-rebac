@@ -17,9 +17,9 @@ The runtime backend uses one Python API:
 - **`LocalBackend`** — pure Django. A permission is compiled to a query over your own tables and the relationship table and evaluated when it is read: field-, attribute- and const-backed relations come from the model columns, stored relations from tuples. The library stores no row per application row, there is no build step, and a write is visible to the next read. Recursive permissions are unrolled to `REBAC_DEPTH_LIMIT` levels. Caveats are decided in Python and bound into the statement. See [the design and its limits](./docs/ARCHITECTURE.md#compiled-permissions--the-localbackend-read-path).
 `REBAC_BACKEND` accepts only `"local"`. A remote SpiceDB adapter is planned.
 
-Add the mixin to your model and `Post.objects.all()` returns only what the user can read. Add `Model.objects.with_actor(actor)` for explicit actor scoping in Celery tasks, GraphQL resolvers, management commands, and other non-HTTP entrypoints — `actor` can be a Django `User`, a registered `Agent`, an `agents/grant` (agent-acting-on-behalf-of-user, shipped by your `agents` app), or anything `@rebac_subject`-registered. Typed shorthands `as_user(user)` and `as_agent(agent, on_behalf_of=user)` cover the common cases. The default Django actor labels are `auth/user` and `auth/group`; include their definitions in your application schema (automatic base-schema emission is planned). `agents/agent`, `agents/grant`, `auth/apikey`, and other subject types live in your own apps.
+Add the mixin to your model and `Post.objects.all()` returns only what the user can read. Add `Model.objects.with_actor(actor)` for explicit actor scoping in Celery tasks, GraphQL resolvers, management commands, and other non-HTTP entrypoints — `actor` can be a Django `User`, a registered `Agent`, an `agents/grant` (agent-acting-on-behalf-of-user, shipped by your `agents` app), or anything `@rebac_subject`-registered. The default Django actor labels are `auth/user` and `auth/group`; include their definitions in your application schema (automatic base-schema emission is planned). `agents/agent`, `agents/grant`, `auth/apikey`, and other subject types live in your own apps.
 
-The agent shorthands resolve identities only. Applications own the delegation
+Actor conversion resolves identities only. Applications own the delegation
 schema and grant relationships; choosing a grant subject does not create those
 relationships or inherit the requester's permissions.
 
@@ -97,7 +97,7 @@ def post_detail(request, pk):
     return render(request, "post.html", {"post": post})
 ```
 
-That's the end-to-end flow. The same `Post.objects.with_actor(...)` pattern works in DRF viewsets, Celery tasks, GraphQL resolvers, management commands, and MCP tools — the actor can be a Django `User`, an `Agent`, an `agents/grant`, or any registered subject. Typed shorthands `as_user(request.user)` and `as_agent(agent, on_behalf_of=request.user)` cover the common cases.
+That's the end-to-end flow. The same `Post.objects.with_actor(...)` pattern works in DRF viewsets, Celery tasks, GraphQL resolvers, management commands, and MCP tools — the actor can be a Django `User`, an `Agent`, an `agents/grant`, or any registered subject.
 
 For an operation on another database, use `with rebac.database_context("alias"):`
 to select the default for REBAC schema, tuple, membership and audit operations.

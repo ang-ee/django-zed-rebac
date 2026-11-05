@@ -7,6 +7,12 @@ pre-1.0; breaking changes within a minor version are explicitly called out.
 
 ### Changed
 
+- The remaining union owner, point checks, and queryset scopes compile through
+  one statement entry. Row, set, fact, and field-visibility decisions use one
+  bounded memo helper; scope preparation has one plan slot per database alias.
+  `RebacQuerySet.action()` reports its resolved read action, and
+  `rebac.relation_loading.pinned_actor()` reports an explicit row or queryset
+  pin without consulting ambient context.
 - Decided queryset statements now reuse compiled SQL across requests with the
   same witnessed outcome and native inline/shared choice. Decided IDs and
   support values bind at execution; revisions, override deadlines, settings
@@ -48,6 +54,7 @@ pre-1.0; breaking changes within a minor version are explicitly called out.
 
 ### Removed
 
+- **Breaking (DC cleanup):** Removed `RebacQuerySet.scope_cte()`, its `SharedScope` handle, the multi-action closure and late attachment machinery, `decision_scope()`, and the `as_user()` / `as_agent()` queryset and instance aliases. Use `with_actor(user)`, `with_actor(agent)` or `with_actor(grant_subject_ref(agent, user))` for actor pinning. Use `evaluator_scope()` for per-request caching and ordinary actor-scoped querysets / `permission_expression()` for composition. `evaluator_scope()` never pins an atomic transaction; each operation in a transaction validates its own schema snapshot. Removed the inert `REBAC_RELATIONSHIP_MODEL`, `REBAC_DEFAULT_CONSISTENCY`, `REBAC_CACHE_ALIAS`, `REBAC_LOOKUP_CACHE_TTL`, and `REBAC_GC_INTERVAL_SECONDS` settings.
 - **Breaking:** Removed the unimplemented `SpiceDBBackend`, the `Backend` ABC,
   the `spicedb` extra, and four `REBAC_SPICEDB_*` settings. `REBAC_BACKEND`
   accepts only `"local"`; `rebac.E002` and `rebac.W101` no longer apply.

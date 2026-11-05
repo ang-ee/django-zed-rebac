@@ -1,8 +1,9 @@
 """Compile schema permission membership into Django ORM predicates.
 
-No application resource IDs are read into Python.  A predicate evaluates at
-an identity expression, so a tuple-only object can participate in both grants
-and exclusions without a corresponding model row.
+The inline predicate evaluates at an identity expression, so a tuple-only
+object can participate in grants and exclusions without a corresponding model
+row. Decided plans may read bounded application IDs into Python before binding
+them back into a witnessed statement.
 
 Three rules shape every statement:
 

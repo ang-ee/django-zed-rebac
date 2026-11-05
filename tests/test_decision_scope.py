@@ -1,4 +1,4 @@
-"""Transaction pins and collector gates have constant revision and gate counts."""
+"""Evaluator reuse, transaction boundaries and collector gates."""
 
 from concurrent.futures import ThreadPoolExecutor
 from contextvars import copy_context
@@ -14,7 +14,6 @@ from rebac import (
     RelationshipTuple,
     SubjectRef,
     backend,
-    decision_scope,
     evaluator_scope,
     sudo,
     to_object_ref,
@@ -56,7 +55,7 @@ def _revision_reads(queries):
 
 
 @pytest.mark.pg_delta
-def test_embedded_bypass_audits_once_per_execution_inside_decision_scope():
+def test_embedded_bypass_audits_once_per_execution_inside_evaluator_scope():
     with sudo(reason="bypass audit fixture"):
         post = Post.objects.create(title="p")
     reason = "embedded decision scope bypass"
@@ -64,7 +63,7 @@ def test_embedded_bypass_audits_once_per_execution_inside_decision_scope():
     outer = Post._base_manager.filter(pk__in=inner).filter(pk__in=inner)
     audits = PermissionAuditEvent.objects.filter(kind="sudo.bypass", reason=reason)
 
-    with decision_scope():
+    with evaluator_scope():
         assert audits.count() == 0
         assert list(outer) == [post]
         assert audits.count() == 1
@@ -87,7 +86,7 @@ def test_bounded_read_collects_embedded_bypass_once_per_execution():
     )
     audits = PermissionAuditEvent.objects.filter(kind="sudo.bypass", reason=reason)
 
-    with decision_scope():
+    with evaluator_scope():
         assert list(outer.values_list("pk", flat=True)) == [post.pk]
         assert audits.count() == 1
         assert list(outer.values_list("pk", flat=True)) == [post.pk]
@@ -95,7 +94,7 @@ def test_bounded_read_collects_embedded_bypass_once_per_execution():
 
 
 @pytest.mark.pg_delta
-def test_held_many_statements_do_not_emit_bypass_audits_inside_decision_scope():
+def test_held_many_statements_do_not_emit_bypass_audits_inside_evaluator_scope():
     local = install_schema(
         """
         definition auth/user {}
@@ -111,7 +110,7 @@ def test_held_many_statements_do_not_emit_bypass_audits_inside_decision_scope():
         post = Post.objects.create(title="p")
     baseline = PermissionAuditEvent.objects.filter(kind="sudo.bypass").count()
 
-    with decision_scope(), CaptureQueriesContext(connection) as queries:
+    with evaluator_scope(), CaptureQueriesContext(connection) as queries:
         assert local.held_many(
             subject=ACTOR,
             actions=("read__title", "read__body"),
@@ -122,7 +121,7 @@ def test_held_many_statements_do_not_emit_bypass_audits_inside_decision_scope():
     assert all("rebac_scope_" not in query["sql"] for query in queries.captured_queries)
 
 
-def test_decision_scope_reuses_one_revision_and_one_preparation_for_twenty_checks():
+def test_evaluator_scope_reuses_one_revision_and_one_preparation_for_twenty_checks():
     local = _stored_schema()
     with sudo(reason="decision scope fixture"):
         posts = [Post.objects.create(title=f"p{i}") for i in range(20)]
@@ -133,7 +132,7 @@ def test_decision_scope_reuses_one_revision_and_one_preparation_for_twenty_check
     def run(count, scoped):
         with CaptureQueriesContext(connection) as queries:
             if scoped:
-                with decision_scope():
+                with evaluator_scope():
                     for post in posts[:count]:
                         assert local.has_access(
                             subject=ACTOR,
@@ -155,19 +154,19 @@ def test_decision_scope_reuses_one_revision_and_one_preparation_for_twenty_check
     twenty = run(20, True)
     assert _revision_reads(unscoped) == 10
     assert _revision_reads(ten) == _revision_reads(twenty) == 1
-    # BEGIN and COMMIT are counted. Each additional check costs one point
-    # statement; schema and actor-set preparation have constant cost.
-    assert len(ten) == 14
+    # Each additional check costs one point statement; schema and actor-set
+    # preparation have constant cost in the evaluator scope.
+    assert len(ten) == 12
     assert len(twenty) - len(ten) == 10
 
 
-def test_decision_scope_revalidates_at_next_transaction_and_after_rollback():
+def test_evaluator_scope_revalidates_at_next_transaction_and_after_rollback():
     local = _stored_schema()
     with sudo(reason="decision scope fixture"):
         post = Post.objects.create(title="p")
     resource = ObjectRef("blog/post", str(post.pk))
     local.write_relationships([RelationshipTuple(resource, "owner", ACTOR)])
-    with decision_scope():
+    with evaluator_scope():
         assert local.has_access(subject=ACTOR, action="read", resource=resource)
         with pytest.raises(RuntimeError), transaction.atomic():
             SchemaPermission.objects.filter(
@@ -176,30 +175,29 @@ def test_decision_scope_revalidates_at_next_transaction_and_after_rollback():
             assert local.has_access(subject=ACTOR, action="read", resource=resource)
             raise RuntimeError("rollback")
         assert local.has_access(subject=ACTOR, action="read", resource=resource)
-    with pytest.raises(RuntimeError), decision_scope():
+    with pytest.raises(RuntimeError), evaluator_scope():
         SchemaDefinition.objects.create(resource_type="scope/rolledback")
         assert local.has_access(subject=ACTOR, action="read", resource=resource)
         raise RuntimeError("rollback")
-    with CaptureQueriesContext(connection) as queries, decision_scope():
+    with CaptureQueriesContext(connection) as queries, evaluator_scope():
         assert local.has_access(subject=ACTOR, action="read", resource=resource)
-    # A rollback evicts the shared parsed snapshot; a cold reload fences it
-    # with a second revision read before publishing it.
-    assert _revision_reads(queries) == 2
+    # Each evaluator scope validates the current committed revision.
+    assert _revision_reads(queries) == 1
     SchemaPermission.objects.filter(definition__resource_type="blog/post", name="read").update(
         expression="folder->read"
     )
-    with decision_scope():
+    with evaluator_scope():
         assert not local.has_access(subject=ACTOR, action="read", resource=resource)
 
 
-def test_decision_scope_observes_arrow_revocation_after_row_memo():
+def test_evaluator_scope_observes_arrow_revocation_after_row_memo():
     local = install_schema(ARROW_SCHEMA)
     with sudo(reason="decision scope fixture"):
         folder = Folder.objects.create(name="f")
         post = Post.objects.create(title="p", folder=folder)
     relation = RelationshipTuple(to_object_ref(folder), "viewer", ACTOR)
     local.write_relationships([relation])
-    with decision_scope() as evaluator:
+    with evaluator_scope() as evaluator:
         assert set(Post.objects.with_actor(ACTOR).values_list("pk", flat=True)) == {post.pk}
         assert evaluator.stats()["row_decision_entries"] > 0
         local.delete_relationship(relation)
@@ -207,7 +205,7 @@ def test_decision_scope_observes_arrow_revocation_after_row_memo():
 
 
 @pytest.mark.pg_delta
-def test_bounded_decision_scope_memo_is_shared_and_savepoint_safe():
+def test_bounded_evaluator_scope_candidate_reads_are_savepoint_safe():
     local = install_schema(ARROW_SCHEMA)
     with sudo(reason="bounded memo fixture"):
         folder = Folder.objects.create(name="f")
@@ -218,127 +216,17 @@ def test_bounded_decision_scope_memo_is_shared_and_savepoint_safe():
     def visible(*ids):
         return set(Post.objects.with_actor(ACTOR).filter(pk__in=ids).values_list("pk", flat=True))
 
-    with decision_scope() as evaluator:
-        with CaptureQueriesContext(connection) as cold:
-            assert visible(posts[0].pk) == {posts[0].pk}
-        keys = set(evaluator._row_decisions)
-        assert keys
-        with CaptureQueriesContext(connection) as warm:
-            assert visible(posts[1].pk) == {posts[1].pk}
-        # The target decision is reused across different root candidate sets.
-        assert set(evaluator._row_decisions) == keys
-        assert len(cold) > len(warm)
+    with evaluator_scope() as evaluator:
+        assert visible(posts[0].pk) == {posts[0].pk}
+        assert visible(posts[1].pk) == {posts[1].pk}
+        # Candidate-root statements remain inline in an ordinary evaluator.
+        assert not evaluator._row_decisions
 
         with pytest.raises(RuntimeError), transaction.atomic():
             local.delete_relationship(relation)
             assert visible(posts[0].pk) == set()
             raise RuntimeError("rollback")
         assert visible(posts[0].pk) == {posts[0].pk}
-
-
-@pytest.mark.pg_delta
-def test_attached_shared_scope_reuses_witnessed_decisions_across_savepoints():
-    local = install_schema(ARROW_SCHEMA)
-    with sudo(reason="shared decision fixture"):
-        folder = Folder.objects.create(name="f")
-        posts = [Post.objects.create(title=f"p{i}", folder=folder) for i in range(2)]
-    relation = RelationshipTuple(to_object_ref(folder), "viewer", ACTOR)
-    local.write_relationships([relation])
-    shared = Post.objects.with_actor(ACTOR).scope_cte()
-
-    def visible():
-        rows = Post._base_manager.filter(pk__in=shared.queryset().values("pk"))
-        return set(shared.attach(rows).values_list("pk", flat=True))
-
-    with decision_scope() as evaluator:
-        with CaptureQueriesContext(connection) as cold:
-            assert visible() == {post.pk for post in posts}
-        keys = set(evaluator._row_decisions)
-        assert keys
-        with CaptureQueriesContext(connection) as warm:
-            assert visible() == {post.pk for post in posts}
-        assert set(evaluator._row_decisions) == keys
-        assert len(warm) < len(cold)
-
-        with pytest.raises(RuntimeError), transaction.atomic():
-            local.delete_relationship(relation)
-            assert visible() == set()
-            raise RuntimeError("rollback")
-        assert visible() == {post.pk for post in posts}
-
-
-@pytest.mark.pg_delta
-def test_attached_shared_scope_plain_outer_audits_embedded_bypass_once():
-    local = install_schema(ARROW_SCHEMA)
-    with sudo(reason="shared bypass fixture"):
-        folder = Folder.objects.create(name="f")
-        post = Post.objects.create(title="p", folder=folder)
-    local.write_relationships([RelationshipTuple(to_object_ref(folder), "viewer", ACTOR)])
-    shared = Post.objects.with_actor(ACTOR).scope_cte()
-    reason = "shared plain outer bypass"
-    bypass = Post.objects.system_context(reason=reason).values("pk")
-    rows = Post._base_manager.filter(pk__in=shared.queryset().values("pk"))
-    rows = rows.filter(pk__in=bypass).filter(pk__in=bypass)
-    attached = shared.attach(rows)
-    audits = PermissionAuditEvent.objects.filter(kind="sudo.bypass", reason=reason)
-
-    with decision_scope():
-        assert list(attached.values_list("pk", flat=True)) == [post.pk]
-        assert audits.count() == 1
-        assert list(attached.values_list("pk", flat=True)) == [post.pk]
-        assert audits.count() == 2
-
-
-@pytest.mark.pg_delta
-@pytest.mark.parametrize("memberships", [1, 20])
-def test_attached_shared_body_respects_set_budget_and_binds_decided_ids(memberships):
-    local = install_schema(
-        """
-        definition auth/user {}
-        definition auth/group { relation member: auth/user | auth/group#member }
-        definition blog/folder {
-            relation viewer: auth/group#member
-            permission read = viewer
-        }
-        definition blog/post {
-            relation folder: blog/folder // rebac:field=folder
-            permission read = folder->read
-        }
-        """
-    )
-    actor = SubjectRef.of("auth/user", "shared-budget")
-    with sudo(reason="shared budget fixture"):
-        folder = Folder.objects.create(name="f")
-        post = Post.objects.create(title="p", folder=folder)
-    local.write_relationships(
-        [
-            relation
-            for index in range(memberships)
-            for relation in (
-                RelationshipTuple(ObjectRef("auth/group", f"g{index}"), "member", actor),
-                RelationshipTuple(
-                    to_object_ref(folder),
-                    "viewer",
-                    SubjectRef.of("auth/group", f"g{index}", "member"),
-                ),
-            )
-        ]
-    )
-    shared = Post.objects.with_actor(actor).scope_cte()
-    with decision_scope() as evaluator:
-        with CaptureQueriesContext(connection) as queries:
-            attached = shared.attach(
-                Post._base_manager.filter(pk__in=shared.queryset().values("pk"))
-            )
-            assert list(attached.values_list("pk", flat=True)) == [post.pk]
-        assert evaluator._row_decisions
-        sql = queries.captured_queries[-1]["sql"]
-        _, params = attached.query.sql_with_params()
-    assert ("rebac_sets_" in sql) is (memberships == 20)
-    if connection.vendor == "postgresql":
-        assert "rebac_decided_" in sql
-        assert "= ANY(" in sql
-        assert any(isinstance(param, list) for param in params)
 
 
 def test_plain_savepoint_rollback_discards_inner_row_memo():
@@ -352,7 +240,7 @@ def test_plain_savepoint_rollback_discards_inner_row_memo():
     def visible():
         return set(Post.objects.with_actor(ACTOR).values_list("pk", flat=True))
 
-    with decision_scope():
+    with evaluator_scope():
         assert visible() == {post.pk}
         with pytest.raises(RuntimeError), transaction.atomic():
             local.delete_relationship(relation)
@@ -372,7 +260,7 @@ def test_plain_savepoint_rollback_discards_schema_pin():
         post = Post.objects.create(title="p")
     resource = to_object_ref(post)
     local.write_relationships([RelationshipTuple(resource, "owner", ACTOR)])
-    with decision_scope():
+    with evaluator_scope():
         assert local.has_access(subject=ACTOR, action="read", resource=resource)
 
 
@@ -389,7 +277,7 @@ def test_plain_savepoint_rollback_discards_backed_row_memo():
     def visible():
         return set(Post.objects.with_actor(ACTOR).values_list("pk", flat=True))
 
-    with decision_scope():
+    with evaluator_scope():
         assert visible() == {first.pk}
         with pytest.raises(RuntimeError), transaction.atomic():
             with sudo(reason="rolled back backing move"):
@@ -449,7 +337,7 @@ def test_delete_keeps_django_unsaved_guard_and_clears_queryset_cache():
 
 @pytest.mark.pg_delta
 @pytest.mark.skipif(connection.vendor != "postgresql", reason="requires a second connection")
-def test_copied_context_cannot_reuse_transaction_row_memo():
+def test_copied_context_cannot_read_uncommitted_backing_write():
     local = install_schema(ARROW_SCHEMA)
     with sudo(reason="second connection fixture"):
         folder = Folder.objects.create(name="f")
@@ -461,7 +349,7 @@ def test_copied_context_cannot_reuse_transaction_row_memo():
     def visible():
         return set(Post.objects.with_actor(ACTOR).values_list("pk", flat=True))
 
-    with decision_scope():
+    with transaction.atomic(), evaluator_scope():
         with sudo(reason="uncommitted backing write"):
             Folder.objects.filter(pk=other.pk).update(parent=folder)
         assert visible() == {post.pk, second.pk}
@@ -492,14 +380,14 @@ def test_concurrent_revision_commit_closes_pinned_predicate_until_next_scope():
         finally:
             close_old_connections()
 
-    with decision_scope():
+    with evaluator_scope():
         assert local.has_access(subject=ACTOR, action="read", resource=resource)
         with ThreadPoolExecutor(max_workers=1) as pool:
             pool.submit(publish_revision).result(timeout=10)
         # An external publisher cannot invalidate this process's pin. The
         # statement's revision fence still denies under READ COMMITTED.
         assert not local.has_access(subject=ACTOR, action="read", resource=resource)
-    with decision_scope():
+    with evaluator_scope():
         # The schema rows did not change; the new revision is loaded and the
         # originally granted relationship is visible again.
         assert local.has_access(subject=ACTOR, action="read", resource=resource)

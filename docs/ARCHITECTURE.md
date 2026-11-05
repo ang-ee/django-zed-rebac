@@ -23,7 +23,7 @@ Core capabilities:
   - **Tier 2 — Override.** Admin-editable tweaks on top of the package baseline.
   - **Tier 3 — Relationship.** The actual edges in `Relationship` rows.
 - **One unified check API:** `check_access(op)` / `has_access(op)` / `accessible(op)` (borrowed from Odoo 18's PR #179148 unification). No model-level vs record-level split at the call site.
-- **`Model.objects.with_actor(actor)` / `instance.sudo(reason=...)`** — distinct verbs for distinct intents. The actor is any `SubjectRef` — a Django `User`, a registered `Agent`, an `agents/grant` (agent-acting-on-behalf-of-user), an `auth/apikey`, or any `@rebac_subject`-registered object. `as_user(u)` and `as_agent(agent, on_behalf_of=u)` are typed shorthands. Mandatory `reason` on bypass, originating uid preserved through bypass for audit (Odoo `env.su` / `env.user` independence).
+- **`Model.objects.with_actor(actor)` / `instance.sudo(reason=...)`** — distinct verbs for distinct intents. The actor is any `SubjectRef` — a Django `User`, a registered `Agent`, an `agents/grant` (agent-acting-on-behalf-of-user), an `auth/apikey`, or any `@rebac_subject`-registered object. Use `with_actor(grant_subject_ref(agent, u))` for the conventional grant subject. Mandatory `reason` on bypass, originating uid preserved through bypass for audit (Odoo `env.su` / `env.user` independence).
 
 The plugin maps Django User/Group objects onto configured subject types, defaulting to `auth/user` and `auth/group`. Applications declare every subject definition their relations reference; automatic base-schema emission is not implemented. Agent, grant, API-key and service-account definitions likewise belong to consumer apps.
 - **Strict-by-default**: a queryset that escapes its actor scope raises `MissingActorError` rather than silently returning all rows.
@@ -122,8 +122,8 @@ def post_detail(request, pk):
     return render(request, "post.html", {"post": post})
 
 # Equivalent shorthands for the Django-User / agent cases:
-# Post.objects.as_user(request.user)
-# Post.objects.as_agent(agent, on_behalf_of=request.user)
+# Post.objects.with_actor(request.user)
+# Post.objects.with_actor(grant_subject_ref(agent, request.user))
 ```
 
 The same flow works in DRF, Celery tasks, GraphQL resolvers, management commands, and MCP tools. See [§ Surface integrations](#surface-integrations).
@@ -457,6 +457,7 @@ from rebac import (
     # Mixin and managers
     RebacMixin, RebacTrackedMixin, RebacManager, RebacQuerySet,
     TrackedManager, TrackedQuerySet,    # unscoped; own gated writes; the base for a declared base manager
+    # RebacQuerySet.action() returns the pinned action or the model's default action
 
     # Decorators
     require_permission, rebac_resource, rebac_subject,
@@ -466,7 +467,6 @@ from rebac import (
     CheckResult, Consistency, Zookie,
     ObjectRef, SubjectRef, RelationshipTuple,
     CheckItem,                          # one item of check_bulk_permissions()
-    SCOPE_CTE_CANDIDATE_LIMIT,          # maximum explicit bounded identity set
 
     # Errors
     PermissionDenied, MissingActorError, CaveatUnsupportedError,
@@ -518,7 +518,6 @@ from rebac import (
 
     # Per-request evaluator and Zookie freshness
     PermissionEvaluator, evaluator_scope, current_evaluator,
-    decision_scope,                    # one atomic transaction and its decision memo
     zookie_scope, current_zookie, record_zookie, effective_consistency,
 
     # Results, errors and enums
@@ -542,6 +541,7 @@ from rebac import (
 
 from rebac.field_visibility import redacted_fields        # fields redacted on a loaded instance
 from rebac.relation_loading import relation_actor          # related-read SubjectRef or None
+from rebac.relation_loading import pinned_actor             # explicit row/queryset SubjectRef or None
 # Relationship.objects.referencing(identities) and RelationshipRegistry.objects.referencing(...):
 # the stored tuples naming any of the identities, at either end (0.29+)
 
@@ -554,6 +554,14 @@ from rebac.testing import install_schema   # test helper: make a schema and back
 from rebac.signals import collected_for_delete  # one admitted collector batch per model
 from rebac.mixins import batch_delivered        # batch marker for per-row pre_delete receivers
 ```
+
+The DC cleanup removes the unused `scope_cte()` handle, `decision_scope()`,
+and the `as_user()` / `as_agent()` aliases. Callers pin an actor with
+`with_actor()`, open request-local reuse with `evaluator_scope()`, and compose
+ordinary actor-scoped querysets with Django expressions. These removals are
+pre-1.0 breaking changes; the authorization and audit contracts continue to
+apply to the retained paths.
+
 
 For an operation without a pinned actor, `is_sudo()` answers whether ambient
 `sudo()` or `system_context()` is active; it does not account for pinned actor
@@ -836,8 +844,6 @@ class Relationship(models.Model):
 
 **`caveat_key`.** A library-owned digest of the caveat name and the pinned context, empty for a tuple without a caveat. It is not part of the wire shape. Every supported write path writes it with the tuple, and statements select caveated tuples by it (see [Caveats](#caveats)).
 
-**Swappability.** Projects that need to extend the model (audit FKs, multi-tenant prefix, etc.) declare a custom subclass and point `REBAC_RELATIONSHIP_MODEL = "myapp.MyRelationship"`. The plugin uses [`swapper`](https://pypi.org/project/swapper/) to keep migrations correct across this swap. Default behaviour: `swapper` returns the built-in `rebac.Relationship`.
-
 **`written_at_xid` (Zookie equivalent).** Populated on save:
 - PostgreSQL: `txid_current()` via a default expression.
 - MySQL: monotonic timestamp (microsecond precision).
@@ -1064,17 +1070,7 @@ statement compilation and nested prefetches share the validated snapshot;
 evaluation to scope. Outside
 an evaluator, the next independent evaluation validates again. Library-owned schema writes invalidate scope pins through schema generation.
 Inside an ordinary transaction, pins are operation-local so rollback cannot
-retain an uncommitted policy. `decision_scope(*, using="default")` opens an
-atomic block and a fresh evaluator on that alias. Its schema pin and bounded
-decision memos live only until that block exits, including rollback. A warm
-schema reads the revision once for reads; each owned write still reads it once
-through `gate_policy`. A cold load validates it again before sharing
-the parsed snapshot. A supported schema write inside the block invalidates the
-pin, so the next operation reads its newly published revision. Memos and pins
-created inside a nested savepoint carry its savepoint stack and cannot be
-reused after that savepoint rolls back. A concurrent schema commit closes an
-older SQL predicate through its revision fence; the next `decision_scope()`
-re-reads the revision. Another connection's committed revocations are denied
+retain an uncommitted policy. Another connection's committed revocations are denied
 at once by statement witnesses; newly granted rows may remain hidden until
 the next scope. An evaluator scope clears its
 pins on exit or `invalidate()`.
@@ -1175,20 +1171,15 @@ All settings prefixed `REBAC_`. No nested dict. Read via the public `app_setting
 | Setting | Default | Type | Purpose |
 |---|---|---|---|
 | `REBAC_BACKEND` | `"local"` | `"local"` | Select the local runtime; other values fail the system check. |
-| `REBAC_RELATIONSHIP_MODEL` | `"rebac.Relationship"` | `str` | Swappable relationship model (Django convention). |
 | `REBAC_LOCAL_BACKEND_STORAGE` | `"denormalized"` | `"denormalized"` \| `"registry"` | LocalBackend relationship storage shape. Registry mode is opt-in and uses `RelationshipRegistry` + `RebacResource`. |
 | `REBAC_LOCAL_BACKEND_REGISTRY_BATCH_SIZE` | `5000` | `int` | Batch size for `python manage.py rebac migrate-storage`. |
 | `REBAC_SCHEMA_DIR` | `BASE_DIR / "rebac"` | `Path` \| `str` | Where `build-zed` writes `effective.zed`. |
 | `REBAC_DEPTH_LIMIT` | `8` | `int` | Number of levels to which a recursive permission is unrolled in a compiled statement, and the cap on the permission walker (`check_new`). Within the bound a point check answers; one that cannot be decided within it raises `PermissionDepthExceeded`; a queryset scope includes only rows provable within it. Choose it to cover the deepest recursive chain in the data; statement size grows linearly with it. See [Recursion](#recursion). |
 | `REBAC_STATEMENT_CACHE_BYTES` | `67108864` | `int` | Maximum approximate bytes of compiled SQL and parameters retained process-wide, alongside the 512-entry cap. |
 | `REBAC_TRACKED_MODELS` | `[]` | `list[str]` | Third-party backing models (`"app_label.ModelName"`), gated by explicit-sender receivers. User and Group are automatically tracked. |
-| `REBAC_DEFAULT_CONSISTENCY` | `"minimize_latency"` | `str` | Default `Consistency` for checks. |
-| `REBAC_CACHE_ALIAS` | `"default"` | `str` | Django cache backend name for `accessible()` cache. |
-| `REBAC_LOOKUP_CACHE_TTL` | `60` (s) | `int` | TTL for `accessible()` cache. Invalidated on relationship writes for the matching `(subject, action, resource_type)`. |
 | `REBAC_STRICT_MODE` | `True` | `bool` | If `True`, queryset construction without an actor (and not in `sudo()`) raises `MissingActorError`. **Production default.** |
 | `REBAC_REQUIRE_SUDO_REASON` | `True` | `bool` | If `True`, `sudo()` calls without a `reason=...` raise. |
 | `REBAC_ALLOW_SUDO` | `True` | `bool` | Globally disable the request-path `sudo()` bypass. Strict tenants set `False`. **Does NOT gate `system_context()`** — framework-owned jobs (migrations, fixture seeders, asset loaders) must still be able to bypass even on strict tenants; the two surfaces are deliberately split. Every block-scoped `system_context()` entry still emits a `KIND_SUDO_BYPASS` audit row, same as block-scoped `sudo()`. |
-| `REBAC_GC_INTERVAL_SECONDS` | `300` | `int` | How often the expiration GC task runs. |
 | `REBAC_AUTHENTICATION_MIDDLEWARE` | `"django.contrib.auth.middleware.AuthenticationMiddleware"` | `str` | Middleware path that populates `request.user`. `rebac.middleware.ActorMiddleware` must appear after this path. Frameworks that replace Django's stock auth middleware set this to their canonical middleware. |
 | `REBAC_ACTOR_RESOLVER` | `"rebac.actors.default_resolver"` | `str` | Dotted-path callable that resolves `request → SubjectRef`. Override for custom identity layers (e.g., agent grants). |
 | `REBAC_MCP_ACTOR_RESOLVER` | `"rebac.mcp.default_actor_resolver"` | `str` | Dotted-path callable resolving an MCP request `Context → SubjectRef`, consulted before ambient `current_actor()`. The default reads a canonical `SubjectRef` string from trusted server-populated `ctx.request_context.meta["actor_subject"]`. Invalid explicit identity fails closed. |
@@ -1703,103 +1694,6 @@ never retain a stale scope predicate. Boolean and SQL set combinations retain
 the left queryset actor/action policy across all operands; rebinding replaces
 the restriction on each operand without mutating the original querysets.
 
-`RebacQuerySet.scope_cte()` requires an actor-scoped queryset that is unfiltered
-or filtered only to a bounded native identity set, and
-returns a `SharedScope` handle. `SharedScope.queryset()` is a plain Django
-`values()` queryset over the scope's identity CTE, suitable for repeated
-filters, `Exists` guards, annotations and aggregates. `SharedScope.attach(outer_queryset)`
-attaches a fresh definition once to a read statement and returns a clone without
-changing the input. Attach after constructing references and before execution;
-for a union, attach to the union owner rather than an operand. Matching
-`permission_expression()` projections and nested queryset scope guards read
-the CTE's identity set only when actor, action, resource model, alias, backend,
-policy and caveat verdicts agree and the scope has no render-time caveat or
-clock decision. Otherwise they keep their own inline predicates. Exact
-late projections retain their point form; queryset scopes with exact or
-bounded native identities use the candidate-root form unless an attached
-shared plan is bounded to a superset of those identities. A multi-action plan
-shares its first action's identity CTE with the outer row scope under the
-same subset proof.
-Other literal ID sets stay on the compiler's general scope path. The CTE
-captures
-policy and caveat verdicts afresh at each `attach()`; its row and relationship
-checks execute in the statement. Only identity
-columns are available from its plain reference queryset; field projection and
-join authorization remain the caller's responsibility.
-Derived identity, closure and recursive-path querysets carry no model ordering;
-the caller's outer ordering is preserved.
-
-`RebacQuerySet.scope_cte(actions=(...))` also accepts a queryset whose only
-caller filter is one mandatory native exact or bounded `__in` lookup on its
-resource identity attribute (`rebac_id_attr`, normally `pk`). The IDs must be
-distinct canonical native integers, with `1` to
-`SCOPE_CTE_CANDIDATE_LIMIT` (`256`) members. An empty set or a larger set raises
-`ValueError`; unlike the candidate-root path, this explicit handle does not
-silently fall back to an unbounded scope. Callers may branch to inline
-projections or chunk their work.
-The handle keeps those candidates in its attached body; references still expose
-row identities. The first action is the handle's identity scope action, and
-the tuple must contain distinct action names. An action may name a permission
-or a relation; an unknown action has the `nil` verdict. An explicit multi-action
-handle defines one statement-local closure CTE of distinct permission leaves
-over the candidate rows. Leaves include relation and permission references,
-arrows, and the `authenticated` and `anonymous` builtins, with lower
-and upper bounds kept separately for exclusion. Each projected action is a
-Boolean verdict over references to this closure. The identity CTE uses the
-first verdict. `permission_expression()` for any listed action shares the
-closure only when actor, resource, alias, backend, policy and caveat verdicts
-match and the projection's resolved query proves that its mandatory native
-identity set is a subset of the handle's candidates. A broader projection
-keeps its inline predicate. Sharing is all-or-nothing for the listed actions:
-recursion in any listed action, an expiring relation anywhere in the schema,
-any override tag, caveat deadline, or caveated tuple reachable by any listed
-action makes the entire multi-action closure ineligible. Those projections
-keep their inline proofs. Attachment always rebuilds and pins the plan for that statement;
-candidate IDs never become authority for a different statement.
-
-A handle built without explicit IDs may acquire candidates when its attached
-statement is compiled. One mandatory positive exact or bounded `__in` lookup
-on that statement's resource identity, including Django's one-column,
-multi-row forward-FK prefetch `TupleIn`, proves the candidate set. NULL rows
-in that `TupleIn` are discarded, as they are by Django's rendered lookup. It must
-name the same model, alias and native identity field, contain distinct
-canonical integers, and stay within `SCOPE_CTE_CANDIDATE_LIMIT`. The attached
-body and its sharing plan then use those IDs. A statement with no such proof,
-an oversized set, or a different model keeps the original unbounded plan and
-its inline fallback rules. A statement that reads the handle's CTE through
-`SharedScope.queryset()` anywhere in its query tree also keeps the unbounded
-definition: those references may need identities outside the statement's own
-row set. Each statement clone derives its own candidates;
-the handle and sibling statements are not narrowed. This applies to ordinary
-single-action handles as well as multi-action closures. The multi-row
-`TupleIn` proof also applies to ordinary queryset scopes with no shared
-handle: a scoped forward-FK prefetch can use the bounded candidate-root path
-for its related statement.
-
-```python
-actions = ("read", "write", "share", "delete")
-scope = Party.objects.with_actor(actor).scope_cte(actions=actions)
-rows = related_party_queryset.annotate(
-    **{
-        f"can_{action}": permission_expression(Party, action, actor=actor)
-        for action in actions
-    }
-)
-invoice_queryset = invoice_queryset.prefetch_related(
-    Prefetch("party", queryset=scope.attach(rows))
-)
-page = list(invoice_queryset)
-```
-
-Build the related queryset through the consumer's usual type hook and optimizer.
-Django adds the forward-FK identity predicate after constructing the `Prefetch`;
-the attached handle reads that predicate when the related statement compiles.
-Denied related rows are cached as `None`, as in Django's own prefetch; a
-hand-written batch must cache them the same way to avoid a later unscoped load.
-For a non-PK `rebac_id_attr`, the predicate must constrain that identity field
-to specialize the handle. A one-action base-manager projection can be larger
-with an explicit handle than inline; use the shared closure for several actions.
-
 Boolean combinations require REBAC querysets so empty-query fast paths cannot
 return a plain unscoped manager. Django's bounded primary-key subqueries for
 sliced Boolean operands inherit the combination's actor/action, including on
@@ -1990,12 +1884,6 @@ conditional or depth-uncertain rows remain absent and revocations remain
 visible. The bound applies to root rows; arrow targets keep their inline
 lowering, which PostgreSQL can candidate-probe but SQLite may materialize.
 `LocalBackend.held()` uses this statement for chunks up to the cap.
-Inside `decision_scope()`, a candidate-root statement may reuse witnessed
-arrow-target, actor-set and fixed-fact decisions. The candidate IDs remain
-parameters of that statement, never a decision-memo or kept-statement key;
-supported writes invalidate the reachable decisions and rolled-back
-savepoints retire decisions first made within them. Outside a decision scope,
-the candidate-root predicate remains inline.
 Only mandatory, positive, resolved native identity leaves qualify;
 a subquery, custom lookup, null, duplicate, expression or unproved identity keeps the general
 scope. The candidate list is bound to the one statement and is never retained
@@ -2135,8 +2023,8 @@ uninstall routine:
 
 #### Prepared permission scopes
 
-A queryset scope is one SQL predicate. Ordinary querysets and scopes inside
-`evaluator_scope()` or `decision_scope()` use the witnessed decision plan:
+A queryset scope is one SQL predicate. Ordinary queryset scopes, including
+those inside `evaluator_scope()`, use the witnessed decision plan:
 bounded field- and attribute-backed
 arrow targets are bound as native ID lists; oversized targets retain inline
 subqueries; bounded stored subject sets are decided to a fixed point. This
@@ -2194,14 +2082,7 @@ first unused suffix at or after that position. This preserves distinct CTE names
 after earlier owner queries are collected while giving repeated compiles the
 same owner names. Literal IDs,
 revision fences and clocks can still vary in the statement text. Reached-object
-CTEs use a stable digest of their recursion slot rather
-than compile order. An explicit `scope_cte()` handle uses a digest of its
-model, actor, action, database alias, selected columns, exact candidate IDs and
-requested actions: callers can build references in
-separate query operands before attaching the definition, so its name must
-already be stable then.
-
-A nonrecursive fixed-object const target that cannot use a prepared fact is
+CTEs use a stable digest of their recursion slot A nonrecursive fixed-object const target that cannot use a prepared fact is
 defined once per target object and lower or upper bound in its statement
 owner. Each use reads the target CTE; the relation's local filters remain at
 the original use. A target reached through an active cycle or without a depth
@@ -2218,98 +2099,12 @@ reach, and the global backend is the scopes' backend. At render, the database
 alias must also equal the owner's alias. A shared projection uses the owner's
 pinned policy, decided sets and witness gate. Other permission expressions bind
 during SQL compilation; their late scopes cannot join an already emitted
-`WITH` clause and compile self-contained predicates unless the caller attached
-a compatible `SharedScope` before compilation. Without that explicit owner,
+`WITH` clause and compile self-contained predicates and compile self-contained predicates. Without a shared owner,
 separate nested queries retain separate definitions. A plain Django union can
 explicitly hoist compatible prepared operands with
 `share_scoped_definitions()`. No connection-wide registry is involved. Empty
 subject sets fold to false before a CTE is attached, so an empty negated arm
 cannot empty the enclosing statement.
-
-For ordinary statements, `scope_cte()` gives the caller an explicit CTE owner.
-Its references carry only the identity set, so each reference contributes a
-small membership or `Exists` expression rather than another permission proof.
-The owner registers matching projections and resolved nested scope guards on
-isolated query clones in the statement. The fresh CTE body has the same inline
-scope proof and revision fence as an unattached queryset; a nested resolution
-may prepare bounded decisions and their witnesses for that statement. Inside
-`decision_scope()`, an ordinary single-action attachment prepares the body's
-bounded decisions through the transaction memo and embeds their witnesses in
-the CTE; subsequent ordinary attachments reuse eligible decisions until a
-dependency write or rolled-back savepoint invalidates them. Multi-action
-closures do not consult that memo; when ineligible, they use the ordinary
-single-action attachment path for the identity body. Reusing
-the handle in another statement builds another body. Sharing does not cross
-statement or database boundaries.
-
-```python
-scope = Folder.objects.with_actor(actor).scope_cte()
-ids = scope.queryset().values("pk")
-rows = Post._base_manager.filter(folder_id__in=ids).annotate(
-    folder_readable=Exists(scope.queryset().filter(pk=OuterRef("folder_id"))),
-)
-rows = scope.attach(rows)
-```
-
-Queryset scopes pin the policy and caveat verdicts when the scope is built.
-Rendering a prepared scope therefore performs no decision read, including
-when a caveated relation is reachable. A newly written caveat instance is
-absent from that scope's lower bound and present in its upper bound, so it
-cannot add a grant. A newly built scope sees the instance. Point checks
-prepare caveat verdicts, bounded sets and fixed facts before their statement
-when reachable. CEL verdicts cannot run in SQL.
-
-`permission_expression()` binds its policy and caveat verdicts at SQL
-compilation by its existing late-binding contract. Its point or population
-plan stays inline unless an attached scope with identical shareable policy and
-verdicts supplies its identity set. Rendering an unmatched expression does not
-read bounded row, set, or fact decisions. Caveat verdicts retain their existing
-late read. An embedded sudo
-queryset's audit write also remains outside the prepared-queryset-scope contract.
-`accessible()` prepares its inline model-row scope before that query renders.
-
-The application clock is bound once per render. The policy revision fence
-closes a predicate whose published revision has changed. Queryset scopes
-without an actor fail closed as described under strict mode.
-A scope built before an override deadline can close under its
-revision fence after the deadline rather than recompose itself; the next
-built scope uses the new policy.
-
-#### Decided rows
-
-Before compiling a scope, `_Rows` reads model-backed arrow targets into native
-ID lists, up to 5,000 IDs across the statement, including transitive witness
-dependencies recovered from evaluator memo hits. An
-oversized set stays inline, using the same recursive CTE lowering where
-applicable. Each scope selects its root rows in the statement; a union only
-decides a root when another operand reaches it as an arrow target. Polymorphic
-generic-FK targets stay inline. Bulk point checks
-keep actor memberships in their shared SQL bounds instead of expanding each
-actor separately. `_Operation._decide_sets` follows stored actor-set membership to
-a fixed point before compilation when its witness fits the byte budget. `_Facts` decides
-fixed-object permissions used by constant backings when one fixed object is
-reachable. Several independent fixed objects stay inline to avoid one
-preparation read per object. Point statements prepare only the decisions they
-use.
-
-`.scoped()` installs the scope and pins its actor without preparing bounded
-decisions. Outside an evaluator scope, first evaluation compiles a witnessed
-decided plan for that request. Inside an evaluator,
-first evaluation or embedding prepares decisions on the selected database
-alias, including from `_RebacQuery.resolve_expression` for an embedded queryset.
-The resolved WHERE selects the candidate-root plan for up to 256 mandatory
-native identities, otherwise the population plan. Standalone point checks
-retain the point plan. A combinator
-operand Django renders without its queryset owner prepares on first render
-and retains that result for another render. An unprepared ordinary queryset
-or standalone scope expression renders its inline form without a decision read;
-its next evaluation can still prepare a decided plan. A library-owned write changes the
-generation and an eager queryset rebuilds its scope before its next evaluation.
-Under the union-sharing precondition, the union owner prepares decisions once
-before any operand prepares separately,
-and `_Scope.as_sql` uses its shared plan. Otherwise each operand prepares its
-own plan. Once prepared for that query shape, `_Scope.as_sql` only binds parameters and
-compiles SQL; it performs no database read or connection introspection.
 
 Every authorizing statement re-reads the rows and tuple memberships on
 which its bound decisions depend. The witness is a lower bound: a raw SQL
@@ -2331,8 +2126,7 @@ unrelated watched model write does not invalidate
 that node's memo. A memo hit carries its
 nested row decisions and actor sets into the new statement's witness. Outside an evaluator scope
 decisions last for one operation. `invalidate()` and scope exit clear them.
-Ordinary transactions do not memoize decisions; `decision_scope()` does so
-only inside the atomic block it owns. Expiring reachable relationships and
+Ordinary transactions do not memoize decisions. Expiring reachable relationships and
 override deadlines still disable memoization. The row memo limits the
 number of held IDs as well as entries; an overflow result is never memoized.
 There is no statement observer, `execute_wrappers`, `run_on_commit`, or
@@ -2755,13 +2549,10 @@ Scoped operands must have the same actor and database alias; a mismatch
 raises `PermissionDenied`. A policy-revision mismatch leaves each scope
 self-contained without sharing. The helper reads the union's
 `combined_queries` and attaches each distinct shareable definition once to
-the outer query. Late permission expressions and nested scoped subqueries
-remain self-contained unless a compatible `SharedScope` is attached to the
-outer read statement. Other SQL shapes retain their independent predicates.
+the outer query. Late permission expressions and nested scoped subqueries remain self-contained. Other SQL shapes retain their independent predicates.
 
 ```python
 ActorLike = Union[SubjectRef, User, Group, "AnyRebacSubject"]
-SCOPE_CTE_CANDIDATE_LIMIT = 256
 # Anything that can resolve to a <type>:<id> SubjectRef:
 #   - django.contrib.auth User instance       → auth/user:<id>
 #   - django.contrib.auth Group instance      → auth/group:<id>#member
@@ -2769,20 +2560,12 @@ SCOPE_CTE_CANDIDATE_LIMIT = 256
 #   - a SubjectRef passed through unchanged   (covers agents/grant, agents/agent,
 #                                              auth/apikey, custom)
 
-class SharedScope:  # from rebac.managers
-    def queryset(self) -> models.QuerySet: ...
-    def attach(self, outer_queryset: models.QuerySet) -> models.QuerySet: ...
-
 class RebacManager:
     def get_queryset(self) -> RebacQuerySet: ...
 
     # Primary, generic actor scoping. Accepts any ActorLike.
     def with_actor(self, actor: ActorLike) -> RebacQuerySet: ...
-    def scope_cte(self, *, actions: tuple[str, ...] = ()) -> SharedScope: ...
 
-    # Typed shorthands — all eventually call with_actor() internally.
-    def as_user(self, user) -> RebacQuerySet: ...
-    def as_agent(self, agent, *, on_behalf_of=None) -> RebacQuerySet: ...
     def with_action(self, action: str) -> RebacQuerySet: ...           # override read-scope action
     def on_field_deny(self, mode: FieldDenyMode) -> RebacQuerySet: ... # allow/redact/omit/raise
     def for_write(self) -> RebacQuerySet: ...                          # write-target: row scope kept, field redaction off
@@ -2793,13 +2576,12 @@ class RebacManager:
     def sudo(self, *, reason: str) -> RebacQuerySet: ...                # gated by REBAC_ALLOW_SUDO
     def system_context(self, *, reason: str) -> RebacQuerySet: ...      # framework-job bypass, NOT gated
     def actor(self) -> SubjectRef | None: ...                           # introspection
+    def action(self) -> str: ...                                         # resolved row-scope permission
     def effective_actor(self, *, strict: bool = False) -> tuple[SubjectRef | None, bool]: ...
 
 class RebacQuerySet:
-    def scope_cte(self, *, actions: tuple[str, ...] = ()) -> SharedScope: ...
     def with_actor(self, actor: ActorLike) -> Self: ...
-    def as_user(self, user) -> Self: ...
-    def as_agent(self, agent, *, on_behalf_of=None) -> Self: ...
+    def action(self) -> str: ...                                         # resolved row-scope permission
     def with_action(self, action: str) -> Self: ...                    # override read-scope action
     def on_field_deny(self, mode: FieldDenyMode) -> Self: ...          # override field-read deny mode
     def for_write(self) -> Self: ...                                   # write-target: row scope kept, field redaction off
@@ -2820,13 +2602,12 @@ class RebacQuerySet:
     def create(self, **kwargs): ...
 ```
 
-The three actor verbs are sugar over the same primitive:
+Use `with_actor()` to pin any actor type. For a consumer-defined grant identity,
+pass `grant_subject_ref(agent, user)` to `with_actor()`:
 
 | Call | What it does | When to reach for it |
 |---|---|---|
 | `with_actor(actor)` | Resolves `actor` to a `SubjectRef` and pins it on the queryset clone. | The default. Works for any subject type. |
-| `as_user(user)` | Equivalent to `with_actor(to_subject_ref(user))` for a Django `User`. | The HTTP request path: `Post.objects.as_user(request.user)`. |
-| `as_agent(agent, on_behalf_of=u)` | Equivalent to `with_actor(grant_subject_ref(agent, u))` — constructs the conventional `agents/grant:<id>#valid` subject. The application must declare `valid` as a relation and provide its relationships. | Applications whose delegation schema uses this subject convention. |
 | `with_action(action)` | Pins the permission used for read-side queryset scoping instead of `read` / `Meta.rebac_default_action`. | Alternate read views such as `credential_lookup`, `list_admin`, or capability-specific resolver scopes. |
 | `on_field_deny(mode)` | Pins the field-read deny mode for `read__<field>` gates instead of the global setting. | Projection-sensitive paths that want `"omit"` while the global default stays `"allow"` or `"redact"`. |
 | `for_write()` | `on_field_deny("allow")` named for intent: keeps actor row scope but turns off `read__<field>` redaction so a load-then-mutate target carries every column. | Resolving an update/delete target while `REBAC_FIELD_READ_MODE` is `"redact"`/`"omit"`, where a redacted column must not be hidden from the row being written. |
@@ -2834,7 +2615,10 @@ The three actor verbs are sugar over the same primitive:
 | `rebac_select_related(*fields)` | Applies Django `select_related` and batch-checks selected REBAC-bound related rows before serialization. | To-one relation optimization when an unreadable related object should fail the field/query instead of leaking. |
 | `rebac_prefetch_related(*lookups)` | Applies Django `prefetch_related`, rewriting bare protected lookups to `Prefetch(queryset=Related.objects.with_actor(actor))`. | Reverse, M2M, and to-many loading where protected children should be scoped rather than loaded via `_base_manager`. |
 
-`as_agent(agent)` without `on_behalf_of` uses `to_subject_ref(agent)` unchanged. Its resource type and grants come from the consumer's identity and schema declarations. Passing `on_behalf_of=user` constructs a deterministic grant subject; it does not create a grant, intersect permissions or impersonate the user. Applications that use a different grant identity pass their own subject through `with_actor`.
+`with_actor(agent)` resolves the agent unchanged. `grant_subject_ref(agent, user)`
+constructs a deterministic grant subject; it does not create a grant, intersect
+permissions or impersonate the user. Applications with a different grant identity
+pass their own subject through `with_actor()`.
 The constructed grant ID is `v2_` followed by unpadded base64url of SHA-256
 over four UTF-8 components in order: principal type, principal ID, agent type,
 agent ID. Each component is framed by its unsigned 4-byte big-endian byte
@@ -2943,7 +2727,7 @@ lazy bypass audit after resolving an explicit instance sudo.
 Resolution order:
 
 1. **Per-queryset or per-instance sudo**, set via `.sudo(reason=...)`. Bypasses scoping; logs a structured audit event.
-2. **Per-queryset or per-instance actor**, set via `.with_actor(actor)` / `.as_user(user)` / `.as_agent(agent, on_behalf_of=u)`. Stored on the queryset or instance — not on a ContextVar — so it survives chaining and DOESN'T leak across queryset boundaries. A related manager transfers its source instance's pin to its own fresh queryset after an explicit queryset pin.
+2. **Per-queryset or per-instance actor**, set via `.with_actor(actor)`. Stored on the queryset or instance — not on a ContextVar — so it survives chaining and DOESN'T leak across queryset boundaries. A related manager transfers its source instance's pin to its own fresh queryset after an explicit queryset pin. Queryset `with_actor()` returns a clone; instance `with_actor()` mutates and returns that same instance.
 3. **Ambient sudo**, set by `with sudo(...)` / `with system_context(...)`, only when no explicit actor is pinned.
 4. **Implicit from `current_actor()`**, the contextvar populated by middleware (see [§ Middleware](#middleware)) or explicit task actor scopes.
 5. **Falls through to** `REBAC_STRICT_MODE` handling: `True` → raise for gates/materialisation; `False` → full visibility for ordinary row scope. Eager aggregate scopes and guarded `rebac_select_related()` reads fail closed without an actor in both strict modes. Ambient sudo still bypasses those reads.
@@ -3463,7 +3247,7 @@ the model-lineage generations reachable from that field permission. It shares
 the compiled reader's dependency key with the witnessed row and fact memos,
 but follows the check cache's eligibility: live field- or attribute-backed
 types, expiring relations, override deadlines and every atomic block bypass
-it. This includes `decision_scope()`, `ATOMIC_REQUESTS`, GraphQL actions,
+it. This includes `ATOMIC_REQUESTS`, GraphQL actions,
 Django `TestCase` and pytest-django's default `db` fixture. An unrelated
 caveat elsewhere in the schema does not disable the memo. Its LRU limits both
 entries and total candidate IDs to `REBAC_EVALUATOR_CACHE_SIZE`. It is cleared
@@ -3487,12 +3271,6 @@ Eligible cache hits cost zero queries, including no revision SELECT per lookup.
 An evaluator scope reuses its schema pin across permission operations in
 autocommit. Inside an ordinary atomic block, each permission operation instead
 reads the schema revision once and pins the snapshot only for that operation.
-`decision_scope()` supplies a transaction-bound pin and bounded decision memos
-on its database alias. No returned answer is cached in any transaction,
-including a decision scope. Every authorizing statement checks its witness
-and revision fence. A pin or memo created inside a nested savepoint is reused
-only while its saved savepoint stack is a prefix of the current stack; a
-rolled-back savepoint cannot leave an uncommitted answer in the scope.
 A permission operation in a transaction discards the evaluator's earlier pin,
 so its next autocommit operation validates the revision once before reusing
 the new pin.
@@ -3600,7 +3378,7 @@ Subscription invariants:
   of subscriptions — the change that initiated the emission carries its
   Zookie within the emission's scope.
 
-For non-request contexts (Celery, cron, management commands), use `with sudo(reason=...)` or set the actor explicitly via `.with_actor(actor)` / `.as_user(user)` / `.as_agent(agent, on_behalf_of=user)`.
+For non-request contexts (Celery, cron, management commands), use `with sudo(reason=...)` or set the actor explicitly via `.with_actor(actor)`.
 
 ### Strawberry-Django optimizer (`rebac.graphql.strawberry_django`)
 
@@ -3622,7 +3400,7 @@ schema = strawberry.Schema(
 `DjangoOptimizerExtension` surface while preserving REBAC invariants:
 
 - Root querysets inherit `current_actor()` when a resolver did not already call
-  `.with_actor(...)`, `.as_user(...)`, `.as_agent(...)`, or `.sudo(...)`.
+  `.with_actor(...)`, `.with_actor(...)` or `.sudo(...)`.
 - To-one relation paths keep `select_related`; selected REBAC-bound related rows
   are batch-checked before serialization. A denied joined row raises
   `PermissionDenied`.
@@ -4214,7 +3992,7 @@ stable across patch releases. `rebac._internal.*` is private.
 
 2. **Swappable User dependency.** *Resolved.* `REBAC_USER_TYPE` (default `"auth/user"`) and `REBAC_GROUP_TYPE` name the subject types; a user model that declares its own `rebac_resource_type` wins, which `user_subject_type()` and the user branch of `to_subject_ref()` read first (§ Django model validation and stored identity references).
 
-3. **Async ORM support.** *Resolved (0.11.x).* No separate async manager API is needed. Django implements every async `QuerySet` method (`aget` / `acount` / `aexists` / `afirst` / `aupdate` / `adelete` / `acreate` / `__aiter__` / `ain_bulk` / `aget_or_create` / …) as a `sync_to_async` wrapper around the sync method `RebacQuerySet` already overrides, so scoping is inherited and the `current_actor()` ContextVar carries into the worker thread — `await Post.objects.as_user(u).aget(...)` enforces with no extra code. The two methods that compute *without* routing through the sync `iterator` / `_fetch_all` path are overridden to re-apply scope: `aiterator()` (builds the row iterable directly) and `aggregate()` / `aaggregate()` (summarises the query without materialising rows). `bulk_create()` and `abulk_create()` preflight every proposed row through `check_new()` and stamp the queryset actor onto inserted instances. Actor-scoped conflict updates (`update_conflicts=True`) fail closed because a create grant cannot authorize changes to existing rows; use checked individual saves or explicit sudo for those upserts.
+3. **Async ORM support.** *Resolved (0.11.x).* No separate async manager API is needed. Django implements every async `QuerySet` method (`aget` / `acount` / `aexists` / `afirst` / `aupdate` / `adelete` / `acreate` / `__aiter__` / `ain_bulk` / `aget_or_create` / …) as a `sync_to_async` wrapper around the sync method `RebacQuerySet` already overrides, so scoping is inherited and the `current_actor()` ContextVar carries into the worker thread — `await Post.objects.with_actor(u).aget(...)` enforces with no extra code. The two methods that compute *without* routing through the sync `iterator` / `_fetch_all` path are overridden to re-apply scope: `aiterator()` (builds the row iterable directly) and `aggregate()` / `aaggregate()` (summarises the query without materialising rows). `bulk_create()` and `abulk_create()` preflight every proposed row through `check_new()` and stamp the queryset actor onto inserted instances. Actor-scoped conflict updates (`update_conflicts=True`) fail closed because a create grant cannot authorize changes to existing rows; use checked individual saves or explicit sudo for those upserts.
 
 4. **Override layer precedence vs caveats.** When a `SchemaOverride` tightens a permission AND a caveat returns `CONDITIONAL`, what wins? Lean: tightening wins (security-fail-closed). Documented as a doctor warning.
 

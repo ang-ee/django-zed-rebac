@@ -13,12 +13,11 @@ loaded instance (it is not visible inside `from_db()`).
 
 from __future__ import annotations
 
-import hashlib
 import re
 from collections import Counter
 from collections.abc import AsyncIterator, Collection, Iterable, Iterator
 from contextvars import ContextVar
-from copy import copy, deepcopy
+from copy import deepcopy
 from enum import Enum, auto
 from typing import TYPE_CHECKING, Any, ClassVar, Self, TypeVar, cast, overload
 
@@ -29,13 +28,11 @@ from django.db.models.sql import Query
 from django.db.models.sql.subqueries import UpdateQuery
 from django.db.models.sql.where import ExtraWhere, NothingNode, WhereNode
 from django_cte import CTE, with_cte
-from django_cte.jitmixin import jit_mixin
 
 from ._id import resource_id_attr
 from .actors import (
     ActorLike,
     current_sudo_reason,
-    grant_subject_ref,
     require_sudo_allowed,
     resolve,
     to_subject_ref,
@@ -60,143 +57,7 @@ from .types import FieldDenyMode, SubjectRef
 _M = TypeVar("_M", bound=models.Model)
 
 if TYPE_CHECKING:
-    from .backends.local import LocalBackend
     from .mixins import RebacMixin
-
-
-class SharedScope[M: models.Model]:
-    """One actor scope defined once and referenced within an ORM statement."""
-
-    def __init__(
-        self,
-        model: type[M],
-        actor: SubjectRef,
-        action: str,
-        using: str,
-        backend: LocalBackend,
-        columns: tuple[str, ...],
-        candidates: tuple[int, ...] | None = None,
-        actions: tuple[str, ...] = (),
-    ) -> None:
-        self._model = model
-        self._actor = actor
-        self._action = action
-        self._using = using
-        self._backend = backend
-        self._columns = columns
-        self._candidates = candidates
-        self._actions = actions
-        owner = (
-            model._meta.label_lower,
-            actor.subject_type,
-            actor.subject_id,
-            actor.optional_relation,
-            action,
-            using,
-            columns,
-            candidates,
-            actions,
-        )
-        digest = hashlib.blake2s(repr(owner).encode(), digest_size=8).hexdigest()
-        self._name = f"rebac_scope_{digest}"
-        # This CTE supplies column metadata to references. Its query is never
-        # attached or resolved; each attach builds a fresh authorized body.
-        self._reference = CTE(
-            models.QuerySet(model=model, using=using).order_by().values(*columns), name=self._name
-        )
-
-    def queryset(self) -> models.QuerySet[Any]:
-        """Return a plain values queryset of authorized row identities."""
-        from .compile.read import identity_cte_queryset
-
-        return identity_cte_queryset(self._reference, self._model, self._using, self._columns)
-
-    def attach[T: models.Model](self, outer_queryset: models.QuerySet[T]) -> models.QuerySet[T]:
-        """Attach one fresh definition to a read statement, leaving its input untouched."""
-        if outer_queryset.db != self._using:
-            raise ValueError("A shared scope and its statement must use the same database alias")
-        result = outer_queryset.all()
-        ctes, plan = self._definition(self._candidates)
-        _replace_shared_definition(result.query, ctes, plan)
-        if self._candidates is None:
-            query = cast(Any, result.query)
-            query._rebac_late_scopes = (
-                *tuple(
-                    scope
-                    for scope in getattr(query, "_rebac_late_scopes", ())
-                    if scope._name != self._name
-                ),
-                self,
-            )
-            jit_mixin(query, _LateSharedScopeQuery)
-        if type(result) is models.QuerySet:
-            result.__class__ = _OwnedScopesQuerySet
-        return result
-
-    def _definition(self, candidates: tuple[int, ...] | None) -> tuple[tuple[CTE, ...], Any]:
-        if self._actions:
-            from .compile.read import attached_permission_plan
-
-            built = attached_permission_plan(
-                self._model,
-                self._actor,
-                self._actions,
-                self._using,
-                self._backend,
-                self._columns,
-                candidates,
-                self._name,
-            )
-            if built is not None:
-                return built
-        return self._single_action_definition(candidates)
-
-    def _single_action_definition(
-        self, candidates: tuple[int, ...] | None
-    ) -> tuple[tuple[CTE, ...], Any]:
-        from .compile.read import attached_scope_plan
-
-        body: models.QuerySet[Any] = (
-            RebacQuerySet(model=self._model, using=self._using)
-            .with_actor(self._actor)
-            .with_action(self._action)
-            .scoped_for_aggregate()
-            .order_by()
-            .values(*self._columns)
-        )
-        if candidates is not None:
-            body = body.filter(**{f"{resource_id_attr(self._model)}__in": candidates})
-        from .compile.read import _scope_decide
-
-        if isinstance(body, RebacQuerySet) and _scope_decide(True, self._using, candidates=True):
-            body._prepare_applied_scope()
-        cte = CTE(body, name=self._name)
-        plan = attached_scope_plan(
-            cte,
-            body,
-            self._model,
-            self._actor,
-            self._action,
-            self._using,
-            self._backend,
-            self._columns,
-            candidates,
-        )
-        return (cte,), plan
-
-
-def _replace_shared_definition(query: Query, ctes: tuple[CTE, ...], plan: Any) -> None:
-    old_scopes: tuple[Any, ...] = tuple(getattr(query, "_rebac_shared_scopes", ()))
-    old_owned = {
-        name
-        for scope in old_scopes
-        if scope.cte.name == plan.cte.name
-        for name in (*scope.owned_ctes, scope.cte.name)
-    }
-    names = {cte.name for cte in ctes} | old_owned
-    _replace_query_ctes(query, ctes, remove_names=names)
-    scopes = (*tuple(scope for scope in old_scopes if scope.cte.name != plan.cte.name), plan)
-    _isolate_statement_queries(query, scopes, tuple(names))
 
 
 def _replace_query_ctes(
@@ -221,55 +82,6 @@ def _replace_query_ctes(
     vars(query)["_with_ctes"] = remaining
     if ctes:
         with_cte(*ctes, select=models.QuerySet(model=query.model, query=query))
-
-
-def _references_cte(query: Query, name: str) -> bool:
-    """Whether a caller-built reference reads this CTE in the statement."""
-    for part in (query, *_nested_queries(query)):
-        if any(getattr(join, "table_name", None) == name for join in part.alias_map.values()):
-            return True
-    return False
-
-
-class _LateSharedScopeQuery:
-    """Specialize an unbounded handle from the final statement predicate."""
-
-    _jit_mixin_prefix = "RebacLate"
-
-    def get_compiler(self, *args: Any, **kwargs: Any) -> Any:
-        from .compile.read import statement_candidate_ids
-
-        connection = kwargs.get("connection")
-        using = kwargs.get("using") or (args[0] if args else None)
-        if using is None and connection is not None:
-            using = connection.alias
-        owned = {handle._name for handle in getattr(self, "_rebac_late_scopes", ())}
-        for part in getattr(self, "combined_queries", ()):
-            # The union owner decides for its operands; an operand never re-specializes.
-            late = getattr(part, "_rebac_late_scopes", ())
-            if late:
-                part._rebac_late_scopes = tuple(h for h in late if h._name not in owned)
-        if using is not None:
-            for handle in getattr(self, "_rebac_late_scopes", ()):
-                if using != handle._using:
-                    continue
-                candidates = (
-                    None
-                    if _references_cte(cast(Query, self), handle._name)
-                    else statement_candidate_ids(handle._model, self, using)
-                )
-                plan = next(
-                    (
-                        item
-                        for item in getattr(self, "_rebac_shared_scopes", ())
-                        if item.cte.name == handle._name
-                    ),
-                    None,
-                )
-                if plan is not None and plan.candidates != candidates:
-                    ctes, replacement = handle._definition(candidates)
-                    _replace_shared_definition(cast(Query, self), ctes, replacement)
-        return cast(Any, super()).get_compiler(*args, **kwargs)
 
 
 def share_scoped_definitions[T: models.Model](
@@ -673,58 +485,6 @@ def _nested_queries(expression: Any, *, boolean_operands_only: bool = False) -> 
             yield part
         if part is not None:
             yield from _nested_queries(part, boolean_operands_only=boolean_operands_only)
-
-
-def _isolate_statement_queries(
-    query: Query, plans: tuple[Any, ...], shared_name: str | tuple[str, ...]
-) -> None:
-    """Clone nested queries before adding statement-local sharing metadata.
-
-    Django clones WHERE leaves and annotations shallowly. Replacing those
-    leaves here keeps the input queryset and sibling statements independent.
-    A nested use of the same handle references the outer WITH definition.
-    """
-    nested = tuple({id(part): part for part in _nested_queries(query)}.values())
-    clones = {id(part): (part, part.clone()) for part in nested}
-
-    class Replacements:
-        def __bool__(self) -> bool:
-            return bool(clones)
-
-        def get(self, value: Any) -> Any:
-            found = clones.get(id(value))
-            return found[1] if found is not None and found[0] is value else None
-
-    replacements = Replacements()
-
-    def replace(value: Any) -> Any:
-        method = getattr(value, "replace_expressions", None)
-        return method(replacements) if callable(method) else value
-
-    for part in (*reversed(tuple(clone for _original, clone in clones.values())), query):
-        part.where = replace(part.where)
-        part.annotations = {name: replace(value) for name, value in part.annotations.items()}
-        part.select = tuple(replace(value) for value in part.select)
-        part.order_by = tuple(replace(value) for value in part.order_by)
-        if isinstance(part.group_by, tuple):
-            part.group_by = tuple(replace(value) for value in part.group_by)
-        for alias, join in tuple(part.alias_map.items()):
-            relation = getattr(join, "filtered_relation", None)
-            condition = getattr(relation, "resolved_condition", None)
-            if condition is not None:
-                new_join = copy(join)
-                new_relation = cast(Any, copy(relation))
-                new_relation.resolved_condition = replace(condition)
-                new_join.filtered_relation = new_relation
-                part.alias_map[alias] = new_join
-        if part.combined_queries:
-            part.combined_queries = tuple(
-                replacements.get(child) or child for child in part.combined_queries
-            )
-        if part is not query and hasattr(part, "_with_ctes"):
-            owned = {shared_name} if isinstance(shared_name, str) else set(shared_name)
-            _replace_query_ctes(part, remove_names=owned)
-        cast(Any, part)._rebac_shared_scopes = plans
 
 
 class _Readable(models.Case):
@@ -1406,12 +1166,11 @@ class TrackedManager[M: models.Model](_TrackedManagerBase[M]):  # pyright: ignor
 class RebacQuerySet(TrackedQuerySet[_M]):
     """REBAC-aware queryset.
 
-    Use `.with_actor(actor)`, `.as_user(user)`, `.as_agent(agent, on_behalf_of=u)`,
-    or `.sudo(reason=...)` to scope. Materialising without any of those AND
+    Use `.with_actor(actor)` or `.sudo(reason=...)` to scope. Materialising without any of those AND
     without an ambient actor raises `MissingActorError` when STRICT_MODE is on.
 
     Generic over the model so the actor verbs preserve the concrete row
-    type: ``Post.objects.filter(...).as_user(u).get()`` stays ``Post``.
+    type: ``Post.objects.filter(...).with_actor(u).get()`` stays ``Post``.
     """
 
     # Per-queryset state. Carried through `_clone()`.
@@ -1547,9 +1306,6 @@ class RebacQuerySet(TrackedQuerySet[_M]):
         scoped._guard_clause_field_reads(*scoped.effective_actor(strict=True))
         return super(RebacQuerySet, scoped).explain(format=format, **options)
 
-    # Note: a second `_clone` override below combines the actor + scope-flag
-    # propagation; this stub kept for readability.
-
     # ----- Actor verbs -----
 
     def with_actor(self, actor: Any) -> Self:
@@ -1568,14 +1324,6 @@ class RebacQuerySet(TrackedQuerySet[_M]):
         cast(Any, clone)._prefetch_related_lookups = rebind_prefetch_actor(prefetches, ref)
         clone._refresh_scope()
         return clone
-
-    def as_user(self, user: Any) -> Self:
-        """Typed shorthand: scope to a Django User."""
-        return self.with_actor(to_subject_ref(user))
-
-    def as_agent(self, agent: Any, *, on_behalf_of: Any | None = None) -> Self:
-        """Typed shorthand: scope to an agent acting via a Grant."""
-        return self.with_actor(grant_subject_ref(agent, on_behalf_of))
 
     def with_action(self, action: str) -> Self:
         """Pin the REBAC permission used for queryset read scoping."""
@@ -1679,37 +1427,6 @@ class RebacQuerySet(TrackedQuerySet[_M]):
         clone._reset_scope()
         return clone.scoped()
 
-    def scope_cte(self, *, actions: tuple[str, ...] = ()) -> SharedScope[_M]:
-        """Make a statement-local identity scope, optionally sharing action leaves."""
-        from .backends import backend
-        from .compile.read import scope_candidate_ids
-
-        unscoped = _without_query_scope(self.query)
-        if unscoped.annotations or unscoped.combined_queries or unscoped.is_sliced:
-            raise ValueError(
-                "scope_cte() requires an unfiltered or identity-filtered, unsliced queryset"
-            )
-        candidates = None
-        if unscoped.where.children:
-            candidates = scope_candidate_ids(self.model, unscoped, self.db)
-            if candidates is None:
-                raise ValueError(
-                    "scope_cte() requires an unfiltered or bounded identity-filtered queryset"
-                )
-        actor, bypass = self.effective_actor(strict=True)
-        if bypass or actor is None:
-            raise ValueError("scope_cte() requires an actor scope")
-        action = str(
-            self._rebac_action or getattr(self.model._meta, "rebac_default_action", "read")
-        )
-        if actions and (actions[0] != action or len(set(actions)) != len(actions)):
-            raise ValueError("scope_cte() actions must be distinct and start with the scope action")
-        identity = resource_id_attr(self.model)
-        columns = tuple(dict.fromkeys(("pk", identity)))
-        return SharedScope(
-            self.model, actor, action, self.db, backend(), columns, candidates, actions
-        )
-
     def _reset_scope(self) -> None:
         # QuerySet.query's public setter switches values_list() to ValuesIterable
         # when values_select is populated. This is an internal SQL replacement;
@@ -1770,6 +1487,13 @@ class RebacQuerySet(TrackedQuerySet[_M]):
 
     def actor(self) -> SubjectRef | None:
         return self._rebac_actor
+
+    def action(self) -> str:
+        """Return the permission used to scope this queryset's rows."""
+        return self._action_for_model(self.model)
+
+    def _action_for_model(self, model: type[models.Model]) -> str:
+        return str(self._rebac_action or getattr(model._meta, "rebac_default_action", "read"))
 
     def is_sudo(self) -> bool:
         return self._rebac_sudo_reason is not None
@@ -1923,7 +1647,7 @@ class RebacQuerySet(TrackedQuerySet[_M]):
                 return
             from .backends import backend
 
-            action = str(self._rebac_action or getattr(model._meta, "rebac_default_action", "read"))
+            action = self._action_for_model(model)
             active_backend = backend()
             predicate = active_backend.queryset_filter(
                 model=model, subject=actor, action=action, using=self.db
@@ -2385,7 +2109,7 @@ class RebacQuerySet(TrackedQuerySet[_M]):
 
         Django computes ``aggregate`` against ``self.query`` directly, so it
         never triggers ``_fetch_all`` / ``iterator``. Without scoping the WHERE
-        clause first, ``SomeModel.objects.as_user(u).aggregate(Count("pk"))``
+        clause first, ``SomeModel.objects.with_actor(u).aggregate(Count("pk"))``
         would summarise rows ``u`` cannot read (and ``aaggregate`` — a
         ``sync_to_async`` wrapper around this method — would leak the same way).
         Applying scope here fixes both surfaces.
@@ -2728,10 +2452,6 @@ class RebacManager[M: models.Model](_RebacManagerBase[M]):  # pyright: ignore[re
 
         def with_actor(self, actor: ActorLike | None) -> RebacQuerySet[M]: ...
 
-        def as_user(self, user: Any) -> RebacQuerySet[M]: ...
-
-        def as_agent(self, agent: Any, *, on_behalf_of: Any | None = None) -> RebacQuerySet[M]: ...
-
         def with_action(self, action: str) -> RebacQuerySet[M]: ...
 
         def on_field_deny(self, mode: FieldDenyMode) -> RebacQuerySet[M]: ...
@@ -2752,9 +2472,9 @@ class RebacManager[M: models.Model](_RebacManagerBase[M]):  # pyright: ignore[re
 
         def scoped_for_aggregate(self) -> RebacQuerySet[M]: ...
 
-        def scope_cte(self, *, actions: tuple[str, ...] = ()) -> SharedScope[M]: ...
-
         def actor(self) -> SubjectRef | None: ...
+
+        def action(self) -> str: ...
 
         def is_sudo(self) -> bool: ...
 

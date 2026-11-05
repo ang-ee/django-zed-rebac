@@ -108,7 +108,7 @@ class RebacFilterBackend(BaseFilterBackend):  # type: ignore[misc]  # untyped th
     """Scopes a viewset's queryset to the actor."""
 
     def filter_queryset(self, request: Any, queryset: Any, view: Any) -> Any:
-        if not hasattr(queryset, "as_user"):
+        if not hasattr(queryset, "with_actor"):
             return queryset
         subject = _subject_from_request(request)
         if subject is None:

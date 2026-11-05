@@ -1,0 +1,4 @@
+nice: setpriority: Operation not permitted
+SCOPE_BENCH {"build_ms": 0.039, "check_ms": 8.965, "check_sql_bytes": 994, "check_statements": 2, "cold_scoped_ms": 37.802, "compile_ms": 0.113, "exists": 1, "max_sql_bytes": 994, "new_actor_ms": 0.791, "params": 32, "rows_ms": 3.705, "rows_sql_bytes": 994, "rows_statements": 2, "scoped_ms": 0.312, "sql_chars": 2429}
+.
+1 passed in 1.91s

@@ -14,17 +14,12 @@ from django.core.signals import setting_changed
 _DEFAULTS: dict[str, Any] = {
     "REBAC_BACKEND": "local",
     "REBAC_TRACKED_MODELS": [],
-    "REBAC_RELATIONSHIP_MODEL": "rebac.Relationship",
     "REBAC_SCHEMA_DIR": None,  # resolves to <cwd>/rebac at use site
     "REBAC_DEPTH_LIMIT": 8,
     "REBAC_STATEMENT_CACHE_BYTES": 64 * 1024 * 1024,
-    "REBAC_DEFAULT_CONSISTENCY": "minimize_latency",
-    "REBAC_CACHE_ALIAS": "default",
-    "REBAC_LOOKUP_CACHE_TTL": 60,
     "REBAC_STRICT_MODE": True,
     "REBAC_REQUIRE_SUDO_REASON": True,
     "REBAC_ALLOW_SUDO": True,
-    "REBAC_GC_INTERVAL_SECONDS": 300,
     "REBAC_AUTHENTICATION_MIDDLEWARE": "django.contrib.auth.middleware.AuthenticationMiddleware",
     "REBAC_ACTOR_RESOLVER": "rebac.actors.default_resolver",
     # Dotted-path callable resolving an MCP request Context → SubjectRef, used

@@ -1,0 +1,30 @@
+nice: setpriority: Operation not permitted
+bringing up nodes...
+bringing up nodes...
+
+........................................................................ [  7%]
+........................................................................ [ 14%]
+..........................s.....s....................................... [ 21%]
+........................................................................ [ 28%]
+........................................................................ [ 35%]
+........................................................................ [ 42%]
+........................................................................ [ 50%]
+........................................................................ [ 57%]
+........................................................................ [ 64%]
+........................................................................ [ 71%]
+.....................................x...x..........s.s................. [ 78%]
+........................................................................ [ 85%]
+......................................................................x. [ 92%]
+........................................................................ [100%]
+============================= slowest 10 durations =============================
+10.61s call     tests/test_read_contract.py::test_context_accessible_enumerates_more_ids_than_the_sqlite_parameter_limit[denormalized]
+8.09s call     tests/test_compile_semantics.py::test_expiry_of_recursive_grants_and_memberships[denormalized]
+7.47s call     tests/test_read_contract.py::test_context_accessible_enumerates_more_ids_than_the_sqlite_parameter_limit[registry]
+5.84s call     tests/test_compile_identity_equiv.py::test_bounded_equals_unbounded_intersection[registry-decided-sliced]
+5.17s call     tests/test_compile_identity_equiv.py::test_bounded_equals_unbounded_intersection[registry-inline-sliced]
+4.77s call     tests/test_decided_largeset.py::test_large_decided_set_uses_inline_closure_by_default
+4.62s call     tests/test_compile_sets.py::test_actor_set_witness_byte_budget_and_model_identity_boundary
+4.33s call     tests/test_write_effects.py::test_conflict_bulk_create_preserves_refusal_and_sudo_writes_take_effect[denormalized]
+4.29s call     tests/test_decided_warmcold.py::test_warm_equals_cold_atomic[evaluator]
+4.16s call     tests/test_decided_warmcold.py::test_warm_equals_cold_atomic[ordinary]
+1001 passed, 4 skipped, 3 xfailed in 163.27s (0:02:43)

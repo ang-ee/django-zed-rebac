@@ -215,14 +215,8 @@ def test_fixed_object_renders_once_per_bound(statement_rows, monkeypatch):
     assert len(re.findall(r'"rebac_const_[^\"]+" AS \(', after)) == 2
 
 
-def test_attached_and_union_owner_names_are_repeatable(statement_rows, monkeypatch):
+def test_union_owner_names_are_repeatable(statement_rows, monkeypatch):
     actor, post = statement_rows
-
-    def attached() -> str:
-        read.reset()
-        handle = Post.objects.with_actor(actor).scope_cte(actions=("read", "view"))
-        base = Post._base_manager.filter(pk__in=handle.queryset().values("pk"))
-        return str(handle.attach(base).query)
 
     def union() -> str:
         read.reset()
@@ -236,9 +230,7 @@ def test_attached_and_union_owner_names_are_repeatable(statement_rows, monkeypat
         ]
         return str(share_scoped_definitions(plain[0].union(plain[1], all=True)).query)
 
-    attached_sql = attached()
     union_sql = union()
-    assert attached_sql == attached()
     assert union_sql == union()
 
     original_init = Compiler.__init__
@@ -250,15 +242,12 @@ def test_attached_and_union_owner_names_are_repeatable(statement_rows, monkeypat
 
     with monkeypatch.context() as prior_width:
         prior_width.setattr(Compiler, "__init__", wide_owner)
-        wide_attached = attached()
         wide_union = union()
-    assert len(wide_attached.encode()) > len(attached_sql.encode())
     assert len(wide_union.encode()) > len(union_sql.encode())
     print(
         "OWNER_WIDTH "
         + repr(
             {
-                "attached": (len(wide_attached.encode()), len(attached_sql.encode())),
                 "union": (len(wide_union.encode()), len(union_sql.encode())),
             }
         )

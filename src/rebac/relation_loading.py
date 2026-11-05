@@ -27,13 +27,19 @@ def relation_actor(queryset: Any) -> SubjectRef | None:
     return actor
 
 
+def pinned_actor(obj_or_qs: Any) -> SubjectRef | None:
+    """Return an explicit row or queryset actor without consulting ambient scope."""
+    actor = getattr(obj_or_qs, "_rebac_actor", None)
+    if actor is None:
+        actor = getattr(obj_or_qs, "_rebac_relation_actor", None)
+    return actor if isinstance(actor, SubjectRef) else None
+
+
 def _relation_scope(queryset: Any) -> tuple[SubjectRef | None, bool]:
     """Resolve a related guard's actor and bypass without inheriting a sudo pin."""
-    pinned_actor = getattr(queryset, "_rebac_actor", None)
-    if pinned_actor is None:
-        pinned_actor = getattr(queryset, "_rebac_relation_actor", None)
+    actor = pinned_actor(queryset)
     return resolve(
-        pinned_actor=pinned_actor,
+        pinned_actor=actor,
         mode="relation",
         strict=False,
         subject_label="Related read",

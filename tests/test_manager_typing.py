@@ -78,8 +78,8 @@ def test_queryset_manager_extensions_keep_native_type_checks(tmp_path: Path) -> 
 
             queryset = PostQuerySet[Post](model=Post)
             assert_type(queryset.with_actor(None), PostQuerySet[Post])
-            assert_type(queryset.as_user(None), PostQuerySet[Post])
-            assert_type(queryset.as_agent(None), PostQuerySet[Post])
+            assert_type(queryset.with_actor(None), PostQuerySet[Post])
+            assert_type(queryset.with_actor(None), PostQuerySet[Post])
             assert_type(queryset.with_action("read"), PostQuerySet[Post])
             assert_type(queryset.on_field_deny("allow"), PostQuerySet[Post])
             assert_type(queryset.for_write(), PostQuerySet[Post])
@@ -250,7 +250,7 @@ def test_queryset_scope_clones_keep_concrete_class() -> None:
     actor = SubjectRef("auth/user", "typing")
     for clone in (
         original.with_actor(actor),
-        original.as_user(actor),
+        original.with_actor(actor),
         original.with_action("read"),
         original.on_field_deny("allow"),
         original.for_write(),

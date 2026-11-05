@@ -12,7 +12,7 @@ from typing import assert_type
 
 from django.db import models
 
-from rebac import RebacManager, RebacQuerySet, SubjectRef
+from rebac import RebacManager, RebacQuerySet, SubjectRef, grant_subject_ref
 from tests.testapp.models import Post
 
 
@@ -26,8 +26,8 @@ PostManager = RebacManager.from_queryset(PostQuerySet)
 
 def verbs_on_a_model_manager(actor: SubjectRef) -> None:
     assert_type(Post.objects.with_actor(actor).get(), Post)
-    assert_type(Post.objects.as_user(actor).filter(title="x").first(), Post | None)
-    assert_type(Post.objects.as_agent(actor, on_behalf_of=actor).count(), int)
+    assert_type(Post.objects.with_actor(actor).filter(title="x").first(), Post | None)
+    assert_type(Post.objects.with_actor(grant_subject_ref(actor, actor)).count(), int)
     assert_type(Post.objects.with_action("write").for_write().get(), Post)
     assert_type(Post.objects.sudo(reason="sample").get(), Post)
     assert_type(Post.objects.system_context(reason="sample").get(), Post)

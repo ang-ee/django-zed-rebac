@@ -368,25 +368,25 @@ def test_queryset_read_methods_and_field_read_gates_use_local_backend_end_to_end
         ]
     )
 
-    scoped = Post.objects.as_user(fake_users.alice).order_by("pk")
+    scoped = Post.objects.with_actor(fake_users.alice).order_by("pk")
     assert scoped.count() == 2
     assert list(scoped.values_list("pk", flat=True)) == [owned.pk, viewer_visible_row.pk]
-    assert Post.objects.as_user(fake_users.alice).filter(pk=owned.pk).exists()
-    assert not Post.objects.as_user(fake_users.alice).filter(pk=hidden.pk).exists()
+    assert Post.objects.with_actor(fake_users.alice).filter(pk=owned.pk).exists()
+    assert not Post.objects.with_actor(fake_users.alice).filter(pk=hidden.pk).exists()
 
-    owner_row = Post.objects.as_user(fake_users.alice).get(pk=owned.pk)
+    owner_row = Post.objects.with_actor(fake_users.alice).get(pk=owned.pk)
     assert owner_row.title == "visible to owner"
-    viewer_row = Post.objects.as_user(fake_users.alice).get(pk=viewer_visible_row.pk)
+    viewer_row = Post.objects.with_actor(fake_users.alice).get(pk=viewer_visible_row.pk)
     assert viewer_row.title is None
     assert viewer_row.body == "viewer can see body"
     assert viewer_row._rebac_redacted_fields == frozenset({"title"})
     iterated = list(
-        Post.objects.as_user(fake_users.alice).filter(pk=viewer_visible_row.pk).iterator()
+        Post.objects.with_actor(fake_users.alice).filter(pk=viewer_visible_row.pk).iterator()
     )
     assert iterated[0].title is None
 
     with pytest.raises(PermissionDenied):
-        list(Post.objects.as_user(fake_users.alice).values("title"))
+        list(Post.objects.with_actor(fake_users.alice).values("title"))
 
     viewer_row.title = "attempted overwrite"
     with pytest.raises(PermissionDenied, match="redacted"):
@@ -415,7 +415,7 @@ def test_caveated_field_read_permission_fails_closed_and_allows_with_context(
         ]
     )
 
-    row = Post.objects.as_user(fake_users.alice).get(pk=post.pk)
+    row = Post.objects.with_actor(fake_users.alice).get(pk=post.pk)
     assert row.body == "visible body"
     assert row.title is None
     assert row._rebac_redacted_fields == frozenset({"title"})
@@ -442,13 +442,13 @@ def test_model_write_delete_and_field_write_gates_use_local_backend_end_to_end(
         ]
     )
 
-    editor_copy = Post.objects.as_user(fake_users.bob).get(pk=post.pk)
+    editor_copy = Post.objects.with_actor(fake_users.bob).get(pk=post.pk)
     editor_copy.body = "editor body"
     editor_copy.save()
     with sudo(reason="local-backend-e2e.verify"):
         assert Post.objects.get(pk=post.pk).body == "editor body"
 
-    editor_copy = Post.objects.as_user(fake_users.bob).get(pk=post.pk)
+    editor_copy = Post.objects.with_actor(fake_users.bob).get(pk=post.pk)
     editor_copy.title = "editor title"
     with pytest.raises(PermissionDenied, match="write__title"):
         editor_copy.save()
@@ -462,28 +462,31 @@ def test_model_write_delete_and_field_write_gates_use_local_backend_end_to_end(
         resource=resource,
     )
     # Bob no longer reads the row: it is not part of his statement.
-    assert Post.objects.as_user(fake_users.bob).filter(pk=post.pk).update(body="after revoke") == 0
+    assert (
+        Post.objects.with_actor(fake_users.bob).filter(pk=post.pk).update(body="after revoke") == 0
+    )
     with sudo(reason="local-backend-e2e.verify"):
         assert Post.objects.get(pk=post.pk).body == "editor body"
 
     write_relationships([_grant(fake_users.bob, resource, "editor")])
     with pytest.raises(PermissionDenied, match="write__title"):
-        Post.objects.as_user(fake_users.bob).filter(pk=post.pk).update(title="bulk editor title")
+        Post.objects.with_actor(fake_users.bob).filter(pk=post.pk).update(title="bulk editor title")
     with sudo(reason="local-backend-e2e.verify"):
         assert Post.objects.get(pk=post.pk).title == "original title"
-    assert Post.objects.as_user(fake_users.bob).filter(pk=post.pk).update(body="bulk body") == 1
+    assert Post.objects.with_actor(fake_users.bob).filter(pk=post.pk).update(body="bulk body") == 1
     assert (
-        Post.objects.as_user(fake_users.alice).filter(pk=post.pk).update(title="owner title") == 1
+        Post.objects.with_actor(fake_users.alice).filter(pk=post.pk).update(title="owner title")
+        == 1
     )
 
     with pytest.raises(PermissionDenied):
-        Post.objects.as_user(fake_users.bob).filter(pk=post.pk).delete()
-    assert Post.objects.as_user(fake_users.alice).filter(pk=post.pk).delete()[0] == 1
+        Post.objects.with_actor(fake_users.bob).filter(pk=post.pk).delete()
+    assert Post.objects.with_actor(fake_users.alice).filter(pk=post.pk).delete()[0] == 1
     with sudo(reason="local-backend-e2e.verify"):
         assert not Post.objects.filter(pk=post.pk).exists()
 
 
-def test_as_agent_shorthands_scope_querysets_and_instances_through_local_backend(
+def test_grant_actor_scope_querysets_and_instances_through_local_backend(
     local_backend: LocalBackend,
     fake_users: FakeUsers,
 ) -> None:
@@ -495,14 +498,16 @@ def test_as_agent_shorthands_scope_querysets_and_instances_through_local_backend
     write_relationships([_grant(grant_subject, ObjectRef("blog/post", str(post.pk)), "owner")])
 
     assert list(
-        Post.objects.as_agent(agent, on_behalf_of=fake_users.alice).values_list("pk", flat=True)
+        Post.objects.with_actor(grant_subject_ref(agent, fake_users.alice)).values_list(
+            "pk", flat=True
+        )
     ) == [post.pk]
-    assert list(Post.objects.as_agent(agent, on_behalf_of=fake_users.bob)) == []
+    assert list(Post.objects.with_actor(grant_subject_ref(agent, fake_users.bob))) == []
 
     with sudo(reason="local-backend-e2e.load"):
         instance = Post.objects.get(pk=post.pk)
-    instance.as_agent(agent, on_behalf_of=fake_users.alice)
+    instance.with_actor(grant_subject_ref(agent, fake_users.alice))
     assert instance.actor() == grant_subject
     assert instance.has_access("read")
-    instance.as_agent(agent, on_behalf_of=fake_users.bob)
+    instance.with_actor(grant_subject_ref(agent, fake_users.bob))
     assert not instance.has_access("read")

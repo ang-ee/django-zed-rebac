@@ -139,7 +139,6 @@ def _row_kwargs(
     """
     actor_type = actor.subject_type if actor is not None else ""
     actor_id = actor.subject_id if actor is not None else ""
-    # TODO(spec): populate origin from middleware impersonation chain when wired.
     # The PermissionAuditEvent model does not currently carry origin_subject_*
     # columns; the `origin` parameter is accepted for API stability, but until
     # the migration grows the column it's discarded.

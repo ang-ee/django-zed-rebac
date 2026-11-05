@@ -228,7 +228,7 @@ def test_pin_current_actor_ignores_router_instance_hint(alice):
     _grant("blog/folder", folder.pk, "viewer", alice)
     _grant("blog/post", alice_post.pk, "viewer", alice)
     _grant("blog/post", bob_post.pk, "viewer", bob)
-    pinned_folder = Folder.objects.as_user(alice).get(pk=folder.pk)
+    pinned_folder = Folder.objects.with_actor(alice).get(pk=folder.pk)
     hinted = Post.objects.db_manager(hints={"instance": pinned_folder}).all()
 
     with actor_context(bob):

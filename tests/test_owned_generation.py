@@ -6,7 +6,7 @@ import threading
 import pytest
 from django.db import connection, connections, models, transaction
 
-from rebac import RelationshipTuple, SubjectRef, decision_scope, sudo, to_object_ref
+from rebac import RelationshipTuple, SubjectRef, evaluator_scope, sudo, to_object_ref
 from rebac.testing import install_schema
 from rebac.watch import model_write, row_generation, row_generations
 
@@ -49,7 +49,7 @@ def visible():
 @pytest.mark.pg_delta
 def test_changed_row_is_redecided_inside_owner():
     top, child, post = tree()
-    with decision_scope() as evaluator:
+    with evaluator_scope() as evaluator:
         assert visible() == {post.pk}
         with model_write(model=Folder, using="default"):
             assert visible() == {post.pk}

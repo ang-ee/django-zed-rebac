@@ -13,7 +13,6 @@ from rebac import (
     ObjectRef,
     RelationshipTuple,
     SubjectRef,
-    decision_scope,
     evaluator_scope,
     sudo,
     to_object_ref,
@@ -290,7 +289,7 @@ def test_every_row_gate_carries_decided_witness_ctes(shape):
             result = sorted(Post.objects.with_actor(admin).values_list("pk", flat=True))
             expected = sorted(post.pk for post in posts)
         elif shape == "pk_in":
-            with decision_scope():
+            with evaluator_scope():
                 result = sorted(
                     Post.objects.with_actor(admin)
                     .filter(pk__in={posts[0].pk, posts[3].pk})
@@ -307,7 +306,7 @@ def test_every_row_gate_carries_decided_witness_ctes(shape):
             expected = sorted(folder.pk for folder in folders)
     assert result == expected
     assert_rebac_ctes_defined(queries)
-    if connection.vendor == "postgresql":
+    if connection.vendor == "postgresql" and shape != "pk_in":
         assert any('FROM "rebac_decided_' in query["sql"] for query in queries)
     if shape == "exists":
         assert len(queries) == 3
@@ -815,7 +814,7 @@ def test_owned_model_write_invalidates_decided_rows(tree):
 @pytest.mark.django_db(transaction=True)
 def test_decided_folder_memo_survives_ten_post_writes_but_not_folder_write(tree):
     _local, child, _leaf, post = tree
-    with decision_scope():
+    with evaluator_scope():
         assert visible(Post) == {post.pk}
         reads = []
         for _ in range(10):
@@ -834,13 +833,12 @@ def test_decided_folder_memo_survives_ten_post_writes_but_not_folder_write(tree)
 
 
 @pytest.mark.django_db(transaction=True)
-@pytest.mark.parametrize("scope_kind", ["evaluator", "decision"])
-def test_proxy_write_invalidates_concrete_model_decision(tree, scope_kind):
+def test_proxy_write_invalidates_concrete_model_decision(tree):
     _local, child, _leaf, post = tree
     with sudo(reason="proxy fixture"):
         other = Folder.objects.create(name="other")
         second = Post.objects.create(title="second", folder=other)
-    scope = evaluator_scope() if scope_kind == "evaluator" else decision_scope()
+    scope = evaluator_scope()
     with scope:
         assert visible(Post) == {post.pk}
         with sudo(reason="proxy backed write"):

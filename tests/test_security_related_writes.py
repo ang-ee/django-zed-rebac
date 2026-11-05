@@ -1416,8 +1416,8 @@ def test_m2m_set_uses_pinned_instance_actor_without_ambient(world):
     for folder in world[0]:
         _grant("blog/folder", folder.pk, "owner", alice_ref)
     _grant("blog/post", world[1][0].pk, "owner", alice_ref)
-    post = Post.objects.as_user(alice).get(pk=world[1][0].pk)
-    target = Folder.objects.as_user(alice).get(pk=world[0][1].pk)
+    post = Post.objects.with_actor(alice).get(pk=world[1][0].pk)
+    target = Folder.objects.with_actor(alice).get(pk=world[0][1].pk)
     assert list(post.collections.using("default").values_list("pk", flat=True)) == [world[0][0].pk]
 
     with transaction.atomic():
@@ -1436,8 +1436,8 @@ def test_m2m_set_uses_pinned_instance_actor_over_ambient(world):
         _grant("blog/folder", folder.pk, "owner", alice_ref)
     _grant("blog/post", world[1][0].pk, "owner", alice_ref)
     _grant("blog/folder", world[0][1].pk, "viewer", bob_ref)
-    post = Post.objects.as_user(alice).get(pk=world[1][0].pk)
-    target = Folder.objects.as_user(alice).get(pk=world[0][1].pk)
+    post = Post.objects.with_actor(alice).get(pk=world[1][0].pk)
+    target = Folder.objects.with_actor(alice).get(pk=world[0][1].pk)
 
     with actor_context(bob_ref), transaction.atomic():
         assert list(post.collections.using("default").values_list("pk", flat=True)) == [

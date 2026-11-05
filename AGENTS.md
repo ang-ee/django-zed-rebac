@@ -158,25 +158,16 @@ design that prevents the worst data-leakage bug class.
 partially supplied; callers may retry with additional context. Don't simplify
 to `bool` — that erases the layered-checks invariant.
 
-### 5. `with_actor` is the primary verb; `as_user` / `as_agent` are sugar
+### 5. `with_actor` is the actor-pinning verb
 
 The generic verb is `.with_actor(actor)`, where `actor` is any `ActorLike`:
 a Django `User`, a registered `Agent`, an `agents/grant` `SubjectRef`, an
-`auth/apikey` `SubjectRef`, or anything `@rebac_subject`-decorated. Two typed
-shorthands cover the common cases:
+`auth/apikey` `SubjectRef`, or anything `@rebac_subject`-decorated.
 
-- `.as_user(user)` — Django `User` shortcut (≡
-  `with_actor(to_subject_ref(user))`).
-- `.as_agent(agent, on_behalf_of=user)` — agent acting via grant (≡
-  `with_actor(grant_subject_ref(agent, user))`).
-
-When a queryset is created with any of the above, every instance loaded from
+When a queryset is created with `with_actor()`, every instance loaded from
 it carries the resolved `SubjectRef`. A subsequent `instance.save()` checks
 against that same actor, regardless of what `current_actor()` says now.
 
-- **Don't** name a queryset method `as_user` and have the implementation be
-  different from `with_actor(to_subject_ref(user))`. There is exactly one
-  code path; the shorthands are sugar.
 - **Don't** mutate a `ContextVar` inside `with_actor()`. The actor lives on
   the queryset instance.
 - **Don't** re-resolve the actor on `save()` — that breaks the Celery / cron
@@ -444,9 +435,7 @@ access via `rebac.backend()`.
 - `Relationship` indexes ship in `0001_initial.py` — never as a
   documentation step.
 - Every `RunSQL` operation has `reverse_sql`.
-- Use `swapper` if `REBAC_RELATIONSHIP_MODEL` is genuinely swappable;
-  otherwise mark `class Meta: managed = True` (default) and ship the
-  standard migration.
+- The relationship model is managed by the plugin; ship the standard migration.
 - Migrations must run on PostgreSQL 15+, MySQL 8.4+, SQLite (test only).
   Data migrations use the Django ORM in bounded batches (`0008` fills
   `caveat_key` 1,000 rows at a time). No raw SQL, triggers or database

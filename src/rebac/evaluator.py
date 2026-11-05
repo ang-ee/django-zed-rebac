@@ -27,10 +27,10 @@ task does not leak back to the parent.
 from __future__ import annotations
 
 from collections import OrderedDict
-from collections.abc import Hashable, Iterable, Iterator
+from collections.abc import Callable, Hashable, Iterable, Iterator
 from contextlib import contextmanager
 from contextvars import ContextVar
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, cast
 
 from .schema.cache import SchemaScope, schema_operation
 from .types import CheckResult, Consistency, ObjectRef, PermissionResult, SubjectRef, Zookie
@@ -87,6 +87,39 @@ def _backend_cache_key(
     return _BackendKey(backend), value
 
 
+def _decision_memo_get[V](
+    cache: OrderedDict[tuple[Any, ...], V], key: tuple[Any, ...]
+) -> tuple[bool, V]:
+    if key not in cache:
+        return False, cast(V, None)
+    cache.move_to_end(key)
+    return True, cache[key]
+
+
+def _decision_memo_store[V](
+    cache: OrderedDict[tuple[Any, ...], V],
+    key: tuple[Any, ...],
+    value: V,
+    *,
+    limit: int,
+    total_weight: int = 0,
+    weight: Callable[[V], int] | None = None,
+) -> int:
+    """Store one decision and enforce both entry and optional total-ID budgets."""
+    if key in cache:
+        previous = cache.pop(key)
+        if weight is not None:
+            total_weight -= weight(previous)
+    cache[key] = value
+    if weight is not None:
+        total_weight += weight(value)
+    while len(cache) > limit or (weight is not None and total_weight > limit):
+        _, evicted = cache.popitem(last=False)
+        if weight is not None:
+            total_weight -= weight(evicted)
+    return total_weight
+
+
 class PermissionEvaluator:
     """Bounded LRU cache for one scope's permission lookups.
 
@@ -97,7 +130,6 @@ class PermissionEvaluator:
 
     __slots__ = (
         "_check_cache",
-        "_decision_connection",
         "_fact_decisions",
         "_max_size",
         "_row_decision_ids",
@@ -115,10 +147,11 @@ class PermissionEvaluator:
         self._row_decision_ids = 0
         self._set_decisions: OrderedDict[tuple[Any, ...], Any] = OrderedDict()
         self._fact_decisions: OrderedDict[tuple[Any, ...], bool] = OrderedDict()
-        self._visibility_decisions: OrderedDict[tuple[Any, ...], frozenset[str]] = OrderedDict()
+        self._visibility_decisions: OrderedDict[tuple[Any, ...], tuple[frozenset[str], int]] = (
+            OrderedDict()
+        )
         self._visibility_decision_ids = 0
         self._schema_scope = SchemaScope()
-        self._decision_connection: Any = None
 
     # ----- public API -----
 
@@ -241,9 +274,9 @@ class PermissionEvaluator:
         }
         for name in names:
             key = keys[name]
-            if key in self._visibility_decisions:
-                self._visibility_decisions.move_to_end(key)
-                answers[name] = set(self._visibility_decisions[key])
+            hit, cached = _decision_memo_get(self._visibility_decisions, key)
+            if hit and cached is not None:
+                answers[name] = set(cached[0])
             else:
                 missing.append(name)
         if missing:
@@ -256,14 +289,14 @@ class PermissionEvaluator:
             )
             for name in missing:
                 answers[name] = found[name]
-                self._visibility_decisions[keys[name]] = frozenset(found[name])
-                self._visibility_decision_ids += len(candidates)
-                while (
-                    len(self._visibility_decisions) > self._max_size
-                    or self._visibility_decision_ids > self._max_size
-                ):
-                    oldest, _ = self._visibility_decisions.popitem(last=False)
-                    self._visibility_decision_ids -= len(oldest[5])
+                self._visibility_decision_ids = _decision_memo_store(
+                    self._visibility_decisions,
+                    keys[name],
+                    (frozenset(found[name]), len(candidates)),
+                    limit=self._max_size,
+                    total_weight=self._visibility_decision_ids,
+                    weight=lambda entry: entry[1],
+                )
         return answers
 
     # ----- introspection (for tests + debugging) -----
@@ -352,22 +385,3 @@ def evaluator_scope(
             # real error being unwound (the ContextVar is discarded with its
             # context, so nothing leaks).
             pass
-
-
-@contextmanager
-def decision_scope(*, using: str = "default") -> Iterator[PermissionEvaluator]:
-    """Open one transaction with a transaction-bound decision and schema memo.
-
-    The memo dies before the atomic block exits, including on rollback. A
-    supported write advances its dependency generation within the block.
-    """
-    from django.db import connections, transaction
-
-    from .database import database_context
-
-    with database_context(using), transaction.atomic(using=using), evaluator_scope() as evaluator:
-        evaluator._decision_connection = connections[using]
-        try:
-            yield evaluator
-        finally:
-            evaluator._decision_connection = None

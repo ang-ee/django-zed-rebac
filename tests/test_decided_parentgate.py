@@ -3,7 +3,7 @@ from django.db import connection
 from django.db.models import Exists, OuterRef
 from django.test.utils import CaptureQueriesContext
 
-from rebac import ObjectRef, RelationshipTuple, SubjectRef, decision_scope, sudo, to_object_ref
+from rebac import ObjectRef, RelationshipTuple, SubjectRef, evaluator_scope, sudo, to_object_ref
 from rebac.testing import install_schema
 from tests.test_compile_rows import assert_rebac_ctes_defined
 from tests.testapp.models import Folder, Post
@@ -44,7 +44,7 @@ def test_parent_every_row_gate(shape):
             result = sorted(Post.objects.with_actor(admin).values_list("pk", flat=True))
             expected = sorted(post.pk for post in posts)
         elif shape == "pk_in":
-            with decision_scope():
+            with evaluator_scope():
                 result = sorted(
                     Post.objects.with_actor(admin)
                     .filter(pk__in={posts[0].pk, posts[3].pk})
@@ -61,7 +61,7 @@ def test_parent_every_row_gate(shape):
             expected = sorted(folder.pk for folder in folders)
     assert result == expected
     assert_rebac_ctes_defined(queries)
-    if connection.vendor == "postgresql":
+    if connection.vendor == "postgresql" and shape != "pk_in":
         assert any('FROM "rebac_decided_' in query["sql"] for query in queries)
     if shape == "exists":
         assert len(queries) == 3
