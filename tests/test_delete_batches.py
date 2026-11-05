@@ -144,6 +144,77 @@ def test_queryset_delete_delivers_each_model_batch_and_marks_row_signals(count, 
 
 @pytest.mark.django_db
 @pytest.mark.pg_delta
+def test_collected_batch_sorts_reversed_set_pair_by_primary_key():
+    install_schema(backend(), parse_zed(SCHEMA))
+    with system_context(reason="batch order fixture"):
+        queues = BackingQueue.objects.bulk_create([BackingQueue() for _ in range(16)])
+    pair = next(
+        (
+            (lower, higher)
+            for index, lower in enumerate(queues)
+            for higher in queues[index + 1 :]
+            if next(iter({lower, higher})) is higher
+        ),
+        None,
+    )
+    assert pair is not None
+    lower, higher = pair
+    assert lower.pk < higher.pk
+    backend().write_relationships(
+        [RelationshipTuple(to_object_ref(queue), "owner", ACTOR) for queue in pair]
+    )
+    batches: list[tuple[int, ...]] = []
+    row_pks: list[int] = []
+
+    def on_batch(sender, instances, **_):
+        if sender is BackingQueue:
+            batches.append(tuple(instance.pk for instance in instances))
+
+    def on_row(sender, instance, **_):
+        row_pks.append(instance.pk)
+
+    collected_for_delete.connect(on_batch, sender=BackingQueue, weak=False)
+    pre_delete.connect(on_row, sender=BackingQueue, weak=False)
+    try:
+        BackingQueue.objects.with_actor(ACTOR).filter(pk__in=[lower.pk, higher.pk]).delete()
+    finally:
+        collected_for_delete.disconnect(on_batch, sender=BackingQueue)
+        pre_delete.disconnect(on_row, sender=BackingQueue)
+
+    assert batches == [(lower.pk, higher.pk)]
+    assert row_pks == [lower.pk, higher.pk]
+
+
+@pytest.mark.django_db
+@pytest.mark.pg_delta
+def test_collected_batches_follow_django_parent_child_model_order():
+    install_schema(backend(), parse_zed(SCHEMA))
+    queue, _ = _seed(1)
+    batches: list[type] = []
+    row_models: list[type] = []
+
+    def on_batch(sender, **_):
+        batches.append(sender)
+
+    def on_row(sender, **_):
+        row_models.append(sender)
+
+    for model in (BackingQueue, BackingTask):
+        collected_for_delete.connect(on_batch, sender=model, weak=False)
+        pre_delete.connect(on_row, sender=model, weak=False)
+    try:
+        queue.with_actor(ACTOR).delete()
+    finally:
+        for model in (BackingQueue, BackingTask):
+            collected_for_delete.disconnect(on_batch, sender=model)
+            pre_delete.disconnect(on_row, sender=model)
+
+    assert batches == [BackingTask, BackingQueue]
+    assert row_models == batches
+
+
+@pytest.mark.django_db
+@pytest.mark.pg_delta
 def test_instance_delete_delivers_non_resource_collected_model():
     install_schema(backend(), parse_zed(SCHEMA))
     queue, tasks = _seed(1, project=True)
@@ -269,7 +340,7 @@ def test_declared_through_gate_can_refuse_after_batches_and_roll_back_receiver_w
     finally:
         collected_for_delete.disconnect(on_batch)
 
-    assert seen == [Folder, PostPin]
+    assert seen == [PostPin, Folder]
     assert BackingStage._base_manager.count() == previous_writes
     assert Folder._base_manager.filter(pk=folder.pk).exists()
     assert PinnedPost._base_manager.filter(pk=post.pk).exists()

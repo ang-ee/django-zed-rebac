@@ -19,6 +19,7 @@ from contextlib import AbstractContextManager, contextmanager, nullcontext
 from contextvars import ContextVar
 from dataclasses import dataclass
 from dataclasses import field as dataclass_field
+from operator import attrgetter
 from typing import TYPE_CHECKING, Any, ClassVar, Self, cast
 
 from django.core.exceptions import ImproperlyConfigured, ObjectDoesNotExist, ValidationError
@@ -342,6 +343,9 @@ def delete_collected(
         collector.collect(del_query)
     else:
         collector.collect(cast(Any, [rows]), keep_parents=keep_parents)
+    collector.sort()
+    for model, instances in collector.data.items():
+        collector.data[model] = sorted(instances, key=attrgetter("pk"))
     for model, instances in collector.data.items():
         if not issubclass(model, RebacMixin):
             continue

@@ -2950,6 +2950,9 @@ Root and cascade gates share one schema operation.
 After the collected REBAC resource gates pass, the owner sends
 `rebac.signals.collected_for_delete` once for each model in `collector.data`,
 including models without REBAC resource types, before `collector.delete()`.
+Before the gates or batch delivery, the owner orders models with Django's
+`Collector.sort()` and orders each model's collected instances by primary key,
+matching the order of Django's per-row `pre_delete` signals.
 The sender is the collected instance's own class, including a proxy root or
 multi-table parent, as in Django's `pre_delete`. Receivers get `sender=model`,
 `instances=tuple(collector.data[model])`, `using` (the database alias),
