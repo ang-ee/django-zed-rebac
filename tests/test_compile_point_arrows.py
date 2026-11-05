@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from contextlib import nullcontext
+
 import pytest
 from django.contrib.contenttypes.models import ContentType
 from django.db import connection
@@ -14,10 +16,12 @@ from rebac import (
     SubjectRef,
     backend,
     database_context,
+    evaluator_scope,
     sudo,
     to_object_ref,
 )
 from rebac.backends import reset_backend
+from rebac.compile import read
 from tests.backend_setup import install_schema
 from tests.testapp.models import Attachment, CodedFolder, Folder, Post
 
@@ -25,6 +29,15 @@ pytestmark = [pytest.mark.django_db(transaction=True), pytest.mark.pg_delta]
 
 ALICE = SubjectRef.of("auth/user", "point-arrow-alice")
 BOB = SubjectRef.of("auth/user", "point-arrow-bob")
+
+
+@pytest.fixture(params=["inline", "decided"])
+def plan(request, monkeypatch):
+    if request.param == "inline":
+        monkeypatch.setattr(read, "_scope_decide", lambda *_args, **_kwargs: False)
+    with evaluator_scope() if request.param == "decided" else nullcontext():
+        yield request.param
+
 
 SCHEMA = """
 definition auth/user {}
@@ -53,7 +66,7 @@ def storage(request):
         reset_backend()
 
 
-def test_point_arrow_preserves_null_missing_and_actor_outcomes(storage):
+def test_point_arrow_preserves_null_missing_and_actor_outcomes(storage, plan):
     install_schema(storage, SCHEMA)
     with sudo(reason="tests.point_arrow.fixture"):
         parent = Folder.objects.create(name="shared")
@@ -76,7 +89,7 @@ def test_point_arrow_preserves_null_missing_and_actor_outcomes(storage):
     assert not Post.objects.with_actor(ALICE).filter(pk=inherited.pk).exists()
 
 
-def test_point_arrow_keeps_source_filters_and_original_queryset_predicates(storage):
+def test_point_arrow_keeps_source_filters_and_original_queryset_predicates(storage, plan):
     filtered = SCHEMA.replace(
         "relation folder: blog/folder // rebac:field=folder",
         'relation folder: blog/folder // rebac:field={"path":"folder",'

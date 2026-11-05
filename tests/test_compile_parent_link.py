@@ -1,13 +1,24 @@
 """A hierarchy over a multi-table child: its key is the link to its parent's table."""
 
+from contextlib import nullcontext
+
 import pytest
 
-from rebac import CheckItem, RelationshipTuple, SubjectRef, sudo, to_object_ref
+from rebac import CheckItem, RelationshipTuple, SubjectRef, evaluator_scope, sudo, to_object_ref
 from rebac.compile import read
 from rebac.testing import install_schema
 from tests.testapp.models import NativeParentLinkedBranch, NativeParentLinkedNote
 
 pytestmark = pytest.mark.django_db
+
+
+@pytest.fixture(params=["inline", "decided"])
+def plan(request, monkeypatch):
+    if request.param == "inline":
+        monkeypatch.setattr(read, "_scope_decide", lambda *_args, **_kwargs: False)
+    with evaluator_scope() if request.param == "decided" else nullcontext():
+        yield request.param
+
 
 SCHEMA = """
 definition auth/user {}
@@ -63,7 +74,7 @@ def test_a_point_check_inherits_through_the_self_foreign_key(branches, name):
         assert answer.allowed is held
 
 
-def test_a_scope_inherits_through_the_self_foreign_key(branches):
+def test_a_scope_inherits_through_the_self_foreign_key(branches, plan):
     _local, rows, notes = branches
     assert writable(NativeParentLinkedBranch) == {rows["region"].pk, rows["office"].pk}
     assert writable(NativeParentLinkedNote) == {notes["region"].pk, notes["office"].pk}
@@ -81,7 +92,7 @@ def test_bulk_checks_agree(branches):
 
 @pytest.mark.pg_delta
 @pytest.mark.parametrize("selector", ["exact", "in"])
-def test_parent_link_identity_uses_only_proven_lookup_shapes(branches, monkeypatch, selector):
+def test_parent_link_identity_uses_only_proven_lookup_shapes(branches, monkeypatch, selector, plan):
     _local, rows, _notes = branches
     original = read._scope_statement
     compiled = []

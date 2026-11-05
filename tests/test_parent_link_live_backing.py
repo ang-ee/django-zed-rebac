@@ -24,7 +24,7 @@ from tests.testapp.models import (
     NativeParentLinkedRecord,
 )
 
-pytestmark = pytest.mark.django_db(transaction=True)
+pytestmark = [pytest.mark.django_db(transaction=True), pytest.mark.pg_delta]
 
 SCHEMA = """
 definition auth/user {}

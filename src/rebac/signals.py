@@ -277,6 +277,10 @@ def connect_tracked_signals() -> None:
 @receiver(class_prepared, dispatch_uid="rebac.model_prepared")
 def _model_prepared(sender: type[Model], **kwargs: Any) -> None:
     _register_model(sender)
+    if model_resource_type(sender) is not None:
+        from .compile import read
+
+        read.reset()
     # _register_model records each newly prepared field's binding.
 
 

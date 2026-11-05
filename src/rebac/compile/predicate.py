@@ -100,7 +100,9 @@ type Fact = tuple[str, str, str, Bound]
 
 
 class CaveatVerdicts(Protocol):
-    def condition_q(self, prefix: str, bound: Bound) -> Q: ...
+    def condition_q(
+        self, prefix: str, bound: Bound, *, using: str, parametric: bool = False
+    ) -> Q: ...
 
 
 class DecidedRows(Protocol):
@@ -110,7 +112,8 @@ class DecidedRows(Protocol):
 class Decided(tuple[Any, ...]):
     """Native IDs read before a statement and rechecked by its witness."""
 
-    __slots__ = ()
+    def __new__(cls, values: Collection[Any]) -> Decided:
+        return super().__new__(cls, values)
 
 
 @dataclass(frozen=True)
@@ -131,6 +134,7 @@ class ActorSets:
     lower: Mapping[Key, frozenset[str]]
     upper: Mapping[Key, frozenset[str]]
     support: tuple[Support, ...]
+    root: Key
 
     def ids(self, key: Key, bound: Bound) -> frozenset[str]:
         return (self.lower if bound is Bound.LOWER else self.upper).get(key, frozenset())
@@ -267,11 +271,15 @@ class _ArrayMember(Exact):
         return f"{lhs_sql} = ANY(({rhs_sql})::{array_type})", (*lhs_params, *rhs_params)
 
 
-def _bound_in(expr: BaseExpression | F | OuterRef, values: Collection[Any]) -> Q:
+def _bound_in(
+    expr: BaseExpression | F | OuterRef,
+    values: Collection[Any],
+) -> Q:
     """Two-valued membership for a decided set."""
     if not values:
         return _FALSE
-    return _not_null(expr) & Q(_BoundIn(expr, tuple(values)))
+    member = _BoundIn(expr, tuple(values))
+    return _not_null(expr) & Q(member)
 
 
 def _one_object(ref: Any) -> bool:
@@ -374,6 +382,9 @@ class ActorShape:
 
 
 def named_ids(schema: Schema, type_: str) -> frozenset[str]:
+    cached = schema._named_ids_cache.get(type_)
+    if cached is not None:
+        return cached
     found: set[str] = set()
     for definition in schema.definitions:
         for relation in definition.relations:
@@ -384,7 +395,9 @@ def named_ids(schema: Schema, type_: str) -> frozenset[str]:
                     found.add(allowed.id)
                 if isinstance(relation.backing, ConstBinding):
                     found.add(relation.backing.target_id)
-    return frozenset(found)
+    result = frozenset(found)
+    schema._named_ids_cache[type_] = result
+    return result
 
 
 def actor_shape(
@@ -570,7 +583,9 @@ class Compiler:
         return _not_null(expr) & Q(_ArrayMember(expr, rhs))
 
     def decided_array(
-        self, values: Collection[Any], field: models.Field[Any, Any]
+        self,
+        values: Collection[Any],
+        field: models.Field[Any, Any],
     ) -> tuple[tuple[str, tuple[Any, ...]], CTE]:
         """Build or reuse the typed array CTE for a decided list."""
         from django.contrib.postgres.fields import ArrayField
@@ -589,7 +604,10 @@ class Compiler:
                 .order_by()
                 .values("_rebac_ids")
             )
-            digest = hashlib.blake2s(repr(key).encode(), digest_size=10).hexdigest()
+            # Decided statements are request-local, so the CTE name may
+            # reflect the IDs of this operation.
+            name_key = (key[0], ids)
+            digest = hashlib.blake2s(repr(name_key).encode(), digest_size=10).hexdigest()
             # The digest deduplicates lists within one owner; the plan
             # namespace separates independent owners combined by Django.
             cte = CTE(selected, name=self._cte_name(f"rebac_decided_{digest}"))
@@ -835,7 +853,9 @@ class Compiler:
         if relation.with_expiration:
             live |= Q(expires_at__gt=self.now)
         if self.verdicts is not None:
-            return live & self.verdicts.condition_q("", bound)
+            return live & self.verdicts.condition_q(
+                "", bound, using=self.using, parametric=self.parametric
+            )
         if bound is Bound.LOWER:
             return live & Q(caveat_name="")
         return live
@@ -935,12 +955,16 @@ class Compiler:
             )
         return step
 
-    def sets_within(self, members: Mapping[Key, Collection[str]]) -> Q:
+    def sets_within(self, members: Mapping[Key, Collection[str]], bound: Bound) -> Q:
         """A tuple's resource is one of the member sets."""
         return _or(
             *(
                 Q(resource_type=type_, relation=name)
-                & self.decided_member(F("resource_id"), sorted(ids), models.TextField())
+                & self.decided_member(
+                    F("resource_id"),
+                    sorted(ids),
+                    models.TextField(),
+                )
                 for (type_, name), ids in sorted(members.items())
                 if ids
             )
@@ -983,7 +1007,7 @@ class Compiler:
         step = self.sets_step(sets.keys, sets.upper, Bound.UPPER)
         if step is not _FALSE:
             beyond = tuples.filter(step)
-            within = self.sets_within(sets.upper)
+            within = self.sets_within(sets.upper, Bound.UPPER)
             if within is not _FALSE:
                 beyond = beyond.exclude(within)
             parts.append(~Q(Exists(beyond)))
@@ -1259,7 +1283,7 @@ class Compiler:
         if own_row:
             decided = self._decided(key, model, identity, bound, depth_possible)
             if decided is not None:
-                return Q(In(at.ref, list(decided))) if decided else _FALSE
+                return _bound_in(at.ref, decided)
         # The holders are looked up by key, a row and its ancestors at a time,
         # so their base is a plain disjunction of inline arms.
         base_row = _or(*base_at(row_at))
@@ -2338,6 +2362,9 @@ class Compiler:
 
 def const_facts(schema: Schema, program: CompileProgram, root: Key) -> tuple[Fact, ...]:
     """Every fact about a fixed object that a statement for ``root`` can use."""
+    cached = program._facts_cache.get(root)
+    if cached is not None:
+        return cast(tuple[Fact, ...], cached)
     types = {key[0] for key in program.reachable(root)}
     found: set[tuple[str, str, str]] = set()
 
@@ -2374,8 +2401,10 @@ def const_facts(schema: Schema, program: CompileProgram, root: Key) -> tuple[Fac
                             arrow.target,
                         )
                     )
-    return tuple(
+    result = tuple(
         (type_, object_id, name, bound)
         for type_, object_id, name in sorted(found)
         for bound in (Bound.LOWER, Bound.UPPER)
     )
+    program._facts_cache[root] = result
+    return result

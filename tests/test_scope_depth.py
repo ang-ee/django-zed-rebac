@@ -21,7 +21,7 @@ from tests.test_recursive_queryscope import (
 )
 from tests.testapp.models import Folder
 
-pytestmark = pytest.mark.django_db
+pytestmark = [pytest.mark.django_db, pytest.mark.pg_delta]
 
 
 def parse_depth(sql):
@@ -66,7 +66,7 @@ def deep_scope_proof(storage, backing, deep, exact):
 
             with connection.execute_wrapper(record):
                 assert [row.pk for row in queryset] == [rows[-1].pk]
-                # Exact identities render once; a range prepares and then renders.
+                # Ranges prepare the decided scope before rendering it.
                 expected_statements = 1 if exact else 2
                 assert len(statements) == expected_statements
                 sql, params = queryset.query.sql_with_params()

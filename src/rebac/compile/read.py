@@ -1,7 +1,9 @@
 """Execute compiled LocalBackend predicates.
 
 A statement is compiled from a policy, permission and actor shape into
-Django SQL. Every permission fact remains in the statement's predicate.
+Django SQL. Queryset scopes decide bounded values before rendering; decided
+statements compile per request and are never kept. Value-independent statements
+are kept with bound parameters.
 """
 
 from __future__ import annotations
@@ -15,10 +17,10 @@ from secrets import token_hex
 from threading import RLock
 from typing import TYPE_CHECKING, Any, cast
 
-from django.core.exceptions import EmptyResultSet
+from django.core.exceptions import EmptyResultSet, FieldDoesNotExist
 from django.db import connections, models
 from django.db.models import Exists, Expression, F, Q, Value
-from django.db.models.expressions import Col, ColPairs
+from django.db.models.expressions import Col, ColPairs, Combinable
 from django.db.models.fields.related_lookups import RelatedExact
 from django.db.models.fields.tuple_lookups import TupleIn
 from django.db.models.lookups import Exact, GreaterThanOrEqual, In, IntegerFieldExact, LessThan
@@ -54,11 +56,12 @@ from rebac.schema.ast import (
     Schema,
 )
 from rebac.schema.cache import SchemaSnapshot, schema_operation
+from rebac.schema.serialization import digest as schema_digest
 from rebac.schema.walker import find_permission, find_relation
 from rebac.types import CheckItem, CheckResult, ObjectRef, SubjectRef
 
 from . import At, Bound, Compiler, predicate
-from .conditions import CaveatVerdicts
+from .conditions import CaveatVerdicts, VerdictSlot, _verdict_class
 from .evaluate import named_subjects, residual
 from .predicate import (
     ActorSets,
@@ -84,6 +87,7 @@ if TYPE_CHECKING:
 
 _MANUAL_REVISION = object()
 _RESOURCE_WIRE = object()
+_CANDIDATES = object()
 _LIMIT = 512
 _ROW_LIMIT = 5000
 _CANDIDATE_LIMIT = SCOPE_CTE_CANDIDATE_LIMIT
@@ -120,19 +124,130 @@ class _Kept:
     every: bool = False
 
 
+@dataclass(frozen=True, slots=True)
+class _CandidateSlot:
+    index: int
+
+
+class _CandidateIn(Expression):
+    """One candidate array on PostgreSQL, a padded arity class elsewhere."""
+
+    def __init__(self, lhs: Expression | F, count: int) -> None:
+        super().__init__(output_field=models.BooleanField())
+        self.lhs = lhs
+        self.count = count
+
+    def get_source_expressions(self) -> list[Expression | F]:
+        return [self.lhs]
+
+    def set_source_expressions(self, exprs: Sequence[Combinable | Expression]) -> None:
+        self.lhs = cast(Expression | F, exprs[0])
+
+    def as_sql(self, compiler: Any, connection: Any) -> tuple[str, tuple[Any, ...]]:
+        lhs, params = compiler.compile(self.lhs)
+        if connection.vendor == "postgresql":
+            return f"{lhs} = ANY(%s)", (*params, _CANDIDATES)
+        slots = ", ".join("%s" for _ in range(self.count))
+        return f"{lhs} IN ({slots})", (*params, *(_CandidateSlot(i) for i in range(self.count)))
+
+
+def _candidate_class(using: str, count: int) -> str | int:
+    if count == 0:
+        return 0
+    return "array" if connections[using].vendor == "postgresql" else 1 << (count - 1).bit_length()
+
+
 _policies: OrderedDict[tuple[Any, ...], _Policy] = OrderedDict()
 _statements: OrderedDict[tuple[Any, ...], _Kept | bool] = OrderedDict()
 _fact_uses: OrderedDict[tuple[Any, ...], tuple[Fact, ...]] = OrderedDict()
+_statement_bytes = 0
+_statement_hits = 0
+_statement_misses = 0
+_statement_evictions = 0
+_seen_revisions: dict[str, OrderedDict[str, None]] = {}
+
+
+def _bound_params(
+    params: Iterable[Any],
+    *,
+    backend: LocalBackend,
+    actor: SubjectRef,
+    using: str,
+    resource_id: str | None = None,
+    candidates: tuple[Any, ...] | None = None,
+    verdicts: CaveatVerdicts | None = None,
+) -> list[Any]:
+    result: list[Any] = []
+    verdict_keys = (
+        {"true": sorted(verdicts.true_keys), "false": sorted(verdicts.false_keys)}
+        if verdicts is not None
+        else None
+    )
+    for param in bind(params, actor, connections[using]):
+        if param is _MANUAL_REVISION:
+            result.append(backend._manual_schema_revision())
+        elif param is _RESOURCE_WIRE:
+            result.append(resource_id)
+        elif param is _CANDIDATES:
+            if candidates is None:
+                raise ValueError("candidate array requires bound candidates")
+            result.append(list(candidates))
+        elif isinstance(param, _CandidateSlot):
+            if not candidates:
+                raise ValueError("candidate slot requires bound candidates")
+            result.append(candidates[min(param.index, len(candidates) - 1)])
+        elif isinstance(param, VerdictSlot):
+            if verdict_keys is None:
+                raise ValueError("verdict slot requires bound verdicts")
+            values = verdict_keys[param.kind]
+            if param.index is not None and not values:
+                raise ValueError("verdict slot requires a nonempty arity class")
+            result.append(
+                values if param.index is None else values[min(param.index, len(values) - 1)]
+            )
+        else:
+            result.append(param)
+    return result
+
+
+def statement_cache_stats() -> dict[str, int]:
+    """Process-wide compiled-statement cache usage and counters."""
+    with _lock:
+        return {
+            "entries": len(_statements),
+            "bytes": _statement_bytes,
+            "hits": _statement_hits,
+            "misses": _statement_misses,
+            "evictions": _statement_evictions,
+        }
+
+
+def _statement_size(compiled: _Kept | bool) -> int:
+    if isinstance(compiled, bool):
+        return 1
+    return len(compiled.sql.encode()) + sum(
+        len(value) if isinstance(value, bytes | str) else 32 for value in compiled.params
+    )
+
+
+def _evict_statement() -> None:
+    global _statement_bytes, _statement_evictions
+    _, old = _statements.popitem(last=False)
+    _statement_bytes -= _statement_size(old)
+    _statement_evictions += 1
 
 
 def reset() -> None:
     """Forget every kept policy and statement (settings or registries changed)."""
     from rebac.evaluator import current_evaluator
 
+    global _statement_bytes, _statement_hits, _statement_misses, _statement_evictions
     with _lock:
         _policies.clear()
         _statements.clear()
         _fact_uses.clear()
+        _seen_revisions.clear()
+        _statement_bytes = _statement_hits = _statement_misses = _statement_evictions = 0
     evaluator = current_evaluator()
     if evaluator is not None:
         # The open scope's pinned policy may predate this invalidation.
@@ -152,6 +267,9 @@ class _Policy:
     selected_at: datetime
     caveat_deadlines: tuple[datetime, ...]
     watched_models: tuple[tuple[str, frozenset[str]], ...]
+    model_indexes: dict[str, tuple[_ModelIndex, tuple[Any, ...]]] = field(
+        default_factory=dict, compare=False, repr=False
+    )
 
     @property
     def schema(self) -> Schema:
@@ -169,20 +287,48 @@ def _policy(backend: LocalBackend, using: str) -> _Policy:
 
     _effective, snapshot = _schema(backend, using)
     baseline = snapshot.baseline or snapshot.schema
+    selected_at = timezone.now()
+    overrides_digest = schema_digest(
+        [
+            (row.pk, row.kind, row.target_ct_id, row.target_pk, row.expression, row.expires_at)
+            for row in sorted(snapshot.overrides, key=lambda item: item.pk)
+        ]
+    )
+    deadlines = tuple(
+        sorted({row.expires_at for row in snapshot.overrides if row.expires_at is not None})
+    )
+    epoch = sum(deadline <= selected_at for deadline in deadlines)
     key = (
-        snapshot.using,
+        using,
         snapshot.revision,
         backend._schema_is_manual,
-        id(baseline),
-        tuple(getattr(row, "pk", None) for row in snapshot.overrides),
+        snapshot.revision or schema_digest(repr(baseline)),
+        overrides_digest,
+        epoch,
     )
     with _lock:
+        if snapshot.revision is not None:
+            recent = _seen_revisions.setdefault(using, OrderedDict())
+            recent[snapshot.revision] = None
+            recent.move_to_end(snapshot.revision)
+            retired = recent.popitem(last=False)[0] if len(recent) > 4 else None
+            if retired is not None:
+                global _statement_bytes, _statement_evictions
+                for stale in tuple(_statements):
+                    if stale[0][0] == using and stale[0][1] == retired:
+                        _statement_bytes -= _statement_size(_statements.pop(stale))
+                        _statement_evictions += 1
+                for stale in tuple(_policies):
+                    if stale[0] == using and stale[1] == retired:
+                        del _policies[stale]
+                for stale in tuple(_fact_uses):
+                    if stale[0][0] == using and stale[0][1] == retired:
+                        del _fact_uses[stale]
         kept = _policies.get(key)
         if kept is not None and kept.snapshot.schema is snapshot.schema:
             _policies.move_to_end(key)
             return kept
     overrides, _stale = split_stale_overrides(baseline, list(snapshot.overrides))
-    selected_at = timezone.now()
     active = [row for row in overrides if row.expires_at is None or row.expires_at > selected_at]
     # Permission sites retain their SQL deadlines. CEL expressions cannot be
     # selected in SQL, so choose the active override composition for this policy.
@@ -196,7 +342,6 @@ def _policy(backend: LocalBackend, using: str) -> _Policy:
             or row.expires_at > selected_at
         ],
     )
-    deadlines = tuple(sorted({row.expires_at for row in overrides if row.expires_at is not None}))
     policy = _Policy(
         key,
         snapshot,
@@ -211,13 +356,10 @@ def _policy(backend: LocalBackend, using: str) -> _Policy:
             for member in model_lineage(spec.model)
         ),
     )
-    if not deadlines:
-        # A deadline can change a prebuilt scope's composition, so prepare
-        # policies with deadlines afresh at each construction boundary.
-        with _lock:
-            _policies[key] = policy
-            while len(_policies) > _LIMIT:
-                _policies.popitem(last=False)
+    with _lock:
+        _policies[key] = policy
+        while len(_policies) > _LIMIT:
+            _policies.popitem(last=False)
     return policy
 
 
@@ -719,7 +861,27 @@ class _Operation:
         policy: _Policy | None = None,
     ) -> _Operation:
         policy = policy if policy is not None else _policy(backend, using)
-        model_index = _ModelIndex.capture()
+        with _lock:
+            indexed = policy.model_indexes.get(using)
+            if indexed is None:
+                model_index = _ModelIndex.capture()
+
+                def identity_class(model: type[models.Model]) -> str:
+                    attr = resource_id_attr(model)
+                    try:
+                        return type(
+                            model._meta.pk if attr == "pk" else model._meta.get_field(attr)
+                        ).__qualname__
+                    except FieldDoesNotExist:
+                        return type(getattr(model, attr)).__qualname__
+
+                model_fingerprint = tuple(
+                    (wire, model._meta.label_lower, model._meta.db_table, identity_class(model))
+                    for wire, model in sorted(model_index.models.items())
+                )
+                indexed = model_index, model_fingerprint
+                policy.model_indexes[using] = indexed
+        model_index, model_fingerprint = indexed
         return cls(
             backend,
             policy,
@@ -733,6 +895,14 @@ class _Operation:
                 connections[using].vendor,
                 app_settings.REBAC_DEPTH_LIMIT,
                 active_relationship_model()._meta.label_lower,
+                app_settings.REBAC_LOCAL_BACKEND_STORAGE,
+                app_settings.REBAC_TYPE_PREFIX,
+                app_settings.REBAC_USER_TYPE,
+                app_settings.REBAC_GROUP_TYPE,
+                app_settings.REBAC_ANONYMOUS_TYPE,
+                app_settings.REBAC_RESOURCE_ID_ATTR,
+                app_settings.REBAC_USER_ID_ATTR,
+                model_fingerprint,
             ),
             model_index,
         )
@@ -859,10 +1029,10 @@ class _Operation:
                 if is_false(step):
                     break
                 rows = tuples.filter(step)
-                within = compiler.sets_within(members)
+                within = compiler.sets_within(members, bound)
                 if not is_false(within):
                     rows = rows.exclude(within)
-                fresh = list(rows.order_by().values_list(*_EDGE).distinct())
+                fresh = list(rows.order_by(*_EDGE).values_list(*_EDGE).distinct())
                 if not fresh:
                     break
                 for type_, resource_id, name, s_type, s_id, s_relation, caveat, digest in fresh:
@@ -911,7 +1081,7 @@ class _Operation:
                 if support_bytes + set_bytes > _SET_WITNESS_BUDGET:
                     return None
             decided[bound] = {found: frozenset(ids) for found, ids in members.items()}
-        return ActorSets(keys, decided[Bound.LOWER], decided[Bound.UPPER], tuple(support))
+        return ActorSets(keys, decided[Bound.LOWER], decided[Bound.UPPER], tuple(support), key)
 
     def compiler(
         self,
@@ -953,9 +1123,21 @@ class _Operation:
         signature: tuple[Any, ...] = (),
         facts: _Facts | None = None,
     ) -> _Kept | bool:
-        """Compile and cache SQL whose only varying values are bound parameters."""
-        keep = cache and verdicts.empty
-        base = (*self.shape, *key, signature)
+        """Compile and cache SQL whose only varying values are bound parameters.
+
+        The cache switch is used by the before/after benchmark's no-cache phase.
+        """
+        global _statement_bytes, _statement_hits, _statement_misses
+        keep = cache
+        base = (
+            *self.shape,
+            *key,
+            signature,
+            _verdict_class(len(verdicts.true_keys), self.using),
+            _verdict_class(len(verdicts.false_keys), self.using),
+        )
+        decided_scope = bool(key and key[0] == "scope" and signature and signature[0] == "decided")
+        keep = keep and not decided_scope
         used: tuple[Fact, ...] | None = () if facts is None else None
         if keep and facts is not None:
             with _lock:
@@ -974,9 +1156,14 @@ class _Operation:
                 kept = _statements.get(full)
                 if kept is not None:
                     _statements.move_to_end(full)
+                    _statement_hits += 1
                     return kept
+                _statement_misses += 1
+        elif keep:
+            with _lock:
+                _statement_misses += 1
         built = build()
-        if keep and (
+        if not decided_scope and (
             any(rows._found for rows in self._rows.values())
             or any(value is not None for value in self._sets.values())
         ):
@@ -992,9 +1179,9 @@ class _Operation:
         if isinstance(built, bool):
             compiled = built
         else:
-            rows, every = built if isinstance(built, tuple) else (built, False)
+            statement_rows, every = built if isinstance(built, tuple) else (built, False)
             try:
-                sql, params = _Compiled(rows).as_sql(None, connections[self.using])
+                sql, params = _Compiled(statement_rows).as_sql(None, connections[self.using])
             except EmptyResultSet:
                 # No row can satisfy it: an unpublished policy, or a
                 # condition Django proves empty.
@@ -1003,21 +1190,34 @@ class _Operation:
                 compiled = _Kept(sql, params, every)
         if keep and full is not None:
             with _lock:
-                _statements[full] = compiled
-                while len(_statements) > _LIMIT:
-                    _statements.popitem(last=False)
+                size = _statement_size(compiled)
+                budget = max(0, int(app_settings.REBAC_STATEMENT_CACHE_BYTES))
+                if size <= budget:
+                    old = _statements.pop(full, None)
+                    if old is not None:
+                        _statement_bytes -= _statement_size(old)
+                    _statements[full] = compiled
+                    _statement_bytes += size
+                    while len(_statements) > _LIMIT or _statement_bytes > budget:
+                        _evict_statement()
         return compiled
 
-    def bound(self, params: Iterable[Any], resource_id: str | None = None) -> list[Any]:
-        result: list[Any] = []
-        for param in bind(params, self.actor, connections[self.using]):
-            if param is _MANUAL_REVISION:
-                result.append(self.backend._manual_schema_revision())
-            elif param is _RESOURCE_WIRE:
-                result.append(resource_id)
-            else:
-                result.append(param)
-        return result
+    def bound(
+        self,
+        params: Iterable[Any],
+        resource_id: str | None = None,
+        candidates: tuple[Any, ...] | None = None,
+        verdicts: CaveatVerdicts | None = None,
+    ) -> list[Any]:
+        return _bound_params(
+            params,
+            backend=self.backend,
+            actor=self.actor,
+            using=self.using,
+            resource_id=resource_id,
+            candidates=candidates,
+            verdicts=verdicts,
+        )
 
 
 def _model_at(model: type[models.Model]) -> At:
@@ -1094,7 +1294,10 @@ def _point(
     compiled = _point_statement(operation, key, which)
     if isinstance(compiled, bool):
         return compiled and operation.gate(parametric=False).exists()
-    probe = _Sql(compiled.sql, operation.bound(compiled.params, resource_id))
+    probe = _Sql(
+        compiled.sql,
+        operation.bound(compiled.params, resource_id, verdicts=operation.verdicts(key)),
+    )
     return SchemaGeneration.objects.using(operation.using).filter(pk=1).filter(Q(probe)).exists()
 
 
@@ -1120,7 +1323,7 @@ def _points(
                     fenced = operation.gate(parametric=False).exists()
                 answers[position] = fenced
         else:
-            bound = operation.bound(compiled.params, resource_id)
+            bound = operation.bound(compiled.params, resource_id, verdicts=operation.verdicts(key))
             if statements[-1] and (
                 size + len(compiled.sql) > _BULK_SQL
                 or (parameter_limit is not None and parameter_count + len(bound) > parameter_limit)
@@ -1277,7 +1480,7 @@ def _answer(
 
 @schema_operation
 def check_many(
-    *, backend: LocalBackend, items: Sequence[CheckItem], using: str
+    *, backend: LocalBackend, items: Sequence[CheckItem], using: str, lower_only: bool = False
 ) -> list[CheckResult]:
     """What ``check`` answers for each item, from statements the items share."""
 
@@ -1308,13 +1511,19 @@ def check_many(
     if points:
         policy = _policy(backend, using)
         for chunk in batched(points, _BULK, strict=False):
-            found = _check_chunk(backend, policy, [items[index] for index in chunk], using)
+            found = _check_chunk(
+                backend, policy, [items[index] for index in chunk], using, lower_only
+            )
             answers.update(zip(chunk, found, strict=True))
     return [answers[index] for index in range(len(items))]
 
 
 def _check_chunk(
-    backend: LocalBackend, policy: _Policy, items: Sequence[CheckItem], using: str
+    backend: LocalBackend,
+    policy: _Policy,
+    items: Sequence[CheckItem],
+    using: str,
+    lower_only: bool = False,
 ) -> list[CheckResult]:
     """The point checks of up to ``_BULK`` items, with bounded depth probes."""
     from rebac.evaluator import _ctx_key
@@ -1344,6 +1553,8 @@ def _check_chunk(
         operation._sets[id(verdicts)] = None
         operation._bulk.add(id(verdicts))
     lower = _points(asked, "lower")
+    if lower_only:
+        return [CheckResult.has() if held else CheckResult.no() for held in lower]
     # The bounds differ only where a caveat or a recursion is in reach.
     open_: list[tuple[int, bool]] = []
     for position, (operation, key, _resource_id) in enumerate(asked):
@@ -1416,7 +1627,11 @@ def _scope_statement(
         sets = operation.sets(verdicts) if decide else None
         decider = operation.rows(verdicts) if decide and one_object else None
         compiler = operation.compiler(
-            verdicts, share_subject_rows=True, rows=decider, sets=sets, facts=facts
+            verdicts,
+            share_subject_rows=True,
+            rows=decider,
+            sets=sets,
+            facts=facts,
         )
         if decider is not None:
             decider.render_compiler = compiler
@@ -1435,7 +1650,15 @@ def _scope_statement(
         # The row predicate goes last: it holds the nested subqueries.
         rows = model._base_manager.using(operation.using)
         if candidates is not None:
-            rows = rows.filter(_bound_in(F(resource_id_attr(model)), candidates))
+            candidate_class = _candidate_class(operation.using, len(candidates))
+            rows = rows.filter(
+                Q(
+                    _CandidateIn(
+                        F(resource_id_attr(model)),
+                        candidate_class if isinstance(candidate_class, int) else 1,
+                    )
+                )
+            )
         rows = rows.filter(Q(Exists(gate)) & predicate)
         return compiler.with_subject_ctes(rows.order_by().values(resource_id_attr(model))), False
 
@@ -1443,10 +1666,24 @@ def _scope_statement(
         ("scope", label, key),
         verdicts,
         build,
-        cache=candidates is None,
-        signature=signature,
+        signature=(
+            *signature,
+            _candidate_class(operation.using, len(candidates)) if candidates is not None else None,
+        ),
         facts=facts,
     )
+
+
+def _scope_decide(requested: bool, using: str, *, candidates: bool) -> bool:
+    """Choose the witnessed plan at the scope's render boundary."""
+    if not requested:
+        return False
+    if not candidates:
+        return True
+    from rebac.evaluator import current_evaluator
+
+    evaluator = current_evaluator()
+    return bool(evaluator is not None and evaluator._decision_connection is connections[using])
 
 
 def _shared_scope_predicate(
@@ -2080,6 +2317,7 @@ class _Scope(Expression):
         policy: _Policy,
         verdicts: CaveatVerdicts,
         decide: bool = True,
+        point_projection: bool = False,
     ) -> None:
         super().__init__(output_field=models.BooleanField())
         self.backend = backend
@@ -2090,15 +2328,27 @@ class _Scope(Expression):
         self.policy = policy
         self.verdicts = verdicts
         self.decide = decide
+        self.point_projection = point_projection
         self.lhs: Any = F(resource_id_attr(model))
         self._prepared: _Kept | bool | None = None
-        # Only an unprepared combinator operand needs a render-time decision.
-        # Ordinary queryset rendering can use the undecided inline statement.
+        # A combinator operand may need a render-time decision when its
+        # queryset owner did not prepare it first.
         self._render_fallback = False
         # Django resolves a new shallow expression copy on every SQL render.
         # The shared holder lets standalone fallback copies reuse preparation.
         self._plans: dict[tuple[str, str], _Kept | bool] = {}
+        self._operations: dict[str, _Operation] = {}
         self._rebac_scope_token = object()
+
+    def _operation(self, using: str) -> _Operation:
+        operation = self._operations.get(using)
+        if operation is None:
+            operation = _Operation.begin(self.backend, self.actor, using, policy=self.policy)
+            resource_type = model_resource_type(self.model)
+            if resource_type is not None:
+                operation.adopt((resource_type, self.action), self.verdicts)
+            self._operations[using] = operation
+        return operation
 
     def prepare(self, using: str) -> None:
         """Read bounded decisions on the known alias before SQL rendering."""
@@ -2108,13 +2358,12 @@ class _Scope(Expression):
         if token in self._plans:
             self._prepared = self._plans[token]
             return
-        operation = _Operation.begin(self.backend, self.actor, using, policy=self.policy)
+        operation = self._operation(using)
         resource_type = model_resource_type(self.model)
         if resource_type is None:
             self._prepared = False
             return
         key = resource_type, self.action
-        operation.adopt(key, self.verdicts)
         self._prepared = _scope_statement(operation, self.model, key, decide=self.decide)
         self._plans[token] = self._prepared
 
@@ -2127,7 +2376,6 @@ class _Scope(Expression):
     @schema_operation
     def as_sql(self, compiler: Any, connection: Any) -> tuple[str, tuple[Any, ...]]:
         resource_type = model_resource_type(self.model)
-        policy = self.policy
         if resource_type is None:
             return "(1 = 0)", ()
         identities = _known_identities(self.model, self.lhs, compiler.query.where, self.using)
@@ -2144,53 +2392,42 @@ class _Scope(Expression):
             if plan[0]
             else None
         )
-        if identities is not None and len(identities) == 1 and not self.decide:
-            # Late permission projections keep their existing point predicate.
-            # Queryset scopes (decide=True) use the candidate-root statement.
-            operation = _Operation.begin(self.backend, self.actor, connection.alias, policy=policy)
+        if identities is not None:
+            shared_scope = matching_shared_scope(compiler.query, self, connection.alias)
+            if shared_scope is not None:
+                member = In(
+                    self.lhs,
+                    shared_scope.queryset().values(resource_id_attr(self.model)),
+                ).resolve_expression(compiler.query)
+                return cast(tuple[str, tuple[Any, ...]], compiler.compile(member))
+        if identities is not None and len(identities) == 1 and self.point_projection:
+            operation = self._operation(connection.alias)
             key = resource_type, self.action
-            operation.adopt(key, self.verdicts)
             point = _point_statement(operation, key, "lower", decide=False)
             if isinstance(point, bool):
                 return "(1 = 0)", ()
             wire = identity_codec(self.model, resource_id_attr(self.model)).wire(
                 identities[0], using=self.using
             )
-            return f"EXISTS {point.sql}", tuple(operation.bound(point.params, wire))
-        if identities is not None:
-            shared_scope = matching_shared_scope(compiler.query, self, connection.alias)
-            if shared_scope is not None and (
-                shared_scope.closure is not None or shared_scope.candidates is not None
-            ):
-                member = In(
-                    self.lhs,
-                    shared_scope.queryset().values(resource_id_attr(self.model)),
-                ).resolve_expression(compiler.query)
-                return cast(tuple[str, tuple[Any, ...]], compiler.compile(member))
+            return f"EXISTS {point.sql}", tuple(
+                operation.bound(point.params, wire, verdicts=self.verdicts)
+            )
         # A combinator operand may reach the compiler without its queryset
-        # owner. Keep that first-render preparation for later renders. Other
-        # unprepared expressions compile inline without reading the database;
-        # evaluation can still prepare their decided plan later.
+        # owner. Keep that first-render preparation for later renders.
         inline: _Kept | bool | None = None
         if identities is not None:
             # The root query inside this proof visits only candidate rows.
             # A decision scope may memoise bounded arrow targets, with their
             # witnesses in the statement; otherwise keep the inline predicate.
-            from rebac.evaluator import current_evaluator
-
-            evaluator = current_evaluator()
-            decide = bool(
-                self.decide
-                and evaluator is not None
-                and evaluator._decision_connection is connections[connection.alias]
-            )
-            operation = _Operation.begin(self.backend, self.actor, connection.alias, policy=policy)
+            decide = _scope_decide(self.decide, connection.alias, candidates=True)
+            operation = self._operation(connection.alias)
             key = resource_type, self.action
-            operation.adopt(key, self.verdicts)
             inline = _scope_statement(
                 operation, self.model, key, decide=decide, candidates=identities
             )
         else:
+            # A matching shared scope already proves membership through its
+            # statement-local CTE, whether its closure has bounded rows or not.
             shared_scope = (
                 matching_shared_scope(compiler.query, self, connection.alias)
                 if not _has_literal_identity_set(self.lhs, compiler.query.where)
@@ -2205,10 +2442,14 @@ class _Scope(Expression):
             if shared is None and self._render_fallback and self._prepared is None:
                 self.prepare(connection.alias)
         if shared is None and self._prepared is None and inline is None:
-            operation = _Operation.begin(self.backend, self.actor, connection.alias, policy=policy)
+            operation = self._operation(connection.alias)
             key = resource_type, self.action
-            operation.adopt(key, self.verdicts)
-            inline = _scope_statement(operation, self.model, key, decide=False)
+            inline = _scope_statement(
+                operation,
+                self.model,
+                key,
+                decide=False,
+            )
         compiled: _Kept | bool | None = (
             inline
             if identities is not None and inline is not None
@@ -2222,8 +2463,14 @@ class _Scope(Expression):
             # ``True`` cannot occur: a statement that admits rows is a gate.
             return "(1 = 0)", ()
         assert compiled is not None
-        operation = _Operation.begin(self.backend, self.actor, self.using, policy=policy)
-        params = operation.bound(compiled.params)
+        params = _bound_params(
+            compiled.params,
+            backend=self.backend,
+            actor=self.actor,
+            using=self.using,
+            candidates=identities,
+            verdicts=self.verdicts,
+        )
         if compiled.every:
             return f"EXISTS {compiled.sql}", tuple(params)
         lhs_sql, lhs_params = compiler.compile(self.lhs)
@@ -2288,7 +2535,17 @@ def scope_expression(
     verdicts = CaveatVerdicts.prepare(
         policy.schema, (resource_type, action), context=None, using=using
     )
-    expression = _Scope(backend, model, action, actor, using, policy, verdicts, decide)
+    expression = _Scope(
+        backend,
+        model,
+        action,
+        actor,
+        using,
+        policy,
+        verdicts,
+        decide,
+        point_projection=identity is not None,
+    )
     if identity is not None:
         expression.set_source_expressions([identity])
     return expression
@@ -2617,7 +2874,7 @@ def held_many(
                 ids=candidates,
                 using=using,
                 context=context,
-                chunk_size=500,
+                chunk_size=_CANDIDATE_LIMIT,
             )
         answers[name] = set(decisions[key])
     return answers
@@ -2719,16 +2976,12 @@ def lookup_subjects(
     )
     if not candidates:
         return []
+    answers = check_many(
+        backend=backend,
+        items=[CheckItem(candidate, action, resource, context) for candidate in candidates],
+        using=using,
+        lower_only=True,
+    )
     return [
-        candidate
-        for candidate in candidates
-        if _point_result(
-            backend=backend,
-            resource=resource,
-            action=action,
-            actor=candidate,
-            context=context,
-            using=using,
-            lower_only=True,
-        )[0]
+        candidate for candidate, answer in zip(candidates, answers, strict=True) if answer.allowed
     ]

@@ -152,14 +152,9 @@ class SharedScope[M: models.Model]:
         )
         if candidates is not None:
             body = body.filter(**{f"{resource_id_attr(self._model)}__in": candidates})
-        from .evaluator import current_evaluator
+        from .compile.read import _scope_decide
 
-        evaluator = current_evaluator()
-        if (
-            evaluator is not None
-            and evaluator._decision_connection is connections[self._using]
-            and isinstance(body, RebacQuerySet)
-        ):
+        if isinstance(body, RebacQuerySet) and _scope_decide(True, self._using, candidates=True):
             body._prepare_applied_scope()
         cte = CTE(body, name=self._name)
         plan = attached_scope_plan(

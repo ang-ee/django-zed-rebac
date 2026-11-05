@@ -229,19 +229,20 @@ def test_held_many_chunks_after_500_ids_with_linear_sql_bytes(monkeypatch):
     monkeypatch.setattr(read, "_scope_statement", observed_scope_statement)
     with CaptureQueriesContext(connection) as first:
         at_500 = active.held_many(**arguments, ids=ids[:500])
-    assert candidates == [None]  # 500 IDs exceed the candidate-root cap.
+    assert [len(chunk) for chunk in candidates if chunk is not None] == [256, 244]
     candidates.clear()
     with CaptureQueriesContext(connection) as second:
         at_501 = active.held_many(**arguments, ids=ids)
-    assert len(candidates) == 2 and candidates[0] is None
-    assert candidates[1] is not None and len(candidates[1]) == 1
+    assert [len(chunk) for chunk in candidates if chunk is not None] == [256, 245]
     first_bytes = sum(len(query["sql"].encode()) for query in first)
     second_bytes = sum(len(query["sql"].encode()) for query in second)
-    assert len(first) == 1 and len(second) == 2
+    assert len(first) == len(second) == 2
     assert at_500 == {"read__title": {ids[0]}, "read__body": {ids[0]}}
     assert at_501 == at_500
-    assert first_bytes < 10_000
-    # The one-row remainder now has its own candidate-root proof.
+    # Two bounded candidate-root chunks replace the unbounded 500-ID fallback.
+    assert all(len(query["sql"].encode()) < 8_000 for query in first)
+    assert all(len(query["sql"].encode()) < 8_000 for query in second)
+    assert first_bytes < 12_000
     assert second_bytes < first_bytes + 4_000
     with pytest.raises(TypeError, match="bare string"):
         active.held_many(subject=actor, actions="read__title", resource_type="blog/post", ids=ids)

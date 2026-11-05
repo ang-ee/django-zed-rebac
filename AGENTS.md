@@ -454,8 +454,9 @@ access via `rebac.backend()`.
   uninstall routine and the three narrow runtime exceptions in
   ARCHITECTURE.md § Statement shape: SQL text produced by Django's compiler
   for compiled id sets and kept statements; the compiled identity conversion
-  guard; and hand-written PostgreSQL `= ANY` operator lookups for bound
-  decided ID lists. No whole statement is written by hand.
+  guard; and hand-written membership operators (`= ANY` on PostgreSQL,
+  parameterized `IN` on SQLite/MySQL) for bound candidate and verdict lists,
+  plus decided ID lists. No whole statement is written by hand.
   CI runs SQLite and PostgreSQL; the opt-in MySQL 8.4 vendor suite
   is a release gate.
 

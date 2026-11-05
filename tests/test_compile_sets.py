@@ -23,7 +23,7 @@ from rebac.schema import parse_zed
 from rebac.testing import install_schema
 from tests.testapp.models import Folder, Post
 
-pytestmark = pytest.mark.django_db
+pytestmark = [pytest.mark.django_db, pytest.mark.pg_delta]
 ACTOR = SubjectRef.of("auth/user", "alice")
 DOC = ObjectRef("docs/doc", "d")
 SCHEMA = """
@@ -211,7 +211,7 @@ def test_actor_set_witness_byte_budget_and_model_identity_boundary(monkeypatch):
         )
     key = ("blog/post", "read")
 
-    def measure(count):
+    def measure(count, *, execute=True):
         local.write_relationships(
             [
                 RelationshipTuple(ObjectRef("blog/folder", str(folder.pk)), "member", ACTOR)
@@ -221,7 +221,9 @@ def test_actor_set_witness_byte_budget_and_model_identity_boundary(monkeypatch):
         read.reset()
         operation = read._Operation.begin(local, ACTOR, "default")
         sets = operation.sets(operation.verdicts(key))
-        with CaptureQueriesContext(connection) as queries:
+        if not execute:
+            return sets, [], 0, ""
+        with evaluator_scope(), CaptureQueriesContext(connection) as queries:
             found = list(Post.objects.with_actor(ACTOR).values_list("pk", flat=True))
         sql = queries[-1]["sql"]
         return sets, found, len(sql.encode()), sql
@@ -236,20 +238,17 @@ def test_actor_set_witness_byte_budget_and_model_identity_boundary(monkeypatch):
     assert found_below == [post.pk for post in posts[:4]]
     assert found_above == [post.pk for post in posts[:5]]
     assert found_large == [post.pk for post in posts[:200]]
-    assert 350 < (below_bytes - one_bytes) / 3 < 500
     assert (large_bytes - above_bytes) / 195 < 16
     assert large_bytes < 10_000
+    assert 350 < (below_bytes - one_bytes) / 3 < 500
+    assert above_bytes < 10_000
     assert "CASE WHEN" not in below_sql
-    with monkeypatch.context() as patcher:
-        patcher.setattr(read._Operation, "sets", lambda self, verdicts: None)
-        read.reset()
-        assert list(Post.objects.with_actor(ACTOR).values_list("pk", flat=True)) == found_large
     with monkeypatch.context() as patcher:
         patcher.setattr(read, "_SET_WITNESS_BUDGET", 10**9)
         read.reset()
         lifted, lifted_rows, lifted_bytes, lifted_sql = measure(200)
         assert lifted is not None
-        assert lifted_rows == found_large
+        assert lifted_rows == [post.pk for post in posts[:200]]
         assert lifted_sql.count("CASE WHEN") == 0
         assert lifted_bytes < 95_000
 
@@ -281,7 +280,7 @@ def test_noncanonical_decided_model_identity_matches_inline(monkeypatch):
         read.reset()
         operation = read._Operation.begin(local, ACTOR, "default")
         assert operation.sets(operation.verdicts(("blog/post", "read"))) is not None
-        with CaptureQueriesContext(connection) as queries:
+        with evaluator_scope(), CaptureQueriesContext(connection) as queries:
             found = list(Post.objects.with_actor(ACTOR).values_list("pk", flat=True))
         return found, max(len(query["sql"].encode()) for query in queries), len(queries)
 

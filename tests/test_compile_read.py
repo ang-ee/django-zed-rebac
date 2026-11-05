@@ -201,6 +201,29 @@ def test_old_scope_closes_after_policy_revision_changes():
 
 
 @pytest.mark.django_db
+def test_kept_scope_statement_checks_revision_when_run():
+    local = install_schema("""
+        definition auth/user {}
+        definition blog/post { permission read = authenticated }
+    """)
+    actor = SubjectRef.of("auth/user", "alice")
+    with sudo(reason="kept scope revision fence fixture"):
+        Post._base_manager.create(title="old grant")
+    old = Post._base_manager.filter(
+        scope_q(backend=local, model=Post, action="read", actor=actor, using="default")
+    )
+    # Render the unprepared inline statement, which is kept; its fence closes it at run time.
+    old.query.sql_with_params()
+    local.set_schema(
+        parse_zed("""
+        definition auth/user {}
+        definition blog/post { permission read = nil }
+    """)
+    )
+    assert not old.exists()
+
+
+@pytest.mark.django_db
 @pytest.mark.parametrize("operation", ["scope", "enumeration"])
 def test_revision_change_during_lazy_compilation_cannot_replace_the_pinned_policy(
     monkeypatch, operation

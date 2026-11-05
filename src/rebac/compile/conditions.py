@@ -9,17 +9,61 @@ bound, which is required for sound subtraction.
 
 from __future__ import annotations
 
-from collections.abc import Mapping
+from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from typing import Any, cast
 
-from django.db.models import Q
+from django.db import models
+from django.db.models import Expression, F, Q
+from django.db.models.expressions import Combinable
 
 from rebac.compile import formulas as conditions
 from rebac.models import active_relationship_model
 from rebac.schema.ast import PermArrow, PermBinOp, PermExpr, PermRef, Relation, Schema
 
 type Key = tuple[str, str]
+
+
+@dataclass(frozen=True, slots=True)
+class VerdictSlot:
+    kind: str
+    index: int | None = None
+
+
+class _VerdictIn(Expression):
+    """Bind caveat verdict IDs without specializing SQL to their values."""
+
+    def __init__(self, path: str, kind: str, count: int) -> None:
+        super().__init__(output_field=models.BooleanField())
+        self.lhs: Expression | F = F(path)
+        self.kind = kind
+        self.count = count
+
+    def get_source_expressions(self) -> list[Expression | F]:
+        return [self.lhs]
+
+    def set_source_expressions(self, exprs: Sequence[Combinable | Expression]) -> None:
+        self.lhs = cast(Expression | F, exprs[0])
+
+    def as_sql(self, compiler: Any, connection: Any) -> tuple[str, tuple[Any, ...]]:
+        lhs, params = compiler.compile(self.lhs)
+        if connection.vendor == "postgresql":
+            return f"{lhs} = ANY(%s)", (*params, VerdictSlot(self.kind))
+        placeholders = ", ".join("%s" for _ in range(self.count))
+        return (
+            f"{lhs} IN ({placeholders})",
+            (*params, *(VerdictSlot(self.kind, index) for index in range(self.count))),
+        )
+
+
+def _verdict_class(count: int, using: str) -> int | str:
+    from django.db import connections
+
+    return (
+        "array"
+        if connections[using].vendor == "postgresql"
+        else (0 if count == 0 else 1 << (count - 1).bit_length())
+    )
 
 
 def reachable_relations(schema: Schema, key: Key) -> frozenset[Key]:
@@ -30,6 +74,9 @@ def reachable_relations(schema: Schema, key: Key) -> frozenset[Key]:
     recursive; SQL evaluation handles that recursion separately.
     """
 
+    cached = schema._reachable_relations_cache.get(key)
+    if cached is not None:
+        return cached
     visited: set[Key] = set()
     relations: set[Key] = set()
 
@@ -71,7 +118,9 @@ def reachable_relations(schema: Schema, key: Key) -> frozenset[Key]:
                 node((allowed.type, allowed.relation))
 
     node(key)
-    return frozenset(relations)
+    found = frozenset(relations)
+    schema._reachable_relations_cache[key] = found
+    return found
 
 
 @dataclass(frozen=True, slots=True)
@@ -146,7 +195,7 @@ class CaveatVerdicts:
         """No caveated tuple is in reach: both bounds read the same rows."""
         return not (self.true_keys or self.false_keys or self.unknown)
 
-    def condition_q(self, prefix: str, bound: Any) -> Q:
+    def condition_q(self, prefix: str, bound: Any, *, using: str, parametric: bool = False) -> Q:
         """The two-valued condition on a tuple row for one bound."""
 
         name = f"{prefix}caveat_name"
@@ -154,9 +203,23 @@ class CaveatVerdicts:
         lower = str(getattr(bound, "value", bound)).lower() == "lower"
         if lower:
             unconditional = Q(**{name: ""})
-            if not self.true_keys:
+            if not parametric:
+                return (
+                    unconditional | Q(**{f"{digest}__in": tuple(sorted(self.true_keys))})
+                    if self.true_keys
+                    else unconditional
+                )
+            size = _verdict_class(len(self.true_keys), using)
+            if size == 0:
                 return unconditional
-            return unconditional | Q(**{f"{digest}__in": tuple(sorted(self.true_keys))})
-        if not self.false_keys:
+            return unconditional | Q(
+                _VerdictIn(digest, "true", size if isinstance(size, int) else 1)
+            )
+        if not parametric:
+            return (
+                ~Q(**{f"{digest}__in": tuple(sorted(self.false_keys))}) if self.false_keys else Q()
+            )
+        size = _verdict_class(len(self.false_keys), using)
+        if size == 0:
             return Q()
-        return ~Q(**{f"{digest}__in": tuple(sorted(self.false_keys))})
+        return ~Q(_VerdictIn(digest, "false", size if isinstance(size, int) else 1))

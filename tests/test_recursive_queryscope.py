@@ -22,11 +22,12 @@ from rebac import (
     to_object_ref,
 )
 from rebac.backends import reset_backend
+from rebac.compile import read
 from rebac.schema import parse_zed
 from tests.backend_setup import STORAGE_TIERS, install_schema
 from tests.testapp.models import Folder, Post
 
-pytestmark = pytest.mark.django_db
+pytestmark = [pytest.mark.django_db, pytest.mark.pg_delta]
 ACTOR = SubjectRef.of("auth/user", "42")
 OUTSIDER = SubjectRef.of("auth/user", "99")
 ANONYMOUS = SubjectRef.of("auth/anonymous", "*")
@@ -149,6 +150,55 @@ def test_recursive_chain_parity(storage, shape, backing, depth):
                     )
                     == expected
                 )
+
+
+@pytest.mark.parametrize("storage", ["denormalized", "registry"])
+@pytest.mark.parametrize("backing", ["tuple", "field"])
+def test_recursive_alias_decided_statement_is_not_kept(storage, backing):
+    with schema_context(storage, "folder", backing) as (active, member, hop, _action):
+        actors = [SubjectRef.of("auth/user", f"cache-actor-{index}") for index in range(2)]
+        chains = []
+        with sudo(reason="cached recursive scope fixture"):
+            for index in range(2):
+                root = Folder.objects.create(pk=81_000_000 + index * 10, name=f"root-{index}")
+                child = Folder.objects.create(
+                    pk=root.pk + 1,
+                    name=f"child-{index}",
+                    parent=root if backing == "field" else None,
+                )
+                chains.append((root, child))
+        if backing == "tuple":
+            active.write_relationships(
+                [
+                    RelationshipTuple(
+                        to_object_ref(child), hop, SubjectRef.of("blog/folder", str(root.pk))
+                    )
+                    for root, child in chains
+                ]
+            )
+        for actor, (root, _child) in zip(actors, chains, strict=True):
+            grant(active, root, member, actor)
+
+        def visible(actor):
+            return set(
+                Folder.objects.with_actor(actor).with_action("alias").values_list("pk", flat=True)
+            )
+
+        read.reset()
+        assert visible(actors[0]) == {row.pk for row in chains[0]}
+        # A decided recursive statement can contain actor-specific literals,
+        # so it must never be retained for the next actor.
+        assert not read._statements
+        expected = {row.pk for row in chains[1]}
+        assert visible(actors[1]) == expected
+        assert not read._statements
+        original = read._Operation.statement
+
+        def uncached(self, key, verdicts, build, **kwargs):
+            return original(self, key, verdicts, build, **{**kwargs, "cache": False})
+
+        with patch.object(read._Operation, "statement", uncached):
+            assert visible(actors[1]) == expected
 
 
 @pytest.mark.parametrize("storage", ["denormalized", "registry"])
@@ -279,7 +329,7 @@ def test_scope_query_count_is_independent_of_depth(storage, backing, deep, exact
             with CaptureQueriesContext(connection) as queries:
                 assert qs.exists()
             costs.append(len(queries))
-    # A known identity needs only the bounded statement; a range still prepares its scope.
+    # Candidate roots use one statement; ranges prepare, then render.
     assert costs == ([1, 1] if exact else [2, 2])
 
 

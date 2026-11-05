@@ -14,9 +14,10 @@ from __future__ import annotations
 
 import math
 import re
-from collections.abc import Sequence
+from collections.abc import Iterable, Sequence
+from copy import deepcopy
 from dataclasses import dataclass, field
-from typing import Any, TypeGuard, cast
+from typing import Any, SupportsIndex, TypeGuard, cast
 
 BUILTIN_ACTOR_TYPES = frozenset({"anonymous", "authenticated"})
 
@@ -326,6 +327,69 @@ class Definition:
         )
 
 
+class _DefinitionList(list[Definition]):
+    def __init__(self, values: Iterable[Definition] = (), owner: Schema | None = None) -> None:
+        super().__init__(values)
+        self.owner = owner
+
+    def _changed(self) -> None:
+        # Deepcopy and pickle populate a list before restoring its owner state.
+        owner = getattr(self, "owner", None)
+        if owner is not None and hasattr(owner, "_definition_index"):
+            owner._definition_index = None
+            owner._named_ids_cache.clear()
+            owner._reachable_relations_cache.clear()
+
+    def __reduce__(self) -> tuple[Any, tuple[list[Definition]]]:
+        return list, (list(self),)
+
+    def append(self, value: Definition) -> None:
+        super().append(value)
+        self._changed()
+
+    def extend(self, values: Iterable[Definition]) -> None:
+        super().extend(values)
+        self._changed()
+
+    def __setitem__(self, index: Any, value: Any) -> None:
+        super().__setitem__(index, value)
+        self._changed()
+
+    def __delitem__(self, index: Any) -> None:
+        super().__delitem__(index)
+        self._changed()
+
+    def insert(self, index: SupportsIndex, value: Definition) -> None:
+        super().insert(index, value)
+        self._changed()
+
+    def pop(self, index: SupportsIndex = -1) -> Definition:
+        result = super().pop(index)
+        self._changed()
+        return result
+
+    def remove(self, value: Definition) -> None:
+        super().remove(value)
+        self._changed()
+
+    def clear(self) -> None:
+        super().clear()
+        self._changed()
+
+    def reverse(self) -> None:
+        super().reverse()
+        self._changed()
+
+    def sort(self, *, key: Any = None, reverse: bool = False) -> None:
+        super().sort(key=key, reverse=reverse)
+        self._changed()
+
+    def __iadd__(self, values: Iterable[Definition]) -> _DefinitionList:  # type: ignore[override,misc]
+        super().__iadd__(values)
+        self._changed()
+        return self
+
+
 @dataclass
 class Schema:
     """Top-level parsed schema."""
@@ -335,11 +399,47 @@ class Schema:
     directives: list[str] = field(default_factory=list)
     headers: dict[str, str] = field(default_factory=dict)
 
+    def __post_init__(self) -> None:
+        self._definition_index: dict[str, Definition] | None = None
+        self._named_ids_cache: dict[str, frozenset[str]] = {}
+        self._reachable_relations_cache: dict[tuple[str, str], frozenset[tuple[str, str]]] = {}
+        self.definitions = _DefinitionList(self.definitions, self)
+
+    def __setattr__(self, name: str, value: Any) -> None:
+        if name == "definitions":
+            value = _DefinitionList(value, self)
+            if "_definition_index" in self.__dict__:
+                self._definition_index = None
+                self._named_ids_cache.clear()
+                self._reachable_relations_cache.clear()
+        object.__setattr__(self, name, value)
+
+    def __copy__(self) -> Schema:
+        return Schema(
+            list(self.definitions), list(self.caveats), list(self.directives), dict(self.headers)
+        )
+
+    def __deepcopy__(self, memo: dict[int, Any]) -> Schema:
+        result = Schema(
+            deepcopy(list(self.definitions), memo),
+            deepcopy(self.caveats, memo),
+            deepcopy(self.directives, memo),
+            deepcopy(self.headers, memo),
+        )
+        memo[id(self)] = result
+        return result
+
+    def __getstate__(self) -> dict[str, Any]:
+        return {**self.__dict__, "definitions": list(self.definitions)}
+
+    def __setstate__(self, state: dict[str, Any]) -> None:
+        self.__dict__.update(state)
+        self.definitions = list(self.definitions)
+
     def get_definition(self, resource_type: str) -> Definition | None:
-        for d in self.definitions:
-            if d.resource_type == resource_type:
-                return d
-        return None
+        if self._definition_index is None:
+            self._definition_index = {d.resource_type: d for d in self.definitions}
+        return self._definition_index.get(resource_type)
 
     def all_relations(self, resource_type: str) -> Sequence[Relation]:
         d = self.get_definition(resource_type)
