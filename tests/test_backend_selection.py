@@ -29,6 +29,9 @@ def _pretend_authzed_is_installed(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr("rebac.backends.spicedb.importlib.util.find_spec", find_spec)
 
 
+# A fresh interpreter under a loaded ``-n auto`` run; the budgets are generous,
+# the test itself is not slow.
+@pytest.mark.timeout(60)
 def test_backend_import_does_not_populate_auth_models() -> None:
     script = """
 import sys
@@ -50,7 +53,7 @@ assert "django.contrib.auth.base_user" not in sys.modules
         [sys.executable, "-c", script],
         capture_output=True,
         text=True,
-        timeout=8,
+        timeout=30,
         check=False,
     )
     assert result.returncode == 0, result.stderr
