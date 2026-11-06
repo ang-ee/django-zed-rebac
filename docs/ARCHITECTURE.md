@@ -1867,7 +1867,20 @@ while building or rendering a scope. The statement reads tuples and backing
 rows in its own database snapshot.
 
 A queryset scope pins its policy and caveat verdicts when the queryset owner
-builds the scope. Rendering the predicate performs no database read. A new
+builds the scope. Rendering the predicate performs no database read, the
+first time or any later time, alone, embedded, or as an operand of a combined
+query that reaches the compiler without its queryset owner; there is no
+render-time preparation to fall back on. Four exceptions do database work at
+render, outside a prepared scope: (a) `permission_expression` reads the policy
+and the caveat-verdict rows when its SQL is compiled, by design; (b) the
+field-read guard reads the schema revision when an actor-scoped subquery
+renders inside a plain outer query with no evaluator scope open; (c) the
+embedded-bypass audit writes at render for a statement whose query class REBAC
+does not hook (see [Bypass audit granularity](#with_actor-vs-sudo--distinct-verbs));
+(d) a REBAC queryset that Django resolves only while compiling the outer
+statement (a `Subquery` in `ORDER BY`, a REBAC `Subquery` as an INSERT value)
+builds its scope then, reading the schema revision, unless an evaluator scope
+pins it, and the caveat-verdict rows. A new
 caveat instance is absent from an already prepared lower bound; a newly
 built scope sees it. Point checks retain their content-type preparation for
 generic backings and prepare caveat verdicts before the SQL statement.
