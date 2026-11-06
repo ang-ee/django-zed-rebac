@@ -1906,16 +1906,16 @@ class RebacQuerySet(models.QuerySet[_M]):
             return super().delete()
         self._for_write = True
         with model_write(model=self.model, using=self.db):
-            from .mixins import deletion_owner
+            from .mixins import delete_collected, deletion_owner
 
             actor, unscoped = self._resolve_effective_actor()
             self._guard_clause_field_reads(actor, unscoped, clears_ordering=True)
             if unscoped or not model_resource_type(self.model):
                 with deletion_owner(self, self.db, actor, unscoped):
-                    return super().delete()
+                    return delete_collected(self, origin=self, using=self.db)
             # The statement acts on the rows the actor's scope admits: exactly
-            # those are checked and deleted, by key.  A cascade that reaches
-            # another row checks it as an instance delete does.
+            # those are checked and deleted, by key.  The rows a cascade
+            # reaches are checked by the collector, one batch per model.
             actor = self._writing_actor(actor)
             keys = statement_keys(self._rows_in_scope(actor, reason="rebac.delete.rows"))
             parts = list(by_key(self, keys))
@@ -1924,7 +1924,7 @@ class RebacQuerySet(models.QuerySet[_M]):
             deleted: Counter[str] = Counter()
             for rows in parts:
                 with deletion_owner(rows, self.db, actor, unscoped):
-                    deleted.update(models.QuerySet.delete(rows)[1])
+                    deleted.update(delete_collected(rows, origin=rows, using=self.db)[1])
             self._result_cache = None
             return sum(deleted.values()), dict(deleted)
 
@@ -2204,7 +2204,7 @@ class TrackedQuerySet[T: models.Model](models.QuerySet[T]):
     def delete(self) -> tuple[int, dict[str, int]]:
         from .actors import current_actor, is_sudo
         from .conf import app_settings
-        from .mixins import RebacMixin, deletion_owner
+        from .mixins import RebacMixin, delete_collected, deletion_owner
         from .signals import _gate_backed_rows, audit_backed_denials
         from .watch import by_key, model_write, statement_keys
 
@@ -2225,14 +2225,15 @@ class TrackedQuerySet[T: models.Model](models.QuerySet[T]):
                 or self.query.is_sliced
             ):
                 with deletion_owner(self, self.db, actor, unscoped):
-                    return super().delete()
+                    return delete_collected(self, origin=self, using=self.db)
             keys = statement_keys(self)
             for rows in by_key(self.model._base_manager.using(self.db), keys):
                 _gate_backed_rows(rows, using=self.db, deleting=True)
             deleted: Counter[str] = Counter()
             for rows in by_key(self, keys):
                 with deletion_owner(rows, self.db, actor, unscoped):
-                    deleted.update(models.QuerySet.delete(rows)[1])
+                    deleted.update(delete_collected(rows, origin=rows, using=self.db)[1])
+            self._result_cache = None
             return sum(deleted.values()), dict(deleted)
 
     def bulk_create(

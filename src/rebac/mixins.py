@@ -258,6 +258,8 @@ class DeleteScope:
     unscoped: bool
     identities: set[ObjectRef] = dataclass_field(default_factory=set)
     root_pks: frozenset[Any] = frozenset()
+    # The collected rows whose delete was authorized, by model.
+    covered_pks: dict[type[models.Model], set[Any]] = dataclass_field(default_factory=dict)
 
 
 _delete_scopes: ContextVar[tuple[DeleteScope, ...]] = ContextVar("rebac_delete_scopes", default=())
@@ -298,6 +300,101 @@ def deletion_owner(
         cleanup_identities(scope.identities, using=using)
     finally:
         _delete_scopes.reset(token)
+
+
+def delete_collected(
+    rows: Any, *, origin: Any, using: str, keep_parents: bool = False
+) -> tuple[int, dict[str, int]]:
+    """Delete as Django does, authorizing each collected resource model as one batch.
+
+    Django's collector gathers the root and its cascade first. Every resource
+    model in the collection is then checked for ``delete`` in one batch for the
+    owner's actor, before any row is removed; the root rows its owner already
+    checked are covered. ``pre_delete`` skips the rows covered here.
+    """
+    from django.db.models.deletion import Collector
+
+    from .backends import backend
+    from .errors import MissingActorError, PermissionDenied
+
+    scope = delete_scope(origin, using)
+    assert scope is not None
+    collector = Collector(using=using, origin=origin)
+    if isinstance(rows, models.QuerySet):
+        cast(Any, rows)._not_support_combined_queries("delete")
+        if rows.query.is_sliced:
+            raise TypeError("Cannot use 'limit' or 'offset' with delete().")
+        if rows.query.distinct_fields:
+            raise TypeError("Cannot call delete() after .distinct(*fields).")
+        if cast(Any, rows)._fields is not None:
+            raise TypeError("Cannot call delete() after .values() or .values_list()")
+        del_query = cast(Any, rows)._chain()
+        del_query._for_write = True
+        query = del_query.query
+        query.select_for_update = False
+        query.select_related = False
+        query.clear_ordering(force=True)
+        collector.collect(del_query)
+    else:
+        if not cast(Any, rows)._is_pk_set():
+            raise ValueError(
+                f"{rows._meta.object_name} object can't be deleted because its "
+                f"{rows._meta.pk.attname} attribute is set to None."
+            )
+        collector.collect(cast(Any, [rows]), keep_parents=keep_parents)
+    for model, instances in sorted(
+        collector.data.items(), key=lambda item: item[0]._meta.label_lower
+    ):
+        if not issubclass(model, RebacMixin):
+            continue
+        resource_type = model_resource_type(model)
+        if resource_type is None:
+            continue
+        covered = scope.covered_pks.setdefault(model, set())
+        if isinstance(origin, models.QuerySet):
+            if model is origin.model:
+                covered.update(scope.root_pks)
+        elif model is type(origin):
+            covered.add(origin.pk)
+        candidates = [instance for instance in instances if instance.pk not in covered]
+        if not candidates:
+            continue
+        if scope.unscoped:
+            covered.update(instance.pk for instance in candidates)
+            continue
+        if scope.actor is None:
+            raise MissingActorError("Cascaded delete has no actor.")
+        identity = resource_id_attr(model)
+        identities = {str(getattr(instance, identity)): instance.pk for instance in candidates}
+        granted = backend().held_many(
+            subject=scope.actor,
+            actions=("delete",),
+            resource_type=resource_type,
+            ids=identities,
+            using=using,
+        )["delete"]
+        denied = sorted(set(identities) - granted)
+        if denied:
+            resource = ObjectRef(resource_type, denied[0])
+            _maybe_audit_denial(actor=scope.actor, action="delete", resource=resource)
+            raise PermissionDenied(f"Denied: {scope.actor} cannot delete {resource}")
+        covered.update(identities.values())
+    result = collector.delete()
+    if isinstance(rows, models.QuerySet):
+        rows._result_cache = None
+    return result
+
+
+def _next_delete_is_model(instance: models.Model, owner: type[models.Model]) -> bool:
+    """Whether the delete after ``owner``'s in the MRO is Django's own.
+
+    Only then does the collector run here; a consumer override keeps its call.
+    """
+    lineage = type(instance).__mro__
+    for base in lineage[lineage.index(owner) + 1 :]:
+        if "delete" in base.__dict__:
+            return base is models.Model
+    return False
 
 
 @contextmanager
@@ -441,6 +538,8 @@ class RebacTrackedMixin(models.Model, metaclass=RebacModelBase):
 
         alias = using or router.db_for_write(type(self), instance=self)
         if delete_scope(self, alias) is not None:
+            if _next_delete_is_model(self, RebacTrackedMixin):
+                return delete_collected(self, origin=self, using=alias, keep_parents=keep_parents)
             return super().delete(using=alias, keep_parents=keep_parents)
         actor = current_actor()
         unscoped = is_sudo() or (actor is None and not app_settings.REBAC_STRICT_MODE)
@@ -449,6 +548,10 @@ class RebacTrackedMixin(models.Model, metaclass=RebacModelBase):
 
             _gate_backed_field_change(type(self), self, alias, None, deleting=True)
             with deletion_owner(self, alias, actor, unscoped):
+                if _next_delete_is_model(self, RebacTrackedMixin):
+                    return delete_collected(
+                        self, origin=self, using=alias, keep_parents=keep_parents
+                    )
                 return super().delete(using=alias, keep_parents=keep_parents)
 
 

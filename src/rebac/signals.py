@@ -427,6 +427,7 @@ def _rebac_pre_delete(
     # unscoped. Only rows actually covered by that root operation can skip.
     covered = scope is not None and (
         origin is instance
+        or instance.pk in scope.covered_pks.get(sender, set())
         or (
             isinstance(origin, (RebacQuerySet, TrackedQuerySet))
             and origin.model is sender
