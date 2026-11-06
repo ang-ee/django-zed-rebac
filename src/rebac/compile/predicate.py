@@ -961,7 +961,9 @@ class Compiler:
                     .order_by()
                     .values("pk", "_rebac_depth")
                 )
-                return cast(QuerySet[Any], first.union(step))
+                # Django restores a model's default ordering on a combinator
+                # query; a CTE body carries none.
+                return cast(QuerySet[Any], first.union(step).order_by())
 
             cte = CTE.recursive(path_rows, name=self._cte_name("rebac_path"))
             reached = self._cte_queryset(cte).values("pk")
