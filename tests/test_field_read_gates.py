@@ -28,7 +28,7 @@ from rebac import (
     write_relationships,
 )
 from rebac.backends import reset_backend
-from rebac.field_visibility import mark_denied_fields, redacted_fields
+from rebac.field_visibility import backend_schema, mark_denied_fields, redacted_fields
 from rebac.schema import parse_zed
 from tests.backend_setup import UNUSABLE_SCHEMA_ACCESSORS, atomic_source_write, install_schema
 from tests.testapp.models import Post
@@ -686,14 +686,26 @@ def test_no_read_gates_do_not_add_field_accessible_calls(alice, monkeypatch):
 
 
 @pytest.mark.parametrize(("accessor", "error"), UNUSABLE_SCHEMA_ACCESSORS)
+def test_backend_schema_refuses_an_unusable_accessor(monkeypatch, accessor, error):
+    """The accessor both field gates share raises; it never answers "no gates"."""
+    monkeypatch.setattr(backend(), "schema", accessor)
+
+    with pytest.raises(error):
+        backend_schema()
+
+
+@pytest.mark.parametrize(("accessor", "error"), UNUSABLE_SCHEMA_ACCESSORS)
 def test_read_gate_fails_closed_without_a_usable_schema(alice, monkeypatch, accessor, error):
-    """A viewer's fetch would redact ``title``; without the schema it raises, not leaks."""
+    """A viewer's fetch would redact ``title``; without the schema it raises, not
+    leaks, and the gates are read before the rows, so none is cached unredacted."""
     post = _post(title="stored secret")
     _grant(post.pk, alice, "viewer")
     monkeypatch.setattr(backend(), "schema", accessor)
+    rows = Post.objects.as_user(alice)
 
     with override_settings(REBAC_FIELD_READ_MODE="redact"), pytest.raises(error):
-        list(Post.objects.as_user(alice))
+        list(rows)
+    assert rows._result_cache is None
 
 
 @override_settings(REBAC_FIELD_READ_MODE="redact")

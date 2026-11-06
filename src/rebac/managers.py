@@ -34,6 +34,7 @@ from .field_visibility import (
     accessible_ids,
     apply_field_visibility,
     backend_grants_all,
+    backend_schema,
     effective_field_deny_mode,
     gated_read_fields,
     runtime_field_deny_mode,
@@ -1372,9 +1373,18 @@ class RebacQuerySet(models.QuerySet[_M]):
         if fetching:
             self._apply_scope_in_place()
         actor, sudo = self._resolve_effective_actor()
+        field_mode = self._effective_field_mode()
+        redact = actor is not None and not sudo
         if fetching:
             # Rows already held were guarded by the evaluation that read them.
             self._guard_projected_field_reads(actor, sudo)
+            # The field gates are read before the rows, as aiterator reads them:
+            # a schema that cannot be read raises here, with no row in the cache.
+            redact = (
+                redact
+                and runtime_field_deny_mode(field_mode) != "allow"
+                and bool(gated_read_fields(self.model))
+            )
         super()._fetch_all()
         if self._result_cache is not None and not self._rebac_visibility_applied:
             if actor is not None and not sudo:
@@ -1382,12 +1392,10 @@ class RebacQuerySet(models.QuerySet[_M]):
                     if isinstance(inst, models.Model):
                         inst._rebac_actor = actor  # type: ignore[attr-defined]
                         inst._rebac_field_deny = self._rebac_field_deny  # type: ignore[attr-defined]
-                apply_field_visibility(
-                    self._result_cache,
-                    model=self.model,
-                    actor=actor,
-                    mode=self._effective_field_mode(),
-                )
+                if redact:
+                    apply_field_visibility(
+                        self._result_cache, model=self.model, actor=actor, mode=field_mode
+                    )
             self._guard_selected_related_reads()
             self._rebac_visibility_applied = True
 
@@ -1808,29 +1816,14 @@ class RebacQuerySet(models.QuerySet[_M]):
         named ``write__<f>``, every row in the current scope must pass
         that check too — same all-or-nothing semantics as the
         resource-level check. Any denied row aborts the whole update.
-
-        Backends without an in-process schema accessor (i.e. SpiceDB
-        once 0.5 lands) skip this — they'll route per-field checks
-        through their own server-side schema. The resource-level
-        ``write`` check already ran before we got here.
         """
         from .backends import backend
-        from .schema.ast import Schema
         from .schema.walker import field_gated_actions
 
         rebac_type = model_resource_type(self.model)
         if not rebac_type:
             return
-        accessor = getattr(backend(), "schema", None)
-        if not callable(accessor):
-            return
-        try:
-            schema = accessor()
-        except Exception:
-            return
-        if not isinstance(schema, Schema):
-            return
-        definition = schema.get_definition(rebac_type)
+        definition = backend_schema().get_definition(rebac_type)
         if definition is None:
             return
         declared = field_gated_actions(definition, "write")
