@@ -1890,6 +1890,15 @@ caveat instance is absent from an already prepared lower bound; a newly
 built scope sees it. Point checks retain their content-type preparation for
 generic backings and prepare caveat verdicts before the SQL statement.
 
+A scoped read that names the identities it reads is bounded to them. When the
+resolved query requires, on a positive AND path, the model's unique native
+integer identity to equal a literal or to be in a list of at most 256 distinct
+literals (`filter(pk=...)`, `filter(pk__in=[...])`), the scope statement visits
+only those candidate rows before applying the permission predicate; the
+selecting query keeps its own filter. Any other shape (an OR, a negation, a
+subquery, duplicates, a longer list) uses the general scope. A bounded
+statement embeds its literals, so it is compiled per read and not kept.
+
 A policy revision fence closes a scope after a new revision is published.
 A scope built without an actor fails closed. Statements bind the application
 clock at execution, so tuple expiration and timed override sites follow that
