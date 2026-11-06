@@ -30,7 +30,7 @@ from rebac import (
 from rebac.backends import reset_backend
 from rebac.field_visibility import mark_denied_fields, redacted_fields
 from rebac.schema import parse_zed
-from tests.backend_setup import atomic_source_write, install_schema
+from tests.backend_setup import UNUSABLE_SCHEMA_ACCESSORS, atomic_source_write, install_schema
 from tests.testapp.models import Post
 
 SCHEMA_TEXT = """
@@ -683,6 +683,17 @@ def test_no_read_gates_do_not_add_field_accessible_calls(alice, monkeypatch):
     post_table = connection.ops.quote_name(Post._meta.db_table)
     row_queries = [query["sql"] for query in queries if f"FROM {post_table}" in query["sql"]]
     assert len(row_queries) == 1
+
+
+@pytest.mark.parametrize(("accessor", "error"), UNUSABLE_SCHEMA_ACCESSORS)
+def test_read_gate_fails_closed_without_a_usable_schema(alice, monkeypatch, accessor, error):
+    """A viewer's fetch would redact ``title``; without the schema it raises, not leaks."""
+    post = _post(title="stored secret")
+    _grant(post.pk, alice, "viewer")
+    monkeypatch.setattr(backend(), "schema", accessor)
+
+    with override_settings(REBAC_FIELD_READ_MODE="redact"), pytest.raises(error):
+        list(Post.objects.as_user(alice))
 
 
 @override_settings(REBAC_FIELD_READ_MODE="redact")

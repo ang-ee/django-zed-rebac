@@ -2722,7 +2722,10 @@ Permissions named `read__<field>` are enforced after a queryset has been
 row-scoped and materialised. The schema syntax is unchanged: `read__title`,
 `read__salary`, and `write__title` are ordinary permission names. The shared
 schema accessor `field_gated_actions(definition, verb)` discovers both read and
-write field gates so the two paths cannot drift.
+write field gates so the two paths cannot drift. Both gates read the installed
+schema through the active backend's `schema()`: a backend without a usable one
+is an `ImproperlyConfigured` error and an exception from `schema()` propagates,
+so neither gate ever decides "no gates" for want of the schema.
 
 Field enforcement is opt-in through `REBAC_FIELD_READ_MODE` or
 `.on_field_deny(mode)`. Modes are:

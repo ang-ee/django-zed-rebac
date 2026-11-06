@@ -21,7 +21,7 @@ from rebac import (
 )
 from rebac.backends import reset_backend
 from rebac.schema import parse_zed
-from tests.backend_setup import atomic_source_write, install_schema
+from tests.backend_setup import UNUSABLE_SCHEMA_ACCESSORS, atomic_source_write, install_schema
 
 # ``write`` opens up to owners + editors; ``write__title`` narrows it back
 # to owners only. ``body`` has no per-field gate, so it inherits ``write``.
@@ -216,6 +216,53 @@ def test_handbuilt_instance_with_pinned_actor(alice):
     instance._rebac_actor = SubjectRef.of("auth/user", str(alice.pk))
     instance.save()
     assert instance.pk is not None
+
+
+@pytest.mark.parametrize(("accessor", "error"), UNUSABLE_SCHEMA_ACCESSORS)
+def test_write_gate_fails_closed_without_a_usable_schema(
+    alice, bob, post, monkeypatch, accessor, error
+):
+    """An editor passes ``write``; ``write__title`` needs the schema, so the save
+    raises rather than writes when the schema cannot be read."""
+    from tests.testapp.models import Post
+
+    _grant(post.pk, alice, "owner")
+    _grant(post.pk, bob, "editor")
+    instance = Post.objects.as_user(bob).get(pk=post.pk)
+    monkeypatch.setattr(backend(), "schema", accessor)
+
+    instance.title = "hijacked title"
+    with pytest.raises(error):
+        instance.save()
+
+    monkeypatch.undo()
+    with sudo(reason="test.verify"):
+        assert Post.objects.get(pk=post.pk).title == "original title"
+
+
+@pytest.mark.parametrize(("accessor", "error"), UNUSABLE_SCHEMA_ACCESSORS)
+def test_per_field_write_gate_itself_fails_closed_without_a_usable_schema(
+    alice, bob, post, monkeypatch, accessor, error
+):
+    """The save path raises at the first gate that reads the schema; this pins
+    the ``write__<field>`` gate's own read of it."""
+    from rebac.mixins import _enforce_per_field_writes
+    from tests.testapp.models import Post
+
+    _grant(post.pk, alice, "owner")
+    _grant(post.pk, bob, "editor")
+    instance = Post.objects.as_user(bob).get(pk=post.pk)
+    monkeypatch.setattr(backend(), "schema", accessor)
+
+    instance.title = "hijacked title"
+    with pytest.raises(error):
+        _enforce_per_field_writes(
+            sender=Post,
+            instance=instance,
+            actor=SubjectRef.of("auth/user", str(bob.pk)),
+            resource=ObjectRef("blog/post", str(post.pk)),
+            update_fields=["title"],
+        )
 
 
 # ---------- bulk updates ----------

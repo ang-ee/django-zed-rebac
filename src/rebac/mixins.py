@@ -1594,18 +1594,14 @@ def _enforce_per_field_writes(
     UPDATE — unusual), every non-pk concrete field is treated as dirty
     (conservative; fail-closed).
 
-    Schema lookup goes via ``backend().schema()`` when the backend
-    exposes one (LocalBackend always does; SpiceDBBackend will route
-    through its own server-side schema once 0.5 lands). Backends without
-    an in-process schema accessor skip per-field enforcement — the
-    resource-level ``write`` check already gated the operation.
+    Schema lookup goes through ``backend_schema()``: a backend without a
+    usable ``schema()`` is an ``ImproperlyConfigured`` error and an exception
+    from ``schema()`` propagates, so a dirty gated field is never written for
+    want of the schema that declares its gate.
 
     Pure in-memory comparison; never queries the DB to refresh state.
     """
-    schema = backend_schema()
-    if schema is None:
-        return
-    definition = schema.get_definition(resource.resource_type)
+    definition = backend_schema().get_definition(resource.resource_type)
     if definition is None:
         return
     declared = field_gated_actions(definition, "write")
