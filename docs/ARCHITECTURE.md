@@ -2472,8 +2472,14 @@ instance's actor pin, including the current-member read in M2M
 `set(clear=False)`. The related manager transfers that pin only while building
 its own fresh queryset; Django's shared database-router `instance` hint never
 grants authority to a caller-owned or reused queryset. Root instances are
-stamped before Django prefetches during queryset `_fetch_all` evaluation, so a
-cached related manager has the same carrying actor on that path. Without that pin, related-manager
+stamped before Django prefetches, in queryset evaluation and in each chunk of
+`iterator()` and `aiterator()`, so a cached related manager has the same
+carrying actor on every path. The iterators stream their chunks: each chunk is
+stamped, prefetched, redacted and guarded before it is yielded, with the root
+and relation actors resolved when `iterator()` or `aiterator()` is called. A
+chunk consumed later, after the actor context closed (a streaming response) or
+under another ambient actor, is still read and guarded for the actor at call
+time. Without that pin, related-manager
 reads resolve ambient authority in relation mode; in non-strict mode, no actor
 falls through to full visibility, as ordinary root reads and backed M2M writes
 do. A block-scoped sudo bypass does apply when no actor is pinned, including

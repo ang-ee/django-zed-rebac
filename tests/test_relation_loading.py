@@ -216,6 +216,72 @@ def test_aiterator_sudo_does_not_bypass_selected_related_guards(alice, with_ambi
             asyncio.run(collect())
 
 
+def _lazy_guard_fixture(alice):
+    """A post alice reads, in a folder only bob reads."""
+    from django.contrib.auth import get_user_model
+
+    bob = atomic_source_write(get_user_model().objects.create, username="bob", is_active=True)
+    folder = _folder("bob's folder")
+    post = _post("alice's post", folder=folder)
+    _grant("blog/post", post.pk, "owner", alice)
+    _grant("blog/folder", folder.pk, "viewer", bob)
+    return bob, post
+
+
+@pytest.mark.django_db
+@pytest.mark.parametrize("consumer", ["none", "bob"])
+def test_iterator_guards_selected_related_rows_with_the_actor_at_call_time(alice, consumer):
+    from tests.testapp.models import Post
+
+    bob, post = _lazy_guard_fixture(alice)
+    with actor_context(SubjectRef.of("auth/user", str(alice.pk))):
+        rows = Post.objects.rebac_select_related("folder").filter(pk=post.pk).iterator(chunk_size=1)
+    # Consumed after the actor context closed (a streaming response), or under
+    # another actor: the guard still answers for alice, who cannot read the folder.
+    if consumer == "bob":
+        with actor_context(SubjectRef.of("auth/user", str(bob.pk))):
+            with pytest.raises(PermissionDenied):
+                list(rows)
+    else:
+        with pytest.raises(PermissionDenied):
+            list(rows)
+
+
+@pytest.mark.django_db(transaction=True)
+@pytest.mark.parametrize("consumer", ["none", "bob"])
+def test_aiterator_guards_selected_related_rows_with_the_actor_at_call_time(alice, consumer):
+    from tests.testapp.models import Post
+
+    bob, post = _lazy_guard_fixture(alice)
+    with actor_context(SubjectRef.of("auth/user", str(alice.pk))):
+        rows = Post.objects.rebac_select_related("folder").filter(pk=post.pk).aiterator()
+
+    async def collect():
+        return [row async for row in rows]
+
+    if consumer == "bob":
+        with actor_context(SubjectRef.of("auth/user", str(bob.pk))):
+            with pytest.raises(PermissionDenied):
+                asyncio.run(collect())
+    else:
+        with pytest.raises(PermissionDenied):
+            asyncio.run(collect())
+
+
+@pytest.mark.django_db
+def test_iterator_consumed_after_its_actor_context_reads_the_pinned_scope(alice):
+    from tests.testapp.models import Folder, Post
+
+    folder = _folder("alice's folder")
+    post = _post("alice's post", folder=folder)
+    _grant("blog/post", post.pk, "owner", alice)
+    _grant("blog/folder", folder.pk, "viewer", alice)
+    with actor_context(SubjectRef.of("auth/user", str(alice.pk))):
+        rows = Post.objects.rebac_select_related("folder").filter(pk=post.pk).iterator(chunk_size=1)
+    [row] = list(rows)  # No MissingActorError mid-stream.
+    assert isinstance(row.folder, Folder) and row.folder.pk == folder.pk
+
+
 @pytest.mark.django_db
 def test_sudo_does_not_bypass_selected_related_projection_guard(alice):
     from tests.testapp.models import Post
@@ -478,10 +544,6 @@ def test_plain_prefetched_related_manager_uses_root_instance_pin(alice):
 
 @pytest.mark.django_db
 @override_settings(REBAC_STRICT_MODE=True)
-@pytest.mark.xfail(
-    strict=True,
-    reason="W2-E iterator lane (cluster 5): stamp each root chunk before prefetch",
-)
 def test_iterator_prefetched_related_manager_uses_pinned_root_actor(alice):
     from tests.testapp.models import Folder
 
@@ -496,12 +558,34 @@ def test_iterator_prefetched_related_manager_uses_pinned_root_actor(alice):
         assert [post.pk for post in rows[0].posts.all()] == [alice_post.pk]
 
 
+@pytest.mark.django_db
+def test_iterator_prefetches_one_chunk_at_a_time():
+    from django.db import connection
+    from django.test.utils import CaptureQueriesContext
+
+    from tests.testapp.models import Folder, Post
+
+    folders = [_folder(f"chunk {index}") for index in range(3)]
+    for folder in folders:
+        _post(f"post in {folder.name}", folder=folder)
+    posts = connection.ops.quote_name(Post._meta.db_table)
+    with sudo(reason="test.iterator-chunks"):
+        rows = (
+            Folder.objects.filter(pk__in=[folder.pk for folder in folders])
+            .order_by("pk")
+            .prefetch_related("posts")
+            .iterator(chunk_size=1)
+        )
+        with CaptureQueriesContext(connection) as first:
+            next(rows)
+        with CaptureQueriesContext(connection) as rest:
+            assert len(list(rows)) == 2
+    assert sum(posts in query["sql"] for query in first) == 1
+    assert sum(posts in query["sql"] for query in rest) == 2
+
+
 @pytest.mark.django_db(transaction=True)
 @override_settings(REBAC_STRICT_MODE=True)
-@pytest.mark.xfail(
-    strict=True,
-    reason="W2-E iterator lane (cluster 5): stamp each root chunk before prefetch",
-)
 def test_aiterator_prefetched_related_manager_uses_pinned_root_actor(alice):
     from tests.testapp.models import Folder
 

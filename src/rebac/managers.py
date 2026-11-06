@@ -1131,28 +1131,22 @@ class RebacQuerySet(models.QuerySet[_M]):
     # ``(actor, bypass)`` as the scope was applied.
     _rebac_scope_decision: tuple[SubjectRef | None, bool] | None = None
 
-    def _apply_scope_in_place(self, *, audit: bool = True) -> None:
-        """Inject ``<id_attr>__in=<accessible>`` onto the query's WHERE clause.
+    def _apply_scope_in_place(
+        self, *, audit: bool = True, decision: tuple[SubjectRef | None, bool] | None = None
+    ) -> None:
+        """Add the compiled permission predicate to this query's WHERE clause.
 
-        ``id_attr`` defaults to ``"pk"`` but can be flipped per-model via
-        ``Meta.rebac_id_attr`` or globally via ``REBAC_RESOURCE_ID_ATTR``.
-
-        Avoids ``self.filter(...)`` because ``.get()`` pre-slices the
-        queryset and ``.filter()`` rejects post-slice. ``Q.add_q``
-        operates at the SQL level and bypasses the slice check.
-
-        ``backend().accessible()`` is memoised per-actor + action +
-        resource_type via the ambient ``_accessible_cache`` ContextVar
-        (``rebac.actors``). A single GraphQL request that materialises
-        the same scoped queryset multiple times (aggregate primary
-        + ``totalCount`` + per-measure resolvers, paginated lookups,
-        nested edges) collapses to one ``accessible()`` graph walk —
-        the underlying relationship SQL is bounded by the schema's
-        depth, not by the number of resolvers fired.
+        The predicate tests each selected row's identity (``Meta.rebac_id_attr``
+        or ``REBAC_RESOURCE_ID_ATTR``, ``"pk"`` by default) on the queryset's
+        database alias, with its policy pinned now. It is added to the
+        underlying ``Query``, which also works after ``.get()`` slices the
+        queryset, when ``.filter()`` would be rejected.
         """
         if self._rebac_scope_applied:
             return
-        actor, sudo = self.effective_actor(strict=True)
+        # ``decision`` is an ``(actor, bypass)`` resolved earlier by a lazy
+        # reader, which must not resolve the ambient context again.
+        actor, sudo = decision if decision is not None else self.effective_actor(strict=True)
         if audit:
             self._audit_bypass_once()
         self._rebac_scope_applied = True
@@ -1488,11 +1482,7 @@ class RebacQuerySet(models.QuerySet[_M]):
             # Django's own _fetch_all, with the rows stamped before their
             # prefetches run: a related manager reads the row's actor pin.
             self._result_cache = list(native._iterable_class(self))
-            if actor is not None and not sudo:
-                for inst in self._result_cache:
-                    if isinstance(inst, models.Model):
-                        inst._rebac_actor = actor  # type: ignore[attr-defined]
-                        inst._rebac_field_deny = self._rebac_field_deny  # type: ignore[attr-defined]
+            self._stamp(self._result_cache, actor, sudo)
         if native._prefetch_related_lookups and not native._prefetch_done:
             native._prefetch_related_objects()
         if self._result_cache is not None and not self._rebac_visibility_applied:
@@ -1505,35 +1495,81 @@ class RebacQuerySet(models.QuerySet[_M]):
             self._rebac_visibility_applied = True
 
     @schema_operation
-    def iterator(self, *args: Any, **kwargs: Any) -> Any:
+    def iterator(self, chunk_size: int | None = None) -> Iterator[_M]:
+        """Django's ``iterator()``, finishing each chunk before Django would prefetch it.
+
+        Rows stream in chunks. Each chunk is stamped with the queryset's actor
+        before its prefetches run, so a related manager reads the pinned root
+        actor, then redacted and guarded like an evaluated queryset. The actors
+        are resolved when ``iterator()`` is called: consuming the chunks later,
+        under another ambient actor or none, changes nothing.
+        """
+        from .relation_loading import _relation_scope
+
+        native = cast(Any, self)
+        if chunk_size is None:
+            if native._prefetch_related_lookups:
+                raise ValueError(
+                    "chunk_size must be provided when using QuerySet.iterator() after "
+                    "prefetch_related()."
+                )
+        elif chunk_size <= 0:
+            raise ValueError("Chunk size must be strictly positive.")
         if self._result_cache is None:
             self._apply_scope_in_place()
         actor, sudo = self.effective_actor(strict=True)
         self._audit_bypass_once()
         self._guard_projected_field_reads(actor, sudo)
-        rows = list(super().iterator(*args, **kwargs))
-        if actor is not None and not sudo:
-            for inst in rows:
-                if isinstance(inst, models.Model):
-                    inst._rebac_actor = actor  # type: ignore[attr-defined]
-                    inst._rebac_field_deny = self._rebac_field_deny  # type: ignore[attr-defined]
-            apply_field_visibility(
-                rows,
-                model=self.model,
-                actor=actor,
-                mode=self._effective_field_mode(),
-            )
-        self._guard_selected_related_reads(rows)
-        return iter(rows)
+        related = _relation_scope(self) if self._rebac_select_related_guards else None
+        chunked = not connections[self.db].settings_dict.get("DISABLE_SERVER_SIDE_CURSORS")
+        size = chunk_size or 2000
+        rows = iter(native._iterable_class(self, chunked_fetch=chunked, chunk_size=size))
+        return self._finished_chunks(rows, size, actor, sudo, related)
 
-    def _guard_selected_related_reads(self, rows: Iterable[Any] | None = None) -> None:
+    def _finished_chunks(
+        self,
+        rows: Iterator[Any],
+        size: int,
+        actor: SubjectRef | None,
+        sudo: bool,
+        related: tuple[SubjectRef | None, bool] | None,
+    ) -> Iterator[_M]:
+        from itertools import islice
+
+        while chunk := list(islice(rows, size)):
+            self._stamp(chunk, actor, sudo)
+            native = cast(Any, self)
+            if native._prefetch_related_lookups:
+                models.prefetch_related_objects(chunk, *native._prefetch_related_lookups)
+            if actor is not None and not sudo:
+                apply_field_visibility(
+                    chunk, model=self.model, actor=actor, mode=self._effective_field_mode()
+                )
+            self._guard_selected_related_reads(chunk, related)
+            yield from chunk
+
+    def _stamp(self, rows: Iterable[Any], actor: SubjectRef | None, sudo: bool) -> None:
+        """Pin the queryset's actor on its materialised rows."""
+        if actor is None or sudo:
+            return
+        for inst in rows:
+            if isinstance(inst, models.Model):
+                inst._rebac_actor = actor  # type: ignore[attr-defined]
+                inst._rebac_field_deny = self._rebac_field_deny  # type: ignore[attr-defined]
+
+    def _guard_selected_related_reads(
+        self,
+        rows: Iterable[Any] | None = None,
+        scope: tuple[SubjectRef | None, bool] | None = None,
+    ) -> None:
+        """Guard selected related rows; ``scope`` is a relation scope resolved earlier."""
         if not self._rebac_select_related_guards:
             return
         from .relation_loading import _relation_scope, guard_selected_related_instances
 
         if rows is None:
             rows = self._result_cache or ()
-        actor, bypass = _relation_scope(self)
+        actor, bypass = scope if scope is not None else _relation_scope(self)
         guard_selected_related_instances(
             rows,
             root_model=self.model,
@@ -1545,7 +1581,7 @@ class RebacQuerySet(models.QuerySet[_M]):
 
     # ----- Async iteration: Django's aiterator bypasses the sync overrides -----
 
-    async def aiterator(self, *args: Any, **kwargs: Any) -> AsyncIterator[_M]:
+    def aiterator(self, chunk_size: int = 2000) -> AsyncIterator[_M]:
         """Async variant of :meth:`iterator` that preserves REBAC scoping.
 
         Django's ``QuerySet.aiterator`` builds the row iterable directly rather
@@ -1564,30 +1600,68 @@ class RebacQuerySet(models.QuerySet[_M]):
         we already override, so it inherits scoping for free — only
         ``aiterator`` and :meth:`aggregate` need explicit handling.
         """
+        if chunk_size <= 0:
+            raise ValueError("Chunk size must be strictly positive.")
+        from .relation_loading import _relation_scope
+
+        # The actors are resolved now, where aiterator() is called: the chunks
+        # may be consumed later, under another ambient actor or none.
+        decision = self.effective_actor(strict=True)
+        related = _relation_scope(self) if self._rebac_select_related_guards else None
+        return self._aiterate(chunk_size, decision, related)
+
+    async def _aiterate(
+        self,
+        chunk_size: int,
+        decision: tuple[SubjectRef | None, bool],
+        related: tuple[SubjectRef | None, bool] | None,
+    ) -> AsyncIterator[_M]:
         if self._result_cache is None:
-            await sync_to_async(self._apply_scope_in_place)()
-        actor, sudo = self.effective_actor(strict=True)
+            await sync_to_async(self._apply_scope_in_place)(audit=False, decision=decision)
+        actor, sudo = decision
         self._audit_bypass_once()
         # DB-backed schemas refresh at operation boundaries. Field discovery
         # and projection guards therefore need the same worker thread as the
         # scope/visibility checks, even when the schema was loaded just above.
         await sync_to_async(self._guard_projected_field_reads)(actor, sudo)
         field_mode = self._effective_field_mode()
-        redact = runtime_field_deny_mode(field_mode) != "allow" and bool(
-            await sync_to_async(gated_read_fields)(self.model)
+        redact = (
+            actor is not None
+            and not sudo
+            and runtime_field_deny_mode(field_mode) != "allow"
+            and bool(await sync_to_async(gated_read_fields)(self.model))
         )
-        guard_related = bool(self._rebac_select_related_guards)
-        async for inst in super().aiterator(*args, **kwargs):
-            if actor is not None and not sudo and isinstance(inst, models.Model):
-                inst._rebac_actor = actor  # type: ignore[attr-defined]
-                inst._rebac_field_deny = self._rebac_field_deny  # type: ignore[attr-defined]
-                if redact:
-                    await sync_to_async(apply_field_visibility)(
-                        [inst], model=self.model, actor=actor, mode=field_mode
-                    )
-            if guard_related:
-                await sync_to_async(self._guard_selected_related_reads)([inst])
-            yield inst
+        native = cast(Any, self)
+        lookups = native._prefetch_related_lookups
+        chunked = not connections[self.db].settings_dict.get("DISABLE_SERVER_SIDE_CURSORS")
+        iterable = native._iterable_class(self, chunked_fetch=chunked, chunk_size=chunk_size)
+        chunk: list[Any] = []
+
+        async def finish(rows: list[Any]) -> None:
+            # Stamped before their prefetches: a related manager reads the
+            # pinned root actor, as in _fetch_all and iterator().
+            self._stamp(rows, actor, sudo)
+            if lookups:
+                await models.aprefetch_related_objects(rows, *lookups)
+            if redact:
+                assert actor is not None
+                await sync_to_async(apply_field_visibility)(
+                    rows, model=self.model, actor=actor, mode=field_mode
+                )
+            if related is not None:
+                await sync_to_async(self._guard_selected_related_reads)(rows, related)
+
+        async for item in iterable:
+            chunk.append(item)
+            if len(chunk) >= chunk_size:
+                await finish(chunk)
+                for row in chunk:
+                    yield row
+                chunk = []
+        if chunk:
+            await finish(chunk)
+            for row in chunk:
+                yield row
 
     # ----- Counts / existence respect scope too -----
 

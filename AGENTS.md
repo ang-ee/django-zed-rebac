@@ -538,7 +538,8 @@ creation refuses any other queryset and `rebac.E023` reports one that filters.
 Don't weaken either check to admit a consumer's manager.
 A related manager built from a pinned `RebacMixin` instance scopes its fresh
 queryset to that actor, including plain `prefetch_related("rel")` during
-evaluation after the root instances are stamped. Caller-supplied `Prefetch`
+evaluation and in each `iterator()` / `aiterator()` chunk, after the root
+instances are stamped. Caller-supplied `Prefetch`
 querysets keep their own actor resolution; use an explicit
 `Prefetch(queryset=...)` to fix their scope.
 Django's shared database-router `instance` hint never carries authority.
