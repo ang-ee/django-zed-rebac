@@ -235,6 +235,19 @@ def emit(
         _write_now(_write)
 
 
+def emit_bypass(reason: str, *, actor: SubjectRef | None) -> None:
+    """Write a bypass event now, where the bypass takes effect."""
+    from .models import PermissionAuditEvent
+
+    emit(
+        PermissionAuditEvent.KIND_SUDO_BYPASS,
+        actor=actor,
+        origin=actor,
+        reason=reason,
+        defer_to_commit=False,
+    )
+
+
 async def aemit(
     kind: str,
     *,
@@ -288,6 +301,19 @@ async def aemit(
     from .models import PermissionAuditEvent
 
     await PermissionAuditEvent.objects.acreate(**kwargs)
+
+
+async def aemit_bypass(reason: str, *, actor: SubjectRef | None) -> None:
+    """Async bypass emission with the row shape of :func:`emit_bypass`."""
+    from .models import PermissionAuditEvent
+
+    await aemit(
+        PermissionAuditEvent.KIND_SUDO_BYPASS,
+        actor=actor,
+        origin=actor,
+        reason=reason,
+        defer_to_commit=False,
+    )
 
 
 def _write_now(write_callable: Callable[[], None]) -> None:

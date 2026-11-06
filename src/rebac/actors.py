@@ -18,13 +18,14 @@ from collections.abc import AsyncIterator, Callable, Iterator
 from contextlib import asynccontextmanager, contextmanager
 from contextvars import ContextVar
 from importlib import import_module
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, Literal
 
 from django.contrib.auth import get_user_model
 
 from ._id import subject_id_attr, subject_relation, type_with_prefix
 from .conf import app_settings
 from .errors import (
+    MissingActorError,
     NoActorResolvedError,
     SudoNotAllowedError,
     SudoReasonRequiredError,
@@ -117,6 +118,52 @@ def is_sudo() -> bool:
 def current_sudo_reason() -> str | None:
     state = _sudo_state.get()
     return None if state is None else state.get("reason")
+
+
+def resolve(
+    *,
+    pinned_actor: SubjectRef | None = None,
+    pinned_sudo: bool | None = None,
+    mode: Literal["row", "relation", "ambient"],
+    strict: bool,
+    subject_label: str,
+    fail_closed: bool = False,
+) -> tuple[SubjectRef | None, bool]:
+    """Resolve local and ambient authority as ``(actor, bypass)``, auditing nothing.
+
+    Row mode honors both pins. Relation mode keeps a carrying actor but ignores
+    a sudo pin; ambient mode ignores both pins. Every mode then takes ambient
+    sudo, then the ambient actor. With neither, ``fail_closed`` answers
+    ``(None, False)``; otherwise strict mode raises for a strict call and
+    answers ``(None, False)`` for an observer, and non-strict mode falls
+    through unscoped.
+    """
+    if mode == "row" and pinned_sudo:
+        return None, True
+    if mode != "ambient" and pinned_actor is not None:
+        return pinned_actor, False
+    if is_sudo():
+        return None, True
+    actor = current_actor()
+    if actor is not None:
+        return actor, False
+    if fail_closed:
+        return None, False
+    if strict and app_settings.REBAC_STRICT_MODE:
+        raise MissingActorError(
+            f"{subject_label} requires an actor. Bind an actor or use sudo(reason='...')."
+        )
+    if app_settings.REBAC_STRICT_MODE:
+        return None, False
+    return None, True
+
+
+def require_sudo_allowed(reason: str | None, *, allow_when_disabled: bool = False) -> None:
+    """Validate a public bypass before its state changes."""
+    if not allow_when_disabled and not app_settings.REBAC_ALLOW_SUDO:
+        raise SudoNotAllowedError("sudo() denied: REBAC_ALLOW_SUDO is False")
+    if app_settings.REBAC_REQUIRE_SUDO_REASON and not reason:
+        raise SudoReasonRequiredError("sudo() requires reason= when REBAC_REQUIRE_SUDO_REASON=True")
 
 
 # ---------- Subject conversion ----------
@@ -382,8 +429,10 @@ def _bypass_unaudited(reason: str) -> Iterator[None]:
         _sudo_state.reset(token)
 
 
-def _install_sudo_state(reason: str | None) -> tuple[Any, dict[str, Any], SubjectRef | None]:
-    """Reason-check + install the sudo ContextVar slot.
+def _install_sudo_state(
+    reason: str | None, *, allow_when_disabled: bool
+) -> tuple[Any, dict[str, Any], SubjectRef | None]:
+    """Validate once and install the sudo ContextVar slot.
 
     Shared between :func:`_sudo_state_context` and
     :func:`_asudo_state_context`. Returns the reset token, the state
@@ -393,32 +442,26 @@ def _install_sudo_state(reason: str | None) -> tuple[Any, dict[str, Any], Subjec
     impersonation chain plumbed yet); see audit.emit for the
     column-level TODO.
     """
-    if app_settings.REBAC_REQUIRE_SUDO_REASON and not reason:
-        raise SudoReasonRequiredError(
-            "sudo() requires a `reason=...` argument when REBAC_REQUIRE_SUDO_REASON is True"
-        )
+    require_sudo_allowed(reason, allow_when_disabled=allow_when_disabled)
     state = {"reason": reason or ""}
     token = _sudo_state.set(state)
     return token, state, _current_actor.get()
 
 
 @contextmanager
-def _sudo_state_context(*, reason: str | None = None) -> Iterator[None]:
+def _sudo_state_context(
+    *, reason: str | None = None, allow_when_disabled: bool = False
+) -> Iterator[None]:
     """Install the ambient bypass state and emit the mandatory audit row."""
-    token, state, bypass_actor = _install_sudo_state(reason)
+    token, state, bypass_actor = _install_sudo_state(
+        reason, allow_when_disabled=allow_when_disabled
+    )
     try:
-        from .audit import emit as _emit_audit
-        from .models import PermissionAuditEvent
+        from .audit import emit_bypass
 
         # Write now so callers inside the block can inspect the audit row.
         # Durability still follows the enclosing transaction.
-        _emit_audit(
-            PermissionAuditEvent.KIND_SUDO_BYPASS,
-            actor=bypass_actor,
-            origin=bypass_actor,
-            reason=state["reason"],
-            defer_to_commit=False,
-        )
+        emit_bypass(state["reason"], actor=bypass_actor)
         yield
     finally:
         _sudo_state.reset(token)
@@ -433,14 +476,14 @@ def sudo(*, reason: str | None = None) -> Iterator[None]:
     Async callers should prefer :func:`asudo`, which awaits the audit
     write on the event loop rather than hopping to a worker thread.
     """
-    if not app_settings.REBAC_ALLOW_SUDO:
-        raise SudoNotAllowedError("sudo() denied: REBAC_ALLOW_SUDO is False")
     with _sudo_state_context(reason=reason):
         yield
 
 
 @asynccontextmanager
-async def _asudo_state_context(*, reason: str | None = None) -> AsyncIterator[None]:
+async def _asudo_state_context(
+    *, reason: str | None = None, allow_when_disabled: bool = False
+) -> AsyncIterator[None]:
     """Async mirror of :func:`_sudo_state_context`.
 
     Sets the same ContextVar slot and emits the same audit row, but
@@ -448,18 +491,13 @@ async def _asudo_state_context(*, reason: str | None = None) -> AsyncIterator[No
     instead of through the sync ``Model.objects.create`` /
     worker-thread fallback in :func:`_sudo_state_context`.
     """
-    token, state, bypass_actor = _install_sudo_state(reason)
+    token, state, bypass_actor = _install_sudo_state(
+        reason, allow_when_disabled=allow_when_disabled
+    )
     try:
-        from .audit import aemit as _aemit_audit
-        from .models import PermissionAuditEvent
+        from .audit import aemit_bypass
 
-        await _aemit_audit(
-            PermissionAuditEvent.KIND_SUDO_BYPASS,
-            actor=bypass_actor,
-            origin=bypass_actor,
-            reason=state["reason"],
-            defer_to_commit=False,
-        )
+        await aemit_bypass(state["reason"], actor=bypass_actor)
         yield
     finally:
         _sudo_state.reset(token)
@@ -473,8 +511,6 @@ async def asudo(*, reason: str | None = None) -> AsyncIterator[None]:
     emits a ``KIND_SUDO_BYPASS`` audit row — but awaits the audit
     write so it never crosses the sync/async boundary.
     """
-    if not app_settings.REBAC_ALLOW_SUDO:
-        raise SudoNotAllowedError("sudo() denied: REBAC_ALLOW_SUDO is False")
     async with _asudo_state_context(reason=reason):
         yield
 
@@ -487,14 +523,14 @@ def system_context(*, reason: str | None = None) -> Iterator[None]:
     still need a fully audited bypass even when deployments disable raw
     request-path `sudo()`.
     """
-    with _sudo_state_context(reason=reason):
+    with _sudo_state_context(reason=reason, allow_when_disabled=True):
         yield
 
 
 @asynccontextmanager
 async def asystem_context(*, reason: str | None = None) -> AsyncIterator[None]:
     """Async :func:`system_context`. Same audit guarantees, on the loop."""
-    async with _asudo_state_context(reason=reason):
+    async with _asudo_state_context(reason=reason, allow_when_disabled=True):
         yield
 
 

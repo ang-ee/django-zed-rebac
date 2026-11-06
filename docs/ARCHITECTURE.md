@@ -1178,7 +1178,7 @@ All settings prefixed `REBAC_`. No nested dict. Read via the public `app_setting
 | `REBAC_RESOURCE_ID_ATTR` | `"pk"` | `str` | Attribute read as a resource's identity when a model sets no `Meta.rebac_id_attr`; consumers with public ids (sqid, slug) flip it globally. |
 | `REBAC_USER_ID_ATTR` | `"pk"` | `str` | The same for the actor side of `to_subject_ref()` on `User` / `Group` instances; `Meta.rebac_id_attr` still wins. |
 | `REBAC_AUDIT_DENIALS` | `False` | `bool` | Also write a `PermissionAuditEvent` row per denied check. Off by default: denial traffic (an attacker fuzzing ids) can dominate the table. |
-| `REBAC_LINT_BARE_PREFETCH` | `True` | `bool` | Toggle for `rebac.W003` — the structural warning that an RBAC-bound model has an FK / O2O / M2M to another RBAC-bound model (a bare-string `select_related` / `prefetch_related` can load unguarded related rows). Enabled by default so the risky shape is visible; use `rebac_select_related()` / `rebac_prefetch_related()` or the Strawberry-Django optimizer for protected paths. |
+| `REBAC_LINT_BARE_PREFETCH` | `True` | `bool` | Toggle for `rebac.W003` — the structural warning that an RBAC-bound model has an FK / O2O / M2M to another RBAC-bound model. A bare-string `select_related` can load unguarded joined rows; a bare-string `prefetch_related` follows the related manager's source pin, or ambient/non-strict scope when no pin exists. Enabled by default so the risky shape is visible; use `rebac_select_related()` / `rebac_prefetch_related()` or the Strawberry-Django optimizer for protected paths. |
 | `REBAC_EVALUATOR_CACHE_SIZE` | `10000` | `int` | Max entries across the per-scope evaluator's check and accessible caches (least recently used dropped first). |
 | `REBAC_ZOOKIE_TRANSPORT` | `"none"` | `"none"` \| `"header"` \| `"session"` | Optional cross-request transport for the current Zookie. |
 | `REBAC_ZOOKIE_HEADER_NAME` | `"X-Rebac-Zookie"` | `str` | Header name used when `REBAC_ZOOKIE_TRANSPORT = "header"`. |
@@ -2419,7 +2419,7 @@ instead of falling back to ambient scope. Ambient sudo bypass applies only when
 the decorator has no `actor_arg`. Named actor and resource arguments must be
 declared parameters of the callable.
 
-**Sudo does NOT propagate through relationship traversal.** This is the single largest deliberate divergence from Odoo's `env.su` semantics. In Odoo, `record.sudo().lines.user_id` reads BOTH `lines` AND `user_id` in sudo because the `env` propagates. We don't do that — see [§ Lessons from Odoo 19 — footguns we avoid](#lessons-from-odoo-19--footguns-we-avoid).
+**An instance or queryset sudo pin does NOT propagate through relationship traversal.** A related read keeps a pinned actor when present; otherwise it observes ambient `sudo()` / `system_context()` just like another read in that block. In Odoo, `record.sudo().lines.user_id` carries the record's sudo pin through every traversal. We don't do that — see [§ Lessons from Odoo 19 — footguns we avoid](#lessons-from-odoo-19--footguns-we-avoid).
 
 ### Three actor-resolution paths
 
@@ -2431,13 +2431,18 @@ non-strict no-actor fallthrough. In default observer mode a strict no-actor
 state returns `(None, False)` rather than raising; materialisation and write
 gates call the strict path and raise `MissingActorError`.
 
+`rebac.actors.resolve()` owns the shared precedence and strict-mode error for
+row, relation, and ambient operations. Querysets handle aggregate fail-closed
+and bypass-audit timing; instances handle insertion scope and emit their own
+lazy bypass audit after resolving an explicit instance sudo.
+
 Resolution order:
 
 1. **Per-queryset or per-instance sudo**, set via `.sudo(reason=...)`. Bypasses scoping; logs a structured audit event.
-2. **Per-queryset or per-instance actor**, set via `.with_actor(actor)` / `.as_user(user)` / `.as_agent(agent, on_behalf_of=u)`. Stored on the queryset or instance — not on a ContextVar — so it survives chaining and DOESN'T leak across queryset boundaries.
+2. **Per-queryset or per-instance actor**, set via `.with_actor(actor)` / `.as_user(user)` / `.as_agent(agent, on_behalf_of=u)`. Stored on the queryset or instance — not on a ContextVar — so it survives chaining and DOESN'T leak across queryset boundaries. A related manager transfers its source instance's pin to its own fresh queryset after an explicit queryset pin.
 3. **Ambient sudo**, set by `with sudo(...)` / `with system_context(...)`, only when no explicit actor is pinned.
 4. **Implicit from `current_actor()`**, the contextvar populated by middleware (see [§ Middleware](#middleware)) or explicit task actor scopes.
-5. **Falls through to** `REBAC_STRICT_MODE` handling: `True` → raise for gates/materialisation; `False` → full visibility.
+5. **Falls through to** `REBAC_STRICT_MODE` handling: `True` → raise for gates/materialisation; `False` → full visibility for ordinary row scope. Eager aggregate scopes and guarded `rebac_select_related()` reads fail closed without an actor in both strict modes. Ambient sudo still bypasses those reads.
 
 A pinned actor (path 2) **always wins** over ambient state (paths 3-4) — there is no path by which ambient sudo or the ambient actor ContextVar can override an explicit `.with_actor(...)`. This is the inverse of Odoo's `allowed_company_ids` ambient-scope precedence; we want the explicit local scope to be the authoritative one. If code truly wants bypass inside an elevated block, it must call `.sudo(reason=...)` on that queryset or instance.
 
@@ -2480,7 +2485,27 @@ related-manager call from a multi-table child of the declaring model, are
 not gated (proposal 0013). Through gates use the changed FK pairs and
 their source rows rather than the whole through table.
 The carrying actor wins over ambient context; instance sudo does not propagate
-to the related manager. Without an actor, strict mode raises `MissingActorError`
+to the related manager. Related-manager querysets read through the source
+instance's actor pin, including the current-member read in M2M
+`set(clear=False)`. The related manager transfers that pin only while building
+its own fresh queryset; Django's shared database-router `instance` hint never
+grants authority to a caller-owned or reused queryset. Root instances are
+stamped before Django prefetches during queryset `_fetch_all` evaluation, so a
+cached related manager has the same carrying actor on that path. Without that pin, related-manager
+reads resolve ambient authority in relation mode; in non-strict mode, no actor
+falls through to full visibility, as ordinary root reads and backed M2M writes
+do. A block-scoped sudo bypass does apply when no actor is pinned, including
+`rebac_prefetch_related()` and guarded `rebac_select_related()`.
+`rebac_prefetch_related()` scopes protected lookups to the root's pinned actor.
+A later `with_actor()` call rebinds querysets that inherited that root actor.
+An unpinned caller-supplied `Prefetch` queryset in plain
+`prefetch_related()` keeps its own scope: its ambient actor or sudo block is
+resolved when it runs, and reusing it never inherits the root's pin. Explicit
+actors on caller-supplied `Prefetch` querysets remain authoritative. Protected
+`rebac_select_related()` reads and projections with no actor and no sudo fail
+closed even when `REBAC_STRICT_MODE=False`: instance loading raises
+`MissingActorError`, and a related-field projection raises `PermissionDenied`.
+Without an actor, strict mode raises `MissingActorError`
 only if an affected resource type declares `write`. An unwatched through table
 without a REBAC owner needs no backed-edge gate. Signal-free `bulk_create`, `update`,
 `bulk_update`, and tracked deletes apply the same backed-column gate.
@@ -2517,7 +2542,7 @@ traversed, so literal SQL placed there reaches the write; also pinned for
 proposal 0013.
 
 `QuerySet.explain()` applies the same actor scope as the query it describes.
-`RebacManager.raw()` and `RebacQuerySet.raw()` cannot attach a REBAC scope to arbitrary SQL and therefore
+`RebacQuerySet.raw()` (also exposed on its manager by Django) cannot attach a REBAC scope to arbitrary SQL and therefore
 requires ambient sudo or `system_context`; it raises in ordinary actor scope
 and raises `MissingActorError` without an actor in strict mode. Explicit queryset
 sudo on `raw()` emits one bypass audit row; an ambient sudo block emits its row
@@ -2597,7 +2622,8 @@ With field redaction enabled, annotations, aliases, and aggregates that read a
 protected column raise `PermissionDenied`: scalar SQL results cannot carry
 instance-level redaction. The same guard rejects projections of protected
 `rebac_select_related()` paths, even through aliases or an explicitly sudoed
-root. `.for_write()` retains its explicit bypass of root field redaction.
+root without ambient sudo. An ambient sudo block permits these projections
+when no actor is pinned. `.for_write()` retains its explicit bypass of root field redaction.
 The guard reads what a query selects: its columns and its computed values.
 A column is protected by the model it is read from, so a projection is
 refused for a protected field of the queryset's own model and for one of a
@@ -3300,7 +3326,7 @@ Odoo 19's `ir.rule` / `ir.model.access` / `env.su` / `with_user` system covers m
 
 **Odoo behaviour:** `record.sudo().lines.user_id` reads `record`, AND its `lines`, AND each line's `user_id` in sudo, because the `env` propagates across every recordset traversal. Once a developer writes `.sudo()` anywhere, every related read in the same chain bypasses checks. This is the canonical source of "I only sudoed for one thing" privilege-escalation bugs in mature Odoo deployments.
 
-**Our behaviour:** `instance.sudo(reason=...)` flips the bypass flag for *this instance only*. Any FK accessor, reverse-FK manager, M2M traversal, or chained queryset on it re-resolves the actor against the carrying scope (`current_actor()`, or the queryset's pinned actor) — it does NOT inherit the sudo flag. If you genuinely need related rows under sudo, call `.sudo(reason="...")` explicitly on the inner queryset; the audit log records every bypass independently.
+**Our behaviour:** `instance.sudo(reason=...)` flips the bypass flag for *this instance only*. Any FK accessor, reverse-FK manager, M2M traversal, or chained queryset on it re-resolves the actor against the carrying scope (`current_actor()`, or the queryset's pinned actor) — it does NOT inherit the sudo flag. An ambient `with sudo(reason="..."):` block does cover related reads without a pinned actor. Otherwise, call `.sudo(reason="...")` explicitly on the inner queryset; the audit log records each bypass independently.
 
 **Why:** transitive sudo is a contagion. Cutting it at every relationship boundary forces each bypass to be greppable, auditable, and intentional. The cost is verbosity; the win is "no surprise sudo".
 

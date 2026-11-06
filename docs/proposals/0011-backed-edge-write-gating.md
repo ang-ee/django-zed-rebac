@@ -66,7 +66,8 @@ the Django API that produced the write:
 - The acting subject is resolved once per write, in the documented order:
   pinned actor on the queryset or instance, then ambient sudo, then
   `current_actor()`, then strict-mode failure. Instance sudo does not reach
-  the gate (5a). A pinned actor outranks a block sudo (5).
+  the gate (5a). A pinned actor outranks a block sudo (5); without that pin,
+  ambient sudo bypasses the relation gate.
 - The row being moved is itself a resource whose edges change, so it is in the
   affected set and is checked like any other.
 - Deletes are writes whose edge changes are removals. The collector's

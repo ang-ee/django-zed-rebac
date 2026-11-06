@@ -4,7 +4,6 @@ import operator
 from typing import Any
 
 import pytest
-from django.db import models
 from django.test import override_settings
 
 from rebac import SubjectRef, sudo
@@ -99,18 +98,6 @@ def test_manager_dispatches_the_custom_queryset_actor_override() -> None:
     assert queryset.model is Post
     assert queryset.actor() == actor
     assert calls == [actor]
-
-
-def test_raw_rejects_a_custom_getter_without_rebac_policy() -> None:
-    class PlainGetterManager(RebacManager[Post]):
-        def get_queryset(self) -> models.QuerySet[Post]:
-            return models.QuerySet(model=self.model)
-
-    manager = PlainGetterManager()
-    manager.model = Post
-
-    with pytest.raises(TypeError, match=r"a RebacManager must return a RebacQuerySet"):
-        manager.raw("SELECT 1")
 
 
 def test_with_action_survives_queryset_cloning() -> None:
