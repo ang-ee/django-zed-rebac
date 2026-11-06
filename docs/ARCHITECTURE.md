@@ -1131,10 +1131,12 @@ Written by every Tier 2 / Tier 3 mutation and every effective public bypass.
 Queryset bypasses are audited at first evaluation or write, instance bypasses
 at the first check or write, and block bypasses at entry, once per bypass.
 A bypass queryset embedded in an expression (`Exists`, `Subquery`, a
-`pk__in=` lookup) is audited when the statement it was resolved into is
-compiled for execution, once per execution; building the expression runs no
-query and writes no row, so an annotation built at import time does not touch
-the database during app initialisation.
+`pk__in=` lookup) is audited once per entry and reason when its enclosing
+statement executes. Building the expression runs no query and writes no row,
+so an annotation built at import time does not touch the database during app
+initialisation. See [Bypass audit granularity](#with_actor-vs-sudo--distinct-verbs)
+for compilation, failed statements, and Django query classes without an
+execution hook.
 Engine-internal captures use a private non-audited path. An audit row is durable
 only when its enclosing transaction commits. Append-only.
 
@@ -2368,6 +2370,30 @@ context before materializing or mutating it.
 - `sudo(reason=...)` — request-path bypass of all REBAC checks. `current_actor()` still returns the originating subject; only `is_sudo()` flips. Mirrors Odoo's `env.su` / `env.user` independence. Mandatory `reason`. Every public bypass is audited at first use: block at entry, queryset at evaluation or write, instance at check or write. Rows follow the enclosing transaction's commit or rollback. **Gated by `REBAC_ALLOW_SUDO`** — strict tenants disable it.
 - `instance.unsudo()` — clears only a per-instance sudo pin and returns the instance. It does not bind an actor; use `with_actor(actor)` when the intent is to leave sudo under a concrete subject.
 - `system_context(reason=...)` — same bypass semantics as `sudo()` (same block-scoped audit kind, same reason requirement, same non-propagation through traversal), but intended for framework-owned jobs running outside a request: migrations, fixture seeders, asset loaders, scheduled maintenance. **Not gated by `REBAC_ALLOW_SUDO`** — a tenant who has disabled request-path sudo still needs to run migrations. Choose `sudo()` for request-path elevation (admin views, override layer); choose `system_context()` for framework jobs.
+
+**Bypass audit granularity.** A block-scoped `sudo()` or `system_context()`
+emits one `KIND_SUDO_BYPASS` row at each entry. An explicit queryset bypass
+emits one row when it first takes effect (eager scope application, direct
+evaluation or write). When a bypass queryset is embedded in another
+statement, each execution audits every distinct `(entry, reason)` pair it
+renders, even if that pair appears in several filters, annotations or `Exists`
+expressions. A count followed by a list read audits the embedded entry twice.
+Nested entries retain separate events even when their reasons match.
+
+A statement whose Query class REBAC owns (a REBAC or tracked queryset's query,
+including a base manager's, a plain Django `Query` that received a REBAC
+subquery, the `UpdateQuery` of an `update()` and the key pre-select an UPDATE
+runs as a statement of its own) collects the embedded entries while it executes
+and writes their rows only after it succeeds. Rendering its SQL alone (`str(queryset.query)`)
+writes nothing; neither does a statement optimized to `EmptyResultSet` or one
+that fails. A statement of a Query class REBAC does not own (an `InsertQuery`
+carrying an expression value, the `DeleteQuery` of a collector fast delete, a
+third-party class), and a plain Django queryset's statement whose REBAC
+subquery Django resolves only while compiling it (an `ORDER BY` expression),
+has no execution to observe: its embedded bypass is audited
+when it renders, so an elevated read never runs without a row, at the cost of
+a row for a render that is not executed. Events record the reason and current
+actor when written and follow the transaction's commit or rollback.
 
 What `sudo()` does NOT bypass:
 - App-layer `clean()` validators.

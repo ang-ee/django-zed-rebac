@@ -16,12 +16,15 @@ from __future__ import annotations
 import re
 from collections import Counter
 from collections.abc import AsyncIterator, Collection, Iterable, Iterator
+from contextvars import ContextVar
+from enum import Enum, auto
 from typing import TYPE_CHECKING, Any, Self, TypeVar, cast, overload
 
 from asgiref.sync import sync_to_async
 from django.db import connections, models
 from django.db.models.expressions import Col, RawSQL
 from django.db.models.sql import Query
+from django.db.models.sql.subqueries import UpdateQuery
 from django.db.models.sql.where import ExtraWhere, NothingNode, WhereNode
 
 from ._id import resource_id_attr
@@ -52,7 +55,130 @@ class _ScopeWhere(WhereNode):
     """A removable authorization restriction, separate from caller predicates."""
 
 
-class _RebacQuery(Query):
+class _CompileOnly(Enum):
+    ACTIVE = auto()
+
+
+# While a statement executes: the embedded bypasses its rendering used, keyed by
+# bypass entry and reason. ``_CompileOnly`` while a top-level statement is only
+# rendered (``str(query)``), which audits nothing.
+_executing_bypass_audits: ContextVar[dict[tuple[object, str], None] | _CompileOnly | None] = (
+    ContextVar("rebac_executing_bypass_audits", default=None)
+)
+
+
+def _emit_executed_bypasses(reasons: dict[tuple[object, str], None]) -> None:
+    for _entry, reason in reasons:
+        _emit_bypass_audit(reason)
+
+
+class _BypassAuditCompilerMixin:
+    """Observe the final compiler's methods, including a later CTE mixin's."""
+
+    _rebac_audit_top_level: bool
+    _rebac_audit_rendered_sql: bool
+
+    def __getattribute__(self, name: str) -> Any:
+        method = super().__getattribute__(name)
+        if name == "as_sql":
+
+            def audited_as_sql(*args: Any, **kwargs: Any) -> Any:
+                compile_only = (
+                    self._rebac_audit_top_level and _executing_bypass_audits.get() is None
+                )
+                marker = _executing_bypass_audits.set(_CompileOnly.ACTIVE) if compile_only else None
+                try:
+                    sql = method(*args, **kwargs)
+                    self._rebac_audit_rendered_sql = bool(sql[0])
+                    return sql
+                finally:
+                    if marker is not None:
+                        _executing_bypass_audits.reset(marker)
+
+            return audited_as_sql
+        if name == "execute_sql":
+
+            def audited_execute_sql(*args: Any, **kwargs: Any) -> Any:
+                self._rebac_audit_rendered_sql = False
+                reasons: dict[tuple[object, str], None] = {}
+                token = _executing_bypass_audits.set(reasons)
+                try:
+                    result = method(*args, **kwargs)
+                finally:
+                    _executing_bypass_audits.reset(token)
+                if self._rebac_audit_rendered_sql:
+                    _emit_executed_bypasses(reasons)
+                return result
+
+            return audited_execute_sql
+        return method
+
+
+_audit_compiler_types: dict[type[Any], type[Any]] = {}
+
+
+class _BypassAuditQuery(Query):
+    """Collect embedded bypasses while the statement renders; audit them once it executes."""
+
+    def chain(self, klass: Any = None) -> Any:
+        chained = super().chain(klass)
+        if klass is UpdateQuery:
+            # QuerySet.update() switches its Query to UpdateQuery before the
+            # write executes. Keep the audit hook on that compiled statement.
+            chained.__class__ = _BypassAuditUpdateQuery
+        elif klass is Query:
+            # An UPDATE's pre-select of its keys is a statement of its own: it
+            # audits what it executed even when the UPDATE then finds no row.
+            chained.__class__ = _BypassAuditQuery
+        return chained
+
+    def get_compiler(self, *args: Any, **kwargs: Any) -> Any:
+        compiler = super().get_compiler(*args, **kwargs)
+        if not isinstance(compiler, _BypassAuditCompilerMixin):
+            base = type(compiler)
+            mixed = _audit_compiler_types.get(base)
+            if mixed is None:
+                mixed = type(
+                    f"RebacAudit{base.__name__}",
+                    (_BypassAuditCompilerMixin, base),
+                    {"__slots__": ()},
+                )
+                _audit_compiler_types[base] = mixed
+            compiler.__class__ = mixed
+        # Query.as_sql() creates a compiler with connection= for a subquery.
+        # Only a top-level render marks a compile without execution.
+        compiler._rebac_audit_top_level = (
+            bool(args and args[0] is not None) or kwargs.get("using") is not None
+        )
+        compiler._rebac_audit_rendered_sql = False
+        return compiler
+
+    def get_aggregation(self, using: str, aggregate_exprs: Any) -> Any:
+        # Django can wrap a sliced or distinct COUNT in a plain AggregateQuery,
+        # whose compiler does not inherit this query's execution hook.
+        reasons: dict[tuple[object, str], None] = {}
+        token = _executing_bypass_audits.set(reasons)
+        try:
+            result = super().get_aggregation(using, aggregate_exprs)
+        finally:
+            _executing_bypass_audits.reset(token)
+        _emit_executed_bypasses(reasons)
+        return result
+
+
+class _BypassAuditUpdateQuery(_BypassAuditQuery, UpdateQuery):
+    """UpdateQuery with the embedded-bypass execution hook."""
+
+
+def _audit_query_when_executed(query: Any) -> None:
+    # A plain Django queryset can hold a REBAC subquery. Its Query must own the
+    # same execution hook; changing this one Query instance's class keeps
+    # Django's clone semantics and the queryset's public type.
+    if type(query) is Query:
+        query.__class__ = _BypassAuditQuery
+
+
+class _RebacQuery(_BypassAuditQuery):
     """Cover expressions which copy QuerySet.query without resolving the QS."""
 
     _rebac_state: dict[str, Any]
@@ -60,9 +186,10 @@ class _RebacQuery(Query):
     # querysets. They inherit the combination's policy, not a separate actor.
     _rebac_boolean_operand = False
 
-    # The bypass reason of an embedded queryset, audited when the statement it
-    # was resolved into is compiled for execution, never when it is built.
-    _rebac_pending_bypass_audit: str | None = None
+    # The bypass entry and reason of an embedded queryset. Clones of one entry
+    # share its identity, so a statement that uses it in several expressions
+    # audits it once, after it executes.
+    _rebac_pending_bypass_audit: tuple[object, str] | None = None
 
     # Django constructs a query of this class itself only as a piece of the
     # statement it is building: the NOT EXISTS of an exclude() across a to-many
@@ -80,10 +207,19 @@ class _RebacQuery(Query):
         # Compiled before the statement that holds it was checked (its
         # queryset is not a rebac one, or no check ran): checked now.
         _check_subquery(self)
-        reason = self._rebac_pending_bypass_audit
-        if reason is not None:
-            _emit_bypass_audit(reason)
-        return super().as_sql(compiler, connection)
+        sql = super().as_sql(compiler, connection)
+        pending = self._rebac_pending_bypass_audit
+        state = _executing_bypass_audits.get()
+        if pending is not None:
+            if isinstance(state, dict):
+                state.setdefault(pending, None)
+            elif state is None:
+                # A statement whose Query class REBAC does not own (Django's
+                # DeleteQuery or InsertQuery, a third-party class) has no
+                # execution hook: it audits when rendered, so an elevated read
+                # never runs without an audit row.
+                _emit_bypass_audit(pending[1])
+        return sql
 
     # A resolved actor-scoped subquery carries what checking it needs, and
     # is checked once: with the statement that holds it, when that statement
@@ -106,7 +242,6 @@ class _RebacQuery(Query):
         )
         for name, value in state.items():
             setattr(queryset, name, value)
-        applied_here = not queryset._rebac_scope_applied
         # Building an expression runs no query, so it must write no audit row
         # (annotations are built at import time, during app initialisation).
         queryset._apply_scope_in_place(audit=False)
@@ -114,7 +249,8 @@ class _RebacQuery(Query):
         # evaluated under actor_context() may be embedded after it has closed.
         decision = queryset._rebac_scope_decision
         actor, bypass = decision if decision is not None else queryset.effective_actor(strict=True)
-        pending = queryset._bypass_audit_reason() if applied_here and bypass else None
+        reason = queryset._bypass_audit_reason() if bypass else None
+        pending = (queryset._rebac_bypass_entry, reason) if reason is not None else None
 
         # A set combination has one actor policy, owned by its root queryset.
         # _scope_query already applied it to each operand (or the root bypass
@@ -146,6 +282,7 @@ class _RebacQuery(Query):
             resolved._rebac_check = (queryset, actor)
         if pending is not None:
             resolved._rebac_pending_bypass_audit = pending
+            _audit_query_when_executed(args[0] if args else kwargs.get("query"))
         return resolved
 
 
@@ -608,6 +745,7 @@ class RebacQuerySet(models.QuerySet[_M]):
     _rebac_actor: SubjectRef | None
     _rebac_action: str | None
     _rebac_sudo_reason: str | None
+    _rebac_bypass_entry: object
     _rebac_field_deny: FieldDenyMode | None
     _rebac_select_related_guards: tuple[str, ...]
 
@@ -619,6 +757,7 @@ class RebacQuerySet(models.QuerySet[_M]):
         self._rebac_action = None
         self._rebac_sudo_reason = None
         self._rebac_sudo_audited = False
+        self._rebac_bypass_entry = object()
         self._rebac_internal_bypass = False
         self._rebac_ambient_bypass = False
         self._rebac_field_deny = None
@@ -637,6 +776,7 @@ class RebacQuerySet(models.QuerySet[_M]):
         state["_rebac_actor"] = None
         state["_rebac_sudo_reason"] = None
         state["_rebac_sudo_audited"] = False
+        state["_rebac_bypass_entry"] = object()
         state["_rebac_internal_bypass"] = False
         state["_rebac_ambient_bypass"] = False
         state["_rebac_scope_applied"] = False
@@ -651,7 +791,7 @@ class RebacQuerySet(models.QuerySet[_M]):
             query._rebac_state = {
                 name: value
                 for name, value in getattr(query, "_rebac_state", {}).items()
-                if name not in {"_rebac_actor", "_rebac_sudo_reason"}
+                if name not in {"_rebac_actor", "_rebac_sudo_reason", "_rebac_bypass_entry"}
             }
             state["_query"] = query
         return state
@@ -696,15 +836,16 @@ class RebacQuerySet(models.QuerySet[_M]):
             # operand's actor. Its own actor, bypass and audit do not apply,
             # and an operand without an actor is not an error here.
             return cast(Query, super(RebacQuerySet, clone).resolve_expression(*args, **kwargs))
-        # Resolution builds an expression; the bypass is exercised, and
-        # audited, when the statement it lands in is compiled for execution.
-        # The query's own resolution checks what it selects, filters and
-        # orders on.
+        # Resolution builds an expression; the bypass is audited only when
+        # the enclosing statement executes. The query's own resolution checks
+        # what it selects, filters and orders on.
         clone._apply_scope_in_place(audit=False)
-        pending = clone._bypass_audit_reason()
+        reason = clone._bypass_audit_reason()
+        pending = (clone._rebac_bypass_entry, reason) if reason is not None else None
         resolved = cast(Query, super(RebacQuerySet, clone).resolve_expression(*args, **kwargs))
         if pending is not None and isinstance(resolved, _RebacQuery):
             resolved._rebac_pending_bypass_audit = pending
+            _audit_query_when_executed(args[0] if args else kwargs.get("query"))
         return resolved
 
     def explain(self, *, format: str | None = None, **options: Any) -> str:
@@ -725,6 +866,7 @@ class RebacQuerySet(models.QuerySet[_M]):
         clone._rebac_actor = ref
         clone._rebac_sudo_reason = None
         clone._rebac_sudo_audited = False
+        clone._rebac_bypass_entry = object()
         clone._rebac_internal_bypass = False
         clone._rebac_ambient_bypass = False
         clone._refresh_scope()
@@ -876,6 +1018,7 @@ class RebacQuerySet(models.QuerySet[_M]):
         clone._rebac_actor = None
         clone._rebac_sudo_reason = reason
         clone._rebac_sudo_audited = False
+        clone._rebac_bypass_entry = object()
         clone._rebac_internal_bypass = internal
         clone._rebac_ambient_bypass = False
         clone._refresh_scope()
@@ -1113,6 +1256,7 @@ class RebacQuerySet(models.QuerySet[_M]):
         clone._rebac_action = self._rebac_action
         clone._rebac_sudo_reason = self._rebac_sudo_reason
         clone._rebac_sudo_audited = self._rebac_sudo_audited
+        clone._rebac_bypass_entry = self._rebac_bypass_entry
         clone._rebac_internal_bypass = self._rebac_internal_bypass
         clone._rebac_ambient_bypass = self._rebac_ambient_bypass
         clone._rebac_field_deny = self._rebac_field_deny
@@ -2001,6 +2145,15 @@ class RebacManager[M: models.Model](_RebacManagerBase[M]):  # pyright: ignore[re
 
 class TrackedQuerySet[T: models.Model](models.QuerySet[T]):
     """Owning queryset without actor scoping, also used by both base managers."""
+
+    def __init__(self, *args: Any, **kwargs: Any) -> None:
+        super().__init__(*args, **kwargs)
+        query = self.query
+        if type(query) is Query:
+            # A REBAC subquery that Django resolves only while compiling (an
+            # ORDER BY expression) audits with this statement's execution, and
+            # rendering it alone audits nothing.
+            query.__class__ = _BypassAuditQuery
 
     def update(self, **kwargs: Any) -> int:
         from .actors import current_actor, is_sudo
