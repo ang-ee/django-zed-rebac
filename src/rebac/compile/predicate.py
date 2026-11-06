@@ -19,7 +19,7 @@ Three rules shape every statement:
 
 from __future__ import annotations
 
-from collections.abc import Collection, Iterable, Mapping, Sequence
+from collections.abc import Iterable, Mapping, Sequence
 from dataclasses import dataclass
 from datetime import datetime
 from enum import StrEnum
@@ -42,7 +42,6 @@ from ..field_backing import (
     ResolvedFieldBacking,
     _content_type,
     _resolve_field_backing,
-    foreign_key_kept,
     resolve_attribute_backing,
     resolve_const_backing,
     resolve_field_backing,
@@ -92,93 +91,8 @@ class At:
     row: bool
 
 
-# A fact about a fixed object: the actor holds ``name`` on ``type:id`` at a bound.
-type Fact = tuple[str, str, str, Bound]
-
-
-@dataclass(frozen=True, slots=True)
-class Support:
-    """The tuple that first put the actor into one stored set."""
-
-    key: Key
-    resource_id: str
-    subject_type: str
-    subject_id: str
-    subject_relation: str
-    caveat_name: str
-    caveat_key: str
-    own: bool
-
-
-@dataclass(frozen=True)
-class ActorSets:
-    """The stored sets the actor belongs to, decided before a statement.
-
-    ``keys`` are the set relations decided; a key absent from ``lower`` or
-    ``upper`` has no member set holding the actor.  ``support`` names, for
-    each member of ``lower`` in the order it was found, the tuple that put it
-    there: a statement that authorizes re-reads them (``Compiler.sets_witness``).
-    """
-
-    keys: frozenset[Key]
-    lower: Mapping[Key, frozenset[str]]
-    upper: Mapping[Key, frozenset[str]]
-    support: tuple[Support, ...]
-
-    def ids(self, key: Key, bound: Bound) -> frozenset[str]:
-        return (self.lower if bound is Bound.LOWER else self.upper).get(key, frozenset())
-
-    @property
-    def digest(self) -> tuple[Any, ...]:
-        """What of the sets shapes a statement: everything but the actor's own id."""
-
-        def listed(members: Mapping[Key, frozenset[str]]) -> tuple[Any, ...]:
-            return tuple((key, tuple(sorted(ids))) for key, ids in sorted(members.items()) if ids)
-
-        return (
-            tuple(sorted(self.keys)),
-            listed(self.lower),
-            listed(self.upper),
-            tuple(
-                (
-                    edge.key,
-                    edge.resource_id,
-                    edge.subject_type,
-                    "" if edge.own else edge.subject_id,
-                    edge.subject_relation,
-                    edge.caveat_name,
-                    edge.caveat_key,
-                    edge.own,
-                )
-                for edge in self.support
-            ),
-        )
-
-
 class CaveatVerdicts(Protocol):
     def condition_q(self, prefix: str, bound: Bound) -> Q: ...
-
-
-class DecidedRows(Protocol):
-    """Small sets of model rows on which the actor holds a node, decided before a statement."""
-
-    def rows(self, key: Key) -> tuple[Any, ...] | None:
-        """The identities of the key's model rows in its lower bound, or ``None``
-        when the set is not decided (too large, or not a set of rows)."""
-        ...
-
-
-@dataclass(frozen=True, slots=True)
-class SelfChain:
-    """A permission that recurses over a self foreign key, taken apart."""
-
-    model: type[models.Model]
-    identity: str
-    target: str
-    parent: str
-    base: Q
-    #: The parent column names its row by the identity itself.
-    keyed: bool
 
 
 # ---------- Constants and two-valued connectives ----------
@@ -315,12 +229,6 @@ class _Compiled(Expression):
             sql, params = query.as_sql(compiler, connection)
             cached = self._sql[connection.alias] = sql, tuple(params)
         return cached
-
-
-class Decided(tuple[Any, ...]):
-    """The keys of a set of rows decided before the statement."""
-
-    __slots__ = ()
 
 
 def _one_object(ref: Any) -> bool:
@@ -484,13 +392,6 @@ class Compiler:
 
     ``parametric`` compiles the actor's id as a placeholder (see ``bind``), so
     the statement depends only on the actor's shape and can be kept.
-    ``facts`` supplies decisions about fixed objects; each one used is recorded
-    in ``used_facts`` and must be witnessed by the statement that uses it.
-    ``sets`` supplies the stored sets the actor belongs to; membership in one
-    of them is then a list of ids instead of a closure over the tuple table.
-    ``rows`` supplies small sets of rows on which the actor holds a node; an
-    arrow into one of them is then a list of keys instead of a subquery, and
-    each one used is recorded in ``used_rows`` for the statement's witness.
     """
 
     def __init__(
@@ -505,9 +406,6 @@ class Compiler:
         depth_limit: int | None = None,
         program: CompileProgram | None = None,
         parametric: bool = False,
-        facts: Mapping[Fact, bool] | None = None,
-        sets: ActorSets | None = None,
-        rows: DecidedRows | None = None,
         point: PointRow | None = None,
     ) -> None:
         self.schema = tagged.schema if tagged is not None else schema
@@ -527,11 +425,6 @@ class Compiler:
         self.depth_limit = app_settings.REBAC_DEPTH_LIMIT if depth_limit is None else depth_limit
         self.program = program if program is not None else CompileProgram.build(self.schema)
         self.parametric = parametric
-        self.facts = facts
-        self.used_facts: set[Fact] = set()
-        self.sets = sets
-        self.rows = rows
-        self.used_rows: set[Key] = set()
         self.point = point
         self.shape = actor_shape(self.schema, actor, using)
         self._memo: dict[tuple[Any, ...], Q] = {}
@@ -587,8 +480,7 @@ class Compiler:
         return self._holds(key, at, bound, {}, depth_possible=True)
 
     def has_recursion(self, key: Key) -> bool:
-        decided = self.sets.keys if self.sets is not None else frozenset()
-        return bool((self.program.reachable(key) & self.program.recursive) - decided)
+        return bool(self.program.reachable(key) & self.program.recursive)
 
     def depth_unknown(self, key: Key, at: At) -> Q:
         """Whether an undecided case is undecided only because a cycle was cut.
@@ -604,17 +496,6 @@ class Compiler:
         upper_without_depth = self._holds(key, at, Bound.UPPER, {}, depth_possible=False)
         lower_without_depth = self._holds(key, at, Bound.LOWER, {}, depth_possible=False)
         return _or(_not(upper_without_depth), lower_without_depth)
-
-    def fact_q(self, fact: Fact) -> Q:
-        """The inline predicate of a fact, for deciding it and for its witness."""
-        type_, object_id, name, bound = fact
-        return self._holds(
-            (type_, name),
-            At(type_, Value(object_id), None, False),
-            bound,
-            {},
-            depth_possible=True,
-        )
 
     # ---------- Nodes ----------
 
@@ -646,8 +527,6 @@ class Compiler:
         *,
         depth_possible: bool,
     ) -> Q:
-        if self.sets is not None and key in self.sets.keys:
-            return self._set_member(key, at, bound)
         count = visits.get(key, 0)
         hops = visits.get(_HOPS, 0)
         seen_at: Key = ("#seen", f"{key[0]}#{key[1]}")
@@ -719,149 +598,6 @@ class Compiler:
 
     def _live(self, rows: Any, relation: Relation, bound: Bound) -> Any:
         return rows.filter(self._live_q(relation, bound))
-
-    # ---------- The actor's stored sets ----------
-
-    def _set_member(self, key: Key, at: At, bound: Bound) -> Q:
-        """``at`` is one of the decided sets of ``key`` that hold the actor."""
-        assert self.sets is not None
-        ids = sorted(self.sets.ids(key, bound))
-        if not ids:
-            return _FALSE
-        if at.key is not None:
-            return _or(*(self._wire_equal(at, wire_id) for wire_id in ids))
-        if isinstance(at.ref, Value):
-            return _truth(at.ref.value in ids)
-        return _not_null(at.ref) & Q(In(at.ref, ids))
-
-    def sets_step(
-        self,
-        keys: Collection[Key],
-        members: Mapping[Key, Collection[str]],
-        bound: Bound,
-        *,
-        own: Q | None = None,
-        direct: bool = True,
-    ) -> Q:
-        """The tuples that put the actor, or a set that holds it, into a set of ``keys``.
-
-        ``own`` selects the actor's id in place of this actor's: the ids of
-        several actors of this actor's shape.  Without ``direct`` only the
-        tuples that name a member set are selected, not those that name the
-        actor.
-        """
-        named = Q(subject_id=self._wire()) if own is None else own
-        step = _FALSE
-        for type_, name in sorted(keys):
-            definition = self.schema.get_definition(type_)
-            relation = (
-                next((r for r in definition.relations if r.name == name), None)
-                if definition is not None
-                else None
-            )
-            if relation is None:
-                continue
-            admitted = _FALSE
-            for allowed in relation.allowed_subjects:
-                if allowed.relation and not self._is_relation(allowed.type, allowed.relation):
-                    continue
-                itself = (
-                    direct
-                    and self.shape.type == allowed.type
-                    and self.shape.relation == allowed.relation
-                )
-                if allowed.wildcard:
-                    member = _truth(
-                        direct and self.shape.type == allowed.type and not self.shape.relation
-                    )
-                elif allowed.relation:
-                    inside = sorted(members.get((allowed.type, allowed.relation), ()))
-                    member = _or(
-                        Q(subject_id__in=inside) if inside else _FALSE,
-                        _and(_truth(itself), named),
-                    )
-                else:
-                    member = _and(
-                        _truth(itself and (not allowed.id or self.shape.named_id == allowed.id)),
-                        named,
-                    )
-                admitted = _or(admitted, _and(self._shape_q(allowed), member))
-            step = _or(
-                step,
-                _and(
-                    Q(resource_type=type_, relation=name),
-                    self._live_q(relation, bound),
-                    admitted,
-                ),
-            )
-        return step
-
-    def sets_within(self, members: Mapping[Key, Collection[str]]) -> Q:
-        """A tuple's resource is one of the member sets."""
-        return _or(
-            *(
-                Q(resource_type=type_, relation=name, resource_id__in=sorted(ids))
-                for (type_, name), ids in sorted(members.items())
-                if ids
-            )
-        )
-
-    def sets_witness(self) -> Q:
-        """The decided sets are still the actor's, in the statement's own snapshot.
-
-        Each set of the lower bound still has the tuple that put it there, so
-        no grant rests on a membership that is gone; and no tuple puts the
-        actor into a set outside the upper bound, so no exclusion misses a
-        membership that has appeared.
-        """
-        sets = self.sets
-        if sets is None or not sets.keys:
-            return _TRUE
-        tuples = self._tuples()
-        parts = []
-        for edge in sets.support:
-            definition = self.schema.get_definition(edge.key[0])
-            assert definition is not None
-            relation = next(r for r in definition.relations if r.name == edge.key[1])
-            parts.append(
-                Q(
-                    Exists(
-                        tuples.filter(
-                            self._live_q(relation, Bound.LOWER),
-                            resource_type=edge.key[0],
-                            resource_id=edge.resource_id,
-                            relation=edge.key[1],
-                            subject_type=edge.subject_type,
-                            subject_id=self._wire() if edge.own else edge.subject_id,
-                            subject_relation=edge.subject_relation,
-                            caveat_name=edge.caveat_name,
-                            caveat_key=edge.caveat_key,
-                        )
-                    )
-                )
-            )
-        step = self.sets_step(sets.keys, sets.upper, Bound.UPPER)
-        if step is not _FALSE:
-            beyond = tuples.filter(step)
-            within = self.sets_within(sets.upper)
-            if within is not _FALSE:
-                beyond = beyond.exclude(within)
-            parts.append(~Q(Exists(beyond)))
-        return _and(*parts)
-
-    def _shape_q(self, allowed: AllowedSubject) -> Q:
-        """A tuple row's subject has the declared shape of ``allowed``."""
-        shape = Q(
-            subject_type=allowed.type,
-            subject_relation=allowed.relation,
-            caveat_name=allowed.with_caveat,
-        )
-        if allowed.wildcard:
-            return shape & Q(subject_id="*")
-        shape &= ~Q(subject_id="*")
-        if allowed.id:
-            shape &= Q(subject_id=allowed.id)
-        return shape
 
     def _closure(self, seed: QuerySet[Any], edges: Any, hops: int) -> QuerySet[Any]:
         """The wire ids within ``hops`` edges of ``seed``, as one nested set.
@@ -1033,58 +769,6 @@ class Compiler:
         _, field = model_identity_fields(model, identity)
         return definition, base, resolved, model, identity, field
 
-    def self_chain(self, key: Key) -> SelfChain | None:
-        """A self-foreign-key recursion as its seeds and its edge, for a closure
-        followed from the seeds: the rows that hold the base (lower bound), then
-        the rows whose parent column names a row already found."""
-        parts_of = self._self_fk(key)
-        if parts_of is None:
-            return None
-        definition, base, resolved, model, identity, field = parts_of
-        parent = cast("models.ForeignKey[Any, Any]", resolved.field)
-        if not foreign_key_kept(parent, self.using):
-            # A child may name a parent that is gone: only the parent's own
-            # row shows that the child still inherits.
-            return None
-        row_at = At(key[0], F(identity), field, True)
-        base_row = _or(*self._arms(definition, base, row_at, Bound.LOWER, {key: 1}, True))
-        return SelfChain(
-            model,
-            identity,
-            parent.target_field.name,
-            parent.attname,
-            base_row,
-            parent.target_field is field,
-        )
-
-    def _decided(
-        self,
-        key: Key,
-        model: type[models.Model],
-        identity: str,
-        bound: Bound,
-        depth_possible: bool,
-        visits: Mapping[Key, int] | None = None,
-    ) -> tuple[Any, ...] | None:
-        """The rows decided for ``key``, when it is a lower bound over its own model's rows.
-
-        A decision is the rows that hold ``key`` with the whole depth to
-        spend.  Inside the key's own component (``visits``) part of the depth
-        is spent already, so the set is not used there.
-        """
-        if self.rows is None or bound is not Bound.LOWER or not depth_possible:
-            return None
-        if visits is not None and any(
-            visits.get(member) for member in self.program.components.get(key, ())
-        ):
-            return None
-        if model_for_resource_type(key[0]) is not model or resource_id_attr(model) != identity:
-            return None
-        decided = self.rows.rows(key)
-        if decided is not None:
-            self.used_rows.add(key)
-        return decided
-
     def _flat_self_fk(
         self,
         key: Key,
@@ -1112,10 +796,6 @@ class Compiler:
             return self._arms(definition, base, where, bound, inside, depth_possible)
 
         own_row = at.row and model_for_resource_type(at.resource_type) is model and at.key is field
-        if own_row:
-            decided = self._decided(key, model, identity, bound, depth_possible)
-            if decided is not None:
-                return Q(In(at.ref, list(decided))) if decided else _FALSE
         # The holders are looked up by key, a row and its ancestors at a time,
         # so their base is a plain disjunction: each arm is decided once.
         base_row = _or(*base_at(row_at))
@@ -1586,7 +1266,7 @@ class Compiler:
         bound: Bound,
         visits: Mapping[Key, int],
         depth_possible: bool,
-    ) -> QuerySet[Any] | Decided | bool:
+    ) -> QuerySet[Any] | bool:
         """The subject-model rows that admit the actor; ``True`` for every row.
 
         With ``name`` (an arrow target or a subject-set relation) a row admits
@@ -1602,12 +1282,6 @@ class Compiler:
             return rows.filter(**{identity: self._native(model, identity)})
         _, field = model_identity_fields(model, identity)
         itself = bool(relation_name and own and self.shape.relation == relation_name)
-        if not itself:
-            decided = self._decided(
-                (allowed_type, name), model, identity, bound, depth_possible, visits
-            )
-            if decided is not None:
-                return Decided(decided) if decided else False
         member = self._holds(
             (allowed_type, name),
             At(allowed_type, F(identity), field, True),
@@ -1658,22 +1332,6 @@ class Compiler:
         if subjects is True:
             source_q = Q(**{f"{target_path}__isnull": False})
             through_rows = False
-        elif isinstance(subjects, Decided) and resolved.keeps_target(self.using):
-            source_q = Q(**{f"{target_path}__in": list(subjects)})
-        elif isinstance(subjects, Decided):
-            # Nothing constrains the reference: a decided key counts only
-            # while its row is there.
-            identity = resolved.target_id_attr
-            rows = resolved.target_model._base_manager.using(self.using)
-            source_q = Q(
-                **{
-                    f"{target_path}__in": _Compiled(
-                        rows.filter(**{f"{identity}__in": list(subjects)})
-                        .order_by()
-                        .values(identity)
-                    )
-                }
-            )
         elif name is None:
             source_q = Q(
                 **{target_path: self._native(resolved.target_model, resolved.target_id_attr)}
@@ -1715,7 +1373,6 @@ class Compiler:
         if target is not None or allowed.relation:
             name = target if target is not None else allowed.relation
             target_key = (allowed.type, name)
-            fact: Fact = (allowed.type, resolved.target_id, name, bound)
             if (
                 target is None
                 and self.shape.type == allowed.type
@@ -1723,18 +1380,6 @@ class Compiler:
                 and self.shape.named_id == resolved.target_id
             ):
                 target_q = _TRUE
-            elif (
-                self.facts is not None
-                and depth_possible
-                and fact in self.facts
-                and not any(
-                    visits.get(member) for member in self.program.components.get(target_key, ())
-                )
-            ):
-                # Decided for this statement; its witness keeps the decision
-                # true of the statement's own snapshot.
-                self.used_facts.add(fact)
-                target_q = _truth(self.facts[fact])
             else:
                 target_q = self._holds(
                     target_key,
@@ -1787,8 +1432,6 @@ class Compiler:
         if found is False:
             return _FALSE
         every = resolved.target_model._base_manager.using(self.using)
-        if isinstance(found, Decided):
-            found = every.filter(**{f"{resolved.target_id_attr}__in": list(found)})
         subjects = (every if found is True else found).filter(Q(**resolved.filters))
         if resolved.resource is not None:
             subjects = subjects.filter(resolved.value_filter(resolved.value))
@@ -2001,48 +1644,3 @@ class Compiler:
             .values(at.key.name)
         )
         return _in(at.ref, target)
-
-
-def const_facts(schema: Schema, program: CompileProgram, root: Key) -> tuple[Fact, ...]:
-    """Every fact about a fixed object that a statement for ``root`` can use."""
-    types = {key[0] for key in program.reachable(root)}
-    found: set[tuple[str, str, str]] = set()
-
-    def arrows(expr: PermExpr) -> Iterable[PermArrow]:
-        if isinstance(expr, PermArrow):
-            yield expr
-        elif isinstance(expr, PermBinOp):
-            yield from arrows(expr.left)
-            yield from arrows(expr.right)
-
-    for definition in schema.definitions:
-        if definition.resource_type not in types:
-            continue
-        constants = {
-            relation.name: relation
-            for relation in definition.relations
-            if isinstance(relation.backing, ConstBinding) and relation.allowed_subjects
-        }
-        for relation in constants.values():
-            allowed = relation.allowed_subjects[0]
-            assert isinstance(relation.backing, ConstBinding)
-            if allowed.relation:
-                found.add((allowed.type, relation.backing.target_id, allowed.relation))
-        for permission in definition.permissions:
-            for arrow in arrows(permission.expression):
-                constant = constants.get(arrow.via)
-                if constant is not None:
-                    relation = constant
-                    assert isinstance(relation.backing, ConstBinding)
-                    found.add(
-                        (
-                            relation.allowed_subjects[0].type,
-                            relation.backing.target_id,
-                            arrow.target,
-                        )
-                    )
-    return tuple(
-        (type_, object_id, name, bound)
-        for type_, object_id, name in sorted(found)
-        for bound in (Bound.LOWER, Bound.UPPER)
-    )

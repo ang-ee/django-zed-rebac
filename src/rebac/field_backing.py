@@ -8,7 +8,7 @@ from graphlib import CycleError, TopologicalSorter
 from typing import TYPE_CHECKING, Any
 
 from django.core.exceptions import FieldDoesNotExist, FieldError, ValidationError
-from django.db import DEFAULT_DB_ALIAS, connections, models, router
+from django.db import DEFAULT_DB_ALIAS, models, router
 from django.db.models import Q, QuerySet, Value
 from django.db.models.expressions import BaseExpression, Col, ColPairs, Combinable
 from django.db.models.functions import Coalesce
@@ -103,11 +103,13 @@ class ResolvedFieldBacking(_SourceFilters):
         """
         if self.generic is None:
             return Q()
-        content_type = _content_type(self.target_model, using)
-        if content_type is None:
-            # No row can carry a content type the database does not have.
-            return Q(pk__in=[])
-        predicate = Q(**{self.generic.ct_field: content_type})
+        from django.contrib.contenttypes.models import ContentType
+
+        content_types = ContentType.objects.db_manager(using).filter(
+            app_label=self.target_model._meta.app_label,
+            model=self.target_model._meta.model_name,
+        )
+        predicate = Q(**{f"{self.generic.ct_field}__in": content_types.values("pk")})
         if exists:
             rows = self.target_model._base_manager.using(using).order_by().values("pk")
             predicate &= Q(**{f"{self.path}__in": rows})
@@ -138,31 +140,6 @@ class ResolvedFieldBacking(_SourceFilters):
             else self.target_model._meta.get_field(self.target_id_attr)
         )
         return self.field.target_field is target_identity
-
-    def keeps_target(self, using: str) -> bool:
-        """Whether a stored reference to a target proves that the target's row exists.
-
-        Django reads a column of the target from the nearest table that holds
-        its value and leaves the others unjoined, so the path proves the row
-        only when it ends in a forward foreign key and the database keeps
-        every forward foreign key on it.  A reverse foreign key on the way is
-        read from the table that holds it; a many-to-many hop is not relied
-        on.
-        """
-
-        if not isinstance(self.field, (models.ForeignKey, models.OneToOneField)):
-            return False
-        kept = True
-
-        def hop(_model: type[models.Model], field: ModelField, _prefix: str) -> None:
-            nonlocal kept
-            if isinstance(field, (models.ForeignKey, models.OneToOneField)):
-                kept = kept and foreign_key_kept(field, using)
-            elif not isinstance(field, (models.ManyToOneRel, models.OneToOneRel)):
-                kept = False
-
-        _relation_path(self.source_model, self.path, visit=hop)
-        return kept
 
     def target_values_path(self) -> str:
         if self.generic is not None:
@@ -354,34 +331,6 @@ def _resolve_generic_backing(
         generic.fk_field,
         GenericColumns(generic.name, generic.ct_field, generic.fk_field),
     )
-
-
-def foreign_key_kept(field: models.ForeignKey[Any, Any], using: str) -> bool:
-    """Whether a value of the column proves a row of the model it names.
-
-    The database must constrain the column, and every link of a multi-table
-    model to an ancestor: its row is its own and its ancestors' together.  A
-    constraint is taken to exist only on a table Django manages.
-    """
-
-    if not connections[using].features.supports_foreign_keys:
-        return False
-    return all(
-        link.db_constraint and link.model._meta.managed  # type: ignore[attr-defined]
-        for link in (field, *_parent_links(field.related_model))
-    )
-
-
-def _parent_links(model: type[models.Model]) -> Iterator[models.Field[Any, Any]]:
-    """The links from a model's table to the tables of all its ancestors.
-
-    A proxy has no link to the model it stands for; that model's own links
-    are followed all the same.
-    """
-    for parent, link in model._meta.parents.items():
-        if link is not None:
-            yield link
-        yield from _parent_links(parent)
 
 
 def proposed_forward_relationships(

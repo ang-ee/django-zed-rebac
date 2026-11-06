@@ -102,8 +102,8 @@ primary key, nothing joins it to another column, and every reader of a field
 backing (the residual evaluator, enumeration, the walker) reads the stored
 value as the target's identity. A relation over a type with another identity
 is refused (`rebac.E009`), as is an object id field whose type cannot hold
-the primary key. Nothing constrains `object_id`, so decided keys are always
-read through the target's rows (ARCHITECTURE § Decided rows, item 5).
+the primary key. Nothing constrains `object_id`, so a statement reads the
+target's rows to prove that the key still names one.
 
 - A scope over the edge model is the compiled predicate, as for any resource:
   the edges of one record are

@@ -1740,17 +1740,13 @@ class RebacQuerySet(models.QuerySet[_M]):
         self._guard_clause_field_reads(actor, sudo, query=self._update_query())
         rebac_type = model_resource_type(self.model)
         if rebac_type:
-            from .compile.read import deciding_afresh
-
-            # A write gate decides afresh, never through rows a scope kept.
-            with deciding_afresh():
-                self._guard_bulk_action(actor, "write")  # type: ignore[arg-type]
-                # Per-field write gates — same all-or-nothing semantics as the
-                # resource-level write check above. For each kwarg whose field
-                # has a ``write__<f>`` permission declared, every affected row
-                # must also pass that check.
-                self._guard_bulk_field_writes(actor, kwargs)  # type: ignore[arg-type]
-                self._guard_bulk_expression_reads(actor, kwargs)  # type: ignore[arg-type]
+            self._guard_bulk_action(actor, "write")  # type: ignore[arg-type]
+            # Per-field write gates — same all-or-nothing semantics as the
+            # resource-level write check above. For each kwarg whose field
+            # has a ``write__<f>`` permission declared, every affected row
+            # must also pass that check.
+            self._guard_bulk_field_writes(actor, kwargs)  # type: ignore[arg-type]
+            self._guard_bulk_expression_reads(actor, kwargs)  # type: ignore[arg-type]
         return super().update(**kwargs)
 
     def delete(self) -> tuple[int, dict[str, int]]:
@@ -1773,17 +1769,14 @@ class RebacQuerySet(models.QuerySet[_M]):
             if unscoped or not model_resource_type(self.model):
                 with deletion_owner(self, self.db, actor, unscoped):
                     return super().delete()
-            from .compile.read import deciding_afresh
-
             # The statement acts on the rows the actor's scope admits: exactly
             # those are checked and deleted, by key.  A cascade that reaches
             # another row checks it as an instance delete does.
             actor = self._writing_actor(actor)
             keys = statement_keys(self._rows_in_scope(actor, reason="rebac.delete.rows"))
             parts = list(by_key(self, keys))
-            with deciding_afresh():
-                for rows in parts:
-                    rows._guard_bulk_action(actor, "delete")
+            for rows in parts:
+                rows._guard_bulk_action(actor, "delete")
             deleted: Counter[str] = Counter()
             for rows in parts:
                 with deletion_owner(rows, self.db, actor, unscoped):
