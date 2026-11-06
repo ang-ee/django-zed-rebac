@@ -7,6 +7,7 @@ Related managers, raw relationship deletes, bulk updates reading gated columns,
 from __future__ import annotations
 
 from datetime import timedelta
+from itertools import pairwise
 
 import pytest
 from django.contrib.auth import get_user_model
@@ -21,6 +22,7 @@ from rebac import (
     MissingActorError,
     ObjectRef,
     PermissionDenied,
+    PermissionDepthExceeded,
     RelationshipTuple,
     SubjectRef,
     actor_context,
@@ -603,6 +605,104 @@ def test_attribute_rekey_requires_write_on_old_and_new_containers():
     assert get_user_model().objects.get(pk=user.pk).username == "alice"
 
 
+@pytest.mark.parametrize("grant", ["tuple", "authenticated"])
+def test_attribute_rekey_accepts_an_absent_canonical_container(grant):
+    write = "editor" if grant == "tuple" else "authenticated"
+    install_schema(
+        backend(),
+        parse_zed(f"""
+        definition auth/user {{}}
+        definition blog/folder {{
+            permission read = authenticated
+            permission write = authenticated
+        }}
+        definition blog/sluggedpost {{
+            relation editor: auth/user
+            relation member: blog/folder // rebac:attribute={{"field":"name"}}
+            permission write = {write}
+        }}
+        """),
+    )
+    with sudo(reason="test.fixture"):
+        folder = Folder.objects.create(name="previous")
+    if grant == "tuple":
+        for container in ("previous", "absent"):
+            _grant("blog/sluggedpost", container, "editor", EDITOR)
+    folder = Folder.objects.with_actor(EDITOR).get(pk=folder.pk)
+    folder.name = "absent"
+    folder.save(update_fields=["name"])
+    assert Folder._base_manager.get(pk=folder.pk).name == "absent"
+    assert not SluggedPost._base_manager.filter(slug="absent").exists()
+
+
+def test_explicit_pk_create_checks_self_keyed_attribute_before_row_exists():
+    install_schema(
+        backend(),
+        parse_zed("""
+        definition auth/user {}
+        definition blog/folder {
+            relation member: blog/folder // rebac:attribute={"field":"id"}
+            permission create = authenticated
+            permission read = authenticated
+            permission write = authenticated
+        }
+        """),
+    )
+    with actor_context(EDITOR):
+        folder = Folder.objects.create(pk=4321, name="explicit")
+    assert Folder._base_manager.get(pk=folder.pk).name == "explicit"
+
+
+@override_settings(REBAC_AUDIT_DENIALS=True, REBAC_DEPTH_LIMIT=2)
+def test_depth_uncertain_absent_container_is_an_audited_edge_denial():
+    install_schema(
+        backend(),
+        parse_zed("""
+        definition auth/user {}
+        definition blog/folder {
+            permission read = authenticated
+            permission write = authenticated
+        }
+        definition blog/sluggedpost {
+            relation editor: auth/user
+            relation parent: blog/sluggedpost
+            relation member: blog/folder // rebac:attribute={"field":"name"}
+            permission write = editor + parent->write
+        }
+        """),
+    )
+    with sudo(reason="test.fixture"):
+        folder = Folder.objects.create(name="previous")
+    _grant("blog/sluggedpost", "previous", "editor", EDITOR)
+    names = ("absent", "next", "far", "further", "granted")
+    backend().write_relationships(
+        [
+            RelationshipTuple(
+                ObjectRef("blog/sluggedpost", child),
+                "parent",
+                SubjectRef.of("blog/sluggedpost", parent),
+            )
+            for child, parent in pairwise(names)
+        ]
+    )
+    _grant("blog/sluggedpost", "granted", "editor", EDITOR)
+    with pytest.raises(PermissionDepthExceeded):
+        backend().check_access(
+            subject=EDITOR,
+            action="write",
+            resource=ObjectRef("blog/sluggedpost", "absent"),
+        )
+    folder.name = "absent"
+    with actor_context(EDITOR), pytest.raises(PermissionDenied):
+        folder.save(update_fields=["name"])
+    assert Folder._base_manager.get(pk=folder.pk).name == "previous"
+    assert list(
+        PermissionAuditEvent.objects.filter(reason__startswith="denied:").values_list(
+            "target_repr", flat=True
+        )
+    ) == ["blog/sluggedpost:absent#write"]
+
+
 def test_nested_m2m_backing_requires_write_on_source_folder():
     install_schema(
         backend(), parse_zed(NESTED_BACKING_SCHEMA.replace("BACKING_PATH", "posts__collections"))
@@ -817,6 +917,59 @@ def test_m2m_set_accepts_objs_keyword_under_actor(world):
     with actor_context(EDITOR), transaction.atomic():
         posts[0].collections.set(objs=[folders[1]])
     assert _stored_collections(world) == {folders[1].pk}
+
+
+@override_settings(REBAC_STRICT_MODE=True)
+def test_m2m_set_uses_pinned_instance_actor_without_ambient(world):
+    alice = get_user_model().objects.create_user(username="m2m_alice")
+    alice_ref = SubjectRef.of("auth/user", str(alice.pk))
+    for folder in world[0]:
+        _grant("blog/folder", folder.pk, "owner", alice_ref)
+    _grant("blog/post", world[1][0].pk, "owner", alice_ref)
+    post = Post.objects.as_user(alice).get(pk=world[1][0].pk)
+    target = Folder.objects.as_user(alice).get(pk=world[0][1].pk)
+    assert list(post.collections.using("default").values_list("pk", flat=True)) == [world[0][0].pk]
+
+    with transaction.atomic():
+        post.collections.set([target])
+
+    assert _stored_collections(world) == {target.pk}
+
+
+@override_settings(REBAC_STRICT_MODE=True)
+def test_m2m_set_uses_pinned_instance_actor_over_ambient(world):
+    alice = get_user_model().objects.create_user(username="m2m_alice")
+    bob = get_user_model().objects.create_user(username="m2m_bob")
+    alice_ref = SubjectRef.of("auth/user", str(alice.pk))
+    bob_ref = SubjectRef.of("auth/user", str(bob.pk))
+    for folder in world[0]:
+        _grant("blog/folder", folder.pk, "owner", alice_ref)
+    _grant("blog/post", world[1][0].pk, "owner", alice_ref)
+    _grant("blog/folder", world[0][1].pk, "viewer", bob_ref)
+    post = Post.objects.as_user(alice).get(pk=world[1][0].pk)
+    target = Folder.objects.as_user(alice).get(pk=world[0][1].pk)
+
+    with actor_context(bob_ref), transaction.atomic():
+        assert list(post.collections.using("default").values_list("pk", flat=True)) == [
+            world[0][0].pk
+        ]
+        post.collections.set([target])
+
+    assert _stored_collections(world) == {target.pk}
+
+
+@override_settings(REBAC_STRICT_MODE=False)
+def test_backed_m2m_write_without_actor_uses_non_strict_bypass():
+    install_schema(backend(), parse_zed(REVERSE_M2M_SCHEMA))
+    with sudo(reason="test.fixture"):
+        post = Post.objects.create(title="source")
+        folder = Folder.objects.create(name="target")
+
+    post.collections.add(folder)
+
+    assert list(Post.collections.through.objects.values_list("post_id", "folder_id")) == [
+        (post.pk, folder.pk)
+    ]
 
 
 # ---------- relationship rows ----------

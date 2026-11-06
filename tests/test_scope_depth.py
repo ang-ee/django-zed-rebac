@@ -7,7 +7,7 @@ import pytest
 from django.db import connection
 from django.utils import timezone
 
-from rebac import RelationshipTuple, app_settings, to_object_ref
+from rebac import RelationshipTuple, to_object_ref
 from rebac.schema import parse_zed
 from tests.backend_setup import STORAGE_TIERS, install_schema
 from tests.test_recursive_queryscope import (
@@ -63,14 +63,11 @@ def deep_scope_proof(storage, backing, deep):
 
             with connection.execute_wrapper(record):
                 sql, params = queryset.query.sql_with_params()
-                # Compiling the scope reads the actor's stored sets; a hierarchy
-                # over a foreign key is also followed from its seeds, level by level.
-                decided = len(statements)
-                levels = min(depth + 1, app_settings.REBAC_DEPTH_LIMIT)
-                assert decided == (1 if backing == "tuple" else 2 + levels)
+                # Rendering the scope reads nothing.
+                assert len(statements) == 0
                 assert list(queryset.values_list("pk", flat=True)) == [rows[-1].pk]
-            # Evaluating it decides the same again, then reads the rows.
-            assert len(statements) == 2 * decided + 1
+            # Evaluating it is one statement.
+            assert len(statements) == 1
             measurements.append(
                 (len(sql), len(params), parse_depth(sql))
                 if backing == "tuple"

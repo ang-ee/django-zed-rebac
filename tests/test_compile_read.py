@@ -8,6 +8,7 @@ from django.utils import timezone
 
 from rebac import RelationshipTuple, sudo
 from rebac.backends.local import LocalBackend
+from rebac.compile import read
 from rebac.compile.conditions import reachable_relations
 from rebac.compile.evaluate import _BDD, _Edge, _Evaluator
 from rebac.compile.read import accessible_ids, check, scope_q
@@ -128,7 +129,7 @@ def test_residual_marks_recursive_ban_cycle_as_depth_relevant(monkeypatch):
 
 
 @pytest.mark.django_db
-def test_reused_scope_sees_new_caveat_instance_at_statement_execution():
+def test_reused_scope_excludes_new_caveat_instance_until_rebuilt():
     local = install_schema(
         """
         caveat active(flag bool) { flag }
@@ -161,7 +162,12 @@ def test_reused_scope_sees_new_caveat_instance_at_statement_execution():
             )
         ]
     )
-    assert list(rows.values_list("pk", flat=True)) == [post.pk]
+    assert list(rows.values_list("pk", flat=True)) == []
+    assert list(
+        Post._base_manager.filter(
+            scope_q(backend=local, model=Post, action="read", actor=actor, using="default")
+        ).values_list("pk", flat=True)
+    ) == [post.pk]
     assert list(ids) == [str(post.pk)]
 
 
@@ -235,7 +241,7 @@ def test_revision_change_during_lazy_compilation_cannot_replace_the_pinned_polic
 
 
 @pytest.mark.django_db
-def test_reused_scope_recompiles_after_override_deadline(monkeypatch):
+def test_reused_scope_stays_closed_after_override_deadline_until_rebuilt(monkeypatch):
     clock = clocks(monkeypatch)
     deadline = clock["app"] + timedelta(minutes=1)
     definition = SchemaDefinition.objects.create(resource_type="blog/post")
@@ -264,7 +270,49 @@ def test_reused_scope_recompiles_after_override_deadline(monkeypatch):
     assert not rows.exists()
 
     clock["sql"] = clock["app"]
-    assert list(rows.values_list("pk", flat=True)) == [post.pk]
+    assert list(rows.values_list("pk", flat=True)) == []
+    assert list(
+        Post._base_manager.filter(
+            scope_q(backend=local, model=Post, action="read", actor=actor, using="default")
+        ).values_list("pk", flat=True)
+    ) == [post.pk]
+
+
+@pytest.mark.django_db
+def test_a_passed_override_deadline_neither_fences_nor_disables_policy_caching(monkeypatch):
+    clock = clocks(monkeypatch)
+    deadline = clock["app"] + timedelta(minutes=1)
+    definition = SchemaDefinition.objects.create(resource_type="blog/post")
+    permission = SchemaPermission.objects.create(
+        definition=definition, name="read", expression="authenticated"
+    )
+    SchemaDefinition.objects.create(resource_type="auth/user")
+    SchemaOverride.objects.create(
+        kind=SchemaOverride.KIND_TIGHTEN,
+        target_ct=ContentType.objects.get_for_model(SchemaPermission),
+        target_pk=permission.pk,
+        expression="nil",
+        reason="temporary closure",
+        expires_at=deadline,
+    )
+    local = LocalBackend()
+    with sudo(reason="override deadline fixture"):
+        post = Post._base_manager.create(title="visible after deadline")
+    actor = SubjectRef.of("auth/user", "alice")
+
+    def scoped():
+        predicate = scope_q(backend=local, model=Post, action="read", actor=actor, using="default")
+        return list(Post._base_manager.filter(predicate).values_list("pk", flat=True))
+
+    # Before the deadline: the fence carries it and the policy is prepared each time.
+    assert scoped() == []
+    assert read._policy(local) is not read._policy(local)
+    clock["app"] = clock["sql"] = deadline + timedelta(seconds=1)
+    # After it: the passed deadline is settled in the composition, the policy is
+    # kept again, and the statement compiled under the old fence is not reused.
+    assert read._policy(local).caveat_deadlines == ()
+    assert read._policy(local) is read._policy(local)
+    assert scoped() == [post.pk]
 
 
 @pytest.mark.django_db

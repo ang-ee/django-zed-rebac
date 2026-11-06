@@ -9,16 +9,15 @@ from django.test.utils import CaptureQueriesContext
 from rebac import (
     CheckItem,
     CheckResult,
+    LocalBackend,
     ObjectRef,
     PermissionDepthExceeded,
     PermissionResult,
     RelationshipTuple,
     SubjectRef,
 )
-from rebac.backends.base import Backend
 from rebac.compile import read
-from rebac.compile.predicate import Bound
-from rebac.evaluator import PermissionEvaluator, evaluator_scope
+from rebac.evaluator import evaluator_scope
 from rebac.testing import install_schema
 
 pytestmark = pytest.mark.django_db
@@ -42,7 +41,6 @@ definition docs/doc {
     permission view = viewer
 }
 """
-MEMBERS = ("auth/group", "member")
 DOC = ObjectRef("docs/doc", "d")
 
 
@@ -173,8 +171,8 @@ def test_statements_do_not_grow_with_the_number_of_actors(office, monkeypatch):
         # Every other user reaches ``staff`` through a group of their own.
         assert [bool(answer) for answer in answers] == [n % 2 == 0 for n in range(size)]
         assert answers == one_by_one(office, items)
-    # The caveat verdicts; the sets, three statements a bound; the two bounds.
-    assert counts == [9, 9]
+    # Actor memberships are part of the bounds, not separate expansion reads.
+    assert counts[0] == counts[1]
 
 
 def test_a_statement_of_bounds_is_cut_by_its_size(office, monkeypatch):
@@ -206,37 +204,6 @@ def test_a_chunk_is_fifty_items(office):
     assert len(large) <= 3 * len(small)
 
 
-def test_sets_decided_together_are_the_sets_each_actor_decides_alone(office):
-    names = [*PEOPLE, *crowd(office, 6)]
-    key = ("docs/doc", "read")
-    for context in (None, {"inside": True}, {"inside": False}):
-        operations = [read._Operation.begin(office, user(n), "default", context) for n in names]
-        verdicts = operations[0].verdicts(key)
-        together = read._decide_sets_together(operations, key, verdicts)
-        assert together is not None
-        for operation in operations:
-            alone = operation._decide_sets(key, operation.verdicts(key))
-            found = together[operation.actor]
-            assert (found.keys, found.lower, found.upper) == (alone.keys, alone.lower, alone.upper)
-            # Each support is a tuple from the actor or from a set found before it.
-            reached = set()
-            for edge in found.support:
-                via = (edge.subject_type, edge.subject_relation, edge.subject_id)
-                actor = operation.actor
-                assert (
-                    (
-                        edge.own
-                        and via == (actor.subject_type, actor.optional_relation, actor.subject_id)
-                    )
-                    or via in reached
-                    or edge.subject_id == "*"
-                )
-                reached.add((*edge.key, edge.resource_id))
-            assert {(key, id_) for key, ids in found.lower.items() for id_ in ids} == {
-                (edge.key, edge.resource_id) for edge in found.support
-            }
-
-
 def test_nested_sets_and_cycles_are_followed_for_every_actor():
     local = install_schema(SCHEMA)
     names = [f"g{n}" for n in range(12)]
@@ -257,13 +224,6 @@ def test_nested_sets_and_cycles_are_followed_for_every_actor():
     # The groups form a cycle: every one of them holds ann and bob.
     assert [bool(answer) for answer in answers] == [True, True, False, False]
     assert answers == one_by_one(local, items)
-    operations = [read._Operation.begin(local, item.subject, "default") for item in items]
-    key = ("docs/doc", "read")
-    together = read._decide_sets_together(operations, key, operations[0].verdicts(key))
-    assert together[user("ann")].ids(MEMBERS, Bound.LOWER) == frozenset(names)
-    assert together[user("bob")].ids(MEMBERS, Bound.LOWER) == frozenset(names)
-    assert together[user("cat")].ids(MEMBERS, Bound.LOWER) == {"other"}
-    assert together[user("dan")].ids(MEMBERS, Bound.LOWER) == frozenset()
 
 
 def elsewhere(monkeypatch, write):
@@ -275,53 +235,11 @@ def elsewhere(monkeypatch, write):
     monkeypatch.setattr(local_module, "_relationship_generation", generation)
 
 
-def test_a_membership_revoked_after_the_sets_were_decided_is_not_read_through(office, monkeypatch):
-    names = crowd(office, 4)
-    decide = read._decide_sets_together
-    done = []
-
-    def decide_then_revoke(operations, key, verdicts):
-        found = decide(operations, key, verdicts)
-        if not done:
-            done.append(True)
-            gone = member("staff", members(f"own-{names[0]}"))
-            elsewhere(monkeypatch, lambda: office.delete_relationship(gone))
-        return found
-
-    monkeypatch.setattr(read, "_decide_sets_together", decide_then_revoke)
-    items = [CheckItem(user(name), "view", DOC) for name in names]
-    with evaluator_scope():
-        answers = office.check_bulk_permissions(items)
-    assert done
-    # u000 was decided into ``staff``; the statement re-reads the tuple that put it there.
-    assert [bool(answer) for answer in answers] == [False, False, True, False]
-
-
-def test_a_membership_gained_after_the_sets_were_decided_does_not_escape_a_ban(office, monkeypatch):
-    decide = read._decide_sets_together
-    done = []
-
-    def decide_then_ban(operations, key, verdicts):
-        found = decide(operations, key, verdicts)
-        if not done:
-            done.append(True)
-            banned = member("blocked", user("ann"))
-            elsewhere(monkeypatch, lambda: office.write_relationships([banned]))
-        return found
-
-    monkeypatch.setattr(read, "_decide_sets_together", decide_then_ban)
-    items = [CheckItem(user(name), "read", DOC) for name in ("ann", "dan")]
-    with evaluator_scope():
-        answers = office.check_bulk_permissions(items)
-    assert done
-    assert [bool(answer) for answer in answers] == [False, True]
-
-
 def test_sets_changed_by_another_process_are_answered_afresh_not_as_a_depth(office, monkeypatch):
     ann = dict(subject=user("ann"), action="read", resource=DOC)
     with evaluator_scope():
         assert office.check_access(**ann).allowed
-        # Another process bans ann, so the scope keeps the sets it decided.
+        # Another process bans ann; the next statement reads the tuple.
         banned = member("blocked", user("ann"))
         elsewhere(monkeypatch, lambda: office.write_relationships([banned]))
         assert office.check_access(**ann) == CheckResult.no()
@@ -354,27 +272,19 @@ def test_an_item_beyond_the_depth_limit_raises_as_check_access_does(settings):
         local.check_bulk_permissions([near, deep])
 
 
-def test_the_base_backend_asks_item_by_item():
+def test_local_backend_boolean_shorthand_uses_check_access():
     asked = []
 
-    class Recording(Backend):
-        kind = "recording"
-
+    class Recording(LocalBackend):
         def check_access(self, *, subject, action, resource, context=None, **options):
             asked.append((subject, action, resource, context, options))
             return CheckResult.has() if action == "read" else CheckResult.no()
 
-        accessible = lookup_subjects = write_relationships = None
-        delete_relationships = delete_relationship = schema = None
-
-    Recording.__abstractmethods__ = frozenset()
-    items = [
-        CheckItem(user("ann"), "read", DOC, {"inside": True}),
-        CheckItem(user("bob"), "write", DOC),
-    ]
-    assert Recording().check_bulk_permissions(iter(items)) == [CheckResult.has(), CheckResult.no()]
+    local = Recording()
+    assert local.has_access(subject=user("ann"), action="read", resource=DOC)
+    assert not local.has_access(subject=user("bob"), action="write", resource=DOC)
     assert [entry[:4] for entry in asked] == [
-        (user("ann"), "read", DOC, {"inside": True}),
+        (user("ann"), "read", DOC, None),
         (user("bob"), "write", DOC, None),
     ]
 
@@ -397,32 +307,3 @@ def expansions(queries):
         query["sql"].startswith("SELECT DISTINCT") and '"subject_relation"' in query["sql"]
         for query in queries
     )
-
-
-def test_a_large_call_expands_each_chunk_once():
-    local = install_schema(FLAT)
-    items = [CheckItem(user(f"u{n:04}"), "read", DOC) for n in range(600)]
-    with CaptureQueriesContext(connection) as queries:
-        answers = local.check_bulk_permissions(items)
-    assert not any(answers)
-    # One expansion for each chunk of 50: the call decides no actor twice.
-    assert expansions(queries) == 12
-
-
-def test_a_chunk_keeps_its_own_decisions_past_the_cache_size():
-    local = install_schema(FLAT)
-    local.write_relationships(
-        [
-            *(member("readers", user(f"u{n:04}")) for n in range(0, 120, 10)),
-            RelationshipTuple(DOC, "reader", members("readers")),
-        ]
-    )
-    items = [CheckItem(user(f"u{n:04}"), "read", DOC) for n in range(120)]
-    evaluator = PermissionEvaluator(max_size=30)
-    with evaluator_scope(evaluator), CaptureQueriesContext(connection) as queries:
-        answers = local.check_bulk_permissions(items)
-    assert [answer.allowed for answer in answers] == [n % 10 == 0 for n in range(120)]
-    # One expansion for each chunk, however few decisions the scope keeps.
-    assert expansions(queries) == 3
-    # The scope keeps the most recent decisions, up to its size.
-    assert len(evaluator._actor_sets) == 30

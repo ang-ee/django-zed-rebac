@@ -17,7 +17,7 @@ Today two evaluators share the walker:
 * :func:`rebac.preflight.check_new` resolves direct relations against a
   caller-supplied virtual ``relation -> subjects`` mapping (the row
   doesn't exist yet) and resolves arrow hops via the active backend's
-  :meth:`Backend.check_access` on the (real) target rows.
+  :meth:`LocalBackend.check_access` on the (real) target rows.
 
 The walker is the single source of truth for operator precedence,
 sub-permission cycle detection, depth bookkeeping, the tri-state

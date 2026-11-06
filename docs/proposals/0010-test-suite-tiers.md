@@ -146,7 +146,7 @@ test. A case that fails is `xfail(strict=True)` with the defect named.
 | `tests/test_admin.py` (settings variant with admin, sessions, messages) | changelists load; relationship and audit admins are read-only; override add sets `created_by` and audits |
 | `tests/test_commands_check_explain.py` | `rebac check` ok and parse error; `rebac explain` hit, miss, with an override |
 | `tests/test_public_api.py` | every name in `rebac.__all__` resolves; error hierarchy; documented public list matches |
-| `tests/test_backend_selection.py` | `REBAC_BACKEND` `spicedb` without client or endpoint, unknown value |
+| `tests/test_backend_selection.py` | local backend caching, unknown backend value |
 | `tests/test_checks_and_conf.py` | E001, E002, E006, W001, W005, W101 triggered and silent; the W006 test fixed |
 | `tests/test_parser.py` | `-` associativity and precedence against `&`; block comments; unterminated string, comment, caveat body; duplicate relation or permission in a definition |
 | `tests/test_build_zed.py` | through `call_command`; output re-parses; two subprocesses with different `PYTHONHASHSEED` give identical bytes; `use expiration` emitted |

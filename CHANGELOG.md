@@ -3,6 +3,111 @@
 All notable changes to `django-zed-rebac` are tracked here. The project is in
 pre-1.0; breaking changes within a minor version are explicitly called out.
 
+## [0.31.0] — 2026-11-06
+
+### Breaking
+
+- `LocalBackend` is the only backend. The `Backend` base class and the
+  `SpiceDBBackend` stub are removed, with the `spicedb` extra; `rebac.Backend`
+  and `rebac.SpiceDBBackend` no longer exist. `REBAC_BACKEND` accepts only
+  `"local"`.
+- The `REBAC_SPICEDB_ENDPOINT`, `REBAC_SPICEDB_TOKEN`, `REBAC_SPICEDB_TLS` and
+  `REBAC_SPICEDB_AUTO_WRITE_SCHEMA` settings and their checks (`rebac.E002`,
+  `rebac.W101`) are removed.
+- `PermissionEvaluator.accessible()` and its cache are removed; the evaluator
+  caches `check()` answers and field visibility. `LocalBackend.accessible()`
+  still enumerates.
+- `django-cte` (`>=5,<6`) is a required dependency. Django stays `>=6.1,<6.2`.
+- `RebacManager.raw()` is gone; `raw()` stays on the queryset, which Django
+  also exposes on the manager.
+- A related manager scopes its fresh queryset to its source instance's pinned
+  actor, never its sudo pin, instead of the ambient actor. An instance loaded
+  through `with_actor()` or `as_user()` carries that actor into every relation
+  read from it: a list loaded once for a service actor and reused under a
+  per-user `actor_context()` (a Celery task, a cache) returns the related rows
+  the service account may read, not the user's. Load the rows for the user, or
+  read the relation through an explicitly scoped queryset.
+- `PermissionEvaluator.stats()` has no `accessible_entries` key; it reports
+  `visibility_entries` and `visibility_ids` for the field-visibility memo.
+- `LocalBackend.held()`, `held_many()`, the bulk write gates and the
+  `rebac_select_related()` guards count a depth-uncertain id as not held
+  instead of raising `PermissionDepthExceeded` as `check_access()` does.
+- `iterator()` is lazy: rows stream chunk by chunk instead of being read in
+  full before the first one is returned. Its actors, like `aiterator()`'s, are
+  resolved where it is called.
+
+### Added
+
+- `rebac.permission_expression(model, action, *, actor)`: a lazy Boolean
+  Django expression for whether an explicit actor holds an action on each
+  row. It never takes authority from an ambient actor or sudo; its policy
+  binds when its SQL is compiled.
+- `rebac.is_sudo()` is exported: whether ambient `sudo()` or
+  `system_context()` is active.
+- `LocalBackend.held()` checks supplied candidate ids, one statement per
+  chunk of stored rows; `LocalBackend.held_many()` does so for several
+  permissions of one type, deciding equal permissions once.
+
+### Changed
+
+- Permission scopes compile inline. Arrows, actor-side subject sets, fixed
+  objects and row membership stay predicates of the statement and are read
+  when it executes. The decided rows and sets kept per evaluator scope
+  (proposal 0017, now superseded) and the connection observer are removed.
+- A queryset scope pins its policy and caveat verdicts when its queryset owner
+  builds it; rendering it reads nothing. Four named exceptions do database
+  work at render: (a) `permission_expression` reads the policy and the
+  caveat-verdict rows when its SQL is compiled, by design; (b) the field-read
+  guard reads the schema revision when an actor-scoped subquery renders inside
+  a plain outer query with no evaluator scope open; (c) the embedded-bypass
+  audit writes its row at render for a statement whose query class REBAC does
+  not hook (Django's insert query, the delete query of a collector fast delete,
+  and a plain Django queryset's statement whose REBAC subquery Django resolves
+  only while compiling it); (d) a REBAC queryset that Django resolves only
+  while compiling the outer statement (a `Subquery` in `ORDER BY`, a REBAC
+  `Subquery` as an INSERT value) builds its scope then, reading the schema
+  revision (unless an evaluator scope pins it) and the caveat-verdict rows.
+- Recursion lowers to recursive CTEs where the columns allow it. Stored
+  subject-set membership (nested groups) is followed to a fixed point inside
+  the statement, data cycles included, however many sets hold the actor.
+  Lower-bound paths over integer keys, tuple closures from one object and the
+  tuple hierarchies of queryset scopes and enumeration use a finite CTE bounded
+  by `REBAC_DEPTH_LIMIT`.
+- Inside an atomic block, each permission operation reads the schema revision
+  once and pins it for that operation only.
+- A scoped read that names its rows (`filter(pk=...)`, `filter(pk__in=[...])`
+  with up to 256 literal integer ids) is bounded to those rows.
+- An embedded `sudo()` or `system_context()` queryset is audited once per entry
+  and reason when its enclosing statement executes, never when it is only
+  rendered.
+- Gated fields of a materialised batch are decided together, one statement per
+  distinct permission over the fetched ids, and memoised within an evaluator
+  scope when the check cache could keep the answer.
+- A delete checks every resource model its cascade reaches for `delete` as one
+  batch, before any row is removed.
+- `rebac.actors.resolve()` owns actor precedence for querysets, instances,
+  relations and gates; one check validates every sudo and one emitter writes
+  every bypass audit. `with_actor()` re-pins the protected prefetches that
+  inherited the root's actor. `relation_actor()` still returns a `SubjectRef`
+  or `None`.
+- Bulk write gates and `rebac_select_related()` guards check the affected ids
+  instead of enumerating the accessible set.
+
+### Fixed
+
+- `iterator()` and `aiterator()` stamp each chunk with the queryset's pinned
+  actor before Django prefetches it, so a prefetched related manager reads that
+  actor instead of the ambient one, and guard selected related rows with the
+  actors resolved where they were called: a streaming response consumed after
+  its actor context closed, or under another ambient actor, neither raises
+  `MissingActorError` mid-stream nor admits related rows by another actor's
+  grants.
+- An expired timed override no longer disables policy caching, and a statement
+  compiled under a deadline fence is not reused by a policy selected on the
+  other side of that deadline.
+- An UPDATE whose key pre-select executes a nested `sudo()` queryset audits it
+  even when the UPDATE then finds no row.
+
 ## [0.30.1] — 2026-11-06
 
 ### Changed

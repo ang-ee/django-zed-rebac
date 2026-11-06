@@ -16,27 +16,35 @@ from __future__ import annotations
 import re
 from collections import Counter
 from collections.abc import AsyncIterator, Collection, Iterable, Iterator
+from contextvars import ContextVar
+from enum import Enum, auto
 from typing import TYPE_CHECKING, Any, Self, TypeVar, cast, overload
 
 from asgiref.sync import sync_to_async
 from django.db import connections, models
 from django.db.models.expressions import Col, RawSQL
 from django.db.models.sql import Query
+from django.db.models.sql.subqueries import UpdateQuery
 from django.db.models.sql.where import ExtraWhere, NothingNode, WhereNode
 
 from ._id import resource_id_attr
-from .actors import ActorLike, current_sudo_reason, grant_subject_ref, to_subject_ref
+from .actors import (
+    ActorLike,
+    current_sudo_reason,
+    grant_subject_ref,
+    require_sudo_allowed,
+    resolve,
+    to_subject_ref,
+)
 from .actors import current_actor as _current_actor
 from .actors import is_sudo as _is_sudo_ambient
-from .conf import app_settings
 from .errors import MissingActorError, PermissionDenied
 from .field_visibility import (
-    accessible_ids,
     apply_field_visibility,
-    backend_grants_all,
     backend_schema,
     effective_field_deny_mode,
     gated_read_fields,
+    held_ids,
     runtime_field_deny_mode,
     validate_field_deny_mode,
     warn_raise_mode_degrades,
@@ -52,7 +60,136 @@ class _ScopeWhere(WhereNode):
     """A removable authorization restriction, separate from caller predicates."""
 
 
-class _RebacQuery(Query):
+class _CompileOnly(Enum):
+    ACTIVE = auto()
+
+
+# While a statement executes: the embedded bypasses its rendering used, keyed by
+# bypass entry and reason. ``_CompileOnly`` while a top-level statement is only
+# rendered (``str(query)``), which audits nothing.
+_executing_bypass_audits: ContextVar[dict[tuple[object, str], None] | _CompileOnly | None] = (
+    ContextVar("rebac_executing_bypass_audits", default=None)
+)
+
+
+def _emit_bypass(reason: str) -> None:
+    from .audit import emit_bypass
+
+    emit_bypass(reason, actor=_current_actor())
+
+
+def _emit_executed_bypasses(reasons: dict[tuple[object, str], None]) -> None:
+    for _entry, reason in reasons:
+        _emit_bypass(reason)
+
+
+class _BypassAuditCompilerMixin:
+    """Observe the final compiler's methods, including a later CTE mixin's."""
+
+    _rebac_audit_top_level: bool
+    _rebac_audit_rendered_sql: bool
+
+    def __getattribute__(self, name: str) -> Any:
+        method = super().__getattribute__(name)
+        if name == "as_sql":
+
+            def audited_as_sql(*args: Any, **kwargs: Any) -> Any:
+                compile_only = (
+                    self._rebac_audit_top_level and _executing_bypass_audits.get() is None
+                )
+                marker = _executing_bypass_audits.set(_CompileOnly.ACTIVE) if compile_only else None
+                try:
+                    sql = method(*args, **kwargs)
+                    self._rebac_audit_rendered_sql = bool(sql[0])
+                    return sql
+                finally:
+                    if marker is not None:
+                        _executing_bypass_audits.reset(marker)
+
+            return audited_as_sql
+        if name == "execute_sql":
+
+            def audited_execute_sql(*args: Any, **kwargs: Any) -> Any:
+                self._rebac_audit_rendered_sql = False
+                reasons: dict[tuple[object, str], None] = {}
+                token = _executing_bypass_audits.set(reasons)
+                try:
+                    result = method(*args, **kwargs)
+                finally:
+                    _executing_bypass_audits.reset(token)
+                if self._rebac_audit_rendered_sql:
+                    _emit_executed_bypasses(reasons)
+                return result
+
+            return audited_execute_sql
+        return method
+
+
+_audit_compiler_types: dict[type[Any], type[Any]] = {}
+
+
+class _BypassAuditQuery(Query):
+    """Collect embedded bypasses while the statement renders; audit them once it executes."""
+
+    def chain(self, klass: Any = None) -> Any:
+        chained = super().chain(klass)
+        if klass is UpdateQuery:
+            # QuerySet.update() switches its Query to UpdateQuery before the
+            # write executes. Keep the audit hook on that compiled statement.
+            chained.__class__ = _BypassAuditUpdateQuery
+        elif klass is Query:
+            # An UPDATE's pre-select of its keys is a statement of its own: it
+            # audits what it executed even when the UPDATE then finds no row.
+            chained.__class__ = _BypassAuditQuery
+        return chained
+
+    def get_compiler(self, *args: Any, **kwargs: Any) -> Any:
+        compiler = super().get_compiler(*args, **kwargs)
+        if not isinstance(compiler, _BypassAuditCompilerMixin):
+            base = type(compiler)
+            mixed = _audit_compiler_types.get(base)
+            if mixed is None:
+                mixed = type(
+                    f"RebacAudit{base.__name__}",
+                    (_BypassAuditCompilerMixin, base),
+                    {"__slots__": ()},
+                )
+                _audit_compiler_types[base] = mixed
+            compiler.__class__ = mixed
+        # Query.as_sql() creates a compiler with connection= for a subquery.
+        # Only a top-level render marks a compile without execution.
+        compiler._rebac_audit_top_level = (
+            bool(args and args[0] is not None) or kwargs.get("using") is not None
+        )
+        compiler._rebac_audit_rendered_sql = False
+        return compiler
+
+    def get_aggregation(self, using: str, aggregate_exprs: Any) -> Any:
+        # Django can wrap a sliced or distinct COUNT in a plain AggregateQuery,
+        # whose compiler does not inherit this query's execution hook.
+        reasons: dict[tuple[object, str], None] = {}
+        token = _executing_bypass_audits.set(reasons)
+        try:
+            result = super().get_aggregation(using, aggregate_exprs)
+        finally:
+            _executing_bypass_audits.reset(token)
+        _emit_executed_bypasses(reasons)
+        return result
+
+
+class _BypassAuditUpdateQuery(_BypassAuditQuery, UpdateQuery):
+    """UpdateQuery with the embedded-bypass execution hook."""
+
+
+def _audit_query_when_executed(query: Any) -> None:
+    # A plain Django queryset can hold a REBAC subquery. Its Query must own the
+    # same execution hook; changing this one Query instance's class keeps
+    # Django's clone semantics and the queryset's public type.
+    if type(query) is Query:
+        query.__class__ = _BypassAuditQuery
+
+
+class _RebacQuery(_BypassAuditQuery):
     """Cover expressions which copy QuerySet.query without resolving the QS."""
 
     _rebac_state: dict[str, Any]
@@ -60,9 +197,10 @@ class _RebacQuery(Query):
     # querysets. They inherit the combination's policy, not a separate actor.
     _rebac_boolean_operand = False
 
-    # The bypass reason of an embedded queryset, audited when the statement it
-    # was resolved into is compiled for execution, never when it is built.
-    _rebac_pending_bypass_audit: str | None = None
+    # The bypass entry and reason of an embedded queryset. Clones of one entry
+    # share its identity, so a statement that uses it in several expressions
+    # audits it once, after it executes.
+    _rebac_pending_bypass_audit: tuple[object, str] | None = None
 
     # Django constructs a query of this class itself only as a piece of the
     # statement it is building: the NOT EXISTS of an exclude() across a to-many
@@ -80,10 +218,19 @@ class _RebacQuery(Query):
         # Compiled before the statement that holds it was checked (its
         # queryset is not a rebac one, or no check ran): checked now.
         _check_subquery(self)
-        reason = self._rebac_pending_bypass_audit
-        if reason is not None:
-            _emit_bypass_audit(reason)
-        return super().as_sql(compiler, connection)
+        sql = super().as_sql(compiler, connection)
+        pending = self._rebac_pending_bypass_audit
+        state = _executing_bypass_audits.get()
+        if pending is not None:
+            if isinstance(state, dict):
+                state.setdefault(pending, None)
+            elif state is None:
+                # A statement whose Query class REBAC does not own (Django's
+                # DeleteQuery or InsertQuery, a third-party class) has no
+                # execution hook: it audits when rendered, so an elevated read
+                # never runs without an audit row.
+                _emit_bypass(pending[1])
+        return sql
 
     # A resolved actor-scoped subquery carries what checking it needs, and
     # is checked once: with the statement that holds it, when that statement
@@ -106,7 +253,6 @@ class _RebacQuery(Query):
         )
         for name, value in state.items():
             setattr(queryset, name, value)
-        applied_here = not queryset._rebac_scope_applied
         # Building an expression runs no query, so it must write no audit row
         # (annotations are built at import time, during app initialisation).
         queryset._apply_scope_in_place(audit=False)
@@ -114,7 +260,8 @@ class _RebacQuery(Query):
         # evaluated under actor_context() may be embedded after it has closed.
         decision = queryset._rebac_scope_decision
         actor, bypass = decision if decision is not None else queryset.effective_actor(strict=True)
-        pending = queryset._bypass_audit_reason() if applied_here and bypass else None
+        reason = queryset._bypass_audit_reason() if bypass else None
+        pending = (queryset._rebac_bypass_entry, reason) if reason is not None else None
 
         # A set combination has one actor policy, owned by its root queryset.
         # _scope_query already applied it to each operand (or the root bypass
@@ -146,6 +293,7 @@ class _RebacQuery(Query):
             resolved._rebac_check = (queryset, actor)
         if pending is not None:
             resolved._rebac_pending_bypass_audit = pending
+            _audit_query_when_executed(args[0] if args else kwargs.get("query"))
         return resolved
 
 
@@ -239,20 +387,6 @@ class _Readable(models.Case):
         return resolved
 
 
-def _emit_bypass_audit(reason: str) -> None:
-    from .audit import emit
-    from .models import PermissionAuditEvent
-
-    actor = _current_actor()
-    emit(
-        PermissionAuditEvent.KIND_SUDO_BYPASS,
-        actor=actor,
-        origin=actor,
-        reason=reason,
-        defer_to_commit=False,
-    )
-
-
 def _without_scope(node: WhereNode) -> WhereNode:
     clone = node.clone()
     clone.children = [
@@ -334,8 +468,8 @@ def _hidden_from(
         for name in names
         if actor is None
         or resource_type is None
-        or not backend_grants_all(
-            backend(), subject=actor, action=f"read__{name}", resource_type=resource_type
+        or not backend().grants_all(
+            subject=actor, action=f"read__{name}", resource_type=resource_type
         )
     )
 
@@ -606,8 +740,12 @@ class RebacQuerySet(models.QuerySet[_M]):
 
     # Per-queryset state. Carried through `_clone()`.
     _rebac_actor: SubjectRef | None
+    # A related manager's source instance pin: its actor, never its sudo.
+    _rebac_relation_actor: SubjectRef | None
+    _rebac_relation_scope: bool
     _rebac_action: str | None
     _rebac_sudo_reason: str | None
+    _rebac_bypass_entry: object
     _rebac_field_deny: FieldDenyMode | None
     _rebac_select_related_guards: tuple[str, ...]
 
@@ -616,9 +754,12 @@ class RebacQuerySet(models.QuerySet[_M]):
         if type(self._query) is Query:
             self._query.__class__ = _RebacQuery
         self._rebac_actor = None
+        self._rebac_relation_actor = None
+        self._rebac_relation_scope = False
         self._rebac_action = None
         self._rebac_sudo_reason = None
         self._rebac_sudo_audited = False
+        self._rebac_bypass_entry = object()
         self._rebac_internal_bypass = False
         self._rebac_ambient_bypass = False
         self._rebac_field_deny = None
@@ -635,8 +776,11 @@ class RebacQuerySet(models.QuerySet[_M]):
         # authorization-sensitive query merely to pickle an inert query.
         state = {**self.__dict__, "_django_version": django.__version__}
         state["_rebac_actor"] = None
+        state["_rebac_relation_actor"] = None
+        state["_rebac_relation_scope"] = False
         state["_rebac_sudo_reason"] = None
         state["_rebac_sudo_audited"] = False
+        state["_rebac_bypass_entry"] = object()
         state["_rebac_internal_bypass"] = False
         state["_rebac_ambient_bypass"] = False
         state["_rebac_scope_applied"] = False
@@ -651,7 +795,14 @@ class RebacQuerySet(models.QuerySet[_M]):
             query._rebac_state = {
                 name: value
                 for name, value in getattr(query, "_rebac_state", {}).items()
-                if name not in {"_rebac_actor", "_rebac_sudo_reason"}
+                if name
+                not in {
+                    "_rebac_actor",
+                    "_rebac_relation_actor",
+                    "_rebac_relation_scope",
+                    "_rebac_sudo_reason",
+                    "_rebac_bypass_entry",
+                }
             }
             state["_query"] = query
         return state
@@ -659,7 +810,8 @@ class RebacQuerySet(models.QuerySet[_M]):
     def raw(
         self, raw_query: Any, params: Any = (), translations: Any = None, using: Any = None
     ) -> Any:
-        _, bypass = self._resolve_effective_actor()
+        _, bypass = self.effective_actor(strict=True)
+        self._audit_bypass_once()
         if not bypass:
             raise PermissionDenied("raw() cannot be actor-scoped; use sudo or system_context")
         raw_method = super().raw
@@ -696,21 +848,23 @@ class RebacQuerySet(models.QuerySet[_M]):
             # operand's actor. Its own actor, bypass and audit do not apply,
             # and an operand without an actor is not an error here.
             return cast(Query, super(RebacQuerySet, clone).resolve_expression(*args, **kwargs))
-        # Resolution builds an expression; the bypass is exercised, and
-        # audited, when the statement it lands in is compiled for execution.
-        # The query's own resolution checks what it selects, filters and
-        # orders on.
+        # Resolution builds an expression; the bypass is audited only when
+        # the enclosing statement executes. The query's own resolution checks
+        # what it selects, filters and orders on.
         clone._apply_scope_in_place(audit=False)
-        pending = clone._bypass_audit_reason()
+        reason = clone._bypass_audit_reason()
+        pending = (clone._rebac_bypass_entry, reason) if reason is not None else None
         resolved = cast(Query, super(RebacQuerySet, clone).resolve_expression(*args, **kwargs))
         if pending is not None and isinstance(resolved, _RebacQuery):
             resolved._rebac_pending_bypass_audit = pending
+            _audit_query_when_executed(args[0] if args else kwargs.get("query"))
         return resolved
 
     def explain(self, *, format: str | None = None, **options: Any) -> str:
         scoped = self._clone()
         scoped._apply_scope_in_place()
-        scoped._guard_clause_field_reads(*scoped._resolve_effective_actor())
+        scoped._audit_bypass_once()
+        scoped._guard_clause_field_reads(*scoped.effective_actor(strict=True))
         return super(RebacQuerySet, scoped).explain(format=format, **options)
 
     # Note: a second `_clone` override below combines the actor + scope-flag
@@ -725,8 +879,13 @@ class RebacQuerySet(models.QuerySet[_M]):
         clone._rebac_actor = ref
         clone._rebac_sudo_reason = None
         clone._rebac_sudo_audited = False
+        clone._rebac_bypass_entry = object()
         clone._rebac_internal_bypass = False
         clone._rebac_ambient_bypass = False
+        from .relation_loading import rebind_prefetch_actor
+
+        prefetches = cast(Any, clone)._prefetch_related_lookups
+        cast(Any, clone)._prefetch_related_lookups = rebind_prefetch_actor(prefetches, ref)
         clone._refresh_scope()
         return clone
 
@@ -864,18 +1023,12 @@ class RebacQuerySet(models.QuerySet[_M]):
         return self._bypass(reason=reason, allow_when_sudo_disabled=True, internal=True)
 
     def _bypass(self, *, reason: str, allow_when_sudo_disabled: bool, internal: bool) -> Self:
-        from .errors import SudoNotAllowedError, SudoReasonRequiredError
-
-        if not allow_when_sudo_disabled and not app_settings.REBAC_ALLOW_SUDO:
-            raise SudoNotAllowedError("sudo() denied: REBAC_ALLOW_SUDO is False")
-        if app_settings.REBAC_REQUIRE_SUDO_REASON and not reason:
-            raise SudoReasonRequiredError(
-                "sudo() requires reason= when REBAC_REQUIRE_SUDO_REASON=True"
-            )
+        require_sudo_allowed(reason, allow_when_disabled=allow_when_sudo_disabled)
         clone = self._clone()
         clone._rebac_actor = None
         clone._rebac_sudo_reason = reason
         clone._rebac_sudo_audited = False
+        clone._rebac_bypass_entry = object()
         clone._rebac_internal_bypass = internal
         clone._rebac_ambient_bypass = False
         clone._refresh_scope()
@@ -899,7 +1052,7 @@ class RebacQuerySet(models.QuerySet[_M]):
         reason = self._bypass_audit_reason()
         if reason is None:
             return
-        _emit_bypass_audit(reason)
+        _emit_bypass(reason)
         self._rebac_sudo_audited = True
 
     def actor(self) -> SubjectRef | None:
@@ -935,12 +1088,14 @@ class RebacQuerySet(models.QuerySet[_M]):
         """``prefetch_related`` with actor-scoped querysets for protected targets."""
         if lookups == (None,):
             return self.prefetch_related(None)
-        from .relation_loading import relation_actor, scope_prefetch_lookups
+        from .relation_loading import scope_prefetch_lookups
 
+        # A protected prefetch takes the queryset's own pin; with_actor()
+        # re-pins it, and without one it resolves when the prefetch runs.
         scoped = scope_prefetch_lookups(
             self.model,
             lookups,
-            actor=relation_actor(self),
+            actor=self._rebac_actor,
             mode=self._rebac_field_deny,
         )
         return self.prefetch_related(*scoped)
@@ -950,77 +1105,50 @@ class RebacQuerySet(models.QuerySet[_M]):
     def effective_actor(self, *, strict: bool = False) -> tuple[SubjectRef | None, bool]:
         """Return ``(actor_ref, is_unscoped)`` for this queryset.
 
-        ``is_unscoped`` is true when evaluation should bypass row scoping:
-        explicit queryset sudo, ambient sudo with no pinned actor, or
-        ``REBAC_STRICT_MODE=False`` with no actor. In observer mode
-        (``strict=False``), a strict-mode no-actor state returns
-        ``(None, False)`` instead of raising.
+        A related manager gives its fresh queryset the source instance's actor
+        pin, never its sudo pin. The queryset's own actor or sudo pin remains
+        authoritative. ``scoped_for_aggregate()`` fails closed without an
+        actor in either strict mode. In observer mode (``strict=False``), a
+        strict-mode no-actor state returns ``(None, False)`` instead of raising.
 
-        Resolution order: per-queryset sudo → per-queryset actor →
-        ambient sudo → ambient actor → strict-mode fallback.
+        Resolution order: queryset sudo, queryset actor, related instance
+        actor, ambient sudo, ambient actor, then the strict-mode fallback.
         """
-        if self._rebac_sudo_reason is not None:
-            return (None, True)
-        if self._rebac_actor is not None:
-            return (self._rebac_actor, False)
-        if _is_sudo_ambient():
-            return (None, True)
-        ambient = _current_actor()
-        if ambient is not None:
-            return (ambient, False)
-        if self._rebac_aggregate_scope:
-            return (None, False)
-        if app_settings.REBAC_STRICT_MODE:
-            if strict:
-                raise MissingActorError(
-                    f"Queryset on {self.model.__name__} materialised without an actor. "
-                    f"Use .with_actor(actor), .as_user(user), "
-                    f".as_agent(agent, on_behalf_of=user), "
-                    f"or .sudo(reason='...'). Or set REBAC_STRICT_MODE=False "
-                    f"(NOT recommended)."
-                )
-            return (None, False)
-        # STRICT_MODE=False: fall through unscoped.
-        return (None, True)
-
-    def _resolve_effective_actor(self, *, audit: bool = True) -> tuple[SubjectRef | None, bool]:
-        """Deprecated private wrapper for :meth:`effective_actor`.
-
-        Removal target: 0.14. Use ``effective_actor(strict=True)`` for
-        gate/materialisation paths or ``effective_actor()`` for observer
-        paths.
-        """
-        result = self.effective_actor(strict=True)
-        if audit:
-            self._audit_bypass_once()
-        return result
+        own_sudo = self.is_sudo()
+        pinned_actor = self._rebac_actor
+        if pinned_actor is None:
+            pinned_actor = self._rebac_relation_actor
+        return resolve(
+            pinned_actor=pinned_actor,
+            pinned_sudo=own_sudo,
+            mode="relation" if self._rebac_relation_scope and not own_sudo else "row",
+            strict=strict,
+            subject_label=f"Queryset on {self.model.__name__}",
+            fail_closed=self._rebac_aggregate_scope,
+        )
 
     _rebac_scope_applied: bool = False
     # ``(actor, bypass)`` as the scope was applied.
     _rebac_scope_decision: tuple[SubjectRef | None, bool] | None = None
 
-    def _apply_scope_in_place(self, *, audit: bool = True) -> None:
-        """Inject ``<id_attr>__in=<accessible>`` onto the query's WHERE clause.
+    def _apply_scope_in_place(
+        self, *, audit: bool = True, decision: tuple[SubjectRef | None, bool] | None = None
+    ) -> None:
+        """Add the compiled permission predicate to this query's WHERE clause.
 
-        ``id_attr`` defaults to ``"pk"`` but can be flipped per-model via
-        ``Meta.rebac_id_attr`` or globally via ``REBAC_RESOURCE_ID_ATTR``.
-
-        Avoids ``self.filter(...)`` because ``.get()`` pre-slices the
-        queryset and ``.filter()`` rejects post-slice. ``Q.add_q``
-        operates at the SQL level and bypasses the slice check.
-
-        ``backend().accessible()`` is memoised per-actor + action +
-        resource_type via the ambient ``_accessible_cache`` ContextVar
-        (``rebac.actors``). A single GraphQL request that materialises
-        the same scoped queryset multiple times (aggregate primary
-        + ``totalCount`` + per-measure resolvers, paginated lookups,
-        nested edges) collapses to one ``accessible()`` graph walk —
-        the underlying relationship SQL is bounded by the schema's
-        depth, not by the number of resolvers fired.
+        The predicate tests each selected row's identity (``Meta.rebac_id_attr``
+        or ``REBAC_RESOURCE_ID_ATTR``, ``"pk"`` by default) on the queryset's
+        database alias, with its policy pinned now. It is added to the
+        underlying ``Query``, which also works after ``.get()`` slices the
+        queryset, when ``.filter()`` would be rejected.
         """
         if self._rebac_scope_applied:
             return
-        actor, sudo = self._resolve_effective_actor(audit=audit)
+        # ``decision`` is an ``(actor, bypass)`` resolved earlier by a lazy
+        # reader, which must not resolve the ambient context again.
+        actor, sudo = decision if decision is not None else self.effective_actor(strict=True)
+        if audit:
+            self._audit_bypass_once()
         self._rebac_scope_applied = True
         self._rebac_scope_decision = (actor, sudo)
         if sudo:
@@ -1048,71 +1176,29 @@ class RebacQuerySet(models.QuerySet[_M]):
             # Aggregate projection is fail-closed regardless of strict mode.
             query.where = WhereNode([query.where, _ScopeWhere(children=[NothingNode()])])
             return
-        from django.db.models import Q
-
         from .backends import backend
 
         action = str(self._rebac_action or getattr(model._meta, "rebac_default_action", "read"))
-        active_backend = backend()
-        predicate = active_backend.queryset_filter(
+        predicate = backend().queryset_filter(
             model=model, subject=actor, action=action, using=self.db
         )
-        if predicate is not None:
-            restriction = query.build_where(predicate)
-            query.where = WhereNode([query.where, _ScopeWhere(children=[restriction])])
-            return
-        if backend_grants_all(
-            active_backend,
-            subject=actor,
-            action=action,
-            resource_type=rebac_type,
-        ):
-            return
-        ids: list[Any] = list(
-            accessible_ids(
-                active_backend,
-                subject=actor,
-                action=action,
-                resource_type=rebac_type,
-            )
-        )
-        attr = resource_id_attr(model)
-        if attr == "pk":
-            # Coerce to ints when the PK is integer-typed; leave as
-            # strings for UUID/Char PKs. Only relevant for the pk path
-            # — non-pk attrs (sqid, public_id, slug) are always
-            # string-valued and pass through unchanged.
-            try:
-                pk_field = model._meta.pk
-                if pk_field is not None and pk_field.get_internal_type() in (
-                    "AutoField",
-                    "BigAutoField",
-                    "IntegerField",
-                    "BigIntegerField",
-                    "SmallIntegerField",
-                    "PositiveIntegerField",
-                    "PositiveBigIntegerField",
-                    "PositiveSmallIntegerField",
-                ):
-                    ids = [int(i) for i in ids]
-            except ValueError:
-                pass
-            except TypeError:
-                pass
-        # ``Q.add_q`` works even on sliced queries.
-        restriction = query.build_where(Q(**{f"{attr}__in": ids}))
-        # Keep the authorization clause identifiable, including in Django's
-        # cloned/combined WHERE trees, so changing actor cannot intersect stale
-        # permission IDs with the new actor's scope.
+        # The compiled predicate keeps the authorization clause identifiable,
+        # including in Django's cloned and combined WHERE trees, so a changed
+        # actor never intersects a stale scope. ``build_where`` works even on
+        # a sliced query.
+        restriction = query.build_where(predicate)
         query.where = WhereNode([query.where, _ScopeWhere(children=[restriction])])
 
     def _clone(self, **kwargs: Any) -> Self:
         # Django's private clone hook; not in django-stubs.
         clone: Self = cast(Any, super())._clone(**kwargs)
         clone._rebac_actor = self._rebac_actor
+        clone._rebac_relation_actor = self._rebac_relation_actor
+        clone._rebac_relation_scope = self._rebac_relation_scope
         clone._rebac_action = self._rebac_action
         clone._rebac_sudo_reason = self._rebac_sudo_reason
         clone._rebac_sudo_audited = self._rebac_sudo_audited
+        clone._rebac_bypass_entry = self._rebac_bypass_entry
         clone._rebac_internal_bypass = self._rebac_internal_bypass
         clone._rebac_ambient_bypass = self._rebac_ambient_bypass
         clone._rebac_field_deny = self._rebac_field_deny
@@ -1150,6 +1236,8 @@ class RebacQuerySet(models.QuerySet[_M]):
         if isinstance(query, _RebacQuery):
             query._rebac_boolean_operand = False
         clone._rebac_actor = self._rebac_actor
+        clone._rebac_relation_actor = self._rebac_relation_actor
+        clone._rebac_relation_scope = self._rebac_relation_scope
         clone._rebac_action = self._rebac_action
         clone._rebac_sudo_reason = self._rebac_sudo_reason
         clone._rebac_eager_scope = self._rebac_eager_scope
@@ -1339,8 +1427,11 @@ class RebacQuerySet(models.QuerySet[_M]):
     def _guard_projected_related_reads(self, expressions: dict[str, Any], *, query: Query) -> None:
         if not self._rebac_select_related_guards:
             return
-        from .relation_loading import protected_lookup_prefixes
+        from .relation_loading import _relation_scope, protected_lookup_prefixes
 
+        if _relation_scope(self)[1]:
+            # An ambient sudo block covers related reads with no pinned actor.
+            return
         paths = {
             path
             for guard in self._rebac_select_related_guards
@@ -1372,7 +1463,8 @@ class RebacQuerySet(models.QuerySet[_M]):
         fetching = self._result_cache is None
         if fetching:
             self._apply_scope_in_place()
-        actor, sudo = self._resolve_effective_actor()
+        actor, sudo = self.effective_actor(strict=True)
+        self._audit_bypass_once()
         field_mode = self._effective_field_mode()
         redact = actor is not None and not sudo
         if fetching:
@@ -1385,13 +1477,16 @@ class RebacQuerySet(models.QuerySet[_M]):
                 and runtime_field_deny_mode(field_mode) != "allow"
                 and bool(gated_read_fields(self.model))
             )
-        super()._fetch_all()
+        native = cast(Any, self)
+        if fetching:
+            # Django's own _fetch_all, with the rows stamped before their
+            # prefetches run: a related manager reads the row's actor pin.
+            self._result_cache = list(native._iterable_class(self))
+            self._stamp(self._result_cache, actor, sudo)
+        if native._prefetch_related_lookups and not native._prefetch_done:
+            native._prefetch_related_objects()
         if self._result_cache is not None and not self._rebac_visibility_applied:
             if actor is not None and not sudo:
-                for inst in self._result_cache:
-                    if isinstance(inst, models.Model):
-                        inst._rebac_actor = actor  # type: ignore[attr-defined]
-                        inst._rebac_field_deny = self._rebac_field_deny  # type: ignore[attr-defined]
                 if redact:
                     apply_field_visibility(
                         self._result_cache, model=self.model, actor=actor, mode=field_mode
@@ -1400,44 +1495,93 @@ class RebacQuerySet(models.QuerySet[_M]):
             self._rebac_visibility_applied = True
 
     @schema_operation
-    def iterator(self, *args: Any, **kwargs: Any) -> Any:
+    def iterator(self, chunk_size: int | None = None) -> Iterator[_M]:
+        """Django's ``iterator()``, finishing each chunk before Django would prefetch it.
+
+        Rows stream in chunks. Each chunk is stamped with the queryset's actor
+        before its prefetches run, so a related manager reads the pinned root
+        actor, then redacted and guarded like an evaluated queryset. The actors
+        are resolved when ``iterator()`` is called: consuming the chunks later,
+        under another ambient actor or none, changes nothing.
+        """
+        from .relation_loading import _relation_scope
+
+        native = cast(Any, self)
+        if chunk_size is None:
+            if native._prefetch_related_lookups:
+                raise ValueError(
+                    "chunk_size must be provided when using QuerySet.iterator() after "
+                    "prefetch_related()."
+                )
+        elif chunk_size <= 0:
+            raise ValueError("Chunk size must be strictly positive.")
         if self._result_cache is None:
             self._apply_scope_in_place()
-        actor, sudo = self._resolve_effective_actor()
+        actor, sudo = self.effective_actor(strict=True)
+        self._audit_bypass_once()
         self._guard_projected_field_reads(actor, sudo)
-        rows = list(super().iterator(*args, **kwargs))
-        if actor is not None and not sudo:
-            for inst in rows:
-                if isinstance(inst, models.Model):
-                    inst._rebac_actor = actor  # type: ignore[attr-defined]
-                    inst._rebac_field_deny = self._rebac_field_deny  # type: ignore[attr-defined]
-            apply_field_visibility(
-                rows,
-                model=self.model,
-                actor=actor,
-                mode=self._effective_field_mode(),
-            )
-        self._guard_selected_related_reads(rows)
-        return iter(rows)
+        related = _relation_scope(self) if self._rebac_select_related_guards else None
+        chunked = not connections[self.db].settings_dict.get("DISABLE_SERVER_SIDE_CURSORS")
+        size = chunk_size or 2000
+        rows = iter(native._iterable_class(self, chunked_fetch=chunked, chunk_size=size))
+        return self._finished_chunks(rows, size, actor, sudo, related)
 
-    def _guard_selected_related_reads(self, rows: Iterable[Any] | None = None) -> None:
+    def _finished_chunks(
+        self,
+        rows: Iterator[Any],
+        size: int,
+        actor: SubjectRef | None,
+        sudo: bool,
+        related: tuple[SubjectRef | None, bool] | None,
+    ) -> Iterator[_M]:
+        from itertools import islice
+
+        while chunk := list(islice(rows, size)):
+            self._stamp(chunk, actor, sudo)
+            native = cast(Any, self)
+            if native._prefetch_related_lookups:
+                models.prefetch_related_objects(chunk, *native._prefetch_related_lookups)
+            if actor is not None and not sudo:
+                apply_field_visibility(
+                    chunk, model=self.model, actor=actor, mode=self._effective_field_mode()
+                )
+            self._guard_selected_related_reads(chunk, related)
+            yield from chunk
+
+    def _stamp(self, rows: Iterable[Any], actor: SubjectRef | None, sudo: bool) -> None:
+        """Pin the queryset's actor on its materialised rows."""
+        if actor is None or sudo:
+            return
+        for inst in rows:
+            if isinstance(inst, models.Model):
+                inst._rebac_actor = actor  # type: ignore[attr-defined]
+                inst._rebac_field_deny = self._rebac_field_deny  # type: ignore[attr-defined]
+
+    def _guard_selected_related_reads(
+        self,
+        rows: Iterable[Any] | None = None,
+        scope: tuple[SubjectRef | None, bool] | None = None,
+    ) -> None:
+        """Guard selected related rows; ``scope`` is a relation scope resolved earlier."""
         if not self._rebac_select_related_guards:
             return
-        from .relation_loading import guard_selected_related_instances, relation_actor
+        from .relation_loading import _relation_scope, guard_selected_related_instances
 
         if rows is None:
             rows = self._result_cache or ()
+        actor, bypass = scope if scope is not None else _relation_scope(self)
         guard_selected_related_instances(
             rows,
             root_model=self.model,
             paths=self._rebac_select_related_guards,
-            actor=relation_actor(self),
+            actor=actor,
+            bypass=bypass,
             mode=self._effective_field_mode(),
         )
 
     # ----- Async iteration: Django's aiterator bypasses the sync overrides -----
 
-    async def aiterator(self, *args: Any, **kwargs: Any) -> AsyncIterator[_M]:
+    def aiterator(self, chunk_size: int = 2000) -> AsyncIterator[_M]:
         """Async variant of :meth:`iterator` that preserves REBAC scoping.
 
         Django's ``QuerySet.aiterator`` builds the row iterable directly rather
@@ -1456,29 +1600,68 @@ class RebacQuerySet(models.QuerySet[_M]):
         we already override, so it inherits scoping for free — only
         ``aiterator`` and :meth:`aggregate` need explicit handling.
         """
+        if chunk_size <= 0:
+            raise ValueError("Chunk size must be strictly positive.")
+        from .relation_loading import _relation_scope
+
+        # The actors are resolved now, where aiterator() is called: the chunks
+        # may be consumed later, under another ambient actor or none.
+        decision = self.effective_actor(strict=True)
+        related = _relation_scope(self) if self._rebac_select_related_guards else None
+        return self._aiterate(chunk_size, decision, related)
+
+    async def _aiterate(
+        self,
+        chunk_size: int,
+        decision: tuple[SubjectRef | None, bool],
+        related: tuple[SubjectRef | None, bool] | None,
+    ) -> AsyncIterator[_M]:
         if self._result_cache is None:
-            await sync_to_async(self._apply_scope_in_place)()
-        actor, sudo = self._resolve_effective_actor()
+            await sync_to_async(self._apply_scope_in_place)(audit=False, decision=decision)
+        actor, sudo = decision
+        self._audit_bypass_once()
         # DB-backed schemas refresh at operation boundaries. Field discovery
         # and projection guards therefore need the same worker thread as the
         # scope/visibility checks, even when the schema was loaded just above.
         await sync_to_async(self._guard_projected_field_reads)(actor, sudo)
         field_mode = self._effective_field_mode()
-        redact = runtime_field_deny_mode(field_mode) != "allow" and bool(
-            await sync_to_async(gated_read_fields)(self.model)
+        redact = (
+            actor is not None
+            and not sudo
+            and runtime_field_deny_mode(field_mode) != "allow"
+            and bool(await sync_to_async(gated_read_fields)(self.model))
         )
-        guard_related = bool(self._rebac_select_related_guards)
-        async for inst in super().aiterator(*args, **kwargs):
-            if actor is not None and not sudo and isinstance(inst, models.Model):
-                inst._rebac_actor = actor  # type: ignore[attr-defined]
-                inst._rebac_field_deny = self._rebac_field_deny  # type: ignore[attr-defined]
-                if redact:
-                    await sync_to_async(apply_field_visibility)(
-                        [inst], model=self.model, actor=actor, mode=field_mode
-                    )
-            if guard_related:
-                await sync_to_async(self._guard_selected_related_reads)([inst])
-            yield inst
+        native = cast(Any, self)
+        lookups = native._prefetch_related_lookups
+        chunked = not connections[self.db].settings_dict.get("DISABLE_SERVER_SIDE_CURSORS")
+        iterable = native._iterable_class(self, chunked_fetch=chunked, chunk_size=chunk_size)
+        chunk: list[Any] = []
+
+        async def finish(rows: list[Any]) -> None:
+            # Stamped before their prefetches: a related manager reads the
+            # pinned root actor, as in _fetch_all and iterator().
+            self._stamp(rows, actor, sudo)
+            if lookups:
+                await models.aprefetch_related_objects(rows, *lookups)
+            if redact:
+                assert actor is not None
+                await sync_to_async(apply_field_visibility)(
+                    rows, model=self.model, actor=actor, mode=field_mode
+                )
+            if related is not None:
+                await sync_to_async(self._guard_selected_related_reads)(rows, related)
+
+        async for item in iterable:
+            chunk.append(item)
+            if len(chunk) >= chunk_size:
+                await finish(chunk)
+                for row in chunk:
+                    yield row
+                chunk = []
+        if chunk:
+            await finish(chunk)
+            for row in chunk:
+                yield row
 
     # ----- Counts / existence respect scope too -----
 
@@ -1487,14 +1670,16 @@ class RebacQuerySet(models.QuerySet[_M]):
             return len(self._result_cache)
         self._apply_scope_in_place()
         # Django keeps the ordering of a sliced query.
-        self._guard_counted_reads(*self._resolve_effective_actor(), clears_ordering=False)
+        self._audit_bypass_once()
+        self._guard_counted_reads(*self.effective_actor(strict=True), clears_ordering=False)
         return super().count()
 
     def exists(self) -> bool:
         if self._result_cache is not None:
             return bool(self._result_cache)
         self._apply_scope_in_place()
-        self._guard_counted_reads(*self._resolve_effective_actor(), clears_ordering=True)
+        self._audit_bypass_once()
+        self._guard_counted_reads(*self.effective_actor(strict=True), clears_ordering=True)
         return super().exists()
 
     def _guard_counted_reads(
@@ -1519,7 +1704,8 @@ class RebacQuerySet(models.QuerySet[_M]):
         Applying scope here fixes both surfaces.
         """
         self._apply_scope_in_place()
-        actor, sudo = self._resolve_effective_actor()
+        actor, sudo = self.effective_actor(strict=True)
+        self._audit_bypass_once()
         if self._rebac_select_related_guards or (
             actor is not None
             and not sudo
@@ -1580,7 +1766,8 @@ class RebacQuerySet(models.QuerySet[_M]):
             )
         from .mixins import insertion_scope
 
-        actor, unscoped = self._resolve_effective_actor()
+        actor, unscoped = self.effective_actor(strict=True)
+        self._audit_bypass_once()
         obj._rebac_actor = actor  # type: ignore[attr-defined]
         obj._rebac_sudo_reason = None  # type: ignore[attr-defined]
         with insertion_scope(obj, actor, unscoped):
@@ -1628,7 +1815,8 @@ class RebacQuerySet(models.QuerySet[_M]):
                     f"{self.model.__name__}.bulk_create() accepts only exact "
                     f"{self.model.__name__} instances; got {type(candidate).__name__}."
                 )
-        actor, unscoped = self._resolve_effective_actor()
+        actor, unscoped = self.effective_actor(strict=True)
+        self._audit_bypass_once()
         from .signals import _gate_backed_rows
 
         _gate_backed_rows(candidates, using=self.db, actor=actor, bypass=unscoped)
@@ -1677,7 +1865,8 @@ class RebacQuerySet(models.QuerySet[_M]):
             audit_backed_denials(),
             model_write(model=self.model, using=self.db, names=kwargs) as watched,
         ):
-            actor, bypass = self._resolve_effective_actor()
+            actor, bypass = self.effective_actor(strict=True)
+            self._audit_bypass_once()
             if bypass or not (watched or model_resource_type(self.model)):
                 return self._rebac_update(**kwargs)
             if self.query.distinct_fields:
@@ -1733,24 +1922,21 @@ class RebacQuerySet(models.QuerySet[_M]):
     def _rebac_update(self, **kwargs: Any) -> int:
         from .watch import gate_policy, refuse_moving_edges
 
-        actor, sudo = self._resolve_effective_actor()
+        actor, sudo = self.effective_actor(strict=True)
+        self._audit_bypass_once()
         if sudo:
             return super().update(**kwargs)
         refuse_moving_edges(gate_policy(self.db), self.model, kwargs)
         self._guard_clause_field_reads(actor, sudo, query=self._update_query())
         rebac_type = model_resource_type(self.model)
         if rebac_type:
-            from .compile.read import deciding_afresh
-
-            # A write gate decides afresh, never through rows a scope kept.
-            with deciding_afresh():
-                self._guard_bulk_action(actor, "write")  # type: ignore[arg-type]
-                # Per-field write gates — same all-or-nothing semantics as the
-                # resource-level write check above. For each kwarg whose field
-                # has a ``write__<f>`` permission declared, every affected row
-                # must also pass that check.
-                self._guard_bulk_field_writes(actor, kwargs)  # type: ignore[arg-type]
-                self._guard_bulk_expression_reads(actor, kwargs)  # type: ignore[arg-type]
+            self._guard_bulk_action(actor, "write")  # type: ignore[arg-type]
+            # Per-field write gates — same all-or-nothing semantics as the
+            # resource-level write check above. For each kwarg whose field
+            # has a ``write__<f>`` permission declared, every affected row
+            # must also pass that check.
+            self._guard_bulk_field_writes(actor, kwargs)  # type: ignore[arg-type]
+            self._guard_bulk_expression_reads(actor, kwargs)  # type: ignore[arg-type]
         return super().update(**kwargs)
 
     def delete(self) -> tuple[int, dict[str, int]]:
@@ -1766,28 +1952,26 @@ class RebacQuerySet(models.QuerySet[_M]):
             return super().delete()
         self._for_write = True
         with model_write(model=self.model, using=self.db):
-            from .mixins import deletion_owner
+            from .mixins import delete_collected, deletion_owner
 
-            actor, unscoped = self._resolve_effective_actor()
+            actor, unscoped = self.effective_actor(strict=True)
+            self._audit_bypass_once()
             self._guard_clause_field_reads(actor, unscoped, clears_ordering=True)
             if unscoped or not model_resource_type(self.model):
                 with deletion_owner(self, self.db, actor, unscoped):
-                    return super().delete()
-            from .compile.read import deciding_afresh
-
+                    return delete_collected(self, origin=self, using=self.db)
             # The statement acts on the rows the actor's scope admits: exactly
-            # those are checked and deleted, by key.  A cascade that reaches
-            # another row checks it as an instance delete does.
+            # those are checked and deleted, by key.  The rows a cascade
+            # reaches are checked by the collector, one batch per model.
             actor = self._writing_actor(actor)
             keys = statement_keys(self._rows_in_scope(actor, reason="rebac.delete.rows"))
             parts = list(by_key(self, keys))
-            with deciding_afresh():
-                for rows in parts:
-                    rows._guard_bulk_action(actor, "delete")
+            for rows in parts:
+                rows._guard_bulk_action(actor, "delete")
             deleted: Counter[str] = Counter()
             for rows in parts:
                 with deletion_owner(rows, self.db, actor, unscoped):
-                    deleted.update(models.QuerySet.delete(rows)[1])
+                    deleted.update(delete_collected(rows, origin=rows, using=self.db)[1])
             self._result_cache = None
             return sum(deleted.values()), dict(deleted)
 
@@ -1801,7 +1985,16 @@ class RebacQuerySet(models.QuerySet[_M]):
         affected = self._affected_resource_ids_for_guard()
         if not affected:
             return
-        allowed = set(backend().accessible(subject=actor, action=action, resource_type=rebac_type))
+        allowed = set(
+            held_ids(
+                backend(),
+                subject=actor,
+                action=action,
+                model=self.model,
+                resource_ids=affected,
+                using=self.db,
+            )
+        )
         denied = affected - allowed
         if denied:
             raise PermissionDenied(
@@ -1847,11 +2040,13 @@ class RebacQuerySet(models.QuerySet[_M]):
             if action not in declared:
                 continue
             allowed = set(
-                accessible_ids(
+                held_ids(
                     backend(),
                     subject=actor,
                     action=action,
-                    resource_type=rebac_type,
+                    model=self.model,
+                    resource_ids=affected,
+                    using=self.db,
                 )
             )
             denied = affected - allowed
@@ -1891,11 +2086,13 @@ class RebacQuerySet(models.QuerySet[_M]):
         assert rebac_type is not None
         for field_name in sorted(required):
             allowed = set(
-                accessible_ids(
+                held_ids(
                     backend(),
                     subject=actor,
                     action=f"read__{field_name}",
-                    resource_type=rebac_type,
+                    model=self.model,
+                    resource_ids=affected,
+                    using=self.db,
                 )
             )
             if affected - allowed:
@@ -1948,13 +2145,15 @@ class RebacManager[M: models.Model](_RebacManagerBase[M]):  # pyright: ignore[re
     model parameter through queryset chains.
     """
 
-    def _rebac_queryset(self) -> RebacQuerySet[M]:
-        queryset = self.get_queryset()
-        if not isinstance(queryset, RebacQuerySet):
-            raise TypeError(
-                f"{type(self).__name__}.get_queryset() returned {type(queryset).__name__}; "
-                "a RebacManager must return a RebacQuerySet."
-            )
+    def get_queryset(self) -> RebacQuerySet[M]:
+        """Give a related manager's fresh queryset its source instance's actor pin."""
+        from .mixins import RebacMixin
+
+        queryset = cast(RebacQuerySet[M], super().get_queryset())
+        instance = getattr(self, "instance", None)
+        if isinstance(instance, RebacMixin) and hasattr(self, "core_filters"):
+            queryset._rebac_relation_actor = instance.actor()
+            queryset._rebac_relation_scope = True
         return queryset
 
     # Static declarations for checkers without Django's from_queryset plugin.
@@ -1995,19 +2194,18 @@ class RebacManager[M: models.Model](_RebacManagerBase[M]):  # pyright: ignore[re
 
         def insert(self, obj: M) -> M: ...
 
-    def raw(
-        self, raw_query: str, params: Any = (), translations: Any = None, using: Any = None
-    ) -> Any:
-        queryset = self._rebac_queryset()
-        _, bypass = queryset.effective_actor(strict=True)
-        if not bypass:
-            raise PermissionDenied("raw() cannot be actor-scoped; use sudo or system_context")
-        raw_method = queryset.raw
-        return raw_method(raw_query, params=params, translations=translations, using=using)
-
 
 class TrackedQuerySet[T: models.Model](models.QuerySet[T]):
     """Owning queryset without actor scoping, also used by both base managers."""
+
+    def __init__(self, *args: Any, **kwargs: Any) -> None:
+        super().__init__(*args, **kwargs)
+        query = self.query
+        if type(query) is Query:
+            # A REBAC subquery that Django resolves only while compiling (an
+            # ORDER BY expression) audits with this statement's execution, and
+            # rendering it alone audits nothing.
+            query.__class__ = _BypassAuditQuery
 
     def update(self, **kwargs: Any) -> int:
         from .actors import current_actor, is_sudo
@@ -2056,21 +2254,18 @@ class TrackedQuerySet[T: models.Model](models.QuerySet[T]):
             return sum(models.QuerySet.update(rows, **kwargs) for rows in by_key(self, keys))
 
     def delete(self) -> tuple[int, dict[str, int]]:
-        from .actors import current_actor, is_sudo
-        from .conf import app_settings
-        from .mixins import RebacMixin, deletion_owner
+        from .actors import is_sudo
+        from .mixins import RebacMixin, delete_collected, deletion_owner
         from .signals import _gate_backed_rows, audit_backed_denials
         from .watch import by_key, model_write, statement_keys
 
         self._for_write = True
-        actor = current_actor()
+        actor, ambient_unscoped = resolve(
+            mode="ambient", strict=False, subject_label="Tracked delete"
+        )
         # Resource base-manager writes are intentionally unscoped infrastructure
         # operations. Plain tracked roots retain ambient scope for resource cascades.
-        unscoped = (
-            issubclass(self.model, RebacMixin)
-            or is_sudo()
-            or (actor is None and not app_settings.REBAC_STRICT_MODE)
-        )
+        unscoped = issubclass(self.model, RebacMixin) or ambient_unscoped
         with audit_backed_denials(), model_write(model=self.model, using=self.db) as watched:
             if (
                 not watched
@@ -2079,14 +2274,15 @@ class TrackedQuerySet[T: models.Model](models.QuerySet[T]):
                 or self.query.is_sliced
             ):
                 with deletion_owner(self, self.db, actor, unscoped):
-                    return super().delete()
+                    return delete_collected(self, origin=self, using=self.db)
             keys = statement_keys(self)
             for rows in by_key(self.model._base_manager.using(self.db), keys):
                 _gate_backed_rows(rows, using=self.db, deleting=True)
             deleted: Counter[str] = Counter()
             for rows in by_key(self, keys):
                 with deletion_owner(rows, self.db, actor, unscoped):
-                    deleted.update(models.QuerySet.delete(rows)[1])
+                    deleted.update(delete_collected(rows, origin=rows, using=self.db)[1])
+            self._result_cache = None
             return sum(deleted.values()), dict(deleted)
 
     def bulk_create(

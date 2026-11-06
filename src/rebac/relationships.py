@@ -138,10 +138,8 @@ def delete_relationship(tuple_: RelationshipTuple) -> Zookie:
     Unlike ``delete_relationships(RelationshipFilter(...))``, empty optional
     subject relations and caveat names are exact values here, not wildcards.
 
-    No direct SpiceDB equivalent — SpiceDB expresses the same intent via
-    ``WriteRelationships`` with an ``OPERATION_DELETE`` update. This helper
-    is therefore local-only today; the plan for 0.4 is to lower it through
-    that path once the backend ABC accepts operation-shaped updates. See
+    No direct SpiceDB equivalent: SpiceDB expresses the same intent through
+    ``WriteRelationships`` with an ``OPERATION_DELETE`` update. See
     ``docs/ARCHITECTURE.md``.
     """
     from .actors import current_actor

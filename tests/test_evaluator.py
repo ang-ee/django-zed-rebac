@@ -12,8 +12,8 @@ from typing import Any
 import pytest
 
 from rebac import (
-    Backend,
     CheckResult,
+    LocalBackend,
     ObjectRef,
     PermissionEvaluator,
     SubjectRef,
@@ -22,12 +22,10 @@ from rebac import (
 )
 
 
-class _StubBackend(Backend):
+class _StubBackend(LocalBackend):
     """Counts calls so tests can assert "exactly one backend hit".
 
-    Subclasses :class:`Backend` so it satisfies the evaluator's type
-    contract; only ``check_access`` / ``accessible`` are exercised, the
-    rest raise.
+    Subclasses :class:`LocalBackend` so it satisfies the evaluator's type contract.
     """
 
     kind = "local"
@@ -36,24 +34,20 @@ class _StubBackend(Backend):
         self,
         *,
         check_result: CheckResult | None = None,
-        accessible_ids: tuple[str, ...] = (),
     ) -> None:
         self.check_calls = 0
-        self.accessible_calls = 0
         # ``check_result or CheckResult.has()`` would coerce a falsy
         # conditional result (allowed=False) back to .has() because
         # ``CheckResult.__bool__`` returns ``allowed``. Use explicit
         # ``is None`` instead.
         self._check_result = check_result if check_result is not None else CheckResult.has()
-        self._accessible_ids = accessible_ids
 
     def check_access(self, **_: Any) -> CheckResult:
         self.check_calls += 1
         return self._check_result
 
-    def accessible(self, **_: Any) -> tuple[str, ...]:
-        self.accessible_calls += 1
-        return self._accessible_ids
+    def _cache_generation(self, resource_type: str) -> int:
+        return 1
 
     def lookup_subjects(self, **_: Any) -> list[SubjectRef]:
         raise NotImplementedError
@@ -163,20 +157,13 @@ def test_check_with_different_context_misses():
 
 
 def test_evaluator_does_not_reuse_another_backends_grants():
-    allowed = _StubBackend(accessible_ids=("private",))
-    denied = _StubBackend(check_result=CheckResult.no(), accessible_ids=())
+    allowed = _StubBackend()
+    denied = _StubBackend(check_result=CheckResult.no())
     actor = SubjectRef.of("auth/user", "1")
     resource = ObjectRef("blog/post", "private")
     ev = PermissionEvaluator()
     assert ev.check(allowed, subject=actor, action="read", resource=resource).allowed
-    assert ev.accessible(
-        allowed, subject=actor, action="read", resource_type=resource.resource_type
-    )
     assert not ev.check(denied, subject=actor, action="read", resource=resource).allowed
-    assert (
-        ev.accessible(denied, subject=actor, action="read", resource_type=resource.resource_type)
-        == ()
-    )
 
 
 def test_evaluator_keeps_reentrant_backend_checks_separate():
@@ -192,24 +179,6 @@ def test_evaluator_keeps_reentrant_backend_checks_separate():
 
     assert ev.check(DelegatingBackend(), subject=actor, action="read", resource=resource).allowed
     assert not ev.check(denied, subject=actor, action="read", resource=resource).allowed
-
-
-def test_evaluator_keeps_reentrant_backend_lookups_separate():
-    ev = PermissionEvaluator()
-    denied = _StubBackend(accessible_ids=())
-    actor = SubjectRef.of("auth/user", "1")
-
-    class DelegatingBackend(_StubBackend):
-        def accessible(self, **_: Any) -> tuple[str, ...]:
-            assert (
-                ev.accessible(denied, subject=actor, action="read", resource_type="blog/post") == ()
-            )
-            return ("private",)
-
-    assert ev.accessible(
-        DelegatingBackend(), subject=actor, action="read", resource_type="blog/post"
-    ) == ("private",)
-    assert ev.accessible(denied, subject=actor, action="read", resource_type="blog/post") == ()
 
 
 @pytest.mark.parametrize("second_value", [1, 1.0])
@@ -240,28 +209,6 @@ def test_evaluator_complex_context_bypasses_cache(value):
     backend._check_result = CheckResult.no()
     assert not ev.check(backend, **args, context={"data": value}).allowed
     assert ev.stats()["check_entries"] == 0
-
-
-# ---------- Accessible cache hit/miss ----------
-
-
-def test_accessible_dedups_same_args():
-    backend = _StubBackend(accessible_ids=("a", "b", "c"))
-    subj = SubjectRef.of("auth/user", "1")
-    ev = PermissionEvaluator()
-    out1 = ev.accessible(backend, subject=subj, action="read", resource_type="blog/post")
-    out2 = ev.accessible(backend, subject=subj, action="read", resource_type="blog/post")
-    assert backend.accessible_calls == 1
-    assert out1 == out2 == ("a", "b", "c")
-
-
-def test_accessible_different_resource_type_miss():
-    backend = _StubBackend(accessible_ids=())
-    subj = SubjectRef.of("auth/user", "1")
-    ev = PermissionEvaluator()
-    ev.accessible(backend, subject=subj, action="read", resource_type="blog/post")
-    ev.accessible(backend, subject=subj, action="read", resource_type="drive/file")
-    assert backend.accessible_calls == 2
 
 
 # ---------- LRU eviction ----------
@@ -324,32 +271,11 @@ def test_lru_move_to_end_on_hit():
     assert backend.check_calls == pre + 1
 
 
-def test_eviction_shared_between_check_and_accessible():
-    """Total entries across BOTH caches counts against the limit."""
-    backend = _StubBackend(accessible_ids=())
-    ev = PermissionEvaluator(max_size=2)
-    ev.check(
-        backend,
-        subject=SubjectRef.of("auth/user", "1"),
-        action="read",
-        resource=ObjectRef("blog/post", "p"),
-    )
-    ev.accessible(
-        backend, subject=SubjectRef.of("auth/user", "1"), action="read", resource_type="x"
-    )
-    ev.accessible(
-        backend, subject=SubjectRef.of("auth/user", "2"), action="read", resource_type="x"
-    )
-    # 3 inserted, 2 max — one evicted.
-    stats = ev.stats()
-    assert stats["check_entries"] + stats["accessible_entries"] == 2
-
-
 # ---------- Invalidation ----------
 
 
 def test_invalidate_drops_all_entries():
-    backend = _StubBackend(accessible_ids=())
+    backend = _StubBackend()
     ev = PermissionEvaluator()
     ev.check(
         backend,
@@ -357,17 +283,9 @@ def test_invalidate_drops_all_entries():
         action="read",
         resource=ObjectRef("blog/post", "p"),
     )
-    ev.accessible(
-        backend,
-        subject=SubjectRef.of("auth/user", "1"),
-        action="read",
-        resource_type="blog/post",
-    )
     assert ev.stats()["check_entries"] == 1
-    assert ev.stats()["accessible_entries"] == 1
     ev.invalidate()
     assert ev.stats()["check_entries"] == 0
-    assert ev.stats()["accessible_entries"] == 0
 
 
 # ---------- Scope isolation ----------

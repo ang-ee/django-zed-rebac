@@ -101,9 +101,7 @@ def _seed_db_schema(resource_type: str, perm_name: str, expr_text: str) -> Schem
 
 @pytest.mark.django_db(transaction=True)
 @pytest.mark.parametrize("warm_cache", [False, True])
-@pytest.mark.parametrize(
-    "surface", ["check", "accessible", "lookup", "grants_all", "evaluator", "evaluator_accessible"]
-)
+@pytest.mark.parametrize("surface", ["check", "accessible", "lookup", "grants_all", "evaluator"])
 def test_expired_override_cannot_grant_access(monkeypatch, warm_cache, surface):
     from django.utils import timezone
 
@@ -139,12 +137,6 @@ def test_expired_override_cannot_grant_access(monkeypatch, warm_cache, surface):
             )
         if surface == "evaluator":
             return evaluator.check(local, subject=viewer, action="read", resource=post).allowed
-        if surface == "evaluator_accessible":
-            return bool(
-                evaluator.accessible(
-                    local, subject=viewer, action="read", resource_type="blog/post"
-                )
-            )
         if surface == "grants_all":
             return local.grants_all(subject=viewer, action="read", resource_type="blog/post")
         return local.check_access(subject=viewer, action="read", resource=post).allowed

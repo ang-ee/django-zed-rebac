@@ -133,8 +133,6 @@ def test_one_generic_foreign_key_backs_a_relation_per_type():
         )
         assert resolved.target_model is model
         assert resolved.target_values_path() == "object_id"
-        # Nothing constrains the object id: keys are read through the target's rows.
-        assert not resolved.keeps_target("default")
 
 
 @pytest.mark.parametrize(
@@ -430,18 +428,14 @@ def edges(world):
 READABLE = ("mine", "shared", "post", "child")
 
 
-@pytest.mark.parametrize("decided", [True, False], ids=["decided", "inline"])
-def test_a_scope_reads_the_edges_whose_target_is_readable(world, edges, monkeypatch, decided):
-    if not decided:
-        monkeypatch.setattr(read, "_ROW_LIMIT", 0)
+def test_a_scope_reads_the_edges_whose_target_is_readable(world, edges):
     rows = Attachment.objects.with_actor(ALICE)
     assert set(rows.values_list("pk", flat=True)) == {edges[name].pk for name in READABLE}
     assert not Attachment.objects.with_actor(BOB).exists()
     # The edges of one record, with no check per edge.
     with CaptureQueriesContext(connection) as queries:
         assert list(rows.filter(**at(world.mine))) == [edges["mine"]]
-    # One decision for each target type, then the edges.
-    assert len(queries) == 4 + 1
+    assert len(queries) == 1
 
 
 def test_checks_enumeration_and_subjects_agree_with_the_reference(world, edges):

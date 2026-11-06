@@ -28,7 +28,7 @@ from django.db.models.base import ModelBase
 from django.db.models.options import DEFAULT_NAMES
 
 from ._id import resource_id_attr
-from .actors import _as_actor_only, _bypass_unaudited, actor_context, is_sudo, system_context
+from .actors import _as_actor_only, _bypass_unaudited, actor_context, system_context
 from .conf import app_settings
 from .errors import PermissionDenied
 from .field_visibility import (
@@ -258,6 +258,8 @@ class DeleteScope:
     unscoped: bool
     identities: set[ObjectRef] = dataclass_field(default_factory=set)
     root_pks: frozenset[Any] = frozenset()
+    # The collected rows whose delete was authorized, by model.
+    covered_pks: dict[type[models.Model], set[Any]] = dataclass_field(default_factory=dict)
 
 
 _delete_scopes: ContextVar[tuple[DeleteScope, ...]] = ContextVar("rebac_delete_scopes", default=())
@@ -298,6 +300,101 @@ def deletion_owner(
         cleanup_identities(scope.identities, using=using)
     finally:
         _delete_scopes.reset(token)
+
+
+def delete_collected(
+    rows: Any, *, origin: Any, using: str, keep_parents: bool = False
+) -> tuple[int, dict[str, int]]:
+    """Delete as Django does, authorizing each collected resource model as one batch.
+
+    Django's collector gathers the root and its cascade first. Every resource
+    model in the collection is then checked for ``delete`` in one batch for the
+    owner's actor, before any row is removed; the root rows its owner already
+    checked are covered. ``pre_delete`` skips the rows covered here.
+    """
+    from django.db.models.deletion import Collector
+
+    from .backends import backend
+    from .errors import MissingActorError, PermissionDenied
+
+    scope = delete_scope(origin, using)
+    assert scope is not None
+    collector = Collector(using=using, origin=origin)
+    if isinstance(rows, models.QuerySet):
+        cast(Any, rows)._not_support_combined_queries("delete")
+        if rows.query.is_sliced:
+            raise TypeError("Cannot use 'limit' or 'offset' with delete().")
+        if rows.query.distinct_fields:
+            raise TypeError("Cannot call delete() after .distinct(*fields).")
+        if cast(Any, rows)._fields is not None:
+            raise TypeError("Cannot call delete() after .values() or .values_list()")
+        del_query = cast(Any, rows)._chain()
+        del_query._for_write = True
+        query = del_query.query
+        query.select_for_update = False
+        query.select_related = False
+        query.clear_ordering(force=True)
+        collector.collect(del_query)
+    else:
+        if not cast(Any, rows)._is_pk_set():
+            raise ValueError(
+                f"{rows._meta.object_name} object can't be deleted because its "
+                f"{rows._meta.pk.attname} attribute is set to None."
+            )
+        collector.collect(cast(Any, [rows]), keep_parents=keep_parents)
+    for model, instances in sorted(
+        collector.data.items(), key=lambda item: item[0]._meta.label_lower
+    ):
+        if not issubclass(model, RebacMixin):
+            continue
+        resource_type = model_resource_type(model)
+        if resource_type is None:
+            continue
+        covered = scope.covered_pks.setdefault(model, set())
+        if isinstance(origin, models.QuerySet):
+            if model is origin.model:
+                covered.update(scope.root_pks)
+        elif model is type(origin):
+            covered.add(origin.pk)
+        candidates = [instance for instance in instances if instance.pk not in covered]
+        if not candidates:
+            continue
+        if scope.unscoped:
+            covered.update(instance.pk for instance in candidates)
+            continue
+        if scope.actor is None:
+            raise MissingActorError("Cascaded delete has no actor.")
+        identity = resource_id_attr(model)
+        identities = {str(getattr(instance, identity)): instance.pk for instance in candidates}
+        granted = backend().held_many(
+            subject=scope.actor,
+            actions=("delete",),
+            resource_type=resource_type,
+            ids=identities,
+            using=using,
+        )["delete"]
+        denied = sorted(set(identities) - granted)
+        if denied:
+            resource = ObjectRef(resource_type, denied[0])
+            _maybe_audit_denial(actor=scope.actor, action="delete", resource=resource)
+            raise PermissionDenied(f"Denied: {scope.actor} cannot delete {resource}")
+        covered.update(identities.values())
+    result = collector.delete()
+    if isinstance(rows, models.QuerySet):
+        rows._result_cache = None
+    return result
+
+
+def _next_delete_is_model(instance: models.Model, owner: type[models.Model]) -> bool:
+    """Whether the delete after ``owner``'s in the MRO is Django's own.
+
+    Only then does the collector run here; a consumer override keeps its call.
+    """
+    lineage = type(instance).__mro__
+    for base in lineage[lineage.index(owner) + 1 :]:
+        if "delete" in base.__dict__:
+            return base is models.Model
+    return False
 
 
 @contextmanager
@@ -434,21 +531,25 @@ class RebacTrackedMixin(models.Model, metaclass=RebacModelBase):
     def delete(
         self, using: str | None = None, keep_parents: bool = False
     ) -> tuple[int, dict[str, int]]:
-        from .actors import current_actor
-        from .conf import app_settings
+        from .actors import resolve
         from .signals import audit_backed_denials
         from .watch import model_write
 
         alias = using or router.db_for_write(type(self), instance=self)
         if delete_scope(self, alias) is not None:
+            if _next_delete_is_model(self, RebacTrackedMixin):
+                return delete_collected(self, origin=self, using=alias, keep_parents=keep_parents)
             return super().delete(using=alias, keep_parents=keep_parents)
-        actor = current_actor()
-        unscoped = is_sudo() or (actor is None and not app_settings.REBAC_STRICT_MODE)
+        actor, unscoped = resolve(mode="ambient", strict=False, subject_label=type(self).__name__)
         with audit_backed_denials(), model_write(model=type(self), using=alias):
             from .signals import _gate_backed_field_change
 
             _gate_backed_field_change(type(self), self, alias, None, deleting=True)
             with deletion_owner(self, alias, actor, unscoped):
+                if _next_delete_is_model(self, RebacTrackedMixin):
+                    return delete_collected(
+                        self, origin=self, using=alias, keep_parents=keep_parents
+                    )
                 return super().delete(using=alias, keep_parents=keep_parents)
 
 
@@ -921,15 +1022,9 @@ class RebacMixin(RebacTrackedMixin):
         on this instance. FK / reverse-FK / M2M accessors do not — and
         must not — inherit the flag.
         """
-        from .conf import app_settings
-        from .errors import SudoNotAllowedError, SudoReasonRequiredError
+        from .actors import require_sudo_allowed
 
-        if not app_settings.REBAC_ALLOW_SUDO:
-            raise SudoNotAllowedError("sudo() denied: REBAC_ALLOW_SUDO is False")
-        if app_settings.REBAC_REQUIRE_SUDO_REASON and not reason:
-            raise SudoReasonRequiredError(
-                "sudo() requires reason= when REBAC_REQUIRE_SUDO_REASON=True"
-            )
+        require_sudo_allowed(reason)
         self._rebac_sudo_reason = reason
         self._rebac_sudo_audited = False
         return self
@@ -954,17 +1049,9 @@ class RebacMixin(RebacTrackedMixin):
             # Inside a check everything is rolled back: the real save audits it.
             return
         from .actors import current_actor
-        from .audit import emit
-        from .models import PermissionAuditEvent
+        from .audit import emit_bypass
 
-        actor = current_actor()
-        emit(
-            PermissionAuditEvent.KIND_SUDO_BYPASS,
-            actor=actor,
-            origin=actor,
-            reason=self._rebac_sudo_reason,
-            defer_to_commit=False,
-        )
+        emit_bypass(self._rebac_sudo_reason, actor=current_actor())
         self._rebac_sudo_audited = True
 
     def is_sudo(self) -> bool:
@@ -983,33 +1070,21 @@ class RebacMixin(RebacTrackedMixin):
         fallback. In observer mode (``strict=False``), a strict-mode no-actor
         state returns ``(None, False)`` instead of raising.
         """
-        from .actors import current_actor as _current_actor
-        from .actors import is_sudo as _is_sudo_ambient
-        from .conf import app_settings
-        from .errors import MissingActorError
+        from .actors import resolve
 
         insert = _insert_scope.get()
         if insert is not None and insert[0] is self:
             return insert[1], insert[2]
-        if self._rebac_sudo_reason is not None:
-            if strict:
-                self._audit_bypass_once()
-            return (None, True)
-        if self._rebac_actor is not None:
-            return (self._rebac_actor, False)
-        if _is_sudo_ambient():
-            return (None, True)
-        ambient = _current_actor()
-        if ambient is not None:
-            return (ambient, False)
-        if app_settings.REBAC_STRICT_MODE:
-            if strict:
-                raise MissingActorError(
-                    f"{type(self).__name__}.check_access() called with no actor. "
-                    f"Use instance.with_actor(actor) or wrap in `with sudo(reason='...'):`."
-                )
-            return (None, False)
-        return (None, True)
+        result = resolve(
+            pinned_actor=self._rebac_actor,
+            pinned_sudo=self.is_sudo(),
+            mode="row",
+            strict=strict,
+            subject_label=f"{type(self).__name__}.check_access()",
+        )
+        if strict and self.is_sudo():
+            self._audit_bypass_once()
+        return result
 
     # ----- Check API (Odoo PR #179148 triple) -----
 

@@ -22,7 +22,6 @@ from ..errors import SchemaError
 from ..field_backing import (
     resolve_field_backing,
 )
-from ..resources import model_resource_type
 from ..schema.ast import (
     AllowedSubject,
     AttributeBinding,
@@ -51,7 +50,6 @@ from ..types import (
     SubjectRef,
     Zookie,
 )
-from .base import Backend
 
 _backend_registry_lock = Lock()
 _db_loaded_backends: WeakSet[LocalBackend] = WeakSet()
@@ -99,10 +97,34 @@ def _enforced_schema_errors(schema: Schema) -> list[str]:
     return backing_errors + subject_relation_errors(schema)
 
 
-class LocalBackend(Backend):
-    """Evaluates permissions as queries over the application's own tables."""
+class LocalBackend:
+    """Evaluates permissions as queries over the application's own tables.
+
+    Two entry points read permissions in bulk: ``accessible()`` enumerates the
+    ids of a type an actor holds, and ``held()`` checks supplied candidate ids.
+    """
 
     kind = "local"
+
+    def has_access(
+        self,
+        *,
+        subject: SubjectRef,
+        action: str,
+        resource: ObjectRef,
+        context: dict[str, Any] | None = None,
+        consistency: Consistency | None = None,
+        at_zookie: Zookie | None = None,
+    ) -> bool:
+        """Boolean shorthand for the three-state permission check."""
+        return self.check_access(
+            subject=subject,
+            action=action,
+            resource=resource,
+            context=context,
+            consistency=consistency,
+            at_zookie=at_zookie,
+        ).allowed
 
     @staticmethod
     def _validate_consistency(consistency: Consistency | None, at_zookie: Zookie | None) -> None:
@@ -207,11 +229,13 @@ class LocalBackend(Backend):
         connection = connections[SchemaDefinition.objects.db]
         evaluator = current_evaluator()
         operation = _schema_operation_scope.get()
-        # Manual transactions have no observable on_commit lifecycle. Keep
-        # their pins operation-local, as before revision caching was added.
-        scoped = connection.get_autocommit() or (
-            connection.in_atomic_block and connection.commit_on_exit
-        )
+        # A rollback has no library-owned notification. Transactional pins
+        # therefore live for one operation, including reused Atomic blocks.
+        scoped = connection.get_autocommit() and not connection.in_atomic_block
+        if evaluator is not None and not scoped:
+            # A transactional read can see a revision that later rolls back.
+            # Refresh the evaluator pin on its next autocommit operation.
+            evaluator._schema_scope.snapshots(connection).clear()
         scope = evaluator._schema_scope if evaluator is not None and scoped else operation
         pins = scope.snapshots(connection) if scope is not None else None
         operation_pins = operation.snapshots(connection) if operation is not None else None
@@ -558,21 +582,17 @@ class LocalBackend(Backend):
         at_zookie: Zookie | None = None,
     ) -> CheckResult:
         self._validate_consistency(consistency, at_zookie)
-        from contextlib import nullcontext
-
-        from ..compile.read import check, deciding_afresh
+        from ..compile.read import check
         from ..models import active_relationship_model
 
-        latest = consistency == Consistency.FULLY_CONSISTENT
-        with deciding_afresh() if latest else nullcontext():
-            return check(
-                backend=self,
-                resource=resource,
-                action=action,
-                actor=subject,
-                context=context,
-                using=active_relationship_model().objects.db,
-            )
+        return check(
+            backend=self,
+            resource=resource,
+            action=action,
+            actor=subject,
+            context=context,
+            using=active_relationship_model().objects.db,
+        )
 
     def check_bulk_permissions(
         self,
@@ -582,16 +602,12 @@ class LocalBackend(Backend):
         at_zookie: Zookie | None = None,
     ) -> list[CheckResult]:
         self._validate_consistency(consistency, at_zookie)
-        from contextlib import nullcontext
-
-        from ..compile.read import check_many, deciding_afresh
+        from ..compile.read import check_many
         from ..models import active_relationship_model
 
-        latest = consistency == Consistency.FULLY_CONSISTENT
-        with deciding_afresh() if latest else nullcontext():
-            return check_many(
-                backend=self, items=list(items), using=active_relationship_model().objects.db
-            )
+        return check_many(
+            backend=self, items=list(items), using=active_relationship_model().objects.db
+        )
 
     @_schema_operation
     def queryset_filter(
@@ -601,12 +617,32 @@ class LocalBackend(Backend):
         subject: SubjectRef,
         action: str,
         using: str,
-    ) -> models.Q | None:
+    ) -> models.Q:
+        """The compiled scope of ``model`` rows; no row for a model without a resource type."""
         from ..compile.read import scope_q
 
-        if model_resource_type(model) is None:
-            return None
         return scope_q(backend=self, model=model, action=action, actor=subject, using=using)
+
+    @_schema_operation
+    def permission_expression(
+        self,
+        *,
+        model: type[models.Model],
+        subject: SubjectRef,
+        action: str,
+        using: str,
+        identity: models.Expression,
+    ) -> models.Expression:
+        from ..compile.read import scope_expression
+
+        return scope_expression(
+            backend=self,
+            model=model,
+            action=action,
+            actor=subject,
+            using=using,
+            identity=identity,
+        )
 
     @_schema_operation
     def accessible(
@@ -619,26 +655,70 @@ class LocalBackend(Backend):
         consistency: Consistency | None = None,
         at_zookie: Zookie | None = None,
     ) -> Iterable[str]:
-        from contextlib import nullcontext
-
-        from ..compile.read import accessible_ids, deciding_afresh
+        from ..compile.read import accessible_ids
         from ..models import active_relationship_model
 
         self._validate_consistency(consistency, at_zookie)
-        # The latest state asked for explicitly is not read through rows an
-        # evaluator scope kept (proposal 0017).
-        latest = consistency == Consistency.FULLY_CONSISTENT
-        with deciding_afresh() if latest else nullcontext():
-            return list(
-                accessible_ids(
-                    backend=self,
-                    resource_type=resource_type,
-                    action=action,
-                    actor=subject,
-                    using=active_relationship_model().objects.db,
-                    context=context,
-                )
+        return list(
+            accessible_ids(
+                backend=self,
+                resource_type=resource_type,
+                action=action,
+                actor=subject,
+                using=active_relationship_model().objects.db,
+                context=context,
             )
+        )
+
+    @_schema_operation
+    def held(
+        self,
+        *,
+        subject: SubjectRef,
+        action: str,
+        resource_type: str,
+        ids: Iterable[str],
+        context: dict[str, Any] | None = None,
+        using: str | None = None,
+    ) -> set[str]:
+        """The candidate ids on which the subject holds the action."""
+        from ..compile.read import held
+        from ..models import active_relationship_model
+
+        return held(
+            backend=self,
+            resource_type=resource_type,
+            action=action,
+            actor=subject,
+            ids=ids,
+            using=using or active_relationship_model().objects.db,
+            context=context,
+        )
+
+    @_schema_operation
+    def held_many(
+        self,
+        *,
+        subject: SubjectRef,
+        actions: Iterable[str],
+        resource_type: str,
+        ids: Iterable[str],
+        context: dict[str, Any] | None = None,
+        using: str | None = None,
+    ) -> dict[str, set[str]]:
+        """The held candidate ids per action, equal permissions decided once."""
+        from ..compile.read import held_many
+        from ..models import active_relationship_model
+
+        return held_many(
+            backend=self,
+            resource_type=resource_type,
+            actions=actions,
+            actor=subject,
+            ids=ids,
+            using=using or active_relationship_model().objects.db,
+            context=context,
+        )
 
     @_schema_operation
     def grants_all(

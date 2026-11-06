@@ -282,10 +282,10 @@ def test_direct_share_revocation_refreshes_pending_and_rebound_querysets(active)
     post = _posts("shared")["shared"]
     share = _grant(post, "shared", ALICE)
     active.write_relationships([share, _grant(post, "approved", ALICE)])
-    with evaluator_scope() as evaluator:
-        assert evaluator.accessible(
-            active, subject=ALICE, action="read", resource_type="blog/post"
-        ) == (str(post.pk),)
+    with evaluator_scope():
+        assert set(active.accessible(subject=ALICE, action="read", resource_type="blog/post")) == {
+            str(post.pk)
+        }
         pending = Post.objects.with_actor(ALICE)
         eager = pending.scoped()
         assert list(eager.values_list("pk", flat=True)) == [post.pk]
@@ -293,8 +293,7 @@ def test_direct_share_revocation_refreshes_pending_and_rebound_querysets(active)
         _assert_post_visibility(active, pending, ALICE, "read", [])
         _assert_post_visibility(active, eager.with_actor(ALICE), ALICE, "read", [])
         assert (
-            evaluator.accessible(active, subject=ALICE, action="read", resource_type="blog/post")
-            == ()
+            list(active.accessible(subject=ALICE, action="read", resource_type="blog/post")) == []
         )
         active.write_relationships([share])
         _assert_post_visibility(active, pending.all(), ALICE, "read", [post])
@@ -460,13 +459,13 @@ def test_field_owner_sql_cost_is_independent_of_visible_row_count(active, corpus
         large_cost = measure(1 + corpus)
     assert large_cost == small_cost
     # One aggregate and one bounded page; the evaluator scope keeps the
-    # actor's stored sets from the warm-up read.
+    # schema pin from the warm-up read.
     assert large_cost[0] == 2
     # A fixed statement, independent of the number of visible IDs. The count
-    # changes only with the compiler.
+    # changes only with the compiler; recursive CTE lowering raises the fixed count.
     # Django 6.1 compares the top-level boolean scope predicate with True (one
     # parameter) where the backend has no native boolean type.
-    assert large_cost[1] == 93 + (not connection.features.has_native_boolean_field)
+    assert large_cost[1] == 97 + (not connection.features.has_native_boolean_field)
 
 
 def test_stored_arrow_resolves_virtual_targets_without_row_multiplication(active):
