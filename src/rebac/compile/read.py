@@ -886,6 +886,7 @@ class _Scope(Expression):
 
 
 @schema_operation
+@schema_operation
 def scope_q(
     *,
     backend: LocalBackend,
@@ -894,14 +895,39 @@ def scope_q(
     actor: SubjectRef,
     using: str,
 ) -> Q:
+    if model_resource_type(model) is None:
+        return Q(pk__in=[])
+    return Q(
+        scope_expression(backend=backend, model=model, action=action, actor=actor, using=using)
+    )
+
+
+@schema_operation
+def scope_expression(
+    *,
+    backend: LocalBackend,
+    model: type[models.Model],
+    action: str,
+    actor: SubjectRef,
+    using: str,
+    identity: Expression | None = None,
+) -> Expression:
+    """The Boolean scope of ``model`` rows, its policy and caveat verdicts pinned now.
+
+    ``identity`` replaces the scope's own identity column, for a caller that
+    resolved it through another query path.
+    """
     resource_type = model_resource_type(model)
     if resource_type is None:
-        return Q(pk__in=[])
-    policy = _policy(backend)
+        return Value(False, output_field=models.BooleanField())
     key = (resource_type, action)
-    operation = _Operation.begin(backend, actor, using, policy=policy)
-    verdicts = operation.verdicts(key)
-    return Q(_Scope(backend, model, action, actor, using, policy, verdicts))
+    operation = _Operation.begin(backend, actor, using, policy=_policy(backend))
+    expression = _Scope(
+        backend, model, action, actor, using, operation.policy, operation.verdicts(key)
+    )
+    if identity is not None:
+        expression.set_source_expressions([identity])
+    return expression
 
 
 # ---------- Enumeration ----------

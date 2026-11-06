@@ -99,6 +99,12 @@ not a code change**.
   (snake_case wrappers around `CheckPermission`, `CheckBulkPermissions`,
   `LookupResources`, `LookupSubjects`, `WriteRelationships`, `WriteSchema`,
   `ExpandPermissionTree`).
+- **Exception: Django projections of a permission.** `permission_expression`
+  (with the `Backend.permission_expression` hook) embeds in a Django statement
+  the same lower-bound answer `check_access` gives, for an explicit actor. It
+  adds no permission semantics and no enumeration a SpiceDB client lacks; a
+  backend without the hook falls back to the actor-scoped queryset. It is an
+  ORM integration surface like queryset scoping, not a new RPC.
 - **Do** emit `use typechecking` at the top of every generated `.zed` file
   (catches mutually-exclusive-type intersections at WriteSchema time).
 

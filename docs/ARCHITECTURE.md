@@ -505,6 +505,7 @@ from rebac import (
 
     # Convenience helpers
     write_relationships, delete_relationships, delete_relationship, backend,
+    permission_expression,             # lazy explicit-actor Boolean Django projection
 
     # One transaction and one validation for a block of stored-schema writes
     schema_changes,
@@ -2506,6 +2507,29 @@ Actor-scoped `bulk_create(update_conflicts=True)` raises `PermissionDenied`
 before writing: a proposed-row create check cannot authorize updates to existing
 rows or their protected fields. Use checked instance saves for those updates,
 or explicitly bypass with `.sudo(reason=...)` for a trusted bulk import.
+
+### Lazy permission projections
+
+`permission_expression(model, action, *, actor)` returns a Django Boolean
+expression: whether `actor` definitely holds `action` on each row of the
+query. It captures the explicit actor at construction and never takes
+authority from an ambient actor or `sudo`. Constructing it reads nothing. The
+executing database and the policy bind when its SQL is compiled, so it is the
+one permission predicate whose policy is chosen at compilation: compiling it
+reads the schema revision, unless an evaluator scope has pinned it, and the
+caveat-verdict rows of the permission, and a policy published since
+construction applies. A queryset scope instead pins
+its policy when the queryset owner builds it.
+
+The owning model must be the query's model, its proxy equivalent or a
+multi-table ancestor. Django's own metadata resolves the identity column
+before compilation, so cloning and relabeling keep its alias; an ancestor is
+correlated through `OuterRef` over the same parent path. For the query's own
+model the backend's `permission_expression` hook embeds the lower-bound scope
+predicate on the resolved identity, with no join. An ancestor, or a backend
+without the hook, uses an actor-scoped correlated queryset. Denied and
+conditional answers and SQL NULL project false. The policy fence and every
+fact remain predicates of the executing statement; no answer is remembered.
 
 ### Field-level read gates (`read__<field>`)
 

@@ -79,6 +79,7 @@ if TYPE_CHECKING:
     from .audit import emit as emit_audit_event
     from .backends import Backend, LocalBackend, SpiceDBBackend, backend
     from .decorators import check_permission, rebac_resource, require_permission
+    from .expressions import permission_expression
     from .field_backing import GenericTarget, generic_target, proposed_forward_relationships
     from .managers import RebacManager, RebacQuerySet, TrackedManager, TrackedQuerySet
     from .mcp import default_actor_resolver, get_mcp_actor_resolver, rebac_mcp_tool
@@ -95,6 +96,7 @@ if TYPE_CHECKING:
 
 
 _LAZY = {
+    "permission_expression": ("rebac.expressions", "permission_expression"),
     "RebacTrackedMixin": ("rebac.mixins", "RebacTrackedMixin"),
     "RebacMixin": ("rebac.mixins", "RebacMixin"),
     "RebacManager": ("rebac.managers", "RebacManager"),
@@ -214,6 +216,7 @@ __all__ = [
     "SchemaError",
     "RebacError",
     # helpers
+    "permission_expression",
     "write_relationships",
     "delete_relationship",
     "delete_relationships",

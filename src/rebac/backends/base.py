@@ -116,6 +116,23 @@ class Backend(ABC):
         """Optional ORM execution strategy; None preserves resource enumeration."""
         return None
 
+    def permission_expression(
+        self,
+        *,
+        model: type[models.Model],
+        subject: SubjectRef,
+        action: str,
+        using: str,
+        identity: models.Expression,
+    ) -> models.Expression | None:
+        """Optional join-free Boolean projection of this resolved row identity.
+
+        Called when the projection's SQL is compiled, on the executing database.
+        ``None`` selects the actor-scoped correlated queryset fallback; it never
+        grants permission.
+        """
+        return None
+
     @abstractmethod
     def lookup_subjects(
         self,

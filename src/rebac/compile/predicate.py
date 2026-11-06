@@ -1189,7 +1189,9 @@ class Compiler:
         if connections[self.using].vendor not in ("postgresql", "sqlite"):
             return False
         columns = tuple(edges.query.resolve_ref(name) for name in ("resource_id", "subject_id"))
-        if not all(type(column) is Col and column.output_field is column.target for column in columns):
+        if not all(
+            type(column) is Col and column.output_field is column.target for column in columns
+        ):
             return False
         resource_field, subject_field = (column.output_field for column in columns)
         return (
