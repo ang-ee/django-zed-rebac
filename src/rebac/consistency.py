@@ -18,11 +18,8 @@ by ``effective_consistency``. Cross-request transport for SPAs / JWT
 clients is opt-in via ``REBAC_ZOOKIE_TRANSPORT`` — see ``middleware.py``
 for the header path.
 
-Backend kind guard: Zookies are NOT portable across backends. A token
-emitted by ``SpiceDBBackend`` (``kind="spicedb"``) handed to
-``LocalBackend`` would be interpreted as a numeric xid — almost
-certainly with garbage semantics. The backends validate
-``zookie.backend`` matches ``self.kind`` and raise on mismatch.
+Zookies carry a backend kind. LocalBackend validates that a supplied
+token has ``kind="local"`` before interpreting it as a numeric xid.
 """
 
 from __future__ import annotations

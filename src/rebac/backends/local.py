@@ -22,7 +22,6 @@ from ..errors import SchemaError
 from ..field_backing import (
     resolve_field_backing,
 )
-from ..resources import model_resource_type
 from ..schema.ast import (
     AllowedSubject,
     AttributeBinding,
@@ -51,7 +50,6 @@ from ..types import (
     SubjectRef,
     Zookie,
 )
-from .base import Backend
 
 _backend_registry_lock = Lock()
 _db_loaded_backends: WeakSet[LocalBackend] = WeakSet()
@@ -99,10 +97,34 @@ def _enforced_schema_errors(schema: Schema) -> list[str]:
     return backing_errors + subject_relation_errors(schema)
 
 
-class LocalBackend(Backend):
-    """Evaluates permissions as queries over the application's own tables."""
+class LocalBackend:
+    """Evaluates permissions as queries over the application's own tables.
+
+    Two entry points read permissions in bulk: ``accessible()`` enumerates the
+    ids of a type an actor holds, and ``held()`` checks supplied candidate ids.
+    """
 
     kind = "local"
+
+    def has_access(
+        self,
+        *,
+        subject: SubjectRef,
+        action: str,
+        resource: ObjectRef,
+        context: dict[str, Any] | None = None,
+        consistency: Consistency | None = None,
+        at_zookie: Zookie | None = None,
+    ) -> bool:
+        """Boolean shorthand for the three-state permission check."""
+        return self.check_access(
+            subject=subject,
+            action=action,
+            resource=resource,
+            context=context,
+            consistency=consistency,
+            at_zookie=at_zookie,
+        ).allowed
 
     @staticmethod
     def _validate_consistency(consistency: Consistency | None, at_zookie: Zookie | None) -> None:
@@ -595,11 +617,10 @@ class LocalBackend(Backend):
         subject: SubjectRef,
         action: str,
         using: str,
-    ) -> models.Q | None:
+    ) -> models.Q:
+        """The compiled scope of ``model`` rows; no row for a model without a resource type."""
         from ..compile.read import scope_q
 
-        if model_resource_type(model) is None:
-            return None
         return scope_q(backend=self, model=model, action=action, actor=subject, using=using)
 
     @_schema_operation
@@ -647,6 +668,31 @@ class LocalBackend(Backend):
                 using=active_relationship_model().objects.db,
                 context=context,
             )
+        )
+
+    @_schema_operation
+    def held(
+        self,
+        *,
+        subject: SubjectRef,
+        action: str,
+        resource_type: str,
+        ids: Iterable[str],
+        context: dict[str, Any] | None = None,
+        using: str | None = None,
+    ) -> set[str]:
+        """The candidate ids on which the subject holds the action."""
+        from ..compile.read import held
+        from ..models import active_relationship_model
+
+        return held(
+            backend=self,
+            resource_type=resource_type,
+            action=action,
+            actor=subject,
+            ids=ids,
+            using=using or active_relationship_model().objects.db,
+            context=context,
         )
 
     @_schema_operation

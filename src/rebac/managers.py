@@ -40,12 +40,11 @@ from .actors import current_actor as _current_actor
 from .actors import is_sudo as _is_sudo_ambient
 from .errors import MissingActorError, PermissionDenied
 from .field_visibility import (
-    accessible_ids,
     apply_field_visibility,
-    backend_grants_all,
     backend_schema,
     effective_field_deny_mode,
     gated_read_fields,
+    held_ids,
     runtime_field_deny_mode,
     validate_field_deny_mode,
     warn_raise_mode_degrades,
@@ -469,8 +468,8 @@ def _hidden_from(
         for name in names
         if actor is None
         or resource_type is None
-        or not backend_grants_all(
-            backend(), subject=actor, action=f"read__{name}", resource_type=resource_type
+        or not backend().grants_all(
+            subject=actor, action=f"read__{name}", resource_type=resource_type
         )
     )
 
@@ -1183,62 +1182,17 @@ class RebacQuerySet(models.QuerySet[_M]):
             # Aggregate projection is fail-closed regardless of strict mode.
             query.where = WhereNode([query.where, _ScopeWhere(children=[NothingNode()])])
             return
-        from django.db.models import Q
-
         from .backends import backend
 
         action = str(self._rebac_action or getattr(model._meta, "rebac_default_action", "read"))
-        active_backend = backend()
-        predicate = active_backend.queryset_filter(
+        predicate = backend().queryset_filter(
             model=model, subject=actor, action=action, using=self.db
         )
-        if predicate is not None:
-            restriction = query.build_where(predicate)
-            query.where = WhereNode([query.where, _ScopeWhere(children=[restriction])])
-            return
-        if backend_grants_all(
-            active_backend,
-            subject=actor,
-            action=action,
-            resource_type=rebac_type,
-        ):
-            return
-        ids: list[Any] = list(
-            accessible_ids(
-                active_backend,
-                subject=actor,
-                action=action,
-                resource_type=rebac_type,
-            )
-        )
-        attr = resource_id_attr(model)
-        if attr == "pk":
-            # Coerce to ints when the PK is integer-typed; leave as
-            # strings for UUID/Char PKs. Only relevant for the pk path
-            # — non-pk attrs (sqid, public_id, slug) are always
-            # string-valued and pass through unchanged.
-            try:
-                pk_field = model._meta.pk
-                if pk_field is not None and pk_field.get_internal_type() in (
-                    "AutoField",
-                    "BigAutoField",
-                    "IntegerField",
-                    "BigIntegerField",
-                    "SmallIntegerField",
-                    "PositiveIntegerField",
-                    "PositiveBigIntegerField",
-                    "PositiveSmallIntegerField",
-                ):
-                    ids = [int(i) for i in ids]
-            except ValueError:
-                pass
-            except TypeError:
-                pass
-        # ``Q.add_q`` works even on sliced queries.
-        restriction = query.build_where(Q(**{f"{attr}__in": ids}))
-        # Keep the authorization clause identifiable, including in Django's
-        # cloned/combined WHERE trees, so changing actor cannot intersect stale
-        # permission IDs with the new actor's scope.
+        # The compiled predicate keeps the authorization clause identifiable,
+        # including in Django's cloned and combined WHERE trees, so a changed
+        # actor never intersects a stale scope. ``build_where`` works even on
+        # a sliced query.
+        restriction = query.build_where(predicate)
         query.where = WhereNode([query.where, _ScopeWhere(children=[restriction])])
 
     def _clone(self, **kwargs: Any) -> Self:
@@ -1957,7 +1911,16 @@ class RebacQuerySet(models.QuerySet[_M]):
         affected = self._affected_resource_ids_for_guard()
         if not affected:
             return
-        allowed = set(backend().accessible(subject=actor, action=action, resource_type=rebac_type))
+        allowed = set(
+            held_ids(
+                backend(),
+                subject=actor,
+                action=action,
+                model=self.model,
+                resource_ids=affected,
+                using=self.db,
+            )
+        )
         denied = affected - allowed
         if denied:
             raise PermissionDenied(
@@ -2003,11 +1966,13 @@ class RebacQuerySet(models.QuerySet[_M]):
             if action not in declared:
                 continue
             allowed = set(
-                accessible_ids(
+                held_ids(
                     backend(),
                     subject=actor,
                     action=action,
-                    resource_type=rebac_type,
+                    model=self.model,
+                    resource_ids=affected,
+                    using=self.db,
                 )
             )
             denied = affected - allowed
@@ -2047,11 +2012,13 @@ class RebacQuerySet(models.QuerySet[_M]):
         assert rebac_type is not None
         for field_name in sorted(required):
             allowed = set(
-                accessible_ids(
+                held_ids(
                     backend(),
                     subject=actor,
                     action=f"read__{field_name}",
-                    resource_type=rebac_type,
+                    model=self.model,
+                    resource_ids=affected,
+                    using=self.db,
                 )
             )
             if affected - allowed:

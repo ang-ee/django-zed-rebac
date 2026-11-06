@@ -125,9 +125,9 @@ instance's own statement only (invariant 5a).
 
 `cursor.execute`, `raw()` and `extra()` bypass the compilers' rewrites, as
 they bypass every ORM guarantee; they stay refused under scope and documented
-as such. `Relationship` writes keep the tuple owner. SpiceDB as a backend is
-unaffected: the compilers consult the active backend for the scope predicate,
-and for SpiceDB they fall back to `accessible()` id lists as today.
+as such. `Relationship` writes keep the tuple owner. The compilers consult
+`LocalBackend` for the scope predicate. A future remote backend needs its own
+compiler integration design.
 
 ## Correctness
 

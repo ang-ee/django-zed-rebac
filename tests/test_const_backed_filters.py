@@ -173,9 +173,9 @@ def test_column_changes_are_live_in_same_evaluator_scope(backend):
                 evaluator.check(backend, subject=ACTOR, action="read", resource=ref(folder)).allowed
                 is active
             )
-            assert evaluator.accessible(
-                backend, subject=ACTOR, action="read", resource_type="blog/folder"
-            ) == ((str(folder.pk),) if active else ())
+            assert set(
+                backend.accessible(subject=ACTOR, action="read", resource_type="blog/folder")
+            ) == ({str(folder.pk)} if active else set())
             assert Folder.objects.with_actor(ACTOR).filter(pk=folder.pk).exists() is active
     assert not Relationship.objects.exists()
 
@@ -607,7 +607,7 @@ def test_unsorted_native_filters_have_canonical_equality(kind):
     assert render_zed(first_schema) == render_zed(second_schema)
 
 
-def test_builtin_intersection_enumeration_and_scope_agree(backend, monkeypatch):
+def test_builtin_intersection_enumeration_and_scope_agree(backend):
     install_schema(
         backend,
         parse_zed(
@@ -622,9 +622,6 @@ def test_builtin_intersection_enumeration_and_scope_agree(backend, monkeypatch):
     assert set(backend.accessible(subject=ACTOR, action="read", resource_type="blog/folder")) == {
         str(folder.pk)
     }
-    assert list(Folder.objects.with_actor(ACTOR)) == [folder]
-    # A backend using the public enumeration fallback retains the same grants.
-    monkeypatch.setattr(backend, "queryset_filter", lambda **kwargs: None)
     assert list(Folder.objects.with_actor(ACTOR)) == [folder]
 
 

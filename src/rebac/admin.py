@@ -4,7 +4,7 @@ Scope per ARCHITECTURE.md § SchemaOverride:
   - SchemaOverride: full writable form; save_model stamps created_by.
   - Tier-1 schema models: read-only — managed via `rebac sync`, not admin.
   - PermissionAuditEvent + PackageManagedRecord: read-only system rows.
-  - Relationship: read-only; writes go through the Backend API.
+  - Relationship: read-only; writes go through the LocalBackend relationship API.
 """
 
 from __future__ import annotations
@@ -133,7 +133,7 @@ class SchemaOverrideAdmin(admin.ModelAdmin):  # type: ignore[type-arg]
 
 
 # ---------------------------------------------------------------------------
-# Tier-3: Relationship — read-only (writes go through Backend API)
+# Tier-3: Relationship — read-only (writes go through the LocalBackend relationship API)
 # ---------------------------------------------------------------------------
 
 

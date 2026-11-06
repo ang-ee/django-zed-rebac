@@ -16,9 +16,7 @@
 Core capabilities:
 
 - **The SpiceDB schema language**, hand-authored as `.zed` files shipped per package. Loaded into DB tables on install/upgrade with `noupdate=True` semantics that preserve admin edits.
-- **A pluggable backend boundary:**
-  - `LocalBackend` — pure Django. A permission is compiled to a query over the application's own tables and the relationship table, so the library stores no row per application row and a write is visible to the next read. Zero infrastructure; no build step.
-  - `SpiceDBBackend` — roadmap adapter for the official [`authzed`](https://pypi.org/project/authzed/) Python client. The class is present as a clear stub, not a supported runtime backend yet.
+- **One local backend:** `LocalBackend` compiles permissions to queries over the application's own tables and the relationship table, so the library stores no row per application row and a write is visible to the next read. Zero infrastructure; no build step. `REBAC_BACKEND` accepts only `"local"`; a remote adapter is roadmap work.
 - **A `RebacMixin` model mixin** that, by inclusion, replaces `Manager.objects` with a permission-aware variant. Every read scopes to the effective user; every write checks before SQL is issued.
 - **Three storage tiers, three editors:**
   - **Tier 1 — Structural.** Per-package `permissions.zed`, code-shipped, DB-loaded.
@@ -61,7 +59,7 @@ AUTHENTICATION_BACKENDS = [
     "django.contrib.auth.backends.ModelBackend",
 ]
 
-REBAC_BACKEND = "local"   # "spicedb" is roadmap/stubbed today
+REBAC_BACKEND = "local"
 ```
 
 ### 2. Ship a `permissions.zed` next to your app
@@ -343,11 +341,9 @@ definition tags/tag_assignment {
 #### Backings are `LocalBackend`-only until the projector ships
 
 Every backing kind below is read from its columns by `LocalBackend` and omitted from
-the exported `.zed`, so with `REBAC_BACKEND = "spicedb"` these relations hold
-no edges until the roadmap's library-owned projector materializes them as
-ordinary tuples. This is the one place the "backend swap is a configuration
-change" contract (`CLAUDE.md` invariant 1) is currently conditional; the
-projection burden differs per kind:
+the exported `.zed`. A future remote adapter will need the roadmap's
+library-owned projector to materialize these relations as ordinary tuples.
+The projection burden differs per kind:
 
 | Backing | Edges the projector must maintain |
 |---|---|
@@ -415,7 +411,7 @@ which has two consequences in
   resource-specific ban (`- banned`) is evaluated per row in the same
   statement.
 - **SpiceDB projection is one tuple per source row.** Unlike field-backing's
-  one-tuple-per-FK, a `SpiceDBBackend` projector must materialize the synthetic
+  one-tuple-per-FK, a SpiceDB projector must materialize the synthetic
   edge for every row of the source type (or model it as a `parent`/`platform`
   hierarchy), since SpiceDB has no static-relationship primitive. The local
   synthesis stays free of that cost. See the per-kind table under
@@ -425,36 +421,16 @@ which has two consequences in
 
 ## Architecture
 
-```
-┌─────────────────────────────────────────────────────────────────┐
-│                         your Django project                      │
-│                                                                   │
-│  views/    drf/    celery/    graphql/    plain Python           │
-│    │         │        │         │         │            │          │
-│    └─────────┴────────┴─────────┴─────────┴────────────┘          │
-│                          │                                        │
-│              RebacMixin / RebacPermission / @rebac_resource         │
-│                          │                                        │
-│  ┌───────────────────────▼────────────────────────────────┐      │
-│  │                 rebac.backends.Backend (ABC)           │     │
-│  │   check_access  has_access  accessible  lookup_subjects  │     │
-│  └───────────────────────┬────────────────────────────────┘      │
-│                          │                                        │
-│            ┌─────────────┴────────────┐                          │
-│            │                          │                          │
-│  ┌─────────▼──────────┐    ┌──────────▼──────────────┐          │
-│  │  LocalBackend      │    │  SpiceDBBackend          │          │
-│  │  ─────────────     │    │  ──────────────          │          │
-│  │  permissions       │    │  planned authzed adapter │          │
-│  │  compiled to SQL   │    │  roadmap implementation  │          │
-│  │  + cel-python for  │    │                          │          │
-│  │  caveats           │    │                          │          │
-│  └────────────────────┘    └──────────────────────────┘          │
-│                                                                   │
-└──────────────────────────────────────────────────────────────────┘
+```text
+Your Django project
+    └── RebacMixin / RebacPermission / @rebac_resource
+          └── rebac.backend() → LocalBackend
+                ├── check_access / has_access / check_bulk_permissions
+                ├── accessible (enumerate) / held (check candidates)
+                └── lookup_subjects / relationship writes
 ```
 
-**Three layers, one boundary.** The schema (`.zed` files → `Schema*` tables → in-memory expression tree) is the contract. Both backends honour it. Application code never imports a backend directly — it goes through the `Backend` ABC instance resolved lazily from `REBAC_BACKEND` on first use.
+**Three layers, one boundary.** The schema (`.zed` files → `Schema*` tables → in-memory expression tree) is the contract. Application code obtains the local runtime through `rebac.backend()`, which lazily caches a `LocalBackend`. The schema and wire types remain SpiceDB-compatible.
 
 **Where each integration hooks:**
 
@@ -482,7 +458,7 @@ from rebac import (
     require_permission, rebac_resource, rebac_subject,
 
     # Backend interface
-    Backend, LocalBackend, SpiceDBBackend,
+    LocalBackend,
     CheckResult, Consistency, Zookie,
     ObjectRef, SubjectRef, RelationshipTuple,
     CheckItem,                          # one item of check_bulk_permissions()
@@ -830,7 +806,7 @@ class Relationship(models.Model):
 - MySQL: monotonic timestamp (microsecond precision).
 - SQLite: package-global `time.monotonic_ns()` counter (test-mode only — not for production).
 
-`Zookie` consistency tokens encode `f"{backend_kind}.{xid}"`. Tokens are **not portable** across backends; if a project flips `REBAC_BACKEND` from `local` to `spicedb`, persisted Zookies in caches must be drained.
+`Zookie` consistency tokens encode `f"{backend_kind}.{xid}"`. `LocalBackend` accepts only local tokens; tokens from a future remote adapter would require translation or draining.
 
 **`expires_at`.** Mirrors SpiceDB's [`use expiration`](https://authzed.com/docs/spicedb/concepts/schema#use-expiration) feature (GA in v1.40+). Expired rows are evaluated as absent at check time. Automatic garbage collection is planned; no `rebac.gc` task is shipped.
 
@@ -908,9 +884,8 @@ not dropped — flip `REBAC_LOCAL_BACKEND_STORAGE` once the copy completes,
 then drop manually. `rebac.W005` surfaces the recommendation at startup
 when the setting is `"denormalized"`.
 
-**SpiceDB unaffected.** This is purely a `LocalBackend` optimisation. The
-future `SpiceDBBackend` will write through gRPC and will not touch the local
-relationship table.
+**A storage choice only.** This is purely a `LocalBackend` optimisation; the
+wire shape of relationships is unchanged.
 
 **Current status.** Both tables have shipped since 0.7.0. The default remains
 `"denormalized"` and registry mode is opt-in. A future minor release may flip
@@ -1148,14 +1123,10 @@ All settings prefixed `REBAC_`. No nested dict. Read via the public `app_setting
 
 | Setting | Default | Type | Purpose |
 |---|---|---|---|
-| `REBAC_BACKEND` | `"local"` | `"local"` \| `"spicedb"` | Which backend to instantiate lazily on first use. `"spicedb"` is reserved for the roadmap adapter and raises today. |
+| `REBAC_BACKEND` | `"local"` | `"local"` | Select the local runtime; other values fail the system check. |
 | `REBAC_RELATIONSHIP_MODEL` | `"rebac.Relationship"` | `str` | Swappable relationship model (Django convention). |
 | `REBAC_LOCAL_BACKEND_STORAGE` | `"denormalized"` | `"denormalized"` \| `"registry"` | LocalBackend relationship storage shape. Registry mode is opt-in and uses `RelationshipRegistry` + `RebacResource`. |
 | `REBAC_LOCAL_BACKEND_REGISTRY_BATCH_SIZE` | `5000` | `int` | Batch size for `python manage.py rebac migrate-storage`. |
-| `REBAC_SPICEDB_ENDPOINT` | `None` | `str` \| `None` | Roadmap setting for the future `authzed.api.v1.Client`. Required once backend `spicedb` is implemented. |
-| `REBAC_SPICEDB_TOKEN` | `None` | `str` \| `None` | Roadmap setting for the future SpiceDB preshared key. |
-| `REBAC_SPICEDB_TLS` | `True` | `bool` | Roadmap setting for TLS behavior in the future SpiceDB adapter. |
-| `REBAC_SPICEDB_AUTO_WRITE_SCHEMA` | `True` | `bool` | Roadmap setting for future schema auto-push. |
 | `REBAC_SCHEMA_DIR` | `BASE_DIR / "rebac"` | `Path` \| `str` | Where `build-zed` writes `effective.zed`. |
 | `REBAC_DEPTH_LIMIT` | `8` | `int` | Bound on a recursive permission other than stored subject-set membership (nested groups, followed to a fixed point), and the cap on the permission walker (`check_new`). Within the bound a point check answers; one that cannot be decided within it raises `PermissionDepthExceeded`; a queryset scope includes only rows provable within it. Choose it to cover the deepest recursive chain in the data. A finite recursive CTE carries the depth as a column; where recursion falls back to nested SQL, statement size grows linearly with the bound. See [Recursion](#recursion). |
 | `REBAC_TRACKED_MODELS` | `[]` | `list[str]` | Third-party backing models (`"app_label.ModelName"`), gated by explicit-sender receivers. User and Group are automatically tracked. |
@@ -1179,22 +1150,18 @@ All settings prefixed `REBAC_`. No nested dict. Read via the public `app_setting
 | `REBAC_USER_ID_ATTR` | `"pk"` | `str` | The same for the actor side of `to_subject_ref()` on `User` / `Group` instances; `Meta.rebac_id_attr` still wins. |
 | `REBAC_AUDIT_DENIALS` | `False` | `bool` | Also write a `PermissionAuditEvent` row per denied check. Off by default: denial traffic (an attacker fuzzing ids) can dominate the table. |
 | `REBAC_LINT_BARE_PREFETCH` | `True` | `bool` | Toggle for `rebac.W003` — the structural warning that an RBAC-bound model has an FK / O2O / M2M to another RBAC-bound model. A bare-string `select_related` can load unguarded joined rows; a bare-string `prefetch_related` follows the related manager's source pin, or ambient/non-strict scope when no pin exists. Enabled by default so the risky shape is visible; use `rebac_select_related()` / `rebac_prefetch_related()` or the Strawberry-Django optimizer for protected paths. |
-| `REBAC_EVALUATOR_CACHE_SIZE` | `10000` | `int` | Max entries across the per-scope evaluator's check and accessible caches (least recently used dropped first). |
+| `REBAC_EVALUATOR_CACHE_SIZE` | `10000` | `int` | Max entries in the per-scope evaluator's check cache, and the bound on its field-visibility memo (least recently used dropped first). |
 | `REBAC_ZOOKIE_TRANSPORT` | `"none"` | `"none"` \| `"header"` \| `"session"` | Optional cross-request transport for the current Zookie. |
 | `REBAC_ZOOKIE_HEADER_NAME` | `"X-Rebac-Zookie"` | `str` | Header name used when `REBAC_ZOOKIE_TRANSPORT = "header"`. |
 | `REBAC_ZOOKIE_SESSION_KEY` | `"_rebac_zookie"` | `str` | Session key used when `REBAC_ZOOKIE_TRANSPORT = "session"`. |
 | `REBAC_FIELD_READ_MODE` | `"allow"` | `"allow"` \| `"redact"` \| `"omit"` \| `"raise"` | Deny behavior for schema permissions named `read__<field>`. `"raise"` currently degrades to `"redact"` and emits `rebac.W008` until descriptor-level protected fields land. |
 | `REBAC_FIELD_READ_FAIL_CLOSED_ON_CONDITIONAL` | `True` | `bool` | Bulk field redaction has no per-row caveat context; `True` treats conditional `read__<field>` results as denied. Set `False` only when conditional visibility is acceptable without context. |
 
-Validation runs in Django's system-checks framework. `rebac.E001` validates the
-backend selection, `rebac.E002` checks required SpiceDB settings, and
-the optional SpiceDB client installation. Schema-dependent checks skip
-backend resolution when a non-local backend is selected, so invalid backend
-configuration is reported as checks rather than crashing `manage.py check`.
+Validation runs in Django's system-checks framework. `rebac.E001` accepts only
+the local backend; schema-dependent checks skip backend resolution then, so an
+invalid setting is reported as a check rather than crashing `manage.py check`.
 `rebac.W001` recognizes the shipped auth backend and its subclasses by class
 identity, including the two public import paths.
-Production-only checks (`--deploy`) include `rebac.W101` for
-`REBAC_SPICEDB_TLS = False`.
 
 ---
 
@@ -1227,8 +1194,8 @@ System checks (in `rebac/checks.py`):
 
 | ID | Severity | What it validates |
 |---|---|---|
-| `rebac.E001` | Error | `REBAC_BACKEND` is `"local"` or `"spicedb"`. |
-| `rebac.E002` | Error | Required SpiceDB settings present when backend is `spicedb`. |
+| `rebac.E001` | Error | `REBAC_BACKEND` is `"local"`. |
+| `rebac.E002` | Retired | Not reused. |
 | `rebac.E003` | Error | A model with `Meta.rebac_resource_type` references a type not declared in any loaded `permissions.zed`. |
 | `rebac.E004` | Error | Permission expressions parse against operator grammar. |
 | `rebac.E005` | Error | `permissions.zed` declared in an `AppConfig` cannot be located on disk. |
@@ -1254,7 +1221,7 @@ System checks (in `rebac/checks.py`):
 | `rebac.W008` | Warning | `REBAC_FIELD_READ_MODE = "raise"` currently degrades to `"redact"` until descriptor-based protected fields land. |
 | `rebac.W009` | Warning | A text attribute-backed column declares a case-insensitive collation (`*_ci`, or the MySQL default), so SQL scoping and Python checks could disagree on container ids. Best-effort detection. |
 | `rebac.W010` | Warning | A stored override references a relation or permission removed from the current baseline; that override is ignored until updated or deleted. |
-| `rebac.W101` | Warning (`--deploy`) | `REBAC_SPICEDB_TLS = False` in production. |
+| `rebac.W101` | Retired | Not reused. |
 
 `rebac.E014`, `rebac.E015`, `rebac.E016` and the backing-path form of
 `rebac.E018` read the stored schema, so they run only as database checks:
@@ -1306,7 +1273,7 @@ The middleware path routes through the public `sudo()` API, so each elevated req
 [Borrowed from Odoo 18 PR #179148. Locked.]
 
 ```python
-class Backend(ABC):
+class LocalBackend:
     def check_access(
         self, *,
         subject: SubjectRef,
@@ -1335,9 +1302,7 @@ class Backend(ABC):
         """One three-state result per item, in the order given: what
            check_access() answers for that item. Mirrors SpiceDB's
            CheckBulkPermissions. An error that check_access() would raise
-           for an item is raised by the call. The base implementation asks
-           item by item; a backend overrides it to share work between
-           items."""
+           for an item is raised by the call. LocalBackend shares work between items."""
 
     def accessible(
         self, *,
@@ -1348,8 +1313,19 @@ class Backend(ABC):
         consistency:    Consistency | None = None,
         at_zookie:      Zookie | None = None,
     ) -> Iterable[str]:
-        """Set of resource_ids the subject has `action` on. Basis of
-           `Model.objects.with_actor(actor)` queryset scoping."""
+        """Enumerate resource_ids the subject has `action` on."""
+
+    def held(
+        self, *, subject, action, resource_type, ids,
+        context=None, using=None,
+    ) -> set[str]:
+        """Which candidate ids hold the action; depth-uncertain ids do not hold."""
+
+    def held_many(
+        self, *, subject, actions, resource_type, ids,
+        context=None, using=None,
+    ) -> dict[str, set[str]]:
+        """Held candidate ids for each action; equal unmodified permissions decide once."""
 
     def lookup_subjects(
         self, *,
@@ -1389,9 +1365,14 @@ class Backend(ABC):
         semantic checks (notably ``rebac.check_new``) that walk
         permission expressions before any row exists. LocalBackend serves
         the in-memory composed schema;
-        the future SpiceDB adapter should cache the parsed result of
-        ``Client.ReadSchema()``."""
+        a future remote adapter may parse ``Client.ReadSchema()``."""
 ```
+
+`LocalBackend.accessible()` enumerates authorized IDs for a resource type.
+`LocalBackend.held()` checks a bounded candidate set through the compiled read
+path. A depth-uncertain candidate counts as not held rather than raising as
+`check_access()` does; other candidates retain their answers. Queryset scoping
+uses `queryset_filter()` and its compiled predicate.
 
 `CheckResult` carries the three-state result, missing caveat parameters and an
 optional `reason`. Unknown resource types and actions preserve their diagnostic
@@ -1420,7 +1401,7 @@ the new row would carry once written — e.g.::
     }
 
 There are no ``Relationship`` rows on ``blog/post:<id>`` yet, so
-``Backend.check_access`` short-circuits to deny. Instead the caller
+``LocalBackend.check_access`` short-circuits to deny. Instead the caller
 supplies the relations the new row *would* point at, and
 :func:`rebac.check_new` evaluates the expression against that virtual
 overlay::
@@ -1547,13 +1528,10 @@ prepared instance carrying its own scope saves through `instance.save()` or
 for both paths override `insert` on their queryset, not `create` on the
 manager; `RebacManager.from_queryset` exposes the override automatically.
 
-**Deliberately outside the ``Backend`` ABC.** ``check_new`` is a free
-function, not a backend RPC, because SpiceDB ships no "check with
-proposed tuples" call. A SpiceDB-mode strategy when 0.5 lands is to
-``WriteRelationships`` the proposed tuples in a sub-transaction,
-``CheckPermission`` against the (now-real) row, then roll back. Until
-then, ``check_new`` raises a clear ``RuntimeError`` if the active
-backend's ``schema()`` is not implemented.
+**Deliberately outside ``LocalBackend``.** ``check_new`` is a free
+function, since SpiceDB ships no "check with proposed tuples" RPC. It
+evaluates the unsaved row's proposed relationships in memory and sends
+arrow hops to `LocalBackend.check_access`.
 
 Limitations (0.4):
 
@@ -2454,7 +2432,7 @@ tracked model's callable attribute named `actor` does not become an actor scope.
 
 | Operation | Permission checked | Where |
 |---|---|---|
-| `Model.objects.all()` / `.filter(...)` / `.get()` / `.count()` / `.exists()` | `read` (or `Meta.rebac_default_action`; override per chain with `.with_action(action)`) | The queryset injects the backend's lazy permission predicate (the compiled scope for `LocalBackend`), falling back to `resource_id__in=<accessible(actor, action, type)>` for backends without one. |
+| `Model.objects.all()` / `.filter(...)` / `.get()` / `.count()` / `.exists()` | `read` (or `Meta.rebac_default_action`; override per chain with `.with_action(action)`) | The queryset injects `LocalBackend`'s compiled permission predicate. |
 | `Model.objects.create(**fields)` | `create` on the proposed row's forward relations | Constructs the instance and delegates to `insert()`. |
 | `Model.objects.insert(obj)` | `create` on the proposed row's forward relations | Pins queryset scope on the prepared instance; the `save_base` `check_new` gate authorizes the insert. |
 | `Model.objects.bulk_create(rows)` | `create` on each proposed row's forward relations | Every candidate is preflighted before Django issues insert SQL. |
@@ -2861,12 +2839,10 @@ with evaluator_scope() as evaluator:
     evaluator.check(backend(), subject=u, action="read", resource=ObjectRef("blog/post", "1"))
     evaluator.check(backend(), subject=u, action="read", resource=ObjectRef("blog/post", "1"))
     # → 1 backend call total
-
-    # `evaluator.accessible(...)` caches list-of-ids the same way.
 ```
 
 Bounded by `REBAC_EVALUATOR_CACHE_SIZE` (default `10_000`) using `OrderedDict`
-Bounded cache eviction across check and accessible caches. Conditional results
+Bounded check-cache eviction. Conditional results
 (`CONDITIONAL_PERMISSION(missing=[...])`) are NOT cached — the missing caveat
 params are part of the answer and the next call may supply them. Per-call
 explicit `consistency` / `at_zookie` also bypass the cache.
@@ -3146,7 +3122,7 @@ The `@rebac_resource` decorator registers the type with the schema validator (th
 
 | Part | What you import | When to use |
 |---|---|---|
-| `Backend` ABC + `LocalBackend` | `from rebac import LocalBackend, ObjectRef, SubjectRef` | You want REBAC checks in code without touching ORM. |
+| `LocalBackend` | `from rebac import LocalBackend, ObjectRef, SubjectRef` | You want REBAC checks in code without touching ORM. |
 | `RebacManager` standalone | `Model.objects = RebacManager.from_queryset(RebacQuerySet)()` | Drop scoping into a model without the metaclass. |
 | `check_access(subject, action, resource)` | `from rebac import backend; backend().check_access(...)` | Imperative checks anywhere. |
 | `@require_permission` decorator | `from rebac import require_permission` | Gate methods on plain Python classes (not just models). |
@@ -3488,8 +3464,8 @@ SpiceDB itself. **Planned; not part of the current build.**
 - **Dev.** `pytest -m spicedb`. A session fixture starts the container through
   Docker with a Docker-assigned port, or uses `REBAC_TEST_SPICEDB_ENDPOINT` when
   set. Selecting the marker without Docker or an endpoint is an error, not a
-  skip. The default `pytest` run deselects the marker. The `authzed` client (the
-  existing `spicedb` extra) joins the `dev` extra.
+  skip. The default `pytest` run deselects the marker. The `authzed` client
+  joins the `dev` extra when the conformance suite is implemented.
 - **CI.** A job starts the pinned image in a step (`docker run … serve-testing`;
   GitHub service containers cannot pass that command), exports
   `REBAC_TEST_SPICEDB_ENDPOINT`, and runs `-m spicedb` in parallel. The job gates
@@ -3498,7 +3474,7 @@ SpiceDB itself. **Planned; not part of the current build.**
   `render_zed(include_backing=False)`, plus `use expiration` when relations
   expire. Field, attribute and constant backings are projected into ordinary
   tuples by a test-side projector that reads the same rows the compiler
-  reads; it is the prototype of the roadmap projector for `SpiceDBBackend`.
+  reads; it is the prototype of a roadmap SpiceDB projector.
   `anonymous` and `authenticated` become synthetic wildcard relations over the
   generated subject types, with one tuple per resource, which is exact for
   generated data. Expirations are generated well in the past or future so both
@@ -3578,7 +3554,7 @@ stable across patch releases. `rebac._internal.*` is private.
 | **0.23.0–0.24.2 — retained features** | Complete subject expansion in `lookup_subjects()`; the reference and differential suites; PostgreSQL CI and the tiered test suite; backed-edge write gates (invariant 5d); declared base managers; `rebac.schema_changes()`. |
 | **0.25.0 — compiled permissions** | [Compiled permissions](#compiled-permissions--the-localbackend-read-path) are the single persisted `LocalBackend` read path ([proposal 0015](./proposals/0015-permissions-compiled-to-queries.md)): a permission is a query over the application's tables and the tuple table, the library stores no row per application row, recursion is unrolled to `REBAC_DEPTH_LIMIT`, gated queryset writes follow the key rule, and policy writes serialize on the generation row. Implemented; the trial on a consumer database at scale is pending. |
 | **Next — SpiceDB conformance suite** | [SpiceDB conformance suite](#spicedb-conformance-suite-planned): generated cases checked against a pinned `spicedb serve-testing` in dev (`-m spicedb`) and CI; test-side projector for backings; deliberate divergences listed and pinned. The in-process oracle then stops copying the walker. |
-| **Then — `SpiceDBBackend`** | `authzed-py` adapter; `WriteSchema` auto-push; the conformance suite becomes its cross-backend contract tests; SpiceDB Zookie translation; the projector grows from the test-side prototype. |
+| **Then — a remote SpiceDB adapter** | An `authzed-py` adapter; `WriteSchema` auto-push; the conformance suite becomes its cross-backend contract tests; SpiceDB Zookie translation; the projector grows from the test-side prototype. |
 | **1.0.0 — Stable release** | Full docs, CI matrix green, stable audit/logging contracts, `select_related` compiler hook (or carved to 1.1). |
 | **1.x** | `select_related` SQL compiler; bulk operations; `Meta.protected_fields` (descriptor-based field gating / true `"raise"` mode complementing [`read__<field>`](#field-level-read-gates-readfield)); PostgreSQL RLS defense-in-depth track. |
 

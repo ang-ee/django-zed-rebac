@@ -1,7 +1,7 @@
-"""PermissionEvaluator — per-scope cache for ``check_access`` and ``accessible``.
+"""PermissionEvaluator — per-scope cache for ``check_access`` and field visibility.
 
 Solves N+1 permission checks in GraphQL / DRF render paths
-by deduping ``(subject, action, resource_or_type, context)`` keys across
+by deduping ``(subject, action, resource, context)`` keys across
 a single scope (HTTP request, subscription tick, Celery task).
 
 Lifecycle:
@@ -13,11 +13,8 @@ Lifecycle:
     a long-lived WS must not serve cached pre-revocation answers.
   - Celery: explicitly opened by the application inside each task.
 
-Cache key:
-  - check:      ``(backend_identity, schema_generation, subject, action, resource, context)``
-  - accessible: ``(backend_identity, schema_generation, subject, action, resource_type, context)``
-
-Both share a single LRU bounded by ``REBAC_EVALUATOR_CACHE_SIZE``
+Cache key: ``(backend_identity, schema_generation, subject, action, resource, context)``.
+The check cache is an LRU bounded by ``REBAC_EVALUATOR_CACHE_SIZE``
 (default 10_000). Conditional results are never cached — the missing
 caveat params are part of the answer and the next call may supply them.
 
@@ -41,7 +38,7 @@ from .types import CheckResult, Consistency, ObjectRef, PermissionResult, Subjec
 if TYPE_CHECKING:  # pragma: no cover
     from django.db import models
 
-    from .backends.base import Backend
+    from .backends.local import LocalBackend
 
 
 def _ctx_key(context: dict[str, Any] | None) -> Hashable | None:
@@ -68,7 +65,7 @@ class _BackendKey:
 
     __slots__ = ("backend",)
 
-    def __init__(self, backend: Backend) -> None:
+    def __init__(self, backend: LocalBackend) -> None:
         self.backend = backend
 
     def __hash__(self) -> int:
@@ -79,19 +76,15 @@ class _BackendKey:
 
 
 def _backend_cache_key(
-    backend: Backend, resource_type: str
+    backend: LocalBackend, resource_type: str
 ) -> tuple[_BackendKey, Hashable | None] | None:
     # LocalBackend refreshes expired or invalidated schema snapshots before
     # a cached permission answer can be reused, and declines caching for
-    # resource types whose evaluation reads live ORM facts. Other backends
-    # need no hook.
-    generation = getattr(backend, "_cache_generation", None)
-    if callable(generation):
-        value = generation(resource_type)
-        if value is None:
-            return None
-        return _BackendKey(backend), value
-    return _BackendKey(backend), None
+    # resource types whose evaluation reads live ORM facts.
+    value = backend._cache_generation(resource_type)
+    if value is None:
+        return None
+    return _BackendKey(backend), value
 
 
 class PermissionEvaluator:
@@ -103,7 +96,6 @@ class PermissionEvaluator:
     """
 
     __slots__ = (
-        "_accessible_cache",
         "_check_cache",
         "_max_size",
         "_schema_scope",
@@ -113,7 +105,6 @@ class PermissionEvaluator:
 
     def __init__(self, *, max_size: int = 10_000) -> None:
         self._check_cache: OrderedDict[tuple[Any, ...], CheckResult] = OrderedDict()
-        self._accessible_cache: OrderedDict[tuple[Any, ...], tuple[str, ...]] = OrderedDict()
         # Field visibility per actor, model, action and row batch; bounded by
         # entries and by the candidate ids they hold together.
         self._visibility_decisions: OrderedDict[tuple[Any, ...], frozenset[str]] = OrderedDict()
@@ -126,7 +117,7 @@ class PermissionEvaluator:
     @schema_operation
     def check(
         self,
-        backend: Backend,
+        backend: LocalBackend,
         *,
         subject: SubjectRef,
         action: str,
@@ -174,59 +165,11 @@ class PermissionEvaluator:
             self._store_check(key, result)
         return result
 
-    @schema_operation
-    def accessible(
-        self,
-        backend: Backend,
-        *,
-        subject: SubjectRef,
-        action: str,
-        resource_type: str,
-        context: dict[str, Any] | None = None,
-        consistency: Consistency | None = None,
-        at_zookie: Zookie | None = None,
-    ) -> tuple[str, ...]:
-        """Memoised wrapper for ``backend.accessible(...)``.
-
-        Bypasses cache when ``context`` / ``consistency`` / ``at_zookie``
-        are supplied — same rationale as :meth:`check`.
-        """
-        if context is not None or consistency is not None or at_zookie is not None:
-            return tuple(
-                backend.accessible(
-                    subject=subject,
-                    action=action,
-                    resource_type=resource_type,
-                    context=context,
-                    consistency=consistency,
-                    at_zookie=at_zookie,
-                )
-            )
-        backend_key = _backend_cache_key(backend, resource_type)
-        if backend_key is None:
-            return tuple(
-                backend.accessible(subject=subject, action=action, resource_type=resource_type)
-            )
-        key = (*backend_key, str(subject), action, resource_type, _ctx_key(context))
-        if key in self._accessible_cache:
-            self._accessible_cache.move_to_end(key)
-            return self._accessible_cache[key]
-        ids = tuple(
-            backend.accessible(
-                subject=subject,
-                action=action,
-                resource_type=resource_type,
-            )
-        )
-        self._store_accessible(key, ids)
-        return ids
-
     def invalidate(self) -> None:
         """Drop every cached entry. Used by subscription teardown for
         per-emission scopes that re-enter without re-constructing.
         """
         self._check_cache.clear()
-        self._accessible_cache.clear()
         self._visibility_decisions.clear()
         self._visibility_decision_ids = 0
         self._schema_scope.clear()
@@ -234,7 +177,7 @@ class PermissionEvaluator:
     @schema_operation
     def _held_many(
         self,
-        backend: Backend,
+        backend: LocalBackend,
         *,
         subject: SubjectRef,
         model: type[models.Model],
@@ -261,13 +204,7 @@ class PermissionEvaluator:
             if len(candidates) <= self._max_size
             else None
         )
-        schema = getattr(backend, "_schema_snapshot", None)
-        if (
-            backend_key is None
-            or backend_key[1] is None
-            or not callable(schema)
-            or schema().schema.caveats
-        ):
+        if backend_key is None or backend._schema_snapshot().schema.caveats:
             return backend.held_many(
                 subject=subject,
                 actions=names,
@@ -311,7 +248,6 @@ class PermissionEvaluator:
     def stats(self) -> dict[str, int]:
         return {
             "check_entries": len(self._check_cache),
-            "accessible_entries": len(self._accessible_cache),
             "visibility_entries": len(self._visibility_decisions),
             "visibility_ids": self._visibility_decision_ids,
             "max_size": self._max_size,
@@ -323,19 +259,9 @@ class PermissionEvaluator:
         self._check_cache[key] = value
         self._evict_if_full()
 
-    def _store_accessible(self, key: tuple[Any, ...], value: tuple[str, ...]) -> None:
-        self._accessible_cache[key] = value
-        self._evict_if_full()
-
     def _evict_if_full(self) -> None:
-        # Both decision caches share one budget.
-        total = len(self._check_cache) + len(self._accessible_cache)
-        while total > self._max_size:
-            if len(self._check_cache) >= len(self._accessible_cache):
-                self._check_cache.popitem(last=False)
-            else:
-                self._accessible_cache.popitem(last=False)
-            total -= 1
+        while len(self._check_cache) > self._max_size:
+            self._check_cache.popitem(last=False)
 
 
 # ---------- ContextVar machinery ----------

@@ -77,7 +77,7 @@ if TYPE_CHECKING:
     from .actors import model_identities
     from .audit import aemit as aemit_audit_event
     from .audit import emit as emit_audit_event
-    from .backends import Backend, LocalBackend, SpiceDBBackend, backend
+    from .backends import LocalBackend, backend
     from .decorators import check_permission, rebac_resource, require_permission
     from .expressions import permission_expression
     from .field_backing import GenericTarget, generic_target, proposed_forward_relationships
@@ -108,9 +108,7 @@ _LAZY = {
         "rebac.permissions_mixin",
         "RebacPermissionsMixin",
     ),
-    "Backend": ("rebac.backends", "Backend"),
     "LocalBackend": ("rebac.backends", "LocalBackend"),
-    "SpiceDBBackend": ("rebac.backends", "SpiceDBBackend"),
     "backend": ("rebac.backends", "backend"),
     "require_permission": ("rebac.decorators", "require_permission"),
     "check_permission": ("rebac.decorators", "check_permission"),
@@ -180,9 +178,7 @@ __all__ = [
     "default_actor_resolver",
     "get_mcp_actor_resolver",
     # backends
-    "Backend",
     "LocalBackend",
-    "SpiceDBBackend",
     "backend",
     # actors
     "ActorLike",

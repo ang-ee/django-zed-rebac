@@ -1286,8 +1286,10 @@ def held(
 ) -> set[str]:
     """The ids among ``ids`` on which the actor holds the action.
 
-    Ids that are rows of the type's model are tested by one scoped statement
-    per chunk; the others (no row, or not a valid identity) one by one.
+    Stored-row candidates share one scoped statement per chunk. Canonical ids
+    absent from stored rows and ids of a type without rows share a bulk point
+    check. A depth-uncertain id counts as not held instead of raising as
+    ``check_access`` does.
     """
     return _held(
         backend=backend,
@@ -1363,10 +1365,12 @@ def _held(
     context: Mapping[str, Any] | None,
 ) -> set[str]:
     pending = set(ids)
+    pending.discard("")
+    if not pending:
+        return set()
     found: set[str] = set()
-    types: Mapping[str, RowTypes] | None = None
     model = model_for_resource_type(resource_type)
-    if model is not None and stores_rows(model) and context is None and len(pending) > 4:
+    if model is not None and stores_rows(model):
         identity = resource_id_attr(model)
         codec = identity_codec(model, identity)
         _, identity_field = model_identity_fields(model, identity)
@@ -1375,38 +1379,49 @@ def _held(
             for value in pending
             if codec.is_canonical(value, using=using)
         }
-        scope = scope_q(backend=backend, model=model, action=action, actor=actor, using=using)
-        rows = model._base_manager.using(using)
-        values = list(native)
-        for start in range(0, len(values), 500):
-            chunk = values[start : start + 500]
-            present = set(
-                rows.filter(**{f"{identity}__in": chunk}).values_list(identity, flat=True)
+        if not native:
+            return set()
+        pending = set(native.values())
+        if context is None:
+            # One statement per chunk: each candidate row with its verdict.
+            rows = model._base_manager.using(using).order_by()
+            values = list(native)
+            scope = scope_q(backend=backend, model=model, action=action, actor=actor, using=using)
+            verdict = models.Case(
+                models.When(scope, then=models.Value(True)),
+                default=models.Value(False),
+                output_field=models.BooleanField(),
             )
-            allowed = set(
-                rows.filter(**{f"{identity}__in": chunk})
-                .filter(scope)
-                .values_list(identity, flat=True)
-            )
-            for value in present:
-                pending.discard(native[value])
-            found.update(native[value] for value in allowed)
-        # The ids left name no row: they have no content types.
-        types = {}
-    if pending and types is None:
-        types = _key_types(_policy(backend), using, (resource_type, action), pending)
-    for value in sorted(pending):
-        if _point_result(
-            backend=backend,
-            resource=ObjectRef(resource_type, value),
-            action=action,
-            actor=actor,
-            context=context,
-            using=using,
-            lower_only=True,
-            types=types,
-        )[0]:
-            found.add(value)
+            for start in range(0, len(values), 500):
+                chunk = values[start : start + 500]
+                for value, allowed in rows.filter(**{f"{identity}__in": chunk}).values_list(
+                    identity, verdict
+                ):
+                    pending.discard(native[value])
+                    if allowed:
+                        found.add(native[value])
+    if not pending:
+        return found
+    # Ids that name no row, and every id under a caveat context, are checked
+    # in bulk, as check_access answers them.
+    candidates = sorted(pending)
+    items = [
+        CheckItem(actor, action, ObjectRef(resource_type, value), context) for value in candidates
+    ]
+    try:
+        answers = check_many(backend=backend, items=items, using=using)
+    except PermissionDepthExceeded:
+        # A bulk check raises for its first deep item with no other answer:
+        # each item is checked alone, and a deep one is not held.
+        for item in items:
+            try:
+                answer = check_many(backend=backend, items=[item], using=using)[0]
+            except PermissionDepthExceeded:
+                continue
+            if answer.allowed:
+                found.add(item.resource.resource_id)
+        return found
+    found.update(value for value, answer in zip(candidates, answers, strict=True) if answer.allowed)
     return found
 
 

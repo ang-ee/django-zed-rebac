@@ -14,9 +14,8 @@ from .actors import resolve
 from .backends import backend
 from .errors import MissingActorError, PermissionDenied
 from .field_visibility import (
-    accessible_ids,
     apply_field_visibility,
-    backend_grants_all,
+    held_ids,
 )
 from .resources import model_resource_type
 from .types import FieldDenyMode, SubjectRef
@@ -104,27 +103,22 @@ def guard_selected_related_instances(
         # Check IDs once, but stamp and redact every in-memory copy of that ID.
         rows = [row for copies in rows_by_id.values() for row in copies.values()]
 
-        if not backend_grants_all(
-            active_backend,
-            subject=actor,
-            action=action,
-            resource_type=rebac_type,
-        ):
-            allowed = set(
-                accessible_ids(
-                    active_backend,
-                    subject=actor,
-                    action=action,
-                    resource_type=rebac_type,
-                )
+        allowed = set(
+            held_ids(
+                active_backend,
+                subject=actor,
+                action=action,
+                model=model,
+                resource_ids=rows_by_id,
             )
-            denied = sorted(set(rows_by_id) - allowed)
-            if denied:
-                sample = ", ".join(denied[:5])
-                raise PermissionDenied(
-                    f"select_related({model.__name__}) loaded {len(denied)} "
-                    f"related row(s) outside actor scope (e.g. {sample})."
-                )
+        )
+        denied = sorted(set(rows_by_id) - allowed)
+        if denied:
+            sample = ", ".join(denied[:5])
+            raise PermissionDenied(
+                f"select_related({model.__name__}) loaded {len(denied)} "
+                f"related row(s) outside actor scope (e.g. {sample})."
+            )
 
         for row in rows:
             row._rebac_actor = actor  # type: ignore[attr-defined]

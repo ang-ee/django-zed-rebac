@@ -198,6 +198,100 @@ def test_model_less_ids_and_context_enumeration(active):
     ) == ["1"]
 
 
+def test_held_checks_only_requested_rows_and_model_less_ids(active):
+    Post._base_manager.bulk_create([Post(pk=number, title=str(number)) for number in range(1, 7)])
+    active.write_relationships(
+        [
+            row("blog/post:1", "viewer", "auth/user:alice"),
+            row("blog/post:6", "viewer", "auth/user:alice"),
+            row("blog/post:7", "viewer", "auth/user:alice"),
+            row("blog/post:01", "viewer", "auth/user:alice"),
+            row("virtual/item:external", "viewer", "auth/user:alice"),
+        ]
+    )
+    assert active.held(subject=ALICE, action="read", resource_type="blog/post", ids=("1", "2")) == {
+        "1"
+    }
+    assert active.held(
+        subject=ALICE,
+        action="read",
+        resource_type="blog/post",
+        ids=("1", "2", "3", "4", "5", "6", "missing"),
+    ) == {"1", "6"}
+    assert active.held(
+        subject=ALICE,
+        action="read",
+        resource_type="blog/post",
+        ids=("1", "7", "01", "bad"),
+    ) == {"1", "7"}
+    assert active.held(
+        subject=ALICE,
+        action="read",
+        resource_type="virtual/item",
+        ids=("external", "other", ""),
+    ) == {"external"}
+
+
+def test_held_context_checks_canonical_ids_and_excludes_noncanonical_ids(active):
+    Post._base_manager.bulk_create([Post(pk=1, title="one")])
+    active.write_relationships(
+        [
+            row("blog/post:1", "viewer", "auth/user:alice", caveat_name="first"),
+            row("blog/post:2", "viewer", "auth/user:alice", caveat_name="first"),
+            row("blog/post:01", "viewer", "auth/user:alice", caveat_name="first"),
+        ]
+    )
+    candidates = ("1", "2", "01", "junk")
+    assert active.held(
+        subject=ALICE,
+        action="read",
+        resource_type="blog/post",
+        ids=candidates,
+        context={"a": True},
+    ) == {"1", "2"}
+    assert (
+        active.held(
+            subject=ALICE,
+            action="read",
+            resource_type="blog/post",
+            ids=candidates,
+            context={"a": False},
+        )
+        == set()
+    )
+
+
+def test_held_keeps_a_direct_grant_beside_a_depth_uncertain_id(active, settings):
+    from rebac.errors import PermissionDepthExceeded
+
+    settings.REBAC_DEPTH_LIMIT = 2
+    install_schema(
+        active,
+        parse_zed("""
+        definition auth/user {}
+        definition test/chain {
+            relation viewer: auth/user
+            relation parent: test/chain
+            permission read = viewer + parent->read
+        }
+        """),
+    )
+    active.write_relationships(
+        [
+            row("test/chain:direct", "viewer", "auth/user:alice"),
+            row("test/chain:deep", "parent", "test/chain:next"),
+            row("test/chain:next", "parent", "test/chain:far"),
+            row("test/chain:far", "parent", "test/chain:further"),
+            row("test/chain:further", "viewer", "auth/user:alice"),
+        ]
+    )
+    args = dict(subject=ALICE, action="read", resource_type="test/chain")
+    assert active.held(**args, ids=("direct",)) == {"direct"}
+    with pytest.raises(PermissionDepthExceeded):
+        active.check_access(subject=ALICE, action="read", resource=ObjectRef("test/chain", "deep"))
+    assert active.held(**args, ids=("direct", "deep")) == {"direct"}
+
+
 def test_lookup_subjects_expands_nested_members_and_excludes_denials(active):
     reference_harness.seed(
         [
@@ -894,7 +988,7 @@ def test_permission_expression_binds_new_schema_but_scope_remains_pinned(active)
     assert pending.all().values_list("allowed", flat=True).get() is False
 
 
-@pytest.mark.parametrize("fallback", [False, True], ids=["orm", "backend-none"])
+@pytest.mark.parametrize("fallback", [False, True], ids=["projection", "expression-fallback"])
 def test_permission_expression_keeps_conditional_and_revoked_answers_false(
     active, monkeypatch, fallback
 ):
@@ -902,7 +996,6 @@ def test_permission_expression_keeps_conditional_and_revoked_answers_false(
 
     if fallback:
         monkeypatch.setattr(active, "permission_expression", lambda **kwargs: None)
-        monkeypatch.setattr(active, "queryset_filter", lambda **kwargs: None)
     with sudo(reason="tests.permission.fixture"):
         post = Post.objects.create(title="conditional")
     active.write_relationships(

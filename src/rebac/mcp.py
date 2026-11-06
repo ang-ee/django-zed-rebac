@@ -347,7 +347,7 @@ def rebac_mcp_tool(
         action: the permission to check (``"write"``, ``"use"``, ``"create"``).
             ``"create"`` (and any action in :data:`_CREATE_ACTIONS`) routes
             through :func:`rebac.check_new` for not-yet-persisted resources;
-            every other action checks :meth:`Backend.check_access` on a concrete
+            every other action checks :meth:`LocalBackend.check_access` on a concrete
             :class:`ObjectRef`.
         id_arg: name of the tool call argument carrying the target resource id.
         resource_id: a fixed resource id, used when no ``id_arg`` is supplied.

@@ -282,10 +282,10 @@ def test_direct_share_revocation_refreshes_pending_and_rebound_querysets(active)
     post = _posts("shared")["shared"]
     share = _grant(post, "shared", ALICE)
     active.write_relationships([share, _grant(post, "approved", ALICE)])
-    with evaluator_scope() as evaluator:
-        assert evaluator.accessible(
-            active, subject=ALICE, action="read", resource_type="blog/post"
-        ) == (str(post.pk),)
+    with evaluator_scope():
+        assert set(active.accessible(subject=ALICE, action="read", resource_type="blog/post")) == {
+            str(post.pk)
+        }
         pending = Post.objects.with_actor(ALICE)
         eager = pending.scoped()
         assert list(eager.values_list("pk", flat=True)) == [post.pk]
@@ -293,8 +293,7 @@ def test_direct_share_revocation_refreshes_pending_and_rebound_querysets(active)
         _assert_post_visibility(active, pending, ALICE, "read", [])
         _assert_post_visibility(active, eager.with_actor(ALICE), ALICE, "read", [])
         assert (
-            evaluator.accessible(active, subject=ALICE, action="read", resource_type="blog/post")
-            == ()
+            list(active.accessible(subject=ALICE, action="read", resource_type="blog/post")) == []
         )
         active.write_relationships([share])
         _assert_post_visibility(active, pending.all(), ALICE, "read", [post])

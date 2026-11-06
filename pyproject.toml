@@ -27,7 +27,6 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
-spicedb = ["authzed>=0.13"]
 caveats = ["cel-python>=0.1.5"]
 drf = ["djangorestframework>=3.18"]  # 3.17 imports a helper Django 6.1 removed
 # FastMCP adapter (``rebac.mcp.rebac_mcp_tool``). The adapter reads the

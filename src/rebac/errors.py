@@ -32,8 +32,7 @@ class CaveatUnsupportedError(RebacError):
     """Caveat references a CEL feature the active backend cannot evaluate.
 
     For example, the `ipaddress` CEL type is not supported by `cel-python`;
-    `LocalBackend` raises this when checking such a caveat. `SpiceDBBackend`
-    handles it natively.
+    `LocalBackend` raises this when checking such a caveat.
     """
 
 

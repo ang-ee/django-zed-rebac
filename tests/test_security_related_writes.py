@@ -7,6 +7,7 @@ Related managers, raw relationship deletes, bulk updates reading gated columns,
 from __future__ import annotations
 
 from datetime import timedelta
+from itertools import pairwise
 
 import pytest
 from django.contrib.auth import get_user_model
@@ -21,6 +22,7 @@ from rebac import (
     MissingActorError,
     ObjectRef,
     PermissionDenied,
+    PermissionDepthExceeded,
     RelationshipTuple,
     SubjectRef,
     actor_context,
@@ -601,6 +603,104 @@ def test_attribute_rekey_requires_write_on_old_and_new_containers():
     with actor_context(EDITOR), pytest.raises(PermissionDenied):
         user.save(update_fields=["username"])
     assert get_user_model().objects.get(pk=user.pk).username == "alice"
+
+
+@pytest.mark.parametrize("grant", ["tuple", "authenticated"])
+def test_attribute_rekey_accepts_an_absent_canonical_container(grant):
+    write = "editor" if grant == "tuple" else "authenticated"
+    install_schema(
+        backend(),
+        parse_zed(f"""
+        definition auth/user {{}}
+        definition blog/folder {{
+            permission read = authenticated
+            permission write = authenticated
+        }}
+        definition blog/sluggedpost {{
+            relation editor: auth/user
+            relation member: blog/folder // rebac:attribute={{"field":"name"}}
+            permission write = {write}
+        }}
+        """),
+    )
+    with sudo(reason="test.fixture"):
+        folder = Folder.objects.create(name="previous")
+    if grant == "tuple":
+        for container in ("previous", "absent"):
+            _grant("blog/sluggedpost", container, "editor", EDITOR)
+    folder = Folder.objects.with_actor(EDITOR).get(pk=folder.pk)
+    folder.name = "absent"
+    folder.save(update_fields=["name"])
+    assert Folder._base_manager.get(pk=folder.pk).name == "absent"
+    assert not SluggedPost._base_manager.filter(slug="absent").exists()
+
+
+def test_explicit_pk_create_checks_self_keyed_attribute_before_row_exists():
+    install_schema(
+        backend(),
+        parse_zed("""
+        definition auth/user {}
+        definition blog/folder {
+            relation member: blog/folder // rebac:attribute={"field":"id"}
+            permission create = authenticated
+            permission read = authenticated
+            permission write = authenticated
+        }
+        """),
+    )
+    with actor_context(EDITOR):
+        folder = Folder.objects.create(pk=4321, name="explicit")
+    assert Folder._base_manager.get(pk=folder.pk).name == "explicit"
+
+
+@override_settings(REBAC_AUDIT_DENIALS=True, REBAC_DEPTH_LIMIT=2)
+def test_depth_uncertain_absent_container_is_an_audited_edge_denial():
+    install_schema(
+        backend(),
+        parse_zed("""
+        definition auth/user {}
+        definition blog/folder {
+            permission read = authenticated
+            permission write = authenticated
+        }
+        definition blog/sluggedpost {
+            relation editor: auth/user
+            relation parent: blog/sluggedpost
+            relation member: blog/folder // rebac:attribute={"field":"name"}
+            permission write = editor + parent->write
+        }
+        """),
+    )
+    with sudo(reason="test.fixture"):
+        folder = Folder.objects.create(name="previous")
+    _grant("blog/sluggedpost", "previous", "editor", EDITOR)
+    names = ("absent", "next", "far", "further", "granted")
+    backend().write_relationships(
+        [
+            RelationshipTuple(
+                ObjectRef("blog/sluggedpost", child),
+                "parent",
+                SubjectRef.of("blog/sluggedpost", parent),
+            )
+            for child, parent in pairwise(names)
+        ]
+    )
+    _grant("blog/sluggedpost", "granted", "editor", EDITOR)
+    with pytest.raises(PermissionDepthExceeded):
+        backend().check_access(
+            subject=EDITOR,
+            action="write",
+            resource=ObjectRef("blog/sluggedpost", "absent"),
+        )
+    folder.name = "absent"
+    with actor_context(EDITOR), pytest.raises(PermissionDenied):
+        folder.save(update_fields=["name"])
+    assert Folder._base_manager.get(pk=folder.pk).name == "previous"
+    assert list(
+        PermissionAuditEvent.objects.filter(reason__startswith="denied:").values_list(
+            "target_repr", flat=True
+        )
+    ) == ["blog/sluggedpost:absent#write"]
 
 
 def test_nested_m2m_backing_requires_write_on_source_folder():

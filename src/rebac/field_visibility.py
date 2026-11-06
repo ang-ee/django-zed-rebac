@@ -17,7 +17,7 @@ from .schema.walker import field_gated_actions
 from .types import CheckResult, FieldDenyMode, ObjectRef, PermissionResult, SubjectRef
 
 if TYPE_CHECKING:  # pragma: no cover
-    from .backends.base import Backend
+    from .backends.local import LocalBackend
 
 
 FIELD_DENY_MODES = frozenset({"allow", "redact", "omit", "raise"})
@@ -78,52 +78,38 @@ def backend_schema() -> Schema:
     return result
 
 
-def backend_grants_all(
-    active_backend: Backend,
+def held_ids(
+    active_backend: LocalBackend,
     *,
     subject: SubjectRef,
     action: str,
-    resource_type: str,
-) -> bool:
-    grants_all = getattr(active_backend, "grants_all", None)
-    if not callable(grants_all):
-        return False
-    return bool(grants_all(subject=subject, action=action, resource_type=resource_type))
-
-
-def accessible_ids(
-    active_backend: Backend,
-    *,
-    subject: SubjectRef,
-    action: str,
-    resource_type: str,
+    model: type[models.Model],
+    resource_ids: Iterable[str],
+    using: str | None = None,
 ) -> tuple[str, ...]:
-    """Route ``accessible`` through the ambient evaluator when one exists."""
-    from .evaluator import current_evaluator
+    """The supplied candidate ids on which ``subject`` holds ``action``.
 
-    evaluator = current_evaluator()
-    if evaluator is None:
-        return tuple(
-            str(v)
-            for v in active_backend.accessible(
-                subject=subject,
-                action=action,
-                resource_type=resource_type,
-            )
-        )
-    return tuple(
-        str(v)
-        for v in evaluator.accessible(
-            active_backend,
-            subject=subject,
-            action=action,
-            resource_type=resource_type,
-        )
+    ``using`` is the alias the caller's statement runs on; a read defaults to
+    the model's read alias.
+    """
+    resource_type = model_resource_type(model)
+    if resource_type is None:
+        return ()
+    ids = tuple(dict.fromkeys(resource_ids))
+    if not ids:
+        return ()
+    allowed = active_backend.held(
+        subject=subject,
+        action=action,
+        resource_type=resource_type,
+        ids=ids,
+        using=using or router.db_for_read(model),
     )
+    return tuple(value for value in ids if value in allowed)
 
 
 def check_field_access(
-    active_backend: Backend,
+    active_backend: LocalBackend,
     *,
     subject: SubjectRef,
     action: str,
@@ -173,7 +159,7 @@ def visible_id_sets(
     actor: SubjectRef,
     fields: frozenset[str],
     resource_ids: Iterable[str],
-    active_backend: Backend | None = None,
+    active_backend: LocalBackend | None = None,
 ) -> dict[str, frozenset[str]]:
     """Map each gated field to its visible subset of the supplied row ids.
 
@@ -369,7 +355,7 @@ def _scrub_loaded_value(instance: models.Model, field_name: str) -> None:
 
 
 def _conditional_field_is_visible(
-    active_backend: Backend,
+    active_backend: LocalBackend,
     *,
     actor: SubjectRef,
     action: str,

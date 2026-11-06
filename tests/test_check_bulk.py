@@ -9,13 +9,13 @@ from django.test.utils import CaptureQueriesContext
 from rebac import (
     CheckItem,
     CheckResult,
+    LocalBackend,
     ObjectRef,
     PermissionDepthExceeded,
     PermissionResult,
     RelationshipTuple,
     SubjectRef,
 )
-from rebac.backends.base import Backend
 from rebac.compile import read
 from rebac.evaluator import evaluator_scope
 from rebac.testing import install_schema
@@ -272,27 +272,19 @@ def test_an_item_beyond_the_depth_limit_raises_as_check_access_does(settings):
         local.check_bulk_permissions([near, deep])
 
 
-def test_the_base_backend_asks_item_by_item():
+def test_local_backend_boolean_shorthand_uses_check_access():
     asked = []
 
-    class Recording(Backend):
-        kind = "recording"
-
+    class Recording(LocalBackend):
         def check_access(self, *, subject, action, resource, context=None, **options):
             asked.append((subject, action, resource, context, options))
             return CheckResult.has() if action == "read" else CheckResult.no()
 
-        accessible = lookup_subjects = write_relationships = None
-        delete_relationships = delete_relationship = schema = None
-
-    Recording.__abstractmethods__ = frozenset()
-    items = [
-        CheckItem(user("ann"), "read", DOC, {"inside": True}),
-        CheckItem(user("bob"), "write", DOC),
-    ]
-    assert Recording().check_bulk_permissions(iter(items)) == [CheckResult.has(), CheckResult.no()]
+    local = Recording()
+    assert local.has_access(subject=user("ann"), action="read", resource=DOC)
+    assert not local.has_access(subject=user("bob"), action="write", resource=DOC)
     assert [entry[:4] for entry in asked] == [
-        (user("ann"), "read", DOC, {"inside": True}),
+        (user("ann"), "read", DOC, None),
         (user("bob"), "write", DOC, None),
     ]
 
