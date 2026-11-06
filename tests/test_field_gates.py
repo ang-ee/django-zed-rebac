@@ -21,7 +21,7 @@ from rebac import (
 )
 from rebac.backends import reset_backend
 from rebac.schema import parse_zed
-from tests.backend_setup import atomic_source_write, install_schema
+from tests.backend_setup import UNUSABLE_SCHEMA_ACCESSORS, atomic_source_write, install_schema
 
 # ``write`` opens up to owners + editors; ``write__title`` narrows it back
 # to owners only. ``body`` has no per-field gate, so it inherits ``write``.
@@ -216,6 +216,42 @@ def test_handbuilt_instance_with_pinned_actor(alice):
     instance._rebac_actor = SubjectRef.of("auth/user", str(alice.pk))
     instance.save()
     assert instance.pk is not None
+
+
+def _save_title(scoped, instance):
+    instance.title = "hijacked title"
+    instance.save()
+
+
+def _update_title(scoped, instance):
+    scoped.update(title="hijacked title")
+
+
+# The two paths a dirty gated field takes to its ``write__<field>`` gate.
+WRITES = (pytest.param(_save_title, id="save"), pytest.param(_update_title, id="update"))
+
+
+@pytest.mark.parametrize(("accessor", "error"), UNUSABLE_SCHEMA_ACCESSORS)
+@pytest.mark.parametrize("write", WRITES)
+def test_write_gate_fails_closed_without_a_usable_schema(
+    alice, bob, post, monkeypatch, write, accessor, error
+):
+    """An editor passes ``write``; ``write__title`` needs the schema, so the save
+    or bulk update raises rather than writes when the schema cannot be read."""
+    from tests.testapp.models import Post
+
+    _grant(post.pk, alice, "owner")
+    _grant(post.pk, bob, "editor")
+    scoped = Post.objects.as_user(bob).filter(pk=post.pk)
+    instance = scoped.get()
+    monkeypatch.setattr(backend(), "schema", accessor)
+
+    with pytest.raises(error):
+        write(scoped, instance)
+
+    monkeypatch.undo()
+    with sudo(reason="test.verify"):
+        assert Post.objects.get(pk=post.pk).title == "original title"
 
 
 # ---------- bulk updates ----------

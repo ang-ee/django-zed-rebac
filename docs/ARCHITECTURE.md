@@ -1214,7 +1214,7 @@ class RebacConfig(AppConfig):
         signals.connect_tracked_signals()  # app registry only
 ```
 
-**No queries. No model instantiation. No backend resolution at import time.** The backend singleton is constructed lazily on first access via `rebac.backend()` — this avoids `AppRegistryNotReady` and keeps `migrate` fast.
+**No queries. No model instantiation. No backend resolution at import time.** The backend singleton is constructed lazily on first access via `rebac.backend()` — this avoids `AppRegistryNotReady` and keeps `migrate` fast. Importing `rebac.backends` before app population must not import Django auth models merely for type annotations.
 
 Schema-dependent checks defer an unreadable persisted schema while Django's
 migration graph reports pending REBAC migrations. This lets `migrate` upgrade
@@ -2722,7 +2722,10 @@ Permissions named `read__<field>` are enforced after a queryset has been
 row-scoped and materialised. The schema syntax is unchanged: `read__title`,
 `read__salary`, and `write__title` are ordinary permission names. The shared
 schema accessor `field_gated_actions(definition, verb)` discovers both read and
-write field gates so the two paths cannot drift.
+write field gates so the two paths cannot drift. Both gates read the installed
+schema through the active backend's `schema()`: a backend without a usable one
+is an `ImproperlyConfigured` error and an exception from `schema()` propagates,
+so neither gate ever decides "no gates" for want of the schema.
 
 Field enforcement is opt-in through `REBAC_FIELD_READ_MODE` or
 `.on_field_deny(mode)`. Modes are:

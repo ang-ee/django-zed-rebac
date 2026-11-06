@@ -3,6 +3,29 @@
 All notable changes to `django-zed-rebac` are tracked here. The project is in
 pre-1.0; breaking changes within a minor version are explicitly called out.
 
+## [0.30.1] — 2026-11-06
+
+### Changed
+
+- `RebacManager`'s actor verbs (`with_actor`, `as_user`, `sudo`, …) are
+  Django's own `from_queryset` methods; the manager declares them for type
+  checkers only. Under mypy, `get_queryset()` on a
+  `RebacManager.from_queryset(...)` manager keeps the custom queryset type,
+  which replaces the 0.30.0 advice to call the verbs on the manager rather
+  than through `get_queryset()`. A manager whose `get_queryset()` does not
+  return a `RebacQuerySet` gets `AttributeError` from the verbs instead of
+  the `TypeError` `_rebac_queryset` raised.
+
+### Fixed
+
+- The field read and write gates (`read__<field>`, `write__<field>`), the
+  bulk `update()` gate included, fail closed when the schema cannot be read:
+  a custom backend without a working `schema()` raises `ImproperlyConfigured`
+  on field-gated reads and writes, and an exception from `schema()`
+  propagates. Before, either case left every field gate unenforced.
+- Importing `rebac.backends` before app population no longer imports
+  `django.contrib.auth.base_user`.
+
 ## [0.30.0] — 2026-10-28
 
 ### Changed

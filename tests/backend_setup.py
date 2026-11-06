@@ -1,6 +1,7 @@
 """Explicit setup for behavioural tests using an in-memory schema."""
 
 import pytest
+from django.core.exceptions import ImproperlyConfigured
 from django.db import router, transaction
 
 from rebac.models import active_relationship_model
@@ -8,6 +9,22 @@ from rebac.models import active_relationship_model
 # A heavy case keeps the default relationship storage in tier 1; the same case on the
 # registry storage runs with ``slow`` (docs/ARCHITECTURE.md § Test tiers).
 STORAGE_TIERS = ("denormalized", pytest.param("registry", marks=pytest.mark.slow))
+
+
+def _raising_schema():
+    raise RuntimeError("schema unavailable")
+
+
+# A backend ``schema`` attribute the field gates cannot use, and what reading it
+# raises: no callable, a callable that returns no ``Schema``, one that raises.
+# Installed with ``monkeypatch.setattr(backend(), "schema", accessor)``; the
+# LocalBackend's own evaluation reads its snapshot directly, so only the gates
+# are affected.
+UNUSABLE_SCHEMA_ACCESSORS = (
+    pytest.param(None, ImproperlyConfigured, id="no-callable"),
+    pytest.param(lambda: object(), ImproperlyConfigured, id="not-a-schema"),
+    pytest.param(_raising_schema, RuntimeError, id="raises"),
+)
 
 
 def ensure_policy(local, *, using=None):

@@ -6,6 +6,7 @@ import warnings
 from collections.abc import Iterable
 from typing import TYPE_CHECKING, Any, cast
 
+from django.core.exceptions import ImproperlyConfigured
 from django.db import models
 
 from ._id import resource_id_attr
@@ -50,18 +51,31 @@ def warn_raise_mode_degrades(*, stacklevel: int = 2) -> None:
     )
 
 
-def backend_schema() -> Schema | None:
-    """Best-effort schema accessor shared by read and write field gates."""
+def backend_schema() -> Schema:
+    """The active backend's installed schema, shared by the read and write field gates.
+
+    The gates decide from the schema alone, so they never run without it: a
+    backend whose ``schema()`` is missing or returns something other than a
+    :class:`Schema` is a configuration error, and an exception ``schema()``
+    raises propagates to the read or write that needed it.
+    """
     from .backends import backend
 
-    accessor = getattr(backend(), "schema", None)
+    active_backend = backend()
+    accessor = getattr(active_backend, "schema", None)
     if not callable(accessor):
-        return None
-    try:
-        result = accessor()
-    except Exception:
-        return None
-    return result if isinstance(result, Schema) else None
+        raise ImproperlyConfigured(
+            f"{type(active_backend).__qualname__} has no callable schema(); the "
+            "read__<field> and write__<field> gates read the installed schema through it."
+        )
+    result = accessor()
+    if not isinstance(result, Schema):
+        raise ImproperlyConfigured(
+            f"{type(active_backend).__qualname__}.schema() returned "
+            f"{type(result).__qualname__}, not a rebac.schema.ast.Schema; the "
+            "read__<field> and write__<field> gates read the installed schema through it."
+        )
+    return result
 
 
 def backend_grants_all(
@@ -141,10 +155,7 @@ def gated_read_fields(model: type[models.Model]) -> frozenset[str]:
     rebac_type = model_resource_type(model)
     if not rebac_type:
         return frozenset()
-    schema = backend_schema()
-    if schema is None:
-        return frozenset()
-    definition = schema.get_definition(rebac_type)
+    definition = backend_schema().get_definition(rebac_type)
     if definition is None:
         return frozenset()
     prefix = "read__"
