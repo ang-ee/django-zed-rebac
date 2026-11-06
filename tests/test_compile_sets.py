@@ -1,5 +1,7 @@
 """Actor-side subject sets stay inside the permission statement."""
 
+from itertools import pairwise
+
 import pytest
 from django.db import connection
 from django.test.utils import CaptureQueriesContext
@@ -9,8 +11,10 @@ from rebac import (
     RelationshipTuple,
     SubjectRef,
     evaluator_scope,
+    sudo,
 )
 from rebac.testing import install_schema
+from tests.testapp.models import Post
 
 pytestmark = pytest.mark.django_db
 ACTOR = SubjectRef.of("auth/user", "alice")
@@ -36,7 +40,32 @@ def group(name):
     return SubjectRef.of("auth/group", name, "member")
 
 
-def test_nested_sets_and_cycles_are_bounded_inline():
+def test_twelve_deep_membership_reaches_fixed_point_at_default_depth():
+    local = install_schema(
+        SCHEMA.replace(
+            "definition docs/doc {",
+            "definition blog/post {",
+        )
+        .replace("    relation banned: auth/group#member\n", "")
+        .replace("    permission read = viewer - banned", "    permission read = viewer")
+    )
+    with sudo(reason="nested membership fixture"):
+        post = Post.objects.create(title="deep membership")
+    names = [f"g{n}" for n in range(12)]
+    local.write_relationships(
+        [
+            member(names[0], ACTOR),
+            *(member(outer, group(inner)) for inner, outer in pairwise(names)),
+            RelationshipTuple(ObjectRef("blog/post", str(post.pk)), "viewer", group(names[-1])),
+        ]
+    )
+    assert Post.objects.with_actor(ACTOR).filter(pk=post.pk).exists()
+    assert local.check_access(
+        subject=ACTOR, action="read", resource=ObjectRef("blog/post", str(post.pk))
+    ).allowed
+
+
+def test_nested_sets_and_cycles_are_followed_inline():
     local = install_schema(SCHEMA)
     local.write_relationships(
         [

@@ -23,6 +23,7 @@ classifiers = [
 ]
 dependencies = [
     "django>=6.1,<6.2",
+    "django-cte>=5,<6",
 ]
 
 [project.optional-dependencies]
@@ -143,6 +144,7 @@ module = [
     "strawberry.*",
     "strawberry_django.*",
     "channels.*",
+    "django_cte.*",
 ]
 ignore_missing_imports = true
 

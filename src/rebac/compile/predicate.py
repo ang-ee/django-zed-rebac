@@ -25,12 +25,16 @@ from datetime import datetime
 from enum import StrEnum
 from typing import Any, Final, Protocol, cast
 
+from django.apps import apps
 from django.core.exceptions import FieldDoesNotExist
-from django.db import models
+from django.db import connections, models
 from django.db.models import Exists, Expression, F, OuterRef, Q, QuerySet, Value
-from django.db.models.lookups import Exact, In, IsNull, LessThan
+from django.db.models.expressions import Col
+from django.db.models.fields.related_lookups import RelatedExact, RelatedIn
+from django.db.models.lookups import Exact, In, IntegerFieldExact, IsNull, LessThan
+from django_cte import CTE, with_cte
 
-from .._id import model_identity_fields, resource_id_attr
+from .._id import _NATIVE_INTEGER_FIELDS, model_identity_fields, resource_id_attr
 from ..actors import is_anonymous_actor
 from ..codec import identity_codec
 from ..composition import TaggedComposition
@@ -41,6 +45,7 @@ from ..field_backing import (
     ResolvedConstBacking,
     ResolvedFieldBacking,
     _content_type,
+    _relation_path,
     _resolve_field_backing,
     resolve_attribute_backing,
     resolve_const_backing,
@@ -429,6 +434,21 @@ class Compiler:
         self.shape = actor_shape(self.schema, actor, using)
         self._memo: dict[tuple[Any, ...], Q] = {}
         self._own_identity = model_for_subject_type(actor.subject_type)
+        self._cte_tables: set[str] | None = None
+
+    def _cte_name(self, name: str) -> str:
+        """A CTE name that no model table of the project already uses."""
+        if self._cte_tables is None:
+            self._cte_tables = {
+                owner._meta.db_table for owner in apps.get_models(include_auto_created=True)
+            }
+        while name in self._cte_tables:
+            name += "_"
+        return name
+
+    def _cte_queryset(self, cte: CTE) -> QuerySet[Any]:
+        selected = cte.queryset()
+        return QuerySet(model=selected.model, query=selected.query, using=self.using)
 
     # ---------- The actor's id, as a value or as a placeholder ----------
 
@@ -600,18 +620,45 @@ class Compiler:
         return rows.filter(self._live_q(relation, bound))
 
     def _closure(self, seed: QuerySet[Any], edges: Any, hops: int) -> QuerySet[Any]:
-        """The wire ids within ``hops`` edges of ``seed``, as one nested set.
+        """The wire ids within ``hops`` edges of ``seed``, in a finite recursive CTE."""
+        if hops <= 0:
+            return seed
 
-        Each level is the seed united with one more hop from the level below,
-        so the statement grows linearly with the bound and names the seed once
-        per level.
-        """
-        closure = seed
-        for _ in range(hops):
-            closure = seed.union(
-                edges.filter(subject_id__in=_Compiled(closure)).order_by().values("resource_id")
+        def body(cte: CTE) -> QuerySet[Any]:
+            first = seed.annotate(_rebac_depth=Value(0, output_field=models.IntegerField()))
+            depth = models.ExpressionWrapper(
+                cte.col._rebac_depth, output_field=models.IntegerField()
             )
-        return closure
+            step = (
+                cte.join(edges, subject_id=cte.col.resource_id)
+                .order_by()
+                .values("resource_id")
+                .annotate(_rebac_depth=depth + Value(1))
+                .filter(_rebac_depth__lte=hops)
+                .values("resource_id", "_rebac_depth")
+            )
+            return cast(QuerySet[Any], first.union(step))
+
+        cte = CTE.recursive(body, name=self._cte_name("rebac_closure"))
+        return cast(
+            QuerySet[Any], with_cte(cte, select=self._cte_queryset(cte).values("resource_id"))
+        )
+
+    def _sets_closure(self, seed: QuerySet[Any], edges: Any) -> QuerySet[Any]:
+        """Actor-side stored subject sets to a fixed point, data cycles included.
+
+        The union drops rows already reached, so the recursion ends when no
+        new set appears.
+        """
+
+        def body(cte: CTE) -> QuerySet[Any]:
+            step = cte.join(edges, subject_id=cte.col.resource_id).order_by().values("resource_id")
+            return seed.union(step)
+
+        cte = CTE.recursive(body, name=self._cte_name("rebac_sets"))
+        return cast(
+            QuerySet[Any], with_cte(cte, select=self._cte_queryset(cte).values("resource_id"))
+        )
 
     def _not_converged(self, edges: Any, closure: QuerySet[Any], known: Q) -> Q:
         """Whether one more hop reaches an object the closure does not hold.
@@ -717,15 +764,8 @@ class Compiler:
         ).exclude(subject_id="*")
         if hop.id:
             edges = edges.filter(subject_id=hop.id)
-        closure = self._closure(
-            rows.filter(direct).order_by().values("resource_id"), edges, self.depth_limit
-        )
-        result = self._wire_membership(at, every, closure)
-        if bound is Bound.UPPER and depth_possible:
-            result = _or(
-                result, _and(self._not_converged(edges, closure, _FALSE), _not_null(at.ref))
-            )
-        return result
+        closure = self._sets_closure(rows.filter(direct).order_by().values("resource_id"), edges)
+        return self._wire_membership(at, every, closure)
 
     def _self_fk(
         self, key: Key
@@ -900,6 +940,34 @@ class Compiler:
                 .values_list(identity, flat=True)
             )
 
+        if bound is Bound.LOWER and self._finite_path(model, identity, resolved, source):
+            _, scalar = model_identity_fields(model, identity)
+
+            def path_rows(cte: CTE) -> QuerySet[Any]:
+                first = (
+                    reaching(seed)
+                    .values("pk")
+                    .annotate(_rebac_depth=Value(1, output_field=models.IntegerField()))
+                )
+                previous = models.ExpressionWrapper(cte.col.pk, output_field=scalar)
+                depth = models.ExpressionWrapper(
+                    cte.col._rebac_depth, output_field=models.IntegerField()
+                )
+                step = (
+                    cte.join(source, Q(**resolved.filters), **{target_path: previous})
+                    .values("pk")
+                    .annotate(_rebac_depth=depth + Value(1))
+                    .filter(_rebac_depth__lte=self.depth_limit)
+                    .order_by()
+                    .values("pk", "_rebac_depth")
+                )
+                return cast(QuerySet[Any], first.union(step))
+
+            cte = CTE.recursive(path_rows, name=self._cte_name("rebac_path"))
+            reached = self._cte_queryset(cte).values("pk")
+            members = with_cte(cte, select=source.filter(pk__in=_Compiled(reached)))
+            parts.append(self._model_membership(at, members, model, identity))
+            return self._union(at, parts)
         closure = seed
         for _ in range(self.depth_limit - 1):
             closure = seed.union(reaching(closure))
@@ -916,6 +984,72 @@ class Compiler:
             beyond = reaching(inherits).exclude(**{f"{identity}__in": _Compiled(known)})
             parts.append(_and(Q(Exists(beyond)), _not_null(at.ref)))
         return self._union(at, parts)
+
+    def _finite_path(
+        self,
+        model: type[models.Model],
+        identity: str,
+        resolved: ResolvedFieldBacking,
+        source: QuerySet[Any],
+    ) -> bool:
+        """Whether a lower-bound path recursion lowers to a finite recursive CTE.
+
+        The CTE carries the row's integer primary key and joins it back to the
+        path's column, so both must be plain columns of stock integer fields
+        compared by Django's own lookups, reached through forward keys only.
+        """
+        query_field, scalar = model_identity_fields(model, identity)
+        if not (
+            self.depth_limit > 1
+            and query_field is model._meta.pk
+            and query_field is scalar
+            and type(scalar) in _NATIVE_INTEGER_FIELDS
+            and identity != "_rebac_depth"
+            and connections[self.using].vendor in ("postgresql", "sqlite")
+        ):
+            return False
+        forward = True
+
+        def hop(_model: type[models.Model], field: object, _prefix: str) -> None:
+            nonlocal forward
+            forward = forward and type(field) in (models.ForeignKey, models.OneToOneField)
+
+        _relation_path(model, resolved.path, visit=hop)
+        if not forward or not resolved.targets_identity_directly():
+            return False
+        inspected = source.all().query
+        own = inspected.resolve_ref(identity)
+        target = inspected.resolve_ref(resolved.target_values_path())
+        if type(own) is not Col or type(target) is not Col:
+            return False
+        target_field = target.target
+        if not (
+            own.target is scalar
+            and own.output_field is scalar
+            and (
+                (target_field is scalar and target.output_field is scalar)
+                or (
+                    isinstance(target_field, models.ForeignKey)
+                    and type(target_field) in (models.ForeignKey, models.OneToOneField)
+                    and target_field is resolved.field
+                    and target_field.target_field is scalar
+                    and (target.output_field is scalar or target.output_field is target_field)
+                )
+            )
+        ):
+            return False
+        compared = target.output_field
+        exact, membership = (
+            (RelatedExact, RelatedIn)
+            if isinstance(compared, (models.ForeignKey, models.OneToOneField))
+            else (IntegerFieldExact, In)
+        )
+        return (
+            scalar.get_lookup("exact") is IntegerFieldExact
+            and scalar.get_lookup("in") is In
+            and compared.get_lookup("exact") is exact
+            and compared.get_lookup("in") is membership
+        )
 
     def _flat_self_tuple(
         self,
@@ -997,10 +1131,38 @@ class Compiler:
         if at.key is None and _one_object(at.ref) and bound is Bound.LOWER:
             # One object: follow the edges from it.  What it reaches is small,
             # each level is one lookup by resource, and the base is named once.
+            holders = edges if seed is _TRUE else edges.filter(seed)
+            if self.depth_limit <= 1:
+                return _or(point, Q(Exists(holders.filter(self._from(at, None)))))
+            if self._forward_recursion(edges):
+
+                def reached_rows(cte: CTE) -> QuerySet[Any]:
+                    first = (
+                        edges.filter(resource_id=at.ref)
+                        .order_by()
+                        .values("subject_id")
+                        .annotate(_rebac_depth=Value(1, output_field=models.IntegerField()))
+                    )
+                    depth = models.ExpressionWrapper(
+                        cte.col._rebac_depth, output_field=models.IntegerField()
+                    )
+                    step = (
+                        cte.join(edges, resource_id=cte.col.subject_id)
+                        .order_by()
+                        .values("subject_id")
+                        .annotate(_rebac_depth=depth + Value(1))
+                        .filter(_rebac_depth__lt=self.depth_limit)
+                        .values("subject_id", "_rebac_depth")
+                    )
+                    return cast(QuerySet[Any], first.union(step))
+
+                cte = CTE.recursive(reached_rows, name=self._cte_name("rebac_reached"))
+                reached_cte = self._cte_queryset(cte).values("subject_id")
+                matched = with_cte(cte, select=holders.filter(self._from(at, reached_cte)))
+                return _or(point, Q(Exists(matched)))
             reached: QuerySet[Any] | None = None
             for _ in range(self.depth_limit - 1):
                 reached = edges.filter(self._from(at, reached)).order_by().values("subject_id")
-            holders = edges if seed is _TRUE else edges.filter(seed)
             return _or(point, Q(Exists(holders.filter(self._from(at, reached)))))
         closure = self._closure(
             (edges if seed is _TRUE else edges.filter(seed)).order_by().values("resource_id"),
@@ -1015,6 +1177,24 @@ class Compiler:
                     result, _and(self._not_converged(edges, closure, known), _not_null(at.ref))
                 )
         return result
+
+    def _forward_recursion(self, edges: Any) -> bool:
+        """Whether tuple edges followed from one object lower to a recursive CTE.
+
+        Both wire columns must be plain text columns of one collation, so the
+        CTE's subject id compares with the next edge's resource id unchanged.
+        """
+        if connections[self.using].vendor not in ("postgresql", "sqlite"):
+            return False
+        columns = tuple(edges.query.resolve_ref(name) for name in ("resource_id", "subject_id"))
+        if not all(type(column) is Col and column.output_field is column.target for column in columns):
+            return False
+        resource_field, subject_field = (column.output_field for column in columns)
+        return (
+            type(resource_field) in (models.CharField, models.TextField)
+            and type(subject_field) in (models.CharField, models.TextField)
+            and resource_field.db_collation == subject_field.db_collation
+        )
 
     @staticmethod
     def _from(at: At, reached: QuerySet[Any] | None) -> Q:

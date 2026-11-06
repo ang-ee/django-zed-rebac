@@ -121,6 +121,11 @@ class _Policy:
     def schema(self) -> Schema:
         return self.tagged.schema
 
+    @property
+    def fence(self) -> tuple[tuple[datetime, bool], ...]:
+        """Each deadline the statement witnesses, and whether it lies ahead."""
+        return tuple((deadline, self.selected_at < deadline) for deadline in self.caveat_deadlines)
+
 
 def _schema(backend: LocalBackend) -> tuple[Schema, SchemaSnapshot]:
     snapshot = backend._schema_snapshot()
@@ -139,13 +144,19 @@ def _policy(backend: LocalBackend) -> _Policy:
         id(baseline),
         tuple(getattr(row, "pk", None) for row in snapshot.overrides),
     )
+    selected_at = timezone.now()
     with _lock:
         kept = _policies.get(key)
-        if kept is not None and kept.snapshot.schema is snapshot.schema:
+        if (
+            kept is not None
+            and kept.snapshot.schema is snapshot.schema
+            # A kept policy has only passed deadlines: it holds while the
+            # clock stays past them.
+            and all(selected_at >= deadline for deadline in kept.caveat_deadlines)
+        ):
             _policies.move_to_end(key)
             return kept
     overrides, _stale = split_stale_overrides(baseline, list(snapshot.overrides))
-    selected_at = timezone.now()
     active = [row for row in overrides if row.expires_at is None or row.expires_at > selected_at]
     # Permission sites retain their SQL deadlines. CEL expressions cannot be
     # selected in SQL, so choose them once and witness that selection interval.
@@ -159,15 +170,24 @@ def _policy(backend: LocalBackend) -> _Policy:
             or row.expires_at > selected_at
         ],
     )
-    deadlines = tuple(
-        sorted(
-            {
-                row.expires_at
-                for row in overrides
-                if row.kind == SchemaOverride.KIND_RECAVEAT and row.expires_at is not None
-            }
-        )
-    )
+    # Every override deadline still ahead closes a prepared scope: a scope pinned
+    # before it selects nothing after it, until it is built again with the new
+    # policy. A passed deadline is settled in the composition, except that a
+    # recaveat chose its expression by the application clock, so the statement
+    # witnesses that the database clock has passed it too.
+    ahead = {
+        row.expires_at
+        for row in overrides
+        if row.expires_at is not None and row.expires_at > selected_at
+    }
+    chosen = {
+        row.expires_at
+        for row in overrides
+        if row.kind == SchemaOverride.KIND_RECAVEAT
+        and row.expires_at is not None
+        and row.expires_at <= selected_at
+    }
+    deadlines = tuple(sorted(ahead | chosen))
     policy = _Policy(
         key,
         snapshot,
@@ -177,9 +197,9 @@ def _policy(backend: LocalBackend) -> _Policy:
         selected_at,
         deadlines,
     )
-    if not deadlines:
-        # A caveat override with a deadline selects its expression by the
-        # clock, so such a policy is prepared afresh each time.
+    if not ahead:
+        # A deadline ahead will change a prebuilt scope's composition, so a
+        # policy with one is prepared afresh at each construction boundary.
         with _lock:
             _policies[key] = policy
             while len(_policies) > _LIMIT:
@@ -210,13 +230,9 @@ def _fence(
         if parametric
         else Value(predicate.statement_now(), output_field=models.DateTimeField())
     )
-    for deadline in policy.caveat_deadlines:
-        comparison = (
-            LessThan(now, Value(deadline, output_field=models.DateTimeField()))
-            if policy.selected_at < deadline
-            else GreaterThanOrEqual(now, Value(deadline, output_field=models.DateTimeField()))
-        )
-        rows = rows.filter(comparison)
+    for deadline, ahead in policy.fence:
+        at = Value(deadline, output_field=models.DateTimeField())
+        rows = rows.filter(LessThan(now, at) if ahead else GreaterThanOrEqual(now, at))
     return rows
 
 
@@ -265,6 +281,9 @@ class _Operation:
             context,
             (
                 policy.key,
+                # A statement's fence carries the policy's deadlines: a policy
+                # selected on the other side of one compiles its own statement.
+                policy.fence,
                 actor_shape(policy.schema, actor, using),
                 using,
                 connections[using].vendor,
@@ -498,6 +517,8 @@ def _points(
     answers = [False] * len(asked)
     statements: list[dict[str, _Sql]] = [{}]
     size = 0
+    parameter_count = 1  # The generation-row primary key in the outer query.
+    parameter_limit = connections[asked[0][0].using].features.max_query_params if asked else None
     fenced: bool | None = None
     for position, (operation, key, resource_id) in enumerate(asked):
         compiled = _point_statement(operation, key, which, types[position])
@@ -507,13 +528,17 @@ def _points(
                     fenced = operation.gate(parametric=False).exists()
                 answers[position] = fenced
         else:
-            if statements[-1] and size + len(compiled.sql) > _BULK_SQL:
+            bound = operation.bound(compiled.params, resource_id)
+            if statements[-1] and (
+                size + len(compiled.sql) > _BULK_SQL
+                or (parameter_limit is not None and parameter_count + len(bound) > parameter_limit)
+            ):
                 statements.append({})
                 size = 0
+                parameter_count = 1
             size += len(compiled.sql)
-            statements[-1][f"item{position}"] = _Sql(
-                compiled.sql, operation.bound(compiled.params, resource_id)
-            )
+            parameter_count += len(bound)
+            statements[-1][f"item{position}"] = _Sql(compiled.sql, bound)
     rows = SchemaGeneration.objects.using(asked[0][0].using).filter(pk=1) if asked else None
     for probes in statements:
         if not probes or rows is None:

@@ -460,13 +460,13 @@ def test_field_owner_sql_cost_is_independent_of_visible_row_count(active, corpus
         large_cost = measure(1 + corpus)
     assert large_cost == small_cost
     # One aggregate and one bounded page; the evaluator scope keeps the
-    # actor's stored sets from the warm-up read.
+    # schema pin from the warm-up read.
     assert large_cost[0] == 2
     # A fixed statement, independent of the number of visible IDs. The count
-    # changes only with the compiler.
+    # changes only with the compiler; recursive CTE lowering raises the fixed count.
     # Django 6.1 compares the top-level boolean scope predicate with True (one
     # parameter) where the backend has no native boolean type.
-    assert large_cost[1] == 93 + (not connection.features.has_native_boolean_field)
+    assert large_cost[1] == 97 + (not connection.features.has_native_boolean_field)
 
 
 def test_stored_arrow_resolves_virtual_targets_without_row_multiplication(active):

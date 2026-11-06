@@ -193,10 +193,11 @@ def test_evaluator_scope_query_budget(synced, atomic, surface):
             with CaptureQueriesContext(connection) as repeated:
                 for _ in range(n):
                     evaluate()
-            expected = 0 if surface == "new" or (surface == "decision" and not atomic) else n
+            statement_reads = 0 if surface == "new" or (surface == "decision" and not atomic) else n
+            expected = statement_reads + (n if atomic else 0)
             assert len(repeated) == expected
             assert _loads(repeated) == 0
-            assert _generation_reads(repeated) == 0
+            assert _generation_reads(repeated) == (n if atomic else 0)
             if expected:
                 assert all("rebac_schemageneration" in query["sql"] for query in repeated)
 
@@ -210,7 +211,7 @@ def test_evaluator_revalidates_once_per_transaction_boundary(synced):
                 with CaptureQueriesContext(connection) as queries:
                     assert _check(local, resource)
                     assert _check(local, resource)
-                assert _generation_reads(queries) == 1
+                assert _generation_reads(queries) == 2
             with CaptureQueriesContext(connection) as queries:
                 assert evaluator.check(
                     local, subject=ACTOR, action="write", resource=resource

@@ -41,7 +41,6 @@ definition docs/doc {
     permission view = viewer
 }
 """
-MEMBERS = ("auth/group", "member")
 DOC = ObjectRef("docs/doc", "d")
 
 
@@ -221,15 +220,10 @@ def test_nested_sets_and_cycles_are_followed_for_every_actor():
         ]
     )
     items = [CheckItem(user(name), "read", DOC) for name in ("ann", "bob", "cat", "dan")]
-    with pytest.raises(PermissionDepthExceeded):
-        local.check_bulk_permissions(items)
-    bounded = [items[0], *items[2:]]
-    answers = local.check_bulk_permissions(bounded)
-    assert [bool(answer) for answer in answers] == [True, False, False]
-    assert answers == one_by_one(local, bounded)
-    # Bob reaches the viewer group only through a path beyond the depth limit.
-    with pytest.raises(PermissionDepthExceeded):
-        local.check_access(subject=user("bob"), action="read", resource=DOC)
+    answers = local.check_bulk_permissions(items)
+    # The groups form a cycle: every one of them holds ann and bob.
+    assert [bool(answer) for answer in answers] == [True, True, False, False]
+    assert answers == one_by_one(local, items)
 
 
 def elsewhere(monkeypatch, write):
