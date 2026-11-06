@@ -10,6 +10,7 @@ import pytest
 from django.core.exceptions import PermissionDenied as DjangoPermissionDenied
 
 import rebac
+from rebac import SubjectRef, actor_context, is_sudo, system_context
 
 ROOT = Path(__file__).resolve().parents[1]
 
@@ -62,6 +63,17 @@ def test_every_exported_name_resolves(name: str) -> None:
 
 def test_exports_are_unique() -> None:
     assert len(rebac.__all__) == len(set(rebac.__all__))
+
+
+@pytest.mark.django_db
+def test_is_sudo_public_export_reports_ambient_scope() -> None:
+    assert "is_sudo" in rebac.__all__
+    assert not is_sudo()
+    with actor_context(SubjectRef.of("auth/user", "42")):
+        assert not is_sudo()
+    with system_context(reason="test public is_sudo export"):
+        assert is_sudo()
+    assert not is_sudo()
 
 
 def test_unknown_attribute_raises_attribute_error() -> None:
