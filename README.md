@@ -14,7 +14,7 @@
 
 The runtime backend uses one Python API:
 
-- **`LocalBackend`** — pure Django. A permission is compiled to a query over your own tables and the relationship table and evaluated when it is read: field-, attribute- and const-backed relations come from the model columns, stored relations from tuples. The library stores no row per application row, there is no build step, and a write is visible to the next read. Recursive permissions are unrolled to `REBAC_DEPTH_LIMIT` levels. Caveats are decided in Python and bound into the statement. See [the design and its limits](./docs/ARCHITECTURE.md#compiled-permissions--the-localbackend-read-path).
+- **`LocalBackend`** — pure Django. A permission is compiled to a query over your own tables and the relationship table and evaluated when it is read: field-, attribute- and const-backed relations come from the model columns, stored relations from tuples. The library stores no row per application row, there is no build step, and a write is visible to the next read. Recursive permissions are recursive CTEs inside the statement: nested groups follow to a fixed point, other recursive paths are bounded by `REBAC_DEPTH_LIMIT`. Caveats are decided in Python and bound into the statement. See [the design and its limits](./docs/ARCHITECTURE.md#compiled-permissions--the-localbackend-read-path).
 `REBAC_BACKEND` accepts only `"local"`. A remote SpiceDB adapter is planned.
 
 Add the mixin to your model and `Post.objects.all()` returns only what the user can read. Add `Model.objects.with_actor(actor)` for explicit actor scoping in Celery tasks, GraphQL resolvers, management commands, and other non-HTTP entrypoints — `actor` can be a Django `User`, a registered `Agent`, an `agents/grant` (agent-acting-on-behalf-of-user, shipped by your `agents` app), or anything `@rebac_subject`-registered. Typed shorthands `as_user(user)` and `as_agent(agent, on_behalf_of=user)` cover the common cases. The default Django actor labels are `auth/user` and `auth/group`; include their definitions in your application schema (automatic base-schema emission is planned). `agents/agent`, `agents/grant`, `auth/apikey`, and other subject types live in your own apps.
@@ -88,7 +88,7 @@ else has to be built, and fixture loads or bulk writes need no command
 afterwards. Write aliases for the models a permission reads and for
 relationships must match; separate read replicas are allowed. After a database
 flush, run `rebac sync` again before serving. See the
-[upgrade notes](./CHANGELOG.md#unreleased).
+[upgrade notes](./CHANGELOG.md#0310--2026-11-06).
 
 ```python
 # blog/views.py
@@ -150,7 +150,7 @@ hooks, so each feature release is verified before the bound moves.
 
 Versioning follows SemVer while the project is below 1.0: minor releases may add public API and tighten alpha contracts; patch releases are reserved for compatible fixes.
 
-Database support: PostgreSQL 15+ (production target), MySQL 8.4+ (opt-in vendor suite), SQLite (test/dev only). CI runs SQLite and PostgreSQL; the MySQL suite is a release gate. The `Relationship` indexes ship in `0001_initial.py`. After upgrading, run `migrate`; no other command is needed. Behaviour on PostgreSQL tables of tens of millions of rows has not been verified yet. See [upgrade notes](./CHANGELOG.md#unreleased) for the removed commands, checks and settings and for the recursion bound.
+Database support: PostgreSQL 15+ (production target), MySQL 8.4+ (opt-in vendor suite), SQLite (test/dev only). CI runs SQLite and PostgreSQL; the MySQL suite is a release gate. The `Relationship` indexes ship in `0001_initial.py`. After upgrading, run `migrate`; no other command is needed. Behaviour on PostgreSQL tables of tens of millions of rows has not been verified yet. See [upgrade notes](./CHANGELOG.md#0310--2026-11-06) for the removed commands, checks and settings and for the recursion bound.
 
 ## Comparison
 
