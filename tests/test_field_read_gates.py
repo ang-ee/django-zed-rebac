@@ -1059,3 +1059,61 @@ def test_the_projection_guard_runs_once_per_evaluation(alice, monkeypatch):
     assert len(rows) == 1
     assert rows
     assert len(calls) == 1
+
+
+@pytest.mark.pg_delta
+@pytest.mark.parametrize("field_count", (1, 2, 3))
+@pytest.mark.parametrize("row_count", (1, 5))
+def test_field_visibility_statement_growth_is_per_distinct_permission(
+    alice, field_count, row_count
+):
+    from rebac.field_visibility import visible_id_sets
+
+    fields = ("title", "body", "folder")[:field_count]
+    expressions = ("owner", "editor", "viewer")[:field_count]
+    gates = "\n    ".join(
+        f"permission read__{field} = {expression}"
+        for field, expression in zip(fields, expressions, strict=True)
+    )
+    install_schema(
+        backend(),
+        parse_zed(SCHEMA_TEXT.replace("permission read__title = owner", gates)),
+    )
+    posts = [_post(title=f"post {index}") for index in range(row_count)]
+    for post in posts:
+        _grant(post.pk, alice, "viewer")
+    ids = tuple(str(post.pk) for post in posts)
+    actor = SubjectRef.of("auth/user", str(alice.pk))
+    with CaptureQueriesContext(connection) as queries:
+        visible = visible_id_sets(
+            model=Post, actor=actor, fields=frozenset(fields), resource_ids=ids
+        )
+    assert set(visible) == set(fields)
+    assert len(queries) == field_count  # 1, 2, 3 permissions; constant in row_count.
+
+
+@pytest.mark.pg_delta
+@pytest.mark.parametrize("field_count", (1, 2, 3))
+def test_field_visibility_equal_permissions_share_one_statement(alice, field_count):
+    from rebac.field_visibility import visible_id_sets
+
+    fields = ("title", "body", "folder")[:field_count]
+    gates = "\n    ".join(f"permission read__{field} = read_private" for field in fields)
+    install_schema(
+        backend(),
+        parse_zed(
+            SCHEMA_TEXT.replace(
+                "permission read__title = owner",
+                f"permission read_private = owner\n    {gates}",
+            )
+        ),
+    )
+    posts = [_post(title=f"post {index}") for index in range(5)]
+    actor = SubjectRef.of("auth/user", str(alice.pk))
+    ids = tuple(str(post.pk) for post in posts)
+    with CaptureQueriesContext(connection) as queries:
+        visible = visible_id_sets(
+            model=Post, actor=actor, fields=frozenset(fields), resource_ids=ids
+        )
+    assert all(not allowed for allowed in visible.values())
+    assert len(queries) == 1  # Constant in the number of fields sharing read_private.

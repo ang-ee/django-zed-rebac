@@ -92,6 +92,34 @@ class Backend(ABC):
             for item in items
         ]
 
+    def held_many(
+        self,
+        *,
+        subject: SubjectRef,
+        actions: Iterable[str],
+        resource_type: str,
+        ids: Iterable[str],
+        context: dict[str, Any] | None = None,
+        using: str | None = None,
+    ) -> dict[str, set[str]]:
+        """The ids among ``ids`` on which ``subject`` holds each action.
+
+        Only definite answers count. A backend overrides this to share work
+        between the actions and the ids.
+        """
+        names = tuple(dict.fromkeys(actions))
+        candidates = tuple(dict.fromkeys(ids))
+        items = [
+            CheckItem(subject, name, ObjectRef(resource_type, value), context)
+            for name in names
+            for value in candidates
+        ]
+        answers: dict[str, set[str]] = {name: set() for name in names}
+        for item, result in zip(items, self.check_bulk_permissions(items), strict=True):
+            if result.allowed:
+                answers[item.action].add(item.resource.resource_id)
+        return answers
+
     @abstractmethod
     def accessible(
         self,

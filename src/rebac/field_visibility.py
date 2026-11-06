@@ -7,7 +7,7 @@ from collections.abc import Iterable
 from typing import TYPE_CHECKING, Any, cast
 
 from django.core.exceptions import ImproperlyConfigured
-from django.db import models
+from django.db import models, router
 
 from ._id import resource_id_attr
 from .conf import app_settings
@@ -172,12 +172,13 @@ def visible_id_sets(
     model: type[models.Model],
     actor: SubjectRef,
     fields: frozenset[str],
+    resource_ids: Iterable[str],
     active_backend: Backend | None = None,
-) -> dict[str, frozenset[str] | None]:
-    """Map each gated field to visible resource ids.
+) -> dict[str, frozenset[str]]:
+    """Map each gated field to its visible subset of the supplied row ids.
 
-    ``None`` means the field action grants every row of this resource type, so
-    callers should skip per-row redaction for that field.
+    Every field of the batch is decided together: one statement per distinct
+    permission, memoised in the ambient evaluator scope when eligible.
     """
     rebac_type = model_resource_type(model)
     if not rebac_type or not fields:
@@ -186,26 +187,31 @@ def visible_id_sets(
         from .backends import backend
 
         active_backend = backend()
-    visible: dict[str, frozenset[str] | None] = {}
-    for field_name in fields:
-        action = f"read__{field_name}"
-        if backend_grants_all(
+    from .evaluator import current_evaluator
+
+    candidates = tuple(dict.fromkeys(resource_ids))
+    actions = tuple(f"read__{name}" for name in sorted(fields))
+    using = router.db_for_read(model)
+    evaluator = current_evaluator()
+    if evaluator is None:
+        answers = active_backend.held_many(
+            subject=actor,
+            actions=actions,
+            resource_type=rebac_type,
+            ids=candidates,
+            using=using,
+        )
+    else:
+        answers = evaluator._held_many(
             active_backend,
             subject=actor,
-            action=action,
+            model=model,
             resource_type=rebac_type,
-        ):
-            visible[field_name] = None
-            continue
-        visible[field_name] = frozenset(
-            accessible_ids(
-                active_backend,
-                subject=actor,
-                action=action,
-                resource_type=rebac_type,
-            )
+            actions=actions,
+            ids=candidates,
+            using=using,
         )
-    return visible
+    return {name: frozenset(answers[f"read__{name}"]) for name in fields}
 
 
 def apply_field_visibility(
@@ -235,22 +241,22 @@ def apply_field_visibility(
     from .backends import backend
 
     active_backend = backend()
+    rebac_type = model_resource_type(model)
+    if not rebac_type:
+        return
+    resource_ids = [_instance_resource_id(inst) for inst in batch]
     visible = visible_id_sets(
         model=model,
         actor=actor,
         fields=fields,
+        resource_ids=resource_ids,
         active_backend=active_backend,
     )
-    rebac_type = model_resource_type(model)
-    if not rebac_type:
-        return
 
-    for inst in batch:
+    for inst, resource_id in zip(batch, resource_ids, strict=True):
         denied: set[str] = set()
-        resource_id = _instance_resource_id(inst)
         for field_name in fields:
-            ids = visible.get(field_name)
-            if ids is None or resource_id in ids:
+            if resource_id in visible[field_name]:
                 continue
             if _conditional_field_is_visible(
                 active_backend,

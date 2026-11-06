@@ -2720,12 +2720,25 @@ that a joined multi-table child inherits from its parent's table
 (`values("child__name")`) is returned: the guard does not know which model
 the join came through.
 
-The engine computes visibility per row, not with a blanket `.defer()`. For each
-declared `read__<field>`, it asks the backend for
-`accessible(subject, action="read__<field>", resource_type=...)` through the
-ambient `PermissionEvaluator` when one is open. A row whose resource id is not
-in that set has the field redacted. This preserves cases where Alice may read
-`title` on her own row but not on Bob's row in the same queryset.
+The engine computes visibility per row, not with a blanket `.defer()`. The
+materialisation pass calls the backend's `held_many()` with the fetched rows'
+ids and every declared `read__<field>` action. Fields whose gates are one
+unmodified permission expression share its decision; distinct expressions are
+decided separately, each by one statement per chunk of candidate ids,
+independent of the number of rows in it. A row whose resource id is not in a
+field's held set has that field redacted. This preserves cases where Alice may
+read `title` on her own row but not on Bob's row in the same queryset.
+
+An ambient `PermissionEvaluator` memoises these answers, keyed by backend,
+policy generation, actor, model, action, database alias and the exact
+candidate ids. Its LRU bounds both its entries and the candidate ids they hold
+by `REBAC_EVALUATOR_CACHE_SIZE`. It is cleared by `invalidate()` and with the
+evaluator. Eligibility is the check cache's: a live field- or
+attribute-backed type, an expiring relation, an override deadline, an atomic
+block (including `ATOMIC_REQUESTS` and test transactions) and a failed schema
+read decide afresh, and so does any caveat in the schema. An evaluator is not
+a single consistent read: an eligible field answer can survive a tuple write
+REBAC does not own until invalidation or scope exit.
 
 Projection querysets that would return gated fields directly, such as
 `.values("salary")`, `.values_list("salary", flat=True)`, or bare `.values()`,

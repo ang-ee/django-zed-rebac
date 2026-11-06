@@ -1205,6 +1205,58 @@ def held(
     )
 
 
+@schema_operation
+def held_many(
+    *,
+    backend: LocalBackend,
+    resource_type: str,
+    actions: Iterable[str],
+    actor: SubjectRef,
+    ids: Iterable[str],
+    using: str,
+    context: Mapping[str, Any] | None = None,
+) -> dict[str, set[str]]:
+    """The ids among ``ids`` the actor holds, per action, deciding equal permissions once.
+
+    A field gate is often an alias of a shared permission: actions whose
+    expressions are equal share one decision. Only an unmodified policy shares;
+    an override carries action-specific sites and deadlines.
+    """
+    if isinstance(actions, str):
+        raise TypeError("actions must be an iterable of names, not a bare string")
+    names = tuple(dict.fromkeys(actions))
+    candidates = tuple(dict.fromkeys(ids))
+    if not names:
+        return {}
+    if not candidates:
+        return {name: set() for name in names}
+    policy = _policy(backend)
+    shared = not policy.tagged.arms and not policy.tagged.sites
+    decisions: dict[object, set[str]] = {}
+    answers: dict[str, set[str]] = {}
+    for name in names:
+        permission = policy.tagged.schema.get_permission(resource_type, name)
+        key: object = (
+            ("expression", permission.expression)
+            if permission is not None and shared
+            else ("action", name)
+        )
+        if key not in decisions:
+            decisions[key] = set(
+                _held(
+                    backend=backend,
+                    resource_type=resource_type,
+                    action=name,
+                    actor=actor,
+                    ids=candidates,
+                    using=using,
+                    context=context,
+                )
+            )
+        answers[name] = set(decisions[key])
+    return answers
+
+
 def _held(
     *,
     backend: LocalBackend,

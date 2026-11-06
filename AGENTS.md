@@ -105,6 +105,9 @@ not a code change**.
   adds no permission semantics and no enumeration a SpiceDB client lacks; a
   backend without the hook falls back to the actor-scoped queryset. It is an
   ORM integration surface like queryset scoping, not a new RPC.
+- **Exception: `held_many()`.** It checks bounded candidate ids for several
+  permissions of one resource type for one subject: a batched
+  `CheckBulkPermissions`, deciding equal permissions once.
 - **Do** emit `use typechecking` at the top of every generated `.zed` file
   (catches mutually-exclusive-type intersections at WriteSchema time).
 

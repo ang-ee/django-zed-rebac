@@ -434,3 +434,43 @@ def test_rebac_prefetch_unprotected_tail_does_not_inherit_root_sudo(authored_fol
             .rebac_prefetch_related("authored_posts__author")
             .get(pk=folder.pk)
         )
+
+
+@pytest.mark.django_db
+@pytest.mark.parametrize("storage", ["denormalized", "registry"])
+def test_materialized_field_visibility_checks_only_fetched_ids(
+    alice, monkeypatch, settings, storage
+):
+    from tests.testapp.models import AuthoredPost
+
+    settings.REBAC_LOCAL_BACKEND_STORAGE = storage
+    reset_backend()
+    install_schema(backend(), parse_zed(SCHEMA_TEXT))
+    with sudo(reason="test.fixture"):
+        readable = AuthoredPost.objects.create(title="visible", author=alice)
+        denied = AuthoredPost.objects.create(title="private", author=alice)
+        unrelated = AuthoredPost.objects.create(title="not fetched", author=alice)
+    for post in (readable, denied, unrelated):
+        _grant("blog/authoredpost", post.pk, "viewer", alice)
+    for post in (readable, unrelated):
+        _grant("blog/authoredpost", post.pk, "owner", alice)
+    active = backend()
+    original = active.held_many
+    requested = []
+
+    def membership(**kwargs):
+        requested.append((tuple(kwargs["actions"]), tuple(kwargs["ids"])))
+        return original(**kwargs)
+
+    monkeypatch.setattr(active, "held_many", membership)
+    monkeypatch.setattr(active, "accessible", lambda **kwargs: pytest.fail("unbounded enumeration"))
+    monkeypatch.setattr(
+        active, "grants_all", lambda **kwargs: pytest.fail("bounded rows need no universal proof")
+    )
+    rows = list(
+        AuthoredPost.objects.as_user(alice)
+        .on_field_deny("redact")
+        .filter(pk__in=(readable.pk, denied.pk))
+    )
+    assert {row.pk: row.title for row in rows} == {readable.pk: "visible", denied.pk: None}
+    assert requested == [(("read__title",), (str(readable.pk), str(denied.pk)))]

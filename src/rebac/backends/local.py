@@ -650,6 +650,31 @@ class LocalBackend(Backend):
         )
 
     @_schema_operation
+    def held_many(
+        self,
+        *,
+        subject: SubjectRef,
+        actions: Iterable[str],
+        resource_type: str,
+        ids: Iterable[str],
+        context: dict[str, Any] | None = None,
+        using: str | None = None,
+    ) -> dict[str, set[str]]:
+        """The held candidate ids per action, equal permissions decided once."""
+        from ..compile.read import held_many
+        from ..models import active_relationship_model
+
+        return held_many(
+            backend=self,
+            resource_type=resource_type,
+            actions=actions,
+            actor=subject,
+            ids=ids,
+            using=using or active_relationship_model().objects.db,
+            context=context,
+        )
+
+    @_schema_operation
     def grants_all(
         self,
         *,

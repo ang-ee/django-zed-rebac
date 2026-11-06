@@ -30,7 +30,7 @@ task does not leak back to the parent.
 from __future__ import annotations
 
 from collections import OrderedDict
-from collections.abc import Hashable, Iterator
+from collections.abc import Hashable, Iterable, Iterator
 from contextlib import contextmanager
 from contextvars import ContextVar
 from typing import TYPE_CHECKING, Any
@@ -39,6 +39,8 @@ from .schema.cache import SchemaScope, schema_operation
 from .types import CheckResult, Consistency, ObjectRef, PermissionResult, SubjectRef, Zookie
 
 if TYPE_CHECKING:  # pragma: no cover
+    from django.db import models
+
     from .backends.base import Backend
 
 
@@ -105,11 +107,17 @@ class PermissionEvaluator:
         "_check_cache",
         "_max_size",
         "_schema_scope",
+        "_visibility_decision_ids",
+        "_visibility_decisions",
     )
 
     def __init__(self, *, max_size: int = 10_000) -> None:
         self._check_cache: OrderedDict[tuple[Any, ...], CheckResult] = OrderedDict()
         self._accessible_cache: OrderedDict[tuple[Any, ...], tuple[str, ...]] = OrderedDict()
+        # Field visibility per actor, model, action and row batch; bounded by
+        # entries and by the candidate ids they hold together.
+        self._visibility_decisions: OrderedDict[tuple[Any, ...], frozenset[str]] = OrderedDict()
+        self._visibility_decision_ids = 0
         self._max_size = max_size
         self._schema_scope = SchemaScope()
 
@@ -219,7 +227,84 @@ class PermissionEvaluator:
         """
         self._check_cache.clear()
         self._accessible_cache.clear()
+        self._visibility_decisions.clear()
+        self._visibility_decision_ids = 0
         self._schema_scope.clear()
+
+    @schema_operation
+    def _held_many(
+        self,
+        backend: Backend,
+        *,
+        subject: SubjectRef,
+        model: type[models.Model],
+        resource_type: str,
+        actions: Iterable[str],
+        ids: Iterable[str],
+        using: str,
+    ) -> dict[str, set[str]]:
+        """Field visibility of a row batch, memoised under the check cache's eligibility.
+
+        A batch is remembered only when the check cache could keep an answer
+        for its resource type (no transaction, no live-backed type, no expiring
+        tuple), the schema declares no caveat and the batch fits the budget.
+        Otherwise it is decided afresh.
+        """
+        names = tuple(dict.fromkeys(actions))
+        candidates = tuple(sorted(set(ids)))
+        if not names:
+            return {}
+        if not candidates:
+            return {name: set() for name in names}
+        backend_key = (
+            _backend_cache_key(backend, resource_type)
+            if len(candidates) <= self._max_size
+            else None
+        )
+        schema = getattr(backend, "_schema_snapshot", None)
+        if (
+            backend_key is None
+            or backend_key[1] is None
+            or not callable(schema)
+            or schema().schema.caveats
+        ):
+            return backend.held_many(
+                subject=subject,
+                actions=names,
+                resource_type=resource_type,
+                ids=candidates,
+                using=using,
+            )
+        base_key = (*backend_key, subject, model, resource_type, candidates, using)
+        answers: dict[str, set[str]] = {}
+        missing: list[str] = []
+        for name in names:
+            key = (*base_key, name)
+            if key in self._visibility_decisions:
+                self._visibility_decisions.move_to_end(key)
+                answers[name] = set(self._visibility_decisions[key])
+            else:
+                missing.append(name)
+        if missing:
+            found = backend.held_many(
+                subject=subject,
+                actions=missing,
+                resource_type=resource_type,
+                ids=candidates,
+                using=using,
+            )
+            for name in missing:
+                answers[name] = found[name]
+                self._visibility_decisions[(*base_key, name)] = frozenset(found[name])
+                self._visibility_decision_ids += len(candidates)
+            while (
+                len(self._visibility_decisions) > self._max_size
+                or self._visibility_decision_ids > self._max_size
+            ):
+                # A key ends with the candidates, the alias and the action.
+                oldest, _ = self._visibility_decisions.popitem(last=False)
+                self._visibility_decision_ids -= len(oldest[-3])
+        return answers
 
     # ----- introspection (for tests + debugging) -----
 
@@ -227,6 +312,8 @@ class PermissionEvaluator:
         return {
             "check_entries": len(self._check_cache),
             "accessible_entries": len(self._accessible_cache),
+            "visibility_entries": len(self._visibility_decisions),
+            "visibility_ids": self._visibility_decision_ids,
             "max_size": self._max_size,
         }
 
