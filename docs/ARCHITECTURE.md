@@ -2214,9 +2214,16 @@ of its own.
 - A queryset scope contains the permissions for its arrow targets and
   subject sets inline. A statement can therefore grow substantially for
   a policy with many paths or deep recursion. There is no scale claim.
-- SQLite can reject a deeply nested expression when it exceeds its
-  expression-tree limit. Choose the depth limit for the policy and the
-  supported database vendor.
+- SQLite adds up the expression depth of every subquery nested in a WHERE
+  clause while it resolves a statement, and refuses one deeper than
+  `SQLITE_LIMIT_EXPR_DEPTH` (1000 by default). Nested id sets would make that
+  sum grow with the square of an arrow chain's length. On SQLite the
+  outermost of every run of three nested compiled id sets is therefore a
+  statement-local CTE, whose body does not count toward the depth of the
+  expression that selects from it: the depth then grows with the chain's
+  length, about 25 levels a type for a type with seven arms.
+  A recursive form that falls back to nested SQL still grows with
+  `REBAC_DEPTH_LIMIT`; choose that limit for the policy and the vendor.
 
 - Query plans on PostgreSQL tables of tens of millions of rows have not been
   verified. A trial at that scale is in progress, and this document makes no

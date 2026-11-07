@@ -3,6 +3,20 @@
 All notable changes to `django-zed-rebac` are tracked here. The project is in
 pre-1.0; breaking changes within a minor version are explicitly called out.
 
+## [0.31.1] — 2026-11-06
+
+### Fixed
+
+- On SQLite, a scoped read over a wide policy failed with `Expression tree is
+  too large (maximum depth 1000)`. SQLite adds up the expression depth of every
+  subquery nested in a WHERE clause while it resolves a statement, and inline
+  compilation nests the id set of each arrow and subject set inside the next,
+  so the depth grew with the square of the longest arrow chain. On SQLite the
+  outermost of every run of three nested id sets is now a statement-local CTE;
+  a CTE's body does not count toward the depth of the expression that selects
+  from it, so the depth grows with the chain's length. PostgreSQL and MySQL
+  statements are unchanged.
+
 ## [0.31.0] — 2026-11-06
 
 ### Breaking
