@@ -3,6 +3,34 @@
 All notable changes to `django-zed-rebac` are tracked here. The project is in
 pre-1.0; breaking changes within a minor version are explicitly called out.
 
+## [0.30.2] — 2026-11-07
+
+### Fixed
+
+- A union that names a union compiles as one union. At a row, a union is
+  `id IN (SELECT … UNION …)`, and an arm naming a permission that is itself a
+  union was compiled as its own such union, one subquery level deeper on every
+  path through it. SQLite adds the height of every enclosing subquery to an
+  expression's depth, so `read = read_granted + chatter_read` reached through
+  arrows pushed a framework file read past SQLite's limit of 1000 (`Expression
+  tree is too large`). The union now takes the named node's own arms, built by
+  the same memoized node in the same order: answers and the statements a read
+  executes are unchanged, and the statement no longer nests per name.
+
+### Carried from the framework's pin
+
+0.30.2 contains f43f0773, the commit the framework pinned, so it supersedes
+that git pin. Besides the two fixes 0.30.1 already carried from it (backend
+imports independent of auth model population; `RebacManager` verbs delegated
+to the native queryset methods):
+
+- `rebac.database_context(using)` supplies a context-local default database
+  for REBAC's own operations, and a queryset's guards, field gates, audits
+  and bulk gates run under its own alias. Explicit queryset, instance and
+  operation aliases still take precedence; Django's routing of ordinary ORM
+  calls is unchanged (8b8b6b0, 610548c).
+- The PostgreSQL delta runs the alias acceptance tests (4bbffd4).
+
 ## [0.30.1] — 2026-11-06
 
 ### Changed

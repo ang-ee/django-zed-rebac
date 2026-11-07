@@ -1863,6 +1863,11 @@ bounds select the same objects.
   a queryset of the model's identities and the arms are united, so no `OR` is
   left above a subquery of the row's model. At an identity that is not a row
   (a tuple column, a parameter) the arms are joined with `OR`.
+- **A union that names a union is one union.** An arm that names a
+  permission or relation of the same type contributes that node's own arms,
+  built once by the same memoized node in the same order: `read = granted +
+  chatter` is the union of the arms of both, not a union of two unions, so a
+  name adds no subquery level. A tagged arm keeps its deadline whole.
 - **A negated disjunction is a conjunction of `NOT EXISTS`**, one per arm.
   `NOT IN` is never emitted.
 - **Membership is two-valued.** An `IN` arm is `ref IS NOT NULL AND ref IN
