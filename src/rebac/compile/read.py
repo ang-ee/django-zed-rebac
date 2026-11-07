@@ -477,7 +477,8 @@ def _constant_witness(
     kept = None if fresh or None in generations else generations
     return evaluator._constant_witness(
         operation.backend,
-        (compiled.sql, compiled.params, operation.actor),
+        # The same SQL decides on each database alias it runs on.
+        (compiled.sql, compiled.params, operation.actor, operation.using),
         kept,
         decide,
         recheck=recheck,

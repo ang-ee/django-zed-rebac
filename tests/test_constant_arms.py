@@ -697,6 +697,44 @@ def test_reads_match_the_references_inside_and_outside_a_scope(shape):
 
 
 @KEPT
+def test_the_witness_is_kept_per_database(tmp_path):
+    from django.db import connections
+
+    from rebac.models.generation import SchemaGeneration
+    from tests.backend_setup import sqlite_alias
+
+    alias = "witness_other"
+    other = sqlite_alias(alias, tmp_path / "other.sqlite3")
+    connections[alias] = other
+    try:
+        with other.schema_editor() as editor:
+            for model in (Folder, Post, Relationship, SchemaGeneration):
+                editor.create_model(model)
+        _shape("viewer + admin->member", "")
+        SchemaGeneration.objects.using(alias).create(pk=1, revision="")
+        with sudo(reason="constant arms per database"):
+            remote = [Post.objects.using(alias).create(title=f"remote-{n}") for n in range(2)]
+        # On the other database the member holds the constant arm.
+        with other.cursor() as cursor:
+            cursor.execute(
+                f"INSERT INTO {_table()} (resource_type, resource_id, relation, subject_type, "
+                "subject_id, optional_subject_relation, caveat_name, caveat_context, "
+                "caveat_key, written_at_xid) VALUES ('org/role', 'admin', 'member', "
+                "'auth/user', 'member', '', '', NULL, '', 0)"
+            )
+        viewed = list(Post._base_manager.order_by("pk").values_list("pk", flat=True))[:1]
+        with evaluator_scope() as evaluator:
+            # It holds none on the default one: kept there, for that database.
+            assert _read(MEMBER)[0] == viewed
+            ids = Post.objects.using(alias).with_actor(MEMBER).order_by("pk")
+            assert list(ids.values_list("pk", flat=True)) == [post.pk for post in remote]
+            assert evaluator.stats()["constant_witness_entries"] == 2
+    finally:
+        other.close()
+        del connections[alias]
+
+
+@KEPT
 def test_a_recursive_permission_with_a_constant_arm_matches_the_references():
     local = install_schema(
         "\n".join(

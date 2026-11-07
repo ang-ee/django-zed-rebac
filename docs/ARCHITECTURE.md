@@ -1900,8 +1900,8 @@ evaluator scope, a witness statement decides whether the actor holds one
   alone, a gate that admits every row, which evaluates them again when it
   runs. A point check (`check_access`) of that actor is answered by the
   witness statement, decided at that check.
-- The evaluator remembers the answer for the rest of the scope, per actor and
-  distinct statement of constant arms. Keeping it is allowed where the
+- The evaluator remembers the answer for the rest of the scope, per actor,
+  database alias and distinct statement of constant arms. Keeping it is allowed where the
   decision cache may keep a decision about every type the arms name
   (`_backend_cache_key`; see
   [the per-request evaluator](#permissionevaluator--per-request-check-cache))
@@ -3003,8 +3003,8 @@ Backend relationship writes and the `post_delete` cascade
 backend instances in this process, including evaluators suspended by a nested
 scope.
 
-The evaluator also remembers, per actor and per statement of a permission's
-constant arms, whether the actor holds one (see
+The evaluator also remembers, per actor, database alias and statement of a
+permission's constant arms, whether the actor holds one (see
 [Inline permission scopes](#inline-permission-scopes)). The answer only
 chooses which statement a read runs. It is used as kept only under these
 rules: when the decision cache may keep a decision about every type the arms

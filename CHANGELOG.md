@@ -37,6 +37,11 @@ pre-1.0; breaking changes within a minor version are explicitly called out.
   statement. Embedded bypasses are still audited with each statement that
   executes them. A queryset that `scoped()` pins inside a `sudo()` block is a
   bypass of its own.
+- The evaluator remembered whether an actor holds a permission's constant
+  arms per statement and actor, not per database alias: within one evaluator
+  scope, a read on another alias reused the answer decided on the first, so an
+  actor holding the arm on that alias alone read too few rows there. The
+  answer is now kept per alias.
 
 ### Documentation
 
