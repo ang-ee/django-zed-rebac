@@ -7,18 +7,32 @@ pre-1.0; breaking changes within a minor version are explicitly called out.
 
 ### Changed
 
-- Inside an evaluator scope, a witness statement decides a permission's
-  constant arms (`admin->member` over a `rebac:const` relation): once per
-  request where the decision cache may keep a decision about the types they
-  name and the call states no consistency requirement, otherwise at each read
-  and check. An actor who holds one reads, and is checked by, a statement of
-  those arms alone, which evaluates them when it runs: on a console-like policy
-  an administrator's read falls from 47,920 to 2,224 bytes. Outside an
-  evaluator scope nothing changes.
-- Where the evaluator keeps the answer that an actor holds no constant arm,
-  that actor's scope statements leave the arms out, and with them the union
-  branch that listed every row of the model: a read of one parent's children
-  no longer scans the child table. Point checks keep every arm.
+- Inside an evaluator scope, a witness statement decides whether the actor
+  holds one of a permission's constant arms (`admin->member` over a
+  `rebac:const` relation); the evaluator remembers the answer for the
+  request. An actor who holds one reads, and is checked by, a statement of
+  those arms alone, which evaluates them when it runs: on a console-like
+  policy an administrator's read falls from 47,920 to 2,224 bytes. Every
+  other actor pays one witness statement per request. Outside an evaluator
+  scope nothing changes.
+- A remembered answer is kept as such only where the decision cache may keep
+  a decision: never inside a transaction (including `ATOMIC_REQUESTS` and
+  Django's `TestCase`), for a type whose arms reach a model- or
+  attribute-backed relation (a model-backed relation on the user type reaches
+  nearly every type), or while the schema declares any expiring relation, nor
+  for a call with an explicit `consistency` or `at_zookie`. There, an actor
+  who holds a constant arm is decided again at each read and check, so still
+  reads the short statement, and an answer that the actor holds none selects
+  the full statement.
+- Where the answer that an actor holds no constant arm may be kept, that
+  actor's scope statements leave the arms out, and with them the union branch
+  that listed every row of the model: a read of one parent's children no
+  longer scans the child table. Point checks keep every arm.
+- Measured on SQLite on a console-like policy, three scoped reads and three
+  checks per actor (statements, SQL bytes): outside an evaluator scope an
+  administrator 6, 265,861 and a member 7, 307,337; inside one where the
+  answer may be kept 7, 15,765 and 8, 307,387; inside one within a
+  transaction 9, 20,291 and 8, 309,666.
 
 ## [0.31.3] — 2026-11-07
 

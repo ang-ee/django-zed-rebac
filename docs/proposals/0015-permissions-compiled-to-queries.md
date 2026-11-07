@@ -39,11 +39,13 @@ reviewed and are kept as written. The implementation settled these points:
   witness statement (0.31.4): an actor who holds one reads the statement of
   those arms alone, which witnesses them in its own snapshot, so a request
   cache never preserves a revoked allow; a point check decides them at the
-  check. The evaluator keeps the answer only where the decision cache may
-  keep a decision about the types they name; there, an actor who holds none
-  reads the statement without them, the guarded decided branch of § 5. That
-  statement is a lower bound for every actor of its shape, so the kept plan
-  embeds no decision; the answer only chooses it. Other operations, and the
+  check. The evaluator remembers the answer for the request. A `True` serves
+  only where the decision cache may keep a decision about the types they
+  name. A `False` leaves the arms out only there: an actor who holds none
+  reads the statement without them, the guarded decided branch of § 5.
+  Elsewhere it selects the statement with every arm. The statement without
+  them is a lower bound for every actor of its shape, so the kept plan embeds
+  no decision; the answer only chooses it. Other operations, and the
   constant arms of the types an arrow reaches, evaluate them inline.
 - **Refused recursion (§ 8).** A component is refused when a permission of
   it is reached through the right-hand side of `-` inside the component, or

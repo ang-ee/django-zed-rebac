@@ -238,21 +238,28 @@ def test_the_witness_is_kept_for_the_request(console):
         assert len(next_request) == 2
 
 
-def test_inside_a_transaction_the_witness_is_decided_at_each_read(console):
-    _local, _folders, posts = console
+def test_inside_a_transaction_a_held_arm_is_decided_at_each_read(console):
+    local, _folders, posts = console
     _ids, policy = _read(MEMBER)
     with evaluator_scope() as evaluator:
         admin = [_read(ADMIN) for _read_again in range(2)]
         member = [_read(MEMBER) for _read_again in range(2)]
-        assert evaluator.stats()["constant_witness_entries"] == 0
+        with CaptureQueriesContext(connection) as checks:
+            assert _check(local, ADMIN, posts[5])
+            assert _check(local, MEMBER, posts[4])
+        assert evaluator.stats()["constant_witness_entries"] == 2
+    # The administrator: the witness, then the constant statement, every time.
     for ids, statements in admin:
         assert ids == [post.pk for post in posts]
         assert len(statements) == 2
-    for ids, statements in member:
-        assert len(ids) == 4
-        # The witness, then the policy's statement with every arm.
-        assert len(statements) == 2
-        assert statements[-1] == policy[-1]
+    # The member: one witness for the request; its remembered answer selects
+    # the policy's statement, every arm in it, and runs nothing.
+    (first_ids, first), (again_ids, again) = member
+    assert len(first_ids) == len(again_ids) == 4
+    assert len(first) == 2 and len(again) == 1
+    assert first[-1] == again[-1] == policy[-1]
+    # A check: the witness for the administrator, the lower bound for the member.
+    assert len(checks.captured_queries) == 2
 
 
 def test_outside_an_evaluator_scope_the_statement_keeps_every_arm(console):
@@ -356,7 +363,7 @@ def test_a_rolled_back_revocation_leaves_nothing_decided(console):
 
 
 @KEPT
-def test_a_model_backed_constant_arm_is_decided_at_each_read():
+def test_a_model_backed_constant_arm_reads_the_policy_statement():
     users = get_user_model().objects
     owner = atomic_source_write(users.create_user, username="owner")
     member = atomic_source_write(users.create_user, username="member")
@@ -384,12 +391,15 @@ def test_a_model_backed_constant_arm_is_decided_at_each_read():
     with evaluator_scope() as evaluator:
         assert _read(actor)[0] == [posts[0].pk]
         # A model write: the decision cache keeps nothing for a type whose
-        # facts are model columns.
+        # facts are model columns, so the remembered answer only selects the
+        # policy's statement, which reads the column.
         with sudo(reason="constant arms fixture"):
             atomic_source_write(AuthoredPost._base_manager.filter(pk=role.pk).update, author=member)
-        assert _read(actor)[0] == [post.pk for post in posts]
+        ids, statements = _read(actor)
+        assert ids == [post.pk for post in posts]
+        assert len(statements) == 1
         assert _check(local, actor, posts[2])
-        assert evaluator.stats()["constant_witness_entries"] == 0
+        assert evaluator.stats()["constant_witness_entries"] == 1
 
 
 @KEPT

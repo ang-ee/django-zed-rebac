@@ -110,8 +110,11 @@ class PermissionEvaluator:
 
     def __init__(self, *, max_size: int = 10_000) -> None:
         self._check_cache: OrderedDict[tuple[Any, ...], CheckResult] = OrderedDict()
-        # Whether an actor holds a policy's constant arms, by statement.
-        self._constant_witnesses: OrderedDict[Hashable, bool] = OrderedDict()
+        # Whether an actor holds a policy's constant arms, by statement, with
+        # the decision-cache key it was decided under (``None``: none).
+        self._constant_witnesses: OrderedDict[
+            Hashable, tuple[bool, tuple[Hashable, ...] | None]
+        ] = OrderedDict()
         # Field visibility per actor, model, action and row batch; bounded by
         # entries and by the candidate ids they hold together.
         self._visibility_decisions: OrderedDict[tuple[Any, ...], frozenset[str]] = OrderedDict()
@@ -252,26 +255,53 @@ class PermissionEvaluator:
         return answers
 
     def _constant_witness(
-        self, key: Hashable, decide: Callable[[], bool], *, recheck: bool = False
-    ) -> bool:
-        """The remembered answer of a constant-arm witness, deciding it when absent.
+        self,
+        backend: LocalBackend,
+        statement: Hashable,
+        kept: tuple[Hashable, ...] | None,
+        decide: Callable[[], bool],
+        *,
+        recheck: bool = False,
+    ) -> bool | None:
+        """The answer of a constant-arm witness statement, decided at most when needed.
 
-        The caller keys it on ``_backend_cache_key`` of the types the witness
-        reads, so it is asked only where the decision cache may keep a
-        decision. ``recheck`` decides a remembered ``True`` again. An
-        unhashable key is decided and not remembered.
+        ``kept`` is the decision cache's key for every type the witness reads
+        (``_backend_cache_key``), or ``None`` where nothing may be kept. A
+        remembered answer serves only under the ``kept`` it was decided at:
+
+        - a ``True`` is decided again where nothing may be kept, after the
+          key changed (a tuple write through the library), or on ``recheck``;
+        - a ``False`` is remembered in every context, and returned as
+          ``False`` (the arms may be left out) only under the same ``kept``.
+          Elsewhere it is ``None``, which selects the policy's statement: that
+          statement evaluates the arms itself, so the answer stays exact
+          whatever changes later. Where something may be kept and the key
+          changed, it is decided again.
+
+        See ``rebac.compile.read._constant_witness``. An unhashable statement
+        key is decided every time.
         """
+        key = (_BackendKey(backend), statement)
         try:
             found = self._constant_witnesses.get(key)
         except TypeError:
-            return decide()
-        if found is None or (found and recheck):
-            found = self._constant_witnesses[key] = decide()
-            while len(self._constant_witnesses) > self._max_size:
-                self._constant_witnesses.popitem(last=False)
-        else:
-            self._constant_witnesses.move_to_end(key)
-        return found
+            held = decide()
+            return True if held else (False if kept is not None else None)
+        if found is not None:
+            held, at = found
+            current = kept is not None and at == kept
+            if held and current and not recheck:
+                self._constant_witnesses.move_to_end(key)
+                return True
+            if not held and (current or kept is None):
+                self._constant_witnesses.move_to_end(key)
+                return False if current else None
+        held = decide()
+        self._constant_witnesses[key] = (held, kept)
+        self._constant_witnesses.move_to_end(key)
+        while len(self._constant_witnesses) > self._max_size:
+            self._constant_witnesses.popitem(last=False)
+        return True if held else (False if kept is not None else None)
 
     # ----- introspection (for tests + debugging) -----
 

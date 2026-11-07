@@ -1898,17 +1898,23 @@ evaluator scope, a witness statement decides whether the actor holds one
   alone, a gate that admits every row, which evaluates them again when it
   runs. A point check (`check_access`) of that actor is answered by the
   witness statement, decided at that check.
-- The evaluator keeps the answer for the rest of the scope, once for each
-  distinct statement of constant arms, only where the decision cache may keep
-  a decision about every type the arms name (`_backend_cache_key`; see
+- The evaluator remembers the answer for the rest of the scope, per actor and
+  distinct statement of constant arms. Keeping it is allowed where the
+  decision cache may keep a decision about every type the arms name
+  (`_backend_cache_key`; see
   [the per-request evaluator](#permissionevaluator--per-request-check-cache))
-  and the call states no `consistency` or `at_zookie`. A tuple write through
-  the library changes that key. Elsewhere in the scope the witness is decided
-  at each scope build and point check.
-- Where the evaluator keeps a `False`, a scope statement compiles the
-  constant arms as false at the lower bound, so the union branch that listed
-  every row of the model is not in it. A point check never leaves them out,
-  in either bound.
+  and the call states no `consistency` or `at_zookie`; a tuple write through
+  the library changes that key.
+- A remembered `True` serves only where keeping is allowed and the key is
+  unchanged; elsewhere the witness is decided again at each scope build and
+  point check.
+- A remembered `False` serves in every context. Where keeping is allowed, a
+  scope statement then compiles the constant arms as false at the lower
+  bound, so the union branch that listed every row of the model is not in
+  it. Elsewhere it only selects the policy's statement, which evaluates the
+  arms itself, so the answer stays exact whatever changes later, and no
+  witness runs again. A point check never leaves the arms out, in either
+  bound.
 
 A kept answer only chooses the statement: a `True` chooses a statement that
 evaluates the arms when it runs, and leaving the arms out only narrows a
@@ -2277,9 +2283,9 @@ of its own.
   only inside an evaluator scope: a permission without one (`read =
   parent->read`) gives an administrator the whole statement, whose id sets
   then hold every row of the types its arrows reach. Where the decision cache
-  keeps nothing for the types the arms name, every actor's scope inside an
-  evaluator scope runs the witness first, and other actors' statements keep
-  the constant arms' union branch. There is no scale claim.
+  keeps nothing for the types the arms name, an actor who holds a constant arm
+  pays one witness per read, other actors one per request, and their
+  statements keep the constant arms' union branch. There is no scale claim.
 - Id sets are driven from the actor's grants, not bounded by the rows the
   selecting query reads: a read of one parent's children computes the set of
   parents the actor reads, by index from its grants, and then that parent's
@@ -2970,14 +2976,15 @@ Backend relationship writes and the `post_delete` cascade
 backend instances in this process, including evaluators suspended by a nested
 scope.
 
-The evaluator also remembers, under the same rules, per actor and per
-statement of a permission's constant arms, whether the actor holds one (see
-[Inline permission scopes](#inline-permission-scopes)): only when the decision
-cache may keep a decision about every type the arms name, and never for a
-call with an explicit `consistency` or `at_zookie`. The answer only chooses
-which statement a read runs; `invalidate()` forgets it, a tuple write through
-the library changes its key, and `stats()` reports it as
-`constant_witness_entries`.
+The evaluator also remembers, per actor and per statement of a permission's
+constant arms, whether the actor holds one (see
+[Inline permission scopes](#inline-permission-scopes)). The answer only
+chooses which statement a read runs. It is used as kept only under these
+rules: when the decision cache may keep a decision about every type the arms
+name and the call states no explicit `consistency` or `at_zookie`; elsewhere
+a `True` is decided again and a `False` selects the statement with every arm.
+`invalidate()` forgets it, a tuple write through the library changes its key,
+and `stats()` reports it as `constant_witness_entries`.
 
 The old `accessible_cached`, `enable_accessible_cache`, and
 `disable_accessible_cache` helpers were removed in 0.5. Use

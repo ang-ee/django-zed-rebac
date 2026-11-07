@@ -444,16 +444,21 @@ def _constant_witness(
 ) -> bool | None:
     """Whether the actor holds one of ``key``'s constant arms, inside an evaluator scope.
 
-    ``True`` when it does, decided by the witness statement now or, unless
-    ``recheck``, remembered from earlier in the scope; a remembered ``True``
-    only chooses a statement that evaluates the arms again when it runs.
-    ``False`` when it holds none and the evaluator keeps that answer: where
-    the decision cache may keep a decision about every type the arms name
-    (``rebac.evaluator._backend_cache_key``), and ``fresh`` (a per-call
-    consistency requirement) is not set. A scope may then leave the arms
-    out (``_scope_statement``). ``None`` otherwise: outside an evaluator
-    scope, under a caveat context, when ``key`` has no constant arm beside
-    its other arms, or when it holds none but the answer may not be kept.
+    The evaluator remembers the answer for the scope
+    (``PermissionEvaluator._constant_witness``):
+
+    - ``True`` when the actor holds one, decided by the witness statement now,
+      or remembered where the decision cache may keep a decision about every
+      type the arms name (``rebac.evaluator._backend_cache_key``), ``fresh``
+      (a per-call consistency requirement) is not set and ``recheck`` is not.
+      It only chooses a statement that evaluates the arms again when it runs.
+    - ``False`` when it holds none and the answer may be kept under the same
+      rules: a scope may then leave the arms out (``_scope_statement``).
+    - ``None`` when it holds none but the answer may not be kept: the policy's
+      statement, which evaluates the arms itself, is read, and a remembered
+      ``None`` costs no statement. Also outside an evaluator scope, under a
+      caveat context, and when ``key`` has no constant arm beside its other
+      arms.
     """
     evaluator = current_evaluator()
     if evaluator is None or operation.context is not None:
@@ -469,10 +474,14 @@ def _constant_witness(
         )
 
     generations = tuple(_backend_cache_key(operation.backend, type_) for type_ in compiled.reads)
-    if fresh or any(generation is None for generation in generations):
-        return decide() or None
-    memo = (generations, compiled.sql, compiled.params, operation.actor)
-    return evaluator._constant_witness(memo, decide, recheck=recheck)
+    kept = None if fresh or None in generations else generations
+    return evaluator._constant_witness(
+        operation.backend,
+        (compiled.sql, compiled.params, operation.actor),
+        kept,
+        decide,
+        recheck=recheck,
+    )
 
 
 # ---------- Point checks ----------
