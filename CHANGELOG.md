@@ -5,6 +5,8 @@ pre-1.0; breaking changes within a minor version are explicitly called out.
 
 ## [Unreleased]
 
+## [0.31.4] — 2026-11-07
+
 ### Changed
 
 - Inside an evaluator scope, a witness statement decides whether the actor
