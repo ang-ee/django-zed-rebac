@@ -32,6 +32,30 @@ def test_sync_check_detects_relation_payload_drift() -> None:
 
 
 @pytest.mark.django_db
+@pytest.mark.parametrize("synced", [True, False], ids=["declaration-changed", "admin-edited"])
+def test_sync_check_names_why_a_managed_row_drifted(synced: bool) -> None:
+    from rebac.management.commands.rebac import Command
+
+    call_command("rebac", "sync", stdout=io.StringIO())
+    post_def = SchemaDefinition.objects.get(resource_type="blog/post")
+    SchemaPermission.objects.filter(definition=post_def, name="read").update(expression="owner")
+    if synced:
+        # The row holds what an earlier sync wrote: the declaration changed since.
+        PackageManagedRecord.objects.filter(external_id="permission:blog/post#read").update(
+            content_hash=Command._hash_payload(
+                {"definition": post_def, "name": "read", "expression": "owner"}
+            )
+        )
+    out = io.StringIO()
+    with pytest.raises(CommandError, match="Schema drift detected"):
+        call_command("rebac", "sync", "--check", stdout=out)
+    cause = "declaration changed" if synced else "admin-edited"
+    assert f"! drift: permission:blog/post#read ({cause}; --force-overwrite to apply)" in (
+        out.getvalue()
+    )
+
+
+@pytest.mark.django_db
 def test_sync_check_detects_stale_permission_rows() -> None:
     call_command("rebac", "sync", stdout=io.StringIO())
     post_def = SchemaDefinition.objects.get(resource_type="blog/post")

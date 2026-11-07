@@ -675,9 +675,12 @@ class Command(BaseCommand):
             return False  # no-op
 
         if record.no_update and not force:
+            # A row that still holds what the last sync wrote was not edited:
+            # the package's declaration changed.
+            cause = "declaration changed" if actual_hash == record.content_hash else "admin-edited"
             self.stdout.write(
                 self.style.WARNING(
-                    f"  ! drift: {external_id} (admin-edited; --force-overwrite to apply)"
+                    f"  ! drift: {external_id} ({cause}; --force-overwrite to apply)"
                 )
             )
             return True

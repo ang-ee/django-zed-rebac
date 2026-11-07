@@ -22,6 +22,12 @@ pre-1.0; breaking changes within a minor version are explicitly called out.
   `get_queryset()` keeps the custom queryset type holds only with a plugin
   that types that getter from the `from_queryset` queryset class; the
   manager's own methods carry the queryset class under either.
+- `rebac sync` reported every changed declaration of a managed row as
+  `! drift: … (admin-edited; …)`, though it never compared the row with what
+  the last sync wrote. A row that still holds the last synced payload is now
+  reported as `(declaration changed; --force-overwrite to apply)`, and only a
+  row that differs from it as `admin-edited`. Sync still applies neither
+  without `--force-overwrite`: a managed row is `no_update`.
 
 ### Carried from the framework's pin
 
