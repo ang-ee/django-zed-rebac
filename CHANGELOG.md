@@ -56,7 +56,9 @@ pre-1.0; breaking changes within a minor version are explicitly called out.
   capture is. A condition (`filter(Exists(...))`) is resolved again when its
   statement compiles, so it is scoped and audited where it executes. A queryset evaluated inside a block and embedded in a
   `Subquery` after it kept that evaluation's bypass; its scope is now decided
-  where it is embedded, as a lookup or a write on it already was.
+  where it is embedded, as a lookup or a write on it already was. Embedding
+  it where no actor is present therefore raises `MissingActorError` in strict
+  mode, where it bypassed silently before.
 - The evaluator remembered whether an actor holds a permission's constant
   arms per statement and actor, not per database alias: within one evaluator
   scope, a read on another alias reused the answer decided on the first, so an
