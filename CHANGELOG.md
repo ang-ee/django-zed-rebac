@@ -38,6 +38,13 @@ pre-1.0; breaking changes within a minor version are explicitly called out.
   executes them. A queryset that `scoped()` pins inside a `sudo()` block is a
   bypass of its own.
 
+### Documentation
+
+- A scope prepared while the answer that its actor holds no constant arm was
+  kept leaves the arms out when it renders after a tuple write that grants
+  one, as a prepared scope omits a new caveat instance; a scope built after
+  a tuple write through the library decides the witness again.
+
 ## [0.31.4] — 2026-11-07
 
 ### Changed

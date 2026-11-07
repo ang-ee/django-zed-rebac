@@ -1945,7 +1945,10 @@ builds its scope then, reading the schema revision, unless an evaluator scope
 pins it, and the caveat-verdict rows, and deciding the constant-arm witness
 inside an evaluator scope. A new
 caveat instance is absent from an already prepared lower bound; a newly
-built scope sees it. Point checks retain their content-type preparation for
+built scope sees it. Likewise, a scope prepared with the constant arms left
+out (a kept `False`) leaves them out when it renders after a tuple write that
+grants one; a scope built after a tuple write through the library decides the
+witness again. Point checks retain their content-type preparation for
 generic backings and prepare caveat verdicts before the SQL statement.
 
 A scoped read that names the identities it reads is bounded to them. When the
