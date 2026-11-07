@@ -72,6 +72,20 @@ _executing_bypass_audits: ContextVar[dict[tuple[object, str], None] | _CompileOn
 )
 
 
+class _BypassEntry:
+    """One ``sudo()`` or ``system_context()`` call, shared by the querysets derived from it.
+
+    The first top-level execution of any of them audits it
+    (``RebacQuerySet._audit_bypass_once``). An embedded use is audited with
+    each statement that executes it, keyed by this entry and its reason.
+    """
+
+    __slots__ = ("audited",)
+
+    def __init__(self) -> None:
+        self.audited = False
+
+
 def _emit_bypass(reason: str) -> None:
     from .audit import emit_bypass
 
@@ -745,7 +759,7 @@ class RebacQuerySet(models.QuerySet[_M]):
     _rebac_relation_scope: bool
     _rebac_action: str | None
     _rebac_sudo_reason: str | None
-    _rebac_bypass_entry: object
+    _rebac_bypass_entry: _BypassEntry
     _rebac_field_deny: FieldDenyMode | None
     _rebac_select_related_guards: tuple[str, ...]
 
@@ -758,8 +772,7 @@ class RebacQuerySet(models.QuerySet[_M]):
         self._rebac_relation_scope = False
         self._rebac_action = None
         self._rebac_sudo_reason = None
-        self._rebac_sudo_audited = False
-        self._rebac_bypass_entry = object()
+        self._rebac_bypass_entry = _BypassEntry()
         self._rebac_internal_bypass = False
         self._rebac_ambient_bypass = False
         self._rebac_field_deny = None
@@ -779,8 +792,7 @@ class RebacQuerySet(models.QuerySet[_M]):
         state["_rebac_relation_actor"] = None
         state["_rebac_relation_scope"] = False
         state["_rebac_sudo_reason"] = None
-        state["_rebac_sudo_audited"] = False
-        state["_rebac_bypass_entry"] = object()
+        state["_rebac_bypass_entry"] = _BypassEntry()
         state["_rebac_internal_bypass"] = False
         state["_rebac_ambient_bypass"] = False
         state["_rebac_scope_applied"] = False
@@ -878,8 +890,7 @@ class RebacQuerySet(models.QuerySet[_M]):
         clone = self._clone()
         clone._rebac_actor = ref
         clone._rebac_sudo_reason = None
-        clone._rebac_sudo_audited = False
-        clone._rebac_bypass_entry = object()
+        clone._rebac_bypass_entry = _BypassEntry()
         clone._rebac_internal_bypass = False
         clone._rebac_ambient_bypass = False
         from .relation_loading import rebind_prefetch_actor
@@ -980,7 +991,9 @@ class RebacQuerySet(models.QuerySet[_M]):
         if actor is not None:
             clone._rebac_actor = actor
         elif bypass and _is_sudo_ambient() and not clone.is_sudo():
+            # The captured block is a bypass of its own.
             clone._rebac_sudo_reason = current_sudo_reason()
+            clone._rebac_bypass_entry = _BypassEntry()
             clone._rebac_internal_bypass = True
             clone._rebac_ambient_bypass = True
         clone._rebac_eager_scope = True
@@ -1027,8 +1040,7 @@ class RebacQuerySet(models.QuerySet[_M]):
         clone = self._clone()
         clone._rebac_actor = None
         clone._rebac_sudo_reason = reason
-        clone._rebac_sudo_audited = False
-        clone._rebac_bypass_entry = object()
+        clone._rebac_bypass_entry = _BypassEntry()
         clone._rebac_internal_bypass = internal
         clone._rebac_ambient_bypass = False
         clone._refresh_scope()
@@ -1047,13 +1059,13 @@ class RebacQuerySet(models.QuerySet[_M]):
     def _audit_bypass_once(self) -> None:
         from .audit import save_check
 
-        if self._rebac_sudo_audited or save_check.get() is not None:
+        if self._rebac_bypass_entry.audited or save_check.get() is not None:
             return
         reason = self._bypass_audit_reason()
         if reason is None:
             return
         _emit_bypass(reason)
-        self._rebac_sudo_audited = True
+        self._rebac_bypass_entry.audited = True
 
     def actor(self) -> SubjectRef | None:
         return self._rebac_actor
@@ -1197,7 +1209,6 @@ class RebacQuerySet(models.QuerySet[_M]):
         clone._rebac_relation_scope = self._rebac_relation_scope
         clone._rebac_action = self._rebac_action
         clone._rebac_sudo_reason = self._rebac_sudo_reason
-        clone._rebac_sudo_audited = self._rebac_sudo_audited
         clone._rebac_bypass_entry = self._rebac_bypass_entry
         clone._rebac_internal_bypass = self._rebac_internal_bypass
         clone._rebac_ambient_bypass = self._rebac_ambient_bypass
@@ -1240,6 +1251,7 @@ class RebacQuerySet(models.QuerySet[_M]):
         clone._rebac_relation_scope = self._rebac_relation_scope
         clone._rebac_action = self._rebac_action
         clone._rebac_sudo_reason = self._rebac_sudo_reason
+        clone._rebac_bypass_entry = self._rebac_bypass_entry
         clone._rebac_eager_scope = self._rebac_eager_scope
         clone._rebac_aggregate_scope = self._rebac_aggregate_scope
         clone._rebac_field_deny = self._rebac_field_deny

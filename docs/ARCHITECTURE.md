@@ -1107,8 +1107,10 @@ class PermissionAuditEvent(models.Model):
 ```
 
 Written by every Tier 2 / Tier 3 mutation and every effective public bypass.
-Queryset bypasses are audited at first evaluation or write, instance bypasses
-at the first check or write, and block bypasses at entry, once per bypass.
+Queryset bypasses are audited at the first evaluation or write of any
+queryset derived from the `sudo()` or `system_context()` call, instance
+bypasses at the first check or write, and block bypasses at entry, once per
+bypass.
 A bypass queryset embedded in an expression (`Exists`, `Subquery`, a
 `pk__in=` lookup) is audited once per entry and reason when its enclosing
 statement executes. Building the expression runs no query and writes no row,
@@ -2473,8 +2475,12 @@ context before materializing or mutating it.
 
 **Bypass audit granularity.** A block-scoped `sudo()` or `system_context()`
 emits one `KIND_SUDO_BYPASS` row at each entry. An explicit queryset bypass
-emits one row when it first takes effect (eager scope application, direct
-evaluation or write). When a bypass queryset is embedded in another
+is an entry: the querysets derived from one `sudo()` or `system_context()`
+call (by `filter()`, `values()`, `get()`, `count()`, `update()`, `delete()`
+and every other clone) share it, and it emits one row when the first of them
+takes effect (eager scope application, direct evaluation or write). A queryset
+that `scoped()` pins inside a `sudo()` block is an entry of its own, audited
+when it first takes effect outside the block. When a bypass queryset is embedded in another
 statement, each execution audits every distinct `(entry, reason)` pair it
 renders, even if that pair appears in several filters, annotations or `Exists`
 expressions. A count followed by a list read audits the embedded entry twice.

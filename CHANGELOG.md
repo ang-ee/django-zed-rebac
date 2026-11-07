@@ -27,6 +27,17 @@ pre-1.0; breaking changes within a minor version are explicitly called out.
   administrator 11, 24,778 before and 8, 17,989 after; a member 9, 357,534
   before and 9, 354,518 after.
 
+### Fixed
+
+- A queryset `sudo()` or `system_context()` call is audited once, at the first
+  top-level evaluation or write of any queryset derived from it. Each derived
+  queryset (`filter()`, `get()`, `count()`, `update()` …) wrote its own row
+  when it was derived before the first one executed, so a job that read and
+  wrote through one `system_context(reason=…)` queryset wrote a row per
+  statement. Embedded bypasses are still audited with each statement that
+  executes them. A queryset that `scoped()` pins inside a `sudo()` block is a
+  bypass of its own.
+
 ## [0.31.4] — 2026-11-07
 
 ### Changed

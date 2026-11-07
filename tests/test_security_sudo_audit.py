@@ -71,6 +71,38 @@ def test_queryset_sudo_audits_only_when_used_once(post):
     assert _bypass_rows("audit.lazy").count() == 1
 
 
+@pytest.mark.parametrize("verb", ["system_context", "sudo"])
+def test_the_querysets_derived_from_one_bypass_entry_audit_once(post, verb):
+    reason = f"audit.one-entry.{verb}"
+    entry = getattr(Post.objects, verb)(reason=reason)
+    # Each derived queryset executes its own statement.
+    assert list(entry.filter(pk=post.pk)) == [post]
+    assert entry.filter(title="hello").exists()
+    assert entry.count() == 1
+    assert entry.values_list("pk", flat=True).get() == post.pk
+    assert entry.filter(pk=post.pk).update(body="changed") == 1
+    assert entry.order_by("pk").explain()
+    assert entry.filter(pk=-1).delete()[0] == 0
+    assert _bypass_rows(reason).count() == 1
+    # Another entry, with the same reason, is another bypass.
+    assert list(getattr(Post.objects, verb)(reason=reason)) == [post]
+    assert _bypass_rows(reason).count() == 2
+
+
+def test_two_captures_of_one_queryset_under_sudo_blocks_are_two_bypasses(post):
+    base = Post.objects.all()
+    with sudo(reason="audit.capture-one"):
+        one = base.scoped()
+    with sudo(reason="audit.capture-two"):
+        two = base.scoped()
+    # Each block audited at entry; each capture, executed outside it, once.
+    assert list(one) == [post]
+    assert list(two) == [post]
+    assert one.count() == two.count() == 1
+    assert _bypass_rows("audit.capture-one").count() == 2
+    assert _bypass_rows("audit.capture-two").count() == 2
+
+
 def test_queryset_sudo_raw_is_audited(post):
     rows = list(Post.objects.sudo(reason="audit.raw").raw(f"SELECT * FROM {Post._meta.db_table}"))
     assert [row.pk for row in rows] == [post.pk]
