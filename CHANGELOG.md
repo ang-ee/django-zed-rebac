@@ -3,6 +3,17 @@
 All notable changes to `django-zed-rebac` are tracked here. The project is in
 pre-1.0; breaking changes within a minor version are explicitly called out.
 
+## [0.31.3] — 2026-11-07
+
+### Fixed
+
+- `rebac sync` reported every changed declaration of a managed row as
+  `! drift: … (admin-edited; …)`, though it never compared the row with what
+  the last sync wrote. A row that still holds the last synced payload is now
+  reported as `(declaration changed; --force-overwrite to apply)`, and only a
+  row that differs from it as `admin-edited`. Sync still applies neither
+  without `--force-overwrite`: a managed row is `no_update` (as in 0.30.2).
+
 ## [0.31.2] — 2026-11-06
 
 ### Fixed

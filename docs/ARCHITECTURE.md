@@ -3246,7 +3246,9 @@ For each AppConfig that declares rebac_schema:
      b. Look up PackageManagedRecord by (package, external_id).
      c. If not found → create Schema* row + PackageManagedRecord. (Fresh install.)
      d. If found and content_hash matches → no-op.
-     e. If found and content_hash differs and no_update=True → skip + warn.
+     e. If found and content_hash differs and no_update=True → skip + warn,
+        naming the cause: `declaration changed` when the row still holds what
+        the last sync wrote, `admin-edited` when it does not.
      f. If found and content_hash differs and no_update=False → update + bump
         last_synced_at.
   4. Detect orphans: PackageManagedRecord with no matching .zed fragment.
