@@ -30,6 +30,7 @@ from rebac.codec import identity_codec
 from rebac.composition import TaggedComposition, compose_tagged, split_stale_overrides
 from rebac.conf import app_settings
 from rebac.errors import PermissionDepthExceeded, SchemaError
+from rebac.evaluator import _backend_cache_key, _ctx_key, current_evaluator
 from rebac.field_backing import resolve_attribute_backing, resolve_field_backing
 from rebac.models import active_relationship_model
 from rebac.models.generation import SchemaGeneration
@@ -85,11 +86,16 @@ _lock = RLock()
 
 @dataclass(frozen=True, slots=True)
 class _Kept:
-    """One compiled statement.  ``every`` marks a gate that admits every row."""
+    """One compiled statement.  ``every`` marks a gate that admits every row.
+
+    ``reads`` are the resource types whose facts a decision of the statement
+    depends on, for the decision cache (``_constant_witness``).
+    """
 
     sql: str
     params: tuple[Any, ...]
     every: bool = False
+    reads: tuple[str, ...] = ()
 
 
 _policies: OrderedDict[tuple[Any, ...], _Policy] = OrderedDict()
@@ -98,8 +104,6 @@ _statements: OrderedDict[tuple[Any, ...], _Kept | bool] = OrderedDict()
 
 def reset() -> None:
     """Forget every kept policy and statement (settings or registries changed)."""
-    from rebac.evaluator import current_evaluator
-
     with _lock:
         _policies.clear()
         _statements.clear()
@@ -316,6 +320,7 @@ class _Operation:
         *,
         parametric: bool = True,
         point: PointRow | None = None,
+        fold: Key | None = None,
     ) -> Compiler:
         return Compiler(
             self.policy.schema,
@@ -326,6 +331,7 @@ class _Operation:
             program=self.policy.program,
             parametric=parametric,
             point=point,
+            fold=fold,
         )
 
     def gate(self, *, parametric: bool = True) -> models.QuerySet[Any]:
@@ -335,7 +341,13 @@ class _Operation:
         self,
         key: tuple[Any, ...],
         verdicts: CaveatVerdicts,
-        build: Callable[[], models.QuerySet[Any] | bool | tuple[models.QuerySet[Any], bool]],
+        build: Callable[
+            [],
+            models.QuerySet[Any]
+            | bool
+            | tuple[models.QuerySet[Any], bool]
+            | tuple[models.QuerySet[Any], bool, tuple[str, ...]],
+        ],
         *,
         cache: bool = True,
     ) -> _Kept | bool:
@@ -359,7 +371,7 @@ class _Operation:
         if isinstance(built, bool):
             compiled = built
         else:
-            rows, every = built if isinstance(built, tuple) else (built, False)
+            rows, every, *reads = built if isinstance(built, tuple) else (built, False)
             query = rows.query.clone()
             # Parenthesised, to embed; a set of ids has no order.
             query.subquery = True
@@ -372,7 +384,7 @@ class _Operation:
                 # condition Django proves empty.
                 compiled = False
             else:
-                compiled = _Kept(sql, tuple(params), every)
+                compiled = _Kept(sql, tuple(params), every, *reads)
         if keep:
             with _lock:
                 _statements[full] = compiled
@@ -399,6 +411,77 @@ def _model_at(model: type[models.Model]) -> At:
     if resource_type is None:
         raise ValueError(f"{model.__name__} has no REBAC resource type")
     return At(resource_type, F(identity), identity_field, True)
+
+
+# ---------- Constant arms ----------
+
+
+def _constant_statement(operation: _Operation, key: Key) -> _Kept | bool:
+    """The policy fence where one of ``key``'s constant arms holds, as SQL.
+
+    ``False`` when ``key`` has none to witness (``Compiler.constant_arms``).
+    When it holds, the actor holds ``key`` on every object of its type, so it
+    is kept as a gate that admits every row; its ``reads`` are the types the
+    constant arms name.
+    """
+    verdicts = operation.verdicts(key)
+
+    def build() -> bool | tuple[models.QuerySet[Any], bool, tuple[str, ...]]:
+        compiler = operation.compiler(verdicts)
+        condition = compiler.constant(key)
+        if is_false(condition) or is_true(condition):
+            # Nothing to witness: a constant arm that holds outright makes the
+            # policy's own statement the fence alone.
+            return False
+        rows = compiler.statement(operation.gate().filter(condition).values("pk"))
+        return rows, True, compiler.constant_types(key)
+
+    return operation.statement(("constant", key), verdicts, build)
+
+
+def _constant_witness(
+    operation: _Operation, key: Key, *, recheck: bool = False, fresh: bool = False
+) -> bool | None:
+    """Whether the actor holds one of ``key``'s constant arms, inside an evaluator scope.
+
+    The evaluator remembers the answer for the scope
+    (``PermissionEvaluator._constant_witness``):
+
+    - ``True`` when the actor holds one, decided by the witness statement now,
+      or remembered where the decision cache may keep a decision about every
+      type the arms name (``rebac.evaluator._backend_cache_key``), ``fresh``
+      (a per-call consistency requirement) is not set and ``recheck`` is not.
+      It only chooses a statement that evaluates the arms again when it runs.
+    - ``False`` when it holds none and the answer may be kept under the same
+      rules: a scope may then leave the arms out (``_scope_statement``).
+    - ``None`` when it holds none but the answer may not be kept: the policy's
+      statement, which evaluates the arms itself, is read, and a remembered
+      ``None`` costs no statement. Also outside an evaluator scope, under a
+      caveat context, and when ``key`` has no constant arm beside its other
+      arms.
+    """
+    evaluator = current_evaluator()
+    if evaluator is None or operation.context is not None:
+        return None
+    compiled = _constant_statement(operation, key)
+    if isinstance(compiled, bool):
+        return None
+
+    def decide() -> bool:
+        probe = _Sql(compiled.sql, operation.bound(compiled.params))
+        return (
+            SchemaGeneration.objects.using(operation.using).filter(pk=1).filter(Q(probe)).exists()
+        )
+
+    generations = tuple(_backend_cache_key(operation.backend, type_) for type_ in compiled.reads)
+    kept = None if fresh or None in generations else generations
+    return evaluator._constant_witness(
+        operation.backend,
+        (compiled.sql, compiled.params, operation.actor),
+        kept,
+        decide,
+        recheck=recheck,
+    )
 
 
 # ---------- Point checks ----------
@@ -584,11 +667,18 @@ def _point_result(
     using: str,
     lower_only: bool = False,
     types: Mapping[str, RowTypes] | None = None,
+    witness: bool = False,
+    fresh: bool = False,
 ) -> tuple[bool, bool, bool, _Policy]:
     """``types`` are the row types already read for the resource's id
-    (``_key_types``); without them, they are read here."""
+    (``_key_types``); without them, they are read here. ``witness`` decides
+    the permission's constant arms first (``_constant_witness``); ``fresh``
+    keeps nothing of that decision."""
     operation = _Operation.begin(backend, actor, using, context)
     key = resource.resource_type, action
+    if witness and _constant_witness(operation, key, recheck=True, fresh=fresh):
+        # Decided by its own statement just now: a lower bound.
+        return True, True, False, operation.policy
     if types is None:
         types = _key_types(operation.policy, using, key, (resource.resource_id,))
     row_types = types.get(resource.resource_id)
@@ -615,7 +705,13 @@ def check(
     actor: SubjectRef,
     context: Mapping[str, Any] | None,
     using: str,
+    fresh: bool = False,
 ) -> CheckResult:
+    """The three-state answer of one point check.
+
+    ``fresh`` is set for a call with an explicit consistency requirement: the
+    evaluator keeps nothing of it (``_constant_witness``).
+    """
     schema, _snapshot = _schema(backend)
     definition = schema.get_definition(resource.resource_type)
     if definition is None:
@@ -655,6 +751,8 @@ def check(
         actor=actor,
         context=context,
         using=using,
+        witness=True,
+        fresh=fresh,
     )
     return _answer(
         lower,
@@ -750,8 +848,6 @@ def _check_chunk(
     backend: LocalBackend, policy: _Policy, items: Sequence[CheckItem], using: str
 ) -> list[CheckResult]:
     """The point checks of up to ``_BULK`` items, by three statements at most."""
-    from rebac.evaluator import _ctx_key
-
     operations: dict[tuple[SubjectRef, Hashable], _Operation] = {}
     prepared: dict[tuple[Key, Hashable], CaveatVerdicts] = {}
     asked: list[tuple[_Operation, Key, str]] = []
@@ -839,18 +935,24 @@ def _scope_statement(
     key: Key,
     *,
     candidates: tuple[int, ...] | None = None,
+    witness: bool | None = None,
 ) -> _Kept | bool:
     """The ids of ``model`` the actor holds ``key`` on, as SQL.
 
     ``False`` when there are none.  ``every`` is set when every row qualifies
     and the SQL is only the policy fence. ``candidates`` bounds the rows the
-    statement visits to those literal identities.
+    statement visits to those literal identities. ``witness`` is the answer
+    of ``_constant_witness``: when ``True`` the statement is the constant
+    arms alone; when ``False`` it is the policy's without them.
     """
+    if witness:
+        return _constant_statement(operation, key)
     verdicts = operation.verdicts(key)
     label = model._meta.label_lower
+    fold = key if witness is False else None
 
     def build() -> bool | tuple[models.QuerySet[Any], bool]:
-        compiler = operation.compiler(verdicts)
+        compiler = operation.compiler(verdicts, fold=fold)
         predicate = compiler.holds(key, _model_at(model), Bound.LOWER)
         if is_false(predicate):
             return False
@@ -864,7 +966,9 @@ def _scope_statement(
         rows = rows.filter(Q(Exists(gate)) & predicate)
         return compiler.statement(rows.order_by().values(resource_id_attr(model))), False
 
-    return operation.statement(("scope", label, key), verdicts, build, cache=candidates is None)
+    return operation.statement(
+        ("scope", label, key, fold is not None), verdicts, build, cache=candidates is None
+    )
 
 
 def _known_identities(
@@ -939,7 +1043,10 @@ def _known_identities(
 
 
 class _Scope(Expression):
-    """A queryset scope with policy and caveat verdicts pinned when built."""
+    """A queryset scope with policy, caveat verdicts and constant-arm witness pinned when built.
+
+    ``witness`` is the answer of ``_constant_witness`` when the scope was built.
+    """
 
     def __init__(
         self,
@@ -950,6 +1057,7 @@ class _Scope(Expression):
         using: str,
         policy: _Policy,
         verdicts: CaveatVerdicts,
+        witness: bool | None = None,
     ) -> None:
         super().__init__(output_field=models.BooleanField())
         self.backend = backend
@@ -959,6 +1067,7 @@ class _Scope(Expression):
         self.using = using
         self.policy = policy
         self.verdicts = verdicts
+        self.witness = witness
         self.lhs: Any = F(resource_id_attr(model))
 
     def get_source_expressions(self) -> list[Any]:
@@ -977,7 +1086,9 @@ class _Scope(Expression):
         # A query that names the identities it reads proves access over
         # exactly those rows; every other shape uses the general scope.
         identities = _known_identities(self.model, self.lhs, compiler.query.where, self.using)
-        compiled = _scope_statement(operation, self.model, key, candidates=identities)
+        compiled = _scope_statement(
+            operation, self.model, key, candidates=identities, witness=self.witness
+        )
         if isinstance(compiled, bool):
             # ``True`` cannot occur: a statement that admits rows is a gate.
             return "(1 = 0)", ()
@@ -1014,7 +1125,8 @@ def scope_expression(
     using: str,
     identity: Expression | None = None,
 ) -> Expression:
-    """The Boolean scope of ``model`` rows, its policy and caveat verdicts pinned now.
+    """The Boolean scope of ``model`` rows, its policy, caveat verdicts and
+    constant-arm witness pinned now.
 
     ``identity`` replaces the scope's own identity column, for a caller that
     resolved it through another query path.
@@ -1025,7 +1137,14 @@ def scope_expression(
     key = (resource_type, action)
     operation = _Operation.begin(backend, actor, using, policy=_policy(backend))
     expression = _Scope(
-        backend, model, action, actor, using, operation.policy, operation.verdicts(key)
+        backend,
+        model,
+        action,
+        actor,
+        using,
+        operation.policy,
+        operation.verdicts(key),
+        _constant_witness(operation, key),
     )
     if identity is not None:
         expression.set_source_expressions([identity])
@@ -1102,7 +1221,11 @@ def _named_parts(
 
 @dataclass(frozen=True)
 class _AccessibleResources:
-    """A lazy enumeration request, prepared afresh at each consumption."""
+    """A lazy enumeration request, prepared afresh at each consumption.
+
+    ``fresh`` is set for a call with an explicit consistency requirement
+    (``_constant_witness``).
+    """
 
     backend: LocalBackend
     resource_type: str
@@ -1111,6 +1234,7 @@ class _AccessibleResources:
     using: str
     context: Mapping[str, Any] | None
     revision: str | None
+    fresh: bool = False
 
     @schema_operation
     def _branches(self) -> list[tuple[models.QuerySet[Any], Callable[[Any], str | None]]]:
@@ -1165,6 +1289,7 @@ def _accessible_branches(
                     self.using,
                     policy,
                     verdicts,
+                    _constant_witness(operation, key, fresh=self.fresh),
                 )
             )
         else:
@@ -1221,10 +1346,11 @@ def accessible_ids(
     actor: SubjectRef,
     using: str,
     context: Mapping[str, Any] | None = None,
+    fresh: bool = False,
 ) -> _AccessibleResources:
     _schema_now, snapshot = _schema(backend)
     return _AccessibleResources(
-        backend, resource_type, action, actor, using, context, snapshot.revision
+        backend, resource_type, action, actor, using, context, snapshot.revision, fresh
     )
 
 

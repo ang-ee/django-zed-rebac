@@ -23,13 +23,9 @@ drops the index tables. The sections that follow are the design as it was
 reviewed and are kept as written. The implementation settled these points:
 
 - **Actor-side recursion (§ 5, § 8).** The stored sets that hold the actor
-  (nested groups, roles held in tuples) are decided before the statement: the
-  operation follows the tuple table from the actor to a fixed point, exact at
-  any depth, binds the sets as id lists, and a statement that authorizes
-  witnesses the decision in its own snapshot. A set that admits a
-  column-backed set, or an actor in more than 256 sets, keeps the closure
-  inside the statement, unrolled to `REBAC_DEPTH_LIMIT` with a convergence
-  test.
+  (nested groups, roles held in tuples) are a recursive CTE of the statement,
+  followed from the actor to a fixed point, exact at any depth, data cycles
+  included (0.31.0; before, they were decided into id lists by the operation).
 - **Structural recursion (§ 8).** Stored-relation and backed-path recursion
   are closures with a convergence test: exact when one more hop reaches
   nothing new, data cycles included; past the bound a point check raises. A
@@ -37,9 +33,20 @@ reviewed and are kept as written. The implementation settled these points:
   that recurse through each other are nested to the bound, counted in
   relations followed, with no convergence test either: a closure for them is
   open work, pinned as an expected failure.
-- **Facts about fixed objects (§ 5).** A queryset scope decides them in one
-  statement, folds them as constants and witnesses each used decision inside
-  the scope statement. Other operations evaluate them inline.
+- **Facts about fixed objects (§ 5).** They are uncorrelated predicates of
+  the statement (0.31.0). Inside an evaluator scope, a permission's own
+  constant arms (its disjuncts that name a fixed object) are decided by a
+  witness statement (0.31.4): an actor who holds one reads the statement of
+  those arms alone, which witnesses them in its own snapshot, so a request
+  cache never preserves a revoked allow; a point check decides them at the
+  check. The evaluator remembers the answer for the request. A `True` serves
+  only where the decision cache may keep a decision about the types they
+  name. A `False` leaves the arms out only there: an actor who holds none
+  reads the statement without them, the guarded decided branch of § 5.
+  Elsewhere it selects the statement with every arm. The statement without
+  them is a lower bound for every actor of its shape, so the kept plan embeds
+  no decision; the answer only chooses it. Other operations, and the
+  constant arms of the types an arrow reaches, evaluate them inline.
 - **Refused recursion (§ 8).** A component is refused when a permission of
   it is reached through the right-hand side of `-` inside the component, or
   when one expression uses the component more than once (`rebac.E016`).
@@ -48,9 +55,10 @@ reviewed and are kept as written. The implementation settled these points:
   one query per operation; there is no condition limit, and
   `REBAC_INDEX_CONDITION_LIMIT` and `rebac.E017` are removed with
   `REBAC_INDEX_LOOKUP_LIMIT` and `rebac.E019`.
-- **Statements are kept** per policy revision, permission, actor shape and
-  the actor's decided sets (gate G4): Django's own SQL, with the actor id,
-  the clock and the resource id as parameters.
+- **Statements are kept** per policy revision, permission and actor shape
+  (gate G4): Django's own SQL, with the actor id, the clock and the resource
+  id as parameters. A permission with constant arms has two more per shape:
+  the arms alone and the policy without them.
 
 Open: gate G1 (plans on the consumer database, under trial) and gate G5
 (§ 13, the gates). Tier 3 was not run.

@@ -336,6 +336,18 @@ def actor_shape(schema: Schema, actor: SubjectRef, using: str) -> ActorShape:
     )
 
 
+def _fixed(relation: Relation | None) -> bool:
+    """Whether a relation names one fixed object, whatever the row: a constant without filters.
+
+    An arm through it holds on every object of its type or on none.
+    """
+    return (
+        relation is not None
+        and isinstance(relation.backing, ConstBinding)
+        and not relation.backing.filters
+    )
+
+
 def _multi_valued(model: type[models.Model], lookup: str) -> bool:
     """Whether a lookup path crosses a reverse or many-to-many relation."""
     current: Any = model
@@ -363,6 +375,9 @@ class Compiler:
 
     ``parametric`` compiles the actor's id as a placeholder (see ``bind``), so
     the statement depends only on the actor's shape and can be kept.
+
+    ``fold`` names a permission whose constant arms (``constant_arms``) are
+    known not to hold for the actor: the lower bound compiles them as false.
     """
 
     def __init__(
@@ -378,6 +393,7 @@ class Compiler:
         program: CompileProgram | None = None,
         parametric: bool = False,
         point: PointRow | None = None,
+        fold: Key | None = None,
     ) -> None:
         self.schema = tagged.schema if tagged is not None else schema
         self.actor = actor
@@ -405,6 +421,9 @@ class Compiler:
         # The statement's id sets, in definition order, and by SQL and parameters.
         self._id_sets: list[CTE] = []
         self._id_set_names: dict[tuple[str, tuple[Any, ...]], CTE] = {}
+        # The constant arms compiled as false at the lower bound, by identity:
+        # the policy's own expression nodes.
+        self._folded = frozenset(map(id, self.constant_arms(fold))) if fold else frozenset()
 
     def _cte_name(self, name: str) -> str:
         """A CTE name that no model table of the project already uses."""
@@ -527,6 +546,87 @@ class Compiler:
 
     def has_recursion(self, key: Key) -> bool:
         return bool(self.program.reachable(key) & self.program.recursive)
+
+    def constant_arms(self, key: Key) -> tuple[PermExpr, ...]:
+        """The disjuncts of ``key`` that hold on every object of its type or on none.
+
+        An arrow through, or a reference to, a relation that names a fixed
+        object (``_fixed``) never reads the row. A permission of the same type that the
+        union names contributes its own disjuncts. An operand of an
+        intersection or an exclusion is not a disjunct: it decides nothing
+        alone. Empty when ``key`` has no other disjunct, whose statement is
+        these arms already, or holds outright for this actor's shape.
+        """
+        definition = self.schema.get_definition(key[0])
+        permission = self.schema.get_permission(*key)
+        if definition is None or permission is None:
+            return ()
+        relations = {relation.name: relation for relation in definition.relations}
+        found: list[PermExpr] = []
+        other = False
+        seen = {key[1]}
+        pending = self._union_arms(permission.expression)
+        while pending:
+            arm = pending.pop(0)
+            if isinstance(arm, PermRef) and arm.name in ("authenticated", "anonymous"):
+                if getattr(self.shape, arm.name):
+                    # The permission holds on every object for this actor.
+                    return ()
+            elif isinstance(arm, PermArrow) and _fixed(relations.get(arm.via)):
+                found.append(arm)
+            elif isinstance(arm, PermRef) and arm.name in relations:
+                if _fixed(relations[arm.name]):
+                    found.append(arm)
+                else:
+                    other = True
+            elif (
+                isinstance(arm, PermRef)
+                and (self.tagged is None or id(arm) not in self.tagged.arms)
+                and (named := self.schema.get_permission(key[0], arm.name)) is not None
+            ):
+                # A permission of the same type at the same object: its own
+                # disjuncts are this one's, unless an override tags the reference.
+                if arm.name not in seen:
+                    seen.add(arm.name)
+                    pending.extend(self._union_arms(named.expression))
+            elif not isinstance(arm, PermNil):
+                other = True
+        return tuple(found) if other else ()
+
+    def constant_types(self, key: Key) -> tuple[str, ...]:
+        """The resource types ``key``'s constant arms name: what their decision reads."""
+        definition = self.schema.get_definition(key[0])
+        if definition is None:
+            return ()
+        relations = {relation.name: relation for relation in definition.relations}
+        return tuple(
+            sorted(
+                {
+                    relations[arm.via if isinstance(arm, PermArrow) else arm.name]
+                    .allowed_subjects[0]
+                    .type
+                    for arm in self.constant_arms(key)
+                    if isinstance(arm, (PermArrow, PermRef))
+                }
+            )
+        )
+
+    def constant(self, key: Key) -> Q:
+        """Whether one of ``key``'s constant arms holds: a predicate of no object.
+
+        False when ``key`` has none to witness (``constant_arms``).
+        """
+        definition = self.schema.get_definition(key[0])
+        if definition is None:
+            return _FALSE
+        # The arms read no object; the empty id stands for one.
+        at = At(key[0], Value("", output_field=models.TextField()), None, False)
+        return _or(
+            *(
+                self._expression(definition, arm, at, Bound.LOWER, {}, depth_possible=True)
+                for arm in self.constant_arms(key)
+            )
+        )
 
     def depth_unknown(self, key: Key, at: At) -> Q:
         """Whether an undecided case is undecided only because a cycle was cut.
@@ -1281,6 +1381,10 @@ class Compiler:
         depth_possible: bool,
     ) -> Q:
         type_ = definition.resource_type
+        if bound is Bound.LOWER and id(expr) in self._folded:
+            # A constant arm known not to hold: it would hold on every object
+            # or none, so it holds on none.
+            return _FALSE
         if isinstance(expr, PermNil):
             result = _FALSE
         elif isinstance(expr, PermRef):
@@ -1363,15 +1467,15 @@ class Compiler:
     ) -> list[Q]:
         """The arms of a union, compiled until one holds outright.
 
-        Arrows over constants come first: they fold to a decision (a member
-        of the admin role), and when one holds nothing else is compiled.
+        Builtins and arrows through a fixed object (``_fixed``) come first:
+        they fold to a decision (a member of the admin role), and when one
+        holds nothing else is compiled.
         """
 
         def constant(arm: PermExpr) -> bool:
             if not isinstance(arm, PermArrow):
                 return isinstance(arm, PermRef) and arm.name in ("authenticated", "anonymous")
-            relation = next((r for r in definition.relations if r.name == arm.via), None)
-            return relation is not None and isinstance(relation.backing, ConstBinding)
+            return _fixed(next((r for r in definition.relations if r.name == arm.via), None))
 
         parts: list[Q] = []
         for arm in sorted(arms, key=lambda arm: not constant(arm)):

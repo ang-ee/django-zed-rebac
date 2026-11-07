@@ -1706,7 +1706,13 @@ application's own tables and the relationship table, and the database
 evaluates it when the statement runs. Field-, attribute- and const-backed
 relations are read from the model columns; stored relations are read from
 tuples. Nothing is built, rebuilt or verified: a model write or a tuple write
-is visible to the next read. The schema walker (`rebac.schema.walker`) remains
+is visible to the next read. Inside an evaluator scope, a decision the
+evaluator keeps (a check answer, field visibility, a constant-arm witness)
+follows the decision-cache rules of
+[the per-request evaluator](#permissionevaluator--per-request-check-cache):
+none is kept inside a transaction, for a fact a model column backs, or while
+the schema declares an expiring relation, and a tuple write through the
+library discards it. The schema walker (`rebac.schema.walker`) remains
 for `check_new`, which evaluates a row that does not exist yet.
 
 The implementation is the package `rebac.compile`: `program` (the dependency
@@ -1861,8 +1867,10 @@ statement. Subject-set membership is a tuple-table predicate; nested groups
 are a recursive CTE followed to a fixed point, data cycles included. Other
 recursive paths are bounded by `REBAC_DEPTH_LIMIT`. No arrow target,
 hierarchy row, fixed object or actor membership is selected into Python
-while building or rendering a scope. The statement reads tuples and backing
-rows in its own database snapshot.
+while building or rendering a scope. The one exception is a Boolean: inside
+an evaluator scope, building a scope decides whether the actor holds the
+permission's constant arms (below), which chooses the statement. The
+statement reads tuples and backing rows in its own database snapshot.
 
 A policy reaches the same id set (an arrow's targets, a subject set's members)
 from many arms: a permission named by several others, a type reached through
@@ -1878,13 +1886,53 @@ number of distinct id sets in reach, not with the number of paths to them, and
 is the same for every actor of one shape. An id set that reads a CTE of the
 query it sits in (a recursive closure's own rows) stays in place.
 
-A queryset scope pins its policy and caveat verdicts when the queryset owner
-builds the scope. Rendering the predicate performs no database read, the
-first time or any later time, alone, embedded, or as an operand of a combined
-query that reaches the compiler without its queryset owner; there is no
-render-time preparation to fall back on. Four exceptions do database work at
-render, outside a prepared scope: (a) `permission_expression` reads the policy
-and the caveat-verdict rows when its SQL is compiled, by design; (b) the
+A constant arrow or constant relation without filters (`admin->member` over
+`rebac:const=admin`) names one fixed object, so it holds on every object of
+its type or on none. A permission's constant arms are those that are
+disjuncts of its expression, directly or through permissions of the same
+type that its union names; an operand of `&` or `-` is not one. Inside an
+evaluator scope, a witness statement decides whether the actor holds one
+(`rebac.compile.read._constant_witness`):
+
+- A scope of an actor who holds one is the statement of the constant arms
+  alone, a gate that admits every row, which evaluates them again when it
+  runs. A point check (`check_access`) of that actor is answered by the
+  witness statement, decided at that check.
+- The evaluator remembers the answer for the rest of the scope, per actor and
+  distinct statement of constant arms. Keeping it is allowed where the
+  decision cache may keep a decision about every type the arms name
+  (`_backend_cache_key`; see
+  [the per-request evaluator](#permissionevaluator--per-request-check-cache))
+  and the call states no `consistency` or `at_zookie`; a tuple write through
+  the library changes that key.
+- A remembered `True` serves only where keeping is allowed and the key is
+  unchanged; elsewhere the witness is decided again at each scope build and
+  point check.
+- A remembered `False` serves in every context. Where keeping is allowed, a
+  scope statement then compiles the constant arms as false at the lower
+  bound, so the union branch that listed every row of the model is not in
+  it. Elsewhere it only selects the policy's statement, which evaluates the
+  arms itself, so the answer stays exact whatever changes later, and no
+  witness runs again. A point check never leaves the arms out, in either
+  bound.
+
+A kept answer only chooses the statement: a `True` chooses a statement that
+evaluates the arms when it runs, and leaving the arms out only narrows a
+lower bound, so an answer that went stale within the scope narrows a read
+and never widens it. Outside an evaluator scope, under a caveat context, in
+bulk checks, subject lookups, `grants_all()` and the enumeration of ids that
+no model row carries, the statement keeps every arm. The constant arms of the
+types an arrow reaches stay in the statement and are evaluated where it reads
+those types.
+
+A queryset scope pins its policy, caveat verdicts and constant-arm witness
+when the queryset owner builds the scope. Rendering the predicate performs no
+database read, the first time or any later time, alone, embedded, or as an
+operand of a combined query that reaches the compiler without its queryset
+owner; there is no render-time preparation to fall back on. Four exceptions do
+database work at render, outside a prepared scope: (a) `permission_expression`
+reads the policy and the caveat-verdict rows, and inside an evaluator scope
+decides the constant-arm witness, when its SQL is compiled, by design; (b) the
 field-read guard reads the schema revision when an actor-scoped subquery
 renders inside a plain outer query with no evaluator scope open; (c) the
 embedded-bypass audit writes at render for a statement whose query class REBAC
@@ -1892,7 +1940,8 @@ does not hook (see [Bypass audit granularity](#with_actor-vs-sudo--distinct-verb
 (d) a REBAC queryset that Django resolves only while compiling the outer
 statement (a `Subquery` in `ORDER BY`, a REBAC `Subquery` as an INSERT value)
 builds its scope then, reading the schema revision, unless an evaluator scope
-pins it, and the caveat-verdict rows. A new
+pins it, and the caveat-verdict rows, and deciding the constant-arm witness
+inside an evaluator scope. A new
 caveat instance is absent from an already prepared lower bound; a newly
 built scope sees it. Point checks retain their content-type preparation for
 generic backings and prepare caveat verdicts before the SQL statement.
@@ -1919,7 +1968,10 @@ alias and vendor, depth limit, active relationship model and scope model.
 The key contains no membership lists, row decisions or fact verdicts. The
 actor shape includes its type and relation suffix, canonical identity
 status, named id and authentication status. Actor id, application clock,
-point resource id and manual-schema revision are bound parameters.
+point resource id and manual-schema revision are bound parameters. A
+permission with constant arms has two more statements per shape: the
+constant arms alone, and the policy without them (see
+[Inline permission scopes](#inline-permission-scopes)).
 
 Two bounded caches per process hold the prepared policies and the statements,
 512 entries each, least recently used evicted first. A statement that
@@ -2072,7 +2124,7 @@ needs one is not in its lower bound.
 
 | Operation | Implementation |
 |---|---|
-| `check_access()` | The lower bound at the resource id, selected from the fenced generation row: one statement, which alone can answer `HAS`. When it does not hold and neither a caveat nor a recursion is in reach, the answer is `NO`. Otherwise the upper bound is a second statement: when it fails, `NO`. Otherwise, when a recursion is in reach, a third statement probes whether the uncertainty is depth, and the residual evaluator names what is undecided. When the permission reaches relations of the resource's type backed by a `GenericForeignKey`, the row's content types in those columns are read first, by one statement, and the statements compile only the arms of those types (an edge to a party compiles `party->read`, not every target type's chain); each statement re-reads the content types, so a row changed in between selects nothing. `check_bulk_permissions()` reads them for a chunk by one statement per resource type, `lookup_subjects()` once for every candidate, and `accessible()` once for the ids it checks one by one. |
+| `check_access()` | Inside an evaluator scope, a permission with constant arms is first answered by the constant-arm witness, decided at that check: `HAS` when the actor holds one; otherwise the bounds below, with every arm (see [Inline permission scopes](#inline-permission-scopes)). The lower bound at the resource id, selected from the fenced generation row: one statement, which alone can answer `HAS`. When it does not hold and neither a caveat nor a recursion is in reach, the answer is `NO`. Otherwise the upper bound is a second statement: when it fails, `NO`. Otherwise, when a recursion is in reach, a third statement probes whether the uncertainty is depth, and the residual evaluator names what is undecided. When the permission reaches relations of the resource's type backed by a `GenericForeignKey`, the row's content types in those columns are read first, by one statement, and the statements compile only the arms of those types (an edge to a party compiles `party->read`, not every target type's chain); each statement re-reads the content types, so a row changed in between selects nothing. `check_bulk_permissions()` reads them for a chunk by one statement per resource type, `lookup_subjects()` once for every candidate, and `accessible()` once for the ids it checks one by one. |
 | `check_bulk_permissions()` | The answers of `check_access()`, with the work shared: see [Bulk checks](#bulk-checks). |
 | Queryset scope (`queryset_filter()`) | `Model.filter(holds(key, At(type, identity column, identity field, row=True), LOWER))`, with every arrow and subject set inline. |
 | `accessible()` | The lower bound over each part of the type's universe: the model's rows, the ids that tuples name at either end, constant targets, attribute containers, and field-backed targets whose model stores no rows. Wildcard and empty ids are excluded and the result is deduplicated. |
@@ -2227,9 +2279,17 @@ of its own.
   subject sets inline, each distinct id set once. A statement grows with the
   number of distinct id sets in its reach, not with the number of paths to
   them, and with the recursion bound. One statement serves every actor of a
-  shape: an actor whose constant facts would prune the policy (an
-  administrator's `admin->member`) still reads the whole statement. There is
-  no scale claim.
+  shape. Only a permission's own constant arms are decided per actor, and
+  only inside an evaluator scope: a permission without one (`read =
+  parent->read`) gives an administrator the whole statement, whose id sets
+  then hold every row of the types its arrows reach. Where the decision cache
+  keeps nothing for the types the arms name, an actor who holds a constant arm
+  pays one witness per read, other actors one per request, and their
+  statements keep the constant arms' union branch. There is no scale claim.
+- Id sets are driven from the actor's grants, not bounded by the rows the
+  selecting query reads: a read of one parent's children computes the set of
+  parents the actor reads, by index from its grants, and then that parent's
+  children by key.
 - PostgreSQL 12 and later, and SQLite 3.35 and later, materialize a CTE that a
   statement references more than once: an id set shared by several arms is
   computed in full once per statement, and the planner does not push the
@@ -2916,6 +2976,16 @@ Backend relationship writes and the `post_delete` cascade
 backend instances in this process, including evaluators suspended by a nested
 scope.
 
+The evaluator also remembers, per actor and per statement of a permission's
+constant arms, whether the actor holds one (see
+[Inline permission scopes](#inline-permission-scopes)). The answer only
+chooses which statement a read runs. It is used as kept only under these
+rules: when the decision cache may keep a decision about every type the arms
+name and the call states no explicit `consistency` or `at_zookie`; elsewhere
+a `True` is decided again and a `False` selects the statement with every arm.
+`invalidate()` forgets it, a tuple write through the library changes its key,
+and `stats()` reports it as `constant_witness_entries`.
+
 The old `accessible_cached`, `enable_accessible_cache`, and
 `disable_accessible_cache` helpers were removed in 0.5. Use
 `current_evaluator()` / `evaluator_scope()` directly.
@@ -2948,7 +3018,8 @@ need a backend that implements them. Database routing and transaction isolation
 must make the required writes visible on the reading connection.
 The returned token is at least the highest xid allocated by any tuple write
 nested in the call. A read in the same transaction sees a nested tuple write
-as soon as it returns, because the statement reads the tuple table itself.
+as soon as it returns, because the statement reads the tuple table itself and
+the evaluator keeps no decision inside a transaction.
 An ambient LocalBackend token only advances; a later outer
 helper cannot replace a nested helper's higher token with a lower one.
 Backends validate `Zookie.backend` matches their

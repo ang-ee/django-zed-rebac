@@ -18,6 +18,10 @@ The check cache is an LRU bounded by ``REBAC_EVALUATOR_CACHE_SIZE``
 (default 10_000). Conditional results are never cached — the missing
 caveat params are part of the answer and the next call may supply them.
 
+The scope also remembers, under the same decision-cache rules, whether an
+actor holds a permission's constant arms (``rebac.compile.read._constant_witness``),
+which only chooses the statement a read runs.
+
 Async-safe via ``ContextVar`` — each ``asyncio.create_task`` and each
 Strawberry resolver coroutine inherits the parent's evaluator slot.
 ``Task.copy_context()`` semantics mean a fresh evaluator opened inside a
@@ -27,7 +31,7 @@ task does not leak back to the parent.
 from __future__ import annotations
 
 from collections import OrderedDict
-from collections.abc import Hashable, Iterable, Iterator
+from collections.abc import Callable, Hashable, Iterable, Iterator
 from contextlib import contextmanager
 from contextvars import ContextVar
 from typing import TYPE_CHECKING, Any
@@ -97,6 +101,7 @@ class PermissionEvaluator:
 
     __slots__ = (
         "_check_cache",
+        "_constant_witnesses",
         "_max_size",
         "_schema_scope",
         "_visibility_decision_ids",
@@ -105,6 +110,11 @@ class PermissionEvaluator:
 
     def __init__(self, *, max_size: int = 10_000) -> None:
         self._check_cache: OrderedDict[tuple[Any, ...], CheckResult] = OrderedDict()
+        # Whether an actor holds a policy's constant arms, by statement, with
+        # the decision-cache key it was decided under (``None``: none).
+        self._constant_witnesses: OrderedDict[
+            Hashable, tuple[bool, tuple[Hashable, ...] | None]
+        ] = OrderedDict()
         # Field visibility per actor, model, action and row batch; bounded by
         # entries and by the candidate ids they hold together.
         self._visibility_decisions: OrderedDict[tuple[Any, ...], frozenset[str]] = OrderedDict()
@@ -170,6 +180,7 @@ class PermissionEvaluator:
         per-emission scopes that re-enter without re-constructing.
         """
         self._check_cache.clear()
+        self._constant_witnesses.clear()
         self._visibility_decisions.clear()
         self._visibility_decision_ids = 0
         self._schema_scope.clear()
@@ -243,11 +254,61 @@ class PermissionEvaluator:
                 self._visibility_decision_ids -= len(oldest[-3])
         return answers
 
+    def _constant_witness(
+        self,
+        backend: LocalBackend,
+        statement: Hashable,
+        kept: tuple[Hashable, ...] | None,
+        decide: Callable[[], bool],
+        *,
+        recheck: bool = False,
+    ) -> bool | None:
+        """The answer of a constant-arm witness statement, decided at most when needed.
+
+        ``kept`` is the decision cache's key for every type the witness reads
+        (``_backend_cache_key``), or ``None`` where nothing may be kept. A
+        remembered answer serves only under the ``kept`` it was decided at:
+
+        - a ``True`` is decided again where nothing may be kept, after the
+          key changed (a tuple write through the library), or on ``recheck``;
+        - a ``False`` is remembered in every context, and returned as
+          ``False`` (the arms may be left out) only under the same ``kept``.
+          Elsewhere it is ``None``, which selects the policy's statement: that
+          statement evaluates the arms itself, so the answer stays exact
+          whatever changes later. Where something may be kept and the key
+          changed, it is decided again.
+
+        See ``rebac.compile.read._constant_witness``. An unhashable statement
+        key is decided every time.
+        """
+        key = (_BackendKey(backend), statement)
+        try:
+            found = self._constant_witnesses.get(key)
+        except TypeError:
+            held = decide()
+            return True if held else (False if kept is not None else None)
+        if found is not None:
+            held, at = found
+            current = kept is not None and at == kept
+            if held and current and not recheck:
+                self._constant_witnesses.move_to_end(key)
+                return True
+            if not held and (current or kept is None):
+                self._constant_witnesses.move_to_end(key)
+                return False if current else None
+        held = decide()
+        self._constant_witnesses[key] = (held, kept)
+        self._constant_witnesses.move_to_end(key)
+        while len(self._constant_witnesses) > self._max_size:
+            self._constant_witnesses.popitem(last=False)
+        return True if held else (False if kept is not None else None)
+
     # ----- introspection (for tests + debugging) -----
 
     def stats(self) -> dict[str, int]:
         return {
             "check_entries": len(self._check_cache),
+            "constant_witness_entries": len(self._constant_witnesses),
             "visibility_entries": len(self._visibility_decisions),
             "visibility_ids": self._visibility_decision_ids,
             "max_size": self._max_size,

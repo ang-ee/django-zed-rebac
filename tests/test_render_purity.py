@@ -8,9 +8,10 @@ is open, so a policy read at render would be observable.
 
 Four named exceptions do database work at render, outside a prepared scope:
 
-- (a) ``permission_expression`` reads the policy and the caveat-verdict rows
-  when its SQL is compiled, by design: its executing database and policy bind
-  at compilation.
+- (a) ``permission_expression`` reads the policy and the caveat-verdict rows,
+  and inside an evaluator scope decides the constant-arm witness, when its SQL
+  is compiled, by design: its executing database and policy bind at
+  compilation.
 - (b) The field-read guard reads the schema revision when an actor-scoped
   subquery renders inside a plain outer query and no evaluator scope is open.
 - (c) The embedded-bypass audit writes its row at render for a statement whose
@@ -20,7 +21,8 @@ Four named exceptions do database work at render, outside a prepared scope:
 - (d) A REBAC queryset that Django resolves only while compiling the outer
   statement (a ``Subquery`` in ``ORDER BY``, a REBAC ``Subquery`` as an INSERT
   value) builds its scope then: it reads the schema revision, unless an
-  evaluator scope pins it, and the caveat-verdict rows.
+  evaluator scope pins it, and the caveat-verdict rows, and decides the
+  constant-arm witness inside an evaluator scope.
 """
 
 from __future__ import annotations
