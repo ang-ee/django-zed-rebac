@@ -12,6 +12,9 @@ pre-1.0; breaking changes within a minor version are explicitly called out.
   statement of those arms alone, decided by one witness statement per request:
   on a console-like policy an administrator's read falls from 47,920 to 2,224
   bytes.
+- Other actors' statements inside an evaluator scope leave those constant arms
+  out, and with them the union branch that listed every row of the model: a
+  read of one parent's children no longer scans the child table.
 
 ## [0.31.3] — 2026-11-07
 

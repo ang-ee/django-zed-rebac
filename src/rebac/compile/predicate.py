@@ -363,6 +363,9 @@ class Compiler:
 
     ``parametric`` compiles the actor's id as a placeholder (see ``bind``), so
     the statement depends only on the actor's shape and can be kept.
+
+    ``fold`` names a permission whose constant arms (``constant_arms``) are
+    known not to hold for the actor: the lower bound compiles them as false.
     """
 
     def __init__(
@@ -378,6 +381,7 @@ class Compiler:
         program: CompileProgram | None = None,
         parametric: bool = False,
         point: PointRow | None = None,
+        fold: Key | None = None,
     ) -> None:
         self.schema = tagged.schema if tagged is not None else schema
         self.actor = actor
@@ -405,6 +409,9 @@ class Compiler:
         # The statement's id sets, in definition order, and by SQL and parameters.
         self._id_sets: list[CTE] = []
         self._id_set_names: dict[tuple[str, tuple[Any, ...]], CTE] = {}
+        # The constant arms compiled as false at the lower bound, by identity:
+        # the policy's own expression nodes.
+        self._folded = frozenset(map(id, self.constant_arms(fold))) if fold else frozenset()
 
     def _cte_name(self, name: str) -> str:
         """A CTE name that no model table of the project already uses."""
@@ -1349,6 +1356,10 @@ class Compiler:
         depth_possible: bool,
     ) -> Q:
         type_ = definition.resource_type
+        if bound is Bound.LOWER and id(expr) in self._folded:
+            # A constant arm known not to hold: it would hold on every object
+            # or none, so it holds on none.
+            return _FALSE
         if isinstance(expr, PermNil):
             result = _FALSE
         elif isinstance(expr, PermRef):

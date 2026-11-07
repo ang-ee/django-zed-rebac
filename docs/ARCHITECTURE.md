@@ -1888,10 +1888,13 @@ once per request for each distinct statement of constant arms
 (`rebac.compile.read._constant_arms_held`). A scope of an actor who holds
 one is then the statement of the constant arms alone, a gate that admits
 every row, and a point check of that actor is answered by the witness
-statement itself; any other actor reads the policy's statement. The witness
-only chooses the statement: the statement of the constant arms evaluates them
-when it runs, so an answer that went stale within the request narrows a read
-and never widens it. A tuple write through the library decides it again. Outside an evaluator scope, under a caveat
+statement itself. For any other actor the statement compiles the constant
+arms as false at the lower bound, so the union branch that listed every row
+of the model is not in it. The witness only chooses the statement: the
+statement of the constant arms evaluates them when it runs, and leaving them
+out only narrows a lower bound, so an answer that went stale within the
+request narrows a read and never widens it. A tuple write through the
+library decides it again. Outside an evaluator scope, under a caveat
 context, in bulk checks and in the enumeration of ids that no model row
 carries, the statement keeps every arm. The constant arms of the types an
 arrow reaches stay in the statement and are evaluated where it reads those
@@ -1941,8 +1944,9 @@ The key contains no membership lists, row decisions or fact verdicts. The
 actor shape includes its type and relation suffix, canonical identity
 status, named id and authentication status. Actor id, application clock,
 point resource id and manual-schema revision are bound parameters. A
-permission with constant arms has one more statement per shape: the constant
-arms alone (see [Inline permission scopes](#inline-permission-scopes)).
+permission with constant arms has two more statements per shape: the
+constant arms alone, and the policy without them (see
+[Inline permission scopes](#inline-permission-scopes)).
 
 Two bounded caches per process hold the prepared policies and the statements,
 512 entries each, least recently used evicted first. A statement that
@@ -2095,7 +2099,7 @@ needs one is not in its lower bound.
 
 | Operation | Implementation |
 |---|---|
-| `check_access()` | Inside an evaluator scope, a permission with constant arms is first answered by the constant-arm witness: `HAS` when the actor holds one (see [Inline permission scopes](#inline-permission-scopes)). The lower bound at the resource id, selected from the fenced generation row: one statement, which alone can answer `HAS`. When it does not hold and neither a caveat nor a recursion is in reach, the answer is `NO`. Otherwise the upper bound is a second statement: when it fails, `NO`. Otherwise, when a recursion is in reach, a third statement probes whether the uncertainty is depth, and the residual evaluator names what is undecided. When the permission reaches relations of the resource's type backed by a `GenericForeignKey`, the row's content types in those columns are read first, by one statement, and the statements compile only the arms of those types (an edge to a party compiles `party->read`, not every target type's chain); each statement re-reads the content types, so a row changed in between selects nothing. `check_bulk_permissions()` reads them for a chunk by one statement per resource type, `lookup_subjects()` once for every candidate, and `accessible()` once for the ids it checks one by one. |
+| `check_access()` | Inside an evaluator scope, a permission with constant arms is first answered by the constant-arm witness: `HAS` when the actor holds one, otherwise the lower bound below compiles them as false (see [Inline permission scopes](#inline-permission-scopes)). The lower bound at the resource id, selected from the fenced generation row: one statement, which alone can answer `HAS`. When it does not hold and neither a caveat nor a recursion is in reach, the answer is `NO`. Otherwise the upper bound is a second statement: when it fails, `NO`. Otherwise, when a recursion is in reach, a third statement probes whether the uncertainty is depth, and the residual evaluator names what is undecided. When the permission reaches relations of the resource's type backed by a `GenericForeignKey`, the row's content types in those columns are read first, by one statement, and the statements compile only the arms of those types (an edge to a party compiles `party->read`, not every target type's chain); each statement re-reads the content types, so a row changed in between selects nothing. `check_bulk_permissions()` reads them for a chunk by one statement per resource type, `lookup_subjects()` once for every candidate, and `accessible()` once for the ids it checks one by one. |
 | `check_bulk_permissions()` | The answers of `check_access()`, with the work shared: see [Bulk checks](#bulk-checks). |
 | Queryset scope (`queryset_filter()`) | `Model.filter(holds(key, At(type, identity column, identity field, row=True), LOWER))`, with every arrow and subject set inline. |
 | `accessible()` | The lower bound over each part of the type's universe: the model's rows, the ids that tuples name at either end, constant targets, attribute containers, and field-backed targets whose model stores no rows. Wildcard and empty ids are excluded and the result is deduplicated. |
@@ -2255,6 +2259,10 @@ of its own.
   parent->read`) gives an administrator the whole statement, whose id sets
   then hold every row of the types its arrows reach. There is no scale
   claim.
+- Id sets are driven from the actor's grants, not bounded by the rows the
+  selecting query reads: a read of one parent's children computes the set of
+  parents the actor reads, by index from its grants, and then that parent's
+  children by key.
 - PostgreSQL 12 and later, and SQLite 3.35 and later, materialize a CTE that a
   statement references more than once: an id set shared by several arms is
   computed in full once per statement, and the planner does not push the

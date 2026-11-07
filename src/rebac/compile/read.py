@@ -316,6 +316,7 @@ class _Operation:
         *,
         parametric: bool = True,
         point: PointRow | None = None,
+        fold: Key | None = None,
     ) -> Compiler:
         return Compiler(
             self.policy.schema,
@@ -326,6 +327,7 @@ class _Operation:
             program=self.policy.program,
             parametric=parametric,
             point=point,
+            fold=fold,
         )
 
     def gate(self, *, parametric: bool = True) -> models.QuerySet[Any]:
@@ -432,8 +434,8 @@ def _constant_arms_held(operation: _Operation, key: Key, *, recheck: bool = Fals
     ``key`` has no constant arm beside its other arms. The answer only chooses
     the statement a read runs (``_scope_statement``): when it is true, a
     statement of the constant arms alone, which evaluates them as it runs;
-    otherwise the policy's statement. A stale answer can narrow a read within
-    the scope, never widen it. A tuple write through the library
+    otherwise the policy's statement without them. A stale answer can narrow
+    a read within the scope, never widen it. A tuple write through the library
     decides it again. ``recheck`` decides a remembered ``True`` again, for an
     answer that authorizes by itself.
     """
@@ -472,19 +474,23 @@ def _point_statement(
     key: Key,
     which: str,
     row_types: RowTypes | None = None,
+    *,
+    fold: bool = False,
 ) -> _Kept | bool:
     """One bound of ``key`` at one identity, as SQL; a bool when it needs no rows.
 
     ``row_types`` are the row's GenericForeignKey content types, when read
     (``_row_types``): the statement is compiled and kept for them, with only
-    the arms of those types, and re-reads them.
+    the arms of those types, and re-reads them. ``fold`` compiles a lower
+    bound without ``key``'s constant arms, which the actor does not hold.
     """
     verdicts = operation.verdicts(key)
+    fold = fold and which == "lower"
 
     def build() -> models.QuerySet[Any] | bool:
         at = At(key[0], _Param(_RESOURCE_WIRE, models.TextField()), None, False)
         point = PointRow(at.ref, row_types) if row_types is not None else None
-        compiler = operation.compiler(verdicts, point=point)
+        compiler = operation.compiler(verdicts, point=point, fold=key if fold else None)
         if which == "depth":
             condition = compiler.depth_unknown(key, at)
         else:
@@ -500,7 +506,7 @@ def _point_statement(
             return rows.values("pk")
         return compiler.statement(rows.filter(condition).values("pk"))
 
-    return operation.statement(("point", key, which, row_types), verdicts, build)
+    return operation.statement(("point", key, which, row_types, fold), verdicts, build)
 
 
 # A point row's content types: each content-type column's attname, with its value.
@@ -577,9 +583,11 @@ def _point(
     resource_id: str,
     which: str,
     row_types: RowTypes | None = None,
+    *,
+    fold: bool = False,
 ) -> bool:
     """One bound of ``key`` at one identity, by one statement."""
-    compiled = _point_statement(operation, key, which, row_types)
+    compiled = _point_statement(operation, key, which, row_types, fold=fold)
     if isinstance(compiled, bool):
         return compiled and operation.gate(parametric=False).exists()
     probe = _Sql(compiled.sql, operation.bound(compiled.params, resource_id))
@@ -654,7 +662,8 @@ def _point_result(
     the permission's constant arms first (``_constant_arms_held``)."""
     operation = _Operation.begin(backend, actor, using, context)
     key = resource.resource_type, action
-    if witness and _constant_arms_held(operation, key, recheck=True):
+    held = _constant_arms_held(operation, key, recheck=True) if witness else None
+    if held:
         # Decided by its own statement just now: a lower bound.
         return True, True, False, operation.policy
     if types is None:
@@ -662,7 +671,7 @@ def _point_result(
     row_types = types.get(resource.resource_id)
     # Only LOWER may authorize. Subsequent probes can only return NO,
     # CONDITIONAL, or a depth error.
-    if _point(operation, key, resource.resource_id, "lower", row_types):
+    if _point(operation, key, resource.resource_id, "lower", row_types, fold=held is False):
         return True, True, False, operation.policy
     recursive = _recursive(operation, key)
     # The bounds differ only where a caveat or a recursion is in reach.
@@ -916,15 +925,16 @@ def _scope_statement(
     and the SQL is only the policy fence. ``candidates`` bounds the rows the
     statement visits to those literal identities. ``constant`` is whether the
     actor holds ``key``'s constant arms (``_constant_arms_held``): if so, the
-    statement is those arms alone.
+    statement is those arms alone; if not, the policy's without them.
     """
     if constant:
         return _constant_statement(operation, key)
     verdicts = operation.verdicts(key)
     label = model._meta.label_lower
+    fold = key if constant is False else None
 
     def build() -> bool | tuple[models.QuerySet[Any], bool]:
-        compiler = operation.compiler(verdicts)
+        compiler = operation.compiler(verdicts, fold=fold)
         predicate = compiler.holds(key, _model_at(model), Bound.LOWER)
         if is_false(predicate):
             return False
@@ -938,7 +948,9 @@ def _scope_statement(
         rows = rows.filter(Q(Exists(gate)) & predicate)
         return compiler.statement(rows.order_by().values(resource_id_attr(model))), False
 
-    return operation.statement(("scope", label, key), verdicts, build, cache=candidates is None)
+    return operation.statement(
+        ("scope", label, key, fold is not None), verdicts, build, cache=candidates is None
+    )
 
 
 def _known_identities(

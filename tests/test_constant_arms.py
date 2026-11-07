@@ -6,7 +6,8 @@ none. One statement serves every actor of a shape, so the policy's statement
 carries the whole policy for an administrator too. Inside an evaluator scope a
 witness decides the permission's constant arms once per request: an actor who
 holds one reads a statement of those arms alone, which still evaluates them when
-it runs.
+it runs; for every other actor they leave the statement, and with them the union
+branch that lists every row of the model.
 """
 
 from __future__ import annotations
@@ -136,7 +137,7 @@ def test_an_actor_holding_a_constant_arm_reads_without_the_policy(console):
     assert len(admin_sql) == len(member_sql) == 2
     admin_read, member_read = admin_sql[-1], member_sql[-1]
     # Measured on SQLite: 2,224 bytes, after a witness of 2,263 (most of either
-    # is the actor's nested groups), against 47,932 for the member's read; on
+    # is the actor's nested groups), against 47,179 for the member's read; on
     # 0.31.3 both actors read the policy's 47,920 bytes in one statement.
     assert len(admin_read) < 2_560
     assert len(admin_sql[0]) < 2_560
@@ -174,6 +175,16 @@ def test_outside_an_evaluator_scope_the_statement_keeps_every_arm(console):
     assert admin_sql[0].replace("('admin')", "('member')") == member_sql[0]
 
 
+def test_the_member_statement_has_no_branch_for_the_constant_arm(console):
+    with evaluator_scope():
+        _ids, inside = _read(MEMBER)
+    _ids, outside = _read(MEMBER)
+    assert len(inside[-1]) < len(outside[-1])
+    # The constant arm's union branch selected every post row; without it the
+    # post table is read by key only.
+    assert inside[-1].count('FROM "testapp_post"') < outside[-1].count('FROM "testapp_post"')
+
+
 def test_a_stale_witness_narrows_a_read_and_never_widens_it(console):
     local, _folders, posts = console
     local.write_relationships([RelationshipTuple(to_object_ref(posts[5]), "editor", ADMIN)])
@@ -191,6 +202,29 @@ def test_a_stale_witness_narrows_a_read_and_never_widens_it(console):
         assert _read(ADMIN)[0] == []
     with evaluator_scope():
         assert _read(ADMIN)[0] == [posts[5].pk]
+
+
+def test_a_constant_arm_granted_within_a_request_waits_for_the_next(console):
+    _local, _folders, posts = console
+    table = connection.ops.quote_name(Relationship._meta.db_table)
+    with sudo(reason="constant arms fixture"):
+        # Only the post's own constant arm reaches a post without a folder; the
+        # folders' constant arms are evaluated where the folders are read.
+        alone = Post.objects.create(title="no folder")
+    with evaluator_scope():
+        assert alone.pk not in _read(MEMBER)[0]
+        # Granted behind the library: the member's read keeps the arm out
+        # until the next request.
+        with connection.cursor() as cursor:
+            cursor.execute(
+                f"INSERT INTO {table} (resource_type, resource_id, relation, subject_type, "
+                "subject_id, optional_subject_relation, caveat_name, caveat_context, "
+                "caveat_key, written_at_xid) VALUES ('org/role', 'admin', 'member', "
+                "'auth/user', 'member', '', '', NULL, '', 0)"
+            )
+        assert alone.pk not in _read(MEMBER)[0]
+    with evaluator_scope():
+        assert _read(MEMBER)[0] == [*(post.pk for post in posts), alone.pk]
 
 
 def test_a_revocation_through_the_library_is_seen_in_the_same_request(console):
@@ -274,26 +308,32 @@ def test_only_a_disjunct_of_the_permission_is_a_constant_arm(permission, admin_r
     local.write_relationships(
         [
             RelationshipTuple(ObjectRef("org/role", "admin"), "member", ADMIN),
-            RelationshipTuple(to_object_ref(posts[0]), "viewer", ADMIN),
-            RelationshipTuple(to_object_ref(posts[1]), "banned", ADMIN),
+            *(
+                RelationshipTuple(to_object_ref(posts[index]), relation, actor)
+                for actor in (ADMIN, MEMBER)
+                for index, relation in ((0, "viewer"), (1, "banned"), (2, "editor"))
+            ),
         ]
     )
     expected = {
         "every": [post.pk for post in posts],
         "unbanned": [posts[0].pk, posts[2].pk],
-        "viewed": [posts[0].pk],
+        "viewed": [posts[0].pk, posts[2].pk],
     }[admin_reads]
-    with evaluator_scope():
-        assert _read(ADMIN)[0] == expected
-        for post in posts:
-            assert (
-                local.check_access(subject=ADMIN, action="read", resource=to_object_ref(post))
-            ).allowed is (post.pk in expected)
-    assert _read(ADMIN)[0] == expected
+    # Outside an evaluator scope the statement keeps every arm: the reference.
+    reference = {ADMIN: _read(ADMIN)[0], MEMBER: _read(MEMBER)[0]}
+    assert reference[ADMIN] == expected
+    for actor in (ADMIN, MEMBER):
+        with evaluator_scope():
+            assert _read(actor)[0] == reference[actor]
+            for post in posts:
+                assert (
+                    local.check_access(subject=actor, action="read", resource=to_object_ref(post))
+                ).allowed is (post.pk in reference[actor])
 
 
 @pytest.mark.skipif(connection.vendor != "sqlite", reason="SQLite's plans read no statistics")
-@pytest.mark.parametrize("actor", [ADMIN], ids=["administrator"])
+@pytest.mark.parametrize("actor", [ADMIN, MEMBER], ids=["administrator", "member"])
 def test_a_parent_to_child_read_does_not_scan_the_child_table(console, actor):
     _local, folders, posts = console
     with evaluator_scope():
