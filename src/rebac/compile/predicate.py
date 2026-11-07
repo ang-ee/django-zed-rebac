@@ -19,7 +19,9 @@ Three rules shape every statement:
 
 from __future__ import annotations
 
+import hashlib
 from collections.abc import Iterable, Mapping, Sequence
+from contextvars import ContextVar
 from dataclasses import dataclass
 from datetime import datetime
 from enum import StrEnum
@@ -207,6 +209,17 @@ def _before(now: Expression, deadline: datetime) -> Q:
     return Q(LessThan(now, Value(deadline, output_field=models.DateTimeField())))
 
 
+# While an id set compiles: whether it holds another id set (set by that one).
+# While an id set compiles: the longest run of id sets nested inline in it,
+# each nested id set reporting its own run (``_Compiled.as_sql``).
+_enclosing_id_set: ContextVar[list[int] | None] = ContextVar("rebac_enclosing_id_set", default=None)
+# On SQLite, the run of id sets nested inline in one another at which the
+# outermost becomes a statement-local CTE (``_Compiled._statement_local``).
+# Three keeps the depth linear in a chain's length (about 25 levels a type
+# with seven arms) while every third nested id set pays the CTE's text.
+_INLINE_RUN = 3
+
+
 class _Compiled(Expression):
     """An uncorrelated id set: compiled by Django once, embedded as text.
 
@@ -222,6 +235,7 @@ class _Compiled(Expression):
         super().__init__(output_field=models.TextField())
         self.rows = rows
         self._sql: dict[str, tuple[str, tuple[Any, ...]]] = {}
+        self._run = 1
 
     def as_sql(self, compiler: Any, connection: Any) -> tuple[str, tuple[Any, ...]]:
         cached = self._sql.get(connection.alias)
@@ -231,9 +245,51 @@ class _Compiled(Expression):
             # An id set has no order; Django 6.1 applies a model's default
             # ordering to a combined query, which an id projection cannot sort by.
             query.clear_ordering(force=True)
-            sql, params = query.as_sql(compiler, connection)
+            nested = [0]
+            token = _enclosing_id_set.set(nested)
+            try:
+                sql, params = query.as_sql(compiler, connection)
+            finally:
+                _enclosing_id_set.reset(token)
+            run = nested[0] + 1
+            if connection.vendor == "sqlite" and run >= _INLINE_RUN:
+                sql, params = self._statement_local(sql, params, compiler, connection)
+                run = 1
             cached = self._sql[connection.alias] = sql, tuple(params)
+            self._run = run
+        enclosing = _enclosing_id_set.get()
+        if enclosing is not None:
+            enclosing[0] = max(enclosing[0], self._run)
         return cached
+
+    def _statement_local(
+        self, sql: str, params: Sequence[Any], compiler: Any, connection: Any
+    ) -> tuple[str, tuple[Any, ...]]:
+        """The id set as a statement-local CTE, selected from its own WITH.
+
+        SQLite adds up the expression depth of every subquery nested in a
+        WHERE clause while it resolves names (``SQLITE_MAX_EXPR_DEPTH``, 1000),
+        so a policy whose arrows and subject sets nest id sets within id sets
+        exceeds it, though each level is shallow. The body of a CTE is not
+        part of the depth of the expression that selects from it: a nested id
+        set then adds only its own WHERE clause to the depth, not its subtree.
+        Runs of up to two nested id sets stay inline, which bounds both the
+        depth of each run and the text the CTEs add.
+        """
+        body = self.rows.query.clone()
+        body.clear_ordering(force=True)
+        rows: QuerySet[Any] = QuerySet(model=self.rows.model, query=body, using=connection.alias)
+        digest = hashlib.sha1(sql.encode(), usedforsecurity=False).hexdigest()[:8]
+        cte = CTE(rows, name=f"rebac_ids_{digest}")
+        # Never the model's default manager: a CTE over an id set is unscoped.
+        selected = cte.queryset()
+        local = with_cte(
+            cte, select=QuerySet(model=selected.model, query=selected.query, using=connection.alias)
+        ).query
+        local.subquery = True
+        local.clear_ordering(force=True)
+        wrapped, params = local.as_sql(compiler, connection)
+        return wrapped, tuple(params)
 
 
 def _one_object(ref: Any) -> bool:
