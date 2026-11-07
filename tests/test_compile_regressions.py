@@ -114,11 +114,8 @@ def test_structural_folder_recursion_uses_sound_lower_and_upper_bounds(hops):
     scope = At("blog/folder", F("pk"), Folder._meta.pk, True)
 
     def point_holds(compiler, action, bound):
-        return (
-            SchemaGeneration.objects.filter(pk=1)
-            .filter(compiler.holds(("blog/folder", action), point, bound))
-            .exists()
-        )
+        condition = compiler.holds(("blog/folder", action), point, bound)
+        return compiler.statement(SchemaGeneration.objects.filter(pk=1).filter(condition)).exists()
 
     limited = Compiler(local.schema(), actor, "default", depth_limit=1 if hops == 2 else 8)
     assert not point_holds(limited, "read", Bound.LOWER)
@@ -126,20 +123,14 @@ def test_structural_folder_recursion_uses_sound_lower_and_upper_bounds(hops):
     # The unresolved inherited grant cannot become a definite allow under exclusion.
     assert not point_holds(limited, "outside", Bound.LOWER)
     assert point_holds(limited, "outside", Bound.UPPER)
-    assert (
-        SchemaGeneration.objects.filter(pk=1)
-        .filter(limited.depth_unknown(("blog/folder", "outside"), point))
-        .exists()
-    )
+    unknown = limited.depth_unknown(("blog/folder", "outside"), point)
+    assert limited.statement(SchemaGeneration.objects.filter(pk=1).filter(unknown)).exists()
 
     complete = Compiler(local.schema(), actor, "default", depth_limit=4 if hops == 2 else 16)
     assert point_holds(complete, "read", Bound.LOWER)
     assert not point_holds(complete, "outside", Bound.UPPER)
-    assert (
-        Folder._base_manager.filter(pk=folders[-1].pk)
-        .filter(complete.holds(("blog/folder", "read"), scope, Bound.LOWER))
-        .exists()
-    )
+    held = complete.holds(("blog/folder", "read"), scope, Bound.LOWER)
+    assert complete.statement(Folder._base_manager.filter(pk=folders[-1].pk).filter(held)).exists()
 
 
 @pytest.mark.xfail(

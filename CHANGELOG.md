@@ -3,6 +3,37 @@
 All notable changes to `django-zed-rebac` are tracked here. The project is in
 pre-1.0; breaking changes within a minor version are explicitly called out.
 
+## [0.31.2] — 2026-11-06
+
+### Fixed
+
+- Permission statements no longer repeat their id sets. Each distinct id set a
+  statement reaches (an arrow's targets, a subject set's members) is one CTE of
+  the statement, built with django-cte, and selected by name wherever it
+  occurs; the compiler also builds a node once whatever arm reaches it, unless
+  a recursion or alias cycle in its reach makes the path matter. A statement
+  carries a `WITH` clause only when it nests an id set. This replaces 0.31.1's
+  SQLite-only CTE for every third nested id set.
+- On an application console policy (about 150 types, a thousand arrows) the
+  largest statement shrinks from 2.7 MB to 255 KB, and a console read's SQL
+  from 4,411 to 1,139 KB (inbox), 13,115 to 3,395 KB (transcript), 5,562 to
+  804 KB (person) and 2,797 to 249 KB (projects). Each occurrence of an id set
+  is Django's own selection from its CTE, about 4.5% more statement text than a
+  hand-written `SELECT *` would be; no statement text is written by hand.
+- Known limit: one statement still serves every actor of a shape, so an
+  actor whose constant facts would prune the policy (an administrator's
+  `admin->member`) reads the full statement: such reads stay larger than on
+  0.30, which decided those facts per actor before compiling.
+- `RebacManager.get_queryset()` is runtime-only again, as in 0.30, so type
+  checkers see Django's own getter. With a Django plugin that types that getter
+  from the `from_queryset` queryset class, a `from_queryset` manager keeps its
+  own queryset type. Under upstream django-stubs 6.1 the getter is
+  `QuerySet[M, M]`, as in 0.30, where 0.31.0 and 0.31.1 declared
+  `RebacQuerySet[M]`: code that chains REBAC queryset methods on
+  `manager.get_queryset()` calls them on the manager or narrows the type. The
+  related-manager actor pin lives in a typed helper, so its body is type
+  checked.
+
 ## [0.31.1] — 2026-11-06
 
 ### Fixed

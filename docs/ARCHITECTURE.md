@@ -1838,14 +1838,12 @@ bounds select the same objects.
 No raw SQL, trigger, database function or hand-written statement is used,
 with two deliberate exceptions, in both of which the SQL is Django's own:
 
-1. **Compiled id sets and kept statements.** An uncorrelated id set is
-   compiled by Django once, through the queryset's own `Query.as_sql()`, and
-   embedded as text by a custom expression. Django resolves an embedded
-   queryset again inside every enclosing `filter()`, which makes the cost of
-   building a nested statement grow with its depth times its size; an
-   uncorrelated set refers to no outer query, so its own compiler produces
-   the same SQL the nested resolution would. A whole statement is kept the
-   same way (see [Kept statements and the policy fence](#kept-statements-and-the-policy-fence)).
+1. **Kept statements.** A whole permission statement is compiled by Django
+   once, through its own `Query.as_sql()`, kept as that text with
+   placeholders, and embedded in the selecting query by a custom expression
+   (see [Kept statements and the policy fence](#kept-statements-and-the-policy-fence)).
+   Its id sets are CTEs built with django-cte (see
+   [Inline permission scopes](#inline-permission-scopes)).
 2. **The identity conversion's guard.** `codec.to_wire()` and
    `codec.to_column()` wrap an expression in a validity check that reads it
    about ten times and depends only on the identity field, the direction and
@@ -1865,6 +1863,20 @@ recursive paths are bounded by `REBAC_DEPTH_LIMIT`. No arrow target,
 hierarchy row, fixed object or actor membership is selected into Python
 while building or rendering a scope. The statement reads tuples and backing
 rows in its own database snapshot.
+
+A policy reaches the same id set (an arrow's targets, a subject set's members)
+from many arms: a permission named by several others, a type reached through
+several arrows. The compiler builds each node once per statement, whatever
+arm reaches it, unless a recursion or alias cycle in its reach makes the path
+matter. Each distinct uncorrelated id set (its SQL and parameters) is one CTE
+of the statement, built with django-cte, and every occurrence selects from its
+name; the statement's root attaches them, so a statement has a `WITH` only
+when it nests an id set. Django resolves a selection from a name, not the id
+set, inside every enclosing `filter()`, so building a statement does not
+re-resolve its id sets at every level. A statement therefore grows with the
+number of distinct id sets in reach, not with the number of paths to them, and
+is the same for every actor of one shape. An id set that reads a CTE of the
+query it sits in (a recursive closure's own rows) stays in place.
 
 A queryset scope pins its policy and caveat verdicts when the queryset owner
 builds the scope. Rendering the predicate performs no database read, the
@@ -2212,16 +2224,26 @@ of its own.
   and otherwise expand into nested SQL to `REBAC_DEPTH_LIMIT`. Statement size
   and database planning work grow with the schema and bound.
 - A queryset scope contains the permissions for its arrow targets and
-  subject sets inline. A statement can therefore grow substantially for
-  a policy with many paths or deep recursion. There is no scale claim.
+  subject sets inline, each distinct id set once. A statement grows with the
+  number of distinct id sets in its reach, not with the number of paths to
+  them, and with the recursion bound. One statement serves every actor of a
+  shape: an actor whose constant facts would prune the policy (an
+  administrator's `admin->member`) still reads the whole statement. There is
+  no scale claim.
+- PostgreSQL 12 and later, and SQLite 3.35 and later, materialize a CTE that a
+  statement references more than once: an id set shared by several arms is
+  computed in full once per statement, and the planner does not push the
+  selecting predicate into it.
 - SQLite adds up the expression depth of every subquery nested in a WHERE
   clause while it resolves a statement, and refuses one deeper than
   `SQLITE_LIMIT_EXPR_DEPTH` (1000 by default). Nested id sets would make that
-  sum grow with the square of an arrow chain's length. On SQLite the
-  outermost of every run of three nested compiled id sets is therefore a
-  statement-local CTE, whose body does not count toward the depth of the
-  expression that selects from it: the depth then grows with the chain's
-  length, about 25 levels a type for a type with seven arms.
+  sum grow with the square of an arrow chain's length. Each id set is a CTE
+  of the statement (see [Inline permission scopes](#inline-permission-scopes)),
+  whose body does not count toward the depth of the expression that selects
+  from it: the depth grows with the chain's length,
+  about fifteen levels a type for a type with seven arms. SQLite still expands
+  every reference to a CTE while it resolves the statement, so its work grows
+  with the number of paths through shared id sets even where the text does not.
   A recursive form that falls back to nested SQL still grows with
   `REBAC_DEPTH_LIMIT`; choose that limit for the policy and the vendor.
 
@@ -2287,6 +2309,8 @@ ActorLike = Union[SubjectRef, User, Group, "AnyRebacSubject"]
 #                                              auth/apikey, custom)
 
 class RebacManager:
+    # Runtime only: type checkers see Django's own getter, typed by the Django
+    # plugin in use (QuerySet[M, M] under upstream django-stubs).
     def get_queryset(self) -> RebacQuerySet: ...
 
     # Primary, generic actor scoping. Accepts any ActorLike.
@@ -3467,7 +3491,7 @@ no scale suite at the moment. Drivers, environment and release gates are in
 | Policy checks | `tests/test_policy_checks.py` | System checks for settings, schemas and models, and what the library refuses as a policy. |
 | Transactions and concurrency | `tests/test_write_effects.py`, `tests/test_compile_read.py` | Deterministic PostgreSQL tests: concurrent revoke and link insertion, concurrent tuple writes. Outer and savepoint rollback. A policy revision that changes while a lazy scope is compiled cannot replace the policy the scope was built for. |
 | Structural | `tests/test_scope_depth.py` and others | The scope statement of a recursive permission has the same size and parse depth whatever the depth of the data. Fresh SQLite/PostgreSQL migrations install no REBAC trigger or function, and end with no table that holds a row per application row. No library raw SQL, triggers or database functions exist outside migration `0005`'s legacy uninstall routine; the two documented exceptions embed SQL that Django compiled. |
-| Vendors | `schema_vendors` | SQLite and PostgreSQL CI; an opt-in MySQL 8.4 suite must pass before release, including the schema write owners, the upgrade path and identity codec bounds for unsigned integers. |
+| Vendors | `schema_vendors` | SQLite and PostgreSQL CI; an opt-in MySQL 8.4 suite must pass before release, including the schema write owners, the upgrade path, identity codec bounds for unsigned integers and the additive scope graph (arrows, subject sets, unions, exclusions and closures) on both vendors. |
 | Security pins | `tests/test_security_*.py` | The gates' rules, unchanged. The strict expected failures for proposals 0011 and 0013 stay pinned. |
 
 Data cycles that exceed the frozen walker's dispatch limit use the pure
