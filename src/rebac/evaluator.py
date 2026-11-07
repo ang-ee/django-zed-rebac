@@ -100,6 +100,7 @@ class PermissionEvaluator:
     """
 
     __slots__ = (
+        "__weakref__",
         "_check_cache",
         "_constant_witnesses",
         "_max_size",

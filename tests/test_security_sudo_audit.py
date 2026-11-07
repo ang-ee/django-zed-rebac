@@ -7,7 +7,7 @@ from django.db import connection, transaction
 from django.db.models import Exists, OuterRef, Subquery
 from django.test.utils import CaptureQueriesContext
 
-from rebac import SubjectRef, actor_context, backend, sudo
+from rebac import SubjectRef, actor_context, backend, evaluator_scope, sudo
 from rebac.backends import reset_backend
 from rebac.models import PermissionAuditEvent
 from rebac.schema import parse_zed
@@ -87,6 +87,82 @@ def test_the_querysets_derived_from_one_bypass_entry_audit_once(post, verb):
     # Another entry, with the same reason, is another bypass.
     assert list(getattr(Post.objects, verb)(reason=reason)) == [post]
     assert _bypass_rows(reason).count() == 2
+
+
+class _View:
+    # A generic view's class-level queryset, cloned by get_queryset() per request.
+    queryset = Post.objects.none()
+
+
+def _requests(actors, *, statements=2):
+    for actor in actors:
+        with evaluator_scope(), actor_context(actor):
+            for _ in range(statements):
+                assert _View.queryset.all().count() == 1
+
+
+def _actors(reason):
+    return list(_bypass_rows(reason).order_by("pk").values_list("actor_subject_id", flat=True))
+
+
+def test_a_long_lived_bypass_queryset_is_audited_in_each_request(post):
+    _View.queryset = Post.objects.system_context(reason="audit.class-level")
+    _requests([SubjectRef.of("auth/user", str(n)) for n in (0, 1, 0)])
+    # One row per request, with its actor, however many statements it ran.
+    assert _actors("audit.class-level") == ["0", "1", "0"]
+
+
+@pytest.mark.django_db(transaction=True)
+def test_a_long_lived_bypass_queryset_is_audited_in_each_committed_request(post):
+    _View.queryset = Post.objects.system_context(reason="audit.class-level.committed")
+    _requests([SubjectRef.of("auth/user", str(n)) for n in (0, 0, 1)])
+    assert _actors("audit.class-level.committed") == ["0", "0", "1"]
+
+
+def _rolled_back_then_committed(post, reason):
+    entry = Post.objects.system_context(reason=reason)
+    with pytest.raises(_Rollback), transaction.atomic():
+        assert entry.filter(pk=post.pk).update(body="first") == 1
+        assert entry.filter(pk=post.pk).update(body="again") == 1
+        raise _Rollback
+    with transaction.atomic():
+        assert entry.filter(pk=post.pk).update(body="second") == 1
+        assert entry.filter(pk=post.pk).update(body="third") == 1
+    post.refresh_from_db()
+    assert post.body == "third"
+    # The rolled-back row is gone; the committed write has its own.
+    assert _bypass_rows(reason).count() == 1
+
+
+def test_a_bypass_whose_first_row_rolled_back_with_a_savepoint_is_audited_again(post):
+    _rolled_back_then_committed(post, "audit.savepoint-rollback")
+
+
+@pytest.mark.django_db(transaction=True)
+def test_a_bypass_whose_first_row_rolled_back_is_audited_again(post):
+    _rolled_back_then_committed(post, "audit.rollback")
+
+
+@pytest.mark.django_db(transaction=True)
+def test_a_bypass_is_audited_once_per_actor_and_evaluator_scope(post):
+    reason = "audit.units"
+    entry = Post.objects.system_context(reason=reason)
+    for _request in range(2):
+        with evaluator_scope():
+            assert entry.count() == entry.filter(pk=post.pk).count() == 1
+            with transaction.atomic():
+                assert entry.exists()
+    assert _bypass_rows(reason).count() == 2
+    # Outside an evaluator scope, once per actor.
+    with transaction.atomic():
+        assert entry.count() == entry.filter(pk=post.pk).count() == 1
+    assert entry.exists()
+    assert _bypass_rows(reason).count() == 3
+    with actor_context(SubjectRef.of("auth/user", "other")):
+        assert entry.exists()
+        assert entry.count() == 1
+    assert _actors(reason)[-1] == "other"
+    assert _bypass_rows(reason).count() == 4
 
 
 def test_two_captures_of_one_queryset_under_sudo_blocks_are_two_bypasses(post):

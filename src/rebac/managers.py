@@ -14,14 +14,15 @@ loaded instance (it is not visible inside `from_db()`).
 from __future__ import annotations
 
 import re
+import weakref
 from collections import Counter
-from collections.abc import AsyncIterator, Collection, Iterable, Iterator
+from collections.abc import AsyncIterator, Callable, Collection, Iterable, Iterator
 from contextvars import ContextVar
 from enum import Enum, auto
 from typing import TYPE_CHECKING, Any, Self, TypeVar, cast, overload
 
 from asgiref.sync import sync_to_async
-from django.db import connections, models
+from django.db import connections, models, router, transaction
 from django.db.models.expressions import Col, RawSQL
 from django.db.models.sql import Query
 from django.db.models.sql.subqueries import UpdateQuery
@@ -39,6 +40,7 @@ from .actors import (
 from .actors import current_actor as _current_actor
 from .actors import is_sudo as _is_sudo_ambient
 from .errors import MissingActorError, PermissionDenied
+from .evaluator import PermissionEvaluator, current_evaluator
 from .field_visibility import (
     apply_field_visibility,
     backend_schema,
@@ -75,15 +77,73 @@ _executing_bypass_audits: ContextVar[dict[tuple[object, str], None] | _CompileOn
 class _BypassEntry:
     """One ``sudo()`` or ``system_context()`` call, shared by the querysets derived from it.
 
-    The first top-level execution of any of them audits it
-    (``RebacQuerySet._audit_bypass_once``). An embedded use is audited with
-    each statement that executes it, keyed by this entry and its reason.
+    A top-level execution of any of them audits it (``audit``) once per actor
+    and evaluator scope (the request; outside one, once per actor), counting a
+    row written inside a transaction only if it commits. An embedded use is
+    audited with each statement that executes it, keyed by this entry and its
+    reason.
     """
 
-    __slots__ = ("audited",)
+    __slots__ = ("_mark",)
 
     def __init__(self) -> None:
-        self.audited = False
+        # The last row written: its actor, its evaluator scope, and while its
+        # transaction is open, the connection and the commit hook that confirm it.
+        self._mark: (
+            tuple[
+                SubjectRef | None,
+                weakref.ref[PermissionEvaluator] | None,
+                Any,
+                Callable[[], None] | None,
+            ]
+            | None
+        ) = None
+
+    def audit(self, reason: str) -> None:
+        """Write the bypass row unless this actor already has one in this evaluator scope.
+
+        A row written inside a transaction counts once the transaction commits,
+        and meanwhile while its commit hook is registered on this thread's
+        connection: a rollback, of a savepoint too, removes the hook with the
+        row, so the next use writes it again.
+        """
+        from .models import PermissionAuditEvent
+
+        actor = _current_actor()
+        evaluator = current_evaluator()
+        connection = transaction.get_connection(router.db_for_write(PermissionAuditEvent))
+        mark = self._mark
+        if mark is not None and mark[0] == actor:
+            _actor, written_in, pending, hook = mark
+            # A closed scope's reference is dead: it is no longer this one.
+            same = (
+                evaluator is None if written_in is None else written_in() is evaluator is not None
+            )
+            if hook is not None:
+                # Django's own list of the hooks still to run at commit.
+                if (
+                    same
+                    and pending is connection
+                    and any(run is hook for _ids, run, _robust in connection.run_on_commit)
+                ):
+                    return
+            elif same:
+                return
+        _emit_bypass(reason)
+        scope = weakref.ref(evaluator) if evaluator is not None else None
+        if connection.in_atomic_block:
+
+            def confirm() -> None:
+                if self._mark is not None and self._mark[3] is confirm:
+                    self._mark = (actor, scope, None, None)
+
+            connection.on_commit(confirm)
+            self._mark = (actor, scope, connection, confirm)
+        else:
+            # Committed in autocommit; under manual transaction management, or in
+            # an event loop (the row was written from a worker thread), unknown.
+            # The attribute is read without opening a connection.
+            self._mark = (actor, scope, None, None) if connection.autocommit else None
 
 
 def _emit_bypass(reason: str) -> None:
@@ -1059,13 +1119,11 @@ class RebacQuerySet(models.QuerySet[_M]):
     def _audit_bypass_once(self) -> None:
         from .audit import save_check
 
-        if self._rebac_bypass_entry.audited or save_check.get() is not None:
+        if save_check.get() is not None:
             return
         reason = self._bypass_audit_reason()
-        if reason is None:
-            return
-        _emit_bypass(reason)
-        self._rebac_bypass_entry.audited = True
+        if reason is not None:
+            self._rebac_bypass_entry.audit(reason)
 
     def actor(self) -> SubjectRef | None:
         return self._rebac_actor

@@ -29,12 +29,16 @@ pre-1.0; breaking changes within a minor version are explicitly called out.
 
 ### Fixed
 
-- A queryset `sudo()` or `system_context()` call is audited once, at the first
+- A queryset `sudo()` or `system_context()` call is audited once per actor
+  and evaluator scope (the request; outside one, once per actor), at the first
   top-level evaluation or write of any queryset derived from it. Each derived
   queryset (`filter()`, `get()`, `count()`, `update()` …) wrote its own row
   when it was derived before the first one executed, so a job that read and
   wrote through one `system_context(reason=…)` queryset wrote a row per
-  statement. Embedded bypasses are still audited with each statement that
+  statement. A class-level queryset cloned per request is still audited in
+  each request, with its actor, and a row written in a transaction that rolls
+  back, or in a rolled-back savepoint, does not count: the next use writes it
+  again. Embedded bypasses are still audited with each statement that
   executes them. A queryset that `scoped()` pins inside a `sudo()` block is a
   bypass of its own.
 - The evaluator remembered whether an actor holds a permission's constant

@@ -1108,9 +1108,9 @@ class PermissionAuditEvent(models.Model):
 
 Written by every Tier 2 / Tier 3 mutation and every effective public bypass.
 Queryset bypasses are audited at the first evaluation or write of any
-queryset derived from the `sudo()` or `system_context()` call, instance
-bypasses at the first check or write, and block bypasses at entry, once per
-bypass.
+queryset derived from the `sudo()` or `system_context()` call, once per actor
+and evaluator scope; instance bypasses at the first check or write, and block
+bypasses at entry, once per bypass.
 A bypass queryset embedded in an expression (`Exists`, `Subquery`, a
 `pk__in=` lookup) is audited once per entry and reason when its enclosing
 statement executes. Building the expression runs no query and writes no row,
@@ -2490,10 +2490,15 @@ context before materializing or mutating it.
 emits one `KIND_SUDO_BYPASS` row at each entry. An explicit queryset bypass
 is an entry: the querysets derived from one `sudo()` or `system_context()`
 call (by `filter()`, `values()`, `get()`, `count()`, `update()`, `delete()`
-and every other clone) share it, and it emits one row when the first of them
-takes effect (eager scope application, direct evaluation or write). A queryset
-that `scoped()` pins inside a `sudo()` block is an entry of its own, audited
-when it first takes effect outside the block. When a bypass queryset is embedded in another
+and every other clone) share it. It emits one row when the first of them takes
+effect (eager scope application, direct evaluation or write) for each actor
+and evaluator scope, the request: a class-level queryset that views clone per
+request is audited in each request, with that request's actor. Outside an
+evaluator scope, once per actor. A row written inside a transaction counts
+only if that transaction commits: after a rollback, of a savepoint too, the
+next use writes it again. A queryset that `scoped()` pins inside a `sudo()`
+block is an entry of its own, audited when it first takes effect outside the
+block. When a bypass queryset is embedded in another
 statement, each execution audits every distinct `(entry, reason)` pair it
 renders, even if that pair appears in several filters, annotations or `Exists`
 expressions. A count followed by a list read audits the embedded entry twice.
