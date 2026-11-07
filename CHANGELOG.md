@@ -5,6 +5,30 @@ pre-1.0; breaking changes within a minor version are explicitly called out.
 
 ## [0.30.2] — 2026-11-07
 
+0.30.2 contains f43f0773, the commit the framework pinned, so it supersedes
+that git pin. 0.30.1 already carried two of its fixes (backend imports
+independent of auth model population; `RebacManager` verbs delegated to the
+native queryset methods); the Added and Changed entries come from the other
+three.
+
+### Added
+
+- `rebac.database_context(using)` supplies a context-local default database
+  for REBAC's own operations: schema, tuple, membership and audit reads and
+  writes. Explicit queryset, instance and operation aliases take precedence;
+  Django's routing of ordinary ORM calls is unchanged (8b8b6b0, 610548c).
+
+### Changed
+
+- A queryset's guards, field gates, audits and bulk gates run on the
+  queryset's own alias.
+- `rebac sync --database X` runs the whole sync on X, `--prune-stale`
+  included. 0.30.1 refused to retire tuples when the router stored
+  relationships on another alias; 0.30.2 deletes them on X, or leaves them in
+  place when X does not migrate the relationship model. Without `--database`
+  the refusal stands.
+- The PostgreSQL delta runs the alias acceptance tests (4bbffd4).
+
 ### Fixed
 
 - A union that names a union compiles as one union. At a row, a union is
@@ -28,20 +52,11 @@ pre-1.0; breaking changes within a minor version are explicitly called out.
   reported as `(declaration changed; --force-overwrite to apply)`, and only a
   row that differs from it as `admin-edited`. Sync still applies neither
   without `--force-overwrite`: a managed row is `no_update`.
-
-### Carried from the framework's pin
-
-0.30.2 contains f43f0773, the commit the framework pinned, so it supersedes
-that git pin. Besides the two fixes 0.30.1 already carried from it (backend
-imports independent of auth model population; `RebacManager` verbs delegated
-to the native queryset methods):
-
-- `rebac.database_context(using)` supplies a context-local default database
-  for REBAC's own operations, and a queryset's guards, field gates, audits
-  and bulk gates run under its own alias. Explicit queryset, instance and
-  operation aliases still take precedence; Django's routing of ordinary ORM
-  calls is unchanged (8b8b6b0, 610548c).
-- The PostgreSQL delta runs the alias acceptance tests (4bbffd4).
+- Known limit: on an application console policy the deepest SQLite read
+  (`storage/file#read`) compiles at expression depth 960 of SQLite's 1000.
+- Known limit: a row union has no guard for SQLite's limit of 500 terms in
+  one compound SELECT; a union of more than 500 arms at one row fails on
+  SQLite.
 
 ## [0.30.1] — 2026-11-06
 

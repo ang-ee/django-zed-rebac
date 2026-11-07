@@ -88,7 +88,7 @@ else has to be built, and fixture loads or bulk writes need no command
 afterwards. Write aliases for the models a permission reads and for
 relationships must match; separate read replicas are allowed. After a database
 flush, run `rebac sync` again before serving. See the
-[upgrade notes](./CHANGELOG.md#unreleased).
+[upgrade notes](./CHANGELOG.md#0302--2026-11-07).
 
 ```python
 # blog/views.py
@@ -156,7 +156,7 @@ hooks, so each feature release is verified before the bound moves.
 
 Versioning follows SemVer while the project is below 1.0: minor releases may add public API and tighten alpha contracts; patch releases are reserved for compatible fixes.
 
-Database support: PostgreSQL 15+ (production target), MySQL 8.4+ (opt-in vendor suite), SQLite (test/dev only). CI runs SQLite and PostgreSQL; the MySQL suite is a release gate. The `Relationship` indexes ship in `0001_initial.py`. After upgrading, run `migrate`; no other command is needed. Behaviour on PostgreSQL tables of tens of millions of rows has not been verified yet. See [upgrade notes](./CHANGELOG.md#unreleased) for the removed commands, checks and settings and for the recursion bound.
+Database support: PostgreSQL 15+ (production target), MySQL 8.4+ (opt-in vendor suite), SQLite (test/dev only). CI runs SQLite and PostgreSQL; the MySQL suite is a release gate. The `Relationship` indexes ship in `0001_initial.py`. After upgrading, run `migrate`; no other command is needed. Behaviour on PostgreSQL tables of tens of millions of rows has not been verified yet. See [upgrade notes](./CHANGELOG.md#0302--2026-11-07) for the removed commands, checks and settings and for the recursion bound.
 
 ## Comparison
 
