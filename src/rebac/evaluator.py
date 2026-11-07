@@ -18,9 +18,9 @@ The check cache is an LRU bounded by ``REBAC_EVALUATOR_CACHE_SIZE``
 (default 10_000). Conditional results are never cached — the missing
 caveat params are part of the answer and the next call may supply them.
 
-The scope also remembers whether an actor holds a permission's constant arms
-(``rebac.compile.read._constant_arms_held``), which only chooses the statement
-a read runs.
+The scope also remembers, under the same decision-cache rules, whether an
+actor holds a permission's constant arms (``rebac.compile.read._constant_witness``),
+which only chooses the statement a read runs.
 
 Async-safe via ``ContextVar`` — each ``asyncio.create_task`` and each
 Strawberry resolver coroutine inherits the parent's evaluator slot.
@@ -256,8 +256,10 @@ class PermissionEvaluator:
     ) -> bool:
         """The remembered answer of a constant-arm witness, deciding it when absent.
 
-        ``recheck`` decides a remembered ``True`` again. An unhashable key is
-        decided and not remembered.
+        The caller keys it on ``_backend_cache_key`` of the types the witness
+        reads, so it is asked only where the decision cache may keep a
+        decision. ``recheck`` decides a remembered ``True`` again. An
+        unhashable key is decided and not remembered.
         """
         try:
             found = self._constant_witnesses.get(key)
@@ -276,6 +278,7 @@ class PermissionEvaluator:
     def stats(self) -> dict[str, int]:
         return {
             "check_entries": len(self._check_cache),
+            "constant_witness_entries": len(self._constant_witnesses),
             "visibility_entries": len(self._visibility_decisions),
             "visibility_ids": self._visibility_decision_ids,
             "max_size": self._max_size,

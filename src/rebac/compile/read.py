@@ -30,6 +30,7 @@ from rebac.codec import identity_codec
 from rebac.composition import TaggedComposition, compose_tagged, split_stale_overrides
 from rebac.conf import app_settings
 from rebac.errors import PermissionDepthExceeded, SchemaError
+from rebac.evaluator import _backend_cache_key, _ctx_key, current_evaluator
 from rebac.field_backing import resolve_attribute_backing, resolve_field_backing
 from rebac.models import active_relationship_model
 from rebac.models.generation import SchemaGeneration
@@ -85,11 +86,16 @@ _lock = RLock()
 
 @dataclass(frozen=True, slots=True)
 class _Kept:
-    """One compiled statement.  ``every`` marks a gate that admits every row."""
+    """One compiled statement.  ``every`` marks a gate that admits every row.
+
+    ``reads`` are the resource types whose facts a decision of the statement
+    depends on, for the decision cache (``_constant_witness``).
+    """
 
     sql: str
     params: tuple[Any, ...]
     every: bool = False
+    reads: tuple[str, ...] = ()
 
 
 _policies: OrderedDict[tuple[Any, ...], _Policy] = OrderedDict()
@@ -98,8 +104,6 @@ _statements: OrderedDict[tuple[Any, ...], _Kept | bool] = OrderedDict()
 
 def reset() -> None:
     """Forget every kept policy and statement (settings or registries changed)."""
-    from rebac.evaluator import current_evaluator
-
     with _lock:
         _policies.clear()
         _statements.clear()
@@ -337,7 +341,13 @@ class _Operation:
         self,
         key: tuple[Any, ...],
         verdicts: CaveatVerdicts,
-        build: Callable[[], models.QuerySet[Any] | bool | tuple[models.QuerySet[Any], bool]],
+        build: Callable[
+            [],
+            models.QuerySet[Any]
+            | bool
+            | tuple[models.QuerySet[Any], bool]
+            | tuple[models.QuerySet[Any], bool, tuple[str, ...]],
+        ],
         *,
         cache: bool = True,
     ) -> _Kept | bool:
@@ -361,7 +371,7 @@ class _Operation:
         if isinstance(built, bool):
             compiled = built
         else:
-            rows, every = built if isinstance(built, tuple) else (built, False)
+            rows, every, *reads = built if isinstance(built, tuple) else (built, False)
             query = rows.query.clone()
             # Parenthesised, to embed; a set of ids has no order.
             query.subquery = True
@@ -374,7 +384,7 @@ class _Operation:
                 # condition Django proves empty.
                 compiled = False
             else:
-                compiled = _Kept(sql, tuple(params), every)
+                compiled = _Kept(sql, tuple(params), every, *reads)
         if keep:
             with _lock:
                 _statements[full] = compiled
@@ -411,37 +421,40 @@ def _constant_statement(operation: _Operation, key: Key) -> _Kept | bool:
 
     ``False`` when ``key`` has none to witness (``Compiler.constant_arms``).
     When it holds, the actor holds ``key`` on every object of its type, so it
-    is kept as a gate that admits every row.
+    is kept as a gate that admits every row; its ``reads`` are the types the
+    constant arms name.
     """
     verdicts = operation.verdicts(key)
 
-    def build() -> bool | tuple[models.QuerySet[Any], bool]:
+    def build() -> bool | tuple[models.QuerySet[Any], bool, tuple[str, ...]]:
         compiler = operation.compiler(verdicts)
         condition = compiler.constant(key)
         if is_false(condition) or is_true(condition):
             # Nothing to witness: a constant arm that holds outright makes the
             # policy's own statement the fence alone.
             return False
-        return compiler.statement(operation.gate().filter(condition).values("pk")), True
+        rows = compiler.statement(operation.gate().filter(condition).values("pk"))
+        return rows, True, compiler.constant_types(key)
 
     return operation.statement(("constant", key), verdicts, build)
 
 
-def _constant_arms_held(operation: _Operation, key: Key, *, recheck: bool = False) -> bool | None:
-    """Whether the actor holds one of ``key``'s constant arms, decided once per evaluator scope.
+def _constant_witness(
+    operation: _Operation, key: Key, *, recheck: bool = False, fresh: bool = False
+) -> bool | None:
+    """Whether the actor holds one of ``key``'s constant arms, inside an evaluator scope.
 
-    ``None`` outside an evaluator scope, under a caveat context, or when
-    ``key`` has no constant arm beside its other arms. The answer only chooses
-    the statement a read runs (``_scope_statement``): when it is true, a
-    statement of the constant arms alone, which evaluates them as it runs;
-    otherwise the policy's statement without them. A stale answer can narrow
-    a read within the scope, never widen it. A tuple write through the library
-    decides it again. ``recheck`` decides a remembered ``True`` again, for an
-    answer that authorizes by itself.
+    ``True`` when it does, decided by the witness statement now or, unless
+    ``recheck``, remembered from earlier in the scope; a remembered ``True``
+    only chooses a statement that evaluates the arms again when it runs.
+    ``False`` when it holds none and the evaluator keeps that answer: where
+    the decision cache may keep a decision about every type the arms name
+    (``rebac.evaluator._backend_cache_key``), and ``fresh`` (a per-call
+    consistency requirement) is not set. A scope may then leave the arms
+    out (``_scope_statement``). ``None`` otherwise: outside an evaluator
+    scope, under a caveat context, when ``key`` has no constant arm beside
+    its other arms, or when it holds none but the answer may not be kept.
     """
-    from rebac.backends import local
-    from rebac.evaluator import _BackendKey, current_evaluator
-
     evaluator = current_evaluator()
     if evaluator is None or operation.context is not None:
         return None
@@ -455,14 +468,10 @@ def _constant_arms_held(operation: _Operation, key: Key, *, recheck: bool = Fals
             SchemaGeneration.objects.using(operation.using).filter(pk=1).filter(Q(probe)).exists()
         )
 
-    memo = (
-        _BackendKey(operation.backend),
-        operation.using,
-        compiled.sql,
-        compiled.params,
-        operation.actor,
-        local._relationship_generation,
-    )
+    generations = tuple(_backend_cache_key(operation.backend, type_) for type_ in compiled.reads)
+    if fresh or any(generation is None for generation in generations):
+        return decide() or None
+    memo = (generations, compiled.sql, compiled.params, operation.actor)
     return evaluator._constant_witness(memo, decide, recheck=recheck)
 
 
@@ -474,23 +483,19 @@ def _point_statement(
     key: Key,
     which: str,
     row_types: RowTypes | None = None,
-    *,
-    fold: bool = False,
 ) -> _Kept | bool:
     """One bound of ``key`` at one identity, as SQL; a bool when it needs no rows.
 
     ``row_types`` are the row's GenericForeignKey content types, when read
     (``_row_types``): the statement is compiled and kept for them, with only
-    the arms of those types, and re-reads them. ``fold`` compiles a lower
-    bound without ``key``'s constant arms, which the actor does not hold.
+    the arms of those types, and re-reads them.
     """
     verdicts = operation.verdicts(key)
-    fold = fold and which == "lower"
 
     def build() -> models.QuerySet[Any] | bool:
         at = At(key[0], _Param(_RESOURCE_WIRE, models.TextField()), None, False)
         point = PointRow(at.ref, row_types) if row_types is not None else None
-        compiler = operation.compiler(verdicts, point=point, fold=key if fold else None)
+        compiler = operation.compiler(verdicts, point=point)
         if which == "depth":
             condition = compiler.depth_unknown(key, at)
         else:
@@ -506,7 +511,7 @@ def _point_statement(
             return rows.values("pk")
         return compiler.statement(rows.filter(condition).values("pk"))
 
-    return operation.statement(("point", key, which, row_types, fold), verdicts, build)
+    return operation.statement(("point", key, which, row_types), verdicts, build)
 
 
 # A point row's content types: each content-type column's attname, with its value.
@@ -583,11 +588,9 @@ def _point(
     resource_id: str,
     which: str,
     row_types: RowTypes | None = None,
-    *,
-    fold: bool = False,
 ) -> bool:
     """One bound of ``key`` at one identity, by one statement."""
-    compiled = _point_statement(operation, key, which, row_types, fold=fold)
+    compiled = _point_statement(operation, key, which, row_types)
     if isinstance(compiled, bool):
         return compiled and operation.gate(parametric=False).exists()
     probe = _Sql(compiled.sql, operation.bound(compiled.params, resource_id))
@@ -656,14 +659,15 @@ def _point_result(
     lower_only: bool = False,
     types: Mapping[str, RowTypes] | None = None,
     witness: bool = False,
+    fresh: bool = False,
 ) -> tuple[bool, bool, bool, _Policy]:
     """``types`` are the row types already read for the resource's id
     (``_key_types``); without them, they are read here. ``witness`` decides
-    the permission's constant arms first (``_constant_arms_held``)."""
+    the permission's constant arms first (``_constant_witness``); ``fresh``
+    keeps nothing of that decision."""
     operation = _Operation.begin(backend, actor, using, context)
     key = resource.resource_type, action
-    held = _constant_arms_held(operation, key, recheck=True) if witness else None
-    if held:
+    if witness and _constant_witness(operation, key, recheck=True, fresh=fresh):
         # Decided by its own statement just now: a lower bound.
         return True, True, False, operation.policy
     if types is None:
@@ -671,7 +675,7 @@ def _point_result(
     row_types = types.get(resource.resource_id)
     # Only LOWER may authorize. Subsequent probes can only return NO,
     # CONDITIONAL, or a depth error.
-    if _point(operation, key, resource.resource_id, "lower", row_types, fold=held is False):
+    if _point(operation, key, resource.resource_id, "lower", row_types):
         return True, True, False, operation.policy
     recursive = _recursive(operation, key)
     # The bounds differ only where a caveat or a recursion is in reach.
@@ -692,7 +696,13 @@ def check(
     actor: SubjectRef,
     context: Mapping[str, Any] | None,
     using: str,
+    fresh: bool = False,
 ) -> CheckResult:
+    """The three-state answer of one point check.
+
+    ``fresh`` is set for a call with an explicit consistency requirement: the
+    evaluator keeps nothing of it (``_constant_witness``).
+    """
     schema, _snapshot = _schema(backend)
     definition = schema.get_definition(resource.resource_type)
     if definition is None:
@@ -733,6 +743,7 @@ def check(
         context=context,
         using=using,
         witness=True,
+        fresh=fresh,
     )
     return _answer(
         lower,
@@ -828,8 +839,6 @@ def _check_chunk(
     backend: LocalBackend, policy: _Policy, items: Sequence[CheckItem], using: str
 ) -> list[CheckResult]:
     """The point checks of up to ``_BULK`` items, by three statements at most."""
-    from rebac.evaluator import _ctx_key
-
     operations: dict[tuple[SubjectRef, Hashable], _Operation] = {}
     prepared: dict[tuple[Key, Hashable], CaveatVerdicts] = {}
     asked: list[tuple[_Operation, Key, str]] = []
@@ -917,21 +926,21 @@ def _scope_statement(
     key: Key,
     *,
     candidates: tuple[int, ...] | None = None,
-    constant: bool | None = None,
+    witness: bool | None = None,
 ) -> _Kept | bool:
     """The ids of ``model`` the actor holds ``key`` on, as SQL.
 
     ``False`` when there are none.  ``every`` is set when every row qualifies
     and the SQL is only the policy fence. ``candidates`` bounds the rows the
-    statement visits to those literal identities. ``constant`` is whether the
-    actor holds ``key``'s constant arms (``_constant_arms_held``): if so, the
-    statement is those arms alone; if not, the policy's without them.
+    statement visits to those literal identities. ``witness`` is the answer
+    of ``_constant_witness``: when ``True`` the statement is the constant
+    arms alone; when ``False`` it is the policy's without them.
     """
-    if constant:
+    if witness:
         return _constant_statement(operation, key)
     verdicts = operation.verdicts(key)
     label = model._meta.label_lower
-    fold = key if constant is False else None
+    fold = key if witness is False else None
 
     def build() -> bool | tuple[models.QuerySet[Any], bool]:
         compiler = operation.compiler(verdicts, fold=fold)
@@ -1025,7 +1034,10 @@ def _known_identities(
 
 
 class _Scope(Expression):
-    """A queryset scope with policy, caveat verdicts and constant-arm witness pinned when built."""
+    """A queryset scope with policy, caveat verdicts and constant-arm witness pinned when built.
+
+    ``witness`` is the answer of ``_constant_witness`` when the scope was built.
+    """
 
     def __init__(
         self,
@@ -1036,7 +1048,7 @@ class _Scope(Expression):
         using: str,
         policy: _Policy,
         verdicts: CaveatVerdicts,
-        constant: bool | None = None,
+        witness: bool | None = None,
     ) -> None:
         super().__init__(output_field=models.BooleanField())
         self.backend = backend
@@ -1046,7 +1058,7 @@ class _Scope(Expression):
         self.using = using
         self.policy = policy
         self.verdicts = verdicts
-        self.constant = constant
+        self.witness = witness
         self.lhs: Any = F(resource_id_attr(model))
 
     def get_source_expressions(self) -> list[Any]:
@@ -1066,7 +1078,7 @@ class _Scope(Expression):
         # exactly those rows; every other shape uses the general scope.
         identities = _known_identities(self.model, self.lhs, compiler.query.where, self.using)
         compiled = _scope_statement(
-            operation, self.model, key, candidates=identities, constant=self.constant
+            operation, self.model, key, candidates=identities, witness=self.witness
         )
         if isinstance(compiled, bool):
             # ``True`` cannot occur: a statement that admits rows is a gate.
@@ -1123,7 +1135,7 @@ def scope_expression(
         using,
         operation.policy,
         operation.verdicts(key),
-        _constant_arms_held(operation, key),
+        _constant_witness(operation, key),
     )
     if identity is not None:
         expression.set_source_expressions([identity])
@@ -1200,7 +1212,11 @@ def _named_parts(
 
 @dataclass(frozen=True)
 class _AccessibleResources:
-    """A lazy enumeration request, prepared afresh at each consumption."""
+    """A lazy enumeration request, prepared afresh at each consumption.
+
+    ``fresh`` is set for a call with an explicit consistency requirement
+    (``_constant_witness``).
+    """
 
     backend: LocalBackend
     resource_type: str
@@ -1209,6 +1225,7 @@ class _AccessibleResources:
     using: str
     context: Mapping[str, Any] | None
     revision: str | None
+    fresh: bool = False
 
     @schema_operation
     def _branches(self) -> list[tuple[models.QuerySet[Any], Callable[[Any], str | None]]]:
@@ -1263,7 +1280,7 @@ def _accessible_branches(
                     self.using,
                     policy,
                     verdicts,
-                    _constant_arms_held(operation, key),
+                    _constant_witness(operation, key, fresh=self.fresh),
                 )
             )
         else:
@@ -1320,10 +1337,11 @@ def accessible_ids(
     actor: SubjectRef,
     using: str,
     context: Mapping[str, Any] | None = None,
+    fresh: bool = False,
 ) -> _AccessibleResources:
     _schema_now, snapshot = _schema(backend)
     return _AccessibleResources(
-        backend, resource_type, action, actor, using, context, snapshot.revision
+        backend, resource_type, action, actor, using, context, snapshot.revision, fresh
     )
 
 

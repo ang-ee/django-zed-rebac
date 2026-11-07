@@ -592,6 +592,7 @@ class LocalBackend:
             actor=subject,
             context=context,
             using=active_relationship_model().objects.db,
+            fresh=consistency is not None or at_zookie is not None,
         )
 
     def check_bulk_permissions(
@@ -667,6 +668,7 @@ class LocalBackend:
                 actor=subject,
                 using=active_relationship_model().objects.db,
                 context=context,
+                fresh=consistency is not None or at_zookie is not None,
             )
         )
 

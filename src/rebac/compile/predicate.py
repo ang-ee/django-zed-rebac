@@ -586,6 +586,24 @@ class Compiler:
                 other = True
         return tuple(found) if other else ()
 
+    def constant_types(self, key: Key) -> tuple[str, ...]:
+        """The resource types ``key``'s constant arms name: what their decision reads."""
+        definition = self.schema.get_definition(key[0])
+        if definition is None:
+            return ()
+        relations = {relation.name: relation for relation in definition.relations}
+        return tuple(
+            sorted(
+                {
+                    relations[arm.via if isinstance(arm, PermArrow) else arm.name]
+                    .allowed_subjects[0]
+                    .type
+                    for arm in self.constant_arms(key)
+                    if isinstance(arm, (PermArrow, PermRef))
+                }
+            )
+        )
+
     def constant(self, key: Key) -> Q:
         """Whether one of ``key``'s constant arms holds: a predicate of no object.
 

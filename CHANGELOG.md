@@ -7,14 +7,18 @@ pre-1.0; breaking changes within a minor version are explicitly called out.
 
 ### Changed
 
-- Inside an evaluator scope, an actor who holds a permission's constant arm
-  (`admin->member` over a `rebac:const` relation) reads, and is checked by, a
-  statement of those arms alone, decided by one witness statement per request:
-  on a console-like policy an administrator's read falls from 47,920 to 2,224
-  bytes.
-- Other actors' statements inside an evaluator scope leave those constant arms
-  out, and with them the union branch that listed every row of the model: a
-  read of one parent's children no longer scans the child table.
+- Inside an evaluator scope, a witness statement decides a permission's
+  constant arms (`admin->member` over a `rebac:const` relation): once per
+  request where the decision cache may keep a decision about the types they
+  name and the call states no consistency requirement, otherwise at each read
+  and check. An actor who holds one reads, and is checked by, a statement of
+  those arms alone, which evaluates them when it runs: on a console-like policy
+  an administrator's read falls from 47,920 to 2,224 bytes. Outside an
+  evaluator scope nothing changes.
+- Where the evaluator keeps the answer that an actor holds no constant arm,
+  that actor's scope statements leave the arms out, and with them the union
+  branch that listed every row of the model: a read of one parent's children
+  no longer scans the child table. Point checks keep every arm.
 
 ## [0.31.3] — 2026-11-07
 
