@@ -1,8 +1,9 @@
-"""The dependency graph of a policy, as the permission compiler dispatches it.
+"""The recursive components of a policy, validated for the permission compiler.
 
-The graph is about authorization dispatch, not model rows.  It includes
-subject-set membership and arrow targets, so that a recursive component is
-the set of nodes one statement may have to unroll together.
+The dependency graph is ``rebac.schema.graph.dispatch_graph``: authorization
+dispatch, not model rows, including subject-set membership and arrow targets.
+A recursive component is the set of nodes one statement may have to unroll
+together.
 """
 
 from __future__ import annotations
@@ -15,7 +16,7 @@ from ..errors import SchemaError
 from ..schema.ast import Schema
 from ..schema.graph import Dependency, Key, dispatch_graph, strongly_connected_components
 
-__all__ = ["CompileProgram", "Dependency", "Key", "program_errors"]
+__all__ = ["CompileProgram", "Key", "program_errors"]
 
 
 @dataclass(frozen=True, slots=True)

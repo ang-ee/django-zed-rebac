@@ -126,7 +126,8 @@ class _BypassEntry:
                 if (
                     same
                     and pending is connection
-                    and any(run is hook for _ids, run, _robust in connection.run_on_commit)
+                    # Each entry is (savepoint ids, callable, robust).
+                    and any(entry[1] is hook for entry in connection.run_on_commit)
                 ):
                     return
             elif same:
