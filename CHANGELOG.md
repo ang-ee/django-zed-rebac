@@ -16,6 +16,12 @@ pre-1.0; breaking changes within a minor version are explicitly called out.
   tree is too large`). The union now takes the named node's own arms, built by
   the same memoized node in the same order: answers and the statements a read
   executes are unchanged, and the statement no longer nests per name.
+- The typing contract states `get_queryset()` as the Django plugin types
+  Django's own getter: `QuerySet[M, M]` under upstream django-stubs 6.1. The
+  0.30.1 note that a `RebacManager.from_queryset(...)` manager's
+  `get_queryset()` keeps the custom queryset type holds only with a plugin
+  that types that getter from the `from_queryset` queryset class; the
+  manager's own methods carry the queryset class under either.
 
 ### Carried from the framework's pin
 
