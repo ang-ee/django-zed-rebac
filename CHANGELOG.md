@@ -5,6 +5,28 @@ pre-1.0; breaking changes within a minor version are explicitly called out.
 
 ## [Unreleased]
 
+### Changed
+
+- The decision cache keeps answers about every resource type none of whose
+  decisions reads a model column. `live_backed_resource_types` follows what
+  the compiler evaluates: a subject set's relation, an arrow's relation and
+  its target on each subject type, a constant's target. A relation that
+  admits a subject directly compares its id and reads nothing of the
+  subject's type, so a model-backed relation of the user type no longer makes
+  live every type that admits users, only those whose policy follows an arrow
+  or a subject set to it. A constant with filters, which is tested on the
+  object's row, is a seed of the public helper too; the backend already
+  treated it as one.
+- In an application whose user type carries a model-backed relation, inside
+  an evaluator scope outside a transaction, an actor who holds a constant arm
+  now pays one witness per request instead of one per read, other actors'
+  scopes leave the constant arms out, and check answers and field visibility
+  about the types that never read the relation are kept for the request.
+  Measured on SQLite on a console-like policy with such a relation, four
+  scoped reads and three checks per actor (statements, SQL bytes): an
+  administrator 11, 24,778 before and 8, 17,989 after; a member 9, 357,534
+  before and 9, 354,518 after.
+
 ## [0.31.4] — 2026-11-07
 
 ### Changed

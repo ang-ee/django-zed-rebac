@@ -72,9 +72,27 @@ ARMS = 4
 POST_ARMS = "folder->read + viewer + editor"
 
 
-def _console(post_read: str = f"{POST_ARMS} + admin->member") -> str:
+# The user type of an application often carries a model-backed relation (a
+# person, a profile) that most of its policy never reads. Here an active user
+# holds ``active`` on itself; only the desk's permission reads it.
+LIVE_USER = "\n".join(
+    [
+        "definition auth/user {",
+        '    relation active: auth/user // rebac:attribute={"field":"id","filters":{"is_active":true}}',
+        "}",
+        "definition console/desk {",
+        "    relation owner: auth/user",
+        "    permission view = owner->active",
+        "}",
+    ]
+)
+
+
+def _console(
+    post_read: str = f"{POST_ARMS} + admin->member", user: str = "definition auth/user {}"
+) -> str:
     lines = [
-        "definition auth/user {}",
+        user,
         "definition auth/group {",
         "    relation member: auth/user | auth/group#member",
         "}",
@@ -119,7 +137,17 @@ def console():
     The member reads the first folder through the console chain and one post of
     the second folder directly.
     """
-    local = install_schema(_console())
+    return _install_console(_console())
+
+
+@pytest.fixture
+def live_user_console():
+    """The console, its user type carrying a model-backed relation (``LIVE_USER``)."""
+    return _install_console(_console(user=LIVE_USER))
+
+
+def _install_console(policy: str):
+    local = install_schema(policy)
     with sudo(reason="constant arms fixture"):
         folders = [Folder.objects.create(name=f"folder-{index}") for index in range(2)]
         posts = [
@@ -236,6 +264,56 @@ def test_the_witness_is_kept_for_the_request(console):
         with evaluator_scope():
             _ids, next_request = _read(actor)
         assert len(next_request) == 2
+
+
+@KEPT
+def test_a_model_backed_relation_of_the_user_type_leaves_the_types_that_never_read_it_eligible(
+    live_user_console,
+):
+    local, folders, _posts = live_user_console
+    # Every type admits the user as a subject; only the types whose decisions
+    # read a model column are live: the user's own, the post's (its folder is a
+    # column) and the desk's, whose permission reads the user's relation.
+    for type_ in ("org/role", "auth/group", "blog/folder", "console/t0", f"console/t{CHAIN - 1}"):
+        assert local._cache_generation(type_) is not None, type_
+    for type_ in ("auth/user", "blog/post", "console/desk"):
+        assert local._cache_generation(type_) is None, type_
+    # So the witness of ``org/role`` is kept for the request: one per request
+    # for the administrator, as for the member.
+    for actor in (ADMIN, MEMBER):
+        with evaluator_scope() as evaluator:
+            _ids, first = _read(actor)
+            _ids, again = _read(actor, folder=folders[1])
+            with CaptureQueriesContext(connection) as captured:
+                list(Folder.objects.with_actor(actor).values_list("pk", flat=True))
+            assert evaluator.stats()["constant_witness_entries"] == 1
+        assert (len(first), len(again), len(captured.captured_queries)) == (2, 1, 1)
+    for actor in (ADMIN, MEMBER, OUTSIDER):
+        with evaluator_scope():
+            # The kept witness first, so that the comparison reads the
+            # statements it chooses.
+            _read(actor)
+            assert_scope_matches(Post, actor=actor, action="read")
+            assert_scope_matches(Folder, actor=actor, action="read")
+
+
+@KEPT
+def test_a_type_whose_policy_reads_the_users_model_backed_relation_stays_live(
+    live_user_console,
+):
+    local, _folders, _posts = live_user_console
+    owner = atomic_source_write(get_user_model().objects.create_user, username="owner")
+    actor = SubjectRef.of("auth/user", str(owner.pk))
+    desk = ObjectRef("console/desk", "1")
+    local.write_relationships([RelationshipTuple(desk, "owner", actor)])
+    with evaluator_scope() as evaluator:
+        assert evaluator.check(local, subject=actor, action="view", resource=desk).allowed
+        # A model write: the next check reads the column.
+        owner.is_active = False
+        with sudo(reason="constant arms fixture"):
+            atomic_source_write(owner.save, update_fields=["is_active"])
+        assert not evaluator.check(local, subject=actor, action="view", resource=desk).allowed
+        assert evaluator.stats()["check_entries"] == 0
 
 
 def test_inside_a_transaction_a_held_arm_is_decided_at_each_read(console):

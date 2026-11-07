@@ -1069,8 +1069,8 @@ revision once before reusing it. The answer caches already decline inside
 transactions. Supported policy writes evict the shared snapshot. Backing rows
 are never stored in schema snapshots; statements read them when they run.
 
-Decision-cache policy retains the 0.18.2 exclusions: resource types reachable
-from field or attribute backings are not cacheable. Expiring relationships
+The decision cache keeps no answer about a resource type some decision of
+which reads a model column (`live_backed_resource_types`). Expiring relationships
 bypass caching; override deadlines refresh the schema generation so a cached
 grant cannot outlive its validity.
 Eligible hits cost zero queries. See [PermissionEvaluator](#permissionevaluator--per-request-check-cache).
@@ -2283,7 +2283,8 @@ of its own.
   only inside an evaluator scope: a permission without one (`read =
   parent->read`) gives an administrator the whole statement, whose id sets
   then hold every row of the types its arrows reach. Where the decision cache
-  keeps nothing for the types the arms name, an actor who holds a constant arm
+  keeps nothing for the types the arms name (inside a transaction, or when a
+  decision about them reads a model column), an actor who holds a constant arm
   pays one witness per read, other actors one per request, and their
   statements keep the constant arms' union branch. There is no scale claim.
 - Id sets are driven from the actor's grants, not bounded by the rows the
@@ -2328,14 +2329,18 @@ sub-permissions. The AST node types remain private implementation details so
 the schema language can grow without downstream walkers silently misreading new
 nodes.
 
-`rebac.schema.accessible_is_exact(schema)` and
-`live_backed_resource_types(schema)` remain public with their 0.18.2 schema-only
-behavior. The former reports the absence of builtin-actor and caveat constructs;
-it does not add a recursion restriction or certify that the policy compiles. The latter
-conservatively propagates live-backing dependencies to resource types, including
-through arrows, const targets and subject sets, for decision-cache exclusion.
-Field and attribute backings seed that closure; constants and builtin actors
-do not seed it on their own.
+`rebac.schema.accessible_is_exact(schema)` reports the absence of
+builtin-actor and caveat constructs; it does not add a recursion restriction or
+certify that the policy compiles. `live_backed_resource_types(schema)` names
+the resource types some permission decision of which reads a model column, the
+types the decision cache keeps nothing about. A field- or attribute-backed
+relation, or a constant with filters (tested on the object's row), reads one; a
+relation or permission reads one when anything the compiler evaluates to decide
+it does (`rebac.compile.program`): a subject set's relation, an arrow's relation
+and its target on each subject type, a constant's target. A subject admitted
+directly is compared by its id, so a model-backed relation of the user type
+makes live only the types whose policy follows an arrow or a subject set to it,
+not every type that admits users.
 
 Role convention tooling should use `rebac.roles.roles_reaching(...)`, passing a
 `role_resource_type` such as `"storage/role"` or `"platform/role"` rather than
@@ -2965,10 +2970,13 @@ Cache keys include backend instance identity, including reentrant checks through
 different backends. Context keys preserve scalar types (`True`, `1`, and `1.0` differ).
 Complex context values bypass caching, including nested dictionaries and lists.
 
-LocalBackend retains the 0.18.2 decision-cache rules. It declines caching inside
-a transaction, when the schema declares expiring relationships, or for a
-resource type in the conservative field/attribute backing reachability closure
-returned by `live_backed_resource_types`. Unrelated types remain cacheable.
+LocalBackend declines caching inside a transaction, when the schema declares
+expiring relationships, or for a resource type some decision of which reads a
+model column (`live_backed_resource_types`, see
+[Schema introspection](#schema-introspection)): a type whose policy follows an
+arrow or a subject set to a field-, attribute- or filtered constant-backed
+relation. Other types remain cacheable, including those that admit as a direct
+subject a type with such a relation.
 Override deadlines refresh the composed schema and its decision generation.
 Eligible cache hits cost zero queries, including no revision SELECT per lookup.
 Backend relationship writes and the `post_delete` cascade

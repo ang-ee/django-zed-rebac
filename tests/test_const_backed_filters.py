@@ -75,8 +75,8 @@ def test_constant_codec_render_and_legacy_bytes():
     assert backing_to_dict(old) == {"kind": "const", "target_id": "public"}
     empty = SCHEMA.replace("const=public", 'const={"target_id":"public","filters":{}}')
     assert render_zed(parse_zed(empty)) == rendered
-    # Public introspection retains its 0.18.2 schema-only classification.
-    assert live_backed_resource_types(schema) == frozenset({"blog/post"})
+    # A constant with filters tests the folder's row: its type is live.
+    assert live_backed_resource_types(schema) == frozenset({"blog/folder", "blog/post"})
     legacy = (
         "definition blog/folder {\n    relation public: site/audience // rebac:const=public\n}\n"
     )

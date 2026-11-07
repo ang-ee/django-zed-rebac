@@ -375,8 +375,9 @@ class LocalBackend:
 
         Decisions are not cached inside a transaction (a rollback would leave
         stale answers), when relationships can expire without a write, or when
-        the resource type can reach live ORM backing. Expired schema snapshots
-        refresh before a cache key is reused; warm scope hits perform no SQL.
+        a decision about the resource type reads a model column
+        (``live_backed_resource_types``). Expired schema snapshots refresh
+        before a cache key is reused; warm scope hits perform no SQL.
         """
         from django.db import connections
 
@@ -414,32 +415,8 @@ class LocalBackend:
             cached = self._schema_facts_memo.get(snapshot.generation)
             if cached is not None and cached.live_types is not None:
                 return cached
-            # Public introspection keeps its 0.18.2 shape. Filtered constants
-            # are a retained 0.19 live source and must also bypass decisions.
-            live = set(live_backed_resource_types(snapshot.schema))
-            live.update(
-                definition.resource_type
-                for definition in snapshot.schema.definitions
-                if any(
-                    isinstance(relation.backing, ConstBinding) and relation.backing.filters
-                    for relation in definition.relations
-                )
-            )
-            while True:
-                expanded = live | {
-                    definition.resource_type
-                    for definition in snapshot.schema.definitions
-                    if any(
-                        allowed.type in live
-                        for relation in definition.relations
-                        for allowed in relation.allowed_subjects
-                    )
-                }
-                if expanded == live:
-                    break
-                live = expanded
             facts = cached if cached is not None else _SchemaFacts(snapshot.generation)
-            facts.live_types = frozenset(live)
+            facts.live_types = live_backed_resource_types(snapshot.schema)
             current = (snapshot.generation == self._schema_generation) or any(
                 s.generation == snapshot.generation for s in self._schema_snapshots.values()
             )

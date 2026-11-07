@@ -79,7 +79,7 @@ def test_roles_reaching_is_parameterized_by_role_resource_type() -> None:
 
 
 # ---------------------------------------------------------------------------
-# live_backed_resource_types — conservative reachability to live ORM backing
+# live_backed_resource_types — the types whose decisions read model columns
 # ---------------------------------------------------------------------------
 
 LIVE_SCHEMA_TEXT = """
@@ -168,6 +168,59 @@ def test_live_backed_resource_types_follows_const_targets_into_live_types():
     )
 
     assert "blog/banner" in live_backed_resource_types(schema)
+
+
+def test_live_backed_resource_types_follow_only_what_evaluation_reads():
+    from rebac.schema.introspection import live_backed_resource_types
+
+    schema = parse_zed(
+        LIVE_SCHEMA_TEXT.replace(
+            "definition auth/user {}",
+            "definition auth/user {\n"
+            '    relation active: auth/user // rebac:attribute={"field":"id"}\n'
+            "    permission is_active = active\n"
+            "}",
+        )
+        + """
+definition blog/desk {
+    relation owner: auth/user
+    permission read = owner->is_active
+}
+
+definition blog/team {
+    relation member: auth/user#active
+}
+"""
+    )
+    live = live_backed_resource_types(schema)
+
+    assert "auth/user" in live  # its own attribute backing
+    # A relation that admits the user directly compares the subject's id: it
+    # reads nothing of the user, however the user's own relations are stored.
+    assert "blog/folder" not in live
+    assert "blog/tag" not in live
+    assert "platform/role" not in live
+    assert "blog/banner" not in live
+    # An arrow to a permission of the user that reads it, and a subject set of
+    # the relation, read it.
+    assert "blog/desk" in live
+    assert "blog/team" in live
+
+
+def test_live_backed_resource_types_seed_a_constant_with_filters():
+    from rebac.schema.introspection import live_backed_resource_types
+
+    schema = parse_zed(
+        LIVE_SCHEMA_TEXT.replace(
+            "relation admin: platform/role // rebac:const=admin",
+            'relation admin: platform/role // rebac:const={"target_id":"admin",'
+            '"filters":{"is_active":true}}',
+        )
+    )
+
+    # Its filters are tested on the object's row.
+    assert "blog/banner" in live_backed_resource_types(schema)
+    assert "platform/role" not in live_backed_resource_types(schema)
 
 
 def test_live_backed_resource_types_is_empty_without_live_backings():
