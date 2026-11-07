@@ -20,15 +20,19 @@ pre-1.0; breaking changes within a minor version are explicitly called out.
   804 KB (person) and 2,797 to 249 KB (projects). Each occurrence of an id set
   is Django's own selection from its CTE, about 4.5% more statement text than a
   hand-written `SELECT *` would be; no statement text is written by hand.
-- One statement still serves every actor of a shape, so an actor whose
-  constant facts would prune the policy (an administrator's `admin->member`)
-  reads the full statement: such reads stay larger than on 0.30, which decided
-  those facts per actor before compiling.
-- A manager built with `from_queryset` keeps its own queryset type again:
-  REBAC's `get_queryset()` is not visible to type checkers, which see
-  Django's own getter (0.31.1 declared it `RebacQuerySet[M]` for every such
-  manager). The related-manager actor pin lives in a typed helper, so its body
-  is type checked. Nothing changes for consumers.
+- Known limit: one statement still serves every actor of a shape, so an
+  actor whose constant facts would prune the policy (an administrator's
+  `admin->member`) reads the full statement: such reads stay larger than on
+  0.30, which decided those facts per actor before compiling.
+- `RebacManager.get_queryset()` is runtime-only again, as in 0.30, so type
+  checkers see Django's own getter. With a Django plugin that types that getter
+  from the `from_queryset` queryset class, a `from_queryset` manager keeps its
+  own queryset type. Under upstream django-stubs 6.1 the getter is
+  `QuerySet[M, M]`, as in 0.30, where 0.31.0 and 0.31.1 declared
+  `RebacQuerySet[M]`: code that chains REBAC queryset methods on
+  `manager.get_queryset()` calls them on the manager or narrows the type. The
+  related-manager actor pin lives in a typed helper, so its body is type
+  checked.
 
 ## [0.31.1] — 2026-11-06
 
