@@ -333,6 +333,9 @@ class _RebacQuery(_BypassAuditQuery):
         if self._rebac_statement_part and not hasattr(self, "_rebac_state"):
             return cast(Self, super().resolve_expression(*args, **kwargs))
         clone = cast(Self, self.clone())
+        # The audit follows this resolution's decision: Django resolves a
+        # condition again when the statement compiles, under the actor then.
+        clone._rebac_pending_bypass_audit = None
         state = getattr(self, "_rebac_state", {})
         queryset: RebacQuerySet[Any] = RebacQuerySet(
             model=self.model, query=clone, using=state.get("_db")

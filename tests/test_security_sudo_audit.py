@@ -210,6 +210,24 @@ def test_an_expression_built_inside_a_sudo_block_is_audited_where_it_executes_ou
         assert _actors(reason)[-1] == "outsider"
 
 
+def test_a_condition_built_inside_a_sudo_block_is_scoped_where_it_executes(post):
+    from rebac import RelationshipTuple, to_object_ref
+
+    outsider = SubjectRef.of("auth/user", "outsider")
+    with sudo(reason="test.fixture"):
+        Post.objects.create(title="hidden")
+    backend().write_relationships([RelationshipTuple(to_object_ref(post), "owner", outsider)])
+    reason = "audit.block-built-condition"
+    with sudo(reason=reason):
+        outer = Post.objects.filter(Exists(Post.objects.filter(title="hidden")))
+    assert _bypass_rows(reason).count() == 1
+    with actor_context(outsider):
+        # Django resolves a condition again when the statement compiles: its
+        # scope is the outsider's, and no bypass took effect to audit.
+        assert list(outer) == []
+    assert _bypass_rows(reason).count() == 1
+
+
 def test_a_queryset_evaluated_inside_a_sudo_block_and_embedded_after_it_is_scoped(post):
     from rebac import RelationshipTuple, to_object_ref
 

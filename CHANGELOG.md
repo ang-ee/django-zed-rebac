@@ -49,11 +49,12 @@ pre-1.0; breaking changes within a minor version are explicitly called out.
   again. Embedded bypasses are still audited with each statement that
   executes them. A queryset that `scoped()` pins inside a `sudo()` block is a
   bypass of its own.
-- A queryset embedded in an expression (`Subquery`, `Exists`, a `pk__in=`
-  lookup) built inside a `sudo()` block keeps the block's bypass after it
-  closes, and its executions outside the block wrote no audit row; each
+- A queryset embedded inside a `sudo()` block in an annotation (`Subquery`,
+  `Exists`) or as a lookup's value (`pk__in=`) keeps the block's bypass after
+  it closes, and its executions outside the block wrote no audit row; each
   statement that executes it outside a block now audits it, as a `scoped()`
-  capture is. A queryset evaluated inside a block and embedded in a
+  capture is. A condition (`filter(Exists(...))`) is resolved again when its
+  statement compiles, so it is scoped and audited where it executes. A queryset evaluated inside a block and embedded in a
   `Subquery` after it kept that evaluation's bypass; its scope is now decided
   where it is embedded, as a lookup or a write on it already was.
 - The evaluator remembered whether an actor holds a permission's constant
