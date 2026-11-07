@@ -15,7 +15,6 @@ from .ast import (
     AttributeBinding,
     ConstBinding,
     Definition,
-    FieldBinding,
     PermArrow,
     PermBinOp,
     PermExpr,
@@ -24,6 +23,7 @@ from .ast import (
     Relation,
     Schema,
 )
+from .graph import live_types
 from .walker import find_permission, find_relation
 
 
@@ -260,39 +260,17 @@ def _references_builtin_actor(expr: PermExpr) -> bool:
 
 
 def live_backed_resource_types(schema: Schema) -> frozenset[str]:
-    """Resource types whose permission evaluation may read live ORM backing.
+    """Resource types some permission decision of which reads a model column.
 
-    A type is live when one of its relations is field- or attribute-backed, or
-    when one of its relations admits an allowed subject whose type is live
-    (fixed point). Allowed-subject types cover every way evaluation crosses a
-    definition boundary — arrows (``via->perm`` walks ``via``'s subject types),
-    subject sets (``group#member``) and const targets — so the result is a
-    conservative over-approximation: it may name a type that never actually
-    reaches a backing, but never omits one that can. Const backings are
-    static and are not live seeds on their own.
+    A field- or attribute-backed relation, or a constant with filters (tested
+    on the object's row), reads one. A type is live when one of its relations
+    or permissions reaches such a relation along what the compiler evaluates:
+    a subject set's relation, an arrow's relation and its target on each
+    subject type, a constant's target. A subject admitted directly is compared
+    by its id, so a type is not live merely because it admits a live type's
+    subjects. The decision cache keeps no answer about a live type.
     """
-    live = {
-        definition.resource_type
-        for definition in schema.definitions
-        if any(
-            isinstance(relation.backing, (FieldBinding, AttributeBinding))
-            for relation in definition.relations
-        )
-    }
-    changed = bool(live)
-    while changed:
-        changed = False
-        for definition in schema.definitions:
-            if definition.resource_type in live:
-                continue
-            if any(
-                allowed.type in live
-                for relation in definition.relations
-                for allowed in relation.allowed_subjects
-            ):
-                live.add(definition.resource_type)
-                changed = True
-    return frozenset(live)
+    return live_types(schema)
 
 
 def _collect_sources(

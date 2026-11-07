@@ -1,8 +1,9 @@
-"""The dependency graph of a policy, as the permission compiler dispatches it.
+"""The recursive components of a policy, validated for the permission compiler.
 
-The graph is about authorization dispatch, not model rows.  It includes
-subject-set membership and arrow targets, so that a recursive component is
-the set of nodes one statement may have to unroll together.
+The dependency graph is ``rebac.schema.graph.dispatch_graph``: authorization
+dispatch, not model rows, including subject-set membership and arrow targets.
+A recursive component is the set of nodes one statement may have to unroll
+together.
 """
 
 from __future__ import annotations
@@ -12,64 +13,10 @@ from dataclasses import dataclass
 from django.core import checks
 
 from ..errors import SchemaError
-from ..schema.ast import (
-    BUILTIN_ACTOR_TYPES,
-    PermArrow,
-    PermBinOp,
-    PermExpr,
-    PermRef,
-    Schema,
-)
-from ..schema.graph import strongly_connected_components
+from ..schema.ast import Schema
+from ..schema.graph import Dependency, Key, dispatch_graph, strongly_connected_components
 
-type Key = tuple[str, str]
-
-
-@dataclass(frozen=True, slots=True)
-class Dependency:
-    target: Key
-    negative: bool = False
-    traverses: bool = False
-
-
-def _expr_dependencies(
-    schema: Schema, type_: str, expr: PermExpr, negative: bool = False
-) -> list[Dependency]:
-    if isinstance(expr, PermRef):
-        if expr.name in BUILTIN_ACTOR_TYPES:
-            return []
-        return [Dependency((type_, expr.name), negative)]
-    if isinstance(expr, PermArrow):
-        definition = schema.get_definition(type_)
-        relation = (
-            next((r for r in definition.relations if r.name == expr.via), None)
-            if definition
-            else None
-        )
-        if relation is None:
-            return []
-        # Several allowed subject shapes can dispatch this one arrow to the
-        # same definition.  They are alternatives, not multiple recursive
-        # uses of the arrow in the expression.
-        return list(
-            dict.fromkeys(
-                Dependency((allowed.type, expr.target), negative, traverses=True)
-                for allowed in relation.allowed_subjects
-            )
-        )
-    if isinstance(expr, PermBinOp):
-        return _expr_dependencies(schema, type_, expr.left, negative) + _expr_dependencies(
-            schema, type_, expr.right, negative ^ (expr.op == "-")
-        )
-    return []
-
-
-def _arrow_vias(type_: str, expr: PermExpr) -> list[Key]:
-    if isinstance(expr, PermArrow):
-        return [(type_, expr.via)]
-    if isinstance(expr, PermBinOp):
-        return _arrow_vias(type_, expr.left) + _arrow_vias(type_, expr.right)
-    return []
+__all__ = ["CompileProgram", "Key", "program_errors"]
 
 
 @dataclass(frozen=True, slots=True)
@@ -85,26 +32,7 @@ class CompileProgram:
 
     @classmethod
     def build(cls, schema: Schema) -> CompileProgram:
-        dependencies: dict[Key, tuple[Dependency, ...]] = {}
-        via_dependencies: dict[Key, tuple[Key, ...]] = {}
-        for definition in schema.definitions:
-            type_ = definition.resource_type
-            for relation in definition.relations:
-                dependencies[(type_, relation.name)] = tuple(
-                    dict.fromkeys(
-                        Dependency((allowed.type, allowed.relation), traverses=True)
-                        for allowed in relation.allowed_subjects
-                        if allowed.relation
-                    )
-                )
-            for permission in definition.permissions:
-                dependencies[(type_, permission.name)] = tuple(
-                    _expr_dependencies(schema, type_, permission.expression)
-                )
-                via_dependencies[(type_, permission.name)] = tuple(
-                    _arrow_vias(type_, permission.expression)
-                )
-
+        dependencies, via_dependencies = dispatch_graph(schema)
         graph = {
             key: {dep.target for dep in deps if dep.target in dependencies}
             for key, deps in dependencies.items()

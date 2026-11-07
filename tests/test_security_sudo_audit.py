@@ -7,7 +7,7 @@ from django.db import connection, transaction
 from django.db.models import Exists, OuterRef, Subquery
 from django.test.utils import CaptureQueriesContext
 
-from rebac import SubjectRef, actor_context, backend, sudo
+from rebac import SubjectRef, actor_context, backend, evaluator_scope, sudo
 from rebac.backends import reset_backend
 from rebac.models import PermissionAuditEvent
 from rebac.schema import parse_zed
@@ -69,6 +69,181 @@ def test_queryset_sudo_audits_only_when_used_once(post):
     assert rows.count() == 1
     assert list(rows) == [post]
     assert _bypass_rows("audit.lazy").count() == 1
+
+
+@pytest.mark.parametrize("verb", ["system_context", "sudo"])
+def test_the_querysets_derived_from_one_bypass_entry_audit_once(post, verb):
+    reason = f"audit.one-entry.{verb}"
+    entry = getattr(Post.objects, verb)(reason=reason)
+    # Each derived queryset executes its own statement.
+    assert list(entry.filter(pk=post.pk)) == [post]
+    assert entry.filter(title="hello").exists()
+    assert entry.count() == 1
+    assert entry.values_list("pk", flat=True).get() == post.pk
+    assert entry.filter(pk=post.pk).update(body="changed") == 1
+    assert entry.order_by("pk").explain()
+    assert entry.filter(pk=-1).delete()[0] == 0
+    assert _bypass_rows(reason).count() == 1
+    # Another entry, with the same reason, is another bypass.
+    assert list(getattr(Post.objects, verb)(reason=reason)) == [post]
+    assert _bypass_rows(reason).count() == 2
+
+
+class _View:
+    # A generic view's class-level queryset, cloned by get_queryset() per request.
+    queryset = Post.objects.none()
+
+
+def _requests(actors, *, statements=2):
+    for actor in actors:
+        with evaluator_scope(), actor_context(actor):
+            for _ in range(statements):
+                assert _View.queryset.all().count() == 1
+
+
+def _actors(reason):
+    return list(_bypass_rows(reason).order_by("pk").values_list("actor_subject_id", flat=True))
+
+
+def test_a_long_lived_bypass_queryset_is_audited_in_each_request(post):
+    _View.queryset = Post.objects.system_context(reason="audit.class-level")
+    _requests([SubjectRef.of("auth/user", str(n)) for n in (0, 1, 0)])
+    # One row per request, with its actor, however many statements it ran.
+    assert _actors("audit.class-level") == ["0", "1", "0"]
+
+
+@pytest.mark.django_db(transaction=True)
+def test_a_long_lived_bypass_queryset_is_audited_in_each_committed_request(post):
+    _View.queryset = Post.objects.system_context(reason="audit.class-level.committed")
+    _requests([SubjectRef.of("auth/user", str(n)) for n in (0, 0, 1)])
+    assert _actors("audit.class-level.committed") == ["0", "0", "1"]
+
+
+def _rolled_back_then_committed(post, reason):
+    entry = Post.objects.system_context(reason=reason)
+    with pytest.raises(_Rollback), transaction.atomic():
+        assert entry.filter(pk=post.pk).update(body="first") == 1
+        assert entry.filter(pk=post.pk).update(body="again") == 1
+        raise _Rollback
+    with transaction.atomic():
+        assert entry.filter(pk=post.pk).update(body="second") == 1
+        assert entry.filter(pk=post.pk).update(body="third") == 1
+    post.refresh_from_db()
+    assert post.body == "third"
+    # The rolled-back row is gone; the committed write has its own.
+    assert _bypass_rows(reason).count() == 1
+
+
+def test_a_bypass_whose_first_row_rolled_back_with_a_savepoint_is_audited_again(post):
+    _rolled_back_then_committed(post, "audit.savepoint-rollback")
+
+
+@pytest.mark.django_db(transaction=True)
+def test_a_bypass_whose_first_row_rolled_back_is_audited_again(post):
+    _rolled_back_then_committed(post, "audit.rollback")
+
+
+@pytest.mark.django_db(transaction=True)
+def test_a_bypass_is_audited_once_per_actor_and_evaluator_scope(post):
+    reason = "audit.units"
+    entry = Post.objects.system_context(reason=reason)
+    for _request in range(2):
+        with evaluator_scope():
+            assert entry.count() == entry.filter(pk=post.pk).count() == 1
+            with transaction.atomic():
+                assert entry.exists()
+    assert _bypass_rows(reason).count() == 2
+    # Outside an evaluator scope, once per actor.
+    with transaction.atomic():
+        assert entry.count() == entry.filter(pk=post.pk).count() == 1
+    assert entry.exists()
+    assert _bypass_rows(reason).count() == 3
+    with actor_context(SubjectRef.of("auth/user", "other")):
+        assert entry.exists()
+        assert entry.count() == 1
+    assert _actors(reason)[-1] == "other"
+    assert _bypass_rows(reason).count() == 4
+
+
+def test_two_captures_of_one_queryset_under_sudo_blocks_are_two_bypasses(post):
+    base = Post.objects.all()
+    with sudo(reason="audit.capture-one"):
+        one = base.scoped()
+    with sudo(reason="audit.capture-two"):
+        two = base.scoped()
+    # Each block audited at entry; each capture, executed outside it, once.
+    assert list(one) == [post]
+    assert list(two) == [post]
+    assert one.count() == two.count() == 1
+    assert _bypass_rows("audit.capture-one").count() == 2
+    assert _bypass_rows("audit.capture-two").count() == 2
+
+
+@pytest.mark.parametrize("embed", ["subquery", "lookup"])
+def test_an_expression_built_inside_a_sudo_block_is_audited_where_it_executes_outside(post, embed):
+    from rebac import RelationshipTuple, to_object_ref
+
+    outsider = SubjectRef.of("auth/user", "outsider")
+    with sudo(reason="test.fixture"):
+        hidden = Post.objects.create(title="hidden")
+    backend().write_relationships([RelationshipTuple(to_object_ref(post), "owner", outsider)])
+    reason = f"audit.block-built.{embed}"
+    with sudo(reason=reason):
+        inner = Post.objects.filter(title="hidden").values("pk")
+        if embed == "subquery":
+            outer = Post.objects.annotate(found=Subquery(inner[:1]))
+            # Executed inside the block, the block's own row covers it.
+            assert list(outer.values_list("found", flat=True))
+        else:
+            outer = Post.objects.filter(pk__in=inner)
+            assert list(outer.all()) == [hidden]
+    assert _bypass_rows(reason).count() == 1
+    with actor_context(outsider):
+        # The block's bypass was pinned when the expression was built: each
+        # statement that executes it outside the block audits it.
+        if embed == "subquery":
+            assert list(outer.values_list("pk", "found")) == [(post.pk, hidden.pk)]
+        else:
+            # The outer rows are the outsider's; the pinned inner bypass runs.
+            assert list(outer.all()) == []
+        assert _bypass_rows(reason).count() == 2
+        assert _actors(reason)[-1] == "outsider"
+
+
+def test_a_condition_built_inside_a_sudo_block_is_scoped_where_it_executes(post):
+    from rebac import RelationshipTuple, to_object_ref
+
+    outsider = SubjectRef.of("auth/user", "outsider")
+    with sudo(reason="test.fixture"):
+        Post.objects.create(title="hidden")
+    backend().write_relationships([RelationshipTuple(to_object_ref(post), "owner", outsider)])
+    reason = "audit.block-built-condition"
+    with sudo(reason=reason):
+        outer = Post.objects.filter(Exists(Post.objects.filter(title="hidden")))
+    assert _bypass_rows(reason).count() == 1
+    with actor_context(outsider):
+        # Django resolves a condition again when the statement compiles: its
+        # scope is the outsider's, and no bypass took effect to audit.
+        assert list(outer) == []
+    assert _bypass_rows(reason).count() == 1
+
+
+def test_a_queryset_evaluated_inside_a_sudo_block_and_embedded_after_it_is_scoped(post):
+    from rebac import RelationshipTuple, to_object_ref
+
+    outsider = SubjectRef.of("auth/user", "outsider")
+    with sudo(reason="test.fixture"):
+        hidden = Post.objects.create(title="hidden")
+    backend().write_relationships([RelationshipTuple(to_object_ref(post), "owner", outsider)])
+    inner = Post.objects.filter(title="hidden").values("pk")
+    with sudo(reason="audit.evaluated-inside"):
+        assert list(inner) == [{"pk": hidden.pk}]
+    with actor_context(outsider):
+        # Its scope is decided where it is embedded, as by a lookup or a write.
+        found = Post.objects.annotate(found=Subquery(inner)).values_list("pk", "found")
+        assert list(found) == [(post.pk, None)]
+        assert list(Post.objects.filter(pk__in=inner)) == []
+    assert _bypass_rows("audit.evaluated-inside").count() == 1
 
 
 def test_queryset_sudo_raw_is_audited(post):

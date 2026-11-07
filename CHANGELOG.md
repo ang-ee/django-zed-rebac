@@ -5,6 +5,79 @@ pre-1.0; breaking changes within a minor version are explicitly called out.
 
 ## [Unreleased]
 
+## [0.31.5] — 2026-11-07
+
+### Changed
+
+- Behaviour change of a public helper: `live_backed_resource_types` returns
+  fewer types, and the decision cache keeps answers about every resource type
+  none of whose decisions reads a model column. The helper follows what
+  the compiler evaluates: a subject set's relation, an arrow's relation and
+  its target on each subject type, a constant's target. A relation that
+  admits a subject directly compares its id and reads nothing of the
+  subject's type, so a model-backed relation of the user type no longer makes
+  live every type that admits users, only those whose policy follows an arrow
+  or a subject set to it. A constant with filters, which is tested on the
+  object's row, is a seed of the public helper too; the backend already
+  treated it as one.
+- More types are therefore cached for an evaluator scope. A cached
+  `PermissionEvaluator.check()` answer (also behind `check_field_access()`) or
+  field-visibility answer can stay wider than the database until the scope ends:
+  after a revocation written outside this process's tuple writes (another
+  worker, raw SQL), it keeps granting while `check_access()` and reads see the
+  revocation. Long scopes (Celery tasks, subscriptions) are the most exposed;
+  see Known limits in ARCHITECTURE.md.
+- In an application whose user type carries a model-backed relation, inside
+  an evaluator scope outside a transaction, an actor who holds a constant arm
+  now pays one witness per request instead of one per read, other actors'
+  scopes leave the constant arms out, and check answers and field visibility
+  about the types that never read the relation are kept for the request.
+  Measured on SQLite on a console-like policy with such a relation, four
+  scoped reads and three checks per actor (statements, SQL bytes): an
+  administrator 11, 24,778 before and 8, 17,989 after; a member 9, 357,534
+  before and 9, 354,518 after.
+
+### Fixed
+
+- A queryset `sudo()` or `system_context()` call is audited once per actor
+  and evaluator scope (the request; outside one, once per actor), at the first
+  top-level evaluation or write of any queryset derived from it. Each derived
+  queryset (`filter()`, `get()`, `count()`, `update()` …) wrote its own row
+  when it was derived before the first one executed, so a job that read and
+  wrote through one `system_context(reason=…)` queryset wrote a row per
+  statement. A class-level queryset cloned per request is still audited in
+  each request, with its actor, and a row written in a transaction that rolls
+  back, or in a rolled-back savepoint, does not count: the next use writes it
+  again. Embedded bypasses are still audited with each statement that
+  executes them. A queryset that `scoped()` pins inside a `sudo()` block is a
+  bypass of its own.
+- A queryset embedded inside a `sudo()` block in an annotation (`Subquery`,
+  `Exists`) or as a lookup's value (`pk__in=`) keeps the block's bypass after
+  it closes, and its executions outside the block wrote no audit row; each
+  statement that executes it outside a block now audits it, as a `scoped()`
+  capture is. A condition (`filter(Exists(...))`) is resolved again when its
+  statement compiles, so it is scoped and audited where it executes. A queryset evaluated inside a block and embedded in a
+  `Subquery` after it kept that evaluation's bypass; its scope is now decided
+  where it is embedded, as a lookup or a write on it already was. Embedding
+  it where no actor is present therefore raises `MissingActorError` in strict
+  mode, where it bypassed silently before.
+- The evaluator remembered whether an actor holds a permission's constant
+  arms per statement and actor, not per database alias: within one evaluator
+  scope, a read on another alias reused the answer decided on the first, so an
+  actor holding the arm on that alias alone read too few rows there. The
+  answer is now kept per alias.
+
+### Documentation
+
+- A scope prepared while the answer that its actor holds no constant arm was
+  kept leaves the arms out when it renders after a tuple write that grants
+  one, as a prepared scope omits a new caveat instance; a scope built after
+  a tuple write through the library decides the witness again.
+- Known limit: within one evaluator scope, after a write that does not go
+  through this process's tuple writes, a scoped read and a check of one actor
+  can disagree until the scope ends; the read is the narrower, but a cached
+  `PermissionEvaluator.check()` answer can be the wider.
+
 ## [0.31.4] — 2026-11-07
 
 ### Changed

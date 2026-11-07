@@ -1069,8 +1069,8 @@ revision once before reusing it. The answer caches already decline inside
 transactions. Supported policy writes evict the shared snapshot. Backing rows
 are never stored in schema snapshots; statements read them when they run.
 
-Decision-cache policy retains the 0.18.2 exclusions: resource types reachable
-from field or attribute backings are not cacheable. Expiring relationships
+The decision cache keeps no answer about a resource type some decision of
+which reads a model column (`live_backed_resource_types`). Expiring relationships
 bypass caching; override deadlines refresh the schema generation so a cached
 grant cannot outlive its validity.
 Eligible hits cost zero queries. See [PermissionEvaluator](#permissionevaluator--per-request-check-cache).
@@ -1107,8 +1107,10 @@ class PermissionAuditEvent(models.Model):
 ```
 
 Written by every Tier 2 / Tier 3 mutation and every effective public bypass.
-Queryset bypasses are audited at first evaluation or write, instance bypasses
-at the first check or write, and block bypasses at entry, once per bypass.
+Queryset bypasses are audited at the first evaluation or write of any
+queryset derived from the `sudo()` or `system_context()` call, once per actor
+and evaluator scope; instance bypasses at the first check or write, and block
+bypasses at entry, once per bypass.
 A bypass queryset embedded in an expression (`Exists`, `Subquery`, a
 `pk__in=` lookup) is audited once per entry and reason when its enclosing
 statement executes. Building the expression runs no query and writes no row,
@@ -1715,11 +1717,11 @@ the schema declares an expiring relation, and a tuple write through the
 library discards it. The schema walker (`rebac.schema.walker`) remains
 for `check_new`, which evaluates a row that does not exist yet.
 
-The implementation is the package `rebac.compile`: `program` (the dependency
-graph of a policy), `predicate` (the compiler), `conditions` and `formulas`
-(caveats), `read` (the operations) and `evaluate` (what an undecided check
-still needs). `rebac.watch` holds the map of the columns a policy reads, for
-the write gates.
+The implementation is the package `rebac.compile`: `program` (the recursive
+components of a policy's dependency graph, which `rebac.schema.graph` builds),
+`predicate` (the compiler), `conditions` and `formulas` (caveats), `read` (the
+operations) and `evaluate` (what an undecided check still needs).
+`rebac.watch` holds the map of the columns a policy reads, for the write gates.
 
 #### Tables
 
@@ -1898,8 +1900,8 @@ evaluator scope, a witness statement decides whether the actor holds one
   alone, a gate that admits every row, which evaluates them again when it
   runs. A point check (`check_access`) of that actor is answered by the
   witness statement, decided at that check.
-- The evaluator remembers the answer for the rest of the scope, per actor and
-  distinct statement of constant arms. Keeping it is allowed where the
+- The evaluator remembers the answer for the rest of the scope, per actor,
+  database alias and distinct statement of constant arms. Keeping it is allowed where the
   decision cache may keep a decision about every type the arms name
   (`_backend_cache_key`; see
   [the per-request evaluator](#permissionevaluator--per-request-check-cache))
@@ -1943,7 +1945,10 @@ builds its scope then, reading the schema revision, unless an evaluator scope
 pins it, and the caveat-verdict rows, and deciding the constant-arm witness
 inside an evaluator scope. A new
 caveat instance is absent from an already prepared lower bound; a newly
-built scope sees it. Point checks retain their content-type preparation for
+built scope sees it. Likewise, a scope prepared with the constant arms left
+out (a kept `False`) leaves them out when it renders after a tuple write that
+grants one; a scope built after a tuple write through the library decides the
+witness again. Point checks retain their content-type preparation for
 generic backings and prepare caveat verdicts before the SQL statement.
 
 A scoped read that names the identities it reads is bounded to them. When the
@@ -2283,9 +2288,31 @@ of its own.
   only inside an evaluator scope: a permission without one (`read =
   parent->read`) gives an administrator the whole statement, whose id sets
   then hold every row of the types its arrows reach. Where the decision cache
-  keeps nothing for the types the arms name, an actor who holds a constant arm
+  keeps nothing for the types the arms name (inside a transaction, or when a
+  decision about them reads a model column), an actor who holds a constant arm
   pays one witness per read, other actors one per request, and their
   statements keep the constant arms' union branch. There is no scale claim.
+- Within one evaluator scope, after a write that does not go through this
+  process's tuple writes (raw SQL, a data migration, another process), one
+  actor's operations can disagree until the scope ends. Scoped reads,
+  `held()`, `held_many()` and the model rows of `accessible()` follow the kept
+  constant-arm answer; `check_access()` decides the witness at the check, and
+  `check_bulk_permissions()` and `lookup_subjects()` evaluate every arm. A
+  granted constant arm is then seen by a check and not by a read; after a
+  revoked one, the read of an actor who held it admits nothing, while a check
+  still admits what the actor's other arms grant. The read is narrower, never
+  wider, and the next evaluator scope agrees.
+- A cached check can be wider than the database. `PermissionEvaluator.check()`
+  (also behind `check_field_access()`, and what GraphQL resolvers reach through
+  the adapter's evaluator) and the field-visibility memo keep their answers for
+  the scope under the decision-cache key, and only this process's tuple writes
+  change that key. After a revocation written another way (another worker, raw
+  SQL, a data migration), a cached answer keeps granting until the scope ends,
+  while `check_access()` and the reads already see the revocation. Long scopes (Celery tasks, subscriptions) are the most
+  exposed; open one scope per unit of work, or call `invalidate()`. A type
+  stays cacheable unless a decision about it reads a model column, so in an
+  application whose user type has a model-backed relation, the types that
+  admit users directly are cached too (since 0.31.5).
 - Id sets are driven from the actor's grants, not bounded by the rows the
   selecting query reads: a read of one parent's children computes the set of
   parents the actor reads, by index from its grants, and then that parent's
@@ -2328,14 +2355,18 @@ sub-permissions. The AST node types remain private implementation details so
 the schema language can grow without downstream walkers silently misreading new
 nodes.
 
-`rebac.schema.accessible_is_exact(schema)` and
-`live_backed_resource_types(schema)` remain public with their 0.18.2 schema-only
-behavior. The former reports the absence of builtin-actor and caveat constructs;
-it does not add a recursion restriction or certify that the policy compiles. The latter
-conservatively propagates live-backing dependencies to resource types, including
-through arrows, const targets and subject sets, for decision-cache exclusion.
-Field and attribute backings seed that closure; constants and builtin actors
-do not seed it on their own.
+`rebac.schema.accessible_is_exact(schema)` reports the absence of
+builtin-actor and caveat constructs; it does not add a recursion restriction or
+certify that the policy compiles. `live_backed_resource_types(schema)` names
+the resource types some permission decision of which reads a model column, the
+types the decision cache keeps nothing about. A field- or attribute-backed
+relation, or a constant with filters (tested on the object's row), reads one; a
+relation or permission reads one when anything the compiler evaluates to decide
+it does (`rebac.schema.graph`): a subject set's relation, an arrow's relation
+and its target on each subject type, a constant's target. A subject admitted
+directly is compared by its id, so a model-backed relation of the user type
+makes live only the types whose policy follows an arrow or a subject set to it,
+not every type that admits users.
 
 Role convention tooling should use `rebac.roles.roles_reaching(...)`, passing a
 `role_resource_type` such as `"storage/role"` or `"platform/role"` rather than
@@ -2468,8 +2499,26 @@ context before materializing or mutating it.
 
 **Bypass audit granularity.** A block-scoped `sudo()` or `system_context()`
 emits one `KIND_SUDO_BYPASS` row at each entry. An explicit queryset bypass
-emits one row when it first takes effect (eager scope application, direct
-evaluation or write). When a bypass queryset is embedded in another
+is an entry: the querysets derived from one `sudo()` or `system_context()`
+call (by `filter()`, `values()`, `get()`, `count()`, `update()`, `delete()`
+and every other clone) share it. It emits one row when the first of them takes
+effect (eager scope application, direct evaluation or write) for each actor
+and evaluator scope, the request: a class-level queryset that views clone per
+request is audited in each request, with that request's actor. Outside an
+evaluator scope, once per actor for the entry's life: a long-running process
+(Celery tasks, Channels consumers) opens an evaluator scope per unit of work,
+or a module-level entry it derives querysets from is audited once per actor
+per process. A row written inside a transaction counts
+only if that transaction commits: after a rollback, of a savepoint too, the
+next use writes it again. A queryset that `scoped()` pins inside a `sudo()`
+block, and a queryset embedded inside one in an annotation (`Subquery`,
+`Exists`) or as a lookup's value (`pk__in=`), keep the block's bypass after it
+closes: each is an entry of its own, audited when it takes effect outside a
+block (the embedded one with each statement that executes it). Django resolves
+a condition (`filter(Exists(...))`) again when its statement compiles, so a
+condition built inside a block is scoped, and audited, by the decision taken
+there. A queryset evaluated inside a block and embedded after it has its scope
+decided where it is embedded, as a lookup or a write on it is. When a bypass queryset is embedded in another
 statement, each execution audits every distinct `(entry, reason)` pair it
 renders, even if that pair appears in several filters, annotations or `Exists`
 expressions. A count followed by a list read audits the embedded entry twice.
@@ -2965,10 +3014,13 @@ Cache keys include backend instance identity, including reentrant checks through
 different backends. Context keys preserve scalar types (`True`, `1`, and `1.0` differ).
 Complex context values bypass caching, including nested dictionaries and lists.
 
-LocalBackend retains the 0.18.2 decision-cache rules. It declines caching inside
-a transaction, when the schema declares expiring relationships, or for a
-resource type in the conservative field/attribute backing reachability closure
-returned by `live_backed_resource_types`. Unrelated types remain cacheable.
+LocalBackend declines caching inside a transaction, when the schema declares
+expiring relationships, or for a resource type some decision of which reads a
+model column (`live_backed_resource_types`, see
+[Schema introspection](#schema-introspection)): a type whose policy follows an
+arrow or a subject set to a field-, attribute- or filtered constant-backed
+relation. Other types remain cacheable, including those that admit as a direct
+subject a type with such a relation.
 Override deadlines refresh the composed schema and its decision generation.
 Eligible cache hits cost zero queries, including no revision SELECT per lookup.
 Backend relationship writes and the `post_delete` cascade
@@ -2976,8 +3028,8 @@ Backend relationship writes and the `post_delete` cascade
 backend instances in this process, including evaluators suspended by a nested
 scope.
 
-The evaluator also remembers, per actor and per statement of a permission's
-constant arms, whether the actor holds one (see
+The evaluator also remembers, per actor, database alias and statement of a
+permission's constant arms, whether the actor holds one (see
 [Inline permission scopes](#inline-permission-scopes)). The answer only
 chooses which statement a read runs. It is used as kept only under these
 rules: when the decision cache may keep a decision about every type the arms

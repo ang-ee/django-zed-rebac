@@ -14,14 +14,15 @@ loaded instance (it is not visible inside `from_db()`).
 from __future__ import annotations
 
 import re
+import weakref
 from collections import Counter
-from collections.abc import AsyncIterator, Collection, Iterable, Iterator
+from collections.abc import AsyncIterator, Callable, Collection, Iterable, Iterator
 from contextvars import ContextVar
 from enum import Enum, auto
 from typing import TYPE_CHECKING, Any, Self, TypeVar, cast, overload
 
 from asgiref.sync import sync_to_async
-from django.db import connections, models
+from django.db import connections, models, router, transaction
 from django.db.models.expressions import Col, RawSQL
 from django.db.models.sql import Query
 from django.db.models.sql.subqueries import UpdateQuery
@@ -39,6 +40,7 @@ from .actors import (
 from .actors import current_actor as _current_actor
 from .actors import is_sudo as _is_sudo_ambient
 from .errors import MissingActorError, PermissionDenied
+from .evaluator import PermissionEvaluator, current_evaluator
 from .field_visibility import (
     apply_field_visibility,
     backend_schema,
@@ -67,9 +69,84 @@ class _CompileOnly(Enum):
 # While a statement executes: the embedded bypasses its rendering used, keyed by
 # bypass entry and reason. ``_CompileOnly`` while a top-level statement is only
 # rendered (``str(query)``), which audits nothing.
-_executing_bypass_audits: ContextVar[dict[tuple[object, str], None] | _CompileOnly | None] = (
+_executing_bypass_audits: ContextVar[dict[tuple[_BypassEntry, str], None] | _CompileOnly | None] = (
     ContextVar("rebac_executing_bypass_audits", default=None)
 )
+
+
+class _BypassEntry:
+    """One ``sudo()`` or ``system_context()`` call, shared by the querysets derived from it.
+
+    A top-level execution of any of them audits it (``audit``) once per actor
+    and evaluator scope (the request; outside one, once per actor), counting a
+    row written inside a transaction only if it commits. An embedded use is
+    audited with each statement that executes it, keyed by this entry and its
+    reason (``_emit_embedded``). ``ambient`` marks the bypass of an enclosing
+    ``sudo()`` block that a queryset pinned (``RebacQuerySet._capture_ambient_bypass``).
+    """
+
+    __slots__ = ("_mark", "ambient")
+
+    def __init__(self, *, ambient: bool = False) -> None:
+        self.ambient = ambient
+        # The last row written: its actor, its evaluator scope, and while its
+        # transaction is open, the connection and the commit hook that confirm it.
+        self._mark: (
+            tuple[
+                SubjectRef | None,
+                weakref.ref[PermissionEvaluator] | None,
+                Any,
+                Callable[[], None] | None,
+            ]
+            | None
+        ) = None
+
+    def audit(self, reason: str) -> None:
+        """Write the bypass row unless this actor already has one in this evaluator scope.
+
+        A row written inside a transaction counts once the transaction commits,
+        and meanwhile while its commit hook is registered on this thread's
+        connection: a rollback, of a savepoint too, removes the hook with the
+        row, so the next use writes it again.
+        """
+        from .models import PermissionAuditEvent
+
+        actor = _current_actor()
+        evaluator = current_evaluator()
+        connection = transaction.get_connection(router.db_for_write(PermissionAuditEvent))
+        mark = self._mark
+        if mark is not None and mark[0] == actor:
+            _actor, written_in, pending, hook = mark
+            # A closed scope's reference is dead: it is no longer this one.
+            same = (
+                evaluator is None if written_in is None else written_in() is evaluator is not None
+            )
+            if hook is not None:
+                # Django's own list of the hooks still to run at commit.
+                if (
+                    same
+                    and pending is connection
+                    # Each entry is (savepoint ids, callable, robust).
+                    and any(entry[1] is hook for entry in connection.run_on_commit)
+                ):
+                    return
+            elif same:
+                return
+        _emit_bypass(reason)
+        scope = weakref.ref(evaluator) if evaluator is not None else None
+        if connection.in_atomic_block:
+
+            def confirm() -> None:
+                if self._mark is not None and self._mark[3] is confirm:
+                    self._mark = (actor, scope, None, None)
+
+            connection.on_commit(confirm)
+            self._mark = (actor, scope, connection, confirm)
+        else:
+            # Committed in autocommit; under manual transaction management, or in
+            # an event loop (the row was written from a worker thread), unknown.
+            # The attribute is read without opening a connection.
+            self._mark = (actor, scope, None, None) if connection.autocommit else None
 
 
 def _emit_bypass(reason: str) -> None:
@@ -78,9 +155,19 @@ def _emit_bypass(reason: str) -> None:
     emit_bypass(reason, actor=_current_actor())
 
 
-def _emit_executed_bypasses(reasons: dict[tuple[object, str], None]) -> None:
-    for _entry, reason in reasons:
+def _emit_embedded(entry: _BypassEntry, reason: str) -> None:
+    """Audit an embedded bypass where its statement executes.
+
+    A captured ``sudo()`` block is covered by the row of the block that is
+    active, if any.
+    """
+    if not (entry.ambient and _is_sudo_ambient()):
         _emit_bypass(reason)
+
+
+def _emit_executed_bypasses(reasons: dict[tuple[_BypassEntry, str], None]) -> None:
+    for entry, reason in reasons:
+        _emit_embedded(entry, reason)
 
 
 class _BypassAuditCompilerMixin:
@@ -111,7 +198,7 @@ class _BypassAuditCompilerMixin:
 
             def audited_execute_sql(*args: Any, **kwargs: Any) -> Any:
                 self._rebac_audit_rendered_sql = False
-                reasons: dict[tuple[object, str], None] = {}
+                reasons: dict[tuple[_BypassEntry, str], None] = {}
                 token = _executing_bypass_audits.set(reasons)
                 try:
                     result = method(*args, **kwargs)
@@ -167,7 +254,7 @@ class _BypassAuditQuery(Query):
     def get_aggregation(self, using: str, aggregate_exprs: Any) -> Any:
         # Django can wrap a sliced or distinct COUNT in a plain AggregateQuery,
         # whose compiler does not inherit this query's execution hook.
-        reasons: dict[tuple[object, str], None] = {}
+        reasons: dict[tuple[_BypassEntry, str], None] = {}
         token = _executing_bypass_audits.set(reasons)
         try:
             result = super().get_aggregation(using, aggregate_exprs)
@@ -200,7 +287,7 @@ class _RebacQuery(_BypassAuditQuery):
     # The bypass entry and reason of an embedded queryset. Clones of one entry
     # share its identity, so a statement that uses it in several expressions
     # audits it once, after it executes.
-    _rebac_pending_bypass_audit: tuple[object, str] | None = None
+    _rebac_pending_bypass_audit: tuple[_BypassEntry, str] | None = None
 
     # Django constructs a query of this class itself only as a piece of the
     # statement it is building: the NOT EXISTS of an exclude() across a to-many
@@ -229,7 +316,7 @@ class _RebacQuery(_BypassAuditQuery):
                 # DeleteQuery or InsertQuery, a third-party class) has no
                 # execution hook: it audits when rendered, so an elevated read
                 # never runs without an audit row.
-                _emit_bypass(pending[1])
+                _emit_embedded(*pending)
         return sql
 
     # A resolved actor-scoped subquery carries what checking it needs, and
@@ -247,12 +334,26 @@ class _RebacQuery(_BypassAuditQuery):
         if self._rebac_statement_part and not hasattr(self, "_rebac_state"):
             return cast(Self, super().resolve_expression(*args, **kwargs))
         clone = cast(Self, self.clone())
+        # The audit follows this resolution's decision: Django resolves a
+        # condition again when the statement compiles, under the actor then.
+        clone._rebac_pending_bypass_audit = None
         state = getattr(self, "_rebac_state", {})
         queryset: RebacQuerySet[Any] = RebacQuerySet(
             model=self.model, query=clone, using=state.get("_db")
         )
         for name, value in state.items():
             setattr(queryset, name, value)
+        earlier = queryset._rebac_scope_decision
+        if (
+            earlier is not None
+            and earlier[1]
+            and not queryset.is_sudo()
+            and not queryset._rebac_eager_scope
+        ):
+            # A bypass an earlier evaluation took from a sudo() block it no
+            # longer runs in is decided again, as a clone's is.
+            queryset._reset_scope()
+            clone = cast(Self, queryset.query)
         # Building an expression runs no query, so it must write no audit row
         # (annotations are built at import time, during app initialisation).
         queryset._apply_scope_in_place(audit=False)
@@ -260,7 +361,9 @@ class _RebacQuery(_BypassAuditQuery):
         # evaluated under actor_context() may be embedded after it has closed.
         decision = queryset._rebac_scope_decision
         actor, bypass = decision if decision is not None else queryset.effective_actor(strict=True)
-        reason = queryset._bypass_audit_reason() if bypass else None
+        if bypass:
+            queryset._capture_ambient_bypass()
+        reason = queryset._bypass_audit_reason(embedded=True) if bypass else None
         pending = (queryset._rebac_bypass_entry, reason) if reason is not None else None
 
         # A set combination has one actor policy, owned by its root queryset.
@@ -745,7 +848,7 @@ class RebacQuerySet(models.QuerySet[_M]):
     _rebac_relation_scope: bool
     _rebac_action: str | None
     _rebac_sudo_reason: str | None
-    _rebac_bypass_entry: object
+    _rebac_bypass_entry: _BypassEntry
     _rebac_field_deny: FieldDenyMode | None
     _rebac_select_related_guards: tuple[str, ...]
 
@@ -758,8 +861,7 @@ class RebacQuerySet(models.QuerySet[_M]):
         self._rebac_relation_scope = False
         self._rebac_action = None
         self._rebac_sudo_reason = None
-        self._rebac_sudo_audited = False
-        self._rebac_bypass_entry = object()
+        self._rebac_bypass_entry = _BypassEntry()
         self._rebac_internal_bypass = False
         self._rebac_ambient_bypass = False
         self._rebac_field_deny = None
@@ -779,8 +881,7 @@ class RebacQuerySet(models.QuerySet[_M]):
         state["_rebac_relation_actor"] = None
         state["_rebac_relation_scope"] = False
         state["_rebac_sudo_reason"] = None
-        state["_rebac_sudo_audited"] = False
-        state["_rebac_bypass_entry"] = object()
+        state["_rebac_bypass_entry"] = _BypassEntry()
         state["_rebac_internal_bypass"] = False
         state["_rebac_ambient_bypass"] = False
         state["_rebac_scope_applied"] = False
@@ -878,8 +979,7 @@ class RebacQuerySet(models.QuerySet[_M]):
         clone = self._clone()
         clone._rebac_actor = ref
         clone._rebac_sudo_reason = None
-        clone._rebac_sudo_audited = False
-        clone._rebac_bypass_entry = object()
+        clone._rebac_bypass_entry = _BypassEntry()
         clone._rebac_internal_bypass = False
         clone._rebac_ambient_bypass = False
         from .relation_loading import rebind_prefetch_actor
@@ -979,10 +1079,8 @@ class RebacQuerySet(models.QuerySet[_M]):
         actor, bypass = clone.effective_actor(strict=True)
         if actor is not None:
             clone._rebac_actor = actor
-        elif bypass and _is_sudo_ambient() and not clone.is_sudo():
-            clone._rebac_sudo_reason = current_sudo_reason()
-            clone._rebac_internal_bypass = True
-            clone._rebac_ambient_bypass = True
+        elif bypass:
+            clone._capture_ambient_bypass()
         clone._rebac_eager_scope = True
         clone._apply_scope_in_place()
         return clone
@@ -1027,19 +1125,36 @@ class RebacQuerySet(models.QuerySet[_M]):
         clone = self._clone()
         clone._rebac_actor = None
         clone._rebac_sudo_reason = reason
-        clone._rebac_sudo_audited = False
-        clone._rebac_bypass_entry = object()
+        clone._rebac_bypass_entry = _BypassEntry()
         clone._rebac_internal_bypass = internal
         clone._rebac_ambient_bypass = False
         clone._refresh_scope()
         return clone
 
-    def _bypass_audit_reason(self) -> str | None:
-        """The reason to audit for this queryset's bypass, or ``None``."""
+    def _capture_ambient_bypass(self) -> None:
+        """Pin the enclosing ``sudo()`` block's bypass on this queryset, if it has none of its own.
+
+        The block's authority outlives it in the queryset (an eager scope, a
+        resolved expression), so the capture is a bypass of its own, audited
+        where it takes effect outside a block.
+        """
+        if self.is_sudo() or not _is_sudo_ambient():
+            return
+        self._rebac_sudo_reason = current_sudo_reason()
+        self._rebac_bypass_entry = _BypassEntry(ambient=True)
+        self._rebac_internal_bypass = True
+        self._rebac_ambient_bypass = True
+
+    def _bypass_audit_reason(self, *, embedded: bool = False) -> str | None:
+        """The reason to audit for this queryset's bypass, or ``None``.
+
+        A captured block is not audited inside a block. ``embedded`` defers
+        that test to the statement that executes it (``_emit_embedded``).
+        """
         if (
             self._rebac_sudo_reason is None
             or (self._rebac_internal_bypass and not self._rebac_ambient_bypass)
-            or (self._rebac_ambient_bypass and _is_sudo_ambient())
+            or (self._rebac_ambient_bypass and _is_sudo_ambient() and not embedded)
         ):
             return None
         return self._rebac_sudo_reason
@@ -1047,13 +1162,11 @@ class RebacQuerySet(models.QuerySet[_M]):
     def _audit_bypass_once(self) -> None:
         from .audit import save_check
 
-        if self._rebac_sudo_audited or save_check.get() is not None:
+        if save_check.get() is not None:
             return
         reason = self._bypass_audit_reason()
-        if reason is None:
-            return
-        _emit_bypass(reason)
-        self._rebac_sudo_audited = True
+        if reason is not None:
+            self._rebac_bypass_entry.audit(reason)
 
     def actor(self) -> SubjectRef | None:
         return self._rebac_actor
@@ -1197,7 +1310,6 @@ class RebacQuerySet(models.QuerySet[_M]):
         clone._rebac_relation_scope = self._rebac_relation_scope
         clone._rebac_action = self._rebac_action
         clone._rebac_sudo_reason = self._rebac_sudo_reason
-        clone._rebac_sudo_audited = self._rebac_sudo_audited
         clone._rebac_bypass_entry = self._rebac_bypass_entry
         clone._rebac_internal_bypass = self._rebac_internal_bypass
         clone._rebac_ambient_bypass = self._rebac_ambient_bypass
@@ -1240,6 +1352,7 @@ class RebacQuerySet(models.QuerySet[_M]):
         clone._rebac_relation_scope = self._rebac_relation_scope
         clone._rebac_action = self._rebac_action
         clone._rebac_sudo_reason = self._rebac_sudo_reason
+        clone._rebac_bypass_entry = self._rebac_bypass_entry
         clone._rebac_eager_scope = self._rebac_eager_scope
         clone._rebac_aggregate_scope = self._rebac_aggregate_scope
         clone._rebac_field_deny = self._rebac_field_deny

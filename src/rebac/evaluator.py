@@ -100,6 +100,7 @@ class PermissionEvaluator:
     """
 
     __slots__ = (
+        "__weakref__",
         "_check_cache",
         "_constant_witnesses",
         "_max_size",
@@ -278,8 +279,9 @@ class PermissionEvaluator:
           whatever changes later. Where something may be kept and the key
           changed, it is decided again.
 
-        See ``rebac.compile.read._constant_witness``. An unhashable statement
-        key is decided every time.
+        ``statement`` names the witness statement, its actor and its database
+        alias (``rebac.compile.read._constant_witness``). An unhashable
+        statement key is decided every time.
         """
         key = (_BackendKey(backend), statement)
         try:

@@ -72,9 +72,27 @@ ARMS = 4
 POST_ARMS = "folder->read + viewer + editor"
 
 
-def _console(post_read: str = f"{POST_ARMS} + admin->member") -> str:
+# The user type of an application often carries a model-backed relation (a
+# person, a profile) that most of its policy never reads. Here an active user
+# holds ``active`` on itself; only the desk's permission reads it.
+LIVE_USER = "\n".join(
+    [
+        "definition auth/user {",
+        '    relation active: auth/user // rebac:attribute={"field":"id","filters":{"is_active":true}}',
+        "}",
+        "definition console/desk {",
+        "    relation owner: auth/user",
+        "    permission view = owner->active",
+        "}",
+    ]
+)
+
+
+def _console(
+    post_read: str = f"{POST_ARMS} + admin->member", user: str = "definition auth/user {}"
+) -> str:
     lines = [
-        "definition auth/user {}",
+        user,
         "definition auth/group {",
         "    relation member: auth/user | auth/group#member",
         "}",
@@ -119,7 +137,17 @@ def console():
     The member reads the first folder through the console chain and one post of
     the second folder directly.
     """
-    local = install_schema(_console())
+    return _install_console(_console())
+
+
+@pytest.fixture
+def live_user_console():
+    """The console, its user type carrying a model-backed relation (``LIVE_USER``)."""
+    return _install_console(_console(user=LIVE_USER))
+
+
+def _install_console(policy: str):
+    local = install_schema(policy)
     with sudo(reason="constant arms fixture"):
         folders = [Folder.objects.create(name=f"folder-{index}") for index in range(2)]
         posts = [
@@ -238,6 +266,56 @@ def test_the_witness_is_kept_for_the_request(console):
         assert len(next_request) == 2
 
 
+@KEPT
+def test_a_model_backed_relation_of_the_user_type_leaves_the_types_that_never_read_it_eligible(
+    live_user_console,
+):
+    local, folders, _posts = live_user_console
+    # Every type admits the user as a subject; only the types whose decisions
+    # read a model column are live: the user's own, the post's (its folder is a
+    # column) and the desk's, whose permission reads the user's relation.
+    for type_ in ("org/role", "auth/group", "blog/folder", "console/t0", f"console/t{CHAIN - 1}"):
+        assert local._cache_generation(type_) is not None, type_
+    for type_ in ("auth/user", "blog/post", "console/desk"):
+        assert local._cache_generation(type_) is None, type_
+    # So the witness of ``org/role`` is kept for the request: one per request
+    # for the administrator, as for the member.
+    for actor in (ADMIN, MEMBER):
+        with evaluator_scope() as evaluator:
+            _ids, first = _read(actor)
+            _ids, again = _read(actor, folder=folders[1])
+            with CaptureQueriesContext(connection) as captured:
+                list(Folder.objects.with_actor(actor).values_list("pk", flat=True))
+            assert evaluator.stats()["constant_witness_entries"] == 1
+        assert (len(first), len(again), len(captured.captured_queries)) == (2, 1, 1)
+    for actor in (ADMIN, MEMBER, OUTSIDER):
+        with evaluator_scope():
+            # The kept witness first, so that the comparison reads the
+            # statements it chooses.
+            _read(actor)
+            assert_scope_matches(Post, actor=actor, action="read")
+            assert_scope_matches(Folder, actor=actor, action="read")
+
+
+@KEPT
+def test_a_type_whose_policy_reads_the_users_model_backed_relation_stays_live(
+    live_user_console,
+):
+    local, _folders, _posts = live_user_console
+    owner = atomic_source_write(get_user_model().objects.create_user, username="owner")
+    actor = SubjectRef.of("auth/user", str(owner.pk))
+    desk = ObjectRef("console/desk", "1")
+    local.write_relationships([RelationshipTuple(desk, "owner", actor)])
+    with evaluator_scope() as evaluator:
+        assert evaluator.check(local, subject=actor, action="view", resource=desk).allowed
+        # A model write: the next check reads the column.
+        owner.is_active = False
+        with sudo(reason="constant arms fixture"):
+            atomic_source_write(owner.save, update_fields=["is_active"])
+        assert not evaluator.check(local, subject=actor, action="view", resource=desk).allowed
+        assert evaluator.stats()["check_entries"] == 0
+
+
 def test_inside_a_transaction_a_held_arm_is_decided_at_each_read(console):
     local, _folders, posts = console
     _ids, policy = _read(MEMBER)
@@ -302,6 +380,24 @@ def test_a_constant_arm_granted_within_a_request_waits_for_the_next_read_scope(c
         assert alone.pk not in _read(MEMBER)[0]
     with evaluator_scope():
         assert _read(MEMBER)[0] == [*(post.pk for post in posts), alone.pk]
+
+
+@KEPT
+def test_after_a_write_behind_the_library_a_read_and_a_check_can_disagree_until_the_scope_ends(
+    console,
+):
+    local, _folders, _posts = console
+    with sudo(reason="constant arms fixture"):
+        alone = Post.objects.create(title="no folder")
+    with evaluator_scope():
+        assert alone.pk not in _read(MEMBER)[0]
+        _grant_behind_the_library("member")
+        # The check evaluates every arm; the read keeps the arms out (a known
+        # limit: the read is narrower, never wider).
+        assert _check(local, MEMBER, alone)
+        assert alone.pk not in _read(MEMBER)[0]
+    with evaluator_scope():
+        assert alone.pk in _read(MEMBER)[0]
 
 
 @KEPT
@@ -598,6 +694,44 @@ def test_reads_match_the_references_inside_and_outside_a_scope(shape):
             # statements it chooses.
             _read(actor)
             assert_scope_matches(Post, actor=actor, action="read")
+
+
+@KEPT
+def test_the_witness_is_kept_per_database(tmp_path):
+    from django.db import connections
+
+    from rebac.models.generation import SchemaGeneration
+    from tests.backend_setup import sqlite_alias
+
+    alias = "witness_other"
+    other = sqlite_alias(alias, tmp_path / "other.sqlite3")
+    connections[alias] = other
+    try:
+        with other.schema_editor() as editor:
+            for model in (Folder, Post, Relationship, SchemaGeneration):
+                editor.create_model(model)
+        _shape("viewer + admin->member", "")
+        SchemaGeneration.objects.using(alias).create(pk=1, revision="")
+        with sudo(reason="constant arms per database"):
+            remote = [Post.objects.using(alias).create(title=f"remote-{n}") for n in range(2)]
+        # On the other database the member holds the constant arm.
+        with other.cursor() as cursor:
+            cursor.execute(
+                f"INSERT INTO {_table()} (resource_type, resource_id, relation, subject_type, "
+                "subject_id, optional_subject_relation, caveat_name, caveat_context, "
+                "caveat_key, written_at_xid) VALUES ('org/role', 'admin', 'member', "
+                "'auth/user', 'member', '', '', NULL, '', 0)"
+            )
+        viewed = list(Post._base_manager.order_by("pk").values_list("pk", flat=True))[:1]
+        with evaluator_scope() as evaluator:
+            # It holds none on the default one: kept there, for that database.
+            assert _read(MEMBER)[0] == viewed
+            ids = Post.objects.using(alias).with_actor(MEMBER).order_by("pk")
+            assert list(ids.values_list("pk", flat=True)) == [post.pk for post in remote]
+            assert evaluator.stats()["constant_witness_entries"] == 2
+    finally:
+        other.close()
+        del connections[alias]
 
 
 @KEPT
