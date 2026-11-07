@@ -135,7 +135,10 @@ design that prevents the worst data-leakage bug class.
   block context at entry; queryset at the first evaluation/update/delete of
   any queryset derived from the `sudo()`/`system_context()` call, once per
   actor and evaluator scope (a row in a rolled-back transaction does not
-  count); instance at first check/save/delete. Engine-internal captures use a private non-audited
+  count); instance at first check/save/delete. Outside an evaluator scope a
+  queryset bypass is audited once per actor for the entry's life, so a
+  long-running process (Celery tasks, Channels consumers) opens an evaluator
+  scope per unit of work. Engine-internal captures use a private non-audited
   path. Rows are durable only if the enclosing transaction commits.
 - Empty `sudo()` calls without `reason` raise when
   `REBAC_REQUIRE_SUDO_REASON = True` (default).

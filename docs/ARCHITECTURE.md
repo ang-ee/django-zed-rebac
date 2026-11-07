@@ -2505,7 +2505,10 @@ and every other clone) share it. It emits one row when the first of them takes
 effect (eager scope application, direct evaluation or write) for each actor
 and evaluator scope, the request: a class-level queryset that views clone per
 request is audited in each request, with that request's actor. Outside an
-evaluator scope, once per actor. A row written inside a transaction counts
+evaluator scope, once per actor for the entry's life: a long-running process
+(Celery tasks, Channels consumers) opens an evaluator scope per unit of work,
+or a module-level entry it derives querysets from is audited once per actor
+per process. A row written inside a transaction counts
 only if that transaction commits: after a rollback, of a savepoint too, the
 next use writes it again. A queryset that `scoped()` pins inside a `sudo()`
 block, and a queryset embedded inside one in an annotation (`Subquery`,
