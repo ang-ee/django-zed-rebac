@@ -179,6 +179,55 @@ def test_two_captures_of_one_queryset_under_sudo_blocks_are_two_bypasses(post):
     assert _bypass_rows("audit.capture-two").count() == 2
 
 
+@pytest.mark.parametrize("embed", ["subquery", "lookup"])
+def test_an_expression_built_inside_a_sudo_block_is_audited_where_it_executes_outside(post, embed):
+    from rebac import RelationshipTuple, to_object_ref
+
+    outsider = SubjectRef.of("auth/user", "outsider")
+    with sudo(reason="test.fixture"):
+        hidden = Post.objects.create(title="hidden")
+    backend().write_relationships([RelationshipTuple(to_object_ref(post), "owner", outsider)])
+    reason = f"audit.block-built.{embed}"
+    with sudo(reason=reason):
+        inner = Post.objects.filter(title="hidden").values("pk")
+        if embed == "subquery":
+            outer = Post.objects.annotate(found=Subquery(inner[:1]))
+            # Executed inside the block, the block's own row covers it.
+            assert list(outer.values_list("found", flat=True))
+        else:
+            outer = Post.objects.filter(pk__in=inner)
+            assert list(outer.all()) == [hidden]
+    assert _bypass_rows(reason).count() == 1
+    with actor_context(outsider):
+        # The block's bypass was pinned when the expression was built: each
+        # statement that executes it outside the block audits it.
+        if embed == "subquery":
+            assert list(outer.values_list("pk", "found")) == [(post.pk, hidden.pk)]
+        else:
+            # The outer rows are the outsider's; the pinned inner bypass runs.
+            assert list(outer.all()) == []
+        assert _bypass_rows(reason).count() == 2
+        assert _actors(reason)[-1] == "outsider"
+
+
+def test_a_queryset_evaluated_inside_a_sudo_block_and_embedded_after_it_is_scoped(post):
+    from rebac import RelationshipTuple, to_object_ref
+
+    outsider = SubjectRef.of("auth/user", "outsider")
+    with sudo(reason="test.fixture"):
+        hidden = Post.objects.create(title="hidden")
+    backend().write_relationships([RelationshipTuple(to_object_ref(post), "owner", outsider)])
+    inner = Post.objects.filter(title="hidden").values("pk")
+    with sudo(reason="audit.evaluated-inside"):
+        assert list(inner) == [{"pk": hidden.pk}]
+    with actor_context(outsider):
+        # Its scope is decided where it is embedded, as by a lookup or a write.
+        found = Post.objects.annotate(found=Subquery(inner)).values_list("pk", "found")
+        assert list(found) == [(post.pk, None)]
+        assert list(Post.objects.filter(pk__in=inner)) == []
+    assert _bypass_rows("audit.evaluated-inside").count() == 1
+
+
 def test_queryset_sudo_raw_is_audited(post):
     rows = list(Post.objects.sudo(reason="audit.raw").raw(f"SELECT * FROM {Post._meta.db_table}"))
     assert [row.pk for row in rows] == [post.pk]

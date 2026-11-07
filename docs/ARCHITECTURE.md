@@ -2497,8 +2497,12 @@ request is audited in each request, with that request's actor. Outside an
 evaluator scope, once per actor. A row written inside a transaction counts
 only if that transaction commits: after a rollback, of a savepoint too, the
 next use writes it again. A queryset that `scoped()` pins inside a `sudo()`
-block is an entry of its own, audited when it first takes effect outside the
-block. When a bypass queryset is embedded in another
+block, and a queryset embedded in an expression (`Subquery`, `Exists`, a
+`pk__in=` lookup) built inside one, keep the block's bypass after it closes:
+each is an entry of its own, audited when it takes effect outside a block (the
+embedded one with each statement that executes it). A queryset evaluated
+inside a block and embedded after it has its scope decided where it is
+embedded, as a lookup or a write on it is. When a bypass queryset is embedded in another
 statement, each execution audits every distinct `(entry, reason)` pair it
 renders, even if that pair appears in several filters, annotations or `Exists`
 expressions. A count followed by a list read audits the embedded entry twice.
