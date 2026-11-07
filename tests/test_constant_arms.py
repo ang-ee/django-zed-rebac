@@ -383,6 +383,24 @@ def test_a_constant_arm_granted_within_a_request_waits_for_the_next_read_scope(c
 
 
 @KEPT
+def test_after_a_write_behind_the_library_a_read_and_a_check_can_disagree_until_the_scope_ends(
+    console,
+):
+    local, _folders, _posts = console
+    with sudo(reason="constant arms fixture"):
+        alone = Post.objects.create(title="no folder")
+    with evaluator_scope():
+        assert alone.pk not in _read(MEMBER)[0]
+        _grant_behind_the_library("member")
+        # The check evaluates every arm; the read keeps the arms out (a known
+        # limit: the read is narrower, never wider).
+        assert _check(local, MEMBER, alone)
+        assert alone.pk not in _read(MEMBER)[0]
+    with evaluator_scope():
+        assert alone.pk in _read(MEMBER)[0]
+
+
+@KEPT
 def test_a_point_check_decides_the_constant_arms_again(console):
     local, _folders, posts = console
     with sudo(reason="constant arms fixture"):

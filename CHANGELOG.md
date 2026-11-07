@@ -44,6 +44,9 @@ pre-1.0; breaking changes within a minor version are explicitly called out.
   kept leaves the arms out when it renders after a tuple write that grants
   one, as a prepared scope omits a new caveat instance; a scope built after
   a tuple write through the library decides the witness again.
+- Known limit: within one evaluator scope, after a write that does not go
+  through this process's tuple writes, a scoped read and a check of one actor
+  can disagree until the scope ends; the read is the narrower.
 
 ## [0.31.4] — 2026-11-07
 

@@ -2292,6 +2292,16 @@ of its own.
   decision about them reads a model column), an actor who holds a constant arm
   pays one witness per read, other actors one per request, and their
   statements keep the constant arms' union branch. There is no scale claim.
+- Within one evaluator scope, after a write that does not go through this
+  process's tuple writes (raw SQL, a data migration, another process), one
+  actor's operations can disagree until the scope ends. Scoped reads,
+  `held()`, `held_many()` and the model rows of `accessible()` follow the kept
+  constant-arm answer; `check_access()` decides the witness at the check, and
+  `check_bulk_permissions()` and `lookup_subjects()` evaluate every arm. A
+  granted constant arm is then seen by a check and not by a read; after a
+  revoked one, the read of an actor who held it admits nothing, while a check
+  still admits what the actor's other arms grant. The read is narrower, never
+  wider, and the next evaluator scope agrees.
 - Id sets are driven from the actor's grants, not bounded by the rows the
   selecting query reads: a read of one parent's children computes the set of
   parents the actor reads, by index from its grants, and then that parent's
