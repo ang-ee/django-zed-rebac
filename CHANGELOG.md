@@ -7,8 +7,9 @@ pre-1.0; breaking changes within a minor version are explicitly called out.
 
 ### Changed
 
-- The decision cache keeps answers about every resource type none of whose
-  decisions reads a model column. `live_backed_resource_types` follows what
+- Behaviour change of a public helper: `live_backed_resource_types` returns
+  fewer types, and the decision cache keeps answers about every resource type
+  none of whose decisions reads a model column. The helper follows what
   the compiler evaluates: a subject set's relation, an arrow's relation and
   its target on each subject type, a constant's target. A relation that
   admits a subject directly compares its id and reads nothing of the
@@ -17,6 +18,13 @@ pre-1.0; breaking changes within a minor version are explicitly called out.
   or a subject set to it. A constant with filters, which is tested on the
   object's row, is a seed of the public helper too; the backend already
   treated it as one.
+- More types are therefore cached for an evaluator scope. A cached
+  `PermissionEvaluator.check()` answer (also behind `check_field_access()`) or
+  field-visibility answer can stay wider than the database until the scope ends:
+  after a revocation written outside this process's tuple writes (another
+  worker, raw SQL), it keeps granting while `check_access()` and reads see the
+  revocation. Long scopes (Celery tasks, subscriptions) are the most exposed;
+  see Known limits in ARCHITECTURE.md.
 - In an application whose user type carries a model-backed relation, inside
   an evaluator scope outside a transaction, an actor who holds a constant arm
   now pays one witness per request instead of one per read, other actors'
@@ -62,7 +70,8 @@ pre-1.0; breaking changes within a minor version are explicitly called out.
   a tuple write through the library decides the witness again.
 - Known limit: within one evaluator scope, after a write that does not go
   through this process's tuple writes, a scoped read and a check of one actor
-  can disagree until the scope ends; the read is the narrower.
+  can disagree until the scope ends; the read is the narrower, but a cached
+  `PermissionEvaluator.check()` answer can be the wider.
 
 ## [0.31.4] — 2026-11-07
 

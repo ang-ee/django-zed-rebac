@@ -2302,6 +2302,17 @@ of its own.
   revoked one, the read of an actor who held it admits nothing, while a check
   still admits what the actor's other arms grant. The read is narrower, never
   wider, and the next evaluator scope agrees.
+- A cached check can be wider than the database. `PermissionEvaluator.check()`
+  (also behind `check_field_access()`, and what GraphQL resolvers reach through
+  the adapter's evaluator) and the field-visibility memo keep their answers for
+  the scope under the decision-cache key, and only this process's tuple writes
+  change that key. After a revocation written another way (another worker, raw
+  SQL, a data migration), a cached answer keeps granting until the scope ends,
+  while `check_access()` and the reads already see the revocation. Long scopes (Celery tasks, subscriptions) are the most
+  exposed; open one scope per unit of work, or call `invalidate()`. A type
+  stays cacheable unless a decision about it reads a model column, so in an
+  application whose user type has a model-backed relation, the types that
+  admit users directly are cached too (since 0.31.5).
 - Id sets are driven from the actor's grants, not bounded by the rows the
   selecting query reads: a read of one parent's children computes the set of
   parents the actor reads, by index from its grants, and then that parent's
