@@ -1901,6 +1901,17 @@ clock.
 
 #### Kept statements and the policy fence
 
+A policy reaches the same id set (an arrow's targets, a subject set's members)
+from many arms: a permission named by several others, a type reached through
+several arrows. The compiler builds each node once per policy, whatever arm
+reaches it, unless a recursion or alias cycle in its reach makes the path
+matter. Each distinct id set (its SQL text and parameters) is written once, as
+a CTE in the `WITH` of the statement's outermost id set, and every occurrence
+selects from its name. A statement therefore grows with the number of distinct
+id sets in reach, not with the number of paths to them, and is the same for
+every actor of one shape. An id set that reads a CTE of the query it sits in
+(a recursive closure's own rows) stays in place.
+
 A statement is compiled once and kept as Django's SQL with placeholders.
 Its key includes the policy, operation and permission, actor shape, database
 alias and vendor, depth limit, active relationship model and scope model.
@@ -2217,11 +2228,12 @@ of its own.
 - SQLite adds up the expression depth of every subquery nested in a WHERE
   clause while it resolves a statement, and refuses one deeper than
   `SQLITE_LIMIT_EXPR_DEPTH` (1000 by default). Nested id sets would make that
-  sum grow with the square of an arrow chain's length. On SQLite the
-  outermost of every run of three nested compiled id sets is therefore a
-  statement-local CTE, whose body does not count toward the depth of the
-  expression that selects from it: the depth then grows with the chain's
-  length, about 25 levels a type for a type with seven arms.
+  sum grow with the square of an arrow chain's length. Each id set is a CTE
+  of the statement (below), whose body does not count toward the depth of the
+  expression that selects from it: the depth grows with the chain's length,
+  about fifteen levels a type for a type with seven arms. SQLite still expands
+  every reference to a CTE while it resolves the statement, so its work grows
+  with the number of paths through shared id sets even where the text does not.
   A recursive form that falls back to nested SQL still grows with
   `REBAC_DEPTH_LIMIT`; choose that limit for the policy and the vendor.
 

@@ -3,6 +3,22 @@
 All notable changes to `django-zed-rebac` are tracked here. The project is in
 pre-1.0; breaking changes within a minor version are explicitly called out.
 
+## [0.31.2] — 2026-11-06
+
+### Fixed
+
+- Permission statements no longer repeat their id sets. Each distinct id set a
+  statement reaches (an arrow's targets, a subject set's members) is written
+  once, as a CTE of the statement, and selected by name wherever it occurs; the
+  compiler also builds a node once whatever arm reaches it, unless a recursion
+  or alias cycle in its reach makes the path matter. On an application console
+  policy (about 150 types, a thousand arrows) the largest statement shrinks
+  from 2.7 MB to 250 KB and a console read's SQL by four to twelve times. On
+  every backend the statement text now carries a `WITH` clause. This replaces
+  0.31.1's SQLite-only CTE for every third nested id set.
+- `RebacManager.get_queryset()` is no longer declared to type checkers, so a
+  custom manager built with `from_queryset` keeps its own queryset type.
+
 ## [0.31.1] — 2026-11-06
 
 ### Fixed
