@@ -8,7 +8,7 @@ from graphlib import CycleError, TopologicalSorter
 from typing import TYPE_CHECKING, Any
 
 from django.core.exceptions import FieldDoesNotExist, FieldError, ValidationError
-from django.db import DEFAULT_DB_ALIAS, connections, models, router
+from django.db import DEFAULT_DB_ALIAS, connections, models
 from django.db.models import Q, QuerySet, Value
 from django.db.models.expressions import BaseExpression, Col, ColPairs, Combinable
 from django.db.models.functions import Coalesce
@@ -17,6 +17,7 @@ from django.db.models.sql.constants import SINGLE
 
 from ._candidate_filters import _candidate_literal, _filter_candidate_targets, _value_is_unresolved
 from ._id import model_identity_fields, model_identity_filter, resource_id_attr
+from .database import read_alias, write_alias
 from .resources import (
     _resolve_dotted,
     model_for_resource_type,
@@ -254,7 +255,7 @@ def generic_target(obj: models.Model, *, using: str | None = None) -> GenericTar
         )
     if obj.pk is None:
         raise ValueError(f"An unsaved {type(obj).__name__} has no primary key to name")
-    alias = using or obj._state.db or router.db_for_read(model)
+    alias = read_alias(model, using=using, instance=obj)
     content_type = ContentType.objects.db_manager(alias).get_for_model(model)
     identity = _resolve_dotted(obj, resource_id_attr(model))
     return GenericTarget(content_type, obj.pk, ObjectRef(resource_type, str(identity)))
@@ -529,7 +530,7 @@ def _proposed_generic_subjects(
         return None
     if content_type_id is None or object_id is None:
         return ()
-    alias = using or router.db_for_write(model)
+    alias = write_alias(model, using=using)
     content_type = _content_type(resolved.target_model, alias)
     if content_type is None or content_type_field.to_python(content_type_id) != content_type.pk:
         return ()

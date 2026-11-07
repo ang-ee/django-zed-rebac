@@ -99,6 +99,12 @@ def post_detail(request, pk):
 
 That's the end-to-end flow. The same `Post.objects.with_actor(...)` pattern works in DRF viewsets, Celery tasks, GraphQL resolvers, management commands, and MCP tools — the actor can be a Django `User`, an `Agent`, an `agents/grant`, or any registered subject. Typed shorthands `as_user(request.user)` and `as_agent(agent, on_behalf_of=request.user)` cover the common cases.
 
+For an operation on another database, use `with rebac.database_context("alias"):`
+to select the default for REBAC schema, tuple, membership and audit operations.
+Explicit queryset `.using(...)`, instance and helper aliases take precedence.
+The scope supplies no authorization and does not redirect application ORM calls;
+see [database selection](./docs/ARCHITECTURE.md#database-selection).
+
 ## Documentation
 
 | Doc | When to read it |

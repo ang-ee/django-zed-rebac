@@ -96,6 +96,7 @@ from collections.abc import Iterator, Mapping
 from typing import TYPE_CHECKING, Any, cast
 
 from .actors import ActorLike
+from .database import read_alias, write_alias
 from .memberships import MEMBER_RELATION
 from .types import ObjectRef, RelationshipTuple, SubjectRef
 
@@ -289,7 +290,7 @@ def imply(*, parent: str | ObjectRef, child: str | ObjectRef) -> RelationshipRow
         # Now any member of storage/role:object_admin is also an
         # effective member of storage/role:object_editor.
     """
-    from django.db import router, transaction
+    from django.db import transaction
 
     from .models import active_relationship_model
     from .relationships import write_relationships
@@ -304,7 +305,7 @@ def imply(*, parent: str | ObjectRef, child: str | ObjectRef) -> RelationshipRow
         subject=SubjectRef(child_ref),
     )
     # Wrap write + read-back: same DoesNotExist race as ``grant``.
-    alias = router.db_for_write(Relationship)
+    alias = write_alias(Relationship)
     with transaction.atomic(using=alias):
         write_relationships([tuple_])
         row = Relationship.objects.using(alias).get(
@@ -324,7 +325,7 @@ def unimply(*, parent: str | ObjectRef, child: str | ObjectRef) -> int:
 
     Returns the number of rows deleted (0 or 1).
     """
-    from django.db import router, transaction
+    from django.db import transaction
 
     from .models import active_relationship_model
     from .relationships import delete_relationship
@@ -339,7 +340,7 @@ def unimply(*, parent: str | ObjectRef, child: str | ObjectRef) -> int:
         subject=SubjectRef(child_ref),
     )
     # Wrap presence-check + delete: same TOCTOU as ``revoke``.
-    alias = router.db_for_write(Relationship)
+    alias = write_alias(Relationship)
     with transaction.atomic(using=alias):
         exists = (
             Relationship.objects.using(alias)
@@ -372,7 +373,7 @@ def implies_of(role: str | ObjectRef) -> Iterator[ObjectRef]:
     Relationship = active_relationship_model()
 
     role_ref = _parse_role(role)
-    rows = Relationship.objects.filter(
+    rows = Relationship.objects.using(read_alias(Relationship)).filter(
         relation=ROLE_INCLUDES_RELATION,
         subject_type=role_ref.resource_type,
         subject_id=role_ref.resource_id,
@@ -393,7 +394,7 @@ def implied_by_of(role: str | ObjectRef) -> Iterator[ObjectRef]:
     Relationship = active_relationship_model()
 
     role_ref = _parse_role(role)
-    rows = Relationship.objects.filter(
+    rows = Relationship.objects.using(read_alias(Relationship)).filter(
         resource_type=role_ref.resource_type,
         resource_id=role_ref.resource_id,
         relation=ROLE_INCLUDES_RELATION,
