@@ -5,6 +5,8 @@ pre-1.0; breaking changes within a minor version are explicitly called out.
 
 ## [Unreleased]
 
+## [0.31.5] — 2026-11-07
+
 ### Changed
 
 - Behaviour change of a public helper: `live_backed_resource_types` returns
