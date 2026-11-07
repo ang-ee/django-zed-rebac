@@ -44,6 +44,7 @@ from typing import Any
 from asgiref.sync import sync_to_async
 from django.db import transaction
 
+from .database import write_alias
 from .types import SubjectRef
 
 
@@ -183,6 +184,7 @@ def emit(
     after: dict[str, Any] | None = None,
     reason: str = "",
     defer_to_commit: bool = True,
+    using: str | None = None,
 ) -> None:
     """Emit a `PermissionAuditEvent` (sync).
 
@@ -208,8 +210,14 @@ def emit(
             even when not in a transaction) and for permission denials
             (which persist while the would-be save rolls back).
 
+    ``using`` selects an explicit database; otherwise ``database_context`` or
+    the model write router selects it. Deferred callbacks retain that alias.
+
     Async callers should prefer :func:`aemit`.
     """
+    from .models import PermissionAuditEvent
+
+    alias = write_alias(PermissionAuditEvent, using=using)
     _ = origin  # accepted for API stability; column not yet defined.
     kwargs = _row_kwargs(
         kind=kind,
@@ -221,16 +229,13 @@ def emit(
     )
 
     def _write() -> None:
-        # Late import — model loading must not block module import time.
-        from .models import PermissionAuditEvent
-
-        PermissionAuditEvent.objects.create(**kwargs)
+        PermissionAuditEvent.objects.using(alias).create(**kwargs)
 
     if defer_to_commit:
         # `on_commit` runs the callback immediately when called outside an
         # atomic block — that's the correct behaviour for the immediate-write
         # case the caller could have asked for explicitly.
-        transaction.on_commit(_write)
+        transaction.on_commit(_write, using=alias)
     else:
         _write_now(_write)
 
@@ -245,6 +250,7 @@ async def aemit(
     after: dict[str, Any] | None = None,
     reason: str = "",
     defer_to_commit: bool = True,
+    using: str | None = None,
 ) -> None:
     """Async sibling of :func:`emit`.
 
@@ -255,6 +261,9 @@ async def aemit(
     on_commit hook itself is sync, but it fires at transaction-commit
     time, which is also when sync code unwinds — no async/sync mismatch).
     """
+    from .models import PermissionAuditEvent
+
+    alias = write_alias(PermissionAuditEvent, using=using)
     _ = origin  # accepted for API stability; column not yet defined.
     kwargs = _row_kwargs(
         kind=kind,
@@ -268,9 +277,7 @@ async def aemit(
     if defer_to_commit:
 
         def _write() -> None:
-            from .models import PermissionAuditEvent
-
-            PermissionAuditEvent.objects.create(**kwargs)
+            PermissionAuditEvent.objects.using(alias).create(**kwargs)
 
         # ``transaction.on_commit`` inspects the current thread's
         # connection (atomic block? autocommit?) and either queues the
@@ -282,12 +289,10 @@ async def aemit(
         # ``on_commit`` sees is consistent, and the eventual ``_write``
         # callback runs in a non-loop context where sync DB calls are
         # legal.
-        await sync_to_async(transaction.on_commit, thread_sensitive=True)(_write)
+        await sync_to_async(transaction.on_commit, thread_sensitive=True)(_write, using=alias)
         return
 
-    from .models import PermissionAuditEvent
-
-    await PermissionAuditEvent.objects.acreate(**kwargs)
+    await PermissionAuditEvent.objects.using(alias).acreate(**kwargs)
 
 
 def _write_now(write_callable: Callable[[], None]) -> None:

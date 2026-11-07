@@ -2,10 +2,9 @@
 
 from __future__ import annotations
 
-from django.db import router
-
 from . import backends
 from .backends.local import LocalBackend
+from .database import write_alias
 from .schema import parse_zed
 from .schema.ast import Schema
 
@@ -30,7 +29,7 @@ def install_schema(
     local = backend if backend is not None else LocalBackend()
     local.set_schema(parse_zed(schema) if isinstance(schema, str) else schema)
     backends._backend = local
-    alias = using or router.db_for_write(active_relationship_model())
+    alias = write_alias(active_relationship_model(), using=using)
     # A flushed test database (TransactionTestCase) loses the migration's row.
     SchemaGeneration.objects.using(alias).get_or_create(pk=1, defaults={"revision": ""})
     return local

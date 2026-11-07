@@ -534,6 +534,9 @@ class Compiler:
         self.used_rows: set[Key] = set()
         self.point = point
         self.shape = actor_shape(self.schema, actor, using)
+        # By key, identity, bound, path and whether depth can be cut: each
+        # node's parts (``_parts``) and their union (``_holds``), built once.
+        self._parts_memo: dict[tuple[Any, ...], list[Q]] = {}
         self._memo: dict[tuple[Any, ...], Q] = {}
         self._own_identity = model_for_subject_type(actor.subject_type)
 
@@ -627,12 +630,34 @@ class Compiler:
         *,
         depth_possible: bool,
     ) -> Q:
-        if key not in self.program.dependencies:
-            return _FALSE
         memo = (key, at, bound, frozenset(visits.items()), depth_possible)
         found = self._memo.get(memo)
         if found is None:
-            found = self._memo[memo] = self._node(
+            found = self._memo[memo] = self._union(
+                at, self._parts(key, at, bound, visits, depth_possible=depth_possible)
+            )
+        return found
+
+    def _parts(
+        self,
+        key: Key,
+        at: At,
+        bound: Bound,
+        visits: Mapping[Key, int],
+        *,
+        depth_possible: bool,
+    ) -> list[Q]:
+        """The disjuncts of ``key`` at ``at``, of which ``_holds`` is the union.
+
+        A union that names this node takes these parts as its own
+        (``_disjuncts``), so a named union adds no nesting level.
+        """
+        if key not in self.program.dependencies:
+            return [_FALSE]
+        memo = (key, at, bound, frozenset(visits.items()), depth_possible)
+        found = self._parts_memo.get(memo)
+        if found is None:
+            found = self._parts_memo[memo] = self._node(
                 key, at, bound, visits, depth_possible=depth_possible
             )
         return found
@@ -645,9 +670,9 @@ class Compiler:
         visits: Mapping[Key, int],
         *,
         depth_possible: bool,
-    ) -> Q:
+    ) -> list[Q]:
         if self.sets is not None and key in self.sets.keys:
-            return self._set_member(key, at, bound)
+            return [self._set_member(key, at, bound)]
         count = visits.get(key, 0)
         hops = visits.get(_HOPS, 0)
         seen_at: Key = ("#seen", f"{key[0]}#{key[1]}")
@@ -655,7 +680,7 @@ class Compiler:
             # The node was already entered at this identity: no relation was
             # followed since.  Its positive least fixed point has no new path
             # on a revisit, in either bound.
-            return _FALSE
+            return [_FALSE]
         recursive = key in self.program.recursive
         if count == 0 and recursive:
             for flatten in (
@@ -666,7 +691,7 @@ class Compiler:
             ):
                 flattened = flatten(key, at, bound, depth_possible=depth_possible)
                 if flattened is not None:
-                    return flattened
+                    return [flattened]
         updated = dict(visits)
         if recursive:
             # The bound counts the relations followed since the component was
@@ -674,23 +699,25 @@ class Compiler:
             first = min(self.program.components[key])
             entered: Key = ("#entered", f"{first[0]}#{first[1]}")
             if hops - updated.setdefault(entered, hops) > self.depth_limit:
-                return _and(_truth(bound is Bound.UPPER and depth_possible), _not_null(at.ref))
+                return [_and(_truth(bound is Bound.UPPER and depth_possible), _not_null(at.ref))]
         if count > len(self.program.dependencies) + self.depth_limit + 1:
             raise SchemaError(f"Permission graph did not terminate at {key!r}")
         updated[key] = count + 1
         updated[seen_at] = hops
         definition = self.schema.get_definition(key[0])
         if definition is None:
-            return _FALSE
+            return [_FALSE]
         relation = next((r for r in definition.relations if r.name == key[1]), None)
         if relation is not None:
-            return self._relation(
-                definition, relation, at, bound, updated, depth_possible=depth_possible
-            )
+            return [
+                self._relation(
+                    definition, relation, at, bound, updated, depth_possible=depth_possible
+                )
+            ]
         permission = self.schema.get_permission(*key)
         if permission is None:
-            return _FALSE
-        return self._expression(
+            return [_FALSE]
+        return self._disjuncts(
             definition,
             permission.expression,
             at,
@@ -1451,13 +1478,50 @@ class Compiler:
 
         parts: list[Q] = []
         for arm in sorted(arms, key=lambda arm: not constant(arm)):
-            part = self._expression(
+            found = self._disjuncts(
                 definition, arm, at, bound, visits, depth_possible=depth_possible
             )
-            if part is _TRUE:
+            if any(part is _TRUE for part in found):
                 return [_TRUE]
-            parts.append(part)
+            parts.extend(found)
         return parts
+
+    def _disjuncts(
+        self,
+        definition: Definition,
+        expr: PermExpr,
+        at: At,
+        bound: Bound,
+        visits: Mapping[Key, int],
+        *,
+        depth_possible: bool,
+    ) -> list[Q]:
+        """``expr`` as parts of the union it is an arm of.
+
+        A plain union gives its arms' parts and an untagged name gives its
+        node's (``_parts``): a union that names a union is one union, built
+        from the same memoized nodes, not a union of unions.  A tagged arm
+        keeps its deadline whole.
+        """
+        if (
+            isinstance(expr, PermRef)
+            and expr.name not in ("authenticated", "anonymous")
+            and not self._tagged_inside(expr)
+        ):
+            return self._parts(
+                (definition.resource_type, expr.name),
+                at,
+                bound,
+                visits,
+                depth_possible=depth_possible,
+            )
+        if isinstance(expr, PermBinOp) and expr.op == "+":
+            arms = self._union_arms(expr)
+            if len(arms) > 1:
+                return self._arms(definition, arms, at, bound, visits, depth_possible)
+        return [
+            self._expression(definition, expr, at, bound, visits, depth_possible=depth_possible)
+        ]
 
     def _anti_expression(
         self,

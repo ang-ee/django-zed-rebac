@@ -10,6 +10,7 @@ from typing import TYPE_CHECKING, Any, cast
 from django.db import models, router
 from django.db.models.base import ModelBase
 
+from ..database import write_alias
 from ..errors import SchemaError
 from .generation import SchemaGeneration, schema_write_atomic
 
@@ -89,7 +90,7 @@ def schema_changes(using: str | None = None) -> Iterator[None]:
     """
     from . import active_relationship_model
 
-    alias = using or router.db_for_write(active_relationship_model())
+    alias = write_alias(active_relationship_model(), using=using)
     with schema_index_write(alias):
         yield
 

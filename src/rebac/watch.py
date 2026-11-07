@@ -21,6 +21,7 @@ from django.core.exceptions import FieldDoesNotExist
 from django.db import DatabaseError, connections, models, transaction
 
 from ._id import model_identity_fields, resource_id_attr
+from .database import database_context
 from .field_backing import (
     _relation_path,
     resolve_attribute_backing,
@@ -342,8 +343,6 @@ def gate_policy(using: str, backend: LocalBackend | None = None) -> GatePolicy |
         held = _open.get()
         if using in held:
             return held[using]
-    from .models import SchemaDefinition
-
     active = backend if backend is not None else active_backend()
     if not isinstance(active, LocalBackend):
         return None
@@ -352,8 +351,8 @@ def gate_policy(using: str, backend: LocalBackend | None = None) -> GatePolicy |
         return None
     # Where the schema lives on the written alias, the revision just read is
     # the one to load it at: one read per gated write.
-    stored = not active._schema_is_manual and using == SchemaDefinition.objects.db
-    schema = active._schema_snapshot(revision if stored else None).schema
+    stored = not active._schema_is_manual
+    schema = active._schema_snapshot(revision if stored else None, using=using).schema
     with _lock:
         kept = _policies.get(id(schema))
         if kept is not None and kept[0] is schema:
@@ -381,7 +380,7 @@ def model_write(
     policy = gate_policy(using)
     token = _open.set({**held, using: policy}) if using not in held else None
     try:
-        with transaction.atomic(using=using):
+        with database_context(using), transaction.atomic(using=using):
             yield policy is not None and model_is_watched(policy.watched, model, names)
     finally:
         if token is not None:

@@ -507,6 +507,7 @@ from rebac import (
 
     # Convenience helpers
     write_relationships, delete_relationships, delete_relationship, backend,
+    database_context,                  # context-local default for REBAC-owned database operations
 
     # One transaction and one validation for a block of stored-schema writes
     schema_changes,
@@ -569,6 +570,29 @@ from rebac.memberships import grant, revoke, members_of, containers_of   # direc
 from rebac.roles  import grant, revoke, roles_of, members_of   # role-as-namespace helpers
 from rebac.testing import install_schema   # test helper: make a schema and backend current
 ```
+
+### Database selection
+
+`rebac.database_context(using: str)` supplies a context-local database default
+for REBAC-owned operations that have no explicit alias: backend schema and tuple
+operations, membership helpers and audit emission. It neither changes Django's
+routers nor redirects arbitrary application ORM calls, and grants no authority.
+Use it with normal `with` in synchronous or asynchronous code; nested scopes,
+exceptions and concurrent async tasks retain normal `ContextVar` isolation.
+
+An explicitly selected queryset `.using(alias)`, instance save/delete alias or
+helper `using` argument (including audit `emit` / `aemit`) remains authoritative.
+Native permission compilation
+uses the statement's known alias for both its policy snapshot and data reads,
+even inside a different ambient database context. Without a scope, each owner
+retains its existing Django router behavior. Direct Django ORM callers continue
+to select databases through Django's own APIs.
+
+The existing per-alias/revision schema snapshot cache remains the sole cache.
+Schema pins and permission decisions never cross aliases. Audit callbacks capture
+the selected alias when emitted and register against that alias's transaction,
+so later scope changes do not redirect a deferred audit write. Relationship
+writes, generation reads and membership projections share the selected alias.
 
 `rebac.testing.install_schema(schema, *, backend=None, using=None)` is the
 supported way for a dependent project's tests to run against a schema of
@@ -1839,6 +1863,11 @@ bounds select the same objects.
   a queryset of the model's identities and the arms are united, so no `OR` is
   left above a subquery of the row's model. At an identity that is not a row
   (a tuple column, a parameter) the arms are joined with `OR`.
+- **A union that names a union is one union.** An arm that names a
+  permission or relation of the same type contributes that node's own arms,
+  built once by the same memoized node in the same order: `read = granted +
+  chatter` is the union of the arms of both, not a union of two unions, so a
+  name adds no subquery level. A tagged arm keeps its deadline whole.
 - **A negated disjunction is a conjunction of `NOT EXISTS`**, one per arm.
   `NOT IN` is never emitted.
 - **Membership is two-valued.** An `IN` arm is `ref IS NOT NULL AND ref IN
@@ -3327,7 +3356,9 @@ For each AppConfig that declares rebac_schema:
      b. Look up PackageManagedRecord by (package, external_id).
      c. If not found → create Schema* row + PackageManagedRecord. (Fresh install.)
      d. If found and content_hash matches → no-op.
-     e. If found and content_hash differs and no_update=True → skip + warn.
+     e. If found and content_hash differs and no_update=True → skip + warn,
+        naming the cause: `declaration changed` when the row still holds what
+        the last sync wrote, `admin-edited` when it does not.
      f. If found and content_hash differs and no_update=False → update + bump
         last_synced_at.
   4. Detect orphans: PackageManagedRecord with no matching .zed fragment.

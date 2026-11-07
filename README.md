@@ -88,7 +88,7 @@ else has to be built, and fixture loads or bulk writes need no command
 afterwards. Write aliases for the models a permission reads and for
 relationships must match; separate read replicas are allowed. After a database
 flush, run `rebac sync` again before serving. See the
-[upgrade notes](./CHANGELOG.md#unreleased).
+[upgrade notes](./CHANGELOG.md#0302--2026-11-07).
 
 ```python
 # blog/views.py
@@ -98,6 +98,12 @@ def post_detail(request, pk):
 ```
 
 That's the end-to-end flow. The same `Post.objects.with_actor(...)` pattern works in DRF viewsets, Celery tasks, GraphQL resolvers, management commands, and MCP tools — the actor can be a Django `User`, an `Agent`, an `agents/grant`, or any registered subject. Typed shorthands `as_user(request.user)` and `as_agent(agent, on_behalf_of=request.user)` cover the common cases.
+
+For an operation on another database, use `with rebac.database_context("alias"):`
+to select the default for REBAC schema, tuple, membership and audit operations.
+Explicit queryset `.using(...)`, instance and helper aliases take precedence.
+The scope supplies no authorization and does not redirect application ORM calls;
+see [database selection](./docs/ARCHITECTURE.md#database-selection).
 
 ## Documentation
 
@@ -150,7 +156,7 @@ hooks, so each feature release is verified before the bound moves.
 
 Versioning follows SemVer while the project is below 1.0: minor releases may add public API and tighten alpha contracts; patch releases are reserved for compatible fixes.
 
-Database support: PostgreSQL 15+ (production target), MySQL 8.4+ (opt-in vendor suite), SQLite (test/dev only). CI runs SQLite and PostgreSQL; the MySQL suite is a release gate. The `Relationship` indexes ship in `0001_initial.py`. After upgrading, run `migrate`; no other command is needed. Behaviour on PostgreSQL tables of tens of millions of rows has not been verified yet. See [upgrade notes](./CHANGELOG.md#unreleased) for the removed commands, checks and settings and for the recursion bound.
+Database support: PostgreSQL 15+ (production target), MySQL 8.4+ (opt-in vendor suite), SQLite (test/dev only). CI runs SQLite and PostgreSQL; the MySQL suite is a release gate. The `Relationship` indexes ship in `0001_initial.py`. After upgrading, run `migrate`; no other command is needed. Behaviour on PostgreSQL tables of tens of millions of rows has not been verified yet. See [upgrade notes](./CHANGELOG.md#0302--2026-11-07) for the removed commands, checks and settings and for the recursion bound.
 
 ## Comparison
 

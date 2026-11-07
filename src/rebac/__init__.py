@@ -19,7 +19,7 @@ from typing import TYPE_CHECKING, Any
 try:
     __version__ = version("django-zed-rebac")
 except PackageNotFoundError:
-    __version__ = "0.30.1"
+    __version__ = "0.30.2"
 
 default_app_config = "rebac.apps.RebacConfig"
 
@@ -49,6 +49,7 @@ from .consistency import (
     record_zookie,
     zookie_scope,
 )
+from .database import database_context
 from .errors import (
     CaveatUnsupportedError,
     MissingActorError,
@@ -214,6 +215,7 @@ __all__ = [
     "SchemaError",
     "RebacError",
     # helpers
+    "database_context",
     "write_relationships",
     "delete_relationship",
     "delete_relationships",
