@@ -63,16 +63,15 @@ def setup(request, monkeypatch):
 
 def _scope(compiler: Compiler, model, resource_type: str):
     _, field = model_identity_fields(model, "pk")
-    return model._base_manager.filter(
-        compiler.holds((resource_type, "read"), At(resource_type, F("pk"), field, True))
-    )
+    condition = compiler.holds((resource_type, "read"), At(resource_type, F("pk"), field, True))
+    return compiler.statement(model._base_manager.filter(condition))
 
 
 def _point(compiler: Compiler, resource_type: str, object_id: str, bound=Bound.LOWER):
     condition = compiler.holds(
         (resource_type, "read"), At(resource_type, Value(object_id), None, False), bound
     )
-    return SchemaGeneration.objects.filter(pk=1).filter(condition).exists()
+    return compiler.statement(SchemaGeneration.objects.filter(pk=1).filter(condition)).exists()
 
 
 def test_tuple_only_exclusion_and_wildcard_are_evaluated_at_identity(setup, django_user_model):

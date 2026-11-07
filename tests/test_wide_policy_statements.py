@@ -24,7 +24,7 @@ from django.db import connection
 
 from rebac import ObjectRef, RelationshipTuple, SubjectRef, sudo, to_object_ref
 from rebac.compile import read
-from rebac.compile.predicate import _Compiled
+from rebac.compile.predicate import Compiler
 from rebac.testing import install_schema
 from tests.testapp.models import Post
 
@@ -105,10 +105,16 @@ def _scope_statement(local, actor: SubjectRef) -> tuple[str, tuple[object, ...]]
     return compiled.sql, tuple(compiled.params)
 
 
+def _id_set_name() -> str:
+    """A pattern for an id set's quoted CTE name."""
+    opening, closing = connection.ops.quote_name("rebac_ids_0").split("rebac_ids_0")
+    return re.escape(opening) + r"(rebac_ids_\d+_*)" + re.escape(closing)
+
+
 def _definitions(sql: str, params: tuple[object, ...]) -> list[tuple[str, tuple[object, ...]]]:
     """Each id-set definition of a statement: its body and the parameters it binds."""
     found = []
-    for match in re.finditer(r'"rebac_ids_\d+" AS \(', sql):
+    for match in re.finditer(_id_set_name() + r" AS \(", sql):
         depth = 0
         for end in range(match.end() - 1, len(sql)):
             depth += {"(": 1, ")": -1}.get(sql[end], 0)
@@ -120,21 +126,60 @@ def _definitions(sql: str, params: tuple[object, ...]) -> list[tuple[str, tuple[
     return found
 
 
-def test_a_statement_grows_with_its_distinct_id_sets_not_its_paths():
+def _counting_nodes(monkeypatch) -> list[int]:
+    """Count the permission nodes the compiler builds (a memo miss each)."""
+    built = [0]
+    node = Compiler._node
+
+    def counted(self, *args, **kwargs):
+        built[0] += 1
+        return node(self, *args, **kwargs)
+
+    monkeypatch.setattr(Compiler, "_node", counted)
+    return built
+
+
+def _scope_ids(local, actor: SubjectRef) -> list[int]:
+    scope = read.scope_q(backend=local, model=Post, action="read", actor=actor, using="default")
+    return list(Post._base_manager.filter(scope).values_list("pk", flat=True))
+
+
+def test_a_statement_grows_with_its_distinct_id_sets_not_its_paths(monkeypatch):
+    built = _counting_nodes(monkeypatch)
     single = _scope_sql(install_schema(_schema(BRANCHING, branching=False)), ACTOR)
+    single_nodes = built[0]
     local, post = _install(BRANCHING, branching=True)
+    read.reset()
+    built[0] = 0
     sql = _scope_sql(local, ACTOR)
-    # 2 ** 9 paths reach the last type, through the same id sets as one path.
+    # 2 ** 9 paths reach the last type, through the same id sets as one path:
+    # the compiler builds each permission node once, and writes each id set once.
+    assert built[0] <= 2 * single_nodes
     assert len(sql) < 1.5 * len(single)
     assert len(sql) < 120_000
-    # No subquery is written twice with the same text and the same parameters.
+    # No id set is defined twice with the same text and the same parameters.
     statement, params = _scope_statement(local, ACTOR)
     definitions = _definitions(statement, params)
+    assert definitions
     assert len(definitions) == len(set(definitions))
-    # Nothing in the statement depends on the actor beyond its bound parameters.
+    # The kept statement defines every id set it selects from.
+    defined = set(re.findall(_id_set_name() + r" AS \(", statement))
+    assert set(re.findall(r"FROM " + _id_set_name(), statement)) == defined
+    assert _scope_ids(local, ACTOR) == [post.pk]
+    # Nothing in the statement depends on the actor beyond its bound
+    # parameters: compiled afresh for another actor, it is the same text.
+    read.reset()
     assert _scope_sql(local, OTHER) == sql
-    scope = read.scope_q(backend=local, model=Post, action="read", actor=ACTOR, using="default")
-    assert list(Post._base_manager.filter(scope).values_list("pk", flat=True)) == [post.pk]
+    assert _scope_ids(local, OTHER) == []
+
+
+def test_each_enumeration_branch_defines_the_id_sets_it_selects():
+    # The branches of an enumeration share one compiler and are not kept.
+    local, post = _install(3, branching=True)
+    assert local.accessible(subject=ACTOR, action="read", resource_type="blog/post") == [
+        str(post.pk)
+    ]
+    assert local.accessible(subject=OTHER, action="read", resource_type="blog/post") == []
 
 
 @pytest.mark.skipif(connection.vendor != "sqlite", reason="SQLite's expression depth")
@@ -143,11 +188,10 @@ def test_a_long_arrow_chain_reads_under_a_fixed_expression_depth():
     connection.ensure_connection()
     raw = connection.connection
     previous = raw.getlimit(sqlite3.SQLITE_LIMIT_EXPR_DEPTH)
-    # Measured at 350; well inside SQLite's default of 1000.
+    # Measured at 341; well inside SQLite's default of 1000.
     raw.setlimit(sqlite3.SQLITE_LIMIT_EXPR_DEPTH, 450)
     try:
-        scope = read.scope_q(backend=local, model=Post, action="read", actor=ACTOR, using="default")
-        assert list(Post._base_manager.filter(scope).values_list("pk", flat=True)) == [post.pk]
+        assert _scope_ids(local, ACTOR) == [post.pk]
         assert local.check_access(
             subject=ACTOR, action="read", resource=to_object_ref(post)
         ).allowed
@@ -158,7 +202,8 @@ def test_a_long_arrow_chain_reads_under_a_fixed_expression_depth():
 @pytest.mark.skipif(connection.vendor != "sqlite", reason="SQLite's expression depth")
 def test_the_same_chain_with_id_sets_nested_in_place_exceeds_sqlites_depth(monkeypatch):
     local, _post = _install(CHAIN, branching=False)
-    monkeypatch.setattr(_Compiled, "as_sql", _Compiled._compile)
+    # Each id set where it occurs, not selected from its CTE.
+    monkeypatch.setattr(Compiler, "_ids", lambda self, rows: rows.order_by())
     read.reset()
     scope = read.scope_q(backend=local, model=Post, action="read", actor=ACTOR, using="default")
     with pytest.raises(Exception, match="Expression tree is too large"):

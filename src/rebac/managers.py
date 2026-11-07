@@ -2145,21 +2145,19 @@ class RebacManager[M: models.Model](_RebacManagerBase[M]):  # pyright: ignore[re
     model parameter through queryset chains.
     """
 
-    # Runtime only. django-stubs types get_queryset() from the queryset class a
-    # manager is built with (``from_queryset``); a declared override here would
-    # replace every custom manager's queryset type with RebacQuerySet.
-    if not TYPE_CHECKING:
+    # Typed as Django's ``Manager.get_queryset``, which every manager base of a
+    # ``from_queryset`` subclass shares; a subclass may narrow it to its own
+    # queryset class.
+    def get_queryset(self) -> models.QuerySet[M, M]:
+        """Give a related manager's fresh queryset its source instance's actor pin."""
+        from .mixins import RebacMixin
 
-        def get_queryset(self):
-            """Give a related manager's fresh queryset its source instance's actor pin."""
-            from .mixins import RebacMixin
-
-            queryset = super().get_queryset()
-            instance = getattr(self, "instance", None)
-            if isinstance(instance, RebacMixin) and hasattr(self, "core_filters"):
-                queryset._rebac_relation_actor = instance.actor()
-                queryset._rebac_relation_scope = True
-            return queryset
+        queryset = cast(RebacQuerySet[M], super().get_queryset())
+        instance = getattr(self, "instance", None)
+        if isinstance(instance, RebacMixin) and hasattr(self, "core_filters"):
+            queryset._rebac_relation_actor = instance.actor()
+            queryset._rebac_relation_scope = True
+        return queryset
 
     # Static declarations for checkers without Django's from_queryset plugin.
     # Runtime dispatch remains Django's native generated queryset methods.

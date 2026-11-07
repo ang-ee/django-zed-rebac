@@ -58,7 +58,6 @@ from .evaluate import named_subjects, residual
 from .predicate import (
     PointRow,
     _and,
-    _Compiled,
     _Param,
     actor_shape,
     bind,
@@ -342,6 +341,7 @@ class _Operation:
     ) -> _Kept | bool:
         """Compile SQL, kept when its only varying values are bound parameters.
 
+        ``build`` returns the statement's root (``Compiler.statement``).
         ``cache`` is off for a statement that embeds per-read literals.
         """
         # A statement can be kept when nothing in it varies but the actor's
@@ -360,14 +360,19 @@ class _Operation:
             compiled = built
         else:
             rows, every = built if isinstance(built, tuple) else (built, False)
+            query = rows.query.clone()
+            # Parenthesised, to embed; a set of ids has no order.
+            query.subquery = True
+            query.clear_ordering(force=True)
+            compiler = query.get_compiler(using=self.using)
             try:
-                sql, params = _Compiled(rows).as_sql(None, connections[self.using])
+                sql, params = query.as_sql(compiler, compiler.connection)
             except EmptyResultSet:
                 # No row can satisfy it: an unpublished policy, or a
                 # condition Django proves empty.
                 compiled = False
             else:
-                compiled = _Kept(sql, params, every)
+                compiled = _Kept(sql, tuple(params), every)
         if keep:
             with _lock:
                 _statements[full] = compiled
@@ -428,7 +433,9 @@ def _point_statement(
             if is_false(condition):
                 return False
         rows = operation.gate()
-        return (rows if is_true(condition) else rows.filter(condition)).values("pk")
+        if is_true(condition):
+            return rows.values("pk")
+        return compiler.statement(rows.filter(condition).values("pk"))
 
     return operation.statement(("point", key, which, row_types), verdicts, build)
 
@@ -855,7 +862,7 @@ def _scope_statement(
             rows = rows.filter(**{f"{resource_id_attr(model)}__in": candidates})
         # The row predicate goes last: it holds the nested subqueries.
         rows = rows.filter(Q(Exists(gate)) & predicate)
-        return rows.order_by().values(resource_id_attr(model)), False
+        return compiler.statement(rows.order_by().values(resource_id_attr(model))), False
 
     return operation.statement(("scope", label, key), verdicts, build, cache=candidates is None)
 
@@ -1163,7 +1170,9 @@ def _accessible_branches(
         else:
             condition = gate & compiler.holds(key, _model_at(model), Bound.LOWER)
         rows = model._base_manager.using(self.using).filter(condition)
-        branches.append((rows.order_by().values_list(identity, flat=True), wire))
+        branches.append(
+            (compiler.statement(rows.order_by().values_list(identity, flat=True)), wire)
+        )
     elif model is None:
         # A configured User or Group mapping has rows but no resource model.
         subject = model_for_subject_type(self.resource_type)
@@ -1179,9 +1188,11 @@ def _accessible_branches(
             at = At(self.resource_type, F("_rebac_wire_id"), None, False)
             branches.append(
                 (
-                    subject_rows.filter(gate & compiler.holds(key, at, Bound.LOWER))
-                    .order_by()
-                    .values_list("_rebac_wire_id", flat=True),
+                    compiler.statement(
+                        subject_rows.filter(gate & compiler.holds(key, at, Bound.LOWER))
+                        .order_by()
+                        .values_list("_rebac_wire_id", flat=True)
+                    ),
                     lambda value: value or None,
                 )
             )
@@ -1189,10 +1200,12 @@ def _accessible_branches(
         at = At(self.resource_type, F(column), None, False)
         branches.append(
             (
-                named.filter(gate & compiler.holds(key, at, Bound.LOWER))
-                .order_by()
-                .values_list(column, flat=True)
-                .distinct(),
+                compiler.statement(
+                    named.filter(gate & compiler.holds(key, at, Bound.LOWER))
+                    .order_by()
+                    .values_list(column, flat=True)
+                    .distinct()
+                ),
                 lambda value: value or None,
             )
         )

@@ -11,23 +11,22 @@ Three rules shape every statement:
   EXISTS``;
 * an arm over a multi-valued path is its own subquery, so two arms never share
   a join;
-* an uncorrelated id set is compiled by Django once and embedded as text
-  (``_Compiled``), so building a statement does not re-resolve its subqueries
-  at every level.  This is the accepted plan-cache exception of ARCHITECTURE:
-  the SQL is Django's own.
+* an uncorrelated id set is one CTE of its statement (``Compiler._ids``),
+  defined once however many arms reach it and selected by name, so building a
+  statement does not re-resolve its subqueries at every level; the statement's
+  root attaches them (``Compiler.statement``).
 """
 
 from __future__ import annotations
 
 from collections.abc import Iterable, Mapping, Sequence
-from contextvars import ContextVar
 from dataclasses import dataclass
 from datetime import datetime
 from enum import StrEnum
 from typing import Any, Final, Protocol, cast
 
 from django.apps import apps
-from django.core.exceptions import FieldDoesNotExist
+from django.core.exceptions import EmptyResultSet, FieldDoesNotExist
 from django.db import connections, models
 from django.db.models import Exists, Expression, F, OuterRef, Q, QuerySet, Value
 from django.db.models.expressions import Col
@@ -208,114 +207,9 @@ def _before(now: Expression, deadline: datetime) -> Q:
     return Q(LessThan(now, Value(deadline, output_field=models.DateTimeField())))
 
 
-class _IdSets:
-    """The id sets of one statement, each defined once as a CTE of that statement.
-
-    A policy reaches the same id set from many arms: a permission referred to by
-    several others, an arrow followed from several types. Each distinct id set
-    (its SQL text and parameters) is defined once and selected by name
-    wherever it occurs. Nesting goes through names, not subqueries, which
-    also keeps SQLite's expression depth linear in an arrow chain's length.
-    """
-
-    def __init__(self) -> None:
-        self.bodies: list[tuple[str, str, tuple[Any, ...]]] = []
-        self.names: dict[tuple[str, Any], str] = {}
-        # By the identity of an id set's rows, kept alive while they key it.
-        self.references: dict[int, tuple[str, tuple[Any, ...]]] = {}
-        self.held: list[QuerySet[Any]] = []
-
-    def name(self, sql: str, params: tuple[Any, ...]) -> str:
-        key: tuple[str, Any] = sql, params
-        try:
-            hash(key)
-        except TypeError:
-            # An unhashable parameter (a list) leaves this id set its own CTE.
-            key = sql, id(params)
-        found = self.names.get(key)
-        if found is None:
-            found = self.names[key] = f"rebac_ids_{len(self.bodies)}"
-            self.bodies.append((found, sql, params))
-        return found
-
-
-# The id sets of the statement being compiled, while it compiles.
-_statement_id_sets: ContextVar[_IdSets | None] = ContextVar("rebac_statement_id_sets", default=None)
-
-
-class _Compiled(Expression):
-    """An uncorrelated id set: compiled by Django once, embedded as text.
-
-    Django resolves a ``Subquery`` again inside every enclosing ``filter()``,
-    which makes the cost of building a nested statement grow with its depth
-    times its size.  The rows here never refer to an outer query, so their own
-    compiler produces the same SQL the nested resolution would.
-
-    The outermost id set of a statement carries a ``WITH`` that defines every
-    distinct id set nested in it once (``_IdSets``); the nested ones select
-    from their name. ``hoist=False`` keeps an id set in place: one that reads
-    a CTE of the query it is nested in cannot move to the statement's top.
-    """
-
-    subquery = True
-
-    def __init__(self, rows: QuerySet[Any], *, hoist: bool = True) -> None:
-        super().__init__(output_field=models.TextField())
-        self.rows = rows
-        self.hoist = hoist
-
-    def _compile(self, compiler: Any, connection: Any) -> tuple[str, tuple[Any, ...]]:
-        query = self.rows.query.clone()
-        query.subquery = True
-        # An id set has no order; Django 6.1 applies a model's default
-        # ordering to a combined query, which an id projection cannot sort by.
-        query.clear_ordering(force=True)
-        sql, params = query.as_sql(compiler, connection)
-        return sql, tuple(params)
-
-    def as_sql(self, compiler: Any, connection: Any) -> tuple[str, tuple[Any, ...]]:
-        id_sets = _statement_id_sets.get()
-        if id_sets is None:
-            # The outermost id set: the statement its nested id sets belong to.
-            id_sets = _IdSets()
-            token = _statement_id_sets.set(id_sets)
-            try:
-                sql, params = self._compile(compiler, connection)
-            finally:
-                _statement_id_sets.reset(token)
-            if not id_sets.bodies:
-                return sql, params
-            qn = connection.ops.quote_name
-            selected = sql[1:-1]
-            if selected.lstrip().upper().startswith("WITH"):
-                # A statement with a WITH of its own is one more definition.
-                selected = f"SELECT * FROM {qn(id_sets.name(sql, params))}"
-                params = ()
-            definitions = ", ".join(f"{qn(name)} AS {body}" for name, body, _ in id_sets.bodies)
-            bound = tuple(param for _, _, body_params in id_sets.bodies for param in body_params)
-            # ``sql`` is the parenthesised select; the WITH goes inside.
-            return f"(WITH {definitions} {selected})", (*bound, *params)
-        if not self.hoist:
-            return self._compile(compiler, connection)
-        # Django copies an expression as it resolves it; the copies share
-        # their rows, which the statement then compiles once.
-        reference = id_sets.references.get(id(self.rows))
-        if reference is None:
-            sql, params = self._compile(compiler, connection)
-            name = connection.ops.quote_name(id_sets.name(sql, params))
-            reference = id_sets.references[id(self.rows)] = f"(SELECT * FROM {name})", ()
-            id_sets.held.append(self.rows)
-        return reference
-
-
 def _one_object(ref: Any) -> bool:
     """The reference is a statement constant: a value or a bound parameter."""
     return isinstance(ref, (Value, _Param))
-
-
-def _in(expr: Expression | F | OuterRef, rows: QuerySet[Any]) -> Q:
-    """Two-valued membership: a NULL reference is not a member."""
-    return _not_null(expr) & Q(In(expr, _Compiled(rows)))
 
 
 # ---------- The actor ----------
@@ -508,6 +402,9 @@ class Compiler:
         self._relevant: dict[Key, frozenset[Key]] = {}
         self._own_identity = model_for_subject_type(actor.subject_type)
         self._cte_tables: set[str] | None = None
+        # The statement's id sets, in definition order, and by SQL and parameters.
+        self._id_sets: list[CTE] = []
+        self._id_set_names: dict[tuple[str, tuple[Any, ...]], CTE] = {}
 
     def _cte_name(self, name: str) -> str:
         """A CTE name that no model table of the project already uses."""
@@ -522,6 +419,62 @@ class Compiler:
     def _cte_queryset(self, cte: CTE) -> QuerySet[Any]:
         selected = cte.queryset()
         return QuerySet(model=selected.model, query=selected.query, using=self.using)
+
+    # ---------- The statement and its id sets ----------
+
+    def statement(self, rows: QuerySet[Any]) -> QuerySet[Any]:
+        """``rows`` as a statement's root, its ``WITH`` defining the compiler's id sets.
+
+        Every predicate the compiler built selects its id sets by name.  A
+        compiler that builds several statements (an enumeration's branches)
+        gives each one the id sets defined so far.
+        """
+        if not self._id_sets:
+            return rows
+        return cast(QuerySet[Any], with_cte(*self._id_sets, select=rows))
+
+    def _ids(self, rows: QuerySet[Any]) -> QuerySet[Any]:
+        """An uncorrelated id set, selected from the CTE that defines it.
+
+        A policy reaches the same id set from many arms: a permission referred
+        to by several others, an arrow followed from several types.  Each
+        distinct id set (its SQL and parameters) is one CTE of the statement
+        (``statement``), registered after the id sets its rows select from.
+        Nesting goes through names, not subqueries: Django resolves a
+        selection from a name, not the id set, inside every enclosing
+        ``filter()``, and SQLite's expression depth, which does not count a
+        CTE's body, stays linear in an arrow chain's length.
+        """
+        body = rows.query.clone()
+        # An id set has no order; Django 6.1 applies a model's default
+        # ordering to a combined query, which an id projection cannot sort by.
+        body.clear_ordering(force=True)
+        try:
+            sql, params = body.get_compiler(using=self.using).as_sql()
+        except EmptyResultSet:
+            # Django proves it empty in place, under the predicate it is in.
+            return rows
+        key = sql, tuple(params)
+        try:
+            cte = self._id_set_names.get(key)
+            shared = True
+        except TypeError:
+            # An unhashable parameter leaves the id set its own CTE.
+            cte, shared = None, False
+        if cte is None:
+            cte = CTE(
+                QuerySet(model=rows.model, query=body, using=self.using),
+                name=self._cte_name(f"rebac_ids_{len(self._id_sets)}"),
+            )
+            self._id_sets.append(cte)
+            if shared:
+                self._id_set_names[key] = cte
+        # A selection of ids has no order, the model's default one included.
+        return self._cte_queryset(cte).order_by()
+
+    def _in(self, expr: Expression | F | OuterRef, rows: QuerySet[Any]) -> Q:
+        """Two-valued membership in an id set: a NULL reference is not a member."""
+        return _not_null(expr) & Q(In(expr, self._ids(rows)))
 
     # ---------- The actor's id, as a value or as a placeholder ----------
 
@@ -770,9 +723,8 @@ class Compiler:
         When it does not, the closure is complete, data cycles included, and
         the upper bound equals the lower one.
         """
-        beyond = edges.filter(subject_id__in=_Compiled(closure)).exclude(
-            resource_id__in=_Compiled(closure)
-        )
+        ids = self._ids(closure)
+        beyond = edges.filter(subject_id__in=ids).exclude(resource_id__in=ids)
         if known is not _FALSE:
             beyond = beyond.filter(_not(known))
         return Q(Exists(beyond))
@@ -780,8 +732,8 @@ class Compiler:
     def _wire_membership(self, at: At, relation_rows: Any, closure: QuerySet[Any]) -> Q:
         """``at`` is one of the wire ids in ``closure``."""
         if at.key is None:
-            return _in(at.ref, closure)
-        return self._tuple_membership(at, relation_rows, Q(resource_id__in=_Compiled(closure)))
+            return self._in(at.ref, closure)
+        return self._tuple_membership(at, relation_rows, Q(resource_id__in=self._ids(closure)))
 
     def _self_arrows(
         self, key: Key, definition: Definition, arms: Sequence[PermExpr]
@@ -1039,7 +991,7 @@ class Compiler:
         def reaching(level: QuerySet[Any]) -> QuerySet[Any]:
             # Filters and the path share one filter call, hence one join.
             return (
-                source.filter(Q(**resolved.filters) & Q(**{f"{target_path}__in": _Compiled(level)}))
+                source.filter(Q(**resolved.filters) & Q(**{f"{target_path}__in": self._ids(level)}))
                 .order_by()
                 .values_list(identity, flat=True)
             )
@@ -1071,7 +1023,8 @@ class Compiler:
 
             cte = CTE.recursive(path_rows, name=self._cte_name("rebac_path"))
             reached = self._cte_queryset(cte).values("pk")
-            members = with_cte(cte, select=source.filter(pk__in=_Compiled(reached, hoist=False)))
+            # ``reached`` reads the CTE of the query it is nested in.
+            members = with_cte(cte, select=source.filter(pk__in=reached))
             parts.append(self._model_membership(at, members, model, identity))
             return self._union(at, parts)
         closure = seed
@@ -1080,14 +1033,14 @@ class Compiler:
         inherits = reaching(closure)
         parts.append(
             self._model_membership(
-                at, source.filter(**{f"{identity}__in": _Compiled(inherits)}), model, identity
+                at, source.filter(**{f"{identity}__in": self._ids(inherits)}), model, identity
             )
         )
         if bound is Bound.UPPER and depth_possible:
             # One more hop that reaches a row outside the closure and its
             # inheritors means the closure has not converged.
             known = seed.union(inherits)
-            beyond = reaching(inherits).exclude(**{f"{identity}__in": _Compiled(known)})
+            beyond = reaching(inherits).exclude(**{f"{identity}__in": self._ids(known)})
             parts.append(_and(Q(Exists(beyond)), _not_null(at.ref)))
         return self._union(at, parts)
 
@@ -1264,13 +1217,14 @@ class Compiler:
 
                 cte = CTE.recursive(reached_rows, name=self._cte_name("rebac_reached"))
                 reached_cte = self._cte_queryset(cte).values("subject_id")
-                matched = with_cte(
-                    cte, select=holders.filter(self._from(at, reached_cte, hoist=False))
-                )
+                # ``reached_cte`` reads the CTE of the query it is nested in.
+                matched = with_cte(cte, select=holders.filter(self._from(at, reached_cte)))
                 return _or(point, Q(Exists(matched)))
             reached: QuerySet[Any] | None = None
             for _ in range(self.depth_limit - 1):
-                reached = edges.filter(self._from(at, reached)).order_by().values("subject_id")
+                reached = self._ids(
+                    edges.filter(self._from(at, reached)).order_by().values("subject_id")
+                )
             return _or(point, Q(Exists(holders.filter(self._from(at, reached)))))
         closure = self._closure(
             (edges if seed is _TRUE else edges.filter(seed)).order_by().values("resource_id"),
@@ -1307,14 +1261,11 @@ class Compiler:
         )
 
     @staticmethod
-    def _from(at: At, reached: QuerySet[Any] | None, *, hoist: bool = True) -> Q:
-        """An edge leaves ``at`` or an object already reached from it.
-
-        ``hoist`` is off when ``reached`` reads a CTE of the enclosing query.
-        """
+    def _from(at: At, reached: QuerySet[Any] | None) -> Q:
+        """An edge leaves ``at`` or an object already reached from it."""
         step = Q(resource_id=at.ref)
         if reached is not None:
-            step |= Q(resource_id__in=_Compiled(reached, hoist=hoist))
+            step |= Q(resource_id__in=reached)
         return step
 
     # ---------- Expressions ----------
@@ -1501,7 +1452,7 @@ class Compiler:
         identity = resource_id_attr(model)
         source = model._base_manager.using(self.using)
         ids = [source.filter(part).order_by().values_list(identity, flat=True) for part in kept]
-        return _in(at.ref, ids[0].union(*ids[1:]))
+        return self._in(at.ref, ids[0].union(*ids[1:]))
 
     # ---------- Relations ----------
 
@@ -1633,7 +1584,7 @@ class Compiler:
         else:
             source_q = Q(
                 **{
-                    f"{target_path}__in": _Compiled(
+                    f"{target_path}__in": self._ids(
                         subjects.order_by().values(resolved.target_id_attr)
                     )
                 }
@@ -1747,15 +1698,15 @@ class Compiler:
         field = resolved.field
         if isinstance(field, (models.CharField, models.TextField)):
             values = subjects.exclude(**{field.name: ""}).exclude(**{f"{field.name}__isnull": True})
-            return _in(at.ref, values.order_by().values(field.name))
+            return self._in(at.ref, values.order_by().values(field.name))
         present = subjects.exclude(**{f"{field.name}__isnull": True}).order_by().values(field.name)
         # Convert the wire identity, not the indexed model column.
         if at.key is None:
             converted = identity_codec(resolved.target_model, field.name).to_column(
                 cast(Expression, at.ref)
             )
-            return _in(converted, present)
-        return _in(at.ref, present)
+            return self._in(converted, present)
+        return self._in(at.ref, present)
 
     def _stored_relation(
         self,
@@ -1850,7 +1801,7 @@ class Compiler:
             # One object: look its tuples up by key instead of building the set.
             rows = rows.filter(resource_id=at.ref)
             return Q(Exists(rows.filter(last) if last is not None else rows))
-        return _in(at.ref, self._tuple_identity_rows(at, rows, last))
+        return self._in(at.ref, self._tuple_identity_rows(at, rows, last))
 
     def _tuple_identity_rows(
         self, at: At, rows: QuerySet[Any], last: Q | None = None
@@ -1882,7 +1833,7 @@ class Compiler:
         if at.key is identity_field:
             return cast(QuerySet[Any], converted.order_by().values("_rebac_native_id"))
         bridge = model._base_manager.using(self.using).filter(
-            **{f"{identity}__in": _Compiled(converted.order_by().values("_rebac_native_id"))}
+            **{f"{identity}__in": self._ids(converted.order_by().values("_rebac_native_id"))}
         )
         return cast(QuerySet[Any], bridge.order_by().values(at.key.name))
 
@@ -1912,14 +1863,14 @@ class Compiler:
             if _one_object(at.ref):
                 # One object: look its row up by key instead of building the set.
                 return Q(Exists(rows.order_by().filter(**{identity: converted})))
-            return _in(converted, native)
+            return self._in(converted, native)
         _, canonical = model_identity_fields(model, identity)
         if at.key is canonical:
-            return _in(at.ref, native)
+            return self._in(at.ref, native)
         bridge = model._base_manager.using(self.using).filter(
-            **{f"{identity}__in": _Compiled(native)}
+            **{f"{identity}__in": self._ids(native)}
         )
-        return _in(at.ref, bridge.order_by().values(at.key.name))
+        return self._in(at.ref, bridge.order_by().values(at.key.name))
 
     def _wire_equal(self, at: At, wire_id: str) -> Q:
         if at.key is None:
@@ -1936,4 +1887,4 @@ class Compiler:
             .order_by()
             .values(at.key.name)
         )
-        return _in(at.ref, target)
+        return self._in(at.ref, target)

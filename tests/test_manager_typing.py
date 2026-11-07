@@ -46,13 +46,13 @@ def test_queryset_manager_extensions_keep_native_type_checks(tmp_path: Path) -> 
     source.write_text(
         dedent(
             """\
-            from typing import assert_type
+            from typing import assert_type, cast
 
             from django.db import models
 
             from rebac import RebacManager, RebacQuerySet, TrackedManager, TrackedQuerySet
             from tests.testapp.models import Post
-            from typing_app.models import OwnRecord
+            from typing_app.models import OwnManager, OwnRecord
 
             class PostQuerySet[T: models.Model](RebacQuerySet[T]):
                 def answer(self) -> int:
@@ -75,6 +75,13 @@ def test_queryset_manager_extensions_keep_native_type_checks(tmp_path: Path) -> 
 
             class TrackedPostManager(TrackedPostManagerBase[Post]):
                 pass
+
+            # A manager built on another manager base narrows its own getter.
+            NarrowingPostManagerBase = OwnManager.from_queryset(PostQuerySet)
+
+            class NarrowingPostManager(NarrowingPostManagerBase[Post]):
+                def get_queryset(self) -> PostQuerySet[Post]:
+                    return cast(PostQuerySet[Post], super().get_queryset())
 
             queryset = PostQuerySet[Post](model=Post)
             assert_type(queryset.with_actor(None), PostQuerySet[Post])
@@ -105,8 +112,14 @@ def test_queryset_manager_extensions_keep_native_type_checks(tmp_path: Path) -> 
             assert_type(queryset.sudo(reason="typing").get().title, str)
             assert_type(PostManager().answer(), int)
             assert_type(TrackedPostManager().label(), str)
-            assert_type(PostManager().get_queryset(), PostQuerySet[Post])
-            assert_type(TrackedPostManager().get_queryset(), TrackedPostQuerySet[Post])
+            # The getter is Django's, typed QuerySet[M, M]; the manager's own
+            # methods carry the queryset class.
+            assert_type(PostManager().get_queryset(), models.QuerySet[Post, Post])
+            assert_type(TrackedPostManager().get_queryset(), models.QuerySet[Post, Post])
+            assert_type(NarrowingPostManager().get_queryset(), PostQuerySet[Post])
+            assert_type(NarrowingPostManager().get_queryset().answer(), int)
+            assert_type(NarrowingPostManager().label(), str)
+            assert_type(NarrowingPostManager().with_actor(None).answer(), int)
             assert_type(PostManager().get_queryset().get(), Post)
             assert_type(TrackedPostManager().get_queryset().get(), Post)
             assert_type(PostManager().sudo(reason="typing"), PostQuerySet[Post])

@@ -8,16 +8,28 @@ pre-1.0; breaking changes within a minor version are explicitly called out.
 ### Fixed
 
 - Permission statements no longer repeat their id sets. Each distinct id set a
-  statement reaches (an arrow's targets, a subject set's members) is written
-  once, as a CTE of the statement, and selected by name wherever it occurs; the
-  compiler also builds a node once whatever arm reaches it, unless a recursion
-  or alias cycle in its reach makes the path matter. On an application console
-  policy (about 150 types, a thousand arrows) the largest statement shrinks
-  from 2.7 MB to 250 KB and a console read's SQL by four to twelve times. On
-  every backend the statement text now carries a `WITH` clause. This replaces
-  0.31.1's SQLite-only CTE for every third nested id set.
-- `RebacManager.get_queryset()` is no longer declared to type checkers, so a
-  custom manager built with `from_queryset` keeps its own queryset type.
+  statement reaches (an arrow's targets, a subject set's members) is one CTE of
+  the statement, built with django-cte, and selected by name wherever it
+  occurs; the compiler also builds a node once whatever arm reaches it, unless
+  a recursion or alias cycle in its reach makes the path matter. On an
+  application console policy (about 150 types, a thousand arrows) the largest
+  statement shrinks from 2.7 MB to 255 KB and a console read's SQL by four to
+  eleven times. A statement carries a `WITH` clause only when it nests an id
+  set. This replaces 0.31.1's SQLite-only CTE for every third nested id set.
+- One statement still serves every actor of a shape, so an actor whose
+  constant facts would prune the policy (an administrator's `admin->member`)
+  reads the full statement: such reads stay larger than on 0.30, which decided
+  those facts per actor before compiling.
+
+### Changed
+
+- Typing: `RebacManager.get_queryset()` is declared as Django's
+  `Manager.get_queryset()`, returning `QuerySet[M, M]`, and its body is type
+  checked. A manager subclass, including one built with `from_queryset` on
+  another manager base, may narrow it to its own queryset class without an
+  override error. Code that chains REBAC or custom queryset methods on
+  `manager.get_queryset()` should call them on the manager or narrow the
+  result.
 
 ## [0.31.1] — 2026-11-06
 

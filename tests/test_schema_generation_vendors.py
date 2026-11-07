@@ -117,10 +117,10 @@ def test_vendor_django_schema_owners_and_upgrade(vendor_connection, settings, st
     exercise_vendor_owners(vendor_connection)
 
 
-@pytest.mark.parametrize("vendor_database", ["postgresql"], indirect=True)
 @pytest.mark.parametrize("storage", ["denormalized", "registry"])
 @pytest.mark.django_db(transaction=True)
-def test_postgresql_additive_scope(vendor_connection, monkeypatch, storage):
+def test_vendor_additive_scope(vendor_connection, monkeypatch, storage):
+    """Arrows, subject sets, unions, exclusions and closures, each id set a CTE."""
     from django.core.management import call_command
     from django.test import override_settings
 
@@ -137,8 +137,11 @@ def test_postgresql_additive_scope(vendor_connection, monkeypatch, storage):
 
     call_command("migrate", database=db.alias, verbosity=0)
     with db.cursor() as cursor:
-        cursor.execute("SET jit = off")
-        cursor.execute("SET statement_timeout = '5s'")
+        if db.vendor == "mysql":
+            cursor.execute("SET SESSION max_execution_time = 5000")
+        else:
+            cursor.execute("SET jit = off")
+            cursor.execute("SET statement_timeout = '5s'")
     with override_settings(DATABASE_ROUTERS=[Router()]):
         exercise_binding_scope(db, monkeypatch, storage)
 

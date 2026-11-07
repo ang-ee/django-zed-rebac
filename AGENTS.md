@@ -454,9 +454,10 @@ access via `rebac.backend()`.
   `caveat_key` 1,000 rows at a time). No raw SQL, triggers or database
   functions, in migrations or at run time; migration `0005`'s existing legacy
   uninstall routine is the only raw-SQL exception. One documented exception
-  covers SQL text that Django's own compiler produced: compiled id sets, kept
-  statements and the identity conversion's guard are embedded as that text
-  (ARCHITECTURE.md § Statement shape). No statement is written by hand.
+  covers SQL text that Django's own compiler produced: kept statements and the
+  identity conversion's guard are embedded as that text (ARCHITECTURE.md §
+  Statement shape); a statement's id sets are django-cte CTEs. No statement is
+  written by hand.
   CI runs SQLite and PostgreSQL; the opt-in MySQL 8.4 vendor suite
   is a release gate.
 
