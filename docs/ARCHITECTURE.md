@@ -1717,11 +1717,11 @@ the schema declares an expiring relation, and a tuple write through the
 library discards it. The schema walker (`rebac.schema.walker`) remains
 for `check_new`, which evaluates a row that does not exist yet.
 
-The implementation is the package `rebac.compile`: `program` (the dependency
-graph of a policy), `predicate` (the compiler), `conditions` and `formulas`
-(caveats), `read` (the operations) and `evaluate` (what an undecided check
-still needs). `rebac.watch` holds the map of the columns a policy reads, for
-the write gates.
+The implementation is the package `rebac.compile`: `program` (the recursive
+components of a policy's dependency graph, which `rebac.schema.graph` builds),
+`predicate` (the compiler), `conditions` and `formulas` (caveats), `read` (the
+operations) and `evaluate` (what an undecided check still needs).
+`rebac.watch` holds the map of the columns a policy reads, for the write gates.
 
 #### Tables
 
@@ -2362,7 +2362,7 @@ the resource types some permission decision of which reads a model column, the
 types the decision cache keeps nothing about. A field- or attribute-backed
 relation, or a constant with filters (tested on the object's row), reads one; a
 relation or permission reads one when anything the compiler evaluates to decide
-it does (`rebac.compile.program`): a subject set's relation, an arrow's relation
+it does (`rebac.schema.graph`): a subject set's relation, an arrow's relation
 and its target on each subject type, a constant's target. A subject admitted
 directly is compared by its id, so a model-backed relation of the user type
 makes live only the types whose policy follows an arrow or a subject set to it,

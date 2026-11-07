@@ -23,6 +23,7 @@ from .ast import (
     Relation,
     Schema,
 )
+from .graph import live_types
 from .walker import find_permission, find_relation
 
 
@@ -269,10 +270,6 @@ def live_backed_resource_types(schema: Schema) -> frozenset[str]:
     by its id, so a type is not live merely because it admits a live type's
     subjects. The decision cache keeps no answer about a live type.
     """
-    # The compiler's own dispatch graph (``rebac.compile.program``), which
-    # imports this package.
-    from ..compile.program import live_types
-
     return live_types(schema)
 
 
