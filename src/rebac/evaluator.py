@@ -18,6 +18,10 @@ The check cache is an LRU bounded by ``REBAC_EVALUATOR_CACHE_SIZE``
 (default 10_000). Conditional results are never cached — the missing
 caveat params are part of the answer and the next call may supply them.
 
+The scope also remembers whether an actor holds a permission's constant arms
+(``rebac.compile.read._constant_arms_held``), which only chooses the statement
+a read runs.
+
 Async-safe via ``ContextVar`` — each ``asyncio.create_task`` and each
 Strawberry resolver coroutine inherits the parent's evaluator slot.
 ``Task.copy_context()`` semantics mean a fresh evaluator opened inside a
@@ -27,7 +31,7 @@ task does not leak back to the parent.
 from __future__ import annotations
 
 from collections import OrderedDict
-from collections.abc import Hashable, Iterable, Iterator
+from collections.abc import Callable, Hashable, Iterable, Iterator
 from contextlib import contextmanager
 from contextvars import ContextVar
 from typing import TYPE_CHECKING, Any
@@ -97,6 +101,7 @@ class PermissionEvaluator:
 
     __slots__ = (
         "_check_cache",
+        "_constant_witnesses",
         "_max_size",
         "_schema_scope",
         "_visibility_decision_ids",
@@ -105,6 +110,8 @@ class PermissionEvaluator:
 
     def __init__(self, *, max_size: int = 10_000) -> None:
         self._check_cache: OrderedDict[tuple[Any, ...], CheckResult] = OrderedDict()
+        # Whether an actor holds a policy's constant arms, by statement.
+        self._constant_witnesses: OrderedDict[Hashable, bool] = OrderedDict()
         # Field visibility per actor, model, action and row batch; bounded by
         # entries and by the candidate ids they hold together.
         self._visibility_decisions: OrderedDict[tuple[Any, ...], frozenset[str]] = OrderedDict()
@@ -170,6 +177,7 @@ class PermissionEvaluator:
         per-emission scopes that re-enter without re-constructing.
         """
         self._check_cache.clear()
+        self._constant_witnesses.clear()
         self._visibility_decisions.clear()
         self._visibility_decision_ids = 0
         self._schema_scope.clear()
@@ -242,6 +250,26 @@ class PermissionEvaluator:
                 oldest, _ = self._visibility_decisions.popitem(last=False)
                 self._visibility_decision_ids -= len(oldest[-3])
         return answers
+
+    def _constant_witness(
+        self, key: Hashable, decide: Callable[[], bool], *, recheck: bool = False
+    ) -> bool:
+        """The remembered answer of a constant-arm witness, deciding it when absent.
+
+        ``recheck`` decides a remembered ``True`` again. An unhashable key is
+        decided and not remembered.
+        """
+        try:
+            found = self._constant_witnesses.get(key)
+        except TypeError:
+            return decide()
+        if found is None or (found and recheck):
+            found = self._constant_witnesses[key] = decide()
+            while len(self._constant_witnesses) > self._max_size:
+                self._constant_witnesses.popitem(last=False)
+        else:
+            self._constant_witnesses.move_to_end(key)
+        return found
 
     # ----- introspection (for tests + debugging) -----
 

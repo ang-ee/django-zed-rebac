@@ -3,6 +3,16 @@
 All notable changes to `django-zed-rebac` are tracked here. The project is in
 pre-1.0; breaking changes within a minor version are explicitly called out.
 
+## [Unreleased]
+
+### Changed
+
+- Inside an evaluator scope, an actor who holds a permission's constant arm
+  (`admin->member` over a `rebac:const` relation) reads, and is checked by, a
+  statement of those arms alone, decided by one witness statement per request:
+  on a console-like policy an administrator's read falls from 47,920 to 2,224
+  bytes.
+
 ## [0.31.3] — 2026-11-07
 
 ### Fixed

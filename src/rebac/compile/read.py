@@ -401,6 +401,69 @@ def _model_at(model: type[models.Model]) -> At:
     return At(resource_type, F(identity), identity_field, True)
 
 
+# ---------- Constant arms ----------
+
+
+def _constant_statement(operation: _Operation, key: Key) -> _Kept | bool:
+    """The policy fence where one of ``key``'s constant arms holds, as SQL.
+
+    ``False`` when ``key`` has none to witness (``Compiler.constant_arms``).
+    When it holds, the actor holds ``key`` on every object of its type, so it
+    is kept as a gate that admits every row.
+    """
+    verdicts = operation.verdicts(key)
+
+    def build() -> bool | tuple[models.QuerySet[Any], bool]:
+        compiler = operation.compiler(verdicts)
+        condition = compiler.constant(key)
+        if is_false(condition) or is_true(condition):
+            # Nothing to witness: a constant arm that holds outright makes the
+            # policy's own statement the fence alone.
+            return False
+        return compiler.statement(operation.gate().filter(condition).values("pk")), True
+
+    return operation.statement(("constant", key), verdicts, build)
+
+
+def _constant_arms_held(operation: _Operation, key: Key, *, recheck: bool = False) -> bool | None:
+    """Whether the actor holds one of ``key``'s constant arms, decided once per evaluator scope.
+
+    ``None`` outside an evaluator scope, under a caveat context, or when
+    ``key`` has no constant arm beside its other arms. The answer only chooses
+    the statement a read runs (``_scope_statement``): when it is true, a
+    statement of the constant arms alone, which evaluates them as it runs;
+    otherwise the policy's statement. A stale answer can narrow a read within
+    the scope, never widen it. A tuple write through the library
+    decides it again. ``recheck`` decides a remembered ``True`` again, for an
+    answer that authorizes by itself.
+    """
+    from rebac.backends import local
+    from rebac.evaluator import _BackendKey, current_evaluator
+
+    evaluator = current_evaluator()
+    if evaluator is None or operation.context is not None:
+        return None
+    compiled = _constant_statement(operation, key)
+    if isinstance(compiled, bool):
+        return None
+
+    def decide() -> bool:
+        probe = _Sql(compiled.sql, operation.bound(compiled.params))
+        return (
+            SchemaGeneration.objects.using(operation.using).filter(pk=1).filter(Q(probe)).exists()
+        )
+
+    memo = (
+        _BackendKey(operation.backend),
+        operation.using,
+        compiled.sql,
+        compiled.params,
+        operation.actor,
+        local._relationship_generation,
+    )
+    return evaluator._constant_witness(memo, decide, recheck=recheck)
+
+
 # ---------- Point checks ----------
 
 
@@ -584,11 +647,16 @@ def _point_result(
     using: str,
     lower_only: bool = False,
     types: Mapping[str, RowTypes] | None = None,
+    witness: bool = False,
 ) -> tuple[bool, bool, bool, _Policy]:
     """``types`` are the row types already read for the resource's id
-    (``_key_types``); without them, they are read here."""
+    (``_key_types``); without them, they are read here. ``witness`` decides
+    the permission's constant arms first (``_constant_arms_held``)."""
     operation = _Operation.begin(backend, actor, using, context)
     key = resource.resource_type, action
+    if witness and _constant_arms_held(operation, key, recheck=True):
+        # Decided by its own statement just now: a lower bound.
+        return True, True, False, operation.policy
     if types is None:
         types = _key_types(operation.policy, using, key, (resource.resource_id,))
     row_types = types.get(resource.resource_id)
@@ -655,6 +723,7 @@ def check(
         actor=actor,
         context=context,
         using=using,
+        witness=True,
     )
     return _answer(
         lower,
@@ -839,13 +908,18 @@ def _scope_statement(
     key: Key,
     *,
     candidates: tuple[int, ...] | None = None,
+    constant: bool | None = None,
 ) -> _Kept | bool:
     """The ids of ``model`` the actor holds ``key`` on, as SQL.
 
     ``False`` when there are none.  ``every`` is set when every row qualifies
     and the SQL is only the policy fence. ``candidates`` bounds the rows the
-    statement visits to those literal identities.
+    statement visits to those literal identities. ``constant`` is whether the
+    actor holds ``key``'s constant arms (``_constant_arms_held``): if so, the
+    statement is those arms alone.
     """
+    if constant:
+        return _constant_statement(operation, key)
     verdicts = operation.verdicts(key)
     label = model._meta.label_lower
 
@@ -939,7 +1013,7 @@ def _known_identities(
 
 
 class _Scope(Expression):
-    """A queryset scope with policy and caveat verdicts pinned when built."""
+    """A queryset scope with policy, caveat verdicts and constant-arm witness pinned when built."""
 
     def __init__(
         self,
@@ -950,6 +1024,7 @@ class _Scope(Expression):
         using: str,
         policy: _Policy,
         verdicts: CaveatVerdicts,
+        constant: bool | None = None,
     ) -> None:
         super().__init__(output_field=models.BooleanField())
         self.backend = backend
@@ -959,6 +1034,7 @@ class _Scope(Expression):
         self.using = using
         self.policy = policy
         self.verdicts = verdicts
+        self.constant = constant
         self.lhs: Any = F(resource_id_attr(model))
 
     def get_source_expressions(self) -> list[Any]:
@@ -977,7 +1053,9 @@ class _Scope(Expression):
         # A query that names the identities it reads proves access over
         # exactly those rows; every other shape uses the general scope.
         identities = _known_identities(self.model, self.lhs, compiler.query.where, self.using)
-        compiled = _scope_statement(operation, self.model, key, candidates=identities)
+        compiled = _scope_statement(
+            operation, self.model, key, candidates=identities, constant=self.constant
+        )
         if isinstance(compiled, bool):
             # ``True`` cannot occur: a statement that admits rows is a gate.
             return "(1 = 0)", ()
@@ -1014,7 +1092,8 @@ def scope_expression(
     using: str,
     identity: Expression | None = None,
 ) -> Expression:
-    """The Boolean scope of ``model`` rows, its policy and caveat verdicts pinned now.
+    """The Boolean scope of ``model`` rows, its policy, caveat verdicts and
+    constant-arm witness pinned now.
 
     ``identity`` replaces the scope's own identity column, for a caller that
     resolved it through another query path.
@@ -1025,7 +1104,14 @@ def scope_expression(
     key = (resource_type, action)
     operation = _Operation.begin(backend, actor, using, policy=_policy(backend))
     expression = _Scope(
-        backend, model, action, actor, using, operation.policy, operation.verdicts(key)
+        backend,
+        model,
+        action,
+        actor,
+        using,
+        operation.policy,
+        operation.verdicts(key),
+        _constant_arms_held(operation, key),
     )
     if identity is not None:
         expression.set_source_expressions([identity])
@@ -1165,6 +1251,7 @@ def _accessible_branches(
                     self.using,
                     policy,
                     verdicts,
+                    _constant_arms_held(operation, key),
                 )
             )
         else:

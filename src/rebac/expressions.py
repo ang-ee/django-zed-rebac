@@ -23,7 +23,9 @@ def permission_expression(
     through it. Nothing is read at construction: the executing database and
     the policy bind when the projection's SQL is compiled, which reads the
     schema revision, unless an evaluator scope has pinned it, and the
-    permission's caveat-verdict rows. The owner must be the query's model, its
+    permission's caveat-verdict rows, and inside an evaluator scope decides
+    whether the actor holds the permission's constant arms (docs/ARCHITECTURE.md
+    § Inline permission scopes). The owner must be the query's model, its
     proxy equivalent or a multi-table ancestor. Denied, conditional and SQL
     NULL answers project false.
     """

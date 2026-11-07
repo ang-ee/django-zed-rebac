@@ -528,6 +528,74 @@ class Compiler:
     def has_recursion(self, key: Key) -> bool:
         return bool(self.program.reachable(key) & self.program.recursive)
 
+    def constant_arms(self, key: Key) -> tuple[PermExpr, ...]:
+        """The disjuncts of ``key`` that hold on every object of its type or on none.
+
+        A constant arrow, or a constant relation, without filters names one
+        fixed object and never the row. A permission of the same type that the
+        union names contributes its own disjuncts. An operand of an
+        intersection or an exclusion is not a disjunct: it decides nothing
+        alone. Empty when ``key`` has no other disjunct, whose statement is
+        these arms already, or holds outright for this actor's shape.
+        """
+        definition = self.schema.get_definition(key[0])
+        permission = self.schema.get_permission(*key)
+        if definition is None or permission is None:
+            return ()
+        relations = {relation.name: relation for relation in definition.relations}
+
+        def constant(name: str) -> bool:
+            backing = relations[name].backing if name in relations else None
+            return isinstance(backing, ConstBinding) and not backing.filters
+
+        found: list[PermExpr] = []
+        other = False
+        seen = {key[1]}
+        pending = self._union_arms(permission.expression)
+        while pending:
+            arm = pending.pop(0)
+            if isinstance(arm, PermRef) and arm.name in ("authenticated", "anonymous"):
+                if getattr(self.shape, arm.name):
+                    # The permission holds on every object for this actor.
+                    return ()
+            elif isinstance(arm, PermArrow) and constant(arm.via):
+                found.append(arm)
+            elif isinstance(arm, PermRef) and arm.name in relations:
+                if constant(arm.name):
+                    found.append(arm)
+                else:
+                    other = True
+            elif (
+                isinstance(arm, PermRef)
+                and (self.tagged is None or id(arm) not in self.tagged.arms)
+                and (named := self.schema.get_permission(key[0], arm.name)) is not None
+            ):
+                # A permission of the same type at the same object: its own
+                # disjuncts are this one's, unless an override tags the reference.
+                if arm.name not in seen:
+                    seen.add(arm.name)
+                    pending.extend(self._union_arms(named.expression))
+            elif not isinstance(arm, PermNil):
+                other = True
+        return tuple(found) if other else ()
+
+    def constant(self, key: Key) -> Q:
+        """Whether one of ``key``'s constant arms holds: a predicate of no object.
+
+        False when ``key`` has none to witness (``constant_arms``).
+        """
+        definition = self.schema.get_definition(key[0])
+        if definition is None:
+            return _FALSE
+        # The arms read no object; the empty id stands for one.
+        at = At(key[0], Value("", output_field=models.TextField()), None, False)
+        return _or(
+            *(
+                self._expression(definition, arm, at, Bound.LOWER, {}, depth_possible=True)
+                for arm in self.constant_arms(key)
+            )
+        )
+
     def depth_unknown(self, key: Key, at: At) -> Q:
         """Whether an undecided case is undecided only because a cycle was cut.
 
