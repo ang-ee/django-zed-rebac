@@ -2145,14 +2145,19 @@ class RebacManager[M: models.Model](_RebacManagerBase[M]):  # pyright: ignore[re
     model parameter through queryset chains.
     """
 
-    # Typed as Django's ``Manager.get_queryset``, which every manager base of a
-    # ``from_queryset`` subclass shares; a subclass may narrow it to its own
-    # queryset class.
-    def get_queryset(self) -> models.QuerySet[M, M]:
+    # Runtime only, so type checkers see Django's own getter and the Django
+    # plugin's typing of it for a ``from_queryset`` manager; a declared
+    # override would replace that typing for every such manager. The body is
+    # the typed ``_pinned``.
+    if not TYPE_CHECKING:
+
+        def get_queryset(self):
+            return self._pinned(super().get_queryset())
+
+    def _pinned(self, queryset: RebacQuerySet[M]) -> RebacQuerySet[M]:
         """Give a related manager's fresh queryset its source instance's actor pin."""
         from .mixins import RebacMixin
 
-        queryset = cast(RebacQuerySet[M], super().get_queryset())
         instance = getattr(self, "instance", None)
         if isinstance(instance, RebacMixin) and hasattr(self, "core_filters"):
             queryset._rebac_relation_actor = instance.actor()

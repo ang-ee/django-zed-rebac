@@ -112,8 +112,9 @@ def test_queryset_manager_extensions_keep_native_type_checks(tmp_path: Path) -> 
             assert_type(queryset.sudo(reason="typing").get().title, str)
             assert_type(PostManager().answer(), int)
             assert_type(TrackedPostManager().label(), str)
-            # The getter is Django's, typed QuerySet[M, M]; the manager's own
-            # methods carry the queryset class.
+            # REBAC's getter is invisible to type checkers: it is typed as Django's
+            # own managers' getter is (QuerySet[M, M] under upstream django-stubs);
+            # the manager's own methods carry the queryset class.
             assert_type(PostManager().get_queryset(), models.QuerySet[Post, Post])
             assert_type(TrackedPostManager().get_queryset(), models.QuerySet[Post, Post])
             assert_type(NarrowingPostManager().get_queryset(), PostQuerySet[Post])

@@ -2308,10 +2308,10 @@ ActorLike = Union[SubjectRef, User, Group, "AnyRebacSubject"]
 #   - a SubjectRef passed through unchanged   (covers agents/grant, agents/agent,
 #                                              auth/apikey, custom)
 
-class RebacManager[M]:
-    # Typed as Django's getter (a subclass may narrow it); a RebacQuerySet, or
-    # the from_queryset class, at run time.
-    def get_queryset(self) -> QuerySet[M, M]: ...
+class RebacManager:
+    # Runtime only: type checkers see Django's own getter, so a from_queryset
+    # manager keeps its queryset type.
+    def get_queryset(self) -> RebacQuerySet: ...
 
     # Primary, generic actor scoping. Accepts any ActorLike.
     def with_actor(self, actor: ActorLike) -> RebacQuerySet: ...
