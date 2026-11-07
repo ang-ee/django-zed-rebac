@@ -336,6 +336,18 @@ def actor_shape(schema: Schema, actor: SubjectRef, using: str) -> ActorShape:
     )
 
 
+def _fixed(relation: Relation | None) -> bool:
+    """Whether a relation names one fixed object, whatever the row: a constant without filters.
+
+    An arm through it holds on every object of its type or on none.
+    """
+    return (
+        relation is not None
+        and isinstance(relation.backing, ConstBinding)
+        and not relation.backing.filters
+    )
+
+
 def _multi_valued(model: type[models.Model], lookup: str) -> bool:
     """Whether a lookup path crosses a reverse or many-to-many relation."""
     current: Any = model
@@ -538,8 +550,8 @@ class Compiler:
     def constant_arms(self, key: Key) -> tuple[PermExpr, ...]:
         """The disjuncts of ``key`` that hold on every object of its type or on none.
 
-        A constant arrow, or a constant relation, without filters names one
-        fixed object and never the row. A permission of the same type that the
+        An arrow through, or a reference to, a relation that names a fixed
+        object (``_fixed``) never reads the row. A permission of the same type that the
         union names contributes its own disjuncts. An operand of an
         intersection or an exclusion is not a disjunct: it decides nothing
         alone. Empty when ``key`` has no other disjunct, whose statement is
@@ -550,11 +562,6 @@ class Compiler:
         if definition is None or permission is None:
             return ()
         relations = {relation.name: relation for relation in definition.relations}
-
-        def constant(name: str) -> bool:
-            backing = relations[name].backing if name in relations else None
-            return isinstance(backing, ConstBinding) and not backing.filters
-
         found: list[PermExpr] = []
         other = False
         seen = {key[1]}
@@ -565,10 +572,10 @@ class Compiler:
                 if getattr(self.shape, arm.name):
                     # The permission holds on every object for this actor.
                     return ()
-            elif isinstance(arm, PermArrow) and constant(arm.via):
+            elif isinstance(arm, PermArrow) and _fixed(relations.get(arm.via)):
                 found.append(arm)
             elif isinstance(arm, PermRef) and arm.name in relations:
-                if constant(arm.name):
+                if _fixed(relations[arm.name]):
                     found.append(arm)
                 else:
                     other = True
@@ -1460,15 +1467,15 @@ class Compiler:
     ) -> list[Q]:
         """The arms of a union, compiled until one holds outright.
 
-        Arrows over constants come first: they fold to a decision (a member
-        of the admin role), and when one holds nothing else is compiled.
+        Builtins and arrows through a fixed object (``_fixed``) come first:
+        they fold to a decision (a member of the admin role), and when one
+        holds nothing else is compiled.
         """
 
         def constant(arm: PermExpr) -> bool:
             if not isinstance(arm, PermArrow):
                 return isinstance(arm, PermRef) and arm.name in ("authenticated", "anonymous")
-            relation = next((r for r in definition.relations if r.name == arm.via), None)
-            return relation is not None and isinstance(relation.backing, ConstBinding)
+            return _fixed(next((r for r in definition.relations if r.name == arm.via), None))
 
         parts: list[Q] = []
         for arm in sorted(arms, key=lambda arm: not constant(arm)):
