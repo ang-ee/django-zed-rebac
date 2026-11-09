@@ -13,13 +13,15 @@ from contextlib import contextmanager
 from contextvars import ContextVar
 from dataclasses import dataclass, field
 from datetime import datetime
+from functools import lru_cache
 from hashlib import sha256
 from io import BytesIO
+from itertools import chain
 from typing import Any, cast
 
 from django.apps import apps
 from django.core.exceptions import EmptyResultSet
-from django.db import models
+from django.db import connections, models
 from django.db.models import QuerySet
 from django.db.models.sql.compiler import (
     SQLCompiler,
@@ -33,7 +35,7 @@ from django_cte import CTE, with_cte
 
 # All django-cte private integration lives in this module. See the named
 # adapter debt and its pinned compatibility tests in ARCHITECTURE.md.
-from django_cte.jitmixin import JITMixin, jit_mixin
+from django_cte.jitmixin import JITMixin, jit_mixin, jit_mixin_type
 from django_cte.join import QJoin
 from django_cte.query import CTECompiler, _ignore_with_col_aliases
 
@@ -43,7 +45,7 @@ from ..errors import SchemaError
 type SQL = tuple[str, tuple[Any, ...]]
 
 
-class _Marker:
+class Marker:
     __slots__ = ("label",)
 
     def __init__(self, label: str) -> None:
@@ -70,7 +72,7 @@ def _encode(value: Any) -> bytes:
 
 
 def _parameter(value: Any) -> Any:
-    if isinstance(value, _Marker):
+    if isinstance(value, Marker):
         return type(value), value.label
     if isinstance(value, ActorNative):
         # The registered field identifies the conversion. Its creation default
@@ -146,36 +148,75 @@ class _CompiledCompiler(SQLCompiler):
 def assemble(
     body: SQL, definitions: tuple[Definition, ...], connection: Any, explain: Any = None
 ) -> SQL:
-    """Let django-cte place definitions, EXPLAIN and positional parameters."""
+    """Reuse django-cte's assembled text; bind fresh parameters in prefix order."""
     if not body[0]:
         return body
-    query = _CompiledQuery(body)
-    query.explain_info = explain
+    if not definitions and not explain:
+        return body
+    sql = _assembled_sql(
+        connection.alias,
+        body[0],
+        tuple((item.name, item.sql, item.materialized) for item in definitions),
+        _encode(explain) if explain else None,
+    )
+    return sql, (*chain.from_iterable(item.params for item in definitions), *body[1])
+
+
+@lru_cache(maxsize=512)
+def _assembled_sql(
+    using: str,
+    body: str,
+    definitions: tuple[tuple[str, str, bool | None], ...],
+    explain: bytes | None,
+) -> str:
+    # Only text and rendering options enter this cache, never bound values or
+    # query graphs. The cache key includes the database's quoting convention.
+    connection = connections[using]
+    query = _CompiledQuery((body, ()))
+    query.explain_info = pickle.loads(explain) if explain else None
     rows: QuerySet[Any] = QuerySet(query=query)
     attached = [
         CTE(
-            QuerySet(query=_CompiledQuery((item.sql, item.params))),
-            name=item.name,
-            materialized=item.materialized,
+            QuerySet(query=_CompiledQuery((sql, ()))),
+            name=name,
+            materialized=materialized,
         )
-        for item in definitions
+        for name, sql, materialized in definitions
     ]
     if not attached:
         # The frozen body's compiler doesn't render EXPLAIN itself.
-        if explain:
-            prefix = connection.ops.explain_query_prefix(explain.format, **explain.options)
-            return f"{prefix} {body[0]}", body[1]
+        if info := query.explain_info:
+            prefix = connection.ops.explain_query_prefix(info.format, **info.options)
+            return f"{prefix} {body}"
         return body
     selected = with_cte(*attached, select=rows)
-    sql, params = selected.query.get_compiler(connection=connection).as_sql()
-    return sql, tuple(params)
+    sql, _params = selected.query.get_compiler(connection=connection).as_sql()
+    return cast(str, sql)
 
 
 def _same_params(left: Sequence[Any], right: Sequence[Any]) -> bool:
     return len(left) == len(right) and all(
-        type(a) is type(b) and (a == b if not isinstance(a, (tuple, list)) else _same_params(a, b))
-        for a, b in zip(left, right, strict=True)
+        _same_value(a, b) for a, b in zip(left, right, strict=True)
     )
+
+
+def _same_value(left: Any, right: Any) -> bool:
+    if type(left) is not type(right):
+        return False
+    if isinstance(left, (tuple, list)):
+        return _same_params(left, right)
+    if isinstance(left, Mapping):
+        return len(left) == len(right) and all(
+            key in right
+            and _same_value(value, right[key])
+            and any(_same_value(key, other) for other in right)
+            for key, value in left.items()
+        )
+    if isinstance(left, (set, frozenset)):
+        return len(left) == len(right) and all(
+            any(_same_value(value, other) for other in right) for value in left
+        )
+    return bool(left == right)
 
 
 @dataclass
@@ -294,7 +335,11 @@ def _render(compiler: Any, body_method: Callable[[], Any], own: tuple[Definition
         query.explain_info = explain
 
 
-class _StatementCompiler(JITMixin):  # type: ignore[misc]  # django-cte is untyped
+class CompilerMixin(JITMixin):  # type: ignore[misc]  # django-cte is untyped
+    """Package seam for compiler mixins; JIT construction stays in this adapter."""
+
+
+class _StatementCompiler(CompilerMixin):
     """Own the statement boundary before django-cte's prefix renderer."""
 
     _jit_mixin_prefix = "RebacStatement"
@@ -328,6 +373,15 @@ def hook(compiler: Any, *, root: bool) -> Any:
     return compiler
 
 
+def outer_compiler_mixin(compiler: Any, mixin: type[CompilerMixin], *, root: bool) -> Any:
+    """Install an observer outside the final statement/CTE compiler methods."""
+    if isinstance(compiler.query, RootQuery):
+        hook(compiler, root=root)
+    elif hasattr(compiler.query, "_with_ctes"):
+        jit_mixin(compiler, CTECompiler)
+    return jit_mixin(compiler, mixin)
+
+
 def root_call(args: tuple[Any, ...], kwargs: dict[str, Any]) -> bool:
     # Django supplies a connection when compiling expressions and UNION
     # branches. Top-level factories and an AggregateQuery's inner SELECT
@@ -337,24 +391,38 @@ def root_call(args: tuple[Any, ...], kwargs: dict[str, Any]) -> bool:
     return using is not None and connection is None
 
 
-class _RootQuery:
+class RootQuery:
     _with_ctes: tuple[Any, ...] = ()
 
     def get_compiler(self, *args: Any, **kwargs: Any) -> Any:
         compiler = super().get_compiler(*args, **kwargs)  # type: ignore[misc]
         return hook(compiler, root=root_call(args, kwargs))
 
+    def get_aggregation(self, *args: Any, **kwargs: Any) -> Any:
+        # Django's AggregateQuery wrapper does not inherit our compiler.
+        with isolated():
+            return super().get_aggregation(*args, **kwargs)  # type: ignore[misc]
 
-class _SharedRootQuery(_RootQuery, JITMixin):  # type: ignore[misc]  # django-cte is untyped
+
+class _SharedRootQuery(RootQuery, JITMixin):  # type: ignore[misc]  # django-cte is untyped
     _jit_mixin_prefix = "RebacIds"
 
 
 class _IdSetQuery(_SharedRootQuery):
+    _jit_mixin_prefix = "RebacIdSet"
     _rebac_id_sets: tuple[Definition, ...] = ()
 
     def combine(self, rhs: Any, connector: Any) -> None:
         cast(Any, super()).combine(rhs, connector)
         self._rebac_id_sets += getattr(rhs, "_rebac_id_sets", ())
+
+
+def rebase_query(query: Any, base: type[Query]) -> None:
+    """Give a plain Query an execution owner, preserving any JIT opt-ins."""
+    if type(query) is Query:
+        query.__class__ = base
+    elif isinstance(query, JITMixin) and cast(Any, query)._jit_mixin_base is Query:
+        query.__class__ = jit_mixin_type(base, *cast(Any, query)._jit_mixins)
 
 
 def attach(rows: QuerySet[Any], definitions: tuple[Definition, ...]) -> QuerySet[Any]:

@@ -1901,9 +1901,11 @@ Django compiler patch is installed. The hook belongs to
 `_RebacQuery.get_compiler`; `share_id_sets` installs the same hook on its cloned
 root. For example: `rows = share_id_sets(with_cte(report_cte, select=rows))`.
 Aggregate wrappers that Django constructs separately retain the inner query's
-boundary. Internal point, batched-point and constant-witness probes use the same
-shared root; when executed during compilation they are isolated from the outer
-collector. Pickling a plain opted-in queryset or its query preserves this SQL
+boundary. Aggregate execution and render-time field-read/scope preparation run
+under isolation, as do plain audit-owned roots. Internal point, batched-point,
+constant-witness and policy-fence probes use the same shared root; when executed
+during compilation they are isolated from the outer collector. Pickling a plain
+opted-in queryset or its query preserves this SQL
 assembly opt-in, including when combined with `with_cte`. REBAC queryset
 serialization still strips authority as described under the manager surface.
 
@@ -1924,8 +1926,9 @@ module that uses django-cte's private API. It owns JIT mixin construction,
 from `generate_cte_sql` (including `QJoin`/empty-left-join handling). Frozen
 Django-produced bodies still go through public `CTE`/`with_cte` for prefix
 rendering. django-cte is constrained to `>=5.0.1,<5.1`, tested on 5.0.1.
-`tests/test_cte_adapter.py` pins the private modules' syntax trees and final
-compiler MRO; `tests/test_compile_ctes.py` covers application CTEs, UNION column
+`tests/test_cte_adapter.py` pins token-normalised source for `jitmixin`, `query`,
+`join` and `cte`, and the final compiler MRO (audit before statement before CTE);
+`tests/test_compile_ctes.py` covers application CTEs, UNION column
 names, empty left joins, EXPLAIN, parameters, mutation state and pickle
 round-trips. An internal change must fail these pins and be reviewed before the
 pin moves. The minimal upstream seam needed is a public, per-query compilation
@@ -2009,9 +2012,9 @@ subquery, duplicates, a longer list) uses the general scope. A bounded
 statement embeds its literals, so it is compiled per read and not kept.
 
 A policy revision fence closes a scope after a new revision is published.
-A scope built without an actor fails closed. Statements bind the application
-clock at execution, so tuple expiration and timed override sites follow that
-clock.
+A scope built without an actor fails closed. Hooked SELECTs bind the application
+clock at the start of outermost compilation, so tuple expiration and
+timed override sites follow that instant.
 
 #### Kept statements and the policy fence
 
@@ -2022,9 +2025,14 @@ these definitions without asking Django to render the kept statement again.
 The statement cache retains at most 512 templates, least recently used evicted
 first. These immutable fragments carry no query graphs. There is no byte budget;
 memory depends on the sizes of those bounded entries.
-django-cte renders the outer prefix from frozen bodies; no SQL is parsed or
-rewritten. Compiler query identity and mutation state remain Django's own.
-Its key includes the policy, operation and permission, actor shape, database
+The assembled SQL text has its own 512-entry least-recently-used cache, keyed by
+connection alias, body SQL, ordered definition names/SQL/materialization and
+EXPLAIN options. Bound values are concatenated in definition order on every
+compile and never retained by this cache.
+django-cte renders the outer prefix from frozen bodies on a cache miss; no SQL
+is parsed or rewritten. Compiler query identity and mutation state remain
+Django's own.
+The statement-template key includes the policy, operation and permission, actor shape, database
 alias and vendor, depth limit, active relationship model and scope model.
 The key contains no membership lists, row decisions or fact verdicts. The
 actor shape includes its type and relation suffix, canonical identity
@@ -2060,13 +2068,16 @@ exist.
 
 The clock is the application's: `django.utils.timezone.now()`, read through
 `rebac.clock.application_now()`, never the database's. It is one parameter per
-outermost hooked SELECT, shared by every embedded permission and by nested
-definitions for a different actor binding, so a fact that appears under both
+outermost hooked SELECT, sampled when that statement starts compiling and
+shared by every embedded permission and by nested definitions for a different
+actor binding, so a fact that appears under both
 polarities is read at one instant. Internal probes execute at their own
 statement boundary with their own clock. An unhooked plain root retains one
 clock per embedded scope; `share_id_sets()` opts that root into the common
-boundary. Tuple expiry and override deadlines compare with this parameter when
-the statement runs; nothing is re-evaluated when time passes.
+boundary. Tuple expiry and override deadlines compare with that compile-start
+instant when the statement runs. Compile-time probes and other work before
+execution can therefore delay the comparison; nothing is re-evaluated when time
+passes.
 
 #### Recursion
 

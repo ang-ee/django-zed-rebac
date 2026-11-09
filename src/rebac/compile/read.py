@@ -55,7 +55,7 @@ from rebac.types import CheckItem, CheckResult, ObjectRef, SubjectRef
 
 from . import At, Bound, Compiler, ctes
 from .conditions import CaveatVerdicts
-from .ctes import _Marker
+from .ctes import Marker
 from .evaluate import named_subjects, residual
 from .predicate import (
     PointRow,
@@ -72,8 +72,8 @@ from .program import CompileProgram, Key
 if TYPE_CHECKING:
     from rebac.backends.local import LocalBackend
 
-_MANUAL_REVISION = _Marker("manual schema revision")
-_RESOURCE_WIRE = _Marker("resource wire id")
+_MANUAL_REVISION = Marker("manual schema revision")
+_RESOURCE_WIRE = Marker("resource wire id")
 _LIMIT = 512
 # The most literal identities a scoped read is bounded to; a longer list uses
 # the general scope (the size crossover, and the vendors' bind limits).
@@ -93,12 +93,17 @@ class _Kept:
     depends on, for the decision cache (``_constant_witness``).
     """
 
-    sql: str
+    body: str
     params: tuple[Any, ...]
+    using: str
     every: bool = False
     reads: tuple[str, ...] = ()
-    body: str | None = None
     definitions: tuple[ctes.Definition, ...] = ()
+
+    @property
+    def sql(self) -> str:
+        sql, _params = ctes.assemble((self.body, ()), self.definitions, connections[self.using])
+        return f"({sql})"
 
     def render(self, bound: Iterable[Any]) -> tuple[str, tuple[Any, ...]]:
         values = tuple(bound)
@@ -113,7 +118,6 @@ class _Kept:
             )
             offset = stop
         if ctes.register(tuple(definitions)):
-            assert self.body is not None
             return f"({self.body})", values[offset:]
         return self.sql, values
 
@@ -237,13 +241,20 @@ def _policy(backend: LocalBackend) -> _Policy:
     return policy
 
 
+class _StatementNow(Expression):
+    def as_sql(self, compiler: Any, connection: Any) -> Any:
+        return Value(ctes.statement_now(), output_field=models.DateTimeField()).as_sql(
+            compiler, connection
+        )
+
+
 def _fence(
     policy: _Policy, *, backend: LocalBackend, using: str, parametric: bool
 ) -> models.QuerySet[Any]:
     """Close a prepared predicate when its policy revision or deadline changes."""
 
     snapshot = policy.snapshot
-    rows = SchemaGeneration.objects.using(using).filter(pk=1)
+    rows = SchemaGeneration.objects.using(using).filter(pk=1) if parametric else _probe_root(using)
     if snapshot.revision is None:
         return rows.none()
     if backend._schema_is_manual:
@@ -255,9 +266,7 @@ def _fence(
         rows = rows.filter(Exact(Value(snapshot.revision), current))
     else:
         rows = rows.filter(revision=snapshot.revision)
-    now: Expression = (
-        clock() if parametric else Value(ctes.statement_now(), output_field=models.DateTimeField())
-    )
+    now = clock() if parametric else _StatementNow(output_field=models.DateTimeField())
     for deadline, ahead in policy.fence:
         at = Value(deadline, output_field=models.DateTimeField())
         rows = rows.filter(LessThan(now, at) if ahead else GreaterThanOrEqual(now, at))
@@ -405,20 +414,17 @@ class _Operation:
                 with ctes.collecting() as collected:
                     body, body_params = compiler.as_sql()
                 definitions = tuple(collected.definitions.values())
-                sql, params = ctes.assemble(
-                    (body, tuple(body_params)), definitions, compiler.connection
-                )
             except EmptyResultSet:
                 # No row can satisfy it: an unpublished policy, or a
                 # condition Django proves empty.
                 compiled = False
             else:
                 compiled = _Kept(
-                    f"({sql})",
-                    tuple(params),
+                    body,
+                    (*[param for item in definitions for param in item.params], *body_params),
+                    self.using,
                     every,
                     reads[0] if reads else (),
-                    body=body if definitions else None,
                     definitions=definitions,
                 )
         if keep:

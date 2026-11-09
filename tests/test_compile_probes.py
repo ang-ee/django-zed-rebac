@@ -129,3 +129,34 @@ def test_lazy_projection_witness_executes_inside_its_own_root():
     assert len(statements) == 2
     assert all(sql.startswith("WITH RECURSIVE") for sql in statements)
     assert ctes._current.get() is None
+
+
+@pytest.mark.parametrize("bulk", [False, True])
+def test_boolean_point_probe_has_its_own_compile_clock(monkeypatch, bulk):
+    from dataclasses import replace
+    from datetime import timedelta
+
+    from django.utils import timezone
+
+    local = install_schema(SCHEMAS["group"])
+    actor = SubjectRef.of("auth/user", "1")
+    before = timezone.now()
+    deadline = before + timedelta(seconds=1)
+    operation = read._Operation.begin(local, actor, "default")
+    operation = replace(
+        operation,
+        policy=replace(operation.policy, selected_at=before, caveat_deadlines=(deadline,)),
+    )
+    monkeypatch.setattr(read, "_point_statement", lambda *args: True)
+    monkeypatch.setattr("rebac.clock.application_now", lambda: before)
+    key = ("blog/post", "read")
+    with ctes.collecting() as outer:
+        assert outer.now == before
+        monkeypatch.setattr("rebac.clock.application_now", lambda: deadline)
+        if bulk:
+            assert read._points([(operation, key, "1")], "lower", [None]) == [False]
+        else:
+            assert not read._point(operation, key, "1", "lower")
+        assert ctes.statement_now() == before
+        assert not outer.definitions
+    assert ctes._current.get() is None

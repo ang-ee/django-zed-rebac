@@ -39,7 +39,8 @@ from .actors import (
 )
 from .actors import current_actor as _current_actor
 from .actors import is_sudo as _is_sudo_ambient
-from .compile.ctes import _RootQuery
+from .compile import ctes
+from .compile.ctes import RootQuery
 from .errors import MissingActorError, PermissionDenied
 from .evaluator import PermissionEvaluator, current_evaluator
 from .field_visibility import (
@@ -171,49 +172,36 @@ def _emit_executed_bypasses(reasons: dict[tuple[_BypassEntry, str], None]) -> No
         _emit_embedded(entry, reason)
 
 
-class _BypassAuditCompilerMixin:
-    """Observe the final compiler's methods, including a later CTE mixin's."""
+class _BypassAuditCompilerMixin(ctes.CompilerMixin):
+    """Audit execution outside the statement collector and CTE renderer."""
 
+    _jit_mixin_prefix = "RebacAudit"
     _rebac_audit_top_level: bool
     _rebac_audit_rendered_sql: bool
 
-    def __getattribute__(self, name: str) -> Any:
-        method = super().__getattribute__(name)
-        if name == "as_sql":
+    def as_sql(self, *args: Any, **kwargs: Any) -> Any:
+        compile_only = self._rebac_audit_top_level and _executing_bypass_audits.get() is None
+        marker = _executing_bypass_audits.set(_CompileOnly.ACTIVE) if compile_only else None
+        try:
+            sql = cast(Any, super()).as_sql(*args, **kwargs)
+            self._rebac_audit_rendered_sql = bool(sql[0])
+            return sql
+        finally:
+            if marker is not None:
+                _executing_bypass_audits.reset(marker)
 
-            def audited_as_sql(*args: Any, **kwargs: Any) -> Any:
-                compile_only = (
-                    self._rebac_audit_top_level and _executing_bypass_audits.get() is None
-                )
-                marker = _executing_bypass_audits.set(_CompileOnly.ACTIVE) if compile_only else None
-                try:
-                    sql = method(*args, **kwargs)
-                    self._rebac_audit_rendered_sql = bool(sql[0])
-                    return sql
-                finally:
-                    if marker is not None:
-                        _executing_bypass_audits.reset(marker)
-
-            return audited_as_sql
-        if name == "execute_sql":
-
-            def audited_execute_sql(*args: Any, **kwargs: Any) -> Any:
-                self._rebac_audit_rendered_sql = False
-                reasons: dict[tuple[_BypassEntry, str], None] = {}
-                token = _executing_bypass_audits.set(reasons)
-                try:
-                    result = method(*args, **kwargs)
-                finally:
-                    _executing_bypass_audits.reset(token)
-                if self._rebac_audit_rendered_sql:
-                    _emit_executed_bypasses(reasons)
-                return result
-
-            return audited_execute_sql
-        return method
-
-
-_audit_compiler_types: dict[type[Any], type[Any]] = {}
+    def execute_sql(self, *args: Any, **kwargs: Any) -> Any:
+        self._rebac_audit_rendered_sql = False
+        reasons: dict[tuple[_BypassEntry, str], None] = {}
+        token = _executing_bypass_audits.set(reasons)
+        try:
+            with ctes.isolated():
+                result = cast(Any, super()).execute_sql(*args, **kwargs)
+        finally:
+            _executing_bypass_audits.reset(token)
+        if self._rebac_audit_rendered_sql:
+            _emit_executed_bypasses(reasons)
+        return result
 
 
 class _BypassAuditQuery(Query):
@@ -233,17 +221,9 @@ class _BypassAuditQuery(Query):
 
     def get_compiler(self, *args: Any, **kwargs: Any) -> Any:
         compiler = super().get_compiler(*args, **kwargs)
-        if not isinstance(compiler, _BypassAuditCompilerMixin):
-            base = type(compiler)
-            mixed = _audit_compiler_types.get(base)
-            if mixed is None:
-                mixed = type(
-                    f"RebacAudit{base.__name__}",
-                    (_BypassAuditCompilerMixin, base),
-                    {"__slots__": ()},
-                )
-                _audit_compiler_types[base] = mixed
-            compiler.__class__ = mixed
+        compiler = ctes.outer_compiler_mixin(
+            compiler, _BypassAuditCompilerMixin, root=ctes.root_call(args, kwargs)
+        )
         # Query.as_sql() creates a compiler with connection= for a subquery.
         # Only a top-level render marks a compile without execution.
         compiler._rebac_audit_top_level = (
@@ -258,7 +238,8 @@ class _BypassAuditQuery(Query):
         reasons: dict[tuple[_BypassEntry, str], None] = {}
         token = _executing_bypass_audits.set(reasons)
         try:
-            result = super().get_aggregation(using, aggregate_exprs)
+            with ctes.isolated():
+                result = super().get_aggregation(using, aggregate_exprs)
         finally:
             _executing_bypass_audits.reset(token)
         _emit_executed_bypasses(reasons)
@@ -273,11 +254,10 @@ def _audit_query_when_executed(query: Any) -> None:
     # A plain Django queryset can hold a REBAC subquery. Its Query must own the
     # same execution hook; changing this one Query instance's class keeps
     # Django's clone semantics and the queryset's public type.
-    if type(query) is Query:
-        query.__class__ = _BypassAuditQuery
+    ctes.rebase_query(query, _BypassAuditQuery)
 
 
-class _RebacQuery(_RootQuery, _BypassAuditQuery):
+class _RebacQuery(RootQuery, _BypassAuditQuery):
     """Cover expressions which copy QuerySet.query without resolving the QS."""
 
     _rebac_state: dict[str, Any]
@@ -357,7 +337,8 @@ class _RebacQuery(_RootQuery, _BypassAuditQuery):
             clone = cast(Self, queryset.query)
         # Building an expression runs no query, so it must write no audit row
         # (annotations are built at import time, during app initialisation).
-        queryset._apply_scope_in_place(audit=False)
+        with ctes.isolated():
+            queryset._apply_scope_in_place(audit=False)
         # The decision the scope was applied with, here or earlier: a queryset
         # evaluated under actor_context() may be embedded after it has closed.
         decision = queryset._rebac_scope_decision
@@ -407,7 +388,8 @@ def _check_subquery(query: Query) -> None:
     if pending is None or getattr(query, "_rebac_checked", False):
         return
     queryset, actor = pending
-    queryset._guard_projected_field_reads(actor, False, query=query)
+    with ctes.isolated():
+        queryset._guard_projected_field_reads(actor, False, query=query)
     cast(Any, query)._rebac_checked = True
 
 

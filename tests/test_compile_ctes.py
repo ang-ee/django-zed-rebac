@@ -602,6 +602,7 @@ def test_kept_sql_is_stable_and_embedding_never_renders_django(shared_rows, monk
         with ctes.collecting():
             assert item.render(item.params)[0] == f"({item.body})"
         assert not hasattr(item, "query")
+        assert "sql" not in item.__slots__
 
 
 def test_statement_cache_evicts_by_count(shared_rows, monkeypatch):
@@ -719,7 +720,7 @@ def test_shared_roots_pickle_and_retain_sharing(shared_rows, application_cte, qu
     rows = share_id_sets(rows)
     restored = pickle.loads(pickle.dumps(rows.query if query_only else rows))
     query = restored if query_only else restored.query
-    assert isinstance(query, ctes._RootQuery)
+    assert isinstance(query, ctes.RootQuery)
     assert query.sql_with_params() == _sql(rows)
     # Embed fresh scopes in the restored root: a with_cte round-trip used to
     # silently discard the opt-in, emitting two nested WITHs here.
@@ -755,7 +756,20 @@ def test_actor_identity_default_is_not_part_of_a_sql_signature(monkeypatch, djan
     assert local.check_access(subject=actor, action="read", resource=to_object_ref(folder)).allowed
 
 
-@pytest.mark.parametrize("left,right", [(True, 1), (1, 1.0), ((True,), (1,)), ([True], [1])])
+@pytest.mark.parametrize(
+    "left,right",
+    [
+        (True, 1),
+        (1, 1.0),
+        ((True,), (1,)),
+        ([True], [1]),
+        ({"a": 1}, {"a": True}),
+        ({1: "a"}, {True: "a"}),
+        ({1}, {True}),
+        (frozenset({1}), frozenset({True})),
+        ({"a": [{(1,)}]}, {"a": [{(True,)}]}),
+    ],
+)
 def test_bound_parameter_comparison_preserves_types(left, right):
     first = ctes.Definition("rebac_ids_types", "SELECT %s", (left,), b"template")
     second = ctes.Definition(first.name, first.sql, (right,), first.template)
@@ -859,3 +873,118 @@ def test_empty_left_joined_application_cte_matches_django_cte(shared_rows, mater
     assert _sql(shared) == _sql(plain)
     expected = [(post.pk, None) for post in shared_rows[2]]
     assert list(shared) == list(plain) == expected
+
+
+@pytest.mark.parametrize("how", ["distinct_count", "sliced_count", "plain_count", "exists", "list"])
+@pytest.mark.parametrize("root", ["rebac", "shared"])
+def test_execution_inside_outer_collector(shared_rows, how, root):
+    rows = Post.objects.with_actor(ALICE).scoped()
+    if root == "shared":
+        rows = share_id_sets(QuerySet(model=Post)).filter(pk__in=rows.values("pk"))
+    run = {
+        "distinct_count": lambda: rows.values("pk").distinct().count(),
+        "sliced_count": lambda: rows.values("pk")[:50].count(),
+        "plain_count": lambda: rows.count(),
+        "exists": lambda: rows.exists(),
+        "list": lambda: len(list(rows.values_list("pk", flat=True))),
+    }[how]
+    baseline = run()
+    with ctes.collecting() as outer:
+        inside = run()
+    assert inside == baseline
+    assert not outer.definitions
+
+
+@pytest.mark.parametrize("how", ["exists", "list"])
+def test_plain_root_with_rebac_subquery_inside_outer_collector(shared_rows, how):
+    rows = Folder._base_manager.filter(
+        Exists(Post.objects.with_actor(ALICE).filter(folder=OuterRef("pk")))
+    )
+    run = {"exists": rows.exists, "list": lambda: sorted(rows.values_list("pk", flat=True))}[how]
+    baseline = run()
+    with ctes.collecting() as outer:
+        inside = run()
+    assert inside == baseline
+    assert not outer.definitions
+
+
+@pytest.mark.parametrize("root", ["plain", "shared", "cte", "shared_cte", "cte_shared"])
+@pytest.mark.parametrize("execute", [False, True])
+def test_embedded_bypass_audit_timing_on_plain_root(shared_rows, root, execute):
+    from django.contrib.contenttypes.models import ContentType
+
+    inner = Exists(Post.objects.sudo(reason="embedded review").filter(pk=OuterRef("pk")))
+    rows = ContentType.objects.all()
+    app = CTE(ContentType.objects.values("pk"), name="audit_types")
+    if root in {"shared", "shared_cte"}:
+        rows = share_id_sets(rows)
+    if root in {"cte", "shared_cte", "cte_shared"}:
+        rows = with_cte(app, select=rows)
+    if root == "cte_shared":
+        rows = share_id_sets(rows)
+    rows = rows.filter(inner)
+    before = PermissionAuditEvent.objects.count()
+    if execute:
+        list(rows)
+    else:
+        str(rows.query)
+    after = PermissionAuditEvent.objects.count()
+    assert after - before == (1 if execute else 0)
+
+
+def test_assembled_sql_cache_keeps_text_and_fresh_parameter_order(shared_rows):
+    from dataclasses import replace
+
+    from django.db.models.sql.query import ExplainInfo
+
+    body_rows = Post._base_manager.filter(title="body").values("pk")
+    definition_rows = Post._base_manager.filter(title="definition").values("pk")
+    body = _sql(body_rows)
+    definition_sql, definition_params = _sql(definition_rows)
+    definition = ctes.Definition("cached_posts", definition_sql, definition_params, b"template")
+    expected = _sql(with_cte(CTE(definition_rows, name=definition.name), select=body_rows))
+    ctes._assembled_sql.cache_clear()
+    try:
+        assert ctes.assemble(body, (definition,), connection) == expected
+        info = ctes._assembled_sql.cache_info()
+        changed = replace(definition, params=("new definition",))
+        assert ctes.assemble((body[0], ("new body",)), (changed,), connection) == (
+            expected[0],
+            ("new definition", "new body"),
+        )
+        assert ctes._assembled_sql.cache_info().misses == info.misses
+        assert ctes._assembled_sql.cache_info().hits == info.hits + 1
+
+        for altered in (
+            replace(definition, name="renamed_posts"),
+            replace(
+                definition, sql=_sql(definition_rows.filter(pk__gt=0))[0], params=("definition", 0)
+            ),
+            replace(definition, materialized=True),
+        ):
+            assert ctes.assemble(body, (altered,), connection)[0] != expected[0]
+        explained = ctes.assemble(body, (definition,), connection, ExplainInfo(None, {}))
+        assert explained[0].startswith(connection.ops.explain_query_prefix(None))
+        assert explained[1] == expected[1]
+        assert ctes.assemble(body, (definition,), connection) == expected
+
+        for i in range(513):
+            ctes.assemble(body, (replace(definition, name=f"cached_posts_{i}"),), connection)
+        assert ctes._assembled_sql.cache_info().currsize == 512
+    finally:
+        ctes._assembled_sql.cache_clear()
+
+
+@pytest.mark.parametrize("root", ["cte_outer", "rebac"])
+def test_pickled_query_retains_sharing_with_outer_mixin(shared_rows, root):
+    import pickle
+
+    rows = share_id_sets(Post.objects.with_actor(ALICE).all())
+    if root == "cte_outer":
+        app = CTE(Post._base_manager.values("pk"), name="pickle_outer_posts")
+        rows = with_cte(app, select=share_id_sets(Post._base_manager.all()))
+    restored = pickle.loads(pickle.dumps(rows.query))
+    assert isinstance(restored, ctes.RootQuery)
+    scope = Post.objects.with_actor(ALICE).scoped().values("pk")
+    rows = QuerySet(model=Post, query=restored).filter(pk__in=scope).filter(pk__in=scope.all())
+    _assert_shared(_sql(rows)[0])

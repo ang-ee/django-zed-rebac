@@ -67,7 +67,7 @@ from ..schema.ast import (
 )
 from ..types import SubjectRef
 from . import ctes
-from .ctes import ActorNative, _Marker, id_name, safe_name, signature, statement_now, table_names
+from .ctes import ActorNative, Marker, id_name, safe_name, signature, statement_now, table_names
 from .program import CompileProgram, Key
 
 # Markers kept beside the visit counts of a path through the policy.
@@ -216,8 +216,8 @@ def _one_object(ref: Any) -> bool:
 # ---------- The actor ----------
 
 
-ACTOR_WIRE: Final = _Marker("actor wire id")
-CLOCK: Final = _Marker("clock")
+ACTOR_WIRE: Final = Marker("actor wire id")
+CLOCK: Final = Marker("clock")
 
 
 class _Param(Expression):
