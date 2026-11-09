@@ -14,7 +14,7 @@ Three rules shape every statement:
 * an uncorrelated id set is one CTE of its statement (``Compiler._ids``),
   defined once however many arms reach it and selected by name, so building a
   statement does not re-resolve its subqueries at every level; the statement's
-  root attaches them (``Compiler.statement``).
+  outermost SQL compiler emits the sets registered by ``Compiler.statement``.
 """
 
 from __future__ import annotations
@@ -25,7 +25,6 @@ from datetime import datetime
 from enum import StrEnum
 from typing import Any, Final, Protocol, cast
 
-from django.apps import apps
 from django.core.exceptions import EmptyResultSet, FieldDoesNotExist
 from django.db import connections, models
 from django.db.models import Exists, Expression, F, OuterRef, Q, QuerySet, Value
@@ -67,6 +66,8 @@ from ..schema.ast import (
     Schema,
 )
 from ..types import SubjectRef
+from . import ctes
+from .ctes import id_name, safe_name, signature, table_names
 from .program import CompileProgram, Key
 
 # Markers kept beside the visit counts of a path through the policy.
@@ -419,8 +420,8 @@ class Compiler:
         self._own_identity = model_for_subject_type(actor.subject_type)
         self._cte_tables: set[str] | None = None
         # The statement's id sets, in definition order, and by SQL and parameters.
-        self._id_sets: list[CTE] = []
-        self._id_set_names: dict[tuple[str, tuple[Any, ...]], CTE] = {}
+        self._id_sets: list[ctes.Definition] = []
+        self._id_set_names: dict[bytes, CTE] = {}
         # The constant arms compiled as false at the lower bound, by identity:
         # the policy's own expression nodes.
         self._folded = frozenset(map(id, self.constant_arms(fold))) if fold else frozenset()
@@ -428,12 +429,8 @@ class Compiler:
     def _cte_name(self, name: str) -> str:
         """A CTE name that no model table of the project already uses."""
         if self._cte_tables is None:
-            self._cte_tables = {
-                owner._meta.db_table for owner in apps.get_models(include_auto_created=True)
-            }
-        while name in self._cte_tables:
-            name += "_"
-        return name
+            self._cte_tables = table_names()
+        return safe_name(name, self._cte_tables)
 
     def _cte_queryset(self, cte: CTE) -> QuerySet[Any]:
         selected = cte.queryset()
@@ -442,7 +439,7 @@ class Compiler:
     # ---------- The statement and its id sets ----------
 
     def statement(self, rows: QuerySet[Any]) -> QuerySet[Any]:
-        """``rows`` as a statement's root, its ``WITH`` defining the compiler's id sets.
+        """Register id sets for the outermost SQL statement that embeds ``rows``.
 
         Every predicate the compiler built selects its id sets by name.  A
         compiler that builds several statements (an enumeration's branches)
@@ -450,7 +447,7 @@ class Compiler:
         """
         if not self._id_sets:
             return rows
-        return cast(QuerySet[Any], with_cte(*self._id_sets, select=rows))
+        return ctes.attach(rows, tuple(self._id_sets))
 
     def _ids(self, rows: QuerySet[Any]) -> QuerySet[Any]:
         """An uncorrelated id set, selected from the CTE that defines it.
@@ -469,25 +466,23 @@ class Compiler:
         # ordering to a combined query, which an id projection cannot sort by.
         body.clear_ordering(force=True)
         try:
-            sql, params = body.get_compiler(using=self.using).as_sql()
+            sql, params = ctes.id_sql(body, self.using)
         except EmptyResultSet:
             # Django proves it empty in place, under the predicate it is in.
             return rows
-        key = sql, tuple(params)
-        try:
-            cte = self._id_set_names.get(key)
-            shared = True
-        except TypeError:
-            # An unhashable parameter leaves the id set its own CTE.
-            cte, shared = None, False
+        key = signature(sql, tuple(params))
+        cte = self._id_set_names.get(key)
         if cte is None:
             cte = CTE(
                 QuerySet(model=rows.model, query=body, using=self.using),
-                name=self._cte_name(f"rebac_ids_{len(self._id_sets)}"),
+                name=self._cte_name(id_name(key)),
             )
-            self._id_sets.append(cte)
-            if shared:
-                self._id_set_names[key] = cte
+            definition = ctes.Definition(cte.name, sql, tuple(params), key)
+            # Check the full signature, even when the short name collides.
+            if any(item.name == cte.name and item.template != key for item in self._id_sets):
+                raise SchemaError("Conflicting REBAC id-set CTE definitions")
+            self._id_sets.append(definition)
+            self._id_set_names[key] = cte
         # A selection of ids has no order, the model's default one included.
         return self._cte_queryset(cte).order_by()
 
@@ -1316,9 +1311,13 @@ class Compiler:
                     return cast(QuerySet[Any], first.union(step))
 
                 cte = CTE.recursive(reached_rows, name=self._cte_name("rebac_reached"))
-                reached_cte = self._cte_queryset(cte).values("subject_id")
-                # ``reached_cte`` reads the CTE of the query it is nested in.
-                matched = with_cte(cte, select=holders.filter(self._from(at, reached_cte)))
+                # The complete closure starts at a statement constant; only
+                # its recursive step reads the local CTE. Share the enclosing
+                # id set, keeping that helper inside its definition.
+                reached_cte = self._ids(
+                    with_cte(cte, select=self._cte_queryset(cte).values("subject_id"))
+                )
+                matched = holders.filter(self._from(at, reached_cte))
                 return _or(point, Q(Exists(matched)))
             reached: QuerySet[Any] | None = None
             for _ in range(self.depth_limit - 1):

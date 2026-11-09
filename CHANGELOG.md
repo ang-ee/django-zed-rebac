@@ -5,6 +5,18 @@ pre-1.0; breaking changes within a minor version are explicitly called out.
 
 ## [Unreleased]
 
+### Fixed
+
+- REBAC SELECT roots share equal permission id sets across composed scopes,
+  including row-independent one-object recursive closures. Plain SELECT roots
+  (including django-cte `with_cte` statements) opt in with the new
+  `share_id_sets(queryset)` helper. Names and kept SQL remain stable across
+  actors of one shape; a second binding of a template keeps its nested `WITH`.
+  Kept statements remain compiled once, with no retained query graphs or
+  process-wide Django compiler patch. Unhooked roots and write statements
+  retain nested definitions, including MySQL INSERTs. Permission decisions
+  and bypass auditing are unchanged.
+
 ## [0.31.5] — 2026-11-07
 
 ### Changed

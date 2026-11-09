@@ -279,6 +279,12 @@ def _audit_query_when_executed(query: Any) -> None:
 class _RebacQuery(_BypassAuditQuery):
     """Cover expressions which copy QuerySet.query without resolving the QS."""
 
+    def get_compiler(self, *args: Any, **kwargs: Any) -> Any:
+        from .compile.ctes import hook, root_call
+
+        compiler = super().get_compiler(*args, **kwargs)
+        return hook(compiler, root=root_call(args, kwargs))
+
     _rebac_state: dict[str, Any]
     # Django builds these bounded pk subqueries while combining sliced
     # querysets. They inherit the combination's policy, not a separate actor.

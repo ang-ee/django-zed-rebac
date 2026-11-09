@@ -108,7 +108,7 @@ def _scope_statement(local, actor: SubjectRef) -> tuple[str, tuple[object, ...]]
 def _id_set_name() -> str:
     """A pattern for an id set's quoted CTE name."""
     opening, closing = connection.ops.quote_name("rebac_ids_0").split("rebac_ids_0")
-    return re.escape(opening) + r"(rebac_ids_\d+_*)" + re.escape(closing)
+    return re.escape(opening) + r"(_*rebac_ids_[0-9a-f]{16})" + re.escape(closing)
 
 
 def _definitions(sql: str, params: tuple[object, ...]) -> list[tuple[str, tuple[object, ...]]]:

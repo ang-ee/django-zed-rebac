@@ -454,6 +454,8 @@ from rebac import (
     RebacMixin, RebacTrackedMixin, RebacManager, RebacQuerySet,
     TrackedManager, TrackedQuerySet,    # unscoped; own gated writes; the base for a declared base manager
 
+    share_id_sets,                     # opt a plain SELECT root into shared permission CTEs
+
     # Decorators
     require_permission, rebac_resource, rebac_subject,
 
@@ -1888,6 +1890,28 @@ number of distinct id sets in reach, not with the number of paths to them, and
 is the same for every actor of one shape. An id set that reads a CTE of the
 query it sits in (a recursive closure's own rows) stays in place.
 
+REBAC queryset SELECT roots collect the uncorrelated id sets of embedded
+scopes into one outer `WITH RECURSIVE`, in dependency order. A plain Django
+root opts in with `share_id_sets(queryset)`, including a queryset made with
+django-cte's `with_cte`. The helper returns a clone, changes SQL assembly only,
+and neither grants access nor resolves an actor. Unhooked plain roots and
+INSERT, UPDATE and DELETE statements keep nested definitions. No process-wide
+Django compiler patch is installed. The hook belongs to
+`_RebacQuery.get_compiler`; `share_id_sets` installs the same hook on its cloned
+root. For example: `rows = share_id_sets(with_cte(report_cte, select=rows))`.
+Aggregate wrappers that Django constructs separately retain the inner query's
+boundary.
+
+Names depend on the SQL template and its non-actor parameters; actor and clock
+placeholders retain the same names when bound. The collector compares full
+template signatures and bound parameters. Equal bindings share a definition;
+a second binding of the same template keeps its nested `WITH`, shadowing the
+outer names. A name collision between different templates raises `SchemaError`.
+A one-object recursive closure is row-independent and is registered as an id
+set; its recursive helper stays inside that definition. Correlated recursive
+helpers stay at their original boundary. Existing application CTEs follow the
+collected id sets in the outer prefix, with positional parameters in that order.
+
 A constant arrow or constant relation without filters (`admin->member` over
 `rebac:const=admin`) names one fixed object, so it holds on every object of
 its type or on none. A permission's constant arms are those that are
@@ -1968,6 +1992,14 @@ clock.
 #### Kept statements and the policy fence
 
 A statement is compiled once and kept as Django's SQL with placeholders.
+Its body and ordered id-set definitions are frozen SQL and parameter tuples,
+not retained Django query graphs. Embedding binds parameters and registers
+these definitions without asking Django to render the kept statement again.
+The statement cache retains at most 512 templates and 16 MiB of SQL text
+(counted conservatively at four bytes per character); an oversized statement
+is executed without retention. These immutable fragments carry no query graphs.
+django-cte renders the outer prefix from frozen bodies; no SQL is parsed or
+rewritten. Compiler query identity and mutation state remain Django's own.
 Its key includes the policy, operation and permission, actor shape, database
 alias and vendor, depth limit, active relationship model and scope model.
 The key contains no membership lists, row decisions or fact verdicts. The
