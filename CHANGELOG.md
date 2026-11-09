@@ -16,6 +16,13 @@ pre-1.0; breaking changes within a minor version are explicitly called out.
   process-wide Django compiler patch. Unhooked roots and write statements
   retain nested definitions, including MySQL INSERTs. Permission decisions
   and bypass auditing are unchanged.
+- Internal field-read and constant-witness probes own an isolated shared
+  statement root, including when they execute while an outer query compiles.
+  Shared SELECT roots bind one clock across their permission embeddings, so
+  expiring relations share id sets too. Plain `share_id_sets` querysets retain
+  the opt-in after pickling. Bound id-set comparisons no longer pickle or hash
+  parameters; the template cache is bounded by count only (512 entries).
+  The private django-cte adapter is pinned to 5.0 with explicit upgrade tests.
 
 ## [0.31.5] — 2026-11-07
 

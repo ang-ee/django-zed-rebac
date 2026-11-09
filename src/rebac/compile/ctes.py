@@ -8,16 +8,18 @@ its local recursive helpers are not candidates for collection.
 from __future__ import annotations
 
 import pickle
-from collections.abc import Callable, Iterator, Mapping
+from collections.abc import Callable, Iterator, Mapping, Sequence
 from contextlib import contextmanager
 from contextvars import ContextVar
 from dataclasses import dataclass, field
+from datetime import datetime
 from hashlib import sha256
 from io import BytesIO
 from typing import Any, cast
 
 from django.apps import apps
 from django.core.exceptions import EmptyResultSet
+from django.db import models
 from django.db.models import QuerySet
 from django.db.models.sql.compiler import (
     SQLCompiler,
@@ -29,13 +31,33 @@ from django.db.models.sql.constants import LOUTER
 from django.db.models.sql.query import Query
 from django_cte import CTE, with_cte
 
-# The two compatibility seams needed to preserve django-cte's application
-# CTEs while rendering the SELECT body once. No django-cte SQL is reproduced.
+# All django-cte private integration lives in this module. See the named
+# adapter debt and its pinned compatibility tests in ARCHITECTURE.md.
+from django_cte.jitmixin import JITMixin, jit_mixin
+from django_cte.join import QJoin
 from django_cte.query import CTECompiler, _ignore_with_col_aliases
 
+from .. import clock as application_clock
 from ..errors import SchemaError
 
 type SQL = tuple[str, tuple[Any, ...]]
+
+
+class _Marker:
+    __slots__ = ("label",)
+
+    def __init__(self, label: str) -> None:
+        self.label = label
+
+    def __repr__(self) -> str:
+        return f"<{self.label}>"
+
+
+@dataclass(frozen=True, slots=True)
+class ActorNative:
+    """Placeholder for the actor's id as a value of ``field``."""
+
+    field: models.Field[Any, Any]
 
 
 def _encode(value: Any) -> bytes:
@@ -48,12 +70,12 @@ def _encode(value: Any) -> bytes:
 
 
 def _parameter(value: Any) -> Any:
-    from .predicate import ActorNative, _Marker
-
     if isinstance(value, _Marker):
         return type(value), value.label
     if isinstance(value, ActorNative):
-        return type(value), _parameter(value.field.deconstruct())
+        # The registered field identifies the conversion. Its creation default
+        # (possibly a lambda) and validators do not participate in SQL binding.
+        return type(value), value.field.model._meta.label_lower, value.field.name
     if isinstance(value, Mapping):
         pairs = [(_parameter(key), _parameter(item)) for key, item in value.items()]
         return type(value), tuple(sorted(pairs, key=lambda pair: _encode(pair[0])))
@@ -149,8 +171,16 @@ def assemble(
     return sql, tuple(params)
 
 
+def _same_params(left: Sequence[Any], right: Sequence[Any]) -> bool:
+    return len(left) == len(right) and all(
+        type(a) is type(b) and (a == b if not isinstance(a, (tuple, list)) else _same_params(a, b))
+        for a, b in zip(left, right, strict=True)
+    )
+
+
 @dataclass
 class _Statement:
+    now: datetime
     definitions: dict[str, Definition] = field(default_factory=dict)
 
     def add(self, definitions: tuple[Definition, ...]) -> bool:
@@ -166,7 +196,7 @@ class _Statement:
             if previous is not None:
                 if previous.template != item.template:
                     raise SchemaError("Conflicting REBAC id-set CTE definitions")
-                if signature("", item.params) != signature("", previous.params):
+                if not _same_params(item.params, previous.params):
                     compatible = False
             seen[item.name] = item
         if compatible:
@@ -189,7 +219,7 @@ def isolated() -> Iterator[None]:
 
 @contextmanager
 def collecting() -> Iterator[_Statement]:
-    statement = _Statement()
+    statement = _Statement(statement_now())
     token = _current.set(statement)
     try:
         yield statement
@@ -197,12 +227,18 @@ def collecting() -> Iterator[_Statement]:
         _current.reset(token)
 
 
+def statement_now() -> datetime:
+    """One clock for all embeddings; isolated executions get a new instant."""
+    statement = _current.get()
+    return statement.now if statement is not None else application_clock.application_now()
+
+
 def register(definitions: tuple[Definition, ...]) -> bool:
     statement = _current.get()
     return statement is not None and statement.add(definitions)
 
 
-def _compile(compiler: Any, method: Callable[[], Any]) -> Any:
+def _compile(compiler: Any, method: Callable[[], Any], body: Callable[[], Any]) -> Any:
     query = compiler.query
     own = getattr(query, "_rebac_id_sets", ())
     if _current.get() is not None:
@@ -210,27 +246,15 @@ def _compile(compiler: Any, method: Callable[[], Any]) -> Any:
             return method()
         # Another binding already owns these names. Its dependencies must
         # shadow the outer binding together, including any embedded scopes.
-        with isolated():
-            return _render(compiler, method, own)
+        return _render(compiler, body, own)
     if compiler._rebac_cte_root or own:
-        return _render(compiler, method, own)
+        return _render(compiler, body, own)
     return method()
 
 
-def _render(compiler: Any, method: Callable[[], Any], own: tuple[Definition, ...]) -> Any:
+def _render(compiler: Any, body_method: Callable[[], Any], own: tuple[Definition, ...]) -> Any:
     query = compiler.query
     attached = getattr(query, "_with_ctes", ())
-    # Skip only django-cte's prefix renderer; the original Django compiler,
-    # query object and all its mutation/selection state remain in place.
-    body_method: Callable[[], Any] = (
-        (
-            lambda: super(CTECompiler, compiler).as_sql(
-                *compiler._rebac_cte_args, **compiler._rebac_cte_kwargs
-            )
-        )
-        if isinstance(compiler, CTECompiler)
-        else method
-    )
     explain = query.explain_info
     # Exactly the metadata bracket used by django-cte. It is restored even
     # on failure; no query graph or compiler.query substitution is involved.
@@ -246,7 +270,7 @@ def _render(compiler: Any, method: Callable[[], Any], own: tuple[Definition, ...
                 alias = query.alias_map.get(cte.name)
                 child = body.get_compiler(
                     connection=compiler.connection,
-                    elide_empty=getattr(alias, "join_type", None) != LOUTER,
+                    elide_empty=not isinstance(alias, QJoin) or alias.join_type != LOUTER,
                 )
                 try:
                     sql, params = child.as_sql()
@@ -270,31 +294,24 @@ def _render(compiler: Any, method: Callable[[], Any], own: tuple[Definition, ...
         query.explain_info = explain
 
 
-class _StatementCompiler:
-    """Observe the final compiler, including a later django-cte mixin."""
+class _StatementCompiler(JITMixin):  # type: ignore[misc]  # django-cte is untyped
+    """Own the statement boundary before django-cte's prefix renderer."""
 
-    def __getattribute__(self, name: str) -> Any:
-        method = super().__getattribute__(name)
-        if name == "as_sql":
+    _jit_mixin_prefix = "RebacStatement"
 
-            def as_sql(*args: Any, **kwargs: Any) -> Any:
-                self._rebac_cte_args, self._rebac_cte_kwargs = args, kwargs
-                return _compile(self, lambda: method(*args, **kwargs))
+    def as_sql(self, *args: Any, **kwargs: Any) -> Any:
+        return _compile(
+            self,
+            lambda: cast(Any, super(_StatementCompiler, self)).as_sql(*args, **kwargs),
+            # Skip only django-cte's prefix; preserve the Django compiler's
+            # query and mutation state, including MTI update keys.
+            lambda: cast(Any, super(CTECompiler, cast(Any, self))).as_sql(*args, **kwargs),
+        )
 
-            return as_sql
-        if name == "execute_sql":
-
-            def execute_sql(*args: Any, **kwargs: Any) -> Any:
-                # Policy/caveat reads during compilation execute independently.
-                with isolated():
-                    return method(*args, **kwargs)
-
-            return execute_sql
-        return method
-
-
-_compiler_types: dict[type[Any], type[Any]] = {}
-_query_types: dict[tuple[type[Any], type[Any]], type[Any]] = {}
+    def execute_sql(self, *args: Any, **kwargs: Any) -> Any:
+        # An execution during compilation owns a separate statement.
+        with isolated():
+            return cast(Any, super()).execute_sql(*args, **kwargs)
 
 
 def hook(compiler: Any, *, root: bool) -> Any:
@@ -303,27 +320,12 @@ def hook(compiler: Any, *, root: bool) -> Any:
     # own related_ids between pre_sql_setup() and get_related_updates().
     if isinstance(compiler, (SQLInsertCompiler, SQLUpdateCompiler, SQLDeleteCompiler)):
         return compiler
-    if not isinstance(compiler, _StatementCompiler):
-        base = type(compiler)
-        if base not in _compiler_types:
-            _compiler_types[base] = type(
-                # Existing execution/audit wrappers remain outside ours,
-                # including when we bypass django-cte's prefix renderer.
-                f"RebacStatement{base.__name__}",
-                (base, _StatementCompiler),
-                {},
-            )
-        compiler.__class__ = _compiler_types[base]
+    # Apply CTECompiler here, so a later CTEQuery.get_compiler() is a no-op.
+    # _StatementCompiler must precede CTECompiler in the final MRO.
+    jit_mixin(compiler, CTECompiler)
+    jit_mixin(compiler, _StatementCompiler)
     compiler._rebac_cte_root = root
     return compiler
-
-
-def _mix(query: Any, mixin: type[Any]) -> None:
-    if not isinstance(query, mixin):
-        key = type(query), mixin
-        if key not in _query_types:
-            _query_types[key] = type(f"RebacIds{type(query).__name__}", (mixin, type(query)), {})
-        query.__class__ = _query_types[key]
 
 
 def root_call(args: tuple[Any, ...], kwargs: dict[str, Any]) -> bool:
@@ -336,23 +338,29 @@ def root_call(args: tuple[Any, ...], kwargs: dict[str, Any]) -> bool:
 
 
 class _RootQuery:
+    _with_ctes: tuple[Any, ...] = ()
+
     def get_compiler(self, *args: Any, **kwargs: Any) -> Any:
         compiler = super().get_compiler(*args, **kwargs)  # type: ignore[misc]
         return hook(compiler, root=root_call(args, kwargs))
 
 
-class _IdSetQuery(_RootQuery):
+class _SharedRootQuery(_RootQuery, JITMixin):  # type: ignore[misc]  # django-cte is untyped
+    _jit_mixin_prefix = "RebacIds"
+
+
+class _IdSetQuery(_SharedRootQuery):
     _rebac_id_sets: tuple[Definition, ...] = ()
 
     def combine(self, rhs: Any, connector: Any) -> None:
-        super().combine(rhs, connector)  # type: ignore[misc]
+        cast(Any, super()).combine(rhs, connector)
         self._rebac_id_sets += getattr(rhs, "_rebac_id_sets", ())
 
 
 def attach(rows: QuerySet[Any], definitions: tuple[Definition, ...]) -> QuerySet[Any]:
     rows = rows.all()
     query = rows.query
-    _mix(query, _IdSetQuery)
+    jit_mixin(query, _IdSetQuery)
     owned = cast(Any, query)
     owned._rebac_id_sets = getattr(query, "_rebac_id_sets", ()) + definitions
     return rows
@@ -365,5 +373,5 @@ def share_id_sets[T: QuerySet[Any]](queryset: T) -> T:
     Unhooked roots and write statements retain nested definitions.
     """
     result = queryset.all()
-    _mix(result.query, _RootQuery)
+    jit_mixin(result.query, _SharedRootQuery)
     return result

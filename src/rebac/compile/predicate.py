@@ -67,7 +67,7 @@ from ..schema.ast import (
 )
 from ..types import SubjectRef
 from . import ctes
-from .ctes import id_name, safe_name, signature, table_names
+from .ctes import ActorNative, _Marker, id_name, safe_name, signature, statement_now, table_names
 from .program import CompileProgram, Key
 
 # Markers kept beside the visit counts of a path through the policy.
@@ -216,25 +216,8 @@ def _one_object(ref: Any) -> bool:
 # ---------- The actor ----------
 
 
-class _Marker:
-    __slots__ = ("label",)
-
-    def __init__(self, label: str) -> None:
-        self.label = label
-
-    def __repr__(self) -> str:
-        return f"<{self.label}>"
-
-
 ACTOR_WIRE: Final = _Marker("actor wire id")
 CLOCK: Final = _Marker("clock")
-
-
-@dataclass(frozen=True, slots=True)
-class ActorNative:
-    """Placeholder for the actor's id as a value of ``field``."""
-
-    field: models.Field[Any, Any]
 
 
 class _Param(Expression):
@@ -246,13 +229,6 @@ class _Param(Expression):
 
     def as_sql(self, compiler: Any, connection: Any) -> tuple[str, tuple[Any, ...]]:
         return "%s", (self.marker,)
-
-
-def statement_now() -> datetime:
-    """The instant a statement is read at: the application clock, never the database's."""
-    from ..clock import application_now
-
-    return application_now()
 
 
 def clock() -> Expression:

@@ -1886,9 +1886,10 @@ name; the statement's root attaches them, so a statement has a `WITH` only
 when it nests an id set. Django resolves a selection from a name, not the id
 set, inside every enclosing `filter()`, so building a statement does not
 re-resolve its id sets at every level. A statement therefore grows with the
-number of distinct id sets in reach, not with the number of paths to them, and
-is the same for every actor of one shape. An id set that reads a CTE of the
-query it sits in (a recursive closure's own rows) stays in place.
+number of distinct id sets in reach, not with the number of paths to them.
+A kept template is independent of the actor's id; sharing in the final statement
+also depends on whether its embeddings bind the same actor. An id set that reads
+a CTE of the query it sits in (a recursive closure's own rows) stays in place.
 
 REBAC queryset SELECT roots collect the uncorrelated id sets of embedded
 scopes into one outer `WITH RECURSIVE`, in dependency order. A plain Django
@@ -1900,7 +1901,11 @@ Django compiler patch is installed. The hook belongs to
 `_RebacQuery.get_compiler`; `share_id_sets` installs the same hook on its cloned
 root. For example: `rows = share_id_sets(with_cte(report_cte, select=rows))`.
 Aggregate wrappers that Django constructs separately retain the inner query's
-boundary.
+boundary. Internal point, batched-point and constant-witness probes use the same
+shared root; when executed during compilation they are isolated from the outer
+collector. Pickling a plain opted-in queryset or its query preserves this SQL
+assembly opt-in, including when combined with `with_cte`. REBAC queryset
+serialization still strips authority as described under the manager surface.
 
 Names depend on the SQL template and its non-actor parameters; actor and clock
 placeholders retain the same names when bound. The collector compares full
@@ -1911,6 +1916,24 @@ A one-object recursive closure is row-independent and is registered as an id
 set; its recursive helper stays inside that definition. Correlated recursive
 helpers stay at their original boundary. Existing application CTEs follow the
 collected id sets in the outer prefix, with positional parameters in that order.
+
+**Named debt: django-cte statement adapter.** `rebac.compile.ctes` is the only
+module that uses django-cte's private API. It owns JIT mixin construction,
+`CTECompiler` ordering and the bypass of its prefix renderer, `_with_ctes`,
+`_ignore_with_col_aliases`, and the application-CTE compilation loop adapted
+from `generate_cte_sql` (including `QJoin`/empty-left-join handling). Frozen
+Django-produced bodies still go through public `CTE`/`with_cte` for prefix
+rendering. django-cte is constrained to `>=5.0.1,<5.1`, tested on 5.0.1.
+`tests/test_cte_adapter.py` pins the private modules' syntax trees and final
+compiler MRO; `tests/test_compile_ctes.py` covers application CTEs, UNION column
+names, empty left joins, EXPLAIN, parameters, mutation state and pickle
+round-trips. An internal change must fail these pins and be reviewed before the
+pin moves. The minimal upstream seam needed is a public, per-query compilation
+wrapper that receives a callable for compiling the SELECT body without its
+WITH prefix and the already compiled application CTE definitions, and can
+prepend additional definitions discovered while compiling that body. django-cte
+would retain ownership of alias handling, empty-CTE behavior, EXPLAIN and prefix
+rendering. No upstream request is part of this change.
 
 A constant arrow or constant relation without filters (`admin->member` over
 `rebac:const=admin`) names one fixed object, so it holds on every object of
@@ -1959,8 +1982,9 @@ owner; there is no render-time preparation to fall back on. Four exceptions do
 database work at render, outside a prepared scope: (a) `permission_expression`
 reads the policy and the caveat-verdict rows, and inside an evaluator scope
 decides the constant-arm witness, when its SQL is compiled, by design; (b) the
-field-read guard reads the schema revision when an actor-scoped subquery
-renders inside a plain outer query with no evaluator scope open; (c) the
+field-read guard reads the schema revision and may run row-independent field
+permission probes when an actor-scoped subquery renders inside a plain outer
+query; these executions own their collector and clock; (c) the
 embedded-bypass audit writes at render for a statement whose query class REBAC
 does not hook (see [Bypass audit granularity](#with_actor-vs-sudo--distinct-verbs));
 (d) a REBAC queryset that Django resolves only while compiling the outer
@@ -1995,9 +2019,9 @@ A statement is compiled once and kept as Django's SQL with placeholders.
 Its body and ordered id-set definitions are frozen SQL and parameter tuples,
 not retained Django query graphs. Embedding binds parameters and registers
 these definitions without asking Django to render the kept statement again.
-The statement cache retains at most 512 templates and 16 MiB of SQL text
-(counted conservatively at four bytes per character); an oversized statement
-is executed without retention. These immutable fragments carry no query graphs.
+The statement cache retains at most 512 templates, least recently used evicted
+first. These immutable fragments carry no query graphs. There is no byte budget;
+memory depends on the sizes of those bounded entries.
 django-cte renders the outer prefix from frozen bodies; no SQL is parsed or
 rewritten. Compiler query identity and mutation state remain Django's own.
 Its key includes the policy, operation and permission, actor shape, database
@@ -2036,9 +2060,13 @@ exist.
 
 The clock is the application's: `django.utils.timezone.now()`, read through
 `rebac.clock.application_now()`, never the database's. It is one parameter per
-statement, so a fact that appears under both polarities is read at one
-instant. Tuple expiry and override deadlines compare with it when the
-statement runs; nothing is re-evaluated when time passes.
+outermost hooked SELECT, shared by every embedded permission and by nested
+definitions for a different actor binding, so a fact that appears under both
+polarities is read at one instant. Internal probes execute at their own
+statement boundary with their own clock. An unhooked plain root retains one
+clock per embedded scope; `share_id_sets()` opts that root into the common
+boundary. Tuple expiry and override deadlines compare with this parameter when
+the statement runs; nothing is re-evaluated when time passes.
 
 #### Recursion
 

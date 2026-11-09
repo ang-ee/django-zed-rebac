@@ -39,6 +39,7 @@ from .actors import (
 )
 from .actors import current_actor as _current_actor
 from .actors import is_sudo as _is_sudo_ambient
+from .compile.ctes import _RootQuery
 from .errors import MissingActorError, PermissionDenied
 from .evaluator import PermissionEvaluator, current_evaluator
 from .field_visibility import (
@@ -276,14 +277,8 @@ def _audit_query_when_executed(query: Any) -> None:
         query.__class__ = _BypassAuditQuery
 
 
-class _RebacQuery(_BypassAuditQuery):
+class _RebacQuery(_RootQuery, _BypassAuditQuery):
     """Cover expressions which copy QuerySet.query without resolving the QS."""
-
-    def get_compiler(self, *args: Any, **kwargs: Any) -> Any:
-        from .compile.ctes import hook, root_call
-
-        compiler = super().get_compiler(*args, **kwargs)
-        return hook(compiler, root=root_call(args, kwargs))
 
     _rebac_state: dict[str, Any]
     # Django builds these bounded pk subqueries while combining sliced

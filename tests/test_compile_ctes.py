@@ -600,39 +600,53 @@ def test_kept_sql_is_stable_and_embedding_never_renders_django(shared_rows, monk
     monkeypatch.setattr(Query, "get_compiler", forbidden)
     for item in kept:
         with ctes.collecting():
-            assert item.render(item.params, connection)[0] == f"({item.body})"
+            assert item.render(item.params)[0] == f"({item.body})"
         assert not hasattr(item, "query")
 
 
-def test_statement_sql_cache_obeys_byte_budget(shared_rows, monkeypatch):
+def test_statement_cache_evicts_by_count(shared_rows, monkeypatch):
     from rebac.compile import read
 
     read.reset()
-    monkeypatch.setattr(read, "_SQL_BYTE_LIMIT", 1)
-    rows = Post.objects.with_actor(ALICE).scoped().values("pk")
-    _assert_shared(_sql(rows)[0])
-    assert read._statement_bytes <= 1
-    assert not any(isinstance(value, read._Kept) for value in read._statements.values())
-    assert set(rows.values_list("pk", flat=True)) == _expected(shared_rows[1])
+    monkeypatch.setattr(read, "_LIMIT", 2)
+    for actor in (ALICE, BOB):
+        for model in (Folder, Post):
+            rows = model.objects.with_actor(actor).scoped().values("pk")
+            _sql(rows)
+            assert len(read._statements) <= 2
+    assert set(Post.objects.with_actor(ALICE).values_list("pk", flat=True)) == _expected(
+        shared_rows[1]
+    )
 
 
-def test_independent_collectors_are_thread_local(shared_rows):
+def test_independent_collectors_are_thread_local(shared_rows, monkeypatch):
     from concurrent.futures import ThreadPoolExecutor
-    from threading import Barrier
+    from threading import Barrier, local
 
     barrier = Barrier(2)
+    state = local()
+    scopes = [Post.objects.with_actor(actor).scoped().values("pk") for actor in (ALICE, BOB)]
+    expected = [_sql(scope) for scope in scopes]
+    original = ctes._Statement.add
 
-    def compile_binding(actor):
-        item = ctes.Definition("rebac_ids_thread", "SELECT %s", (actor,), b"template")
-        with ctes.collecting() as statement:
-            assert ctes.register((item,))
+    def interleave(self, definitions):
+        result = original(self, definitions)
+        if definitions and not getattr(state, "waited", False):
+            state.waited = True
             barrier.wait(timeout=5)
-            assert tuple(statement.definitions.values()) == (item,)
+            assert ctes._current.get() is self
+        return result
+
+    monkeypatch.setattr(ctes._Statement, "add", interleave)
+
+    def compile_scope(scope):
+        result = _sql(scope)
         assert ctes._current.get() is None
-        return actor
+        _assert_shared(result[0])
+        return result
 
     with ThreadPoolExecutor(max_workers=2) as pool:
-        assert set(pool.map(compile_binding, ("alice", "bob"))) == {"alice", "bob"}
+        assert list(pool.map(compile_scope, scopes)) == expected
 
 
 def test_name_collision_between_templates_raises_at_root(shared_rows, monkeypatch):
@@ -691,3 +705,157 @@ def test_plain_union_root_and_aggregate_keep_valid_cte_boundaries(shared_rows, h
         assert not _sql(rows)[0].startswith("WITH")
     assert set(rows.values_list("pk", flat=True)) == _expected(shared_rows[1])
     assert rows.count() == len(_expected(shared_rows[1]))
+
+
+@pytest.mark.parametrize("application_cte", [False, True])
+@pytest.mark.parametrize("query_only", [False, True])
+def test_shared_roots_pickle_and_retain_sharing(shared_rows, application_cte, query_only):
+    import pickle
+
+    rows = Post._base_manager.filter(title__in=("direct", "inherited"))
+    if application_cte:
+        app = CTE(Post._base_manager.values("pk"), name="pickle_posts")
+        rows = with_cte(app, select=rows)
+    rows = share_id_sets(rows)
+    restored = pickle.loads(pickle.dumps(rows.query if query_only else rows))
+    query = restored if query_only else restored.query
+    assert isinstance(query, ctes._RootQuery)
+    assert query.sql_with_params() == _sql(rows)
+    # Embed fresh scopes in the restored root: a with_cte round-trip used to
+    # silently discard the opt-in, emitting two nested WITHs here.
+    scope = Post.objects.with_actor(ALICE).scoped().values("pk")
+    selected = QuerySet(model=Post, query=query).filter(pk__in=scope).filter(pk__in=scope.all())
+    _assert_shared(_sql(selected)[0])
+    assert set(selected.values_list("pk", flat=True)) == _expected(shared_rows[1])
+
+
+def test_actor_identity_default_is_not_part_of_a_sql_signature(monkeypatch, django_user_model):
+    from tests.testapp.models import AuthoredPost
+
+    actor = SubjectRef.of("auth/user", "1")
+    local = install_schema("""
+        definition auth/user {}
+        definition blog/authoredpost {
+            relation owner: auth/user // rebac:field=author
+            permission read = owner
+        }
+        definition blog/folder {
+            relation posts: blog/authoredpost // rebac:field=authored_posts
+            permission read = posts->read
+        }
+    """)
+    with sudo(reason="lambda identity default fixture"):
+        owner = django_user_model.objects.create(pk=1, username="lambda-default")
+        folder = Folder.objects.create(name="owned")
+        AuthoredPost.objects.create(title="visible", folder=folder, author=owner)
+    monkeypatch.setattr(django_user_model._meta.pk, "default", lambda: 1)
+    rows = Folder.objects.with_actor(actor).scoped().values("pk")
+    _assert_shared(_sql(rows)[0])
+    assert list(rows.values_list("pk", flat=True)) == [folder.pk]
+    assert local.check_access(subject=actor, action="read", resource=to_object_ref(folder)).allowed
+
+
+@pytest.mark.parametrize("left,right", [(True, 1), (1, 1.0), ((True,), (1,)), ([True], [1])])
+def test_bound_parameter_comparison_preserves_types(left, right):
+    first = ctes.Definition("rebac_ids_types", "SELECT %s", (left,), b"template")
+    second = ctes.Definition(first.name, first.sql, (right,), first.template)
+    with ctes.collecting() as statement:
+        assert statement.add((first,))
+        assert not statement.add((second,))
+        assert statement.add((first,))
+        assert tuple(statement.definitions.values()) == (first,)
+
+
+@pytest.mark.parametrize("shared_plain", [False, True])
+def test_expiring_scopes_share_one_clock_and_stable_sql(monkeypatch, shared_plain):
+    from datetime import timedelta
+
+    from rebac import ObjectRef
+
+    local = install_schema(
+        SCHEMA.replace("relation member: auth/user", "relation member: auth/user with expiration")
+    )
+    instant = timezone.now()
+    with sudo(reason="statement clock fixture"):
+        folder = Folder.objects.create(name="expires")
+        post = Post.objects.create(title="expires", folder=folder)
+    local.write_relationships(
+        [
+            RelationshipTuple(
+                to_object_ref(folder), "viewer", SubjectRef.of("auth/group", "g", "member")
+            ),
+            RelationshipTuple(
+                ObjectRef("auth/group", "g"),
+                "member",
+                ALICE,
+                expires_at=instant + timedelta(seconds=5),
+            ),
+        ]
+    )
+    rows = (
+        share_id_sets(Post._base_manager.all()) if shared_plain else Post.objects.with_actor(ALICE)
+    )
+    for _ in range(4):
+        rows = rows.filter(Exists(Post.objects.with_actor(ALICE).filter(pk=OuterRef("pk"))))
+    if not shared_plain:
+        rows = rows.scoped()
+    _sql(rows)  # Warm all templates before observing clock bindings.
+    calls = []
+
+    def tick():
+        now = instant + timedelta(seconds=len(calls))
+        calls.append(now)
+        return now
+
+    monkeypatch.setattr("rebac.clock.application_now", tick)
+    first_sql, first_params = _sql(rows)
+    second_sql, second_params = _sql(rows)
+    assert calls == [instant, instant + timedelta(seconds=1)]
+    assert first_sql == second_sql
+    _assert_shared(first_sql)
+    assert first_sql.count("WITH RECURSIVE") == 1
+    prepared = connection.ops.adapt_datetimefield_value(instant)
+    assert first_params.count(prepared) > 0
+    assert len(first_params) == len(second_params)
+    assert {b for a, b in zip(first_params, second_params, strict=True) if a != b} == {
+        connection.ops.adapt_datetimefield_value(instant + timedelta(seconds=1))
+    }
+    assert list(rows.values_list("pk", flat=True)) == [post.pk]
+    monkeypatch.setattr("rebac.clock.application_now", lambda: instant + timedelta(seconds=10))
+    assert list(rows.values_list("pk", flat=True)) == []
+    assert _sql(rows)[0] == first_sql
+
+
+def test_batched_point_probes_share_sets_and_isolate_outer_collector(shared_rows):
+    from rebac import CheckItem
+
+    local, reference, posts = shared_rows
+    with ctes.collecting() as outer, CaptureQueriesContext(connection) as captured:
+        answers = local.check_bulk_permissions(
+            [CheckItem(ALICE, "read", to_object_ref(post)) for post in posts]
+        )
+        assert not outer.definitions
+    assert {p.pk for p, answer in zip(posts, answers, strict=True) if answer.allowed} == _expected(
+        reference
+    )
+    probes = [q["sql"] for q in captured if 'AS "item0"' in q["sql"]]
+    assert len(probes) == 1
+    _assert_shared(probes[0])
+    assert probes[0].count("WITH RECURSIVE") == 1
+
+
+@pytest.mark.parametrize("materialized", [None, True, False])
+def test_empty_left_joined_application_cte_matches_django_cte(shared_rows, materialized):
+    from django.db.models.sql.constants import LOUTER
+
+    empty = CTE(
+        Post._base_manager.none().values("pk"), name="empty_left_posts", materialized=materialized
+    )
+    joined = empty.join(Post._base_manager.all(), pk=empty.col.pk, _join_type=LOUTER).annotate(
+        empty_pk=empty.col.pk
+    )
+    plain = with_cte(empty, select=joined).order_by("pk").values_list("pk", "empty_pk")
+    shared = share_id_sets(plain)
+    assert _sql(shared) == _sql(plain)
+    expected = [(post.pk, None) for post in shared_rows[2]]
+    assert list(shared) == list(plain) == expected
