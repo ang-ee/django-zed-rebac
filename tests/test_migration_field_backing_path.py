@@ -11,8 +11,9 @@ from django.db import connection
 from django.db.migrations.loader import MigrationLoader
 from django.utils import timezone
 
-from rebac.management.commands.rebac import Command
+from rebac.management.commands.rebac import Command, _SyncBatch
 from rebac.models import PackageManagedRecord, SchemaDefinition, SchemaRelation
+from rebac.schema.ast import Definition, Schema
 
 migration = importlib.import_module("rebac.migrations.0004_field_backing_path")
 _schema_editor = SimpleNamespace(connection=connection)
@@ -133,15 +134,22 @@ def test_migrated_rows_sync_without_drift_while_admin_edits_stay_drift() -> None
 
     command = Command()
     command.stdout = __import__("io").StringIO()
-    sync = lambda row, check_only: command._sync_row(  # noqa: E731
-        SchemaRelation,
-        {"definition": post_def, "name": row.name},
-        new_payload,
-        "testapp",
-        f"blog/post#{row.name}",
-        check_only,
-        False,
-    )
+
+    def sync(row: SchemaRelation, check_only: bool) -> bool:
+        source = Schema(definitions=[Definition("blog/post", (), ())])
+        batch = _SyncBatch(source, package="testapp", using="default")
+        drift = command._sync_row(
+            batch,
+            SchemaRelation,
+            {"definition": post_def, "name": row.name},
+            new_payload,
+            f"blog/post#{row.name}",
+            check_only=check_only,
+            force=False,
+        )
+        batch.flush()
+        return drift
+
     # Migrated row equals the declared payload: no drift, and an ordinary
     # (non-check) sync refreshes the stale provenance hash in place.
     assert sync(synced, True) is False

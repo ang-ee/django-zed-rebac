@@ -19,7 +19,7 @@ from typing import TYPE_CHECKING, Any
 try:
     __version__ = version("django-zed-rebac")
 except PackageNotFoundError:
-    __version__ = "0.32.2"
+    __version__ = "0.33.0"
 
 default_app_config = "rebac.apps.RebacConfig"
 

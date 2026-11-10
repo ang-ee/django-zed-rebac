@@ -1,6 +1,6 @@
-"""Tri-state permission-expression walker — shared by every evaluator.
+"""Tri-state permission-expression walker, and the schema lookups readers share.
 
-The walker dispatches on the :class:`PermExpr` AST and combines branch
+:func:`eval_expr` dispatches on the :class:`PermExpr` AST and combines branch
 results through ``+`` / ``&`` / ``-`` with caveat-aware tri-state
 semantics. The two side-effectful resolution steps —
 
@@ -10,19 +10,16 @@ semantics. The two side-effectful resolution steps —
   the row's subject?"
 
 — are delegated to caller-supplied callbacks on :class:`WalkContext`.
-Today two evaluators share the walker:
+Its one evaluator is :func:`rebac.preflight.check_new`, which resolves
+direct relations against a caller-supplied virtual ``relation -> subjects``
+mapping (the row doesn't exist yet) and arrow hops via the active
+backend's :meth:`LocalBackend.check_access` on the (real) target rows.
 
-* :class:`rebac.backends.local.LocalBackend` resolves both callbacks
-  against the in-process ``Relationship`` table.
-* :func:`rebac.preflight.check_new` resolves direct relations against a
-  caller-supplied virtual ``relation -> subjects`` mapping (the row
-  doesn't exist yet) and resolves arrow hops via the active backend's
-  :meth:`LocalBackend.check_access` on the (real) target rows.
-
-The walker is the single source of truth for operator precedence,
-sub-permission cycle detection, depth bookkeeping, the tri-state
-``OR/AND/MINUS`` combinators, and the ``anonymous`` / ``authenticated``
-built-in actor terms. Backends do not re-implement any of these.
+:class:`rebac.backends.local.LocalBackend` does not walk: its reads are
+compiled to queries (:mod:`rebac.compile`). The backend, the compiler and
+the field gates share only this module's schema lookups (``find_relation``,
+``find_permission``, ``field_gated_actions``, allowed-subject matching) and
+its tri-state combinators.
 """
 
 from __future__ import annotations

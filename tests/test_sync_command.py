@@ -8,6 +8,8 @@ import pytest
 from django.contrib.contenttypes.models import ContentType
 from django.core.management import call_command
 from django.core.management.base import CommandError
+from django.db import connection
+from django.test.utils import CaptureQueriesContext
 from django.utils import timezone
 
 from rebac.models import (
@@ -133,6 +135,41 @@ def test_sync_only_prunes_stale_managed_rows_when_forced(force: bool) -> None:
             "caveat:legacy_caveat",
         ]
     ).exists() is (not force)
+
+
+def _source(tmp_path, monkeypatch, name: str, text: str) -> None:
+    root = tmp_path / name
+    root.mkdir()
+    (root / "permissions.zed").write_text(text, encoding="utf-8")
+    monkeypatch.setattr(
+        "rebac.management.commands.rebac.apps.get_app_configs",
+        lambda: [SimpleNamespace(name=name, path=str(root))],
+    )
+
+
+@pytest.mark.django_db
+@pytest.mark.parametrize("returned", [True, False], ids=["keys-returned", "keys-read-back"])
+def test_sync_statements_do_not_grow_with_the_rows_it_writes(returned, monkeypatch, tmp_path):
+    # Without returned keys (MySQL), sync reads the created rows' keys back once per table.
+    monkeypatch.setattr(connection.features, "can_return_rows_from_bulk_insert", returned)
+
+    def statements(size: int) -> int:
+        text = f"caveat c{size}(on bool) {{ on }}\n" + "".join(
+            f"definition s{size}/n{n} {{ relation member: s{size}/n{n} with c{size} "
+            "permission read = member }\n"
+            for n in range(size)
+        )
+        _source(tmp_path, monkeypatch, f"app{size}", text)
+        with CaptureQueriesContext(connection) as queries:
+            call_command("rebac", "sync", stdout=io.StringIO())
+        return len(queries)
+
+    call_command("rebac", "sync", stdout=io.StringIO())  # A published policy beside the sources.
+    ContentType.objects.get_for_model(SchemaCaveat)  # Cached on first use, outside the measure.
+    assert statements(1) == statements(20)
+    records = PackageManagedRecord.objects.filter(package="app20")
+    assert len(records) == 61
+    assert all(record.external_id.endswith(f":{record.target}") for record in records)
 
 
 @pytest.mark.django_db

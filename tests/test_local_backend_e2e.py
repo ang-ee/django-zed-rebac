@@ -30,10 +30,12 @@ from rebac import (
     grant_subject_ref,
     rebac_subject,
     sudo,
+    to_object_ref,
     write_relationships,
 )
 from rebac.backends import reset_backend
 from rebac.schema import parse_zed
+from rebac.testing import assert_decisions
 from rebac.types import RelationshipFilter
 from tests.backend_setup import install_schema
 
@@ -282,6 +284,45 @@ def test_local_backend_consistency_tokens_scope_direct_checks_and_accessible(
             at_zookie=after_bob,
         )
     ) == {"freshness"}
+
+
+def test_assert_decisions_names_every_cell_that_differs(
+    local_backend: LocalBackend,
+    fake_users: FakeUsers,
+) -> None:
+    from tests.testapp.models import Post
+
+    owned, other = _create_post(title="owned"), _create_post(title="other")
+    owned_ref, other_ref = to_object_ref(owned), to_object_ref(other)
+    write_relationships([_grant(fake_users.alice, owned_ref, "owner")])
+    alice, bob = _user(fake_users.alice), _user(fake_users.bob)
+
+    assert_decisions(
+        [(fake_users.alice, "delete", owned, True), (fake_users.bob, "delete", owned_ref, False)],
+        accessible=[(fake_users.alice, "delete", Post, {owned}), (bob, "delete", "blog/post", ())],
+    )
+    with pytest.raises(AssertionError) as raised:
+        assert_decisions(
+            [
+                (bob, "delete", owned, True),
+                (alice, "delete", owned, True),
+                (alice, "delete", other, True),
+            ],
+            accessible=[
+                (alice, "delete", Post, {owned_ref.resource_id, other}),
+                # Another type's object never matches, whatever its id.
+                (alice, "delete", Post, {ObjectRef("blog/folder", owned_ref.resource_id)}),
+            ],
+        )
+    assert str(raised.value).splitlines() == [
+        "4 decision(s) differ:",
+        f"{bob} delete {owned_ref}: expected True, got NO_PERMISSION",
+        f"{alice} delete {other_ref}: expected True, got NO_PERMISSION",
+        f"{alice} delete blog/post: expected {sorted([str(owned_ref), str(other_ref)])}, "
+        f"got ['{owned_ref}']",
+        f"{alice} delete blog/post: expected ['blog/folder:{owned_ref.resource_id}'], "
+        f"got ['{owned_ref}']",
+    ]
 
 
 def test_local_backend_caveats_are_conditional_for_checks_and_conservative_for_reads(
