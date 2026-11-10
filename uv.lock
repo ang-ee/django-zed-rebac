@@ -324,7 +324,7 @@ wheels = [
 
 [[package]]
 name = "django-zed-rebac"
-version = "0.31.5"
+version = "0.32.0"
 source = { editable = "." }
 dependencies = [
     { name = "django" },
@@ -375,7 +375,7 @@ requires-dist = [
     { name = "cel-python", marker = "extra == 'caveats'", specifier = ">=0.1.5" },
     { name = "channels", marker = "extra == 'strawberry'", specifier = ">=4.0" },
     { name = "django", specifier = ">=6.1,<6.2" },
-    { name = "django-cte", specifier = ">=5,<6" },
+    { name = "django-cte", specifier = ">=5.0.1,<5.1" },
     { name = "djangorestframework", marker = "extra == 'drf'", specifier = ">=3.18" },
     { name = "mcp", marker = "extra == 'mcp'", specifier = ">=1.27" },
     { name = "strawberry-graphql", marker = "extra == 'strawberry'", specifier = ">=0.220" },

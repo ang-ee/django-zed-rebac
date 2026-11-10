@@ -53,8 +53,9 @@ from rebac.schema.cache import SchemaSnapshot, schema_operation
 from rebac.schema.walker import find_permission, find_relation
 from rebac.types import CheckItem, CheckResult, ObjectRef, SubjectRef
 
-from . import At, Bound, Compiler, predicate
+from . import At, Bound, Compiler, ctes
 from .conditions import CaveatVerdicts
+from .ctes import Marker
 from .evaluate import named_subjects, residual
 from .predicate import (
     PointRow,
@@ -71,8 +72,8 @@ from .program import CompileProgram, Key
 if TYPE_CHECKING:
     from rebac.backends.local import LocalBackend
 
-_MANUAL_REVISION = object()
-_RESOURCE_WIRE = object()
+_MANUAL_REVISION = Marker("manual schema revision")
+_RESOURCE_WIRE = Marker("resource wire id")
 _LIMIT = 512
 # The most literal identities a scoped read is bounded to; a longer list uses
 # the general scope (the size crossover, and the vendors' bind limits).
@@ -92,10 +93,33 @@ class _Kept:
     depends on, for the decision cache (``_constant_witness``).
     """
 
-    sql: str
+    body: str
     params: tuple[Any, ...]
+    using: str
     every: bool = False
     reads: tuple[str, ...] = ()
+    definitions: tuple[ctes.Definition, ...] = ()
+
+    @property
+    def sql(self) -> str:
+        sql, _params = ctes.assemble((self.body, ()), self.definitions, connections[self.using])
+        return f"({sql})"
+
+    def render(self, bound: Iterable[Any]) -> tuple[str, tuple[Any, ...]]:
+        values = tuple(bound)
+        if not self.definitions:
+            return self.sql, values
+        definitions = []
+        offset = 0
+        for item in self.definitions:
+            stop = offset + len(item.params)
+            definitions.append(
+                ctes.Definition(item.name, item.sql, values[offset:stop], item.template)
+            )
+            offset = stop
+        if ctes.register(tuple(definitions)):
+            return f"({self.body})", values[offset:]
+        return self.sql, values
 
 
 _policies: OrderedDict[tuple[Any, ...], _Policy] = OrderedDict()
@@ -217,13 +241,20 @@ def _policy(backend: LocalBackend) -> _Policy:
     return policy
 
 
+class _StatementNow(Expression):
+    def as_sql(self, compiler: Any, connection: Any) -> Any:
+        return Value(ctes.statement_now(), output_field=models.DateTimeField()).as_sql(
+            compiler, connection
+        )
+
+
 def _fence(
     policy: _Policy, *, backend: LocalBackend, using: str, parametric: bool
 ) -> models.QuerySet[Any]:
     """Close a prepared predicate when its policy revision or deadline changes."""
 
     snapshot = policy.snapshot
-    rows = SchemaGeneration.objects.using(using).filter(pk=1)
+    rows = SchemaGeneration.objects.using(using).filter(pk=1) if parametric else _probe_root(using)
     if snapshot.revision is None:
         return rows.none()
     if backend._schema_is_manual:
@@ -235,11 +266,7 @@ def _fence(
         rows = rows.filter(Exact(Value(snapshot.revision), current))
     else:
         rows = rows.filter(revision=snapshot.revision)
-    now: Expression = (
-        clock()
-        if parametric
-        else Value(predicate.statement_now(), output_field=models.DateTimeField())
-    )
+    now = clock() if parametric else _StatementNow(output_field=models.DateTimeField())
     for deadline, ahead in policy.fence:
         at = Value(deadline, output_field=models.DateTimeField())
         rows = rows.filter(LessThan(now, at) if ahead else GreaterThanOrEqual(now, at))
@@ -250,15 +277,17 @@ def _fence(
 
 
 class _Sql(Expression):
-    """``EXISTS`` over Django-compiled SQL whose parameters are already bound."""
+    """``EXISTS`` over kept SQL, bound inside its executing statement's collector."""
 
-    def __init__(self, sql: str, params: Iterable[Any]) -> None:
+    def __init__(self, kept: _Kept, operation: _Operation, resource_id: str | None = None) -> None:
         super().__init__(output_field=models.BooleanField())
-        self.sql = sql
-        self.params = tuple(params)
+        self.kept = kept
+        self.operation = operation
+        self.resource_id = resource_id
 
     def as_sql(self, compiler: Any, connection: Any) -> tuple[str, tuple[Any, ...]]:
-        return f"EXISTS {self.sql}", self.params
+        sql, params = self.kept.render(self.operation.bound(self.kept.params, self.resource_id))
+        return f"EXISTS {sql}", params
 
 
 @dataclass(frozen=True)
@@ -366,7 +395,11 @@ class _Operation:
                 if kept is not None:
                     _statements.move_to_end(full)
                     return kept
-        built = build()
+        # Building a template is not part of the SQL statement currently
+        # embedding it. In particular, its actor placeholders must not become
+        # that outer statement's CTE definitions.
+        with ctes.isolated():
+            built = build()
         compiled: _Kept | bool
         if isinstance(built, bool):
             compiled = built
@@ -378,16 +411,26 @@ class _Operation:
             query.clear_ordering(force=True)
             compiler = query.get_compiler(using=self.using)
             try:
-                sql, params = query.as_sql(compiler, compiler.connection)
+                with ctes.collecting() as collected:
+                    body, body_params = compiler.as_sql()
+                definitions = tuple(collected.definitions.values())
             except EmptyResultSet:
                 # No row can satisfy it: an unpublished policy, or a
                 # condition Django proves empty.
                 compiled = False
             else:
-                compiled = _Kept(sql, tuple(params), every, *reads)
+                compiled = _Kept(
+                    body,
+                    (*[param for item in definitions for param in item.params], *body_params),
+                    self.using,
+                    every,
+                    reads[0] if reads else (),
+                    definitions=definitions,
+                )
         if keep:
             with _lock:
                 _statements[full] = compiled
+                _statements.move_to_end(full)
                 while len(_statements) > _LIMIT:
                     _statements.popitem(last=False)
         return compiled
@@ -439,6 +482,11 @@ def _constant_statement(operation: _Operation, key: Key) -> _Kept | bool:
     return operation.statement(("constant", key), verdicts, build)
 
 
+def _probe_root(using: str) -> models.QuerySet[SchemaGeneration]:
+    """A probe executes its own statement, even during another one's compilation."""
+    return ctes.share_id_sets(SchemaGeneration.objects.using(using).filter(pk=1))
+
+
 def _constant_witness(
     operation: _Operation, key: Key, *, recheck: bool = False, fresh: bool = False
 ) -> bool | None:
@@ -468,10 +516,8 @@ def _constant_witness(
         return None
 
     def decide() -> bool:
-        probe = _Sql(compiled.sql, operation.bound(compiled.params))
-        return (
-            SchemaGeneration.objects.using(operation.using).filter(pk=1).filter(Q(probe)).exists()
-        )
+        probe = _Sql(compiled, operation)
+        return _probe_root(operation.using).filter(Q(probe)).exists()
 
     generations = tuple(_backend_cache_key(operation.backend, type_) for type_ in compiled.reads)
     kept = None if fresh or None in generations else generations
@@ -603,8 +649,8 @@ def _point(
     compiled = _point_statement(operation, key, which, row_types)
     if isinstance(compiled, bool):
         return compiled and operation.gate(parametric=False).exists()
-    probe = _Sql(compiled.sql, operation.bound(compiled.params, resource_id))
-    return SchemaGeneration.objects.using(operation.using).filter(pk=1).filter(Q(probe)).exists()
+    probe = _Sql(compiled, operation, resource_id)
+    return _probe_root(operation.using).filter(Q(probe)).exists()
 
 
 def _points(
@@ -631,18 +677,18 @@ def _points(
                     fenced = operation.gate(parametric=False).exists()
                 answers[position] = fenced
         else:
-            bound = operation.bound(compiled.params, resource_id)
+            parameters = len(compiled.params)
             if statements[-1] and (
                 size + len(compiled.sql) > _BULK_SQL
-                or (parameter_limit is not None and parameter_count + len(bound) > parameter_limit)
+                or (parameter_limit is not None and parameter_count + parameters > parameter_limit)
             ):
                 statements.append({})
                 size = 0
                 parameter_count = 1
             size += len(compiled.sql)
-            parameter_count += len(bound)
-            statements[-1][f"item{position}"] = _Sql(compiled.sql, bound)
-    rows = SchemaGeneration.objects.using(asked[0][0].using).filter(pk=1) if asked else None
+            parameter_count += parameters
+            statements[-1][f"item{position}"] = _Sql(compiled, operation, resource_id)
+    rows = _probe_root(asked[0][0].using) if asked else None
     for probes in statements:
         if not probes or rows is None:
             continue
@@ -1093,11 +1139,11 @@ class _Scope(Expression):
         if isinstance(compiled, bool):
             # ``True`` cannot occur: a statement that admits rows is a gate.
             return "(1 = 0)", ()
-        params = operation.bound(compiled.params)
+        sql, params = compiled.render(operation.bound(compiled.params))
         if compiled.every:
-            return f"EXISTS {compiled.sql}", tuple(params)
+            return f"EXISTS {sql}", params
         lhs_sql, lhs_params = compiler.compile(self.lhs)
-        return f"({lhs_sql} IN {compiled.sql})", (*lhs_params, *params)
+        return f"({lhs_sql} IN {sql})", (*lhs_params, *params)
 
 
 @schema_operation

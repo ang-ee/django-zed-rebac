@@ -10,6 +10,7 @@ from django.utils.functional import cached_property
 
 from ._id import model_identity_fields, resource_id_attr
 from .actors import ActorLike, to_subject_ref
+from .compile import ctes
 from .resources import model_resource_type
 from .types import SubjectRef
 
@@ -92,26 +93,27 @@ class _Permission(models.Expression):
 
         if self.row_model is None:
             raise ValueError("Resolve a permission expression into its model query first")
-        using = connection.alias
-        active = backend()
-        condition: BaseExpression | None = None
-        if self.row_model._meta.concrete_model is self.model._meta.concrete_model:
-            condition = active.permission_expression(
-                model=self.model,
-                subject=self.actor,
-                action=self.action,
-                using=using,
-                identity=self.identity,
-            )
-        if condition is None:
-            rows = self.model._default_manager.all().using(using)
-            if not isinstance(rows, RebacQuerySet):
-                rows = RebacQuerySet(model=self.model, query=rows.query.clone(), using=using)
-            rows = rows.with_actor(self.actor).with_action(self.action).scoped_for_aggregate()
-            condition = models.Exists(rows.filter(pk=models.OuterRef(self.owner_lookup)))
-        expression = models.Case(
-            models.When(condition, then=models.Value(True)),
-            default=models.Value(False),
-            output_field=models.BooleanField(),
-        ).resolve_expression(compiler.query)
+        with ctes.isolated():
+            using = connection.alias
+            active = backend()
+            condition: BaseExpression | None = None
+            if self.row_model._meta.concrete_model is self.model._meta.concrete_model:
+                condition = active.permission_expression(
+                    model=self.model,
+                    subject=self.actor,
+                    action=self.action,
+                    using=using,
+                    identity=self.identity,
+                )
+            if condition is None:
+                rows = self.model._default_manager.all().using(using)
+                if not isinstance(rows, RebacQuerySet):
+                    rows = RebacQuerySet(model=self.model, query=rows.query.clone(), using=using)
+                rows = rows.with_actor(self.actor).with_action(self.action).scoped_for_aggregate()
+                condition = models.Exists(rows.filter(pk=models.OuterRef(self.owner_lookup)))
+            expression = models.Case(
+                models.When(condition, then=models.Value(True)),
+                default=models.Value(False),
+                output_field=models.BooleanField(),
+            ).resolve_expression(compiler.query)
         return compiler.compile(cast(models.Expression, expression))

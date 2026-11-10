@@ -19,7 +19,7 @@ from typing import TYPE_CHECKING, Any
 try:
     __version__ = version("django-zed-rebac")
 except PackageNotFoundError:
-    __version__ = "0.31.5"
+    __version__ = "0.32.0"
 
 default_app_config = "rebac.apps.RebacConfig"
 
@@ -79,6 +79,7 @@ if TYPE_CHECKING:
     from .audit import aemit as aemit_audit_event
     from .audit import emit as emit_audit_event
     from .backends import LocalBackend, backend
+    from .compile.ctes import share_id_sets
     from .decorators import check_permission, rebac_resource, require_permission
     from .expressions import permission_expression
     from .field_backing import GenericTarget, generic_target, proposed_forward_relationships
@@ -97,6 +98,7 @@ if TYPE_CHECKING:
 
 
 _LAZY = {
+    "share_id_sets": ("rebac.compile.ctes", "share_id_sets"),
     "permission_expression": ("rebac.expressions", "permission_expression"),
     "RebacTrackedMixin": ("rebac.mixins", "RebacTrackedMixin"),
     "RebacMixin": ("rebac.mixins", "RebacMixin"),
@@ -215,6 +217,7 @@ __all__ = [
     "RebacError",
     # helpers
     "permission_expression",
+    "share_id_sets",
     "write_relationships",
     "delete_relationship",
     "delete_relationships",

@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "django-zed-rebac"
-version = "0.31.5"
+version = "0.32.0"
 description = "Drop-in REBAC engine for Django, SpiceDB-compatible, with a pure-Django LocalBackend."
 readme = "README.md"
 license = "Apache-2.0"
@@ -23,7 +23,7 @@ classifiers = [
 ]
 dependencies = [
     "django>=6.1,<6.2",
-    "django-cte>=5,<6",
+    "django-cte>=5.0.1,<5.1",
 ]
 
 [project.optional-dependencies]
@@ -115,6 +115,7 @@ select = ["E", "F", "I", "B", "UP", "RUF"]
 ignore = ["E501"]
 
 [tool.mypy]
+files = ["src", "tests/typing"]
 python_version = "3.14"
 strict = true
 plugins = ["mypy_django_plugin.main"]
