@@ -13,8 +13,9 @@ pre-1.0; breaking changes within a minor version are explicitly called out.
   decision table against the active backend. `(subject, action, resource,
   allowed)` rows are decided in one `check_bulk_permissions` call;
   `(subject, action, resource_type, ids)` rows compare the complete
-  `accessible` answer. One `AssertionError` lists every row whose answer
-  differs, with the expected and the actual answer.
+  `accessible` answer as `ObjectRef`s, from wire ids, `ObjectRef`s or resource
+  instances. One `AssertionError` lists every row whose answer differs, with
+  the expected and the actual answer (a check's `PermissionResult`).
 
 ### Changed
 

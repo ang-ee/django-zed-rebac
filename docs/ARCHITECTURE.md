@@ -568,9 +568,12 @@ resource, allowed)`: an `ActorLike`, an action, an `ObjectRef` or anything
 does not); the rows are decided in one `check_bulk_permissions` call. Each
 `accessible` row is `(subject, action, resource_type, ids)`, where
 `resource_type` is a type name or a resource model and `ids` is the complete
-set `accessible` answers, as wire ids or resource instances. It raises one
-`AssertionError` that lists every row whose answer differs, with the expected
-and the actual answer. Tables are Python data; there is no file format.
+set `accessible` answers, as wire ids of that type, `ObjectRef`s or resource
+instances, compared as `ObjectRef`s (another type's object never matches). It
+raises one `AssertionError` that lists every row whose answer differs, with
+the expected and the actual answer (a check's `PermissionResult`, so a
+conditional answer reads as one). Tables are Python data; there is no file
+format.
 
 `rebac.schema_changes(using=None)` groups writes to stored schema rows
 (`SchemaDefinition`, `SchemaRelation`, `SchemaPermission`, `SchemaCaveat`,

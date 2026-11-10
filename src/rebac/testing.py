@@ -42,6 +42,13 @@ def install_schema(
     return local
 
 
+def _member(value: Any, resource_type: str) -> ObjectRef:
+    """An expected ``accessible`` member: a wire id of ``resource_type``, an ObjectRef or a resource."""
+    if isinstance(value, str):
+        return ObjectRef(resource_type, value)
+    return value if isinstance(value, ObjectRef) else to_object_ref(value)
+
+
 def assert_decisions(
     checks: Iterable[tuple[ActorLike, str, Any, bool]] = (),
     accessible: Iterable[tuple[ActorLike, str, Any, Iterable[Any]]] = (),
@@ -55,8 +62,10 @@ def assert_decisions(
     ``check_bulk_permissions`` call. ``accessible`` rows are
     ``(subject, action, resource_type, ids)``: ``resource_type`` is a type name
     or a resource model, and ``ids`` the complete set ``accessible`` answers,
-    as wire ids or resource instances. One ``AssertionError`` lists every row
-    whose answer differs, with the expected and the actual answer.
+    as wire ids of that type, ``ObjectRef``s or resource instances; they are
+    compared as ``ObjectRef``s, so another type's object never matches. One
+    ``AssertionError`` lists every row whose answer differs, with the expected
+    and the actual answer (a check's ``PermissionResult``).
     """
     active = backends.backend()
     rows = [
@@ -65,7 +74,7 @@ def assert_decisions(
     ]
     answers = active.check_bulk_permissions(CheckItem(s, a, r) for s, a, r, _ in rows)
     failures = [
-        f"{s} {a} {r}: expected {allowed}, got {bool(answer)}"
+        f"{s} {a} {r}: expected {allowed}, got {answer.result}"
         for (s, a, r, allowed), answer in zip(rows, answers, strict=True)
         if bool(answer) != allowed
     ]
@@ -74,11 +83,13 @@ def assert_decisions(
         resource_type = target if isinstance(target, str) else model_resource_type(target)
         if resource_type is None:
             raise TypeError(f"{target!r} is not a resource type or a resource model")
-        expected = sorted(i if isinstance(i, str) else to_object_ref(i).resource_id for i in ids)
+        expected = {_member(i, resource_type) for i in ids}
         found = active.accessible(subject=subject, action=action, resource_type=resource_type)
-        if sorted(found) != expected:
+        actual = {ObjectRef(resource_type, i) for i in found}
+        if actual != expected:
             failures.append(
-                f"{subject} {action} {resource_type}: expected {expected}, got {sorted(found)}"
+                f"{subject} {action} {resource_type}: "
+                f"expected {sorted(map(str, expected))}, got {sorted(map(str, actual))}"
             )
     if failures:
         raise AssertionError("\n".join([f"{len(failures)} decision(s) differ:", *failures]))

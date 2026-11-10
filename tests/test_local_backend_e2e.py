@@ -308,14 +308,20 @@ def test_assert_decisions_names_every_cell_that_differs(
                 (alice, "delete", owned, True),
                 (alice, "delete", other, True),
             ],
-            accessible=[(alice, "delete", Post, {owned_ref.resource_id, other})],
+            accessible=[
+                (alice, "delete", Post, {owned_ref.resource_id, other}),
+                # Another type's object never matches, whatever its id.
+                (alice, "delete", Post, {ObjectRef("blog/folder", owned_ref.resource_id)}),
+            ],
         )
     assert str(raised.value).splitlines() == [
-        "3 decision(s) differ:",
-        f"{bob} delete {owned_ref}: expected True, got False",
-        f"{alice} delete {other_ref}: expected True, got False",
-        f"{alice} delete blog/post: expected {sorted([owned_ref.resource_id, other_ref.resource_id])}, "
-        f"got {[owned_ref.resource_id]}",
+        "4 decision(s) differ:",
+        f"{bob} delete {owned_ref}: expected True, got NO_PERMISSION",
+        f"{alice} delete {other_ref}: expected True, got NO_PERMISSION",
+        f"{alice} delete blog/post: expected {sorted([str(owned_ref), str(other_ref)])}, "
+        f"got ['{owned_ref}']",
+        f"{alice} delete blog/post: expected ['blog/folder:{owned_ref.resource_id}'], "
+        f"got ['{owned_ref}']",
     ]
 
 
