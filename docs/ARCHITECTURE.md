@@ -3496,7 +3496,10 @@ Default mode. Idempotent. Respects `no_update`:
 For each AppConfig that declares rebac_schema:
   1. Locate the .zed file.
   2. Parse and validate against the schema language.
-  3. For each definition / relation / permission / caveat:
+  3. Read the package's schema rows and PackageManagedRecords once. For each
+     definition / relation / permission / caveat, decide from them; the
+     package's new and changed rows and records are then written in bulk, so
+     the statements a sync issues do not grow with the rows it writes:
      a. Compute content_hash of the fragment.
      b. Look up PackageManagedRecord by (package, external_id).
      c. If not found → create Schema* row + PackageManagedRecord. (Fresh install.)

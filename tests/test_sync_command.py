@@ -8,6 +8,8 @@ import pytest
 from django.contrib.contenttypes.models import ContentType
 from django.core.management import call_command
 from django.core.management.base import CommandError
+from django.db import connection
+from django.test.utils import CaptureQueriesContext
 from django.utils import timezone
 
 from rebac.models import (
@@ -133,6 +135,52 @@ def test_sync_only_prunes_stale_managed_rows_when_forced(force: bool) -> None:
             "caveat:legacy_caveat",
         ]
     ).exists() is (not force)
+
+
+def _source(tmp_path, monkeypatch, name: str, text: str) -> None:
+    root = tmp_path / name
+    root.mkdir()
+    (root / "permissions.zed").write_text(text, encoding="utf-8")
+    monkeypatch.setattr(
+        "rebac.management.commands.rebac.apps.get_app_configs",
+        lambda: [SimpleNamespace(name=name, path=str(root))],
+    )
+
+
+@pytest.mark.django_db
+def test_sync_statements_do_not_grow_with_the_rows_it_writes(monkeypatch, tmp_path) -> None:
+    def statements(size: int) -> int:
+        items = [f"s{size}/n{n}" for n in range(size)]
+        text = "".join(
+            f"definition {i} {{ relation member: {i} permission read = member }}\n" for i in items
+        )
+        _source(tmp_path, monkeypatch, f"app{size}", text)
+        with CaptureQueriesContext(connection) as queries:
+            call_command("rebac", "sync", stdout=io.StringIO())
+        return len(queries)
+
+    call_command("rebac", "sync", stdout=io.StringIO())  # A published policy beside the sources.
+    assert statements(1) == statements(20)
+
+
+@pytest.mark.django_db
+def test_sync_reads_inserted_keys_back_where_the_backend_returns_none(
+    monkeypatch, tmp_path
+) -> None:
+    monkeypatch.setattr(connection.features, "can_return_rows_from_bulk_insert", False)
+    _source(
+        tmp_path,
+        monkeypatch,
+        "app",
+        "caveat office(inside bool) { inside }\n"
+        "definition item/a { relation member: item/a with office permission read = member }\n"
+        "definition item/b { relation parent: item/a permission read = parent->read }\n",
+    )
+    call_command("rebac", "sync", stdout=io.StringIO())
+    call_command("rebac", "sync", "--check", stdout=io.StringIO())
+    records = PackageManagedRecord.objects.filter(package="app")
+    assert len(records) == 7
+    assert all(record.external_id.endswith(f":{record.target}") for record in records)
 
 
 @pytest.mark.django_db

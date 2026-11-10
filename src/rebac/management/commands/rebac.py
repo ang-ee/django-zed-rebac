@@ -18,6 +18,7 @@ from __future__ import annotations
 import hashlib
 import json
 import sys
+from functools import partial
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, cast
 
@@ -104,6 +105,135 @@ def _schema_external_ids(schema: Schema) -> set[str]:
             for permission in definition.permissions
         ),
     }
+
+
+def _natural(natural_key: dict[str, Any]) -> tuple[str, ...]:
+    """A natural key as stored strings; a definition is spelled by its resource type."""
+    return tuple(str(value) for value in natural_key.values())
+
+
+class _SyncBatch:
+    """One package's schema rows and managed records, read once and written in bulk.
+
+    ``row`` answers from the rows the package's source names, read when the
+    batch is built, and from the rows it will create. ``flush`` creates the
+    pending rows parents first, updates the changed rows and then writes the
+    managed records, each naming its row's key.
+    """
+
+    RECORD_FIELDS = (
+        "schema_revision",
+        "target_ct",
+        "target_pk",
+        "content_hash",
+        "no_update",
+        "last_synced_at",
+    )
+
+    def __init__(self, schema: Schema, *, package: str, using: str) -> None:
+        from ...models import (
+            PackageManagedRecord,
+            SchemaCaveat,
+            SchemaDefinition,
+            SchemaPermission,
+            SchemaRelation,
+        )
+
+        self.package, self.using, self.now = package, using, timezone.now()
+        definitions = list(
+            SchemaDefinition.objects.using(using).filter(
+                resource_type__in=[d.resource_type for d in schema.definitions]
+            )
+        )
+        caveats = SchemaCaveat.objects.using(using).filter(
+            name__in=[c.name for c in schema.caveats]
+        )
+        # Parents first: ``flush`` creates in this order.
+        self.rows: dict[Any, dict[tuple[str, ...], Any]] = {
+            SchemaCaveat: {(row.name,): row for row in caveats},
+            SchemaDefinition: {(row.resource_type,): row for row in definitions},
+        }
+        for model_cls in (SchemaRelation, SchemaPermission):
+            children = model_cls.objects.using(using).filter(definition__in=definitions)
+            self.rows[model_cls] = {
+                (row.definition.resource_type, row.name): row
+                for row in children.select_related("definition")
+            }
+        self.records = {
+            record.external_id: record
+            for record in PackageManagedRecord.objects.using(using).filter(package=package)
+        }
+        self.declared: set[tuple[Any, tuple[str, ...]]] = set()
+        self.created: dict[Any, list[tuple[Any, dict[str, Any]]]] = {
+            model: [] for model in self.rows
+        }
+        self.updated: dict[Any, tuple[list[str], list[Any]]] = {}
+        self.claims: list[tuple[Any, str, str]] = []
+        self.refreshed: list[Any] = []
+
+    def row(self, model_cls: Any, natural_key: dict[str, Any]) -> Any:
+        """The row the source declares under ``natural_key``, read or pending; ``None`` if absent."""
+        key = _natural(natural_key)
+        self.declared.add((model_cls, key))
+        return self.rows[model_cls].get(key)
+
+    def stale(self, model_cls: Any) -> list[Any]:
+        """The read rows of ``model_cls`` the source no longer declares."""
+        return [
+            row
+            for key, row in self.rows[model_cls].items()
+            if (model_cls, key) not in self.declared
+        ]
+
+    def create(self, model_cls: Any, natural_key: dict[str, Any], payload: dict[str, Any]) -> Any:
+        row = self.rows[model_cls][_natural(natural_key)] = model_cls(**natural_key, **payload)
+        row._state.db = self.using  # Rows related to it route to its alias, as to a saved row's.
+        self.created[model_cls].append((row, natural_key))
+        return row
+
+    def update(self, row: Any, payload: dict[str, Any]) -> None:
+        for key, value in payload.items():
+            setattr(row, key, value)
+        if payload:
+            self.updated.setdefault(type(row), (list(payload), []))[1].append(row)
+
+    def claim(self, row: Any, external_id: str, content_hash: str) -> None:
+        """Record ``row`` as the package's, in its managed record (reused when present)."""
+        self.claims.append((row, external_id, content_hash))
+
+    def refresh(self, record: Any, content_hash: str) -> None:
+        record.content_hash, record.last_synced_at = content_hash, self.now
+        self.refreshed.append(record)
+
+    def flush(self) -> None:
+        from django.contrib.contenttypes.models import ContentType
+
+        from ...models import PackageManagedRecord
+
+        for model_cls, created in self.created.items():
+            if created:
+                model_cls.objects.using(self.using).bulk_create([row for row, _ in created])
+            for row, natural_key in created:
+                if row.pk is None:  # A backend that returns no inserted keys (MySQL).
+                    found = model_cls.objects.using(self.using).filter(**natural_key)
+                    row.pk = found.values_list("pk", flat=True).get()
+        for model_cls, (fields, rows) in self.updated.items():
+            model_cls.objects.using(self.using).bulk_update(rows, fields)
+        new = []
+        for row, external_id, content_hash in self.claims:
+            record = self.records.get(external_id)
+            if record is None:
+                record = PackageManagedRecord(package=self.package, external_id=external_id)
+                new.append(record)
+            else:
+                self.refreshed.append(record)
+            record.schema_revision, record.no_update, record.target_pk = 1, True, row.pk
+            record.target_ct = ContentType.objects.db_manager(self.using).get_for_model(type(row))
+            record.content_hash, record.last_synced_at = content_hash, self.now
+        records = PackageManagedRecord.objects.using(self.using)
+        records.bulk_create(new)
+        if self.refreshed:
+            records.bulk_update(self.refreshed, self.RECORD_FIELDS)
 
 
 class Command(BaseCommand):
@@ -416,53 +546,36 @@ class Command(BaseCommand):
             with schema_write_atomic(using):
                 expected_external_ids = _schema_external_ids(schema)
                 expected_by_package[package_name] = expected_external_ids
+                batch = _SyncBatch(schema, package=package_name, using=using)
+                sync = partial(
+                    self._sync_row,
+                    batch,
+                    check_only=check_only,
+                    force=force,
+                    transfer_ownership=prune_stale,
+                )
+
                 # Caveats first (definitions reference them).
                 for caveat in schema.caveats:
-                    external_id = _external_id("caveat", caveat.name)
                     payload = {
                         "params": [{"name": p.name, "type": p.type} for p in caveat.params],
                         "expression": caveat.expression,
                     }
-                    drift = self._sync_row(
+                    any_drift |= sync(
                         SchemaCaveat,
-                        natural_key={"name": caveat.name},
-                        payload=payload,
-                        package=package_name,
-                        external_id=external_id,
-                        check_only=check_only,
-                        force=force,
-                        using=using,
-                        transfer_ownership=prune_stale,
+                        {"name": caveat.name},
+                        payload,
+                        _external_id("caveat", caveat.name),
                     )
-                    any_drift = any_drift or drift
 
-                # Definitions
                 for d in schema.definitions:
-                    external_id = _external_id("definition", d.resource_type)
-                    drift = self._sync_row(
-                        SchemaDefinition,
-                        natural_key={"resource_type": d.resource_type},
-                        payload={},
-                        package=package_name,
-                        external_id=external_id,
-                        check_only=check_only,
-                        force=force,
-                        using=using,
-                        transfer_ownership=prune_stale,
-                    )
-                    any_drift = any_drift or drift
-                    schema_def = (
-                        SchemaDefinition.objects.using(using)
-                        .filter(resource_type=d.resource_type)
-                        .first()
-                    )
+                    natural_key = {"resource_type": d.resource_type}
+                    eid = _external_id("definition", d.resource_type)
+                    any_drift |= sync(SchemaDefinition, natural_key, {}, eid)
+                    schema_def = batch.row(SchemaDefinition, natural_key)
                     if schema_def is None:
                         continue
-
-                    relation_names: set[str] = set()
                     for r in d.relations:
-                        relation_names.add(r.name)
-                        external_id = _external_id("relation", d.resource_type, r.name)
                         allowed = [
                             {
                                 "type": s.type,
@@ -473,61 +586,36 @@ class Command(BaseCommand):
                             }
                             for s in r.allowed_subjects
                         ]
-                        drift = self._sync_row(
+                        payload = {
+                            "allowed_subjects": allowed,
+                            "backing": backing_to_dict(r.backing),
+                            "caveat": "",
+                            "with_expiration": r.with_expiration,
+                        }
+                        any_drift |= sync(
                             SchemaRelation,
-                            natural_key={"definition": schema_def, "name": r.name},
-                            payload={
-                                "allowed_subjects": allowed,
-                                "backing": backing_to_dict(r.backing),
-                                "caveat": "",
-                                "with_expiration": r.with_expiration,
-                            },
-                            package=package_name,
-                            external_id=external_id,
-                            check_only=check_only,
-                            force=force,
-                            using=using,
-                            transfer_ownership=prune_stale,
+                            {"definition": schema_def, "name": r.name},
+                            payload,
+                            _external_id("relation", d.resource_type, r.name),
                         )
-                        any_drift = any_drift or drift
-
-                    permission_names: set[str] = set()
                     for p in d.permissions:
-                        permission_names.add(p.name)
-                        external_id = _external_id("permission", d.resource_type, p.name)
-                        drift = self._sync_row(
+                        any_drift |= sync(
                             SchemaPermission,
-                            natural_key={"definition": schema_def, "name": p.name},
-                            payload={"expression": p.raw_text or "<expr>"},
-                            package=package_name,
-                            external_id=external_id,
-                            check_only=check_only,
-                            force=force,
-                            using=using,
-                            transfer_ownership=prune_stale,
+                            {"definition": schema_def, "name": p.name},
+                            {"expression": p.raw_text or "<expr>"},
+                            _external_id("permission", d.resource_type, p.name),
                         )
-                        any_drift = any_drift or drift
+                batch.flush()
 
-                    drift = self._prune_schema_children(
-                        SchemaRelation,
-                        definition=schema_def,
-                        keep_names=relation_names,
+                for model_cls in (SchemaRelation, SchemaPermission):
+                    any_drift |= self._prune_schema_children(
+                        model_cls,
+                        batch.stale(model_cls),
                         check_only=check_only,
                         force=force,
                         using=using,
                         retire=prune_stale,
                     )
-                    any_drift = any_drift or drift
-                    drift = self._prune_schema_children(
-                        SchemaPermission,
-                        definition=schema_def,
-                        keep_names=permission_names,
-                        check_only=check_only,
-                        force=force,
-                        using=using,
-                        retire=prune_stale,
-                    )
-                    any_drift = any_drift or drift
 
                 if not prune_stale:
                     drift = self._prune_package_records(
@@ -572,51 +660,35 @@ class Command(BaseCommand):
 
     def _sync_row(
         self,
+        batch: _SyncBatch,
         model_cls: Any,
         natural_key: dict[str, Any],
         payload: dict[str, Any],
-        package: str,
         external_id: str,
+        *,
         check_only: bool,
         force: bool,
-        using: str = "default",
         transfer_ownership: bool = False,
     ) -> bool:
-        """Sync one schema row, respecting `no_update`. Returns True if drifted."""
+        """Decide one schema row, respecting `no_update`; ``batch`` writes it. True if drifted."""
         from django.contrib.contenttypes.models import ContentType
 
         from ...models import PackageManagedRecord
 
+        using = batch.using
         content_hash = self._hash_payload({**natural_key, **payload})
-        existing = model_cls.objects.using(using).filter(**natural_key).first()
-        ct = ContentType.objects.db_manager(using).get_for_model(model_cls)
-
-        record = (
-            PackageManagedRecord.objects.using(using)
-            .filter(package=package, external_id=external_id)
-            .first()
-        )
+        existing = batch.row(model_cls, natural_key)
+        record = batch.records.get(external_id)
 
         if existing is None:
             # Fresh.
             if check_only:
                 return True
-            obj = model_cls.objects.using(using).create(**natural_key, **payload)
-            PackageManagedRecord.objects.using(using).update_or_create(
-                package=package,
-                external_id=external_id,
-                defaults={
-                    "schema_revision": 1,
-                    "target_ct": ct,
-                    "target_pk": obj.pk,
-                    "content_hash": content_hash,
-                    "no_update": True,
-                    "last_synced_at": timezone.now(),
-                },
-            )
+            batch.claim(batch.create(model_cls, natural_key, payload), external_id, content_hash)
             return False
 
         if record is None and transfer_ownership:
+            ct = ContentType.objects.db_manager(using).get_for_model(model_cls)
             claims = list(
                 PackageManagedRecord.objects.using(using)
                 .filter(external_id=external_id, target_ct=ct, target_pk=existing.pk)
@@ -627,8 +699,8 @@ class Command(BaseCommand):
             if claims:
                 if check_only:
                     return True
-                record = claims[0]
-                record.package = package
+                record = batch.records[external_id] = claims[0]
+                record.package = batch.package
                 record.save(using=using, update_fields=["package"])
 
         # Already present. Decide based on the actual row payload, not just
@@ -638,28 +710,15 @@ class Command(BaseCommand):
             # Orphan adoption — claim ownership.
             if check_only:
                 return True
-            for k, v in payload.items():
-                setattr(existing, k, v)
-            existing.save(using=using)
-            PackageManagedRecord.objects.using(using).create(
-                package=package,
-                external_id=external_id,
-                schema_revision=1,
-                target_ct=ct,
-                target_pk=existing.pk,
-                content_hash=content_hash,
-                no_update=True,
-                last_synced_at=timezone.now(),
-            )
+            batch.update(existing, payload)
+            batch.claim(existing, external_id, content_hash)
             return False
 
         actual_payload = {key: getattr(existing, key) for key in payload}
         actual_hash = self._hash_payload({**natural_key, **actual_payload})
         if actual_hash == content_hash:
             if record.content_hash != content_hash and not check_only:
-                record.content_hash = content_hash
-                record.last_synced_at = timezone.now()
-                record.save(using=using, update_fields=["content_hash", "last_synced_at"])
+                batch.refresh(record, content_hash)
             return False  # no-op
 
         if record.no_update and not force:
@@ -675,35 +734,25 @@ class Command(BaseCommand):
 
         if check_only:
             return True
-        for k, v in payload.items():
-            setattr(existing, k, v)
-        existing.save(using=using)
-        record.content_hash = content_hash
-        record.last_synced_at = timezone.now()
-        record.save(using=using, update_fields=["content_hash", "last_synced_at"])
+        batch.update(existing, payload)
+        batch.refresh(record, content_hash)
         return False
 
     def _prune_schema_children(
         self,
         model_cls: Any,
+        stale: list[Any],
         *,
-        definition: Any,
-        keep_names: set[str],
         check_only: bool,
         force: bool,
         using: str = "default",
         retire: bool = False,
     ) -> bool:
-        """Remove relation/permission rows no longer declared by the package schema.
+        """Remove the relation/permission rows a package schema no longer declares.
 
         ``force`` is ``--force-overwrite``; ``retire`` is ``--prune-stale``, which
         also deletes the tuples naming a retired relation.
         """
-        stale = list(
-            model_cls.objects.using(using)
-            .filter(definition=definition)
-            .exclude(name__in=keep_names)
-        )
         if not stale:
             return False
 
@@ -711,14 +760,15 @@ class Command(BaseCommand):
 
         from ...models import PackageManagedRecord
 
+        ct = ContentType.objects.db_manager(using).get_for_model(model_cls)
+        target_pks = [obj.pk for obj in stale]
         if check_only or not force:
             # Unmanaged rows (a consumer's own additions) are only ever
             # deleted by --force-overwrite; a managed stale row is retired by
             # --prune-stale through its managed record.
-            ct = ContentType.objects.db_manager(using).get_for_model(model_cls)
             managed = set(
                 PackageManagedRecord.objects.using(using)
-                .filter(target_ct=ct, target_pk__in=[obj.pk for obj in stale])
+                .filter(target_ct=ct, target_pk__in=target_pks)
                 .values_list("target_pk", flat=True)
             )
             for obj in stale:
@@ -731,7 +781,7 @@ class Command(BaseCommand):
                 self.stdout.write(
                     self.style.WARNING(
                         f"  ! drift: stale {model_cls.__name__} "
-                        f"{definition.resource_type}#{obj.name} ({hint})"
+                        f"{obj.definition.resource_type}#{obj.name} ({hint})"
                     )
                 )
             return True
@@ -741,12 +791,13 @@ class Command(BaseCommand):
 
             if model_cls is SchemaRelation:
                 deleted = self._delete_stale_relationships(
-                    {_external_id("relation", definition.resource_type, obj.name) for obj in stale},
+                    {
+                        _external_id("relation", obj.definition.resource_type, obj.name)
+                        for obj in stale
+                    },
                     using=using,
                 )
                 self._report_retired_tuples(deleted)
-        ct = ContentType.objects.db_manager(using).get_for_model(model_cls)
-        target_pks = [obj.pk for obj in stale]
         PackageManagedRecord.objects.using(using).filter(
             target_ct=ct, target_pk__in=target_pks
         ).delete()
