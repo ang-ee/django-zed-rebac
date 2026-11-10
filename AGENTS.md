@@ -624,8 +624,9 @@ When implementing or modifying the plugin:
    Tier 3 is **not** part of this chain: the reference sweep
    (`make test-reference`), the full PostgreSQL suite,
    `make test-schema-vendors` and, once it lands, `pytest -m spicedb`
-   run nightly and before a release (`make test-release`). There is no scale
-   suite at the moment. Say in the report
+   run nightly and before a release (`make test-release`). The selective-scope
+   scale benchmark (`make test-pg-scale`) runs alone, only when requested.
+   Say in the report
    that tier 3 was not run; don't run it to be safe.
 5. **Determinism test on every emitter touch.** See
    [§ Don't ship a non-deterministic build](#dont-ship-a-non-deterministic-build).

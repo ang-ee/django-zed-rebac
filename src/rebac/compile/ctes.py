@@ -132,6 +132,7 @@ class Definition:
     params: tuple[Any, ...]
     template: bytes
     materialized: bool | None = None
+    independent: bool = False
 
 
 class _CompiledQuery(Query):
@@ -454,6 +455,22 @@ def attach(rows: QuerySet[Any], definitions: tuple[Definition, ...]) -> QuerySet
     owned = cast(Any, query)
     owned._rebac_id_sets = getattr(query, "_rebac_id_sets", ()) + definitions
     return rows
+
+
+def policy_fence(rows: QuerySet[Any]) -> QuerySet[Any]:
+    """Read an equal revision/deadline fence once at the owning statement.
+
+    Embeddings keep their own EXISTS, so a fence inside an excluded or optional
+    branch never becomes a mandatory condition of the outer query.
+    """
+    body = rows.order_by().values("pk")
+    sql, params = id_sql(body.query, rows.db)
+    key = signature(sql, params)
+    name = safe_name("rebac_fence_" + key.hex()[:16], table_names())
+    definition = Definition(name, sql, params, key, independent=True)
+    cte = CTE(body, name=name)
+    selected = cte.queryset()
+    return attach(QuerySet(model=rows.model, query=selected.query, using=rows.db), (definition,))
 
 
 def share_id_sets[T: QuerySet[Any]](queryset: T) -> T:

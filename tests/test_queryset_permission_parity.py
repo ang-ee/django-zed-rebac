@@ -465,7 +465,8 @@ def test_field_owner_sql_cost_is_independent_of_visible_row_count(active, corpus
     # changes only with the compiler; recursive CTE lowering raises the fixed count.
     # Django 6.1 compares the top-level boolean scope predicate with True (one
     # parameter) where the backend has no native boolean type.
-    assert large_cost[1] == 97 + (not connection.features.has_native_boolean_field)
+    # Includes scalar SELECT witnesses and Django's Boolean wrappers.
+    assert large_cost[1] == 99 + (not connection.features.has_native_boolean_field)
 
 
 def test_stored_arrow_resolves_virtual_targets_without_row_multiplication(active):

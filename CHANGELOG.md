@@ -5,6 +5,33 @@ pre-1.0; breaking changes within a minor version are explicitly called out.
 
 ## [Unreleased]
 
+### Fixed
+
+- Selective queryset scopes now check the selected row and field-backed
+  arrow targets through scalar native-key witnesses. Universal role arms
+  decide before shared target sets; the fallback compiles with those witnesses
+  false, so its remaining sparse grants can drive resource lookups. This avoids
+  whole-parent/child enumeration and unused-branch JIT in the measured narrow
+  reads while preserving materialized sharing for branching policies.
+  Revocations, caveats, expiry and exclusion bounds still apply at execution;
+  this introduces no superuser bypass. The special small-integer-candidate
+  path is removed: Django resolves the correlation for every identity shape.
+- Equal schema revision/deadline fences share one definition and table read
+  per collecting statement, including embeddings with different actors.
+  Each check remains at its original Boolean position. Reused field-target
+  sets and recursive closures retain 0.32's sharing; universal witnesses can
+  decide before demanding a shared resource set. Generated SQL and
+  content-hashed CTE names change; public APIs and storage do not.
+
+### Added
+
+- Opt-in `make test-pg-scale` benchmark for selective counts and listings
+  over a parent/child hierarchy, with both storage layouts, exact-result and
+  plan-work assertions, and PostgreSQL 17+ planning-memory measurements.
+  Small plan and semantic regressions run in the normal tiers. See
+  [proposal 0018](docs/proposals/0018-selective-permission-scopes.md) for
+  before/after measurements and the remaining performance limits.
+
 ## [0.33.0] — 2026-11-10
 
 ### Added

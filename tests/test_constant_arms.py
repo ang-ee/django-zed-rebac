@@ -213,7 +213,8 @@ def _grant_behind_the_library(subject_id: str) -> None:
 
 def _without_revision(sql: str) -> str:
     """A statement without the manual schema's revision, which names the policy text."""
-    return re.sub(r"'[0-9a-f]{32}'", "'revision'", sql)
+    sql = re.sub(r"'[0-9a-f]{32}'", "'revision'", sql)
+    return re.sub(r"rebac_fence_[0-9a-f]{16}", "rebac_fence_revision", sql)
 
 
 @KEPT

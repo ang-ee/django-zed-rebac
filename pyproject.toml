@@ -82,8 +82,9 @@ rebac = ["py.typed"]
 DJANGO_SETTINGS_MODULE = "tests.settings"
 python_files = ["test_*.py"]
 testpaths = ["tests"]
-addopts = "-p no:randomly -m 'not reference_exhaustive and not slow and not schema_vendors'"
+addopts = "-p no:randomly -m 'not reference_exhaustive and not slow and not schema_vendors and not scale'"
 markers = [
+    "scale: opt-in serial PostgreSQL scale benchmark; excluded from CI and release sweeps",
     "slow: opt-in expensive tests, excluded from the default suite",
     "reference_exhaustive: opt-in complete reference expression and tuple-presence sweep",
     "reference_shard: independently schedulable shard of the exhaustive reference sweep",

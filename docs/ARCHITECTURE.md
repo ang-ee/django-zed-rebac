@@ -1845,10 +1845,14 @@ bounds select the same objects.
 
 #### Statement shape
 
-- **A disjunction over a row is one `id IN (UNION of id sets)`.** Each arm is
-  a queryset of the model's identities and the arms are united, so no `OR` is
-  left above a subquery of the row's model. At an identity that is not a row
-  (a tuple column, a parameter) the arms are joined with `OR`.
+- **A scope tests the selected row.** A scalar Boolean witness correlates
+  the scope's native identity to the caller's identity; Django resolves its
+  aliases. `SELECT true … LIMIT 1` with `COALESCE(…, false)` prevents the
+  witness becoming a whole-table semi-join or hashed EXISTS alternative.
+  The caller's own filters and indexes determine the candidate rows. Disjunction at that row
+  uses `OR`; it does not enumerate every resource satisfying each arm.
+  Unbounded row enumeration outside the scope path retains its UNION of id
+  sets. Row-independent operands remain Boolean witnesses outside that UNION.
 - **A negated disjunction is a conjunction of `NOT EXISTS`**, one per arm.
   `NOT IN` is never emitted.
 - **Membership is two-valued.** An `IN` arm is `ref IS NOT NULL AND ref IN
@@ -1882,8 +1886,14 @@ with two deliberate exceptions, in both of which the SQL is Django's own:
 
 #### Inline permission scopes
 
-A queryset scope is one SQL predicate. Field- and attribute-backed arrows
-select their targets through subqueries. A constant arrow such as
+A queryset scope is one SQL predicate. In a scope, single-path field-backed
+arrows select an allowed target through a scalar subquery by its native key.
+It selects `true` from a matching row, with `COALESCE(…, false)` for no match. A
+non-unique identity still succeeds if **any** row of that identity allows it;
+the subquery must filter for permission before its `LIMIT 1`. This prevents
+PostgreSQL from turning an `EXISTS` into a hash of every visible parent.
+Backing filters and multi-valued join isolation are unchanged. Attribute-backed arrows retain
+their identity sets. A constant arrow such as
 `admin->member` is an uncorrelated subquery; its result remains inside the
 statement. Subject-set membership is a tuple-table predicate; nested groups
 are a recursive CTE followed to a fixed point, data cycles included. Other
@@ -1908,6 +1918,34 @@ number of distinct id sets in reach, not with the number of paths to them.
 A kept template is independent of the actor's id; sharing in the final statement
 also depends on whether its embeddings bind the same actor. An id set that reads
 a CTE of the query it sits in (a recursive closure's own rows) stays in place.
+
+Field-arrow targets reached through more than one dependency in the policy
+graph, and their descendants, retain shared native-id sets. For a target
+outside a recursive/alias component, a universal disjunct is evaluated before
+access to that set: a scalar CASE checks the constant witness, then either
+checks the target's existence by key or selects from the shared allowed set.
+It uses the same bound and recursion visits as the arrow. A uniform target
+permission/relation can supply that witness on its own; intersection and
+exclusion operands never become independent disjuncts. This avoids demanding
+the full resource set when a universal path suffices, while preserving the
+planning-memory benefit of sharing repeated paths. The fallback selects an
+allowed key through a scalar witness too: when a singly referenced CTE inlines,
+that key can push into its rows. Plain IN membership can instead inflate the
+estimated cost and trigger JIT even for a skipped set. Single-path targets outside
+shared subgraphs use correlated scalar lookups. No CTE is forced to inline:
+actor membership, target id sets and recursive closures keep the existing
+materialization policy. See [proposal 0018](./proposals/0018-selective-permission-scopes.md)
+for the rejected inlining experiment and measured memory bounds.
+
+The shared fallback is compiled under its branch condition: every universal
+disjunct is false there. Equal row-independent SQL witnesses are false in its
+inherited paths too. Full Django-produced SQL/parameter signatures distinguish
+roles, caveat bounds, deadline conditions and recursion paths; no fact is read
+into Python. The compiler memo includes these assumptions and the row versus
+enumeration mode. The fallback uses UNION-based enumeration of the remaining
+grants, so its resource lookups can start from those sparse sets instead of
+estimating a per-row OR over the whole table. Assumptions end at the branch;
+the statement always rechecks its universal witness before choosing it.
 
 REBAC queryset SELECT roots collect the uncorrelated id sets of embedded
 scopes into one outer `WITH RECURSIVE`, in dependency order. A plain Django
@@ -1953,10 +1991,15 @@ when bound. Non-parametric enumeration statements use a 16-digit hexadecimal
 ordinal within their compiler instead: their already bound actor and clock
 values must not change SQL text. These statements execute as separate roots,
 rather than sharing their sets across permission embeddings.
-The collector compares full template signatures and bound parameters. Equal
+The collector compares full template signatures (including materialization)
+and bound parameters. Equal
 bindings share a definition; a second binding of the same template keeps its
 nested `WITH`, shadowing the outer names. A name collision between different
-templates raises `SchemaError`.
+templates raises `SchemaError`. Independent policy fences share separately
+from actor-dependent definitions, including when a different actor binding
+keeps its own nested definitions. Their `EXISTS` checks stay at each original
+Boolean position; a fence in an excluded or optional arm is never hoisted
+into a mandatory outer condition.
 A one-object recursive closure is row-independent and is registered as an id
 set; its recursive helper stays inside that definition. Correlated recursive
 helpers stay at their original boundary. Existing application CTEs follow the
@@ -2051,14 +2094,11 @@ grants one; a scope built after a tuple write through the library decides the
 witness again. Point checks retain their content-type preparation for
 generic backings and prepare caveat verdicts before the SQL statement.
 
-A scoped read that names the identities it reads is bounded to them. When the
-resolved query requires, on a positive AND path, the model's unique native
-integer identity to equal a literal or to be in a list of at most 256 distinct
-literals (`filter(pk=...)`, `filter(pk__in=[...])`), the scope statement visits
-only those candidate rows before applying the permission predicate; the
-selecting query keeps its own filter. Any other shape (an OR, a negation, a
-subquery, duplicates, a longer list) uses the general scope. A bounded
-statement embeds its literals, so it is compiled per read and not kept.
+Every scoped read correlates to its caller's identity, including filters on
+non-identity columns, disjunctions, exclusions, aggregates and embedded
+queries. The previous special case that extracted up to 256 integer identity
+literals from the caller's WHERE tree is removed. No Python code interprets
+the caller's filters to decide which rows authorization should visit.
 
 A policy revision fence closes a scope after a new revision is published.
 A scope built without an actor fails closed. Parametric permission embeddings
@@ -2084,6 +2124,10 @@ is parsed or rewritten. Compiler query identity and mutation state remain
 Django's own.
 The statement-template key includes the policy, operation and permission, actor shape, database
 alias and vendor, depth limit, active relationship model and scope model.
+Correlated scope templates additionally key on the compiled identity
+expression and the caller's alias namespace. Django resolves their correlation
+against a cloned context on a cache miss; a warm embedding binds frozen SQL
+without retaining or re-rendering its query graph.
 The key contains no membership lists, row decisions or fact verdicts. The
 actor shape includes its type and relation suffix, canonical identity
 status, named id and authentication status. Actor id, application clock,
@@ -2113,6 +2157,13 @@ again. Before any policy is published the
 fence matches nothing and reads are closed. A manual schema (`set_schema()`, `rebac.testing.install_schema()`)
 has a digest of the schema as its revision, and the generation row must
 exist.
+
+Equal parametric fences are one `rebac_fence_<digest>` CTE at the shared
+statement boundary, so repeated scope embeddings read the revision once,
+including embeddings for different actors. Distinct revisions or deadline
+intervals retain distinct fences. Non-parametric internal probes retain their
+execution-time fence construction so preparation cannot bind an enclosing
+statement's clock.
 
 #### The clock
 
@@ -2409,17 +2460,17 @@ of its own.
   and otherwise expand into nested SQL to `REBAC_DEPTH_LIMIT`. Statement size
   and database planning work grow with the schema and bound.
 - A queryset scope contains the permissions for its arrow targets and
-  subject sets inline, each distinct id set once. A statement grows with the
-  number of distinct id sets in its reach, not with the number of paths to
-  them, and with the recursion bound. One statement serves every actor of a
-  shape. Only a permission's own constant arms are decided per actor, and
-  only inside an evaluator scope: a permission without one (`read =
-  parent->read`) gives an administrator the whole statement, whose id sets
-  then hold every row of the types its arrows reach. Where the decision cache
+  subject sets, sharing repeated target identity sets.
+  Mutable universal grants remain SQL witnesses, including inside parent
+  permissions; they no longer enumerate a resource-wide UNION arm. Only a
+  permission's own constant arms are decided per actor by the evaluator's
+  witness optimization. Where the decision cache
   keeps nothing for the types the arms name (inside a transaction, or when a
   decision about them reads a model column), an actor who holds a constant arm
   pays one witness per read, other actors one per request, and their
-  statements keep the constant arms' union branch. There is no scale claim.
+  statements keep the constant arms' Boolean witness. The selective synthetic
+  benchmark is described in [proposal 0018](./proposals/0018-selective-permission-scopes.md);
+  it is not a performance guarantee for other policies or data distributions.
 - Within one evaluator scope, after a write that does not go through this
   process's tuple writes (raw SQL, a data migration, another process), one
   actor's operations can disagree until the scope ends. Scoped reads,
@@ -2441,14 +2492,16 @@ of its own.
   stays cacheable unless a decision about it reads a model column, so in an
   application whose user type has a model-backed relation, the types that
   admit users directly are cached too (since 0.31.5).
-- Id sets are driven from the actor's grants, not bounded by the rows the
-  selecting query reads: a read of one parent's children computes the set of
-  parents the actor reads, by index from its grants, and then that parent's
-  children by key.
+- Scoped rows and single-path field-arrow targets are checked by native key.
+  Reused target sets without a sufficient universal witness, actor membership,
+  attribute backings and structural recursive closures can still compute
+  unbounded sets. A broad read can pay for a scalar target lookup per selected
+  row; selective reads are the measured workload.
 - PostgreSQL 12 and later, and SQLite 3.35 and later, materialize a CTE that a
   statement references more than once: an id set shared by several arms is
   computed in full once per statement, and the planner does not push the
-  selecting predicate into it.
+  selecting predicate into it. Universal field-target witnesses can avoid
+  demanding their shared set, but do not change its materialization policy.
 - SQLite adds up the expression depth of every subquery nested in a WHERE
   clause while it resolves a statement, and refuses one deeper than
   `SQLITE_LIMIT_EXPR_DEPTH` (1000 by default). Nested id sets would make that
@@ -3672,7 +3725,8 @@ worker in any order. Random ordering is opt-in with
 
 ### Test tiers
 
-Every test belongs to exactly one of three tiers. The tiers differ in when
+Every regression test belongs to one of three tiers; scale benchmarks run
+separately on request. The tiers differ in when
 they run, not in how much they are trusted: a tier 3 failure is a release
 blocker like any other.
 
@@ -3680,7 +3734,7 @@ blocker like any other.
 |---|---|---|---|
 | **1. Fast** — `make check` | Every change, every push and pull request. The only gate for merging and for publishing a tag. | Ruff lint and format, strict mypy, Pyright, then the SQLite suite without `slow`, in parallel with work stealing, stopping at the first failure. | 1 minute on a developer machine, 5 minutes in CI. |
 | **2. PostgreSQL delta** — `make test-pg` | Every push and pull request, as a job beside tier 1. Locally when a change touches SQL generation, transactions, locking or migrations. | Only the tests marked `postgresql` or `pg_delta`, on PostgreSQL 16. | 3 minutes. |
-| **3. Release** — `make test-release` | Nightly on `main` and on demand before a release. Never inside a fix loop. | `slow` on SQLite; the whole suite including `slow` on PostgreSQL; the full `reference_exhaustive` sweep; the `schema_vendors` PostgreSQL/MySQL contracts; a randomized parallel run with seed 137; the SpiceDB conformance suite once it lands. There is no scale suite at the moment. | No measured budget at the moment; independent parallel jobs in CI, where the sweep is the longest. |
+| **3. Release** — `make test-release` | Nightly on `main` and on demand before a release. Never inside a fix loop. | `slow` on SQLite; the whole suite including `slow` on PostgreSQL; the full `reference_exhaustive` sweep; the `schema_vendors` PostgreSQL/MySQL contracts; a randomized parallel run with seed 137; the SpiceDB conformance suite once it lands. Scale benchmarks are separately opt-in. | No measured budget at the moment; independent parallel jobs in CI, where the sweep is the longest. |
 
 Rules that keep the tiers honest:
 
@@ -3705,15 +3759,21 @@ Rules that keep the tiers honest:
   for something that did not run.
 - **Parallel scheduling is by test, not by file** (`--dist worksteal`). No
   test may rely on sharing a worker with its module.
-- **There is no scale suite at the moment.** No test holds time, statement or
-  query-plan budgets for large tables. A suite that does runs alone, never
-  beside parallel workers, because they distort such budgets.
+- **Scale runs alone and is opt-in.** `make test-pg-scale` selects `scale`
+  tests on PostgreSQL, serially, outside all CI/release sweeps. The default
+  fixture has 150,000 messages and 1.5 million parts; `REBAC_SCALE_MESSAGES`
+  and `REBAC_SCALE_PARTS` set larger cardinalities. `REBAC_SCALE_REPORT`
+  saves SQL, bound queries, JSON plans and measurements; `REBAC_SCALE_BASELINE`
+  optionally replays a saved baseline against the same fixture. The benchmark
+  checks exact rows, selective plan work and sub-second query time, and records
+  planning memory on PostgreSQL 17+. Small plan and semantics tests remain in
+  tiers 1 and 2. Do not run timing benchmarks beside parallel test workers.
 - **Publishing does not wait for tier 3.** A tag publishes once tier 1 is
   green on it. Tier 3 is consulted before tagging; its nightly result on
   `main` is the release evidence.
 
-Default `pytest` deselects `slow`, `reference_exhaustive` and
-`schema_vendors`. `make test` runs the tier 1 selection serially, for
+Default `pytest` deselects `slow`, `reference_exhaustive`,
+`schema_vendors` and `scale`. `make test` runs the tier 1 selection serially, for
 debugging only.
 
 Tiers 1 and 2 are the two parallel jobs of `.github/workflows/ci.yml`, on
@@ -3740,8 +3800,8 @@ cases also carry `reference_shard`. `make test-reference` overrides the
 marker filter and runs every reference shard, distributed by test rather
 than by file. `make test-postgres` runs the whole suite, `slow` included, on
 PostgreSQL. `make test-schema-vendors` opts into disposable PostgreSQL/MySQL
-contracts; MySQL 8.4 is covered only there. All of these are tier 3. There is
-no scale suite at the moment. Drivers, environment and release gates are in
+contracts; MySQL 8.4 is covered only there. All of these are tier 3; the
+selective-scope scale benchmark is separately opt-in. Drivers, environment and release gates are in
 [CONTRIBUTING.md](../CONTRIBUTING.md).
 
 | Suite | Modules | Required cases and assertions |
@@ -3904,7 +3964,7 @@ routing. Candidate projection uses the write alias. Arbitrary cross-database
 authorization remains unsupported; explicit alias handling is not a distributed
 transaction or permission join.
 
-9. **Query plans at scale.** Compiled statements have not been verified on PostgreSQL tables of tens of millions of rows. A trial on a consumer database is in progress ([proposal 0015](./proposals/0015-permissions-compiled-to-queries.md), gate G1). The shape under test is the one of [Statement shape](#statement-shape): a disjunction as a union of id sets.
+9. **Query plans at scale.** Compiled statements have not been verified on PostgreSQL tables of tens of millions of rows. A trial on a consumer database is in progress ([proposal 0015](./proposals/0015-permissions-compiled-to-queries.md), gate G1). [Proposal 0018](./proposals/0018-selective-permission-scopes.md) measures selective correlated scopes on synthetic parent/child tables; it does not settle broad-read, large tuple-table or production planner-memory budgets.
 
 10. **Recursion deeper than the bound.** Stored subject-set membership is followed to a fixed point. Every other recursive path is bounded by `REBAC_DEPTH_LIMIT`: a deployment with deeper chains raises it. Its finite CTEs carry the depth as a column, so a deeper bound adds no SQL there; the nested fallback pays one level of SQL per unit. A closure table for one recursive relation would remove the bound (proposal 0015 § 8); it is not planned.
 
@@ -3912,7 +3972,7 @@ transaction or permission join.
 
 12. **Ordering of grant changes and gated writes.** A gate locks the rows it decides on, not the tuples or parent rows its decision reads. Whether the library should offer a stronger ordering than the database's isolation level gives is open; lean: no, document the contract.
 
-13. **Budgets.** There is no scale suite at the moment. Statement counts per save, SQL size and compile time per scope are quantities to measure before budgets are set.
+13. **Budgets.** The opt-in selective-scope benchmark holds a sub-second query and bounded scan-work budget for its fixture, and records SQL size, compilation and PostgreSQL 17+ planning memory. General statement counts per save and compiler/planner budgets across policy shapes remain to be measured.
 
 ---
 

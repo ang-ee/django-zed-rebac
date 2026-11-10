@@ -6,9 +6,9 @@ and exclusions without a corresponding model row.
 
 Three rules shape every statement:
 
-* a disjunction over a row is one ``id IN (union of id sets)``, never ``OR``
-  over subqueries, and a negated disjunction is a conjunction of ``NOT
-  EXISTS``;
+* a correlated row scope uses Boolean disjunction at that row; an unbounded
+  row enumeration uses a union of id sets, with uniform arms outside it;
+  a negated disjunction is a conjunction of ``NOT EXISTS``;
 * an arm over a multi-valued path is its own subquery, so two arms never share
   a join;
 * an uncorrelated id set is one CTE of its statement (``Compiler._ids``),
@@ -27,9 +27,10 @@ from typing import Any, Final, Protocol, cast
 
 from django.core.exceptions import EmptyResultSet, FieldDoesNotExist
 from django.db import connections, models
-from django.db.models import Exists, Expression, F, OuterRef, Q, QuerySet, Value
+from django.db.models import Exists, Expression, F, OuterRef, Q, QuerySet, Subquery, Value
 from django.db.models.expressions import Col
 from django.db.models.fields.related_lookups import RelatedExact, RelatedIn
+from django.db.models.functions import Coalesce
 from django.db.models.lookups import Exact, In, IntegerFieldExact, IsNull, LessThan
 from django_cte import CTE, with_cte
 
@@ -355,6 +356,9 @@ class Compiler:
 
     ``fold`` names a permission whose constant arms (``constant_arms``) are
     known not to hold for the actor: the lower bound compiles them as false.
+
+    ``correlated`` compiles for a row selected by its native identity. Field
+    arrows are scalar target predicates, and unions don't enumerate rows.
     """
 
     def __init__(
@@ -371,6 +375,7 @@ class Compiler:
         parametric: bool = False,
         point: PointRow | None = None,
         fold: Key | None = None,
+        correlated: bool = False,
     ) -> None:
         self.schema = tagged.schema if tagged is not None else schema
         self.actor = actor
@@ -391,6 +396,8 @@ class Compiler:
         self.program = program if program is not None else CompileProgram.build(self.schema)
         self.parametric = parametric
         self.point = point
+        self.correlated = correlated
+        self._assumed_false: frozenset[bytes] = frozenset()
         self.shape = actor_shape(self.schema, actor, using)
         self._memo: dict[tuple[Any, ...], Q] = {}
         self._relevant: dict[Key, frozenset[Key]] = {}
@@ -427,7 +434,7 @@ class Compiler:
         return ctes.attach(rows, tuple(self._id_sets))
 
     def _ids(self, rows: QuerySet[Any]) -> QuerySet[Any]:
-        """An uncorrelated id set, selected from the CTE that defines it.
+        """An uncorrelated set selected from its CTE.
 
         A policy reaches the same id set from many arms: a permission referred
         to by several others, an arrow followed from several types.  Each
@@ -447,7 +454,7 @@ class Compiler:
         except EmptyResultSet:
             # Django proves it empty in place, under the predicate it is in.
             return rows
-        key = signature(sql, tuple(params))
+        key = signature(sql, params)
         cte = self._id_set_names.get(key)
         if cte is None:
             # Enumeration binds its values while building each separate root.
@@ -631,13 +638,22 @@ class Compiler:
     ) -> Q:
         if key not in self.program.dependencies:
             return _FALSE
-        memo = (key, at, bound, self._path(key, visits), depth_possible)
+        memo = (
+            key,
+            at,
+            bound,
+            self.correlated,
+            self._assumed_false,
+            self._path(key, visits),
+            depth_possible,
+        )
         found = self._memo.get(memo)
         if found is None:
             found = self._memo[memo] = self._node(
                 key, at, bound, visits, depth_possible=depth_possible
             )
-        return found
+        definition = self.schema.get_definition(key[0])
+        return self._under_assumptions(definition, PermRef(key[1]), found) if definition else found
 
     def _path(self, key: Key, visits: Mapping[Key, int]) -> frozenset[tuple[Key, int]]:
         """What of the path to ``key`` its predicate depends on.
@@ -1398,8 +1414,18 @@ class Compiler:
                 if len(arms) == 1:
                     # A tagged union: its own tag applies below, its operands here.
                     arms = [expr.left, expr.right]
-                result = self._union(
-                    at, self._arms(definition, arms, at, bound, visits, depth_possible)
+                constants = [arm for arm in arms if self._uniform(definition, arm)]
+                varying = [arm for arm in arms if not self._uniform(definition, arm)]
+                uniform = _or(*self._arms(definition, constants, at, bound, visits, depth_possible))
+                result = (
+                    uniform
+                    if uniform is _TRUE
+                    else _or(
+                        uniform,
+                        self._union(
+                            at, self._arms(definition, varying, at, bound, visits, depth_possible)
+                        ),
+                    )
                 )
             elif expr.op == "&":
                 left = self._expression(
@@ -1432,8 +1458,59 @@ class Compiler:
             raise TypeError(f"Unknown permission expression {type(expr).__name__}")
         arm = self.tagged.arms.get(id(expr)) if self.tagged is not None else None
         if arm is not None and arm.deadline:
-            return _and(result, _before(self.now, arm.deadline))
+            result = _and(result, _before(self.now, arm.deadline))
+        return self._under_assumptions(definition, expr, result)
+
+    def _uniform_signature(self, predicate: Q) -> bytes:
+        """Compare row-independent witnesses in one canonical Django context."""
+        from ..models.generation import SchemaGeneration
+
+        rows = SchemaGeneration.objects.using(self.using).filter(predicate).values("pk")
+        try:
+            return signature(*ctes.id_sql(rows.query, self.using))
+        except EmptyResultSet:
+            return b""
+
+    def _under_assumptions(self, definition: Definition, expression: PermExpr, result: Q) -> Q:
+        if (
+            self._assumed_false
+            and result is not _TRUE
+            and result is not _FALSE
+            and self._uniform(definition, expression)
+            and self._uniform_signature(result) in self._assumed_false
+        ):
+            return _FALSE
         return result
+
+    def _uniform(
+        self, definition: Definition, expression: PermExpr, seen: frozenset[str] = frozenset()
+    ) -> bool:
+        """Whether this expression reads no identity of its declaring type.
+
+        This is a schema property, not a decision about mutable membership.
+        The expression's SQL still witnesses the fact in the reading snapshot.
+        """
+        if isinstance(expression, PermNil):
+            return True
+        if isinstance(expression, PermBinOp):
+            return self._uniform(definition, expression.left, seen) and self._uniform(
+                definition, expression.right, seen
+            )
+        if isinstance(expression, PermArrow):
+            return _fixed(next((r for r in definition.relations if r.name == expression.via), None))
+        if isinstance(expression, PermRef):
+            if expression.name in ("authenticated", "anonymous"):
+                return True
+            relation = next((r for r in definition.relations if r.name == expression.name), None)
+            if relation is not None:
+                return _fixed(relation)
+            permission = self.schema.get_permission(definition.resource_type, expression.name)
+            return (
+                permission is not None
+                and expression.name not in seen
+                and self._uniform(definition, permission.expression, seen | {expression.name})
+            )
+        return False
 
     def _arms(
         self,
@@ -1521,7 +1598,7 @@ class Compiler:
         return ~Q(Exists(rows))
 
     def _union(self, at: At, parts: Sequence[Q]) -> Q:
-        """Normalize a row disjunction to one semi-join over a UNION of ids."""
+        """A Boolean at a correlated row, otherwise a UNION for row enumeration."""
         kept = [part for part in parts if part is not _FALSE]
         if any(part is _TRUE for part in kept):
             return _TRUE
@@ -1530,7 +1607,7 @@ class Compiler:
         if len(kept) == 1:
             return kept[0]
         model = model_for_resource_type(at.resource_type)
-        if not at.row or model is None:
+        if self.correlated or not at.row or model is None:
             return _or(*kept)
         identity = resource_id_attr(model)
         source = model._base_manager.using(self.using)
@@ -1598,8 +1675,8 @@ class Compiler:
 
         With ``name`` (an arrow target or a subject-set relation) a row admits
         the actor when the actor holds it there, or, for a bare subject set,
-        when the actor is that very subject set.  Without it the actor must be
-        the row.  A set decided before the statement comes back as its keys.
+        when the actor is that very subject set. Without it the actor must be
+        the row.
         """
         rows = model._base_manager.using(self.using)
         own = self.shape.type == allowed_type and self._canonical(model, identity)
@@ -1641,22 +1718,87 @@ class Compiler:
             return _FALSE
         target_path = resolved.target_values_path()
         name = target if target is not None else (allowed.relation or None)
-        subjects = self._subject_rows(
-            allowed.type,
-            name,
-            allowed.relation if target is None else "",
-            resolved.target_model,
-            resolved.target_id_attr,
-            bound,
-            visits,
-            depth_possible,
-        )
-        if subjects is False:
+
+        def witness(rows: QuerySet[Any]) -> Q:
+            # Filter before LIMIT: an identity need not be unique.
+            return Q(
+                Coalesce(
+                    Subquery(
+                        rows.order_by()
+                        .filter(**{resolved.target_id_attr: OuterRef(target_path)})
+                        .annotate(_rebac_match=Value(True))
+                        .values("_rebac_match")[:1]
+                    ),
+                    Value(False),
+                )
+            )
+
+        uniform = _FALSE
+        assumptions = self._assumed_false
+        shared = self.correlated and (allowed.type, name) in self.program.shared_targets
+        definition = self.schema.get_definition(allowed.type)
+        if (
+            shared
+            and name is not None
+            and definition is not None
+            and (allowed.type, name) not in (self.program.recursive | self.program.alias_cycles)
+        ):
+            reference = PermRef(name)
+            arms = (
+                (reference,)
+                if self._uniform(definition, reference)
+                else self.constant_arms((allowed.type, name))
+            )
+            parts = [
+                self._expression(
+                    definition,
+                    arm,
+                    At(allowed.type, Value("", output_field=models.TextField()), None, False),
+                    bound,
+                    visits,
+                    depth_possible=depth_possible,
+                )
+                for arm in arms
+            ]
+            uniform = _or(*parts)
+            if uniform is not _TRUE:
+                # The fallback is used only when every universal disjunct is
+                # false. Equal witnesses in inherited paths are false there
+                # too; full SQL/parameter signatures preserve caveat bounds,
+                # deadlines and the recursion path's actual decision.
+                self._assumed_false |= frozenset(
+                    self._uniform_signature(part) for part in parts if part is not _FALSE
+                )
+        correlated = self.correlated
+        if shared:
+            # The fallback enumerates a shared set, with universal disjuncts
+            # removed under its branch condition. Use UNION to drive those
+            # remaining sparse grants, not per-row OR over the full table.
+            self.correlated = False
+        try:
+            subjects = self._subject_rows(
+                allowed.type,
+                name,
+                allowed.relation if target is None else "",
+                resolved.target_model,
+                resolved.target_id_attr,
+                bound,
+                visits,
+                depth_possible,
+            )
+        finally:
+            self._assumed_false = assumptions
+            self.correlated = correlated
+        if subjects is False and uniform is _FALSE:
             return _FALSE
         # Whether the predicate reads the targets' own rows; otherwise a
         # reference that nothing constrains is checked against them.
         through_rows = True
-        if subjects is True:
+        if subjects is False:
+            source_q = _and(
+                uniform, witness(resolved.target_model._base_manager.using(self.using).all())
+            )
+        elif subjects is True:
             source_q = Q(**{f"{target_path}__isnull": False})
             through_rows = False
         elif name is None:
@@ -1664,6 +1806,26 @@ class Compiler:
                 **{target_path: self._native(resolved.target_model, resolved.target_id_attr)}
             )
             through_rows = False
+        elif self.correlated:
+            if not shared:
+                source_q = witness(subjects)
+            else:
+                # Keep reused sets materializable. Inlining a Boolean map
+                # repeats its plan at every path, even when its SQL is shared.
+                source_q = witness(self._ids(subjects.order_by().values(resolved.target_id_attr)))
+                if uniform is not _FALSE:
+                    present = witness(resolved.target_model._base_manager.using(self.using).all())
+                    source_q = (
+                        present
+                        if uniform is _TRUE
+                        else Q(
+                            models.Case(
+                                models.When(uniform, then=present),
+                                default=source_q,
+                                output_field=models.BooleanField(),
+                            )
+                        )
+                    )
         else:
             source_q = Q(
                 **{

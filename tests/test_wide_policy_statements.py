@@ -100,7 +100,16 @@ def _scope_sql(local, actor: SubjectRef) -> str:
 def _scope_statement(local, actor: SubjectRef) -> tuple[str, tuple[object, ...]]:
     """The compiled scope statement, before its parameters are bound."""
     operation = read._Operation.begin(local, actor, "default")
-    compiled = read._scope_statement(operation, Post, ("blog/post", "read"))
+    outer = Post._base_manager.values("pk").query
+    identity = outer.resolve_ref("pk")
+    compiled = read._scope_statement(
+        operation,
+        Post,
+        ("blog/post", "read"),
+        outer=outer,
+        identity=identity,
+        identity_sql=outer.get_compiler("default").compile(identity),
+    )
     assert not isinstance(compiled, bool)
     return compiled.sql, tuple(compiled.params)
 

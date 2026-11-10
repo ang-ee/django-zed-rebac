@@ -48,7 +48,7 @@ def _id_pattern():
 
 
 def _definitions(sql):
-    return re.findall(_id_pattern() + r" AS \(", sql)
+    return re.findall(_id_pattern() + r" AS (?:NOT MATERIALIZED )?\(", sql)
 
 
 def _assert_shared(sql, expected=None):
@@ -59,7 +59,10 @@ def _assert_shared(sql, expected=None):
         assert set(definitions) == expected
     # Every reference is backed by a definition somewhere in this statement.
     assert set(re.findall(_id_pattern(), sql)) == set(definitions)
-    positions = {match[1]: match.start() for match in re.finditer(_id_pattern() + r" AS \(", sql)}
+    positions = {
+        match[1]: match.start()
+        for match in re.finditer(_id_pattern() + r" AS (?:NOT MATERIALIZED )?\(", sql)
+    }
     for reference in re.finditer(r"FROM " + _id_pattern(), sql):
         assert positions[reference[1]] < reference.start()
     assert sql.startswith("WITH RECURSIVE ")
@@ -157,9 +160,22 @@ def test_different_actor_bindings_do_not_alias(shared_rows, monkeypatch):
         sql, params = original(self, values)
         if collector is not None and self.definitions and sql.startswith("(WITH RECURSIVE "):
             # A conflicting actor binding reaches _Kept.render's fallback,
-            # retaining every parameter and atomically leaving the outer sets.
+            # retaining dependent parameters and atomically leaving the outer
+            # sets. The independent fence is already shared by both actors.
             assert collector.definitions == before
-            assert (sql, params) == (self.sql, values)
+            from dataclasses import replace
+
+            offset = 0
+            nested = []
+            for item in self.definitions:
+                stop = offset + len(item.params)
+                if not item.independent:
+                    nested.append(replace(item, params=values[offset:stop]))
+                offset = stop
+            expected, expected_params = ctes.assemble(
+                (self.body, values[offset:]), tuple(nested), connection
+            )
+            assert (sql, params) == (f"({expected})", expected_params)
             fallbacks.append((sql, params))
         return sql, params
 

@@ -94,7 +94,7 @@ drop `with_actor` from `select_related`/`prefetch_related` workarounds.
 - Spike parity: byte-identical scope SQL on the parity suites.
 - Write cost: one gate query per affected declaring type per statement; a
   100,000-row update on SQLite and PostgreSQL completes within a budget still
-  to be set (there is no scale suite at the moment).
+  to be set (the opt-in selective-read scale benchmark does not cover writes).
 - Query plans of compiled scopes on a PostgreSQL database of tens of millions
   of rows (proposal 0015, gate G1): under trial, not verified.
 - The 0.24.0 probe corpus (folded into

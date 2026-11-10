@@ -17,15 +17,12 @@ from typing import TYPE_CHECKING, Any, cast
 
 from django.core.exceptions import EmptyResultSet
 from django.db import connections, models
-from django.db.models import Exists, Expression, F, Q, Value
-from django.db.models.expressions import Col, ColPairs
-from django.db.models.fields.related_lookups import RelatedExact
-from django.db.models.fields.tuple_lookups import TupleIn
-from django.db.models.lookups import Exact, GreaterThanOrEqual, In, IntegerFieldExact, LessThan
-from django.db.models.sql.where import WhereNode
+from django.db.models import Exists, Expression, F, OuterRef, Q, Value
+from django.db.models.functions import Coalesce
+from django.db.models.lookups import Exact, GreaterThanOrEqual, LessThan
 from django.utils import timezone
 
-from rebac._id import _NATIVE_INTEGER_FIELDS, model_identity_fields, resource_id_attr
+from rebac._id import model_identity_fields, resource_id_attr
 from rebac.codec import identity_codec
 from rebac.composition import TaggedComposition, compose_tagged, split_stale_overrides
 from rebac.conf import app_settings
@@ -75,9 +72,6 @@ if TYPE_CHECKING:
 _MANUAL_REVISION = Marker("manual schema revision")
 _RESOURCE_WIRE = Marker("resource wire id")
 _LIMIT = 512
-# The most literal identities a scoped read is bounded to; a longer list uses
-# the general scope (the size crossover, and the vendors' bind limits).
-_CANDIDATE_LIMIT = 256
 # Items of a bulk check compiled together, and the SQL text one statement of
 # their bounds may reach before it is cut.
 _BULK = 50
@@ -114,11 +108,28 @@ class _Kept:
         for item in self.definitions:
             stop = offset + len(item.params)
             definitions.append(
-                ctes.Definition(item.name, item.sql, values[offset:stop], item.template)
+                ctes.Definition(
+                    item.name,
+                    item.sql,
+                    values[offset:stop],
+                    item.template,
+                    item.materialized,
+                    item.independent,
+                )
             )
             offset = stop
-        if ctes.register(tuple(definitions)):
+        # Policy fences have no dependencies or actor binding. They can share
+        # even when another actor forces the dependent id sets to stay nested.
+        independent = tuple(item for item in definitions if item.independent)
+        shared = bool(independent) and ctes.register(independent)
+        remaining = tuple(item for item in definitions if not shared or not item.independent)
+        if ctes.register(remaining):
             return f"({self.body})", values[offset:]
+        if shared:
+            sql, params = ctes.assemble(
+                (self.body, values[offset:]), remaining, connections[self.using]
+            )
+            return f"({sql})", params
         return self.sql, values
 
 
@@ -270,24 +281,34 @@ def _fence(
     for deadline, ahead in policy.fence:
         at = Value(deadline, output_field=models.DateTimeField())
         rows = rows.filter(LessThan(now, at) if ahead else GreaterThanOrEqual(now, at))
-    return rows
+    # Non-parametric probes bind their fence clock when their own statement
+    # compiles, not while an enclosing operation prepares them.
+    return ctes.policy_fence(rows) if parametric else rows
 
 
 # ---------- Kept statements ----------
 
 
 class _Sql(Expression):
-    """``EXISTS`` over kept SQL, bound inside its executing statement's collector."""
+    """A kept scalar or EXISTS, bound inside its executing statement's collector."""
 
-    def __init__(self, kept: _Kept, operation: _Operation, resource_id: str | None = None) -> None:
+    def __init__(
+        self,
+        kept: _Kept,
+        operation: _Operation,
+        resource_id: str | None = None,
+        *,
+        scalar: bool = False,
+    ) -> None:
         super().__init__(output_field=models.BooleanField())
         self.kept = kept
         self.operation = operation
         self.resource_id = resource_id
+        self.scalar = scalar
 
     def as_sql(self, compiler: Any, connection: Any) -> tuple[str, tuple[Any, ...]]:
         sql, params = self.kept.render(self.operation.bound(self.kept.params, self.resource_id))
-        return f"EXISTS {sql}", params
+        return sql if self.scalar else f"EXISTS {sql}", params
 
 
 @dataclass(frozen=True)
@@ -350,6 +371,7 @@ class _Operation:
         parametric: bool = True,
         point: PointRow | None = None,
         fold: Key | None = None,
+        correlated: bool = False,
     ) -> Compiler:
         return Compiler(
             self.policy.schema,
@@ -361,6 +383,7 @@ class _Operation:
             parametric=parametric,
             point=point,
             fold=fold,
+            correlated=correlated,
         )
 
     def gate(self, *, parametric: bool = True) -> models.QuerySet[Any]:
@@ -981,14 +1004,15 @@ def _scope_statement(
     model: type[models.Model],
     key: Key,
     *,
-    candidates: tuple[int, ...] | None = None,
+    outer: Any,
+    identity: Expression,
+    identity_sql: tuple[str, tuple[Any, ...]],
     witness: bool | None = None,
 ) -> _Kept | bool:
-    """The ids of ``model`` the actor holds ``key`` on, as SQL.
+    """A correlated witness of ``key`` at the caller's native identity.
 
     ``False`` when there are none.  ``every`` is set when every row qualifies
-    and the SQL is only the policy fence. ``candidates`` bounds the rows the
-    statement visits to those literal identities. ``witness`` is the answer
+    and the SQL is only the policy fence. ``witness`` is the answer
     of ``_constant_witness``: when ``True`` the statement is the constant
     arms alone; when ``False`` it is the policy's without them.
     """
@@ -999,7 +1023,7 @@ def _scope_statement(
     fold = key if witness is False else None
 
     def build() -> bool | tuple[models.QuerySet[Any], bool]:
-        compiler = operation.compiler(verdicts, fold=fold)
+        compiler = operation.compiler(verdicts, fold=fold, correlated=True)
         predicate = compiler.holds(key, _model_at(model), Bound.LOWER)
         if is_false(predicate):
             return False
@@ -1007,86 +1031,34 @@ def _scope_statement(
         if is_true(predicate):
             return gate.values("pk"), True
         rows = model._base_manager.using(operation.using)
-        if candidates is not None:
-            rows = rows.filter(**{f"{resource_id_attr(model)}__in": candidates})
+        # Resolve the correlation with Django, including alias allocation.
+        # The temporary annotation lives only on a resolution context, never
+        # on the caller's query or in its SELECT list.
+        context = outer.clone()
+        name = "_rebac_scope_identity"
+        context.annotations[name] = identity
+        rows = rows.filter(**{resource_id_attr(model): OuterRef(name)})
         # The row predicate goes last: it holds the nested subqueries.
         rows = rows.filter(Q(Exists(gate)) & predicate)
-        return compiler.statement(rows.order_by().values(resource_id_attr(model))), False
+        rows = rows.order_by().annotate(_rebac_match=Value(True)).values("_rebac_match")[:1]
+        query = rows.query.resolve_expression(context)
+        return compiler.statement(
+            models.QuerySet(model=model, query=query, using=operation.using)
+        ), False
 
     return operation.statement(
-        ("scope", label, key, fold is not None), verdicts, build, cache=candidates is None
+        (
+            "scope",
+            label,
+            key,
+            fold is not None,
+            ctes.signature(*identity_sql),
+            tuple(sorted(outer.alias_map)),
+            tuple(sorted(outer.subq_aliases)),
+        ),
+        verdicts,
+        build,
     )
-
-
-def _known_identities(
-    model: type[models.Model], lhs: Any, where: Any, using: str
-) -> tuple[int, ...] | None:
-    """Native literal identities mandatory in this resolved query, or no proof.
-
-    Only positive AND paths are traversed. Unknown fields, lookups and expression
-    shapes keep the general scope; the original Django predicates are untouched.
-    """
-    if type(lhs) is not Col:
-        return None
-    identity = resource_id_attr(model)
-    field, scalar = model_identity_fields(model, identity)
-    if type(scalar) not in _NATIVE_INTEGER_FIELDS:
-        return None
-    if field is not scalar and (
-        type(field) not in (models.ForeignKey, models.OneToOneField)
-        or cast(models.ForeignKey[Any, Any], field).target_field is not scalar
-    ):
-        return None
-    if not field.unique or lhs.target is not field or lhs.output_field is not scalar:
-        return None
-    codec = identity_codec(model, identity)
-    pending = [where]
-    while pending:
-        node = pending.pop()
-        if type(node) is WhereNode:
-            if node.connector == "AND" and not node.negated:
-                pending.extend(node.children)
-            continue
-        if type(node) not in (Exact, IntegerFieldExact, RelatedExact, In, TupleIn):
-            continue
-        column = node.lhs
-        value = node.rhs
-        if type(node) is TupleIn:
-            if (
-                type(column) is not ColPairs
-                or len(column.targets) != 1
-                or len(column.sources) != 1
-                or type(value) not in (list, tuple)
-                or len(value) != 1
-            ):
-                continue
-            [value] = value
-            if type(value) not in (list, tuple) or len(value) != 1:
-                continue
-            [value] = value
-            [column] = column.get_cols()
-        if (
-            type(column) is not Col
-            or column.alias != lhs.alias
-            or column.target is not field
-            or (column.output_field is not field and column.output_field is not scalar)
-        ):
-            continue
-        if type(node) is In:
-            if type(value) not in (list, tuple) or not 0 < len(value) <= _CANDIDATE_LIMIT:
-                continue
-            values = value
-        else:
-            values = (value,)
-        if any(type(item) is not int for item in values) or len(set(values)) != len(values):
-            continue
-        try:
-            for item in values:
-                codec.wire(item, using=using)
-        except SchemaError:
-            continue
-        return tuple(values)
-    return None
 
 
 class _Scope(Expression):
@@ -1130,20 +1102,26 @@ class _Scope(Expression):
         key = (resource_type, self.action)
         operation = _Operation.begin(self.backend, self.actor, self.using, policy=self.policy)
         operation.adopt(key, self.verdicts)
-        # A query that names the identities it reads proves access over
-        # exactly those rows; every other shape uses the general scope.
-        identities = _known_identities(self.model, self.lhs, compiler.query.where, self.using)
         compiled = _scope_statement(
-            operation, self.model, key, candidates=identities, witness=self.witness
+            operation,
+            self.model,
+            key,
+            outer=compiler.query,
+            identity=self.lhs,
+            identity_sql=compiler.compile(self.lhs),
+            witness=self.witness,
         )
         if isinstance(compiled, bool):
             # ``True`` cannot occur: a statement that admits rows is a gate.
             return "(1 = 0)", ()
-        sql, params = compiled.render(operation.bound(compiled.params))
-        if compiled.every:
-            return f"EXISTS {sql}", params
-        lhs_sql, lhs_params = compiler.compile(self.lhs)
-        return f"({lhs_sql} IN {sql})", (*lhs_params, *params)
+        # EXISTS also permits a hashed alternative over the full child table.
+        # A scalar witness preserves the caller's narrow candidate lookup.
+        expression: Expression = (
+            _Sql(compiled, operation)
+            if compiled.every
+            else Coalesce(_Sql(compiled, operation, scalar=True), Value(False))
+        )
+        return cast(tuple[str, tuple[Any, ...]], compiler.compile(expression))
 
 
 @schema_operation

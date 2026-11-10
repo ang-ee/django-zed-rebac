@@ -8,6 +8,7 @@ together.
 
 from __future__ import annotations
 
+from collections import Counter
 from dataclasses import dataclass
 
 from django.core import checks
@@ -29,6 +30,7 @@ class CompileProgram:
     components: dict[Key, frozenset[Key]]
     recursive: frozenset[Key]
     alias_cycles: frozenset[Key]
+    shared_targets: frozenset[Key]
 
     @classmethod
     def build(cls, schema: Schema) -> CompileProgram:
@@ -59,6 +61,16 @@ class CompileProgram:
                             f"Recursive permission component {sorted(component)!r} is nonlinear (rebac.E016)."
                         )
                 (recursive if traverses else alias_cycles).update(members)
+        uses = Counter(dep.target for key in sorted(dependencies) for dep in dependencies[key])
+        pending = [key for key in sorted(uses) if uses[key] > 1]
+        shared: set[Key] = set()
+        while pending:
+            key = pending.pop()
+            if key in shared:
+                continue
+            shared.add(key)
+            pending.extend(sorted(graph.get(key, ())))
+            pending.extend(via_dependencies.get(key, ()))
         return cls(
             schema,
             dependencies,
@@ -66,6 +78,7 @@ class CompileProgram:
             components,
             frozenset(recursive),
             frozenset(alias_cycles),
+            frozenset(shared),
         )
 
     def reachable(self, root: Key) -> frozenset[Key]:

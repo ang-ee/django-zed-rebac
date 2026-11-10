@@ -1,5 +1,5 @@
 .PHONY: install-dev lint format-check typecheck check ci \
-	test test-fast test-pg \
+	test test-fast test-pg test-pg-scale \
 	test-slow test-postgres test-reference \
 	test-schema-vendors test-random test-release \
 	pg-up pg-down require-postgres require-docker require-vendor-drivers
@@ -17,11 +17,11 @@ ARGS ?=
 
 # An explicit -m replaces the addopts expression in pyproject.toml, so each
 # expression below is written in full. Targets without -m use the addopts one:
-# not reference_exhaustive, slow or schema_vendors.
-PG_DELTA_MARKS := (postgresql or pg_delta) and not slow and not reference_exhaustive and not schema_vendors
-SLOW_MARKS := slow and not reference_exhaustive and not schema_vendors
-FULL_MARKS := not reference_exhaustive and not schema_vendors
-REFERENCE_MARKS := reference_exhaustive or not reference_exhaustive
+# not reference_exhaustive, slow, schema_vendors or scale.
+PG_DELTA_MARKS := (postgresql or pg_delta) and not slow and not reference_exhaustive and not schema_vendors and not scale
+SLOW_MARKS := slow and not reference_exhaustive and not schema_vendors and not scale
+FULL_MARKS := not reference_exhaustive and not schema_vendors and not scale
+REFERENCE_MARKS := (reference_exhaustive or not reference_exhaustive) and not scale
 
 # The default per-test timeout is 10 s (pyproject.toml). Targets that select
 # slow, reference_exhaustive or schema_vendors tests raise it.
@@ -65,6 +65,10 @@ test:
 # a freshly started PostgreSQL, so it is wider than tier 1's.
 test-pg: require-postgres
 	$(PYTEST) $(PG) -n $(PG_WORKERS) --dist worksteal -m '$(PG_DELTA_MARKS)' --timeout=60 --durations=10 $(ARGS)
+
+# Opt-in, serial: never compete with other workers for plan/timing budgets.
+test-pg-scale: require-postgres
+	$(PYTEST) $(PG) -m scale --timeout=300 -s tests/test_scope_plans.py $(ARGS)
 
 # Tier 3 parts.
 test-slow:

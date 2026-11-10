@@ -1,4 +1,4 @@
-"""Candidate-root reads agree with the unbounded scoped predicate."""
+"""Correlated scopes agree across filters, terminals and embeddings."""
 
 import pytest
 from django.db.models import Count, Exists, OuterRef, Q
@@ -29,10 +29,6 @@ definition blog/post {
     permission read = (viewer + folder->read) - banned
 }
 """
-
-
-def _general_identities(_model, _lhs, _where, _using):
-    return None
 
 
 @pytest.fixture(params=["denormalized", "registry"])
@@ -88,11 +84,11 @@ def world(request, monkeypatch):
         original = read._scope_statement
 
         def observed(operation, model, key, *args, **kwargs):
-            calls.append(kwargs.get("candidates"))
+            calls.append(kwargs.get("identity"))
             return original(operation, model, key, *args, **kwargs)
 
         monkeypatch.setattr(read, "_scope_statement", observed)
-        yield local, folders, posts, calls, monkeypatch
+        yield local, folders, posts, calls
 
 
 def _ids(qs):
@@ -103,36 +99,30 @@ def _shapes(posts, folders):
     p = [x.pk for x in posts]
     big = p[:60]
     return {
-        "list2": (lambda q: q.filter(pk__in=p[:2]), True),
-        "list5": (lambda q: q.filter(pk__in=p[:5]), True),
-        "list50": (lambda q: q.filter(pk__in=big[:50]), True),
-        "all90": (lambda q: q.filter(pk__in=p), True),
-        "tuple": (lambda q: q.filter(pk__in=tuple(p[10:20])), True),
-        "set": (lambda q: q.filter(pk__in=set(p[10:20])), True),
-        "strings": (lambda q: q.filter(pk__in=[str(x) for x in p[10:20]]), True),
-        "qs_base": (
-            lambda q: q.filter(pk__in=Post._base_manager.filter(pk__in=p[:30]).values("pk")),
-            False,
+        "list2": lambda q: q.filter(pk__in=p[:2]),
+        "list5": lambda q: q.filter(pk__in=p[:5]),
+        "list50": lambda q: q.filter(pk__in=big[:50]),
+        "all90": lambda q: q.filter(pk__in=p),
+        "tuple": lambda q: q.filter(pk__in=tuple(p[10:20])),
+        "set": lambda q: q.filter(pk__in=set(p[10:20])),
+        "strings": lambda q: q.filter(pk__in=[str(x) for x in p[10:20]]),
+        "qs_base": lambda q: q.filter(pk__in=Post._base_manager.filter(pk__in=p[:30]).values("pk")),
+        "qs_scoped": lambda q: q.filter(
+            pk__in=Post.objects.with_actor(A).filter(pk__in=p[:30]).values("pk")
         ),
-        "qs_scoped": (
-            lambda q: q.filter(
-                pk__in=Post.objects.with_actor(A).filter(pk__in=p[:30]).values("pk")
-            ),
-            None,
-        ),
-        "mixed_col": (lambda q: q.filter(pk__in=p[:40], title__endswith="1"), True),
-        "mixed_join": (lambda q: q.filter(pk__in=p[:40], folder__name__startswith="chain"), True),
-        "or": (lambda q: q.filter(Q(pk__in=p[:5]) | Q(title="p40")), False),
-        "exclude": (lambda q: q.exclude(pk__in=p[:5]), False),
-        "neg_nested": (lambda q: q.filter(Q(title__startswith="p") & ~Q(pk__in=p[:5])), False),
-        "neg_double": (lambda q: q.filter(~Q(~Q(pk__in=p[:5]))), False),
-        "in_then_exclude": (lambda q: q.filter(pk__in=p[:30]).exclude(pk__in=p[:5]), True),
-        "in_and_in": (lambda q: q.filter(pk__in=p[:30]).filter(pk__in=p[20:50]), True),
-        "pk_and_in": (lambda q: q.filter(pk=p[7], pk__in=p[:30]), None),
-        "dupes": (lambda q: q.filter(pk__in=[p[7], p[7], p[8]]), False),
-        "null": (lambda q: q.filter(pk__in=[p[7], None, p[8]]), False),
-        "sliced": (lambda q: q.filter(pk__in=p[:40]).order_by("-pk")[:5], True),
-        "folder_related_in": (lambda q: q.filter(folder__in=folders[:3]), False),
+        "mixed_col": lambda q: q.filter(pk__in=p[:40], title__endswith="1"),
+        "mixed_join": lambda q: q.filter(pk__in=p[:40], folder__name__startswith="chain"),
+        "or": lambda q: q.filter(Q(pk__in=p[:5]) | Q(title="p40")),
+        "exclude": lambda q: q.exclude(pk__in=p[:5]),
+        "neg_nested": lambda q: q.filter(Q(title__startswith="p") & ~Q(pk__in=p[:5])),
+        "neg_double": lambda q: q.filter(~Q(~Q(pk__in=p[:5]))),
+        "in_then_exclude": lambda q: q.filter(pk__in=p[:30]).exclude(pk__in=p[:5]),
+        "in_and_in": lambda q: q.filter(pk__in=p[:30]).filter(pk__in=p[20:50]),
+        "pk_and_in": lambda q: q.filter(pk=p[7], pk__in=p[:30]),
+        "dupes": lambda q: q.filter(pk__in=[p[7], p[7], p[8]]),
+        "null": lambda q: q.filter(pk__in=[p[7], None, p[8]]),
+        "sliced": lambda q: q.filter(pk__in=p[:40]).order_by("-pk")[:5],
+        "folder_related_in": lambda q: q.filter(folder__in=folders[:3]),
     }
 
 
@@ -161,26 +151,23 @@ def _shapes(posts, folders):
         for name in _shapes([Post(pk=i) for i in range(90)], [Folder(pk=i) for i in range(9)])
     ],
 )
-def test_bounded_equals_unbounded_intersection(world, shape):
-    _local, folders, posts, calls, monkeypatch = world
+def test_filtered_scope_equals_visible_intersection(world, shape):
+    _local, folders, posts, calls = world
     with override_settings(REBAC_DEPTH_LIMIT=4):
         full = set(_ids(Post.objects.with_actor(A)))
-        builder, bounded = _shapes(posts, folders)[shape]
+        builder = _shapes(posts, folders)[shape]
         with sudo(reason="probe"):
             selected = set(_ids(builder(Post._base_manager.all())))
         calls.clear()
         got = _ids(builder(Post.objects.with_actor(A)))
         lane_calls = list(calls)
-        # The base (pre-lane) plan for the same shape.
-        monkeypatch.setattr(read, "_known_identities", _general_identities)
+        # A fresh compilation must agree with the kept correlated template.
         read.reset()
         base = _ids(builder(Post.objects.with_actor(A)))
     assert got == base, (shape, got, base)
     if shape != "sliced":
         assert got == sorted(full & selected), (shape, got, sorted(full & selected))
-    used = any(c is not None for c in lane_calls)
-    if bounded is not None:
-        assert used is bounded, (shape, lane_calls)
+    assert lane_calls and all(c is not None for c in lane_calls)
     # Sanity: the fixture has visible, depth-cut, banned and caveated rows.
     assert posts[0].pk in full and posts[7].pk in full and posts[16].pk in full
     assert posts[1].pk not in full and posts[25].pk not in full and posts[34].pk not in full
@@ -203,7 +190,7 @@ def test_bounded_equals_unbounded_intersection(world, shape):
     ],
 )
 def test_terminals_and_embeddings(world, terminal):
-    _local, folders, posts, calls, monkeypatch = world
+    _local, folders, posts, calls = world
     p = [x.pk for x in posts]
     a, b = p[:20], p[30:60]
     with override_settings(REBAC_DEPTH_LIMIT=4):
@@ -249,14 +236,13 @@ def test_terminals_and_embeddings(world, terminal):
 
         calls.clear()
         lane = run()
-        monkeypatch.setattr(read, "_known_identities", _general_identities)
         read.reset()
         base = run()
     assert lane == base, (terminal, lane, base)
 
 
 def test_held_matches_base(world):
-    local, _folders, posts, calls, monkeypatch = world
+    local, _folders, posts, calls = world
     ids = [str(x.pk) for x in posts]
     with override_settings(REBAC_DEPTH_LIMIT=4):
         calls.clear()
@@ -269,7 +255,6 @@ def test_held_matches_base(world):
             using="default",
         )
         used = any(c is not None for c in calls)
-        monkeypatch.setattr(read, "_known_identities", _general_identities)
         read.reset()
         base = read.held(
             backend=local,
@@ -280,4 +265,4 @@ def test_held_matches_base(world):
             using="default",
         )
     assert lane == base
-    assert used, "a chunk within the candidate limit takes the bounded statement"
+    assert used, "each candidate is correlated to its native identity"

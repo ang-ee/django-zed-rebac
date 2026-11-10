@@ -33,6 +33,10 @@ eval "$(make -s pg-up)"     # the same, exported in one step
 make test-pg                # tests marked postgresql or pg_delta, slow excluded
 make pg-down                # remove the container
 
+# Scale: opt-in, serial, run without other test workers
+make test-pg-scale          # uses REBAC_TEST_POSTGRES_URL; 150k messages / 1.5M parts
+# REBAC_SCALE_MESSAGES/PARTS override sizes; REBAC_SCALE_REPORT saves plans and SQL
+
 # Tier 3: before a release, never inside a change
 make test-release           # every part below in sequence, then a pass/fail summary
 make test-slow              # slow, on SQLite
@@ -109,9 +113,11 @@ practice:
   on the others; it never returns early.
 - `make test` runs the tier 1 selection serially, for debugging.
   `make test-random` checks isolation under a reproducible random order.
-- Default pytest configuration deselects `reference_exhaustive`, `slow` and
-  `schema_vendors`. There is no scale suite at the moment: no test holds time,
-  statement or query-plan budgets for large tables.
+- Default pytest configuration deselects `reference_exhaustive`, `slow`,
+  `schema_vendors` and `scale`. `make test-pg-scale` runs the selective-scope
+  benchmark alone; it checks exact results, sub-second query time and bounded
+  scan work in both storage layouts. PostgreSQL 17+ also records planning
+  memory. `REBAC_SCALE_BASELINE` replays saved bound queries on the same fixture.
   `reference_exhaustive` selects the complete reference sweep;
   `reference_shard` labels independently schedulable cases within it. Default runs
   retain every named regression, all one/two-leaf expressions and deterministic
