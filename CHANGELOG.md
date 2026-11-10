@@ -5,7 +5,7 @@ pre-1.0; breaking changes within a minor version are explicitly called out.
 
 ## [Unreleased]
 
-## [0.32.2] — Unreleased
+## [0.32.2] — 2026-11-10
 
 ### Fixed
 
