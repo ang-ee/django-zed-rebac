@@ -1111,8 +1111,9 @@ class PermissionAuditEvent(models.Model):
 Written by every Tier 2 / Tier 3 mutation and every effective public bypass.
 Queryset bypasses are audited at the first evaluation or write of any
 queryset derived from the `sudo()` or `system_context()` call, once per actor
-and evaluator scope; instance bypasses at the first check or write, and block
-bypasses at entry, once per bypass.
+and evaluator scope; instance bypasses at the first validation, check or write
+under the same actor and evaluator-scope rule. Block bypasses emit at entry,
+once per bypass.
 A bypass queryset embedded in an expression (`Exists`, `Subquery`, a
 `pk__in=` lookup) is audited once per entry and reason when its enclosing
 statement executes. Building the expression runs no query and writes no row,
@@ -2632,6 +2633,13 @@ statement, each execution audits every distinct `(entry, reason)` pair it
 renders, even if that pair appears in several filters, annotations or `Exists`
 expressions. A count followed by a list read audits the embedded entry twice.
 Nested entries retain separate events even when their reasons match.
+
+An instance `sudo()` call owns the same kind of audit entry. Its validation,
+checks, saves and deletes share one row per actor and evaluator scope. A
+rolled-back row does not count: the next use writes it again, including after
+a validation failure or a database `IntegrityError`. Calling `sudo()` again
+starts a new entry; `with_actor()` and `unsudo()` clear the bypass, and
+pickling removes the entry along with the actor and reason.
 
 A statement whose Query class REBAC owns (a REBAC or tracked queryset's query,
 including a base manager's, a plain Django `Query` that received a REBAC

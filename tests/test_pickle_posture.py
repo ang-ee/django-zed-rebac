@@ -20,10 +20,12 @@ from rebac import (
     RelationshipTuple,
     SubjectRef,
     backend,
+    evaluator_scope,
     sudo,
     write_relationships,
 )
 from rebac.backends import reset_backend
+from rebac.models import PermissionAuditEvent
 from rebac.schema import parse_zed
 from tests.backend_setup import atomic_source_write, install_schema
 
@@ -116,6 +118,30 @@ def test_pickle_strips_sudo_flag(alice, post):
     restored = pickle.loads(pickle.dumps(instance))
 
     assert getattr(restored, "_rebac_sudo_reason", None) is None
+
+
+@pytest.mark.parametrize("used", [False, True])
+def test_pickle_strips_instance_bypass_entry(post, used):
+    """Neither an unused entry nor a pending audit's connection crosses the boundary."""
+    reason = "audit.pickle-instance"
+    post.sudo(reason=reason)
+    with evaluator_scope():
+        if used:
+            assert post.check_access("write").allowed
+        restored = pickle.loads(pickle.dumps(post))
+        assert "_rebac_bypass_entry" not in restored.__dict__
+        assert not restored.is_sudo()
+        with pytest.raises(MissingActorError):
+            restored.save()
+        # Reauthorizing the restored instance owns a separate audit entry.
+        restored.sudo(reason=reason).save()
+        post.save()
+        assert (
+            PermissionAuditEvent.objects.filter(
+                kind=PermissionAuditEvent.KIND_SUDO_BYPASS, reason=reason
+            ).count()
+            == 2
+        )
 
 
 def test_unpickled_save_raises_missing_actor(alice, post):
