@@ -21,6 +21,9 @@ pre-1.0; breaking changes within a minor version are explicitly called out.
   savepoint rollback, the next use writes a replacement row: retrying a save
   after `ValidationError` or `IntegrityError` no longer commits without a
   surviving bypass audit row.
+  A long-lived `sudo()` instance used under several actors or evaluator
+  scopes now writes one row per actor and scope; 0.32.0 wrote one per
+  `sudo()` call regardless of scope.
 
 ## [0.32.0] — 2026-11-10
 

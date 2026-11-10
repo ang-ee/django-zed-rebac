@@ -321,7 +321,7 @@ def test_bypassed_save_retry_after_rollback_keeps_an_audit_row(
     assert saved.pk is not None
     assert GuardedUniqueRow._base_manager.filter(pk=saved.pk, email="fresh@example.com").exists()
     events = PermissionAuditEvent.objects.filter(kind=PermissionAuditEvent.KIND_SUDO_BYPASS)
-    assert events.count() >= 1
+    assert events.count() == 1
     assert {event.reason for event in events} == {reason}
     assert {event.actor_subject_id for event in events} == {str(actor.pk) if ambient_actor else ""}
 
