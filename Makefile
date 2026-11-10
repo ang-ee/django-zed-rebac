@@ -66,6 +66,11 @@ test:
 test-pg: require-postgres
 	$(PYTEST) $(PG) -n $(PG_WORKERS) --dist worksteal -m '$(PG_DELTA_MARKS)' --timeout=60 --durations=10 $(ARGS)
 
+# Timing and planner measurements run alone, without worker contention.
+.PHONY: test-pg-scale
+test-pg-scale: require-postgres
+	$(PYTEST) $(PG) -m scale --timeout=900 -s tests/test_scope_plans.py $(ARGS)
+
 # Tier 3 parts.
 test-slow:
 	$(PYTEST) -n auto --dist worksteal -m '$(SLOW_MARKS)' $(LONG) --durations=25 $(ARGS)

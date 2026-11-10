@@ -2020,9 +2020,42 @@ evaluates the arms when it runs, and leaving the arms out only narrows a
 lower bound, so an answer that went stale within the scope narrows a read
 and never widens it. Outside an evaluator scope, under a caveat context, in
 bulk checks, subject lookups, `grants_all()` and the enumeration of ids that
-no model row carries, the statement keeps every arm. The constant arms of the
-types an arrow reaches stay in the statement and are evaluated where it reads
-those types.
+no model row carries, the statement keeps every arm.
+
+Inside an evaluator scope, positive, untagged single-valued field arrows can
+also witness their targets' constant arms. The compile program keeps this
+reachability per policy; scope construction does not walk it again. Own and
+inherited witnesses, when both are pending, share one SELECT, deduplicated by
+statement, and reuse the operation's prepared caveat verdicts. A read with no own witness pays at most
+one additional first-read statement per evaluator scope; subsequent reads pay
+none, including inside transactions and in schemas with expiration.
+If `check_access()` first caches a negative own witness, a subsequent list read
+can still need an inherited probe: the first list costs two statements (probe
+and data), and a repeat list costs one. A cached positive own witness skips
+pending inherited probes.
+
+An inherited positive witness chooses its target's constant-arm recheck alone
+at the lower bound, with live target membership a top-level conjunct. The
+remaining target grants are not compiled into that statement. Inherited
+positives survive library tuple writes, even for fresh querysets in the same
+scope. After a library role revoke, a fresh child read can return `[]` despite
+other target grants. Results can depend on read order: an own-witness read of
+the target re-decides the shared entry after the write, so a later child read
+can see those other grants. This explicit staleness contract only denies,
+never admits extra rows. A fresh evaluator scope decides again and returns
+the exact ordinary result, including all other grants. Out-of-band revocation
+can narrow both own and inherited witnesses.
+
+Negative inherited witnesses keep the complete ordinary statement, without
+folding its arms. Inherited answers are scope-local plan choices, retained even
+where decision caching is disabled: a positive choice still rechecks the grant
+in the executing statement, and a negative choice evaluates every arm. Own
+witnesses retain their existing freshness rules. If an own witness already
+selects an all-row gate, no pending inherited witnesses are decided.
+Compile-time TRUE/FALSE targets retain the compiler's ordinary handling,
+including `fk IS NOT NULL` for TRUE. Targets whose ordinary lower bound
+folds to TRUE for the actor's shape are never witnessed, including compound
+Boolean expressions; dangling FK values therefore retain the ordinary result.
 
 A queryset scope pins its policy, caveat verdicts and constant-arm witness
 when the queryset owner builds the scope. Rendering the predicate performs no
@@ -2411,11 +2444,13 @@ of its own.
 - A queryset scope contains the permissions for its arrow targets and
   subject sets inline, each distinct id set once. A statement grows with the
   number of distinct id sets in its reach, not with the number of paths to
-  them, and with the recursion bound. One statement serves every actor of a
-  shape. Only a permission's own constant arms are decided per actor, and
-  only inside an evaluator scope: a permission without one (`read =
-  parent->read`) gives an administrator the whole statement, whose id sets
-  then hold every row of the types its arrows reach. Where the decision cache
+  them, and with the recursion bound. Inside an evaluator scope, inherited
+  constant-arm witnesses can select inline target predicates containing only
+  their constant recheck and live-row membership. These predicates
+  vary with the positive witnessed-key set; other actors keep the ordinary
+  statement. A read with no own witness pays one extra first-read statement
+  per scope, shared by its inherited targets; it pays no repeat witness.
+  For own witnesses, where the decision cache
   keeps nothing for the types the arms name (inside a transaction, or when a
   decision about them reads a model column), an actor who holds a constant arm
   pays one witness per read, other actors one per request, and their
@@ -2427,9 +2462,17 @@ of its own.
   constant-arm answer; `check_access()` decides the witness at the check, and
   `check_bulk_permissions()` and `lookup_subjects()` evaluate every arm. A
   granted constant arm is then seen by a check and not by a read; after a
-  revoked one, the read of an actor who held it admits nothing, while a check
-  still admits what the actor's other arms grant. The read is narrower, never
-  wider, and the next evaluator scope agrees.
+  revoked own constant arm, the read of an actor who held it admits nothing,
+  while a check still admits what the actor's other arms grant. Inherited
+  positive witnesses follow the same denial-only contract: revocation can
+  suppress other grants reached through that target until the scope ends.
+  A fresh scope sees those other grants again. The read is narrower, never
+  wider. Inherited positives also survive a tuple write through the library,
+  including for fresh querysets in the same scope: a fresh child read may
+  return `[]` despite other target grants. An own-witness read of that target
+  first refreshes the shared answer and can make a later child read admit
+  those grants. This order dependence ends with the evaluator scope; it is
+  not limited to already prepared querysets or out-of-band writers.
 - A cached check can be wider than the database. `PermissionEvaluator.check()`
   (also behind `check_field_access()`, and what GraphQL resolvers reach through
   the adapter's evaluator) and the field-visibility memo keep their answers for

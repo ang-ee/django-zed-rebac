@@ -150,6 +150,7 @@ class _Policy:
     program: CompileProgram
     selected_at: datetime
     caveat_deadlines: tuple[datetime, ...]
+    inherited: dict[tuple[Any, ...], tuple[Key, ...]] = field(default_factory=dict)
 
     @property
     def schema(self) -> Schema:
@@ -227,7 +228,7 @@ def _policy(backend: LocalBackend) -> _Policy:
         snapshot,
         tagged,
         compose_tagged(baseline, active).schema,
-        CompileProgram.build(tagged.schema),
+        CompileProgram.build(tagged.schema, tagged=tagged),
         selected_at,
         deadlines,
     )
@@ -350,6 +351,7 @@ class _Operation:
         parametric: bool = True,
         point: PointRow | None = None,
         fold: Key | None = None,
+        witnessed: frozenset[Key] = frozenset(),
     ) -> Compiler:
         return Compiler(
             self.policy.schema,
@@ -361,6 +363,7 @@ class _Operation:
             parametric=parametric,
             point=point,
             fold=fold,
+            witnessed=witnessed,
         )
 
     def gate(self, *, parametric: bool = True) -> models.QuerySet[Any]:
@@ -493,7 +496,7 @@ def _constant_witness(
     """Whether the actor holds one of ``key``'s constant arms, inside an evaluator scope.
 
     The evaluator remembers the answer for the scope
-    (``PermissionEvaluator._constant_witness``):
+    (``PermissionEvaluator._constant_witness_batch``):
 
     - ``True`` when the actor holds one, decided by the witness statement now,
       or remembered where the decision cache may keep a decision about every
@@ -508,27 +511,62 @@ def _constant_witness(
       caveat context, and when ``key`` has no constant arm beside its other
       arms.
     """
+    return _constant_witnesses(operation, (key,), recheck=recheck, fresh=fresh)[0]
+
+
+def _constant_witnesses(
+    operation: _Operation,
+    keys: tuple[Key, ...],
+    *,
+    recheck: bool = False,
+    fresh: bool = False,
+    inherited: bool = False,
+) -> tuple[bool | None, ...]:
+    """One Boolean per distinct, uncached constant-arm signature in one SELECT."""
     evaluator = current_evaluator()
     if evaluator is None or operation.context is not None:
-        return None
-    compiled = _constant_statement(operation, key)
-    if isinstance(compiled, bool):
-        return None
+        return (None,) * len(keys)
+    signatures: list[tuple[str, tuple[Any, ...], SubjectRef, str]] = []
+    statements: list[tuple[Hashable, tuple[Hashable, ...] | None]] = []
+    compiled_arms = []
+    positions: list[int | None] = []
+    verdicts = operation.verdicts(keys[0])
+    for key in keys:
+        # The root reaches every inherited target; its verdicts cover them.
+        operation.adopt(key, verdicts)
+        compiled = _constant_statement(operation, key)
+        if isinstance(compiled, bool):
+            positions.append(None)
+            continue
+        signature = (compiled.sql, compiled.params, operation.actor, operation.using)
+        try:
+            position = signatures.index(signature)
+        except ValueError:
+            position = len(signatures)
+            signatures.append(signature)
+            generations = tuple(
+                _backend_cache_key(operation.backend, type_) for type_ in compiled.reads
+            )
+            kept = None if fresh or None in generations else generations
+            statements.append((signature, kept))
+            compiled_arms.append(compiled)
+        positions.append(position)
 
-    def decide() -> bool:
-        probe = _Sql(compiled, operation)
-        return _probe_root(operation.using).filter(Q(probe)).exists()
+    def decide(indices: list[int]) -> list[bool]:
+        probes = [_Sql(compiled_arms[index], operation) for index in indices]
+        row = next(iter(_probe_root(operation.using).order_by().values_list(*probes)), None)
+        return [bool(value) for value in row] if row is not None else [False] * len(indices)
 
-    generations = tuple(_backend_cache_key(operation.backend, type_) for type_ in compiled.reads)
-    kept = None if fresh or None in generations else generations
-    return evaluator._constant_witness(
+    primary = positions[0] if inherited else None
+    answers = evaluator._constant_witness_batch(
         operation.backend,
-        # The same SQL decides on each database alias it runs on.
-        (compiled.sql, compiled.params, operation.actor, operation.using),
-        kept,
+        statements,
         decide,
         recheck=recheck,
+        advisory=frozenset(range(len(statements))) - {primary} if inherited else frozenset(),
+        primary=primary,
     )
+    return tuple(None if position is None else answers[position] for position in positions)
 
 
 # ---------- Point checks ----------
@@ -983,6 +1021,7 @@ def _scope_statement(
     *,
     candidates: tuple[int, ...] | None = None,
     witness: bool | None = None,
+    inherited: tuple[Key, ...] = (),
 ) -> _Kept | bool:
     """The ids of ``model`` the actor holds ``key`` on, as SQL.
 
@@ -990,7 +1029,9 @@ def _scope_statement(
     and the SQL is only the policy fence. ``candidates`` bounds the rows the
     statement visits to those literal identities. ``witness`` is the answer
     of ``_constant_witness``: when ``True`` the statement is the constant
-    arms alone; when ``False`` it is the policy's without them.
+    arms alone; when ``False`` it is the policy's without them. ``inherited``
+    selects the targets' constant rechecks alone, retaining live membership.
+    Revocation may deny other inherited grants until a fresh evaluator scope.
     """
     if witness:
         return _constant_statement(operation, key)
@@ -999,7 +1040,7 @@ def _scope_statement(
     fold = key if witness is False else None
 
     def build() -> bool | tuple[models.QuerySet[Any], bool]:
-        compiler = operation.compiler(verdicts, fold=fold)
+        compiler = operation.compiler(verdicts, fold=fold, witnessed=frozenset(inherited))
         predicate = compiler.holds(key, _model_at(model), Bound.LOWER)
         if is_false(predicate):
             return False
@@ -1014,7 +1055,10 @@ def _scope_statement(
         return compiler.statement(rows.order_by().values(resource_id_attr(model))), False
 
     return operation.statement(
-        ("scope", label, key, fold is not None), verdicts, build, cache=candidates is None
+        ("scope", label, key, fold is not None, inherited),
+        verdicts,
+        build,
+        cache=candidates is None,
     )
 
 
@@ -1092,7 +1136,8 @@ def _known_identities(
 class _Scope(Expression):
     """A queryset scope with policy, caveat verdicts and constant-arm witness pinned when built.
 
-    ``witness`` is the answer of ``_constant_witness`` when the scope was built.
+    ``witness`` is the own constant-arm answer when built. ``inherited`` names
+    positive target witnesses; their other grants remain in the statement.
     """
 
     def __init__(
@@ -1105,6 +1150,7 @@ class _Scope(Expression):
         policy: _Policy,
         verdicts: CaveatVerdicts,
         witness: bool | None = None,
+        inherited: tuple[Key, ...] = (),
     ) -> None:
         super().__init__(output_field=models.BooleanField())
         self.backend = backend
@@ -1115,6 +1161,7 @@ class _Scope(Expression):
         self.policy = policy
         self.verdicts = verdicts
         self.witness = witness
+        self.inherited = inherited
         self.lhs: Any = F(resource_id_attr(model))
 
     def get_source_expressions(self) -> list[Any]:
@@ -1134,7 +1181,12 @@ class _Scope(Expression):
         # exactly those rows; every other shape uses the general scope.
         identities = _known_identities(self.model, self.lhs, compiler.query.where, self.using)
         compiled = _scope_statement(
-            operation, self.model, key, candidates=identities, witness=self.witness
+            operation,
+            self.model,
+            key,
+            candidates=identities,
+            witness=self.witness,
+            inherited=self.inherited,
         )
         if isinstance(compiled, bool):
             # ``True`` cannot occur: a statement that admits rows is a gate.
@@ -1183,6 +1235,22 @@ def scope_expression(
         return Value(False, output_field=models.BooleanField())
     key = (resource_type, action)
     operation = _Operation.begin(backend, actor, using, policy=_policy(backend))
+    targets: tuple[Key, ...] = ()
+    if current_evaluator() is not None and operation.context is None:
+        memo = (operation.shape, key)
+        cached = operation.policy.inherited.get(memo)
+        if cached is None:
+            compiler = operation.compiler(operation.verdicts(key))
+            cached = operation.policy.inherited[memo] = tuple(
+                target
+                for target in operation.policy.program.inherited_targets(key)
+                if compiler.constant_arms(target)
+            )
+        targets = cached
+    witness, *decisions = _constant_witnesses(operation, (key, *targets), inherited=True)
+    inherited = tuple(
+        target for target, decision in zip(targets, decisions, strict=True) if decision is True
+    )
     expression = _Scope(
         backend,
         model,
@@ -1191,7 +1259,8 @@ def scope_expression(
         using,
         operation.policy,
         operation.verdicts(key),
-        _constant_witness(operation, key),
+        witness,
+        inherited,
     )
     if identity is not None:
         expression.set_source_expressions([identity])

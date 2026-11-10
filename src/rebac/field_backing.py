@@ -91,6 +91,13 @@ class ResolvedFieldBacking(_SourceFilters):
     generic: GenericColumns | None = None
 
     @property
+    def single_valued(self) -> bool:
+        """Neither the backing path nor its source filters traverse multiple rows."""
+        return not any(
+            _multi_valued(self.source_model, lookup) for lookup in (self.path, *self.filters)
+        )
+
+    @property
     def source_id_attr(self) -> str:
         return resource_id_attr(self.source_model)
 
@@ -844,6 +851,24 @@ def _json_column(model: type[models.Model], lookup: str) -> str | None:
     if parts[width:] not in ([], ["exact"]):
         return None  # a key transform or another lookup keeps its meaning
     return "__".join(parts[:width])
+
+
+def _multi_valued(model: type[models.Model], lookup: str) -> bool:
+    """Whether a lookup path crosses a reverse or many-to-many relation."""
+    current: Any = model
+    for part in lookup.split("__"):
+        try:
+            field = current._meta.pk if part == "pk" else current._meta.get_field(part)
+        except FieldDoesNotExist:
+            return False
+        if not field.is_relation:
+            return False
+        if field.many_to_many or field.one_to_many:
+            return True
+        current = field.related_model
+        if not isinstance(current, type):
+            return False
+    return False
 
 
 def resolve_field_backing(
