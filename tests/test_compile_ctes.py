@@ -529,9 +529,11 @@ def test_mti_write_keeps_parent_update_keys(shared_rows, django_user_model, hook
     assert NativeParentLinkedChild._base_manager.get(pk=second.pk).name == "untouched"
 
 
-def test_one_object_recursive_closure_is_shared_across_constant_arms():
+@pytest.mark.parametrize("storage", ["denormalized", "registry"])
+def test_one_object_recursive_closure_is_shared_across_constant_arms(settings, storage):
     from rebac import ObjectRef
 
+    settings.REBAC_LOCAL_BACKEND_STORAGE = storage
     local = install_schema("""
         definition auth/user {}
         definition org/role {

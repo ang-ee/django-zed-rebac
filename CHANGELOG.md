@@ -5,6 +5,21 @@ pre-1.0; breaking changes within a minor version are explicitly called out.
 
 ## [Unreleased]
 
+## [0.32.2] — Unreleased
+
+### Fixed
+
+- Frozen permission id sets now use Django's compact subquery aliases,
+  including the local helpers of recursive role closures. Since 0.32.0,
+  freezing before alias assignment repeated full table names throughout
+  those helpers. On a representative registry-backed role read on PostgreSQL,
+  the recursive fragment returns from 1,734 to 1,288 bytes, byte-identical to
+  the 0.31 shape; its shared wrapper/reference saves another 6 bytes. The
+  complete read falls from 7,645 to 6,269 bytes with bound parameters rendered.
+  Reachability, depth limits, parameter order, content-hash naming and sharing
+  across subqueries are unchanged. The wrapper that keeps a recursive helper
+  local to its shared id set remains necessary.
+
 ## [0.32.1] — 2026-11-10
 
 ### Fixed

@@ -1929,7 +1929,11 @@ execute queries during compilation must isolate that execution or opt its
 SELECT root into `share_id_sets()`; no global Django hook closes this gap.
 
 Id-set names are `rebac_ids_<16 hex>`, with leading underscores added to avoid
-model-table collisions. Parametric statements use a prefix of the SQL-template
+model-table collisions. Before freezing an id-set body, Django resolves a clone
+against a fresh, empty outer query, assigning compact subquery aliases to its
+tables, UNION branches and local recursive helpers. That outer query is fixed,
+independent of embedding depth, so equal bodies still have equal signatures.
+Parametric statements use a prefix of the SQL-template
 signature, including its non-actor parameters; actor and clock placeholders
 retain the same names when bound. Non-parametric enumeration statements use a
 16-digit hexadecimal ordinal within their compiler instead: their already bound

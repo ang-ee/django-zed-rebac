@@ -96,6 +96,10 @@ def signature(sql: str, params: tuple[Any, ...]) -> bytes:
 
 
 def id_sql(query: Query, using: str) -> SQL:
+    # Freeze the same compact aliases Django assigns when embedding a query.
+    # A fresh outer query makes the names independent of the eventual scope;
+    # django-cte also resolves (and clones) local recursive helpers here.
+    query = query.resolve_expression(Query(None))
     # Match django-cte's column naming for UNION bodies, on our own clone.
     _ignore_with_col_aliases(query)
     sql, params = query.get_compiler(using=using).as_sql()
