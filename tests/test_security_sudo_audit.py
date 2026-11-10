@@ -274,6 +274,29 @@ def test_instance_sudo_writes_bypass_row(post):
     assert _bypass_rows("audit.instance-sudo").count() == 1
 
 
+@pytest.mark.pg_delta
+@pytest.mark.django_db(transaction=True)
+def test_instance_bypass_shares_one_committed_entry_per_actor_and_evaluator_scope(post):
+    reason = "audit.instance-units"
+    post.sudo(reason=reason)
+    for actor in ("first", "second"):
+        with actor_context(SubjectRef.of("auth/user", actor)):
+            for _request in range(2):
+                with evaluator_scope():
+                    before = _bypass_rows(reason).count()
+                    with transaction.atomic():
+                        assert post.check_save().allowed
+                        post.save()
+                    # The pending entry remains counted after commit, too.
+                    post.save()
+                    assert post.check_access("write").allowed
+                    assert _bypass_rows(reason).count() == before + 1
+                    # A new sudo call is another entry, even with the same reason.
+                    post.sudo(reason=reason).save()
+                    assert _bypass_rows(reason).count() == before + 2
+    assert _actors(reason) == ["first"] * 4 + ["second"] * 4
+
+
 def test_block_sudo_writes_bypass_row_inside_block(post):
     with sudo(reason="audit.block-sudo"):
         assert _bypass_rows("audit.block-sudo").count() == 1

@@ -38,7 +38,7 @@ from .field_visibility import (
     redacted_fields,
     runtime_field_deny_mode,
 )
-from .managers import RebacManager, TrackedManager, TrackedQuerySet, _hidden_from
+from .managers import RebacManager, TrackedManager, TrackedQuerySet, _BypassEntry, _hidden_from
 from .preflight import _check_new_model
 from .resources import model_resource_type
 from .schema.walker import field_gated_actions
@@ -612,7 +612,7 @@ class RebacMixin(RebacTrackedMixin):
     # forcing the consumer to re-attach via middleware / Celery hook.
     _rebac_actor: SubjectRef | None = None
     _rebac_sudo_reason: str | None = None
-    _rebac_sudo_audited: bool = False
+    _rebac_bypass_entry: _BypassEntry
     _rebac_field_deny: FieldDenyMode | None = None
     _rebac_resource_id: str | None = None
 
@@ -755,9 +755,11 @@ class RebacMixin(RebacTrackedMixin):
         save leaves them unwritten. The step runs as it is for a model without
         row policy, when none of its rules reads other rows, under a bypass
         that is already in effect, and with no actor (where strict mode
-        refuses an actor-less read). The instance's own bypass (``sudo``)
-        enters a system context under its own reason; the pinned actor
-        outranks an ambient bypass, as everywhere.
+        refuses an actor-less read). An effective bypass includes the
+        queryset's unscoped insertion authority and the instance's own
+        ``sudo``. It makes every row visible only for this step, sharing the
+        bypass's audit entry with the save; the pinned actor outranks an
+        ambient bypass, as everywhere.
         """
         from .audit import save_check
 
@@ -771,14 +773,12 @@ class RebacMixin(RebacTrackedMixin):
             return None
         label = f"{self._meta.label_lower}.{step}"
         unwritten = none if self._state.adding else redacted_fields(self)
-        if self.is_sudo():
-            if running is not None:
-                return _bypass_unaudited(self._rebac_sudo_reason or label), none, none
-            return system_context(reason=self._rebac_sudo_reason or label), none, none
-        actor, _ = self.effective_actor()
+        actor, unscoped = self.effective_actor()
+        if unscoped:
+            self._audit_bypass_once()
+            return _bypass_unaudited(self._rebac_sudo_reason or label), none, none
         if actor is None:
-            # An ambient bypass already reads every row; no actor reads as
-            # strict mode allows.
+            # No actor and no bypass: strict mode refuses the read.
             return nullcontext(), none, none
         if running is None:
             verdict = self._rebac_gates_admit()
@@ -958,8 +958,8 @@ class RebacMixin(RebacTrackedMixin):
     def __getstate__(self) -> dict[str, Any]:
         """Strip per-instance REBAC binding before pickling.
 
-        Removes ``_rebac_actor``, ``_rebac_sudo_reason``, and
-        ``_rebac_loaded_values`` so a pickled instance cannot smuggle a
+        Removes ``_rebac_actor``, ``_rebac_sudo_reason``, the bypass audit
+        entry, and ``_rebac_loaded_values`` so a pickled instance cannot smuggle a
         trusted actor across a process boundary. The receiving end must
         re-attach an actor via middleware / Celery hook (see CLAUDE.md
         § 5 — actor lives on the queryset / instance, not in a ContextVar
@@ -969,7 +969,7 @@ class RebacMixin(RebacTrackedMixin):
         if isinstance(state, dict):
             state.pop("_rebac_actor", None)
             state.pop("_rebac_sudo_reason", None)
-            state.pop("_rebac_sudo_audited", None)
+            state.pop("_rebac_bypass_entry", None)
             state.pop("_rebac_loaded_values", None)
             state.pop("_rebac_field_deny", None)
             state.pop(_SAVE_VERDICT, None)
@@ -992,7 +992,7 @@ class RebacMixin(RebacTrackedMixin):
 
         self._rebac_actor = actor if isinstance(actor, SubjectRef) else to_subject_ref(actor)
         self._rebac_sudo_reason = None
-        self._rebac_sudo_audited = False
+        self._rebac_bypass_entry = _BypassEntry()
         return self
 
     def as_user(self, user: Any) -> Self:
@@ -1026,7 +1026,7 @@ class RebacMixin(RebacTrackedMixin):
 
         require_sudo_allowed(reason)
         self._rebac_sudo_reason = reason
-        self._rebac_sudo_audited = False
+        self._rebac_bypass_entry = _BypassEntry()
         return self
 
     def unsudo(self) -> Self:
@@ -1037,22 +1037,19 @@ class RebacMixin(RebacTrackedMixin):
         ``sudo(reason=...)`` for actorless paths.
         """
         self._rebac_sudo_reason = None
-        self._rebac_sudo_audited = False
+        self._rebac_bypass_entry = _BypassEntry()
         return self
 
     def _audit_bypass_once(self) -> None:
+        """Share the instance's audit entry, counting only rows not rolled back."""
         from .audit import save_check
 
-        if self._rebac_sudo_reason is None or self._rebac_sudo_audited:
+        if self._rebac_sudo_reason is None:
             return
         if save_check.get() is not None:
             # Inside a check everything is rolled back: the real save audits it.
             return
-        from .actors import current_actor
-        from .audit import emit_bypass
-
-        emit_bypass(self._rebac_sudo_reason, actor=current_actor())
-        self._rebac_sudo_audited = True
+        self._rebac_bypass_entry.audit(self._rebac_sudo_reason)
 
     def is_sudo(self) -> bool:
         return self._rebac_sudo_reason is not None

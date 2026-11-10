@@ -3,12 +3,14 @@
 from __future__ import annotations
 
 from collections.abc import Iterator
+from contextlib import nullcontext
 from types import SimpleNamespace
 from typing import Any
 
 import pytest
 from django.contrib.auth import get_user_model
 from django.core.exceptions import ValidationError
+from django.db import IntegrityError, connection, transaction
 
 from rebac import actor_context, backend, system_context
 from rebac.backends import reset_backend
@@ -220,6 +222,142 @@ def _validating_save(model, monkeypatch):
         return native_save(instance, *args, **kwargs)
 
     monkeypatch.setattr(model, "save", validating_save)
+
+
+@pytest.mark.parametrize(
+    "model,field,available,duplicate",
+    [
+        (GuardedUniqueRow, "email", "fresh@example.com", "bob@example.com"),
+        (GuardedConstraintRow, "code", "fresh", "taken"),
+    ],
+)
+@pytest.mark.parametrize("operation", ["create", "insert", "instance_sudo"])
+@pytest.mark.parametrize("ambient_actor", [False, True])
+def test_bypassed_save_validates_all_rows_with_one_audit_entry(
+    validation_rows, monkeypatch, model, field, available, duplicate, operation, ambient_actor
+):
+    """Validation inside a consumer save uses the insertion's existing authority."""
+    _validating_save(model, monkeypatch)
+    PermissionAuditEvent.objects.all().delete()
+    before = model._base_manager.count()
+    reason = "validation insertion bypass"
+    actor = validation_rows.alice
+
+    with actor_context(actor) if ambient_actor else nullcontext():
+        queryset = model.objects.system_context(reason=reason)
+        row = model(owner=validation_rows.bob, **{field: duplicate})
+        if operation == "instance_sudo":
+            row.sudo(reason=reason)
+
+        def persist(value):
+            setattr(row, field, value)
+            if operation == "create":
+                return queryset.create(owner=validation_rows.bob, **{field: value})
+            if operation == "insert":
+                return queryset.insert(row)
+            row.save()
+            return row
+
+        with pytest.raises(ValidationError) as caught:
+            persist(duplicate)
+        assert set(caught.value.message_dict) == {field}
+        assert model._base_manager.count() == before
+        saved = persist(available)
+        assert saved.pk is not None
+        assert not saved._state.adding
+        assert model._base_manager.count() == before + 1
+
+    events = list(PermissionAuditEvent.objects.all())
+    assert len(events) == 1
+    assert events[0].kind == PermissionAuditEvent.KIND_SUDO_BYPASS
+    assert events[0].reason == reason
+    assert events[0].actor_subject_id == (str(actor.pk) if ambient_actor else "")
+    # The temporary validation bypass must not escape to unrelated reads.
+    with pytest.raises(MissingActorError):
+        model.objects.count()
+    if operation != "instance_sudo":
+        assert not saved.effective_actor()[1]
+
+
+@pytest.mark.parametrize("failure", ["validation", "integrity"])
+@pytest.mark.parametrize("operation", ["instance_sudo", "create"])
+@pytest.mark.parametrize("ambient_actor", [False, True])
+@pytest.mark.parametrize(
+    "rollback",
+    ["savepoint", pytest.param("transaction", marks=pytest.mark.django_db(transaction=True))],
+)
+def test_bypassed_save_retry_after_rollback_keeps_an_audit_row(
+    validation_rows, monkeypatch, failure, operation, ambient_actor, rollback
+):
+    """A rolled-back validation or database error cannot consume the bypass audit."""
+    assert connection.in_atomic_block == (rollback == "savepoint")
+    if failure == "validation":
+        _validating_save(GuardedUniqueRow, monkeypatch)
+    error = ValidationError if failure == "validation" else IntegrityError
+    PermissionAuditEvent.objects.all().delete()
+    reason = "validation rollback retry"
+    actor = validation_rows.alice
+    with actor_context(actor) if ambient_actor else nullcontext():
+        queryset = GuardedUniqueRow.objects.system_context(reason=reason)
+        row = GuardedUniqueRow(owner=validation_rows.bob, email="bob@example.com")
+        if operation == "instance_sudo":
+            row.sudo(reason=reason)
+        with pytest.raises(error), transaction.atomic():
+            if operation == "create":
+                queryset.create(owner=validation_rows.bob, email="bob@example.com")
+            else:
+                row.save()
+        assert not PermissionAuditEvent.objects.exists()
+
+        # Retry using the same instance or queryset authority, then commit.
+        with transaction.atomic():
+            if operation == "create":
+                saved = queryset.create(owner=validation_rows.bob, email="fresh@example.com")
+            else:
+                row.email = "fresh@example.com"
+                row.save()
+                saved = row
+
+    assert saved.pk is not None
+    assert GuardedUniqueRow._base_manager.filter(pk=saved.pk, email="fresh@example.com").exists()
+    events = PermissionAuditEvent.objects.filter(kind=PermissionAuditEvent.KIND_SUDO_BYPASS)
+    assert events.count() == 1
+    assert {event.reason for event in events} == {reason}
+    assert {event.actor_subject_id for event in events} == {str(actor.pk) if ambient_actor else ""}
+
+
+@pytest.mark.parametrize("operation", ["create", "insert"])
+@pytest.mark.parametrize("admitted", [False, True])
+@pytest.mark.parametrize("duplicate", [False, True])
+def test_actor_scoped_insert_validation_keeps_its_gate_and_audit(
+    validation_rows, monkeypatch, operation, admitted, duplicate
+):
+    """A pinned actor outranks ambient sudo, including the actor-only fallback."""
+    _validating_save(GuardedConstraintRow, monkeypatch)
+    actor = validation_rows.alice
+    owner = actor if admitted else validation_rows.bob
+    values = {"owner": owner, "code": "taken" if duplicate else "fresh"}
+    queryset = GuardedConstraintRow.objects.with_actor(actor)
+
+    with system_context(reason="ambient bypass must not override the pinned actor"):
+        PermissionAuditEvent.objects.all().delete()
+        if not admitted:
+            expected = pytest.raises(PermissionDenied)
+        elif duplicate:
+            expected = pytest.raises(ValidationError)
+        else:
+            expected = nullcontext()
+        with expected:
+            if operation == "create":
+                queryset.create(**values)
+            else:
+                queryset.insert(GuardedConstraintRow(**values))
+
+    events = list(PermissionAuditEvent.objects.filter(kind=PermissionAuditEvent.KIND_SUDO_BYPASS))
+    assert len(events) == int(admitted)
+    if admitted:
+        assert events[0].reason == "testapp.guardedconstraintrow.validate_constraints"
+        assert events[0].actor_subject_id == str(actor.pk)
 
 
 def _row_form():

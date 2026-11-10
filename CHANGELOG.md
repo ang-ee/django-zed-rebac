@@ -5,6 +5,26 @@ pre-1.0; breaking changes within a minor version are explicitly called out.
 
 ## [Unreleased]
 
+## [0.32.1] — 2026-11-10
+
+### Fixed
+
+- Creating a row through `Model.objects.system_context(reason=...).create()`
+  or `.insert(obj)` now honours that bypass when the model's `save()` validates
+  unique fields or constraints. Validation previously raised `MissingActorError`
+  without an ambient actor; with one, it could raise `PermissionDenied` on a
+  gated field or miss hidden duplicates. Validation shares the insertion's
+  audit entry. Actor-scoped validation keeps its existing gates.
+- Instance `sudo()` now writes one audit row per instance bypass, actor and
+  evaluator scope, shared by validation, checks and saves, instead of a row
+  per validation step plus another for the save. After a transaction or
+  savepoint rollback, the next use writes a replacement row: retrying a save
+  after `ValidationError` or `IntegrityError` no longer commits without a
+  surviving bypass audit row.
+  A long-lived `sudo()` instance used under several actors or evaluator
+  scopes now writes one row per actor and scope; 0.32.0 wrote one per
+  `sudo()` call regardless of scope.
+
 ## [0.32.0] — 2026-11-10
 
 ### Added

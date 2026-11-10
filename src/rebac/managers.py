@@ -77,11 +77,12 @@ _executing_bypass_audits: ContextVar[dict[tuple[_BypassEntry, str], None] | _Com
 
 
 class _BypassEntry:
-    """One ``sudo()`` or ``system_context()`` call, shared by the querysets derived from it.
+    """One instance bypass or queryset ``sudo()`` / ``system_context()`` call.
 
-    A top-level execution of any of them audits it (``audit``) once per actor
-    and evaluator scope (the request; outside one, once per actor), counting a
-    row written inside a transaction only if it commits. An embedded use is
+    An instance's validation, checks and writes, or top-level executions of
+    querysets derived from the call, audit it (``audit``) once per actor and
+    evaluator scope (the request; outside one, once per actor), counting a row
+    written inside a transaction only if it commits. An embedded use is
     audited with each statement that executes it, keyed by this entry and its
     reason (``_emit_embedded``). ``ambient`` marks the bypass of an enclosing
     ``sudo()`` block that a queryset pinned (``RebacQuerySet._capture_ambient_bypass``).

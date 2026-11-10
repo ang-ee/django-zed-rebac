@@ -1111,8 +1111,9 @@ class PermissionAuditEvent(models.Model):
 Written by every Tier 2 / Tier 3 mutation and every effective public bypass.
 Queryset bypasses are audited at the first evaluation or write of any
 queryset derived from the `sudo()` or `system_context()` call, once per actor
-and evaluator scope; instance bypasses at the first check or write, and block
-bypasses at entry, once per bypass.
+and evaluator scope; instance bypasses at the first validation, check or write
+under the same actor and evaluator-scope rule. Block bypasses emit at entry,
+once per bypass.
 A bypass queryset embedded in an expression (`Exists`, `Subquery`, a
 `pk__in=` lookup) is audited once per entry and reason when its enclosing
 statement executes. Building the expression runs no query and writes no row,
@@ -1599,9 +1600,11 @@ the decision is pending, so a consumer `save()` that cleans again never
 validates with more access than the actor, whichever call is outermost. The
 instance marker that carries the decision is removed on every outermost
 exit and is not pickled. The instance's pinned actor outranks an ambient
-bypass, as everywhere: an instance bypass (`sudo`) validates in a system
-context under its own reason; with no actor and no bypass the rules run as
-they are, and strict mode refuses the actor-less read. Models without
+bypass, as everywhere: an instance bypass (`sudo`) or a queryset's unscoped
+insertion authority makes every row visible during the validation step,
+sharing the bypass's own audit entry and reason with the save. With no actor
+and no bypass the rules run as they are, and strict mode refuses the
+actor-less read. Models without
 resource policy and steps without a cross-row rule run unchanged, with no
 rehearsal. A `ModelForm` makes the two direct calls separately, so it pays
 two rehearsals and two audit rows per `is_valid()`; one decision per form is
@@ -2630,6 +2633,13 @@ statement, each execution audits every distinct `(entry, reason)` pair it
 renders, even if that pair appears in several filters, annotations or `Exists`
 expressions. A count followed by a list read audits the embedded entry twice.
 Nested entries retain separate events even when their reasons match.
+
+An instance `sudo()` call owns the same kind of audit entry. Its validation,
+checks, saves and deletes share one row per actor and evaluator scope. A
+rolled-back row does not count: the next use writes it again, including after
+a validation failure or a database `IntegrityError`. Calling `sudo()` again
+starts a new entry; `with_actor()` and `unsudo()` clear the bypass, and
+pickling removes the entry along with the actor and reason.
 
 A statement whose Query class REBAC owns (a REBAC or tracked queryset's query,
 including a base manager's, a plain Django `Query` that received a REBAC
