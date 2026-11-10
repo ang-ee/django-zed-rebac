@@ -544,7 +544,7 @@ from rebac.mcp    import rebac_mcp_tool, default_actor_resolver, get_mcp_actor_r
 from rebac.schema import parse_zed, validate_schema   # for tooling
 from rebac.memberships import grant, revoke, members_of, containers_of   # direct `member` tuples
 from rebac.roles  import grant, revoke, roles_of, members_of   # role-as-namespace helpers
-from rebac.testing import install_schema   # test helper: make a schema and backend current
+from rebac.testing import install_schema, assert_decisions   # test helpers: a current schema; a decision table
 ```
 
 For an operation without a pinned actor, `is_sudo()` answers whether ambient
@@ -560,6 +560,17 @@ one `rebac.backend()` returns in this process, makes sure the
 default), and returns the backend. It builds nothing: permissions on `using`
 are decided from the rows already stored.
 `rebac.backends.reset_backend()` undoes it; call it in teardown.
+
+`rebac.testing.assert_decisions(checks=(), accessible=())` asserts a decision
+table against the active backend. Each `checks` row is `(subject, action,
+resource, allowed)`: an `ActorLike`, an action, an `ObjectRef` or anything
+`to_object_ref` resolves, and whether the check allows (a conditional answer
+does not); the rows are decided in one `check_bulk_permissions` call. Each
+`accessible` row is `(subject, action, resource_type, ids)`, where
+`resource_type` is a type name or a resource model and `ids` is the complete
+set `accessible` answers, as wire ids or resource instances. It raises one
+`AssertionError` that lists every row whose answer differs, with the expected
+and the actual answer. Tables are Python data; there is no file format.
 
 `rebac.schema_changes(using=None)` groups writes to stored schema rows
 (`SchemaDefinition`, `SchemaRelation`, `SchemaPermission`, `SchemaCaveat`,
