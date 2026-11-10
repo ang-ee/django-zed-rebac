@@ -420,8 +420,9 @@ Per `docs/ARCHITECTURE.md § Testing`:
   multi-exception clause (`except A, B:`, PEP 758) is the formatter's
   canonical form, not a Python 2 leftover. Don't add `# fmt: skip` to fight
   it.
-- **DjangoVer** for releases:
-  `<DJANGO_MAJOR>.<DJANGO_FEATURE>.<PACKAGE_VERSION>`.
+- **DjangoVer** applies after 1.0:
+  `<DJANGO_MAJOR>.<DJANGO_FEATURE>.<PACKAGE_VERSION>`. Pre-1.0 releases use the
+  0.x series.
 
 ### AppConfig
 

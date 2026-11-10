@@ -378,7 +378,8 @@ class Compiler:
         self.tagged = tagged
         self.verdicts = verdicts
         # The application clock, never the database's.  A parametric
-        # statement binds it when it runs; any other reads it now.
+        # statement binds it when its outermost SELECT compiles; any other
+        # reads it now, while building the predicate.
         self.now = (
             now
             if now is not None
@@ -449,9 +450,12 @@ class Compiler:
         key = signature(sql, tuple(params))
         cte = self._id_set_names.get(key)
         if cte is None:
+            # Enumeration binds its values while building each separate root.
+            # Keep its SQL stable without hashing the actor or clock into names.
+            name_key = key if self.parametric else len(self._id_sets).to_bytes(8, "big")
             cte = CTE(
                 QuerySet(model=rows.model, query=body, using=self.using),
-                name=self._cte_name(id_name(key)),
+                name=self._cte_name(id_name(name_key)),
             )
             definition = ctes.Definition(cte.name, sql, tuple(params), key)
             # Check the full signature, even when the short name collides.

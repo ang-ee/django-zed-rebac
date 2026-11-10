@@ -342,8 +342,8 @@ def test_compilation_and_shared_reads_preserve_bypass_audits(shared_rows, applic
 def test_content_names_are_stable_and_include_parameters(shared_rows):
     local, _, _ = shared_rows
     left, right = (
-        Compiler(local.schema(), ALICE, "default"),
-        Compiler(local.schema(), ALICE, "default"),
+        Compiler(local.schema(), ALICE, "default", parametric=True),
+        Compiler(local.schema(), ALICE, "default", parametric=True),
     )
     ids = Post._base_manager.filter(title="same").order_by().values("pk")
     # Give one compiler an unrelated id set first: registration order is not identity.
@@ -361,7 +361,7 @@ def test_independent_predicate_compilers_share_in_dependency_order(shared_rows):
     local, reference, _ = shared_rows
     rows = share_id_sets(Post._base_manager.all())
     for _ in range(4):
-        compiler = Compiler(local.schema(), ALICE, "default")
+        compiler = Compiler(local.schema(), ALICE, "default", parametric=True)
         first = compiler._ids(
             Post._base_manager.filter(title__in=("direct", "inherited")).values("pk")
         )
@@ -376,13 +376,13 @@ def test_independent_predicate_compilers_share_in_dependency_order(shared_rows):
 
 def test_content_name_avoids_model_tables(shared_rows, monkeypatch):
     local, _, _ = shared_rows
-    compiler = Compiler(local.schema(), ALICE, "default")
+    compiler = Compiler(local.schema(), ALICE, "default", parametric=True)
     body = Post._base_manager.filter(title="same").values("pk")
     name = compiler._ids(body).query.get_initial_alias()
     # A model happens to use the generated name as its db_table.
     with monkeypatch.context() as patch:
         patch.setattr(Folder._meta, "db_table", name)
-        other = Compiler(local.schema(), ALICE, "default")
+        other = Compiler(local.schema(), ALICE, "default", parametric=True)
         ids = other._ids(body)
         assert ids.query.get_initial_alias() != name
         sql, _ = _sql(other.statement(Post._base_manager.filter(pk__in=ids)))
@@ -395,7 +395,7 @@ def test_digest_collision_fails_closed(shared_rows, monkeypatch):
     local, _, _ = shared_rows
     # Distinct SQL bodies must never silently become the same definition.
     monkeypatch.setattr("rebac.compile.predicate.id_name", lambda key: "rebac_ids_" + "0" * 16)
-    compiler = Compiler(local.schema(), ALICE, "default")
+    compiler = Compiler(local.schema(), ALICE, "default", parametric=True)
     compiler._ids(Post._base_manager.filter(title="first").values("pk"))
     with pytest.raises(SchemaError, match="Conflicting REBAC"):
         compiler._ids(Post._base_manager.filter(title="second").values("pk"))
@@ -656,7 +656,7 @@ def test_name_collision_between_templates_raises_at_root(shared_rows, monkeypatc
     monkeypatch.setattr("rebac.compile.predicate.id_name", lambda key: "rebac_ids_" + "0" * 16)
     rows = Post._base_manager.all()
     for title in ("first", "second"):
-        compiler = Compiler(shared_rows[0].schema(), ALICE, "default")
+        compiler = Compiler(shared_rows[0].schema(), ALICE, "default", parametric=True)
         ids = compiler._ids(Post._base_manager.filter(title=title).values("pk"))
         rows = rows.filter(pk__in=compiler.statement(Post._base_manager.filter(pk__in=ids)))
     with pytest.raises(SchemaError, match="Conflicting REBAC"):
@@ -676,7 +676,9 @@ def test_application_name_collision_raises(shared_rows):
 
 @pytest.mark.parametrize("operator", ["or", "and"])
 def test_predicate_statement_clones_and_boolean_combination_keeps_both_sets(shared_rows, operator):
-    left, right = (Compiler(shared_rows[0].schema(), ALICE, "default") for _ in range(2))
+    left, right = (
+        Compiler(shared_rows[0].schema(), ALICE, "default", parametric=True) for _ in range(2)
+    )
     original = Post._base_manager.all()
     first = left._ids(original.filter(title="direct").values("pk"))
     second = right._ids(original.filter(title="inherited").values("pk"))
@@ -1025,3 +1027,86 @@ def test_actor_scoped_subquery_owns_plain_outer_execution(shared_rows, shared, e
         assert run() == baseline
         assert not outer.definitions
     assert PermissionAuditEvent.objects.count() == audits
+
+
+@pytest.mark.parametrize("select", ["actor", "sudo", "all"])
+@pytest.mark.parametrize("attach", [False, True])
+@pytest.mark.parametrize("root_first", [False, True])
+def test_root_factory_with_cte_rebac_queryset(shared_rows, select, attach, root_first):
+    from rebac import actor_context
+
+    rows = {
+        "actor": lambda: Post.objects.with_actor(ALICE),
+        "sudo": lambda: Post.objects.sudo(reason="CTE root MRO"),
+        "all": Post.objects.all,
+    }[select]()
+    app = CTE(Post._base_manager.values("pk"), name="app_mro")
+
+    def root(queryset):
+        return ctes.attach(queryset, ()) if attach else share_id_sets(queryset)
+
+    rows = with_cte(app, select=root(rows)) if root_first else root(with_cte(app, select=rows))
+    with actor_context(ALICE):
+        sql, _params = _sql(rows.scoped())
+        assert "app_mro" in sql
+        assert set(rows.values_list("pk", flat=True)) == (
+            {post.pk for post in shared_rows[2]} if select == "sudo" else _expected(shared_rows[1])
+        )
+
+
+def test_accessible_sql_stable_across_actors_and_expiration_instants(monkeypatch):
+    from datetime import timedelta
+
+    from rebac import ObjectRef
+
+    instant = timezone.now()
+    local = install_schema("""
+        definition auth/user {}
+        definition auth/group { relation member: auth/user with expiration }
+        definition blog/post {
+            relation viewer: auth/user | auth/group#member
+            permission read = viewer
+        }
+    """)
+    with sudo(reason="enumeration text fixture"):
+        posts = [Post.objects.create(title=str(i)) for i in range(3)]
+    local.write_relationships(
+        [
+            RelationshipTuple(
+                to_object_ref(posts[0]), "viewer", SubjectRef.of("auth/group", "g", "member")
+            ),
+            RelationshipTuple(
+                ObjectRef("auth/group", "g"),
+                "member",
+                ALICE,
+                expires_at=instant + timedelta(days=1),
+            ),
+            RelationshipTuple(
+                ObjectRef("auth/group", "g"), "member", BOB, expires_at=instant + timedelta(days=1)
+            ),
+            RelationshipTuple(to_object_ref(posts[1]), "viewer", BOB),
+        ]
+    )
+    texts, bindings = [], []
+    for index, actor in enumerate((ALICE, ALICE, BOB)):
+        monkeypatch.setattr(
+            "rebac.clock.application_now", lambda now=instant + timedelta(seconds=index): now
+        )
+        sqls, params = [], []
+
+        def capture(execute, sql, values, many, context, *, sqls=sqls, params=params):
+            if "rebac_relationship" in sql:
+                sqls.append(sql)
+                params.append(values)
+            return execute(sql, values, many, context)
+
+        with connection.execute_wrapper(capture):
+            found = set(local.accessible(subject=actor, action="read", resource_type="blog/post"))
+        assert found == (
+            {str(posts[0].pk), str(posts[1].pk)} if actor == BOB else {str(posts[0].pk)}
+        )
+        assert sqls
+        texts.append(tuple(sqls))
+        bindings.append(tuple(params))
+    assert texts[0] == texts[1] == texts[2]
+    assert bindings[0] != bindings[1] != bindings[2]

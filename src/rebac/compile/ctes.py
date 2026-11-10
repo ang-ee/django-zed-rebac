@@ -174,16 +174,20 @@ def _assembled_sql(
     # Only text and rendering options enter this cache, never bound values or
     # query graphs. The cache key includes the database's quoting convention.
     connection = connections[using]
-    query = _CompiledQuery((body, ()))
+    # Consumers can install a different 5.0.x patch without running our pins.
+    # Sentinels verify parameter order independently of text containing nested
+    # definitions with the same names. Nothing here executes these parameters.
+    order = tuple(object() for _ in range(len(definitions) + 1))
+    query = _CompiledQuery((body, (order[-1],)))
     query.explain_info = pickle.loads(explain) if explain else None
     rows: QuerySet[Any] = QuerySet(query=query)
     attached = [
         CTE(
-            QuerySet(query=_CompiledQuery((sql, ()))),
+            QuerySet(query=_CompiledQuery((sql, (order[index],)))),
             name=name,
             materialized=materialized,
         )
-        for name, sql, materialized in definitions
+        for index, (name, sql, materialized) in enumerate(definitions)
     ]
     if not attached:
         # The frozen body's compiler doesn't render EXPLAIN itself.
@@ -192,7 +196,16 @@ def _assembled_sql(
             return f"{prefix} {body}"
         return body
     selected = with_cte(*attached, select=rows)
-    sql, _params = selected.query.get_compiler(connection=connection).as_sql()
+    sql, params = selected.query.get_compiler(connection=connection).as_sql()
+    if tuple(params) != order or not sql.endswith(body):
+        raise SchemaError("django-cte changed statement assembly; review the adapter")
+    position = 0
+    for name, _sql, _materialized in definitions:
+        marker = f"{connection.ops.quote_name(name)} AS "
+        found = sql.find(marker, position)
+        if found < 0:
+            raise SchemaError("django-cte changed definition order; review the adapter")
+        position = found + len(marker)
     return cast(str, sql)
 
 
@@ -406,7 +419,7 @@ class RootQuery:
             return super().get_aggregation(*args, **kwargs)  # type: ignore[misc]
 
 
-class _SharedRootQuery(RootQuery, JITMixin):  # type: ignore[misc]  # django-cte is untyped
+class _SharedRootQuery(JITMixin, RootQuery):  # type: ignore[misc]  # django-cte is untyped
     _jit_mixin_prefix = "RebacIds"
 
 
@@ -440,7 +453,12 @@ def share_id_sets[T: QuerySet[Any]](queryset: T) -> T:
     """Opt a plain SELECT root (including with_cte) into permission CTE sharing.
 
     Return a clone. This changes SQL assembly only, not actor scope or audits.
-    Unhooked roots and write statements retain nested definitions.
+    REBAC querysets already share; they do not need this helper. Django's Query
+    class swaps for update()/delete() lose the opt-in; writes keep nested WITHs.
+    Pickling preserves the opt-in on roots without embedded permission scopes;
+    those scopes retain unpicklable backend state. REBAC queryset pickling still
+    strips authority. Custom Query roots need an explicit opt-in when executed
+    during compilation of another statement; they are not automatically owned.
     """
     result = queryset.all()
     jit_mixin(result.query, _SharedRootQuery)

@@ -3,26 +3,47 @@
 All notable changes to `django-zed-rebac` are tracked here. The project is in
 pre-1.0; breaking changes within a minor version are explicitly called out.
 
-## [Unreleased]
+## [0.32.0] — 2026-11-10
+
+### Added
+
+- `share_id_sets(queryset)` opts a plain SELECT root into sharing permission
+  id sets, including roots composed with django-cte's `with_cte`. It returns a
+  clone and changes SQL assembly only; REBAC querysets already share.
+
+### Changed
+
+- REBAC SELECTs collect equal permission id sets across embedded scopes into
+  one outer `WITH RECURSIVE`, in dependency order. Different bindings of the
+  same template keep their nested definitions. Unhooked plain roots and write
+  statements retain nested definitions; permission decisions are unchanged.
+- Id-set names use `rebac_ids_<16 hex>`, with leading underscores on model-table
+  collisions, instead of `rebac_ids_<n>` with a trailing collision suffix.
+  Parametric statements use template-signature prefixes; non-parametric
+  enumeration statements use local hexadecimal ordinals, so actor and clock
+  values do not change their SQL text.
+- Parametric permission embeddings share one application-clock instant sampled
+  when the outermost SELECT starts compiling. Enumeration's non-parametric
+  branches still bind their predicate clock while building the branch and
+  their policy-fence clock during SQL compilation.
+- Row-independent one-object recursive closures are hoisted as id sets;
+  their recursive helpers stay inside those definitions.
+- The django-cte dependency range narrows from `>=5,<6` to `>=5.0.1,<5.1`.
 
 ### Fixed
 
-- REBAC SELECT roots share equal permission id sets across composed scopes,
-  including row-independent one-object recursive closures. Plain SELECT roots
-  (including django-cte `with_cte` statements) opt in with the new
-  `share_id_sets(queryset)` helper. Names and kept SQL remain stable across
-  actors of one shape; a second binding of a template keeps its nested `WITH`.
-  Kept statements remain compiled once, with no retained query graphs or
-  process-wide Django compiler patch. Unhooked roots and write statements
-  retain nested definitions, including MySQL INSERTs. Permission decisions
-  and bypass auditing are unchanged.
-- Internal field-read and constant-witness probes own an isolated shared
-  statement root, including when they execute while an outer query compiles.
-  Shared SELECT roots bind one clock across their permission embeddings, so
-  expiring relations share id sets too. Plain `share_id_sets` querysets retain
-  the opt-in after pickling. Bound id-set comparisons no longer pickle or hash
-  parameters; the template cache is bounded by count only (512 entries).
-  The private django-cte adapter is pinned to 5.0 with explicit upgrade tests.
+- A plain django-cte queryset embedding a sudo REBAC subquery now audits its
+  bypass when the statement executes. In 0.31.5, merely rendering that query's
+  SQL wrote an audit row.
+
+### Upgrading
+
+- Consumers pinning `django-zed-rebac<0.32`, including Angee, must raise their
+  upper bound to adopt this release.
+- Projects requiring `django-cte>=5.1` conflict with this release's dependency
+  range.
+- SQL snapshot tests matching `rebac_ids_<n>` or the old collision suffix must
+  accept the new names and the outer `WITH RECURSIVE` shape.
 
 ## [0.31.5] — 2026-11-07
 

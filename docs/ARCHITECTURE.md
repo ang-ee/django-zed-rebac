@@ -1848,11 +1848,12 @@ bounds select the same objects.
 No raw SQL, trigger, database function or hand-written statement is used,
 with two deliberate exceptions, in both of which the SQL is Django's own:
 
-1. **Kept statements.** A whole permission statement is compiled by Django
-   once, through its own `Query.as_sql()`, kept as that text with
-   placeholders, and embedded in the selecting query by a custom expression
+1. **Kept statements.** A permission statement is compiled by Django once,
+   through `compiler.as_sql()`, and kept as frozen body and ordered id-set
+   definition SQL/parameter tuples with placeholders. A custom expression
+   embeds the body and registers its definitions with the selecting statement
    (see [Kept statements and the policy fence](#kept-statements-and-the-policy-fence)).
-   Its id sets are CTEs built with django-cte (see
+   django-cte assembles the definitions into the outer prefix (see
    [Inline permission scopes](#inline-permission-scopes)).
 2. **The identity conversion's guard.** `codec.to_wire()` and
    `codec.to_column()` wrap an expression in a validity check that reads it
@@ -1897,23 +1898,42 @@ root opts in with `share_id_sets(queryset)`, including a queryset made with
 django-cte's `with_cte`. The helper returns a clone, changes SQL assembly only,
 and neither grants access nor resolves an actor. Unhooked plain roots and
 INSERT, UPDATE and DELETE statements keep nested definitions. No process-wide
-Django compiler patch is installed. The hook belongs to
-`_RebacQuery.get_compiler`; `share_id_sets` installs the same hook on its cloned
-root. For example: `rows = share_id_sets(with_cte(report_cte, select=rows))`.
+Django compiler patch is installed. `RootQuery.get_compiler` and
+`_BypassAuditQuery.get_compiler`, through `outer_compiler_mixin`, install the
+statement and audit compiler mixins. `share_id_sets` installs the root hook on
+its clone; REBAC querysets already have it. For example:
+`rows = share_id_sets(with_cte(report_cte, select=rows))`.
 Aggregate wrappers that Django constructs separately retain the inner query's
 boundary. Every embedded REBAC subquery gives its plain outer query an execution
 owner, whether actor-scoped or bypassed. Aggregate execution and render-time
 field-read/scope preparation run under isolation, as do these plain roots.
-Internal point, batched-point,
-constant-witness and policy-fence probes use the same shared root; when executed
+Internal point, batched-point, constant-witness and policy-fence probes use the
+same shared root; when executed
 during compilation they are isolated from the outer collector. Pickling a plain
-opted-in queryset or its query preserves this SQL
-assembly opt-in, including when combined with `with_cte`. REBAC queryset
-serialization still strips authority as described under the manager surface.
+opted-in queryset or its query preserves this SQL assembly opt-in when the root
+contains no embedded permission scope, including when combined with `with_cte`.
+Embedded scopes retain backend state that cannot be pickled (a thread lock).
+REBAC queryset serialization still strips authority as described under the
+manager surface. Django's Query-class swaps for `update()`/`delete()` drop the
+sharing opt-in; write statements retain nested definitions.
 
-Names depend on the SQL template and its non-actor parameters; actor and clock
-placeholders retain the same names when bound. The collector compares full
-template signatures and bound parameters. Equal bindings share a definition;
+Execution ownership covers plain `Query` roots and django-cte JIT mixtures of
+them. It does not rebase arbitrary custom Query subclasses, or detect a custom
+plain manager that embeds only a `queryset_filter()` predicate. If consumer code
+executes such a root while another statement is compiling, it can register id
+sets with the wrong collector and fail with a missing-CTE error. Consumers that
+execute queries during compilation must isolate that execution or opt its
+SELECT root into `share_id_sets()`; no global Django hook closes this gap.
+
+Id-set names are `rebac_ids_<16 hex>`, with leading underscores added to avoid
+model-table collisions. Parametric statements use a prefix of the SQL-template
+signature, including its non-actor parameters; actor and clock placeholders
+retain the same names when bound. Non-parametric enumeration statements use a
+16-digit hexadecimal ordinal within their compiler instead: their already bound
+actor and clock values must not change SQL text. These statements execute as
+separate roots, rather than sharing their sets across permission embeddings.
+The collector compares full template signatures and bound parameters. Equal
+bindings share a definition;
 a second binding of the same template keeps its nested `WITH`, shadowing the
 outer names. A name collision between different templates raises `SchemaError`.
 A one-object recursive closure is row-independent and is registered as an id
@@ -1932,13 +1952,17 @@ rendering. django-cte is constrained to `>=5.0.1,<5.1`, tested on 5.0.1.
 `join` and `cte`, and the final compiler MRO (audit before statement before CTE);
 `tests/test_compile_ctes.py` covers application CTEs, UNION column
 names, empty left joins, EXPLAIN, parameters, mutation state and pickle
-round-trips. An internal change must fail these pins and be reviewed before the
-pin moves. The minimal upstream seam needed is a public, per-query compilation
+round-trips. These pins protect this repository's tested lockfile; consumers can
+resolve another 5.0.x patch without running them. On each assembled-SQL cache
+miss, a runtime guard verifies definition order, parameter order and the
+unchanged body suffix, raising `SchemaError` if django-cte changes that contract.
+The minimal upstream seam needed is a public, per-query compilation
 wrapper that receives a callable for compiling the SELECT body without its
 WITH prefix and the already compiled application CTE definitions, and can
 prepend additional definitions discovered while compiling that body. django-cte
 would retain ownership of alias handling, empty-CTE behavior, EXPLAIN and prefix
-rendering. No upstream request is part of this change.
+rendering. [django-cte issue #154](https://github.com/dimagi/django-cte/issues/154)
+tracks this seam as the exit path for the adapter debt.
 
 A constant arrow or constant relation without filters (`admin->member` over
 `rebac:const=admin`) names one fixed object, so it holds on every object of
@@ -2016,9 +2040,10 @@ subquery, duplicates, a longer list) uses the general scope. A bounded
 statement embeds its literals, so it is compiled per read and not kept.
 
 A policy revision fence closes a scope after a new revision is published.
-A scope built without an actor fails closed. Hooked SELECTs bind the application
-clock at the start of outermost compilation, so tuple expiration and
-timed override sites follow that instant.
+A scope built without an actor fails closed. Parametric permission embeddings
+bind the application clock at the start of outermost hooked SELECT compilation,
+so tuple expiration and timed override sites follow that instant. Enumeration's
+non-parametric branches have the two instants described under [The clock](#the-clock).
 
 #### Kept statements and the policy fence
 
@@ -2071,10 +2096,10 @@ exist.
 #### The clock
 
 The clock is the application's: `django.utils.timezone.now()`, read through
-`rebac.clock.application_now()`, never the database's. It is one parameter per
-outermost hooked SELECT, sampled when that statement starts compiling and
-shared by every embedded permission and by nested definitions for a different
-actor binding, so a fact that appears under both
+`rebac.clock.application_now()`, never the database's. Parametric permission
+embeddings share one instant per outermost hooked SELECT, sampled when that
+statement starts compiling and shared by every embedded permission and by nested
+definitions for a different actor binding, so a fact that appears under both
 polarities is read at one instant. Internal probes execute at their own
 statement boundary with their own clock. An unhooked plain root retains one
 clock per embedded scope; `share_id_sets()` opts that root into the common
@@ -2082,6 +2107,13 @@ boundary. Tuple expiry and override deadlines compare with that compile-start
 instant when the statement runs. Compile-time probes and other work before
 execution can therefore delay the comparison; nothing is re-evaluated when time
 passes.
+
+Enumeration's non-parametric branches are an exception: their compiler captures
+the predicate's instant when the branch is built, while the policy fence samples
+its instant during SQL compilation. The later fence check is conservative for
+policy deadlines. Model-backed enumeration without caveat context uses the
+parametric scope path instead. Neither path refreshes an already bound predicate
+just because time passes.
 
 #### Recursion
 
