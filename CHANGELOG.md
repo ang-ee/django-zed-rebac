@@ -3,6 +3,8 @@
 All notable changes to `django-zed-rebac` are tracked here. The project is in
 pre-1.0; breaking changes within a minor version are explicitly called out.
 
+## [Unreleased]
+
 ## [0.32.0] — 2026-11-10
 
 ### Added
@@ -44,6 +46,10 @@ pre-1.0; breaking changes within a minor version are explicitly called out.
   range.
 - SQL snapshot tests matching `rebac_ids_<n>` or the old collision suffix must
   accept the new names and the outer `WITH RECURSIVE` shape.
+- A different django-cte 5.0.x patch release that changes the rendering this
+  release validates fails closed with `SchemaError("django-cte changed …")` on
+  the first affected statement; stay on the tested 5.0.1 until REBAC certifies
+  the newer patch.
 
 ## [0.31.5] — 2026-11-07
 
