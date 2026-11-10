@@ -5,6 +5,17 @@ pre-1.0; breaking changes within a minor version are explicitly called out.
 
 ## [Unreleased]
 
+## [0.32.1] — 2026-11-10
+
+### Fixed
+
+- Creating a row through `Model.objects.system_context(reason=...).create()`
+  or `.insert(obj)` now honours that bypass when the model's `save()` validates
+  unique fields or constraints. Validation previously raised `MissingActorError`
+  without an ambient actor, or missed hidden duplicates with one. Validation
+  shares the insertion's audit entry; instance `sudo()` validation also shares
+  its entry with the save. Actor-scoped validation keeps its existing gates.
+
 ## [0.32.0] — 2026-11-10
 
 ### Added

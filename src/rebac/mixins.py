@@ -755,9 +755,11 @@ class RebacMixin(RebacTrackedMixin):
         save leaves them unwritten. The step runs as it is for a model without
         row policy, when none of its rules reads other rows, under a bypass
         that is already in effect, and with no actor (where strict mode
-        refuses an actor-less read). The instance's own bypass (``sudo``)
-        enters a system context under its own reason; the pinned actor
-        outranks an ambient bypass, as everywhere.
+        refuses an actor-less read). An effective bypass includes the
+        queryset's unscoped insertion authority and the instance's own
+        ``sudo``. It makes every row visible only for this step, sharing the
+        bypass's audit entry with the save; the pinned actor outranks an
+        ambient bypass, as everywhere.
         """
         from .audit import save_check
 
@@ -771,14 +773,12 @@ class RebacMixin(RebacTrackedMixin):
             return None
         label = f"{self._meta.label_lower}.{step}"
         unwritten = none if self._state.adding else redacted_fields(self)
-        if self.is_sudo():
-            if running is not None:
-                return _bypass_unaudited(self._rebac_sudo_reason or label), none, none
-            return system_context(reason=self._rebac_sudo_reason or label), none, none
-        actor, _ = self.effective_actor()
+        actor, unscoped = self.effective_actor()
+        if unscoped:
+            self._audit_bypass_once()
+            return _bypass_unaudited(self._rebac_sudo_reason or label), none, none
         if actor is None:
-            # An ambient bypass already reads every row; no actor reads as
-            # strict mode allows.
+            # No actor and no bypass: strict mode refuses the read.
             return nullcontext(), none, none
         if running is None:
             verdict = self._rebac_gates_admit()

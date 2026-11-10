@@ -1599,9 +1599,11 @@ the decision is pending, so a consumer `save()` that cleans again never
 validates with more access than the actor, whichever call is outermost. The
 instance marker that carries the decision is removed on every outermost
 exit and is not pickled. The instance's pinned actor outranks an ambient
-bypass, as everywhere: an instance bypass (`sudo`) validates in a system
-context under its own reason; with no actor and no bypass the rules run as
-they are, and strict mode refuses the actor-less read. Models without
+bypass, as everywhere: an instance bypass (`sudo`) or a queryset's unscoped
+insertion authority makes every row visible during the validation step,
+sharing the bypass's own audit entry and reason with the save. With no actor
+and no bypass the rules run as they are, and strict mode refuses the
+actor-less read. Models without
 resource policy and steps without a cross-row rule run unchanged, with no
 rehearsal. A `ModelForm` makes the two direct calls separately, so it pays
 two rehearsals and two audit rows per `is_valid()`; one decision per form is

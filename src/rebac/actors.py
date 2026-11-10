@@ -416,11 +416,11 @@ def _as_actor_only(actor: SubjectRef) -> Iterator[None]:
 
 @contextmanager
 def _bypass_unaudited(reason: str) -> Iterator[None]:
-    """A bypass that writes no audit row: engine-internal, inside a rehearsal.
+    """An engine-internal bypass that shares its owner's audit entry.
 
-    Used only while a ``SaveCheck`` runs, where a row written inside the
-    rolled-back transaction would not survive; the bypass being exercised was
-    audited before the rehearsal began (``_audit_bypass_once``).
+    Validation uses authority already held by the insertion or instance;
+    its owner audits it once. Inside a ``SaveCheck`` rehearsal, a new audit
+    row would be rolled back, so the real save retains responsibility for it.
     """
     token = _sudo_state.set({"reason": reason})
     try:
