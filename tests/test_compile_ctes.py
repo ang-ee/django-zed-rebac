@@ -144,7 +144,26 @@ def test_independent_scopes_define_each_id_set_once(shared_rows, count, embeddin
     assert {pk for pk, _ in projected.all()} == expected
 
 
-def test_different_actor_bindings_do_not_alias(shared_rows):
+def test_different_actor_bindings_do_not_alias(shared_rows, monkeypatch):
+    from rebac.compile import read
+
+    original = read._Kept.render
+    fallbacks = []
+
+    def render(self, bound):
+        values = tuple(bound)
+        collector = ctes._current.get()
+        before = dict(collector.definitions) if collector is not None else None
+        sql, params = original(self, values)
+        if collector is not None and self.definitions and sql.startswith("(WITH RECURSIVE "):
+            # A conflicting actor binding reaches _Kept.render's fallback,
+            # retaining every parameter and atomically leaving the outer sets.
+            assert collector.definitions == before
+            assert (sql, params) == (self.sql, values)
+            fallbacks.append((sql, params))
+        return sql, params
+
+    monkeypatch.setattr(read._Kept, "render", render)
     _, reference, _ = shared_rows
     rows = (
         share_id_sets(Post._base_manager.all())
@@ -159,6 +178,8 @@ def test_different_actor_bindings_do_not_alias(shared_rows):
     assert sql.count("WITH RECURSIVE") > 1
     assert max(Counter(_definitions(sql)).values()) == 2
     assert "alice" in params and "bob" in params
+    assert fallbacks
+    assert any("bob" in params for _, params in fallbacks)
     expected_alice, expected_bob = _expected(reference), _expected(reference, BOB)
     for pk, alice, bob in rows.values_list("pk", "alice", "bob"):
         assert alice == (pk in expected_alice)
@@ -529,9 +550,11 @@ def test_mti_write_keeps_parent_update_keys(shared_rows, django_user_model, hook
     assert NativeParentLinkedChild._base_manager.get(pk=second.pk).name == "untouched"
 
 
-def test_one_object_recursive_closure_is_shared_across_constant_arms():
+@pytest.mark.parametrize("storage", ["denormalized", "registry"])
+def test_one_object_recursive_closure_is_shared_across_constant_arms(settings, storage):
     from rebac import ObjectRef
 
+    settings.REBAC_LOCAL_BACKEND_STORAGE = storage
     local = install_schema("""
         definition auth/user {}
         definition org/role {

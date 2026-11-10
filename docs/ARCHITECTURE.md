@@ -1929,16 +1929,20 @@ execute queries during compilation must isolate that execution or opt its
 SELECT root into `share_id_sets()`; no global Django hook closes this gap.
 
 Id-set names are `rebac_ids_<16 hex>`, with leading underscores added to avoid
-model-table collisions. Parametric statements use a prefix of the SQL-template
-signature, including its non-actor parameters; actor and clock placeholders
-retain the same names when bound. Non-parametric enumeration statements use a
-16-digit hexadecimal ordinal within their compiler instead: their already bound
-actor and clock values must not change SQL text. These statements execute as
-separate roots, rather than sharing their sets across permission embeddings.
+model-table collisions. Before freezing an id-set body, Django resolves a clone
+against a fresh, empty outer query, assigning compact subquery aliases to its
+tables, UNION branches and local recursive helpers. That outer query is fixed,
+independent of embedding depth, so equal bodies still have equal signatures.
+Parametric statements use a prefix of the SQL-template signature, including
+its non-actor parameters; actor and clock placeholders retain the same names
+when bound. Non-parametric enumeration statements use a 16-digit hexadecimal
+ordinal within their compiler instead: their already bound actor and clock
+values must not change SQL text. These statements execute as separate roots,
+rather than sharing their sets across permission embeddings.
 The collector compares full template signatures and bound parameters. Equal
-bindings share a definition;
-a second binding of the same template keeps its nested `WITH`, shadowing the
-outer names. A name collision between different templates raises `SchemaError`.
+bindings share a definition; a second binding of the same template keeps its
+nested `WITH`, shadowing the outer names. A name collision between different
+templates raises `SchemaError`.
 A one-object recursive closure is row-independent and is registered as an id
 set; its recursive helper stays inside that definition. Correlated recursive
 helpers stay at their original boundary. Existing application CTEs follow the
