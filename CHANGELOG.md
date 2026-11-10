@@ -16,9 +16,12 @@ pre-1.0; breaking changes within a minor version are explicitly called out.
   the recursive fragment returns from 1,734 to 1,288 bytes, byte-identical to
   the 0.31 shape; its shared wrapper/reference saves another 6 bytes. The
   complete read falls from 7,645 to 6,269 bytes with bound parameters rendered.
-  Reachability, depth limits, parameter order, content-hash naming and sharing
-  across subqueries are unchanged. The wrapper that keeps a recursive helper
-  local to its shared id set remains necessary.
+  Reachability, depth limits, parameter order and sharing across subqueries
+  are unchanged. The `rebac_ids_<16 hex>` naming scheme is unchanged, but
+  every content-hashed `rebac_ids_<hex>` value changes with the aliased SQL;
+  downstream snapshots that pin those names will churn. Non-parametric
+  enumeration's ordinal names remain unchanged. The wrapper that keeps a
+  recursive helper local to its shared id set remains necessary.
 
 ## [0.32.1] — 2026-11-10
 

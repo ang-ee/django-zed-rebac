@@ -97,8 +97,11 @@ def signature(sql: str, params: tuple[Any, ...]) -> bytes:
 
 def id_sql(query: Query, using: str) -> SQL:
     # Freeze the same compact aliases Django assigns when embedding a query.
-    # A fresh outer query makes the names independent of the eventual scope;
-    # django-cte also resolves (and clones) local recursive helpers here.
+    # A fresh outer query makes the names independent of the eventual scope.
+    # Resolution clones the Query, UNION branches and nested expression queries;
+    # django-cte also clones its helper queries. Django's Query.clone() copies
+    # the table_map dict but shares its lists: alias relabeling updates those
+    # lists on the caller too. This is not a deep copy of the query graph.
     query = query.resolve_expression(Query(None))
     # Match django-cte's column naming for UNION bodies, on our own clone.
     _ignore_with_col_aliases(query)
