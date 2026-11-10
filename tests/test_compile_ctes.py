@@ -932,7 +932,7 @@ def test_embedded_bypass_audit_timing_on_plain_root(shared_rows, root, execute):
     assert after - before == (1 if execute else 0)
 
 
-def test_assembled_sql_cache_keeps_text_and_fresh_parameter_order(shared_rows):
+def test_assembled_sql_cache_keeps_text_and_fresh_parameter_order(shared_rows, monkeypatch):
     from dataclasses import replace
 
     from django.db.models.sql.query import ExplainInfo
@@ -954,6 +954,16 @@ def test_assembled_sql_cache_keeps_text_and_fresh_parameter_order(shared_rows):
         )
         assert ctes._assembled_sql.cache_info().misses == info.misses
         assert ctes._assembled_sql.cache_info().hits == info.hits + 1
+
+        # A reused alias with a different engine must render its own prefix.
+        with monkeypatch.context() as patch:
+            patch.setattr(connection, "vendor", "cache_test_vendor")
+            patch.setattr(connection.ops, "quote_name", lambda name: f"[{name}]")
+            switched = ctes.assemble(body, (definition,), connection)
+            assert switched[0] != expected[0]
+            assert "[cached_posts] AS" in switched[0]
+            assert switched[1] == expected[1]
+        assert ctes.assemble(body, (definition,), connection) == expected
 
         for altered in (
             replace(definition, name="renamed_posts"),
@@ -988,3 +998,30 @@ def test_pickled_query_retains_sharing_with_outer_mixin(shared_rows, root):
     scope = Post.objects.with_actor(ALICE).scoped().values("pk")
     rows = QuerySet(model=Post, query=restored).filter(pk__in=scope).filter(pk__in=scope.all())
     _assert_shared(_sql(rows)[0])
+
+
+@pytest.mark.parametrize("shared", [False, True])
+@pytest.mark.parametrize("embedding", ["exists", "in"])
+@pytest.mark.parametrize("how", ["exists", "list", "distinct_count", "sliced_count"])
+def test_actor_scoped_subquery_owns_plain_outer_execution(shared_rows, shared, embedding, how):
+    from django.contrib.contenttypes.models import ContentType
+
+    scope = Post.objects.with_actor(ALICE)
+    if embedding == "exists":
+        rows = ContentType.objects.filter(Exists(scope.filter(pk=OuterRef("pk"))))
+    else:
+        rows = ContentType.objects.filter(pk__in=scope.values("pk"))
+    if shared:
+        rows = share_id_sets(rows)
+    run = {
+        "exists": rows.exists,
+        "list": lambda: sorted(rows.values_list("pk", flat=True)),
+        "distinct_count": lambda: rows.values("pk").distinct().count(),
+        "sliced_count": lambda: rows.values("pk")[:50].count(),
+    }[how]
+    audits = PermissionAuditEvent.objects.count()
+    baseline = run()
+    with ctes.collecting() as outer:
+        assert run() == baseline
+        assert not outer.definitions
+    assert PermissionAuditEvent.objects.count() == audits

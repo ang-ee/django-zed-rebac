@@ -1901,8 +1901,10 @@ Django compiler patch is installed. The hook belongs to
 `_RebacQuery.get_compiler`; `share_id_sets` installs the same hook on its cloned
 root. For example: `rows = share_id_sets(with_cte(report_cte, select=rows))`.
 Aggregate wrappers that Django constructs separately retain the inner query's
-boundary. Aggregate execution and render-time field-read/scope preparation run
-under isolation, as do plain audit-owned roots. Internal point, batched-point,
+boundary. Every embedded REBAC subquery gives its plain outer query an execution
+owner, whether actor-scoped or bypassed. Aggregate execution and render-time
+field-read/scope preparation run under isolation, as do these plain roots.
+Internal point, batched-point,
 constant-witness and policy-fence probes use the same shared root; when executed
 during compilation they are isolated from the outer collector. Pickling a plain
 opted-in queryset or its query preserves this SQL
@@ -1984,7 +1986,9 @@ operand of a combined query that reaches the compiler without its queryset
 owner; there is no render-time preparation to fall back on. Four exceptions do
 database work at render, outside a prepared scope: (a) `permission_expression`
 reads the policy and the caveat-verdict rows, and inside an evaluator scope
-decides the constant-arm witness, when its SQL is compiled, by design; (b) the
+decides the constant-arm witness, when its SQL is compiled, by design. This scope
+construction is isolated; the resulting predicate compiles into the enclosing
+statement's collector; (b) the
 field-read guard reads the schema revision and may run row-independent field
 permission probes when an actor-scoped subquery renders inside a plain outer
 query; these executions own their collector and clock; (c) the
@@ -2026,7 +2030,7 @@ The statement cache retains at most 512 templates, least recently used evicted
 first. These immutable fragments carry no query graphs. There is no byte budget;
 memory depends on the sizes of those bounded entries.
 The assembled SQL text has its own 512-entry least-recently-used cache, keyed by
-connection alias, body SQL, ordered definition names/SQL/materialization and
+connection alias and vendor, body SQL, ordered definition names/SQL/materialization and
 EXPLAIN options. Bound values are concatenated in definition order on every
 compile and never retained by this cache.
 django-cte renders the outer prefix from frozen bodies on a cache miss; no SQL

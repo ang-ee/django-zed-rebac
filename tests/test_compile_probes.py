@@ -160,3 +160,51 @@ def test_boolean_point_probe_has_its_own_compile_clock(monkeypatch, bulk):
         assert ctes.statement_now() == before
         assert not outer.definitions
     assert ctes._current.get() is None
+
+
+@pytest.mark.parametrize("fallback", [False, True])
+def test_projection_preparation_isolated_but_predicate_joins_outer_collector(monkeypatch, fallback):
+    from rebac import permission_expression
+    from rebac.managers import RebacQuerySet
+    from tests.test_compile_ctes import _assert_shared
+
+    local = install_schema(SCHEMAS["group"])
+    actor = SubjectRef.of("auth/user", "1")
+    with sudo(reason="projection preparation fixture"):
+        post = Post.objects.create(title="visible")
+    local.write_relationships(
+        [RelationshipTuple(ObjectRef("blog/post", str(post.pk)), "viewer", actor)]
+    )
+    prepared = Post.objects.with_actor(actor).scoped().values("pk")
+    calls = []
+
+    def isolated_preparation(method):
+        def prepare(*args, **kwargs):
+            # Preparation may compile a separate read. Its definitions belong
+            # in that read, even with an enclosing SELECT being compiled.
+            sql, _params = prepared.query.sql_with_params()
+            _assert_shared(sql)
+            calls.append(sql)
+            return method(*args, **kwargs)
+
+        return prepare
+
+    if fallback:
+        monkeypatch.setattr(local, "permission_expression", lambda **kwargs: None)
+        monkeypatch.setattr(
+            RebacQuerySet,
+            "scoped_for_aggregate",
+            isolated_preparation(RebacQuerySet.scoped_for_aggregate),
+        )
+    else:
+        monkeypatch.setattr(
+            local, "permission_expression", isolated_preparation(local.permission_expression)
+        )
+    rows = share_id_sets(Post._base_manager.all()).annotate(
+        allowed=permission_expression(Post, "read", actor=actor)
+    )
+    sql, _params = rows.query.sql_with_params()
+    _assert_shared(sql)
+    assert calls
+    assert list(rows.values_list("pk", "allowed")) == [(post.pk, True)]
+    assert ctes._current.get() is None

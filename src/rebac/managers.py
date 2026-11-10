@@ -250,13 +250,6 @@ class _BypassAuditUpdateQuery(_BypassAuditQuery, UpdateQuery):
     """UpdateQuery with the embedded-bypass execution hook."""
 
 
-def _audit_query_when_executed(query: Any) -> None:
-    # A plain Django queryset can hold a REBAC subquery. Its Query must own the
-    # same execution hook; changing this one Query instance's class keeps
-    # Django's clone semantics and the queryset's public type.
-    ctes.rebase_query(query, _BypassAuditQuery)
-
-
 class _RebacQuery(RootQuery, _BypassAuditQuery):
     """Cover expressions which copy QuerySet.query without resolving the QS."""
 
@@ -310,6 +303,9 @@ class _RebacQuery(RootQuery, _BypassAuditQuery):
 
     @schema_operation
     def resolve_expression(self, *args: Any, **kwargs: Any) -> Self:
+        # Any enclosing plain root owns execution isolation, even when no
+        # bypass needs auditing. Rebase only this instance, preserving clones.
+        ctes.rebase_query(args[0] if args else kwargs.get("query"), _BypassAuditQuery)
         if self._rebac_boolean_operand:
             return cast(Self, super().resolve_expression(*args, **kwargs))
         if self._rebac_statement_part and not hasattr(self, "_rebac_state"):
@@ -378,7 +374,6 @@ class _RebacQuery(RootQuery, _BypassAuditQuery):
             resolved._rebac_check = (queryset, actor)
         if pending is not None:
             resolved._rebac_pending_bypass_audit = pending
-            _audit_query_when_executed(args[0] if args else kwargs.get("query"))
         return resolved
 
 
@@ -924,6 +919,7 @@ class RebacQuerySet(models.QuerySet[_M]):
 
     @schema_operation
     def resolve_expression(self, *args: Any, **kwargs: Any) -> Query:
+        ctes.rebase_query(args[0] if args else kwargs.get("query"), _BypassAuditQuery)
         clone = self._clone()
         query = clone.query
         if isinstance(query, _RebacQuery) and query._rebac_boolean_operand:
@@ -941,7 +937,6 @@ class RebacQuerySet(models.QuerySet[_M]):
         resolved = cast(Query, super(RebacQuerySet, clone).resolve_expression(*args, **kwargs))
         if pending is not None and isinstance(resolved, _RebacQuery):
             resolved._rebac_pending_bypass_audit = pending
-            _audit_query_when_executed(args[0] if args else kwargs.get("query"))
         return resolved
 
     def explain(self, *, format: str | None = None, **options: Any) -> str:

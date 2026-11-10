@@ -155,6 +155,7 @@ def assemble(
         return body
     sql = _assembled_sql(
         connection.alias,
+        connection.vendor,
         body[0],
         tuple((item.name, item.sql, item.materialized) for item in definitions),
         _encode(explain) if explain else None,
@@ -165,6 +166,7 @@ def assemble(
 @lru_cache(maxsize=512)
 def _assembled_sql(
     using: str,
+    vendor: str,
     body: str,
     definitions: tuple[tuple[str, str, bool | None], ...],
     explain: bytes | None,
