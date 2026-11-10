@@ -5,6 +5,36 @@ pre-1.0; breaking changes within a minor version are explicitly called out.
 
 ## [Unreleased]
 
+## [0.33.0] — 2026-11-10
+
+### Added
+
+- `rebac.testing.assert_decisions(checks=(), accessible=())` asserts a
+  decision table against the active backend. `(subject, action, resource,
+  allowed)` rows are decided in one `check_bulk_permissions` call;
+  `(subject, action, resource_type, ids)` rows compare the complete
+  `accessible` answer. One `AssertionError` lists every row whose answer
+  differs, with the expected and the actual answer.
+
+### Changed
+
+- `rebac sync` reads each package's schema rows and managed records once and
+  writes its new and changed rows and records in bulk, so the statements it
+  issues no longer grow with the rows it writes. Syncing 1,401 rows from 35
+  packages onto an empty SQLite store fell from 20,578 statements and 1.27 s
+  to 856 statements and 0.15 s on a file database (1.02 s to 0.13 s in
+  memory); re-syncing the unchanged store fell from 3,768 statements and
+  0.68 s to 263 statements and 0.10 s. Ownership records, `no_update`,
+  `--force-overwrite`, `--prune-stale`, drift detection and every message are
+  unchanged; a package's stale relation and permission lines now follow its
+  other drift lines instead of each definition's.
+
+### Documentation
+
+- The `rebac.schema.walker` docstring no longer says `LocalBackend` evaluates
+  through the walker: reads are compiled to queries, and `check_new` is the
+  walker's one evaluator.
+
 ## [0.32.2] — 2026-11-10
 
 ### Fixed
