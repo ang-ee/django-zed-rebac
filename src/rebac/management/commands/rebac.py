@@ -18,6 +18,7 @@ from __future__ import annotations
 import hashlib
 import json
 import sys
+from collections.abc import Iterable
 from functools import partial
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, cast
@@ -25,7 +26,7 @@ from typing import TYPE_CHECKING, Any, cast
 from django.apps import apps
 from django.core.management.base import BaseCommand, CommandError
 from django.db import connections, router
-from django.db.models import Q
+from django.db.models import Model, Q
 from django.utils import timezone
 
 from ...conf import app_settings
@@ -107,9 +108,18 @@ def _schema_external_ids(schema: Schema) -> set[str]:
     }
 
 
-def _natural(natural_key: dict[str, Any]) -> tuple[str, ...]:
-    """A natural key as stored strings; a definition is spelled by its resource type."""
-    return tuple(str(value) for value in natural_key.values())
+def _spelled(value: Any) -> Any:
+    """A natural-key value as sync compares it: a definition by its resource type, not its PK."""
+    return str(value) if isinstance(value, Model) else value
+
+
+def _natural(natural_key: dict[str, Any]) -> tuple[Any, ...]:
+    return tuple(_spelled(value) for value in natural_key.values())
+
+
+def _keyed(rows: Iterable[Any], fields: Iterable[str]) -> dict[tuple[Any, ...], Any]:
+    """``rows`` by their natural key over ``fields``."""
+    return {_natural({field: getattr(row, field) for field in fields}): row for row in rows}
 
 
 class _SyncBatch:
@@ -149,21 +159,20 @@ class _SyncBatch:
             name__in=[c.name for c in schema.caveats]
         )
         # Parents first: ``flush`` creates in this order.
-        self.rows: dict[Any, dict[tuple[str, ...], Any]] = {
-            SchemaCaveat: {(row.name,): row for row in caveats},
-            SchemaDefinition: {(row.resource_type,): row for row in definitions},
+        self.rows: dict[Any, dict[tuple[Any, ...], Any]] = {
+            SchemaCaveat: _keyed(caveats, ("name",)),
+            SchemaDefinition: _keyed(definitions, ("resource_type",)),
         }
         for model_cls in (SchemaRelation, SchemaPermission):
             children = model_cls.objects.using(using).filter(definition__in=definitions)
-            self.rows[model_cls] = {
-                (row.definition.resource_type, row.name): row
-                for row in children.select_related("definition")
-            }
+            self.rows[model_cls] = _keyed(
+                children.select_related("definition"), ("definition", "name")
+            )
         self.records = {
             record.external_id: record
             for record in PackageManagedRecord.objects.using(using).filter(package=package)
         }
-        self.declared: set[tuple[Any, tuple[str, ...]]] = set()
+        self.declared: set[tuple[Any, tuple[Any, ...]]] = set()
         self.created: dict[Any, list[tuple[Any, dict[str, Any]]]] = {
             model: [] for model in self.rows
         }
@@ -211,12 +220,20 @@ class _SyncBatch:
         from ...models import PackageManagedRecord
 
         for model_cls, created in self.created.items():
-            if created:
-                model_cls.objects.using(self.using).bulk_create([row for row, _ in created])
-            for row, natural_key in created:
-                if row.pk is None:  # A backend that returns no inserted keys (MySQL).
-                    found = model_cls.objects.using(self.using).filter(**natural_key)
-                    row.pk = found.values_list("pk", flat=True).get()
+            if not created:
+                continue
+            rows = model_cls.objects.using(self.using)
+            rows.bulk_create([row for row, _ in created])
+            if missing := {_natural(key): row for row, key in created if row.pk is None}:
+                # A backend that returns no inserted keys (MySQL): one read per table.
+                fields = list(created[0][1])
+                lookups = {f"{field}__in": {key[field] for _, key in created} for field in fields}
+                found = rows.filter(**lookups)
+                if "definition" in fields:  # Spelled by its resource type, as when read.
+                    found = found.select_related("definition")
+                for key, row in _keyed(found, fields).items():
+                    if key in missing:
+                        missing[key].pk = row.pk
         for model_cls, (fields, rows) in self.updated.items():
             model_cls.objects.using(self.using).bulk_update(rows, fields)
         new = []
@@ -982,18 +999,9 @@ class Command(BaseCommand):
 
     @staticmethod
     def _hash_payload(payload: dict[str, Any]) -> str:
-        from django.db.models import Model
-
         from ...schema.serialization import digest
 
-        # Natural keys include SchemaDefinition instances. Preserve their
-        # stable wire type spelling, rather than a database-specific PK.
-        return digest(
-            {
-                key: str(value) if isinstance(value, Model) else value
-                for key, value in payload.items()
-            }
-        )
+        return digest({key: _spelled(value) for key, value in payload.items()})
 
     # ---------- check ----------
 

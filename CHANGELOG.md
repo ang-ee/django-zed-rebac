@@ -20,14 +20,15 @@ pre-1.0; breaking changes within a minor version are explicitly called out.
 
 - `rebac sync` reads each package's schema rows and managed records once and
   writes its new and changed rows and records in bulk, so the statements it
-  issues no longer grow with the rows it writes. Syncing 1,401 rows from 35
-  packages onto an empty SQLite store fell from 20,578 statements and 1.27 s
-  to 856 statements and 0.15 s on a file database (1.02 s to 0.13 s in
-  memory); re-syncing the unchanged store fell from 3,768 statements and
-  0.68 s to 263 statements and 0.10 s. Ownership records, `no_update`,
-  `--force-overwrite`, `--prune-stale`, drift detection and every message are
-  unchanged; a package's stale relation and permission lines now follow its
-  other drift lines instead of each definition's.
+  issues no longer grow with the rows it writes; a backend that returns no
+  inserted keys (MySQL) reads them back with one query per table. Syncing
+  1,401 rows from 35 packages onto an empty SQLite store fell from 20,578
+  statements and 1.27 s to 856 statements and 0.15 s on a file database
+  (1.02 s to 0.13 s in memory); re-syncing the unchanged store fell from 3,768
+  statements and 0.68 s to 263 statements and 0.10 s. Ownership records,
+  `no_update`, `--force-overwrite`, `--prune-stale`, drift detection and every
+  message are unchanged; a package's stale relation and permission lines now
+  follow its other drift lines instead of each definition's.
 
 ### Documentation
 

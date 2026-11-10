@@ -3499,7 +3499,8 @@ For each AppConfig that declares rebac_schema:
   3. Read the package's schema rows and PackageManagedRecords once. For each
      definition / relation / permission / caveat, decide from them; the
      package's new and changed rows and records are then written in bulk, so
-     the statements a sync issues do not grow with the rows it writes:
+     the statements a sync issues do not grow with the rows it writes (a
+     backend that returns no inserted keys reads them back once per table):
      a. Compute content_hash of the fragment.
      b. Look up PackageManagedRecord by (package, external_id).
      c. If not found → create Schema* row + PackageManagedRecord. (Fresh install.)

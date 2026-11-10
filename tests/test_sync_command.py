@@ -148,11 +148,16 @@ def _source(tmp_path, monkeypatch, name: str, text: str) -> None:
 
 
 @pytest.mark.django_db
-def test_sync_statements_do_not_grow_with_the_rows_it_writes(monkeypatch, tmp_path) -> None:
+@pytest.mark.parametrize("returned", [True, False], ids=["keys-returned", "keys-read-back"])
+def test_sync_statements_do_not_grow_with_the_rows_it_writes(returned, monkeypatch, tmp_path):
+    # Without returned keys (MySQL), sync reads the created rows' keys back once per table.
+    monkeypatch.setattr(connection.features, "can_return_rows_from_bulk_insert", returned)
+
     def statements(size: int) -> int:
-        items = [f"s{size}/n{n}" for n in range(size)]
-        text = "".join(
-            f"definition {i} {{ relation member: {i} permission read = member }}\n" for i in items
+        text = f"caveat c{size}(on bool) {{ on }}\n" + "".join(
+            f"definition s{size}/n{n} {{ relation member: s{size}/n{n} with c{size} "
+            "permission read = member }\n"
+            for n in range(size)
         )
         _source(tmp_path, monkeypatch, f"app{size}", text)
         with CaptureQueriesContext(connection) as queries:
@@ -160,26 +165,10 @@ def test_sync_statements_do_not_grow_with_the_rows_it_writes(monkeypatch, tmp_pa
         return len(queries)
 
     call_command("rebac", "sync", stdout=io.StringIO())  # A published policy beside the sources.
+    ContentType.objects.get_for_model(SchemaCaveat)  # Cached on first use, outside the measure.
     assert statements(1) == statements(20)
-
-
-@pytest.mark.django_db
-def test_sync_reads_inserted_keys_back_where_the_backend_returns_none(
-    monkeypatch, tmp_path
-) -> None:
-    monkeypatch.setattr(connection.features, "can_return_rows_from_bulk_insert", False)
-    _source(
-        tmp_path,
-        monkeypatch,
-        "app",
-        "caveat office(inside bool) { inside }\n"
-        "definition item/a { relation member: item/a with office permission read = member }\n"
-        "definition item/b { relation parent: item/a permission read = parent->read }\n",
-    )
-    call_command("rebac", "sync", stdout=io.StringIO())
-    call_command("rebac", "sync", "--check", stdout=io.StringIO())
-    records = PackageManagedRecord.objects.filter(package="app")
-    assert len(records) == 7
+    records = PackageManagedRecord.objects.filter(package="app20")
+    assert len(records) == 61
     assert all(record.external_id.endswith(f":{record.target}") for record in records)
 
 
