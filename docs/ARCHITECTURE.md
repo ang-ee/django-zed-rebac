@@ -975,7 +975,7 @@ class PackageManagedRecord(models.Model):
         indexes = [models.Index(fields=["target_ct", "target_pk"])]
 ```
 
-The schema rows themselves stay clean. Provenance, hash-checking, and noupdate are one decoupled layer above. This is the lesson from Odoo's two decades of `ir.model.data`: by keying noupdate on the external id (provenance), upgrades can cleanly distinguish "package shipped a new version of a row" from "admin edited the row and we need to preserve their edit".
+The schema rows themselves stay clean. Provenance, hash-checking, and noupdate are one decoupled layer above. This is the lesson from Odoo's two decades of `ir.model.data`: by keying noupdate on the external id (provenance), upgrades can cleanly distinguish "package shipped a new version of a row" from "admin edited the row and we need to preserve their edit". `rebac sync` applies the first and keeps the second ([§ `sync` lifecycle](#sync-lifecycle)).
 
 ### `SchemaOverride` — Tier 2, runtime tweaks
 
@@ -3504,9 +3504,9 @@ The `@rebac_resource` decorator registers the type with the schema validator (th
 Single namespace `rebac` with subcommands. Destructive overwrite is explicit.
 
 ```bash
-python manage.py rebac sync                       # idempotent; respects no_update
+python manage.py rebac sync                       # idempotent; applies changed declarations, keeps admin edits
 python manage.py rebac sync --check               # CI gate; no writes; non-zero on drift
-python manage.py rebac sync --force-overwrite     # destructive; bypasses no_update
+python manage.py rebac sync --force-overwrite     # destructive; overwrites admin edits, deletes stale rows
                                                        # requires --yes for non-interactive
 python manage.py rebac sync --force-overwrite --package=blog
 python manage.py rebac sync --prune-stale --yes    # retire stale package-owned policy
@@ -3559,21 +3559,59 @@ For each AppConfig that declares rebac_schema:
      a. Compute content_hash of the fragment.
      b. Look up PackageManagedRecord by (package, external_id).
      c. If not found → create Schema* row + PackageManagedRecord. (Fresh install.)
-     d. If found and content_hash matches → no-op.
-     e. If found and content_hash differs and no_update=True → skip + warn,
-        naming the cause: `declaration changed` when the row still holds what
-        the last sync wrote, `admin-edited` when it does not.
-     f. If found and content_hash differs and no_update=False → update + bump
-        last_synced_at.
-  4. Detect orphans: PackageManagedRecord with no matching .zed fragment.
-     Reported as warnings; deletion requires --force-overwrite.
-  5. Validate cross-package references.
-  6. Publish a fresh `SchemaGeneration.revision`, in the same transaction as
+     d. If found and the row holds the fragment → no-op.
+     e. If found and the row still holds what the last sync wrote (the
+        record's content_hash) → the declaration changed: update the row,
+        refresh the record and report `~ updated: <id> (declaration changed)`.
+     f. If found, the row differs from what the last sync wrote and
+        no_update=True → admin-edited: keep the row and report
+        `! drift: <id> (admin-edited; --force-overwrite to apply)`.
+        --force-overwrite updates it as in e.
+     g. If found and no_update=False → update + bump last_synced_at, edited
+        or not.
+  4. Prune the relations and permissions of a declared definition that the
+     source no longer declares, deciding each the same way: a managed row
+     that still holds what the last sync wrote is deleted with its record
+     (`- pruned: …`). It is kept and reported as drift instead while a kept
+     permission of its definition (an admin edit sync keeps, or a stale
+     permission kept itself) names it, and, for a relation that stores
+     tuples, while tuples hold it (`N relationship(s) remain; delete them or
+     --prune-stale`): SpiceDB refuses to drop a relation that relationships
+     use. A field-, const- or attribute-backed relation stores none. One
+     query per package counts the tuples of every such stale relation. An
+     admin-edited managed row and an unmanaged row (a consumer's own
+     addition) are kept and reported too. An ordinary sync deletes no tuple;
+     --force-overwrite deletes every stale child, and --prune-stale retires
+     the managed ones with the tuples naming them. A stale relation that only
+     another definition's kept permission names, as an arrow's target
+     (`parent->x`), is pruned: the policy still validates and that arm grants
+     nothing, which takes away what a backed relation granted through it.
+  5. Detect orphans: PackageManagedRecord with no matching .zed fragment (a
+     removed definition or caveat, and the children of a removed definition).
+     Reported as warnings; deletion requires --prune-stale or
+     --force-overwrite.
+  6. Validate cross-package references.
+  7. Publish a fresh `SchemaGeneration.revision`, in the same transaction as
      the schema writes, and reset the in-process backend.
-  7. Validate the composed policy (baseline and overrides) once, under the
+  8. Validate the composed policy (baseline and overrides) once, under the
      policy lock; a refused policy raises `SchemaError` and rolls the sync
      back.
 ```
+
+A deployment that runs plain `rebac sync` therefore receives every changed
+declaration on the rows nobody edited, and its output lists exactly the rows
+that still need a decision. `--check` writes nothing. It reports a pending
+change as drift too, a changed declaration as `(declaration changed; sync
+applies)` and a prunable child as `(no longer declared; sync prunes)`, beside
+the admin edits, and exits non-zero for either.
+
+An ordinary sync never prunes a definition or a caveat the source no longer
+declares, edited or not. Deleting a definition cascades to every relation and
+permission under it, admin-edited and unmanaged ones included, and leaves the
+tuples of its type naming nothing; a caveat still conditions the tuples that
+carry its name and any kept relation that allows it. Neither can be decided
+row by row as a child is, so both wait for `--prune-stale`, which retires them
+with those tuples, or `--force-overwrite`.
 
 The whole sync is one policy write: it locks the `SchemaGeneration` row
 before it reads or writes a schema row and holds the lock until it commits.
@@ -3626,7 +3664,7 @@ reports retirement as drift and writes nothing. Ordinary sync behavior is
 unchanged; `--force-overwrite` retains its separate overwrite and stale-child
 behavior. Use both flags only when replacing edited live policy is also intended.
 
-**There is no implicit "first install" path that bypasses `no_update`.** A clean DB has no `PackageManagedRecord` rows, so case 5c applies naturally and no overwrite is needed. This avoids Odoo's [bug #1023615](https://bugs.launchpad.net/openobject-server/+bug/1023615) class of upgrade footguns.
+**There is no implicit "first install" path that bypasses `no_update`.** A clean DB has no `PackageManagedRecord` rows, so case 3c applies naturally and no overwrite is needed. This avoids Odoo's [bug #1023615](https://bugs.launchpad.net/openobject-server/+bug/1023615) class of upgrade footguns.
 
 ---
 
@@ -3656,7 +3694,7 @@ CI determinism test: run `rebac build-zed` twice in a tmpdir, byte-diff. Failure
 | Swappable `Relationship` model adopted post-install | The shipped relationship tables are concrete models; automatic swappable-model migration wiring is not implemented. |
 | Adding `expires_at` later (back-port to existing relationships) | `expires_at` is nullable; existing rows get `NULL`. No data migration needed. |
 | Multi-tenant prefix added later (`REBAC_TYPE_PREFIX`) | Automatic relationship retyping is not implemented. Plan a data migration before changing stored type identities. |
-| Package upgrade silently overwrites admin schema edits | `no_update=True` on `PackageManagedRecord`. Conflict surfaced as warning + audit event. Force-overwrite is explicit. |
+| Package upgrade silently overwrites admin schema edits | `no_update=True` on `PackageManagedRecord`. Sync applies a changed declaration only to a row that still holds what the last sync wrote; an edited row is kept and reported as drift. Force-overwrite is explicit. |
 | Upgrade of a populated relationship table (`0008`) | `0008` adds `caveat_key` to `Relationship` and `RelationshipRegistry` with an empty default, then fills it for existing rows in primary-key order, 1,000 rows per batch, through the ORM. Its reverse drops the column. |
 | Upgrade from a release that kept derived tables (`0007` → `0009`) | `0007` creates the tables `IndexTerm`, `IndexEdge`, `IndexMember`, `IndexCover`, `IndexWork` and `IndexState` and the columns `SchemaGeneration.index_revision` and `index_program`; `0009` drops them, referencing tables first, and creates the `SchemaGeneration` row with an empty revision when it is absent. Nothing reads those tables, so no data is carried over and no command runs after `migrate`. A fresh install runs both migrations and ends with the same tables. |
 | Database without a published policy | The generation row exists with an empty revision. Every permission statement is fenced out and reads are closed until `rebac sync` publishes a revision. |

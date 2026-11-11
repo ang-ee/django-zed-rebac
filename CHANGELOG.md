@@ -5,6 +5,49 @@ pre-1.0; breaking changes within a minor version are explicitly called out.
 
 ## [Unreleased]
 
+## [0.34.1] — 2026-11-11
+
+### Fixed
+
+- `rebac sync` applies a changed package declaration to a row nobody edited.
+  Every managed row is `no_update`, and sync refused any change to one
+  without `--force-overwrite`, reporting it as `! drift: … (declaration
+  changed; --force-overwrite to apply)`; a deployment that runs `rebac sync`
+  without the flag kept the permission rules it first installed. A caveat,
+  relation or permission row that still holds what the last sync wrote now
+  takes the new declaration and its managed record is refreshed, reported as
+  `~ updated: <id> (declaration changed)`; rows and records an earlier
+  release wrote hash the same and count as unedited. A relation or
+  permission the package no longer declares is deleted with its record, as
+  `- pruned: stale <model> <type>#<name>`, unless a kept permission of its
+  definition names it (`named by kept permission <type>#<name>`) or tuples
+  still hold a relation that stores them (`N relationship(s) remain; delete
+  them or --prune-stale`), as SpiceDB refuses to drop a relation that
+  relationships use; an ordinary sync deletes no tuple. A stale relation that
+  only another definition's kept permission names, as an arrow's target
+  (`parent->x`), is pruned and that arm grants nothing, so access a backed
+  relation gave through it ends. A row edited since the last sync is kept and reported as `! drift: <id> (admin-edited;
+  --force-overwrite to apply)`, or stale, `(admin-edited; --prune-stale or
+  --force-overwrite to delete)`, so the output names exactly what still needs
+  a decision. `--check` writes nothing, reports all of them (a pending change
+  as `(declaration changed; sync applies)` or `(no longer declared; sync
+  prunes)`) and exits non-zero for any. The writes stay on the 0.33.0 bulk
+  path, and one query per package counts the tuples of its stale relations:
+  the statements a sync issues do not grow with the declarations it applies or
+  the children it prunes or keeps. An ordinary sync never prunes a removed
+  definition or caveat (deleting a definition cascades to its admin-edited and
+  unmanaged children); they still need `--prune-stale` or
+  `--force-overwrite`. `--force-overwrite` overwrites admin-edited rows and
+  deletes every stale row, as before, and now lists each row it updates or
+  deletes.
+
+### Documentation
+
+- ZED.md no longer says `// @rebac_schema_revision` decides whether admin
+  edits survive an upgrade, or that `// @rebac_package` names the managed
+  records' package: sync reads neither header, and records the app's
+  `AppConfig.name`.
+
 ## [0.34.0] — 2026-11-11
 
 ### Changed

@@ -136,7 +136,7 @@ That's the end-to-end flow. The same `Post.objects.with_actor(...)` pattern work
 - **MCP integration shipped.** Model MCP tools as schema resources and gate them with `from rebac.mcp import rebac_mcp_tool` — it resolves the actor from the request context (`ctx.request_context.meta["actor_subject"]` by default), checks the permission, then runs the tool body. Sync and async tools both supported. See [proposal 0004](./docs/proposals/0004-mcp-tool-integration.md).
 - **Three-state checks.** Like SpiceDB, `check_access()` returns `HAS_PERMISSION`, `NO_PERMISSION`, or `CONDITIONAL_PERMISSION(missing=[...])` — the latter lists which caveat fields the caller must supply for a definitive answer.
 - **Typed package.** Ships `py.typed` and keeps the public API annotated so downstream projects and IDEs can reason about the manager/queryset surface.
-- **`noupdate=True` upgrade safety.** Admin schema edits are preserved across package upgrades. Destructive overwrite is an explicit `--force-overwrite` flag, never an implicit side effect of install vs upgrade. Engineers Odoo's `-i` footgun out.
+- **`noupdate=True` upgrade safety.** An ordinary `rebac sync` applies a package's changed declarations to the schema rows nobody edited, and keeps admin schema edits across package upgrades, listing each as drift. Overwriting an edit is an explicit `--force-overwrite` flag, never an implicit side effect of install vs upgrade. Engineers Odoo's `-i` footgun out.
 - **Deterministic build.** `python manage.py rebac sync --check` is a CI gate that returns non-zero on schema drift, mirroring `migrate --check`.
 
 ## Compatibility
