@@ -3723,7 +3723,7 @@ blocker like any other.
 |---|---|---|---|
 | **1. Fast** — `make check` | Every change, every push and pull request. The only gate for merging and for publishing a tag. | Ruff lint and format, strict mypy, Pyright, then the SQLite suite without `slow`, in parallel with work stealing, stopping at the first failure. | 1 minute on a developer machine, 5 minutes in CI. |
 | **2. PostgreSQL delta** — `make test-pg` | Every push and pull request, as a job beside tier 1. Locally when a change touches SQL generation, transactions, locking or migrations. | Only the tests marked `postgresql` or `pg_delta`, on PostgreSQL 16. | 3 minutes. |
-| **3. Release** — `make test-release` | Nightly on `main` and on demand before a release. Never inside a fix loop. | `slow` on SQLite; the whole suite including `slow` on PostgreSQL; the full `reference_exhaustive` sweep; the `schema_vendors` PostgreSQL/MySQL contracts; a randomized parallel run with seed 137; the SpiceDB conformance suite once it lands. There is no scale suite at the moment. | No measured budget at the moment; independent parallel jobs in CI, where the sweep is the longest. |
+| **3. Release** — `make test-release` | Nightly on `main` and on demand before a release. Never inside a fix loop. | `slow` on SQLite; the whole suite including `slow` on PostgreSQL; the full `reference_exhaustive` sweep; the `schema_vendors` PostgreSQL/MySQL contracts; a randomized parallel run with seed 137; the `scale` matrix on PostgreSQL, alone (`make test-pg-scale`); the SpiceDB conformance suite once it lands. | No measured budget at the moment; independent parallel jobs in CI, where the sweep is the longest. |
 
 Rules that keep the tiers honest:
 
@@ -3748,9 +3748,10 @@ Rules that keep the tiers honest:
   for something that did not run.
 - **Parallel scheduling is by test, not by file** (`--dist worksteal`). No
   test may rely on sharing a worker with its module.
-- **There is no scale suite at the moment.** No test holds time, statement or
-  query-plan budgets for large tables. A suite that does runs alone, never
-  beside parallel workers, because they distort such budgets.
+- **The scale suite runs alone.** `make test-pg-scale` (marker `scale`) holds
+  row-equality, plan-shape and planning-memory checks on tables of hundreds of
+  thousands of rows. It runs alone, never beside parallel workers, because they
+  distort such budgets; the whole-suite selection excludes it.
 - **Publishing does not wait for tier 3.** A tag publishes once tier 1 is
   green on it. Tier 3 is consulted before tagging; its nightly result on
   `main` is the release evidence.
@@ -3783,8 +3784,8 @@ cases also carry `reference_shard`. `make test-reference` overrides the
 marker filter and runs every reference shard, distributed by test rather
 than by file. `make test-postgres` runs the whole suite, `slow` included, on
 PostgreSQL. `make test-schema-vendors` opts into disposable PostgreSQL/MySQL
-contracts; MySQL 8.4 is covered only there. All of these are tier 3. There is
-no scale suite at the moment. Drivers, environment and release gates are in
+contracts; MySQL 8.4 is covered only there. All of these are tier 3, and
+`make test-pg-scale` runs the `scale` matrix alone. Drivers, environment and release gates are in
 [CONTRIBUTING.md](../CONTRIBUTING.md).
 
 | Suite | Modules | Required cases and assertions |

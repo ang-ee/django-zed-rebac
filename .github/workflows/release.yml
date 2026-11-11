@@ -70,6 +70,41 @@ jobs:
       - name: Whole suite including slow
         run: make test-postgres
 
+  # Scale measurements run alone: parallel workers distort their timeouts
+  # and planner budgets (docs/ARCHITECTURE.md § Test tiers).
+  scale:
+    name: scale (PostgreSQL 16)
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    services:
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_USER: postgres
+          POSTGRES_PASSWORD: rebac-test
+          POSTGRES_DB: rebac_test
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U postgres -d rebac_test"
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+    env:
+      REBAC_TEST_POSTGRES_URL: postgresql://postgres:rebac-test@127.0.0.1:5432/rebac_test
+    steps:
+      - uses: actions/checkout@v5
+      # uv's managed Python bundles a current SQLite. The runner's system
+      # SQLite has a fixed parser stack that deep read plans overflow.
+      - name: Install uv
+        uses: astral-sh/setup-uv@v7
+      - name: Install dependencies and PostgreSQL driver
+        run: |
+          uv sync --locked --python 3.14 --managed-python --extra caveats --extra drf --extra strawberry --group postgres
+          uv run --no-sync python -c 'import sqlite3; print("SQLite", sqlite3.sqlite_version)'
+      - name: Scale matrix, alone
+        run: make test-pg-scale
+
   # The sweep's target is 60 minutes on 16 workers, about four hours on one
   # four-core runner, so it is split by expression shape: the five four-leaf
   # shapes carry nearly all of the cost and take one job each; everything else
