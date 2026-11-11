@@ -3572,10 +3572,17 @@ For each AppConfig that declares rebac_schema:
   4. Prune the relations and permissions of a declared definition that the
      source no longer declares, deciding each the same way: a managed row
      that still holds what the last sync wrote is deleted with its record
-     (`- pruned: …`); an admin-edited managed row and an unmanaged row (a
-     consumer's own addition) are kept and reported as drift. --force-overwrite
-     deletes both, --prune-stale the managed one. Pruning leaves the tuples
-     naming a pruned relation in place; --prune-stale retires them with it.
+     (`- pruned: …`). It is kept and reported as drift instead while a kept
+     permission of its definition (an admin edit sync keeps, or a stale
+     permission kept itself) names it, and, for a relation that stores
+     tuples, while tuples hold it (`N relationship(s) remain; delete them or
+     --prune-stale`): SpiceDB refuses to drop a relation that relationships
+     use. A field-, const- or attribute-backed relation stores none. One
+     query per package counts the tuples of every such stale relation. An
+     admin-edited managed row and an unmanaged row (a consumer's own
+     addition) are kept and reported too. An ordinary sync deletes no tuple;
+     --force-overwrite deletes every stale child, and --prune-stale retires
+     the managed ones with the tuples naming them.
   5. Detect orphans: PackageManagedRecord with no matching .zed fragment (a
      removed definition or caveat, and the children of a removed definition).
      Reported as warnings; deletion requires --prune-stale or
@@ -3594,6 +3601,14 @@ that still need a decision. `--check` writes nothing. It reports a pending
 change as drift too, a changed declaration as `(declaration changed; sync
 applies)` and a prunable child as `(no longer declared; sync prunes)`, beside
 the admin edits, and exits non-zero for either.
+
+An ordinary sync never prunes a definition or a caveat the source no longer
+declares, edited or not. Deleting a definition cascades to every relation and
+permission under it, admin-edited and unmanaged ones included, and leaves the
+tuples of its type naming nothing; a caveat still conditions the tuples that
+carry its name and any kept relation that allows it. Neither can be decided
+row by row as a child is, so both wait for `--prune-stale`, which retires them
+with those tuples, or `--force-overwrite`.
 
 The whole sync is one policy write: it locks the `SchemaGeneration` row
 before it reads or writes a schema row and holds the lock until it commits.

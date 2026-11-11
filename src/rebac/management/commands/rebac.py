@@ -179,6 +179,7 @@ class _SyncBatch:
         self.updated: dict[Any, tuple[list[str], list[Any]]] = {}
         self.claims: list[tuple[Any, str, str]] = []
         self.refreshed: list[Any] = []
+        self.kept: list[Any] = []  # Declared rows sync keeps: admin edits it does not overwrite.
 
     def row(self, model_cls: Any, natural_key: dict[str, Any]) -> Any:
         """The row the source declares under ``natural_key``, read or pending; ``None`` if absent."""
@@ -623,16 +624,9 @@ class Command(BaseCommand):
                             _external_id("permission", d.resource_type, p.name),
                         )
                 batch.flush()
-
-                for model_cls in (SchemaRelation, SchemaPermission):
-                    any_drift |= self._prune_schema_children(
-                        model_cls,
-                        batch.stale(model_cls),
-                        check_only=check_only,
-                        force=force,
-                        using=using,
-                        retire=prune_stale,
-                    )
+                any_drift |= self._prune_schema_children(
+                    batch, check_only=check_only, force=force, using=using, retire=prune_stale
+                )
 
                 if not prune_stale:
                     drift = self._prune_package_records(
@@ -743,6 +737,8 @@ class Command(BaseCommand):
         edited = actual_hash != record.content_hash
         kept = edited and record.no_update
         cause = "admin-edited" if edited else "declaration changed"
+        if kept and not force:
+            batch.kept.append(existing)
         if check_only or (kept and not force):
             hint = "--force-overwrite to apply" if kept else "sync applies"
             self.stdout.write(self.style.WARNING(f"  ! drift: {external_id} ({cause}; {hint})"))
@@ -754,82 +750,179 @@ class Command(BaseCommand):
 
     def _prune_schema_children(
         self,
-        model_cls: Any,
-        stale: list[Any],
+        batch: _SyncBatch,
         *,
         check_only: bool,
         force: bool,
         using: str = "default",
         retire: bool = False,
     ) -> bool:
-        """Remove the relation/permission rows a package schema no longer declares.
+        """Remove the relation and permission rows a package schema no longer declares.
 
         A managed row that still holds what the last sync wrote is pruned with
-        its record: the package's declaration removed it. A ``no_update`` row
-        edited since, and an unmanaged row (a consumer's own addition), are
-        kept and reported unless ``force`` (``--force-overwrite``). ``retire``
+        its record: the package's declaration removed it. ``force``
+        (``--force-overwrite``) deletes every stale row; otherwise the rows
+        ``_kept_children`` names are kept and reported. ``retire``
         (``--prune-stale``) leaves managed rows to the record pass, which also
         deletes the tuples naming a retired relation; forced, they go here.
         True if a stale row is kept or, under ``check_only``, pending.
         """
-        if not stale:
-            return False
-
         from django.contrib.contenttypes.models import ContentType
 
-        from ...models import PackageManagedRecord
+        from ...models import PackageManagedRecord, SchemaPermission, SchemaRelation
 
-        ct = ContentType.objects.db_manager(using).get_for_model(model_cls)
-        pruned = stale
+        stale = {
+            model_cls: batch.stale(model_cls) for model_cls in (SchemaRelation, SchemaPermission)
+        }
+        rows = [row for model_rows in stale.values() for row in model_rows]
+        if not rows:
+            return False
+        cts = {
+            model_cls: ContentType.objects.db_manager(using).get_for_model(model_cls)
+            for model_cls in stale
+        }
+        kept: dict[Any, str] = {}
         if check_only or not force:
-            by_pk = {obj.pk: obj for obj in stale}
-            kept: dict[Any, bool] = {}  # A managed row's pk: whether a no_update record keeps it.
-            for record in PackageManagedRecord.objects.using(using).filter(
-                target_ct=ct, target_pk__in=list(by_pk)
-            ):
-                edited = record.content_hash != self._row_hash(by_pk[record.target_pk])
-                kept[record.target_pk] = kept.get(record.target_pk, False) or (
-                    edited and record.no_update
-                )
-            pruned = []
-            for obj in stale:
-                if obj.pk not in kept:
-                    hint = "unmanaged; --force-overwrite to delete"
-                elif retire:
-                    hint = "--prune-stale retires" if check_only else "retired by --prune-stale"
-                elif kept[obj.pk]:
-                    hint = "admin-edited; --prune-stale or --force-overwrite to delete"
-                elif check_only:
-                    hint = "no longer declared; sync prunes"
-                else:
-                    pruned.append(obj)
-                    continue
+            kept = self._kept_children(batch, stale, cts, check_only=check_only, retire=retire)
+        for row in rows:
+            hint = kept.get(row, "no longer declared; sync prunes" if check_only else "")
+            if hint:
                 self.stdout.write(
-                    self.style.WARNING(f"  ! drift: stale {model_cls.__name__} {obj} ({hint})")
+                    self.style.WARNING(f"  ! drift: stale {type(row).__name__} {row} ({hint})")
                 )
-            if not pruned:
-                return True
+        if check_only:
+            return True
 
+        pruned = {
+            model_cls: [row for row in model_rows if row not in kept]
+            for model_cls, model_rows in stale.items()
+        }
+        if retire and pruned[SchemaRelation]:
+            deleted = self._delete_stale_relationships(
+                {
+                    _external_id("relation", row.definition.resource_type, row.name)
+                    for row in pruned[SchemaRelation]
+                },
+                using=using,
+            )
+            self._report_retired_tuples(deleted)
+        for model_cls, model_rows in pruned.items():
+            if not model_rows:
+                continue
+            target_pks = [row.pk for row in model_rows]
+            PackageManagedRecord.objects.using(using).filter(
+                target_ct=cts[model_cls], target_pk__in=target_pks
+            ).delete()
+            model_cls.objects.using(using).filter(pk__in=target_pks).delete()
+            for row in model_rows:
+                self.stdout.write(f"  - pruned: stale {model_cls.__name__} {row}")
+        return bool(kept)
+
+    def _kept_children(
+        self,
+        batch: _SyncBatch,
+        stale: dict[Any, list[Any]],
+        cts: dict[Any, Any],
+        *,
+        check_only: bool,
+        retire: bool,
+    ) -> dict[Any, str]:
+        """The stale rows an unforced sync keeps, each with the reason it reports.
+
+        A ``no_update`` row edited since the last sync, and an unmanaged row (a
+        consumer's own addition), are kept. So is a row a kept permission of
+        its definition names, which would otherwise name nothing, and, for a
+        relation that stores tuples, one that tuples still hold: SpiceDB
+        refuses to drop such a relation. A field-, const- or attribute-backed
+        relation stores none.
+        """
+        from ...models import PackageManagedRecord, SchemaPermission, SchemaRelation
+
+        rows = {
+            (cts[type(row)].pk, row.pk): row for model_rows in stale.values() for row in model_rows
+        }
+        targets = [
+            Q(target_ct=cts[model_cls], target_pk__in=[row.pk for row in model_rows])
+            for model_cls, model_rows in stale.items()
+            if model_rows
+        ]
+        edited: dict[Any, bool] = {}  # A managed row: whether a no_update record keeps it.
+        records = PackageManagedRecord.objects.using(batch.using).filter(
+            Q(*targets, _connector=Q.OR)
+        )
+        for ct, pk, content_hash, no_update in records.values_list(
+            "target_ct", "target_pk", "content_hash", "no_update"
+        ):
+            row = rows[(ct, pk)]
+            changed = content_hash != self._row_hash(row)
+            edited[row] = edited.get(row, False) or (changed and no_update)
+        kept: dict[Any, str] = {}
+        for row in rows.values():
+            if row not in edited:
+                kept[row] = "unmanaged; --force-overwrite to delete"
+            elif retire:
+                kept[row] = "--prune-stale retires" if check_only else "retired by --prune-stale"
+            elif edited[row]:
+                kept[row] = "admin-edited; --prune-stale or --force-overwrite to delete"
         if retire:
-            from ...models import SchemaRelation
+            return kept
 
-            if model_cls is SchemaRelation:
-                deleted = self._delete_stale_relationships(
-                    {
-                        _external_id("relation", obj.definition.resource_type, obj.name)
-                        for obj in pruned
-                    },
-                    using=using,
+        prunable = {
+            (row.definition.resource_type, row.name): row
+            for row in rows.values()
+            if row not in kept
+        }
+        holding = [row for row in batch.kept if isinstance(row, SchemaPermission)]
+        holding += [row for row in stale[SchemaPermission] if row in kept]
+        while holding:  # A permission kept for what another names may name more.
+            names, holding = self._named_by(holding), []
+            for key, permission in names.items():
+                row = prunable.pop(key, None)
+                if row is None:
+                    continue
+                kept[row] = (
+                    f"named by kept permission {permission}; "
+                    "--prune-stale or --force-overwrite to delete"
                 )
-                self._report_retired_tuples(deleted)
-        target_pks = [obj.pk for obj in pruned]
-        PackageManagedRecord.objects.using(using).filter(
-            target_ct=ct, target_pk__in=target_pks
-        ).delete()
-        model_cls.objects.using(using).filter(pk__in=target_pks).delete()
-        for obj in pruned:
-            self.stdout.write(f"  - pruned: stale {model_cls.__name__} {obj}")
-        return len(pruned) < len(stale)
+                if isinstance(row, SchemaPermission):
+                    holding.append(row)
+
+        stored = {
+            key: row
+            for key, row in prunable.items()
+            if isinstance(row, SchemaRelation) and row.backing is None
+        }
+        for key, count in self._relationship_counts(stored).items():
+            kept[stored[key]] = f"{count} relationship(s) remain; delete them or --prune-stale"
+        return kept
+
+    @staticmethod
+    def _named_by(permissions: list[Any]) -> dict[tuple[str, str], str]:
+        """What ``permissions`` name on their definitions, by ``(type, name)``: the permission.
+
+        Against definitions holding only these permissions, every other
+        relation or permission they reference is a reference issue.
+        """
+        from ...schema.ast import Definition, Permission
+        from ...schema.parser import parse_permission_expression, reference_issues
+
+        by_type: dict[str, list[Permission]] = {}
+        for row in sorted(permissions, key=lambda row: (row.definition.resource_type, row.name)):
+            by_type.setdefault(row.definition.resource_type, []).append(
+                Permission(row.name, parse_permission_expression(row.expression), row.expression)
+            )
+        schema = Schema(
+            definitions=[
+                Definition(resource_type, (), tuple(rules))
+                for resource_type, rules in by_type.items()
+            ]
+        )
+        names: dict[tuple[str, str], str] = {}
+        for issue in reference_issues(schema):
+            names.setdefault(
+                (issue.resource_type, issue.name), f"{issue.resource_type}#{issue.permission}"
+            )
+        return names
 
     def _prune_package_records(
         self,
@@ -972,6 +1065,32 @@ class Command(BaseCommand):
         for caveat in sorted(caveats):
             queries[f"caveat {caveat}"] = rows.filter(caveat_name=caveat)
         return queries
+
+    @staticmethod
+    def _relationship_counts(relations: Iterable[tuple[str, str]]) -> dict[tuple[str, str], int]:
+        """How many stored tuples hold each ``(resource_type, relation)``, in one statement.
+
+        Read where tuples are written, ``router.db_for_write`` of the
+        relationship model; a database the router does not migrate the model
+        to stores none. Only relations some tuple holds are returned.
+        """
+        from django.db.models import Count
+
+        from ...models import active_relationship_model
+
+        pairs = sorted(relations)
+        model: Any = active_relationship_model()
+        alias = router.db_for_write(model)
+        if not pairs or not router.allow_migrate_model(alias, model):
+            return {}
+        held = (
+            model.objects.using(alias)
+            .filter(Q(*(Q(resource_type=t, relation=r) for t, r in pairs), _connector=Q.OR))
+            .order_by()
+            .values("resource_type", "relation")
+            .annotate(count=Count("pk"))
+        )
+        return {(row["resource_type"], row["relation"]): row["count"] for row in held}
 
     @classmethod
     def _count_stale_relationships(cls, external_ids: set[str], *, using: str) -> dict[str, int]:

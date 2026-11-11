@@ -203,6 +203,22 @@ def _records() -> dict[str, tuple[str, Any]]:
     }
 
 
+def _store_tuples(resource_type: str, relation: str, count: int = 1) -> Any:
+    """Store ``count`` tuples of ``relation`` on ``resource_type:1``; the tuples of that relation."""
+    from rebac.models import active_relationship_model
+
+    rows = active_relationship_model().objects
+    for subject_id in range(count):
+        rows.create(
+            resource_type=resource_type,
+            resource_id="1",
+            relation=relation,
+            subject_type="auth/user",
+            subject_id=str(subject_id),
+        )
+    return rows.filter(resource_type=resource_type, relation=relation)
+
+
 @pytest.mark.django_db
 @pytest.mark.parametrize("kind", sorted(_FRAGMENTS))
 def test_sync_applies_a_changed_declaration_to_an_unedited_row(kind, monkeypatch, tmp_path) -> None:
@@ -287,10 +303,10 @@ def test_sync_writes_changed_edited_unchanged_new_and_stale_rows_of_one_package(
             f" permission edited = {edited}\n permission same = owner\n",
         )
 
-    _source(
-        tmp_path, monkeypatch, "docs", declared("owner", "owner", " permission dropped = owner\n")
-    )
+    stale = " relation held: auth/user\n permission dropped = owner\n"
+    _source(tmp_path, monkeypatch, "docs", declared("owner", "owner", stale))
     _sync()
+    _store_tuples("doc/item", "held")
     permissions = _doc_children(SchemaPermission)
     permissions.filter(name="edited").update(expression="viewer")  # The admin's edit.
     synced = _records()
@@ -309,11 +325,20 @@ def test_sync_writes_changed_edited_unchanged_new_and_stale_rows_of_one_package(
     assert "~ updated: permission:doc/item#changed (declaration changed)" in out
     assert "! drift: permission:doc/item#edited (admin-edited; --force-overwrite to apply)" in out
     assert "- pruned: stale SchemaPermission doc/item#dropped" in out
+    assert (
+        "! drift: stale SchemaRelation doc/item#held "
+        "(1 relationship(s) remain; delete them or --prune-stale)"
+    ) in out
+    assert _doc_children(SchemaRelation).filter(name="held").exists()
     records = _records()
     assert records["permission:doc/item#changed"][0] == Command._row_hash(
         permissions.get(name="changed")
     )
-    for kept in ("permission:doc/item#edited", "permission:doc/item#same"):
+    for kept in (
+        "permission:doc/item#edited",
+        "permission:doc/item#same",
+        "relation:doc/item#held",
+    ):
         assert records[kept] == synced[kept]
     assert records.keys() - synced.keys() == {
         "relation:doc/item#reviewer",
@@ -360,6 +385,166 @@ def test_sync_prunes_an_unedited_stale_child_and_keeps_an_edited_one(monkeypatch
 
 
 @pytest.mark.django_db
+@pytest.mark.pg_delta
+@pytest.mark.parametrize("storage", ["denormalized", "registry"])
+def test_sync_keeps_a_stale_stored_relation_while_tuples_hold_it(
+    storage, settings, monkeypatch, tmp_path
+) -> None:
+    settings.REBAC_LOCAL_BACKEND_STORAGE = storage
+    _source(tmp_path, monkeypatch, "docs", _docs(extra=" relation legacy: auth/user\n"))
+    _sync()
+    held = _store_tuples("doc/item", "legacy", count=2)
+    _store_tuples("doc/item", "owner")  # Another relation's tuple holds nothing stale.
+    _source(tmp_path, monkeypatch, "docs", _docs())
+    kept = (
+        "! drift: stale SchemaRelation doc/item#legacy "
+        "(2 relationship(s) remain; delete them or --prune-stale)"
+    )
+
+    check = io.StringIO()
+    with pytest.raises(CommandError, match="Schema drift detected"):
+        call_command("rebac", "sync", "--check", stdout=check)
+    assert kept in check.getvalue()
+    assert kept in _sync()
+    assert _doc_children(SchemaRelation).filter(name="legacy").exists()
+    assert held.count() == 2  # Sync retires no tuple.
+
+    held.delete()
+    assert "- pruned: stale SchemaRelation doc/item#legacy" in _sync()
+    assert not _doc_children(SchemaRelation).filter(name="legacy").exists()
+    assert "relation:doc/item#legacy" not in _records()
+
+
+@pytest.mark.django_db
+@pytest.mark.parametrize("backing", ["rebac:field=folder", "rebac:const=admins"])
+def test_sync_prunes_a_stale_backed_relation_which_stores_no_tuples(
+    backing, monkeypatch, tmp_path
+) -> None:
+    folder = "definition doc/folder { relation owner: auth/user }\n"
+    _source(
+        tmp_path,
+        monkeypatch,
+        "docs",
+        folder + _docs(extra=f" relation folder: doc/folder // {backing}\n"),
+    )
+    _sync()
+    _source(tmp_path, monkeypatch, "docs", folder + _docs())
+
+    assert "- pruned: stale SchemaRelation doc/item#folder" in _sync()
+    assert not _doc_children(SchemaRelation).filter(name="folder").exists()
+
+
+@pytest.mark.django_db
+def test_sync_keeps_a_stale_child_a_kept_permission_names(monkeypatch, tmp_path) -> None:
+    stale = (
+        " relation legacy: auth/user\n relation other: auth/user\n relation unused: auth/user\n"
+        " permission old = other\n"
+    )
+    _source(tmp_path, monkeypatch, "docs", _docs(extra=stale))
+    _sync()
+    # The admin's edit names a relation and a permission the package then drops.
+    _doc_children(SchemaPermission).filter(name="read").update(expression="owner + legacy + old")
+    _source(tmp_path, monkeypatch, "docs", _docs())
+    hint = "--prune-stale or --force-overwrite to delete"
+
+    out = _sync()
+
+    assert "! drift: permission:doc/item#read (admin-edited; --force-overwrite to apply)" in out
+    for row, permission in (
+        ("SchemaRelation doc/item#legacy", "doc/item#read"),
+        ("SchemaPermission doc/item#old", "doc/item#read"),
+        ("SchemaRelation doc/item#other", "doc/item#old"),  # Named by a permission kept for it.
+    ):
+        assert f"! drift: stale {row} (named by kept permission {permission}; {hint})" in out
+    assert "- pruned: stale SchemaRelation doc/item#unused" in out
+    assert set(_doc_children(SchemaRelation).values_list("name", flat=True)) == {
+        "owner",
+        "viewer",
+        "legacy",
+        "other",
+    }
+    assert _doc_children(SchemaPermission).filter(name="old").exists()
+
+
+# A source of every stored shape, and the content hashes a 0.34.0 sync recorded for it.
+# Frozen: a change to how sync hashes a row would turn each deployed row into an admin edit.
+_EARLIER = (
+    "use expiration\n"
+    "caveat office_hours(hour int, zones list<string>) {{ hour < {hour} }}\n"
+    "definition auth/user {{}}\n"
+    "definition auth/group {{ relation member: auth/user | auth/group#member{group} }}\n"
+    "definition doc/folder {{ relation owner: auth/user{group} }}\n"
+    "definition doc/item {{\n"
+    " relation owner: auth/user | auth/group#member{caveat}\n"
+    " relation viewer: auth/user | auth/user:*{expiring}\n"
+    " relation folder: doc/folder // rebac:field={folder}\n"
+    " relation admin: auth/group // rebac:const={admin}\n"
+    " permission read = owner + viewer{arrow}\n"
+    " permission write = owner{exclusion}\n"
+    "}}\n"
+)
+_EARLIER_034 = {
+    "hour": 18,
+    "group": "",
+    "caveat": " with office_hours",
+    "expiring": " | auth/user with expiration",
+    "folder": "folder",
+    "admin": "admins",
+    "arrow": " + folder->owner",
+    "exclusion": " - viewer",
+}
+_EARLIER_HASHES = {
+    "caveat:office_hours": "14555e20ea4f7f6d524e5b80a7757198a52e6ce6a5eb2057c4d37355f01b3de1",
+    "definition:auth/group": "1254b13139555473bd2ca42a12bf4fa901ca491a08ddc989b36e5d3167b969c0",
+    "definition:auth/user": "faee4b066aa2cec2b8fdb89985a8b863f7be7a5448211ccdebc8f06cb4035847",
+    "definition:doc/folder": "0028a2139db6001482ea54396d5291066f7b1ca55399ab1e315f64d0bb5b3d07",
+    "definition:doc/item": "bc81522d589b2b0375fdd47b30fdc1080200bba38f98222da4292338fdb7f162",
+    "permission:doc/item#read": "e62d96f6752d3bbc838163b3232fd1c600ab06970c76bb92ee08a5ca0a3a3e37",
+    "permission:doc/item#write": "d2b097c14f93b125172a3629b06f1505457b3037418a0bbd9dde3f9d96ddfd15",
+    "relation:auth/group#member": "2a0b747480388ac833d5004f2aaea2c58704b371cf3cd20a9402fae627a768a8",
+    "relation:doc/folder#owner": "a03c87cb013ee8579046011ef5029e301ba8e8e1b384a9f900d7deadc866f804",
+    "relation:doc/item#admin": "cae044514d9b0677ef6b0d7a4c98e144a4d428d9f71e2bcc9fcd11c68a058bc3",
+    "relation:doc/item#folder": "c4b084c06d25ce06cfa20db14ed8ea33ff83fef788983bd2ebbd22ca770f4ce6",
+    "relation:doc/item#owner": "7ae818ffed8277b0da70e5fe8666765f1fde1b0d5f64f3ad0d420e05b49ab6f8",
+    "relation:doc/item#viewer": "9c19b1b5f0ba2cfd8fe87841ffb78353dd968f816d94db2fbda57dd908b0591e",
+}
+
+
+@pytest.mark.django_db
+def test_sync_takes_rows_an_earlier_release_recorded_for_unedited(monkeypatch, tmp_path) -> None:
+    from rebac.management.commands.rebac import Command
+
+    _source(tmp_path, monkeypatch, "docs", _EARLIER.format(**_EARLIER_034))
+    _sync()
+    records = PackageManagedRecord.objects.filter(package="docs")
+    # Sync records what 0.34.0 recorded, and each row it wrote hashes the same.
+    assert {record.external_id: record.content_hash for record in records} == _EARLIER_HASHES
+    assert {record.external_id: Command._row_hash(record.target) for record in records} == (
+        _EARLIER_HASHES
+    )
+    # So every declaration a package then changes is applied, none taken for an admin edit.
+    changed = {
+        "hour": 17,
+        "group": " | auth/group#member",
+        "caveat": "",
+        "expiring": "",
+        "folder": "parent",
+        "admin": "staff",
+        "arrow": "",
+        "exclusion": "",
+    }
+    _source(tmp_path, monkeypatch, "docs", _EARLIER.format(**changed))
+
+    out = _sync()
+
+    assert "drift" not in out
+    updated = {line.split()[2] for line in out.splitlines() if "~ updated: " in line}
+    assert updated == {eid for eid in _EARLIER_HASHES if not eid.startswith("definition:")}
+    assert "(declaration changed)" in out and "(admin-edited)" not in out
+    assert "OK — no drift." in _sync("--check")
+
+
+@pytest.mark.django_db
 @pytest.mark.parametrize("returned", [True, False], ids=["keys-returned", "keys-read-back"])
 def test_sync_statements_do_not_grow_with_the_rows_it_writes(returned, monkeypatch, tmp_path):
     # Without returned keys (MySQL), sync reads the created rows' keys back once per table.
@@ -369,25 +554,31 @@ def test_sync_statements_do_not_grow_with_the_rows_it_writes(returned, monkeypat
         def text(read: str, stale: str) -> str:
             return f"caveat c{size}(on bool) {{ on }}\n" + "".join(
                 f"definition s{size}/n{n} {{ relation member: s{size}/n{n} with c{size} "
-                f"relation viewer: s{size}/n{n} permission read = {read} {stale}}}\n"
+                f"relation viewer: s{size}/n{n} {stale.format(f's{size}/n{n}')}"
+                f"permission read = {read} }}\n"
                 for n in range(size)
             )
 
-        _source(tmp_path, monkeypatch, f"app{size}", text("member", "permission old = member "))
+        stale = "relation held: {0} relation spare: {0} permission old = member "
+        _source(tmp_path, monkeypatch, f"app{size}", text("member", stale))
         with CaptureQueriesContext(connection) as written:
             call_command("rebac", "sync", stdout=io.StringIO())
-        # Every definition's permission changes and its stale one is pruned.
+        for n in range(size):
+            _store_tuples(f"s{size}/n{n}", "held")
+        # Every definition's permission changes, its stale permission and its
+        # tuple-free stale relation are pruned, and its held relation is kept.
         _source(tmp_path, monkeypatch, f"app{size}", text("viewer", ""))
         with CaptureQueriesContext(connection) as applied:
             out = _sync()
-        assert out.count("~ updated: ") == out.count("- pruned: ") == size
+        assert out.count("~ updated: ") == out.count(" relationship(s) remain") == size
+        assert out.count("- pruned: ") == 2 * size
         return len(written), len(applied)
 
     call_command("rebac", "sync", stdout=io.StringIO())  # A published policy beside the sources.
     ContentType.objects.get_for_model(SchemaCaveat)  # Cached on first use, outside the measure.
     assert statements(1) == statements(20)
     records = PackageManagedRecord.objects.filter(package="app20")
-    assert len(records) == 81
+    assert len(records) == 101
     assert all(record.external_id.endswith(f":{record.target}") for record in records)
 
 

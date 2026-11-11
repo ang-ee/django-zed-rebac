@@ -14,18 +14,25 @@ pre-1.0; breaking changes within a minor version are explicitly called out.
   without the flag kept the permission rules it first installed. A caveat,
   relation or permission row that still holds what the last sync wrote now
   takes the new declaration and its managed record is refreshed, reported as
-  `~ updated: <id> (declaration changed)`. A relation or permission the
-  package no longer declares is deleted with its record, as `- pruned: stale
-  <model> <type>#<name>`. A row edited since the last sync is kept and
-  reported as `! drift: <id> (admin-edited; --force-overwrite to apply)`, or
-  stale, `(admin-edited; --prune-stale or --force-overwrite to delete)`, so the
-  output names exactly what still needs a decision. `--check` writes nothing,
-  reports both (a pending change as `(declaration changed; sync applies)` or
-  `(no longer declared; sync prunes)`) and exits non-zero for either. The
-  writes stay on the 0.33.0 bulk path: the statements a sync issues do not
-  grow with the declarations it applies or the children it prunes. Pruning
-  leaves the tuples naming a pruned relation in place (`--prune-stale` retires
-  them), and removed definitions and caveats still need `--prune-stale` or
+  `~ updated: <id> (declaration changed)`; rows and records an earlier
+  release wrote hash the same and count as unedited. A relation or
+  permission the package no longer declares is deleted with its record, as
+  `- pruned: stale <model> <type>#<name>`, unless a kept permission of its
+  definition names it (`named by kept permission <type>#<name>`) or tuples
+  still hold a relation that stores them (`N relationship(s) remain; delete
+  them or --prune-stale`), as SpiceDB refuses to drop a relation that
+  relationships use; an ordinary sync deletes no tuple. A row edited since the
+  last sync is kept and reported as `! drift: <id> (admin-edited;
+  --force-overwrite to apply)`, or stale, `(admin-edited; --prune-stale or
+  --force-overwrite to delete)`, so the output names exactly what still needs
+  a decision. `--check` writes nothing, reports all of them (a pending change
+  as `(declaration changed; sync applies)` or `(no longer declared; sync
+  prunes)`) and exits non-zero for any. The writes stay on the 0.33.0 bulk
+  path, and one query per package counts the tuples of its stale relations:
+  the statements a sync issues do not grow with the declarations it applies or
+  the children it prunes or keeps. An ordinary sync never prunes a removed
+  definition or caveat (deleting a definition cascades to its admin-edited and
+  unmanaged children); they still need `--prune-stale` or
   `--force-overwrite`. `--force-overwrite` overwrites admin-edited rows and
   deletes every stale row, as before, and now lists each row it updates or
   deletes.
