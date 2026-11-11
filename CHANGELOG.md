@@ -5,6 +5,15 @@ pre-1.0; breaking changes within a minor version are explicitly called out.
 
 ## [Unreleased]
 
+### Changed
+
+- A scoped read bounded to the identities it names (`filter(pk=...)`,
+  `filter(pk__in=[...])` with at most 256 ids, and `held()` chunks) is kept
+  like the general scope. Its identities are bound parameters, in slots rounded
+  up to the next power of two, so repeated reads by id no longer recompile the
+  permission's predicate. On a composed host, a member's inbox document spent
+  about 70% of its time recompiling bounded reads.
+
 ## [0.33.1] — 2026-11-11
 
 ### Changed
