@@ -5,6 +5,8 @@ pre-1.0; breaking changes within a minor version are explicitly called out.
 
 ## [Unreleased]
 
+## [0.34.0] — 2026-11-11
+
 ### Changed
 
 - A scoped read bounded to the identities it names (`filter(pk=...)`,
