@@ -93,6 +93,13 @@ post-write subset checks and exact results in fresh scopes.
 
 ## Known limitations / follow-up
 
+**Operational note.** With a positive inherited witness, an unfiltered count can
+plan as a parallel hash join over the target table, which allocates dynamic
+shared memory. PostgreSQL running in Docker with the default 64 MB `/dev/shm`
+then fails with "could not resize shared memory segment"; give such containers
+a larger `--shm-size` (tier 3 uses 1 GB), as PostgreSQL in containers generally
+requires for parallel queries.
+
 Two scale limitations predate 0.33.1 and reproduce on 0.33.0 (`65754b2`).
 Their follow-up belongs to this section of proposal 0018, not to inherited
 witness semantics:
