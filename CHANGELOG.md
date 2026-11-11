@@ -5,6 +5,8 @@ pre-1.0; breaking changes within a minor version are explicitly called out.
 
 ## [Unreleased]
 
+## [0.34.1] — 2026-11-11
+
 ### Fixed
 
 - `rebac sync` applies a changed package declaration to a row nobody edited.
