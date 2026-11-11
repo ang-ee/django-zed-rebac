@@ -19,6 +19,14 @@ pre-1.0; breaking changes within a minor version are explicitly called out.
   `CompileProgram`; `predicate.named_ids()` moves to
   `CompileProgram.named_ids()`.
 
+### Fixed
+
+- A constant-arm witness is decided, and remembered, per arm. In 0.33.1 it was
+  remembered per permission's whole statement of arms, so a permission whose
+  arms are a subset of ones an earlier read had decided (a document's lines
+  after the document, for the same fixed roles) ran another witness statement.
+  `constant_witness_entries` now counts arms.
+
 ## [0.33.1] — 2026-11-11
 
 ### Changed

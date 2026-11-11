@@ -263,7 +263,7 @@ class PermissionEvaluator:
         *,
         recheck: bool = False,
         advisory: frozenset[int] = frozenset(),
-        primary: int | None = None,
+        primary: frozenset[int] = frozenset(),
     ) -> list[bool | None]:
         """Batch missing witnesses, sharing decisions between own and inherited reads.
 
@@ -281,7 +281,7 @@ class PermissionEvaluator:
         An own read can refresh the shared entry: results may depend on read
         order, but inherited staleness only denies, never admits extra rows.
 
-        A positive ``primary`` own witness makes pending targets redundant.
+        A positive arm of the ``primary`` own witness makes pending ones redundant.
         Otherwise all pending signatures are decided together. A cached own
         negative is not pending, so inherited probes may need a new statement.
         Signatures include SQL, parameters, actor and database alias; an
@@ -310,7 +310,7 @@ class PermissionEvaluator:
                     answers[index] = held if current else None
                     continue
             pending.append(index)
-        if primary is not None and answers[primary] is True:
+        if any(answers[index] is True for index in primary):
             pending = []
         if pending:
             for index, held in zip(pending, decide(pending), strict=True):

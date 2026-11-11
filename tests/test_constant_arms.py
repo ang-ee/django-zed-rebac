@@ -841,3 +841,44 @@ def test_a_parent_to_child_read_does_not_scan_the_child_table(console, actor):
     # The outer read seeks the folder's posts by key; no step scans the table.
     assert steps[0].startswith(f"SEARCH {table} USING ") and "(folder_id=?)" in steps[0], plan
     assert not any(step.startswith(f"SCAN {table}") for step in steps), plan
+
+
+# Two types whose constant arms overlap: the post's one arm is one of the
+# folder's two.
+OVERLAPPING_ARMS = """
+definition auth/user {}
+definition org/role {
+    relation member: auth/user
+}
+definition blog/folder {
+    relation viewer: auth/user
+    relation admin: org/role // rebac:const=admin
+    relation auditor: org/role // rebac:const=auditor
+    permission read = viewer + admin->member + auditor->member
+}
+definition blog/post {
+    relation folder: blog/folder // rebac:field=folder
+    relation viewer: auth/user
+    relation admin: org/role // rebac:const=admin
+    permission read = viewer + admin->member
+}
+"""
+
+
+@KEPT
+def test_keys_whose_constant_arms_overlap_share_each_arms_witness():
+    local = install_schema(OVERLAPPING_ARMS)
+    with sudo(reason="overlapping constant arms fixture"):
+        folder = Folder.objects.create(name="folder")
+        post = Post.objects.create(title="post", folder=folder)
+    local.write_relationships([RelationshipTuple(ObjectRef("org/role", "admin"), "member", ADMIN)])
+    read.reset()
+    for actor, expected in ((ADMIN, [post.pk]), (MEMBER, [])):
+        with evaluator_scope() as evaluator:
+            list(Folder.objects.with_actor(actor).values_list("pk", flat=True))
+            with CaptureQueriesContext(connection) as captured:
+                ids = list(Post.objects.with_actor(actor).values_list("pk", flat=True))
+            # Each arm is one witness: the folder's read decided the post's arm.
+            assert evaluator.stats()["constant_witness_entries"] == 2
+        assert ids == expected
+        assert len(captured.captured_queries) == 1, actor
