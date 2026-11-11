@@ -1,8 +1,8 @@
 """Single management command with subcommands.
 
-python manage.py rebac sync                     # idempotent
+python manage.py rebac sync                     # idempotent; applies changed declarations
 python manage.py rebac sync --check             # CI gate; non-zero on drift
-python manage.py rebac sync --force-overwrite   # destructive
+python manage.py rebac sync --force-overwrite   # destructive; overwrites admin edits
 python manage.py rebac sync --prune-stale --yes # retire removed package policy
 python manage.py rebac check                    # validate without writes
 python manage.py rebac build-zed                # emit effective.zed
@@ -266,7 +266,7 @@ class Command(BaseCommand):
         p_sync.add_argument(
             "--force-overwrite",
             action="store_true",
-            help="Bypass no_update; destructive.",
+            help="Overwrite admin-edited rows and delete every stale row; destructive.",
         )
         p_sync.add_argument(
             "--prune-stale",
@@ -448,7 +448,7 @@ class Command(BaseCommand):
             if not sys.stdin.isatty():
                 raise CommandError(f"Non-interactive {flag} requires --yes.")
             action = (
-                "Overwrite edited schema rows and delete stale policy rows"
+                "Overwrite admin-edited schema rows and delete stale policy rows"
                 if force
                 else "Retire stale package-owned policy and its relationships"
             )
@@ -731,28 +731,25 @@ class Command(BaseCommand):
             batch.claim(existing, external_id, content_hash)
             return False
 
-        actual_payload = {key: getattr(existing, key) for key in payload}
-        actual_hash = self._hash_payload({**natural_key, **actual_payload})
+        actual_hash = self._row_hash(existing)
         if actual_hash == content_hash:
             if record.content_hash != content_hash and not check_only:
                 batch.refresh(record, content_hash)
             return False  # no-op
 
-        if record.no_update and not force:
-            # A row that still holds what the last sync wrote was not edited:
-            # the package's declaration changed.
-            cause = "declaration changed" if actual_hash == record.content_hash else "admin-edited"
-            self.stdout.write(
-                self.style.WARNING(
-                    f"  ! drift: {external_id} ({cause}; --force-overwrite to apply)"
-                )
-            )
-            return True
-
-        if check_only:
+        # A row that still holds what the last sync wrote was not edited: the
+        # package's declaration changed, and sync applies it. A ``no_update``
+        # row edited since is kept unless forced.
+        edited = actual_hash != record.content_hash
+        kept = edited and record.no_update
+        cause = "admin-edited" if edited else "declaration changed"
+        if check_only or (kept and not force):
+            hint = "--force-overwrite to apply" if kept else "sync applies"
+            self.stdout.write(self.style.WARNING(f"  ! drift: {external_id} ({cause}; {hint})"))
             return True
         batch.update(existing, payload)
         batch.refresh(record, content_hash)
+        self.stdout.write(f"  ~ updated: {external_id} ({cause})")
         return False
 
     def _prune_schema_children(
@@ -767,8 +764,13 @@ class Command(BaseCommand):
     ) -> bool:
         """Remove the relation/permission rows a package schema no longer declares.
 
-        ``force`` is ``--force-overwrite``; ``retire`` is ``--prune-stale``, which
-        also deletes the tuples naming a retired relation.
+        A managed row that still holds what the last sync wrote is pruned with
+        its record: the package's declaration removed it. A ``no_update`` row
+        edited since, and an unmanaged row (a consumer's own addition), are
+        kept and reported unless ``force`` (``--force-overwrite``). ``retire``
+        (``--prune-stale``) leaves managed rows to the record pass, which also
+        deletes the tuples naming a retired relation; forced, they go here.
+        True if a stale row is kept or, under ``check_only``, pending.
         """
         if not stale:
             return False
@@ -778,30 +780,35 @@ class Command(BaseCommand):
         from ...models import PackageManagedRecord
 
         ct = ContentType.objects.db_manager(using).get_for_model(model_cls)
-        target_pks = [obj.pk for obj in stale]
+        pruned = stale
         if check_only or not force:
-            # Unmanaged rows (a consumer's own additions) are only ever
-            # deleted by --force-overwrite; a managed stale row is retired by
-            # --prune-stale through its managed record.
-            managed = set(
-                PackageManagedRecord.objects.using(using)
-                .filter(target_ct=ct, target_pk__in=target_pks)
-                .values_list("target_pk", flat=True)
-            )
+            by_pk = {obj.pk: obj for obj in stale}
+            kept: dict[Any, bool] = {}  # A managed row's pk: whether a no_update record keeps it.
+            for record in PackageManagedRecord.objects.using(using).filter(
+                target_ct=ct, target_pk__in=list(by_pk)
+            ):
+                edited = record.content_hash != self._row_hash(by_pk[record.target_pk])
+                kept[record.target_pk] = kept.get(record.target_pk, False) or (
+                    edited and record.no_update
+                )
+            pruned = []
             for obj in stale:
-                if obj.pk not in managed:
+                if obj.pk not in kept:
                     hint = "unmanaged; --force-overwrite to delete"
                 elif retire:
                     hint = "--prune-stale retires" if check_only else "retired by --prune-stale"
+                elif kept[obj.pk]:
+                    hint = "admin-edited; --prune-stale or --force-overwrite to delete"
+                elif check_only:
+                    hint = "no longer declared; sync prunes"
                 else:
-                    hint = "--prune-stale or --force-overwrite to delete"
+                    pruned.append(obj)
+                    continue
                 self.stdout.write(
-                    self.style.WARNING(
-                        f"  ! drift: stale {model_cls.__name__} "
-                        f"{obj.definition.resource_type}#{obj.name} ({hint})"
-                    )
+                    self.style.WARNING(f"  ! drift: stale {model_cls.__name__} {obj} ({hint})")
                 )
-            return True
+            if not pruned:
+                return True
 
         if retire:
             from ...models import SchemaRelation
@@ -810,16 +817,19 @@ class Command(BaseCommand):
                 deleted = self._delete_stale_relationships(
                     {
                         _external_id("relation", obj.definition.resource_type, obj.name)
-                        for obj in stale
+                        for obj in pruned
                     },
                     using=using,
                 )
                 self._report_retired_tuples(deleted)
+        target_pks = [obj.pk for obj in pruned]
         PackageManagedRecord.objects.using(using).filter(
             target_ct=ct, target_pk__in=target_pks
         ).delete()
         model_cls.objects.using(using).filter(pk__in=target_pks).delete()
-        return True
+        for obj in pruned:
+            self.stdout.write(f"  - pruned: stale {model_cls.__name__} {obj}")
+        return len(pruned) < len(stale)
 
     def _prune_package_records(
         self,
@@ -1002,6 +1012,21 @@ class Command(BaseCommand):
         from ...schema.serialization import digest
 
         return digest({key: _spelled(value) for key, value in payload.items()})
+
+    @classmethod
+    def _row_hash(cls, row: Any) -> str:
+        """The content hash of what ``row`` stores: every column but its key.
+
+        A schema row's columns are its natural key and the payload sync writes,
+        so this equals the declared hash of the payload the row holds.
+        """
+        return cls._hash_payload(
+            {
+                field.name: getattr(row, field.name)
+                for field in row._meta.concrete_fields
+                if not field.primary_key
+            }
+        )
 
     # ---------- check ----------
 

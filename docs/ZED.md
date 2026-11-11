@@ -88,9 +88,9 @@ Every `.zed` file must declare three headers. They're parsed as comments by Spic
 
 | Header | Required | Purpose |
 |---|---|---|
-| `// @rebac_package: <name>` | yes | Stable package identity. Used as `package` in `PackageManagedRecord` rows. |
+| `// @rebac_package: <name>` | yes | Stable package identity; informational. `PackageManagedRecord.package` is the app's `AppConfig.name`. |
 | `// @rebac_package_version: <semver>` | yes | Track upgrades; informational. |
-| `// @rebac_schema_revision: <int>` | yes | Bump on any schema change. Drives `noupdate=True` upgrade logic — admin edits to overrides are preserved unless the revision increments. |
+| `// @rebac_schema_revision: <int>` | yes | Bump on any schema change; informational. `rebac sync` does not read it: it applies a changed declaration to a row nobody edited and keeps an admin edit, whatever the revision ([ARCHITECTURE.md § `sync` lifecycle](./ARCHITECTURE.md#sync-lifecycle)). |
 
 The build refuses to run with missing headers. `rebac.E010` is reserved for
 const-arrow cycle validation, not header validation.
@@ -1243,7 +1243,7 @@ encode the consumer's delegation policy for the subject being checked.
 
 ### 7. Don't omit the required headers
 
-The build refuses (`rebac.E010`) if any of `// @rebac_package`, `// @rebac_package_version`, `// @rebac_schema_revision` is missing. Bump the revision number whenever you change the schema, even for cosmetic changes — the upgrade-safety machinery uses it to decide whether admin overrides survive.
+The build refuses (`rebac.E010`) if any of `// @rebac_package`, `// @rebac_package_version`, `// @rebac_schema_revision` is missing. Bump the revision number whenever you change the schema, even for cosmetic changes. Upgrade safety does not depend on it: an ordinary `rebac sync` keeps every admin-edited schema row, and no sync writes `SchemaOverride` rows.
 
 ---
 

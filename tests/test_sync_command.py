@@ -51,10 +51,12 @@ def test_sync_check_names_why_a_managed_row_drifted(synced: bool) -> None:
     out = io.StringIO()
     with pytest.raises(CommandError, match="Schema drift detected"):
         call_command("rebac", "sync", "--check", stdout=out)
-    cause = "declaration changed" if synced else "admin-edited"
-    assert f"! drift: permission:blog/post#read ({cause}; --force-overwrite to apply)" in (
-        out.getvalue()
+    cause = (
+        "declaration changed; sync applies"
+        if synced
+        else "admin-edited; --force-overwrite to apply"
     )
+    assert f"! drift: permission:blog/post#read ({cause})" in out.getvalue()
 
 
 @pytest.mark.django_db
@@ -73,7 +75,7 @@ def test_sync_check_detects_stale_permission_rows() -> None:
 
 @pytest.mark.django_db
 @pytest.mark.parametrize("force", [False, True])
-def test_sync_only_prunes_stale_children_when_forced(force: bool) -> None:
+def test_sync_only_prunes_unmanaged_stale_children_when_forced(force: bool) -> None:
     call_command("rebac", "sync", stdout=io.StringIO())
     post_def = SchemaDefinition.objects.get(resource_type="blog/post")
     SchemaRelation.objects.create(
@@ -138,13 +140,223 @@ def test_sync_only_prunes_stale_managed_rows_when_forced(force: bool) -> None:
 
 
 def _source(tmp_path, monkeypatch, name: str, text: str) -> None:
+    """Install ``text`` as the one package ``name`` declares, replacing an earlier one."""
     root = tmp_path / name
-    root.mkdir()
+    root.mkdir(exist_ok=True)
     (root / "permissions.zed").write_text(text, encoding="utf-8")
     monkeypatch.setattr(
         "rebac.management.commands.rebac.apps.get_app_configs",
         lambda: [SimpleNamespace(name=name, path=str(root))],
     )
+
+
+def _sync(*flags: str) -> str:
+    out = io.StringIO()
+    call_command("rebac", "sync", *flags, stdout=out)
+    return out.getvalue()
+
+
+def _docs(
+    *, level: int = 0, viewer: str = "auth/user", read: str = "owner + viewer", extra: str = ""
+) -> str:
+    """The ``docs`` package: a caveat, a relation and a permission that each change alone."""
+    return (
+        f"caveat level_check(level int) {{ level > {level} }}\n"
+        "definition auth/user {}\n"
+        "definition doc/item {\n"
+        " relation owner: auth/user\n"
+        f" relation viewer: {viewer}\n"
+        f"{extra}"
+        f" permission read = {read}\n"
+        "}\n"
+    )
+
+
+def _doc_children(model_cls: Any) -> Any:
+    return model_cls.objects.filter(definition__resource_type="doc/item")
+
+
+# Each fragment's managed id, the ``_docs`` change to its declaration and its stored row.
+_FRAGMENTS = {
+    "caveat": (
+        "caveat:level_check",
+        {"level": 1},
+        lambda: SchemaCaveat.objects.get(name="level_check"),
+    ),
+    "relation": (
+        "relation:doc/item#viewer",
+        {"viewer": "auth/user with level_check"},
+        lambda: _doc_children(SchemaRelation).get(name="viewer"),
+    ),
+    "permission": (
+        "permission:doc/item#read",
+        {"read": "owner"},
+        lambda: _doc_children(SchemaPermission).get(name="read"),
+    ),
+}
+
+
+def _records() -> dict[str, tuple[str, Any]]:
+    return {
+        record.external_id: (record.content_hash, record.last_synced_at)
+        for record in PackageManagedRecord.objects.filter(package="docs")
+    }
+
+
+@pytest.mark.django_db
+@pytest.mark.parametrize("kind", sorted(_FRAGMENTS))
+def test_sync_applies_a_changed_declaration_to_an_unedited_row(kind, monkeypatch, tmp_path) -> None:
+    from rebac.management.commands.rebac import Command
+
+    external_id, change, stored = _FRAGMENTS[kind]
+    _source(tmp_path, monkeypatch, "docs", _docs())
+    _sync()
+    before = stored()
+    _source(tmp_path, monkeypatch, "docs", _docs(**change))
+
+    out = _sync()
+
+    row = stored()
+    assert f"~ updated: {external_id} (declaration changed)" in out
+    assert "drift" not in out
+    assert row.pk == before.pk
+    assert Command._row_hash(row) != Command._row_hash(before)
+    assert _records()[external_id][0] == Command._row_hash(row)
+    assert "OK — no drift." in _sync("--check")
+
+
+@pytest.mark.django_db
+@pytest.mark.parametrize("force", [False, True], ids=["kept", "forced"])
+@pytest.mark.parametrize("changed", [False, True], ids=["declared-same", "declaration-changed"])
+def test_sync_keeps_an_admin_edit_unless_forced(changed, force, monkeypatch, tmp_path) -> None:
+    _source(tmp_path, monkeypatch, "docs", _docs())
+    _sync()
+    read = _doc_children(SchemaPermission).filter(name="read")
+    read.update(expression="viewer")  # The admin's edit.
+    synced = _records()
+    declared = "owner" if changed else "owner + viewer"
+    _source(tmp_path, monkeypatch, "docs", _docs(read=declared))
+
+    out = _sync(*(["--force-overwrite", "--yes"] if force else []))
+
+    if force:
+        assert "~ updated: permission:doc/item#read (admin-edited)" in out
+        assert read.get().expression == declared
+        assert "OK — no drift." in _sync("--check")
+    else:
+        assert "! drift: permission:doc/item#read (admin-edited; --force-overwrite to apply)" in out
+        assert "~ updated" not in out
+        assert read.get().expression == "viewer"
+        assert _records() == synced
+
+
+@pytest.mark.django_db
+def test_sync_check_reports_changed_declarations_and_admin_edits(monkeypatch, tmp_path) -> None:
+    _source(tmp_path, monkeypatch, "docs", _docs())
+    _sync()
+    SchemaCaveat.objects.filter(name="level_check").update(expression="level > 5")
+    synced = _records()
+    _source(tmp_path, monkeypatch, "docs", _docs(read="owner"))
+
+    out = io.StringIO()
+    with pytest.raises(CommandError, match="Schema drift detected"):
+        call_command("rebac", "sync", "--check", stdout=out)
+
+    assert "! drift: permission:doc/item#read (declaration changed; sync applies)" in (
+        out.getvalue()
+    )
+    assert "! drift: caveat:level_check (admin-edited; --force-overwrite to apply)" in (
+        out.getvalue()
+    )
+    assert _doc_children(SchemaPermission).get(name="read").expression == "owner + viewer"
+    assert SchemaCaveat.objects.get(name="level_check").expression == "level > 5"
+    assert _records() == synced
+
+
+@pytest.mark.django_db
+@pytest.mark.pg_delta
+def test_sync_writes_changed_edited_unchanged_new_and_stale_rows_of_one_package(
+    monkeypatch, tmp_path
+) -> None:
+    from rebac.management.commands.rebac import Command
+
+    def declared(changed: str, edited: str, other: str) -> str:
+        return _docs(
+            read="owner",
+            extra=f"{other} permission changed = {changed}\n"
+            f" permission edited = {edited}\n permission same = owner\n",
+        )
+
+    _source(
+        tmp_path, monkeypatch, "docs", declared("owner", "owner", " permission dropped = owner\n")
+    )
+    _sync()
+    permissions = _doc_children(SchemaPermission)
+    permissions.filter(name="edited").update(expression="viewer")  # The admin's edit.
+    synced = _records()
+    added = " relation reviewer: auth/user\n permission added = reviewer\n"
+    _source(tmp_path, monkeypatch, "docs", declared("viewer", "owner + viewer", added))
+
+    out = _sync()
+
+    assert dict(permissions.values_list("name", "expression")) == {
+        "read": "owner",
+        "changed": "viewer",
+        "edited": "viewer",
+        "same": "owner",
+        "added": "reviewer",
+    }
+    assert "~ updated: permission:doc/item#changed (declaration changed)" in out
+    assert "! drift: permission:doc/item#edited (admin-edited; --force-overwrite to apply)" in out
+    assert "- pruned: stale SchemaPermission doc/item#dropped" in out
+    records = _records()
+    assert records["permission:doc/item#changed"][0] == Command._row_hash(
+        permissions.get(name="changed")
+    )
+    for kept in ("permission:doc/item#edited", "permission:doc/item#same"):
+        assert records[kept] == synced[kept]
+    assert records.keys() - synced.keys() == {
+        "relation:doc/item#reviewer",
+        "permission:doc/item#added",
+    }
+    assert synced.keys() - records.keys() == {"permission:doc/item#dropped"}
+
+
+@pytest.mark.django_db
+def test_sync_prunes_an_unedited_stale_child_and_keeps_an_edited_one(monkeypatch, tmp_path) -> None:
+    stale = " relation legacy: auth/user\n permission old = owner\n permission edited = owner\n"
+    _source(tmp_path, monkeypatch, "docs", _docs(extra=stale))
+    _sync()
+    _doc_children(SchemaPermission).filter(name="edited").update(expression="read")
+    _source(tmp_path, monkeypatch, "docs", _docs())
+    edited = (
+        "! drift: stale SchemaPermission doc/item#edited "
+        "(admin-edited; --prune-stale or --force-overwrite to delete)"
+    )
+
+    check = io.StringIO()
+    with pytest.raises(CommandError, match="Schema drift detected"):
+        call_command("rebac", "sync", "--check", stdout=check)
+    for name in ("SchemaRelation doc/item#legacy", "SchemaPermission doc/item#old"):
+        assert f"! drift: stale {name} (no longer declared; sync prunes)" in check.getvalue()
+    assert edited in check.getvalue()
+    assert _doc_children(SchemaRelation).filter(name="legacy").exists()
+
+    out = _sync()
+
+    assert "- pruned: stale SchemaRelation doc/item#legacy" in out
+    assert "- pruned: stale SchemaPermission doc/item#old" in out
+    assert edited in out
+    assert set(_doc_children(SchemaRelation).values_list("name", flat=True)) == {
+        "owner",
+        "viewer",
+    }
+    assert set(_doc_children(SchemaPermission).values_list("name", flat=True)) == {
+        "read",
+        "edited",
+    }
+    assert not {"relation:doc/item#legacy", "permission:doc/item#old"} & _records().keys()
+    assert "permission:doc/item#edited" in _records()
 
 
 @pytest.mark.django_db
@@ -153,22 +365,29 @@ def test_sync_statements_do_not_grow_with_the_rows_it_writes(returned, monkeypat
     # Without returned keys (MySQL), sync reads the created rows' keys back once per table.
     monkeypatch.setattr(connection.features, "can_return_rows_from_bulk_insert", returned)
 
-    def statements(size: int) -> int:
-        text = f"caveat c{size}(on bool) {{ on }}\n" + "".join(
-            f"definition s{size}/n{n} {{ relation member: s{size}/n{n} with c{size} "
-            "permission read = member }\n"
-            for n in range(size)
-        )
-        _source(tmp_path, monkeypatch, f"app{size}", text)
-        with CaptureQueriesContext(connection) as queries:
+    def statements(size: int) -> tuple[int, int]:
+        def text(read: str, stale: str) -> str:
+            return f"caveat c{size}(on bool) {{ on }}\n" + "".join(
+                f"definition s{size}/n{n} {{ relation member: s{size}/n{n} with c{size} "
+                f"relation viewer: s{size}/n{n} permission read = {read} {stale}}}\n"
+                for n in range(size)
+            )
+
+        _source(tmp_path, monkeypatch, f"app{size}", text("member", "permission old = member "))
+        with CaptureQueriesContext(connection) as written:
             call_command("rebac", "sync", stdout=io.StringIO())
-        return len(queries)
+        # Every definition's permission changes and its stale one is pruned.
+        _source(tmp_path, monkeypatch, f"app{size}", text("viewer", ""))
+        with CaptureQueriesContext(connection) as applied:
+            out = _sync()
+        assert out.count("~ updated: ") == out.count("- pruned: ") == size
+        return len(written), len(applied)
 
     call_command("rebac", "sync", stdout=io.StringIO())  # A published policy beside the sources.
     ContentType.objects.get_for_model(SchemaCaveat)  # Cached on first use, outside the measure.
     assert statements(1) == statements(20)
     records = PackageManagedRecord.objects.filter(package="app20")
-    assert len(records) == 61
+    assert len(records) == 81
     assert all(record.external_id.endswith(f":{record.target}") for record in records)
 
 
