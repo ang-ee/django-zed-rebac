@@ -88,7 +88,7 @@ def world(request, monkeypatch):
         original = read._scope_statement
 
         def observed(operation, model, key, *args, **kwargs):
-            calls.append(kwargs.get("candidates"))
+            calls.append(kwargs.get("slots"))
             return original(operation, model, key, *args, **kwargs)
 
         monkeypatch.setattr(read, "_scope_statement", observed)
@@ -281,3 +281,38 @@ def test_held_matches_base(world):
         )
     assert lane == base
     assert used, "a chunk within the candidate limit takes the bounded statement"
+
+
+def test_bounded_statements_are_kept_per_power_of_two(world):
+    _local, folders, _posts, calls, monkeypatch = world
+    f = [x.pk for x in folders]
+    compiled = []
+    original = read._Operation.compiler
+
+    def counted(self, *args, **kwargs):
+        compiled.append(1)
+        return original(self, *args, **kwargs)
+
+    monkeypatch.setattr(read._Operation, "compiler", counted)
+    with override_settings(REBAC_DEPTH_LIMIT=4):
+        read.reset()
+        calls.clear()
+        # Folder reads reach no caveat, so their statements are kept. Three
+        # and four identities share the four-slot statement; the spare slot
+        # repeats the last identity.
+        first = _ids(Folder.objects.with_actor(A).filter(pk__in=f[:3]))
+        built = len(compiled)
+        second = _ids(Folder.objects.with_actor(A).filter(pk__in=f[3:7]))
+        reused = len(compiled)
+        third = _ids(Folder.objects.with_actor(A).filter(pk=f[7]))
+        assert calls == [4, 4, 1]
+        assert built, "the first bounded read compiles"
+        assert reused == built, "a read in a kept bucket compiles nothing"
+        assert len(compiled) > reused, "a one-slot read keeps its own statement"
+        monkeypatch.setattr(read, "_known_identities", _general_identities)
+        read.reset()
+        full = set(_ids(Folder.objects.with_actor(A)))
+    assert first == sorted(full & set(f[:3]))
+    assert second == sorted(full & set(f[3:7]))
+    assert third == sorted(full & {f[7]})
+    assert full & set(f[:7]) and set(f[:7]) - full, "the folders hold visible and hidden rows"

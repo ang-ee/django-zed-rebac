@@ -122,6 +122,30 @@ class _Kept:
         return self.sql, values
 
 
+class _Candidate:
+    """One identity slot of a bounded scope statement, bound when it renders."""
+
+    __slots__ = ("index",)
+
+    def __init__(self, index: int) -> None:
+        self.index = index
+
+    def __repr__(self) -> str:
+        return f"<candidate identity {self.index}>"
+
+
+_CANDIDATES = tuple(_Candidate(index) for index in range(_CANDIDATE_LIMIT))
+
+
+def _candidate_slots(count: int) -> int:
+    """The slots kept for a read bounded to ``count`` identities: the next power of two.
+
+    One statement serves every count up to its slots; the spare slots repeat
+    the last identity (``_Operation.bound``).
+    """
+    return 1 << (count - 1).bit_length()
+
+
 _policies: OrderedDict[tuple[Any, ...], _Policy] = OrderedDict()
 _statements: OrderedDict[tuple[Any, ...], _Kept | bool] = OrderedDict()
 
@@ -380,17 +404,15 @@ class _Operation:
             | tuple[models.QuerySet[Any], bool]
             | tuple[models.QuerySet[Any], bool, tuple[str, ...]],
         ],
-        *,
-        cache: bool = True,
     ) -> _Kept | bool:
         """Compile SQL, kept when its only varying values are bound parameters.
 
         ``build`` returns the statement's root (``Compiler.statement``).
-        ``cache`` is off for a statement that embeds per-read literals.
         """
         # A statement can be kept when nothing in it varies but the actor's
-        # id and the clock: that is, when it carries no caveat verdict list.
-        keep = cache and verdicts.empty
+        # id, the clock and its candidate identities: that is, when it
+        # carries no caveat verdict list.
+        keep = verdicts.empty
         full = (*self.shape, *key)
         if keep:
             with _lock:
@@ -438,13 +460,21 @@ class _Operation:
                     _statements.popitem(last=False)
         return compiled
 
-    def bound(self, params: Iterable[Any], resource_id: str | None = None) -> list[Any]:
+    def bound(
+        self,
+        params: Iterable[Any],
+        resource_id: str | None = None,
+        candidates: tuple[int, ...] = (),
+    ) -> list[Any]:
         result: list[Any] = []
         for param in bind(params, self.actor, connections[self.using]):
             if param is _MANUAL_REVISION:
                 result.append(self.backend._manual_schema_revision())
             elif param is _RESOURCE_WIRE:
                 result.append(resource_id)
+            elif type(param) is _Candidate:
+                # A spare slot repeats the last identity.
+                result.append(candidates[min(param.index, len(candidates) - 1)])
             else:
                 result.append(param)
         return result
@@ -1019,15 +1049,16 @@ def _scope_statement(
     model: type[models.Model],
     key: Key,
     *,
-    candidates: tuple[int, ...] | None = None,
+    slots: int | None = None,
     witness: bool | None = None,
     inherited: tuple[Key, ...] = (),
 ) -> _Kept | bool:
     """The ids of ``model`` the actor holds ``key`` on, as SQL.
 
     ``False`` when there are none.  ``every`` is set when every row qualifies
-    and the SQL is only the policy fence. ``candidates`` bounds the rows the
-    statement visits to those literal identities. ``witness`` is the answer
+    and the SQL is only the policy fence. ``slots`` bounds the rows the
+    statement visits to that many candidate identities, parameters bound when
+    it renders (``_candidate_slots``). ``witness`` is the answer
     of ``_constant_witness``: when ``True`` the statement is the constant
     arms alone; when ``False`` it is the policy's without them. ``inherited``
     selects the targets' constant rechecks alone, retaining live membership.
@@ -1048,17 +1079,19 @@ def _scope_statement(
         if is_true(predicate):
             return gate.values("pk"), True
         rows = model._base_manager.using(operation.using)
-        if candidates is not None:
-            rows = rows.filter(**{f"{resource_id_attr(model)}__in": candidates})
+        if slots is not None:
+            # A plain ``In``: a related identity's lookup would coerce the slots to ints.
+            identity = resource_id_attr(model)
+            _field, scalar = model_identity_fields(model, identity)
+            rows = rows.filter(
+                In(F(identity), [_Param(slot, scalar) for slot in _CANDIDATES[:slots]])
+            )
         # The row predicate goes last: it holds the nested subqueries.
         rows = rows.filter(Q(Exists(gate)) & predicate)
         return compiler.statement(rows.order_by().values(resource_id_attr(model))), False
 
     return operation.statement(
-        ("scope", label, key, fold is not None, inherited),
-        verdicts,
-        build,
-        cache=candidates is None,
+        ("scope", label, key, fold is not None, inherited, slots), verdicts, build
     )
 
 
@@ -1184,14 +1217,14 @@ class _Scope(Expression):
             operation,
             self.model,
             key,
-            candidates=identities,
+            slots=None if identities is None else _candidate_slots(len(identities)),
             witness=self.witness,
             inherited=self.inherited,
         )
         if isinstance(compiled, bool):
             # ``True`` cannot occur: a statement that admits rows is a gate.
             return "(1 = 0)", ()
-        sql, params = compiled.render(operation.bound(compiled.params))
+        sql, params = compiled.render(operation.bound(compiled.params, candidates=identities or ()))
         if compiled.every:
             return f"EXISTS {sql}", params
         lhs_sql, lhs_params = compiler.compile(self.lhs)

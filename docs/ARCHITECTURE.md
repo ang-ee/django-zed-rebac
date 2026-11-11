@@ -2091,7 +2091,10 @@ literals (`filter(pk=...)`, `filter(pk__in=[...])`), the scope statement visits
 only those candidate rows before applying the permission predicate; the
 selecting query keeps its own filter. Any other shape (an OR, a negation, a
 subquery, duplicates, a longer list) uses the general scope. A bounded
-statement embeds its literals, so it is compiled per read and not kept.
+statement binds its identities as parameters, in a number of slots rounded up
+to the next power of two (1, 2, 4, … 256), the spare slots repeating the last
+identity. It is kept like the general scope, one statement per slot count, so a
+repeated read by id compiles nothing.
 
 A policy revision fence closes a scope after a new revision is published.
 A scope built without an actor fails closed. Parametric permission embeddings
@@ -2120,7 +2123,8 @@ alias and vendor, depth limit, active relationship model and scope model.
 The key contains no membership lists, row decisions or fact verdicts. The
 actor shape includes its type and relation suffix, canonical identity
 status, named id and authentication status. Actor id, application clock,
-point resource id and manual-schema revision are bound parameters. A
+point resource id, a bounded read's candidate identities and manual-schema
+revision are bound parameters. A
 permission with constant arms has two more statements per shape: the
 constant arms alone, and the policy without them (see
 [Inline permission scopes](#inline-permission-scopes)).
