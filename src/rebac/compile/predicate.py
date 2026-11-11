@@ -278,21 +278,7 @@ class ActorShape:
     anonymous: bool
 
 
-def named_ids(schema: Schema, type_: str) -> frozenset[str]:
-    found: set[str] = set()
-    for definition in schema.definitions:
-        for relation in definition.relations:
-            for allowed in relation.allowed_subjects:
-                if allowed.type != type_:
-                    continue
-                if allowed.id:
-                    found.add(allowed.id)
-                if isinstance(relation.backing, ConstBinding):
-                    found.add(relation.backing.target_id)
-    return frozenset(found)
-
-
-def actor_shape(schema: Schema, actor: SubjectRef, using: str) -> ActorShape:
+def actor_shape(program: CompileProgram, actor: SubjectRef, using: str) -> ActorShape:
     target = model_for_subject_type(actor.subject_type)
     canonical = False
     if target is not None:
@@ -307,7 +293,7 @@ def actor_shape(schema: Schema, actor: SubjectRef, using: str) -> ActorShape:
         actor.subject_type,
         actor.optional_relation,
         canonical,
-        actor.subject_id if actor.subject_id in named_ids(schema, actor.subject_type) else None,
+        actor.subject_id if actor.subject_id in program.named_ids(actor.subject_type) else None,
         not anonymous and actor.subject_id != "",
         anonymous,
     )
@@ -378,7 +364,7 @@ class Compiler:
         self.parametric = parametric
         self.point = point
         self.witnessed = witnessed
-        self.shape = actor_shape(self.schema, actor, using)
+        self.shape = actor_shape(self.program, actor, using)
         self._memo: dict[tuple[Any, ...], Q] = {}
         self._relevant: dict[Key, frozenset[Key]] = {}
         self._own_identity = model_for_subject_type(actor.subject_type)

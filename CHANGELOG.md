@@ -13,6 +13,11 @@ pre-1.0; breaking changes within a minor version are explicitly called out.
   up to the next power of two, so repeated reads by id no longer recompile the
   permission's predicate. On a composed host, a member's inbox document spent
   about 70% of its time recompiling bounded reads.
+- The caveated relations a permission reaches, and the ids a policy names for
+  an actor type, are derived once per prepared policy instead of by a schema
+  walk in every permission operation. `actor_shape()` takes the policy's
+  `CompileProgram`; `predicate.named_ids()` moves to
+  `CompileProgram.named_ids()`.
 
 ## [0.33.1] — 2026-11-11
 

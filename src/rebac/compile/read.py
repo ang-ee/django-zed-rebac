@@ -54,7 +54,7 @@ from rebac.schema.walker import find_permission, find_relation
 from rebac.types import CheckItem, CheckResult, ObjectRef, SubjectRef
 
 from . import At, Bound, Compiler, ctes
-from .conditions import CaveatVerdicts
+from .conditions import CaveatVerdicts, caveated_relations
 from .ctes import Marker
 from .evaluate import named_subjects, residual
 from .predicate import (
@@ -175,6 +175,7 @@ class _Policy:
     selected_at: datetime
     caveat_deadlines: tuple[datetime, ...]
     inherited: dict[tuple[Any, ...], tuple[Key, ...]] = field(default_factory=dict)
+    caveated: dict[Key, frozenset[Key]] = field(default_factory=dict)
 
     @property
     def schema(self) -> Schema:
@@ -348,7 +349,7 @@ class _Operation:
                 # A statement's fence carries the policy's deadlines: a policy
                 # selected on the other side of one compiles its own statement.
                 policy.fence,
-                actor_shape(policy.schema, actor, using),
+                actor_shape(policy.program, actor, using),
                 using,
                 connections[using].vendor,
                 app_settings.REBAC_DEPTH_LIMIT,
@@ -359,8 +360,11 @@ class _Operation:
     def verdicts(self, key: Key) -> CaveatVerdicts:
         found = self._verdicts.get(key)
         if found is None:
+            caveated = self.policy.caveated.get(key)
+            if caveated is None:
+                caveated = self.policy.caveated[key] = caveated_relations(self.policy.schema, key)
             found = self._verdicts[key] = CaveatVerdicts.prepare(
-                self.policy.schema, key, context=self.context, using=self.using
+                self.policy.schema, key, context=self.context, using=self.using, caveated=caveated
             )
         return found
 

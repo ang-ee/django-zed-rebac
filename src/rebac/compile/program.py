@@ -15,7 +15,7 @@ from django.core import checks
 from ..composition import TaggedComposition
 from ..errors import SchemaError
 from ..field_backing import resolve_field_backing
-from ..schema.ast import PermArrow, PermBinOp, PermExpr, PermRef, Schema
+from ..schema.ast import ConstBinding, PermArrow, PermBinOp, PermExpr, PermRef, Schema
 from ..schema.graph import Dependency, Key, dispatch_graph, strongly_connected_components
 
 __all__ = ["CompileProgram", "Key", "program_errors"]
@@ -33,6 +33,7 @@ class CompileProgram:
     alias_cycles: frozenset[Key]
     tagged: TaggedComposition | None = None
     _inherited: dict[Key, tuple[Key, ...]] = field(default_factory=dict, compare=False)
+    _named_ids: dict[str, frozenset[str]] = field(default_factory=dict, compare=False)
 
     @classmethod
     def build(cls, schema: Schema, *, tagged: TaggedComposition | None = None) -> CompileProgram:
@@ -118,6 +119,27 @@ class CompileProgram:
         visit(root)
         result = self._inherited[root] = tuple(sorted(found))
         return result
+
+    def named_ids(self, type_: str) -> frozenset[str]:
+        """The ids of ``type_`` the policy names, derived once per program/type.
+
+        An allowed subject with an id, or a constant binding's target.
+        """
+        found = self._named_ids.get(type_)
+        if found is not None:
+            return found
+        names: set[str] = set()
+        for definition in self.schema.definitions:
+            for relation in definition.relations:
+                for allowed in relation.allowed_subjects:
+                    if allowed.type != type_:
+                        continue
+                    if allowed.id:
+                        names.add(allowed.id)
+                    if isinstance(relation.backing, ConstBinding):
+                        names.add(relation.backing.target_id)
+        found = self._named_ids[type_] = frozenset(names)
+        return found
 
     def reachable(self, root: Key) -> frozenset[Key]:
         result: set[Key] = set()
