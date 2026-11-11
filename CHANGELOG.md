@@ -5,6 +5,8 @@ pre-1.0; breaking changes within a minor version are explicitly called out.
 
 ## [Unreleased]
 
+## [0.33.1] — 2026-11-11
+
 ### Changed
 
 - Evaluator-scoped reads can witness constant grants reached through positive
