@@ -563,8 +563,8 @@ class Compiler:
         at = At(key[0], Value("", output_field=models.TextField()), None, False)
         return () if is_true(ordinary.holds(key, at)) else tuple(found)
 
-    def constant_types(self, key: Key) -> tuple[str, ...]:
-        """The resource types ``key``'s constant arms name: what their decision reads."""
+    def constant_types(self, key: Key, arm: PermExpr | None = None) -> tuple[str, ...]:
+        """The resource types ``key``'s constant arms, or ``arm`` alone, name: what their decision reads."""
         definition = self.schema.get_definition(key[0])
         if definition is None:
             return ()
@@ -572,17 +572,17 @@ class Compiler:
         return tuple(
             sorted(
                 {
-                    relations[arm.via if isinstance(arm, PermArrow) else arm.name]
+                    relations[each.via if isinstance(each, PermArrow) else each.name]
                     .allowed_subjects[0]
                     .type
-                    for arm in self.constant_arms(key)
-                    if isinstance(arm, (PermArrow, PermRef))
+                    for each in (self.constant_arms(key) if arm is None else (arm,))
+                    if isinstance(each, (PermArrow, PermRef))
                 }
             )
         )
 
-    def constant(self, key: Key) -> Q:
-        """Whether one of ``key``'s constant arms holds: a predicate of no object.
+    def constant(self, key: Key, arm: PermExpr | None = None) -> Q:
+        """Whether one of ``key``'s constant arms, or ``arm`` alone, holds: a predicate of no object.
 
         False when ``key`` has none to witness (``constant_arms``).
         """
@@ -593,8 +593,8 @@ class Compiler:
         at = At(key[0], Value("", output_field=models.TextField()), None, False)
         return _or(
             *(
-                self._expression(definition, arm, at, Bound.LOWER, {}, depth_possible=True)
-                for arm in self.constant_arms(key)
+                self._expression(definition, each, at, Bound.LOWER, {}, depth_possible=True)
+                for each in (self.constant_arms(key) if arm is None else (arm,))
             )
         )
 

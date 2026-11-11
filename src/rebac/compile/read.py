@@ -90,7 +90,8 @@ class _Kept:
     """One compiled statement.  ``every`` marks a gate that admits every row.
 
     ``reads`` are the resource types whose facts a decision of the statement
-    depends on, for the decision cache (``_constant_witness``).
+    depends on, for the decision cache (``_constant_witness``). ``arms`` is the
+    number of constant arms a constant statement ORs (``_constant_arm_statement``).
     """
 
     body: str
@@ -99,6 +100,7 @@ class _Kept:
     every: bool = False
     reads: tuple[str, ...] = ()
     definitions: tuple[ctes.Definition, ...] = ()
+    arms: int = 0
 
     @property
     def sql(self) -> str:
@@ -406,7 +408,8 @@ class _Operation:
             models.QuerySet[Any]
             | bool
             | tuple[models.QuerySet[Any], bool]
-            | tuple[models.QuerySet[Any], bool, tuple[str, ...]],
+            | tuple[models.QuerySet[Any], bool, tuple[str, ...]]
+            | tuple[models.QuerySet[Any], bool, tuple[str, ...], int],
         ],
     ) -> _Kept | bool:
         """Compile SQL, kept when its only varying values are bound parameters.
@@ -433,7 +436,7 @@ class _Operation:
         if isinstance(built, bool):
             compiled = built
         else:
-            rows, every, *reads = built if isinstance(built, tuple) else (built, False)
+            rows, every, *extra = built if isinstance(built, tuple) else (built, False)
             query = rows.query.clone()
             # Parenthesised, to embed; a set of ids has no order.
             query.subquery = True
@@ -453,8 +456,9 @@ class _Operation:
                     (*[param for item in definitions for param in item.params], *body_params),
                     self.using,
                     every,
-                    reads[0] if reads else (),
+                    cast(tuple[str, ...], extra[0]) if extra else (),
                     definitions=definitions,
+                    arms=cast(int, extra[1]) if len(extra) > 1 else 0,
                 )
         if keep:
             with _lock:
@@ -502,11 +506,11 @@ def _constant_statement(operation: _Operation, key: Key) -> _Kept | bool:
     ``False`` when ``key`` has none to witness (``Compiler.constant_arms``).
     When it holds, the actor holds ``key`` on every object of its type, so it
     is kept as a gate that admits every row; its ``reads`` are the types the
-    constant arms name.
+    constant arms name, and ``arms`` their number.
     """
     verdicts = operation.verdicts(key)
 
-    def build() -> bool | tuple[models.QuerySet[Any], bool, tuple[str, ...]]:
+    def build() -> bool | tuple[models.QuerySet[Any], bool, tuple[str, ...], int]:
         compiler = operation.compiler(verdicts)
         condition = compiler.constant(key)
         if is_false(condition) or is_true(condition):
@@ -514,9 +518,31 @@ def _constant_statement(operation: _Operation, key: Key) -> _Kept | bool:
             # policy's own statement the fence alone.
             return False
         rows = compiler.statement(operation.gate().filter(condition).values("pk"))
-        return rows, True, compiler.constant_types(key)
+        return rows, True, compiler.constant_types(key), len(compiler.constant_arms(key))
 
     return operation.statement(("constant", key), verdicts, build)
+
+
+def _constant_arm_statement(operation: _Operation, key: Key, index: int) -> _Kept | bool:
+    """``key``'s constant arm ``index`` alone, as a witness statement.
+
+    An arm reads only the fixed object it names, so the keys whose arms reach
+    the same objects compile the same SQL and share one witness answer.
+    ``False`` when the arm cannot hold.
+    """
+    verdicts = operation.verdicts(key)
+
+    def build() -> bool | tuple[models.QuerySet[Any], bool, tuple[str, ...]]:
+        compiler = operation.compiler(verdicts)
+        arm = compiler.constant_arms(key)[index]
+        condition = compiler.constant(key, arm)
+        if is_false(condition):
+            return False
+        gate = operation.gate()
+        rows = gate if is_true(condition) else compiler.statement(gate.filter(condition))
+        return rows.values("pk"), True, compiler.constant_types(key, arm)
+
+    return operation.statement(("constant", key, index), verdicts, build)
 
 
 def _probe_root(using: str) -> models.QuerySet[SchemaGeneration]:
@@ -556,14 +582,19 @@ def _constant_witnesses(
     fresh: bool = False,
     inherited: bool = False,
 ) -> tuple[bool | None, ...]:
-    """One Boolean per distinct, uncached constant-arm signature in one SELECT."""
+    """One Boolean per key, from its arms' witnesses: the uncached ones decided in one SELECT.
+
+    Each constant arm is its own witness signature, so keys whose arms reach
+    the same fixed objects share their answers. A key holds when one arm does,
+    is ``None`` when an arm's answer may not be kept, and ``False`` otherwise.
+    """
     evaluator = current_evaluator()
     if evaluator is None or operation.context is not None:
         return (None,) * len(keys)
     signatures: list[tuple[str, tuple[Any, ...], SubjectRef, str]] = []
     statements: list[tuple[Hashable, tuple[Hashable, ...] | None]] = []
     compiled_arms = []
-    positions: list[int | None] = []
+    positions: list[tuple[int, ...] | None] = []
     verdicts = operation.verdicts(keys[0])
     for key in keys:
         # The root reaches every inherited target; its verdicts cover them.
@@ -572,35 +603,50 @@ def _constant_witnesses(
         if isinstance(compiled, bool):
             positions.append(None)
             continue
-        signature = (compiled.sql, compiled.params, operation.actor, operation.using)
-        try:
-            position = signatures.index(signature)
-        except ValueError:
-            position = len(signatures)
-            signatures.append(signature)
-            generations = tuple(
-                _backend_cache_key(operation.backend, type_) for type_ in compiled.reads
-            )
-            kept = None if fresh or None in generations else generations
-            statements.append((signature, kept))
-            compiled_arms.append(compiled)
-        positions.append(position)
+        arms: list[int] = []
+        for index in range(compiled.arms):
+            arm = _constant_arm_statement(operation, key, index)
+            if isinstance(arm, bool):
+                continue
+            signature = (arm.sql, arm.params, operation.actor, operation.using)
+            try:
+                position = signatures.index(signature)
+            except ValueError:
+                position = len(signatures)
+                signatures.append(signature)
+                generations = tuple(
+                    _backend_cache_key(operation.backend, type_) for type_ in arm.reads
+                )
+                kept = None if fresh or None in generations else generations
+                statements.append((signature, kept))
+                compiled_arms.append(arm)
+            arms.append(position)
+        positions.append(tuple(arms))
 
     def decide(indices: list[int]) -> list[bool]:
         probes = [_Sql(compiled_arms[index], operation) for index in indices]
         row = next(iter(_probe_root(operation.using).order_by().values_list(*probes)), None)
         return [bool(value) for value in row] if row is not None else [False] * len(indices)
 
-    primary = positions[0] if inherited else None
+    primary = frozenset(positions[0] or ()) if inherited else frozenset()
     answers = evaluator._constant_witness_batch(
         operation.backend,
         statements,
         decide,
         recheck=recheck,
-        advisory=frozenset(range(len(statements))) - {primary} if inherited else frozenset(),
+        advisory=frozenset(range(len(statements))) - primary if inherited else frozenset(),
         primary=primary,
     )
-    return tuple(None if position is None else answers[position] for position in positions)
+
+    def held(arms: tuple[int, ...] | None) -> bool | None:
+        if arms is None:
+            return None
+        found = [answers[arm] for arm in arms]
+        if True in found:
+            return True
+        return None if None in found or not found else False
+
+    return tuple(held(arms) for arms in positions)
 
 
 # ---------- Point checks ----------
