@@ -374,3 +374,37 @@ def test_recaveat_verdicts_are_witnessed_in_their_selected_time_interval(
 
     monkeypatch.setattr(CaveatVerdicts, "prepare", crossing)
     assert not allowed()
+
+
+@pytest.mark.django_db
+def test_policy_walks_are_derived_once_per_policy(monkeypatch):
+    from rebac.compile.program import CompileProgram
+
+    schema = """
+definition auth/user {}
+definition blog/post {
+    relation viewer: auth/user
+    relation pinned: auth/user:ops
+    permission read = viewer + pinned
+}
+"""
+    install_schema(schema)
+    read.reset()
+    walks = []
+    original = read.caveated_relations
+
+    def counted(schema, key):
+        walks.append(key)
+        return original(schema, key)
+
+    monkeypatch.setattr(read, "caveated_relations", counted)
+    actor = SubjectRef.of("auth/user", "alice")
+    for _ in range(3):
+        list(Post.objects.with_actor(actor).values_list("pk", flat=True))
+    # The caveated relations a permission reaches are a fact of the policy.
+    assert walks == [("blog/post", "read")]
+
+    program = CompileProgram.build(parse_zed(schema))
+    names = program.named_ids("auth/user")
+    assert names == {"ops"}
+    assert program.named_ids("auth/user") is names

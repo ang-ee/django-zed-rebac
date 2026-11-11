@@ -74,6 +74,21 @@ def reachable_relations(schema: Schema, key: Key) -> frozenset[Key]:
     return frozenset(relations)
 
 
+def caveated_relations(schema: Schema, key: Key) -> frozenset[Key]:
+    """The tuple relations ``key`` reaches that allow a caveated subject."""
+    return frozenset(
+        (type_, relation)
+        for type_, relation in reachable_relations(schema, key)
+        if (
+            (definition := schema.get_definition(type_)) is not None
+            and any(
+                r.name == relation and any(allowed.with_caveat for allowed in r.allowed_subjects)
+                for r in definition.relations
+            )
+        )
+    )
+
+
 @dataclass(frozen=True, slots=True)
 class CaveatVerdicts:
     """Decided condition keys and the missing inputs of undecided instances."""
@@ -90,20 +105,15 @@ class CaveatVerdicts:
         *,
         context: Mapping[str, Any] | None,
         using: str,
+        caveated: frozenset[Key] | None = None,
     ) -> CaveatVerdicts:
-        reached = reachable_relations(schema, key)
-        caveated = frozenset(
-            (type_, relation)
-            for type_, relation in reached
-            if (
-                (definition := schema.get_definition(type_)) is not None
-                and any(
-                    r.name == relation
-                    and any(allowed.with_caveat for allowed in r.allowed_subjects)
-                    for r in definition.relations
-                )
-            )
-        )
+        """Decide the caveat instances ``key`` reaches.
+
+        ``caveated`` is ``caveated_relations(schema, key)`` when the caller
+        keeps it for the policy.
+        """
+        if caveated is None:
+            caveated = caveated_relations(schema, key)
         if not caveated:
             return cls(frozenset(), frozenset(), {})
 
