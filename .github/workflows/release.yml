@@ -50,7 +50,10 @@ jobs:
           POSTGRES_DB: rebac_test
         ports:
           - 5432:5432
+        # Docker's default 64 MB /dev/shm is too small for parallel hash joins
+        # over the scale tables ("could not resize shared memory segment").
         options: >-
+          --shm-size=1g
           --health-cmd "pg_isready -U postgres -d rebac_test"
           --health-interval 10s
           --health-timeout 5s
@@ -85,7 +88,10 @@ jobs:
           POSTGRES_DB: rebac_test
         ports:
           - 5432:5432
+        # Docker's default 64 MB /dev/shm is too small for parallel hash joins
+        # over the scale tables ("could not resize shared memory segment").
         options: >-
+          --shm-size=1g
           --health-cmd "pg_isready -U postgres -d rebac_test"
           --health-interval 10s
           --health-timeout 5s
