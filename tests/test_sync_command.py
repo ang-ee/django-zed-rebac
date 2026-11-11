@@ -466,6 +466,49 @@ def test_sync_keeps_a_stale_child_a_kept_permission_names(monkeypatch, tmp_path)
     assert _doc_children(SchemaPermission).filter(name="old").exists()
 
 
+@pytest.mark.django_db
+@pytest.mark.parametrize("backing", ["", " // rebac:const=3"], ids=["stored", "const-backed"])
+def test_sync_prunes_a_stale_relation_only_another_definitions_kept_arrow_names(
+    backing, monkeypatch, tmp_path
+) -> None:
+    from rebac import ObjectRef, SubjectRef, sudo
+    from rebac.backends import backend, reset_backend
+
+    from .testapp.models import Folder, Post
+
+    legacy = f" relation legacy: auth/user{backing}\n"
+    declared = (
+        "definition auth/user {}\n"
+        "definition blog/folder {\n relation owner: auth/user\n" + legacy + "}\n"
+        "definition blog/post {\n relation folder: blog/folder // rebac:field=folder\n"
+        " relation owner: auth/user\n permission read = owner + folder->owner\n}\n"
+    )
+    _source(tmp_path, monkeypatch, "docs", declared)
+    _sync()
+    with sudo(reason="arrow to a pruned relation"):
+        post = Post.objects.create(title="post", folder=Folder.objects.create(name="folder"))
+    read = SchemaPermission.objects.filter(definition__resource_type="blog/post", name="read")
+    read.update(expression="owner + folder->legacy")  # The admin's edit walks to the folder.
+
+    def reads() -> bool:
+        reset_backend()
+        subject, resource = SubjectRef.of("auth/user", "3"), ObjectRef("blog/post", str(post.pk))
+        return backend().check_access(subject=subject, action="read", resource=resource).allowed
+
+    assert reads() is bool(backing)  # Only the constant grants user 3 through the arm.
+    _source(tmp_path, monkeypatch, "docs", declared.replace(legacy, ""))
+
+    out = _sync()
+
+    # Names on the kept permission's own definition are kept, not its arrows'
+    # targets: the relation is pruned, the policy still validates, and the arm
+    # grants nothing.
+    assert "- pruned: stale SchemaRelation blog/folder#legacy" in out
+    assert "Sync complete." in out
+    assert read.get().expression == "owner + folder->legacy"
+    assert reads() is False
+
+
 # A source of every stored shape, and the content hashes a 0.34.0 sync recorded for it.
 # Frozen: a change to how sync hashes a row would turn each deployed row into an admin edit.
 _EARLIER = (

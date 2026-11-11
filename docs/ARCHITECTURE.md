@@ -3582,7 +3582,10 @@ For each AppConfig that declares rebac_schema:
      admin-edited managed row and an unmanaged row (a consumer's own
      addition) are kept and reported too. An ordinary sync deletes no tuple;
      --force-overwrite deletes every stale child, and --prune-stale retires
-     the managed ones with the tuples naming them.
+     the managed ones with the tuples naming them. A stale relation that only
+     another definition's kept permission names, as an arrow's target
+     (`parent->x`), is pruned: the policy still validates and that arm grants
+     nothing, which takes away what a backed relation granted through it.
   5. Detect orphans: PackageManagedRecord with no matching .zed fragment (a
      removed definition or caveat, and the children of a removed definition).
      Reported as warnings; deletion requires --prune-stale or

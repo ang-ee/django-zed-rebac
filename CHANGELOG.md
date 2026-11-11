@@ -21,8 +21,10 @@ pre-1.0; breaking changes within a minor version are explicitly called out.
   definition names it (`named by kept permission <type>#<name>`) or tuples
   still hold a relation that stores them (`N relationship(s) remain; delete
   them or --prune-stale`), as SpiceDB refuses to drop a relation that
-  relationships use; an ordinary sync deletes no tuple. A row edited since the
-  last sync is kept and reported as `! drift: <id> (admin-edited;
+  relationships use; an ordinary sync deletes no tuple. A stale relation that
+  only another definition's kept permission names, as an arrow's target
+  (`parent->x`), is pruned and that arm grants nothing, so access a backed
+  relation gave through it ends. A row edited since the last sync is kept and reported as `! drift: <id> (admin-edited;
   --force-overwrite to apply)`, or stale, `(admin-edited; --prune-stale or
   --force-overwrite to delete)`, so the output names exactly what still needs
   a decision. `--check` writes nothing, reports all of them (a pending change
