@@ -746,9 +746,12 @@ def _scale_matrix(storage, shape, scope_mode, settings, subtests, tmp_path, *, p
                             explained = cursor.fetchone()[0][0]
                     except DatabaseError as error:
                         entry["error"] = str(error)
-                        violations.append(key + ": timeout/error")
+                        reason = (
+                            f"{type(error).__name__}: {str(error).strip().splitlines()[0][:240]}"
+                        )
+                        violations.append(f"{key}: {entry['stage']}: {reason}")
                         save()
-                        print("SCOPE_CELL " + key + " TIMEOUT", flush=True)
+                        print(f"SCOPE_CELL {key} ERROR at {entry['stage']}: {reason}", flush=True)
                         continue
                     nodes = list(_nodes(explained["Plan"]))
                     rescans = [
