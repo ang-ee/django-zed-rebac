@@ -611,3 +611,27 @@ class MetadataIdentityUser(RebacMixin, AbstractBaseUser):
     class Meta:
         app_label = "testapp"
         rebac_resource_type = "members/person"
+
+
+class ScopeThread(RebacMixin):
+    """Parent/child permission plan fixtures, also used by the opt-in PG benchmark."""
+
+    label = models.CharField(max_length=32, default="thread")
+
+    class Meta:
+        rebac_resource_type = "scope/thread"
+
+
+class ScopeMessage(RebacMixin):
+    thread = models.ForeignKey(ScopeThread, on_delete=models.CASCADE)
+
+    class Meta:
+        rebac_resource_type = "scope/message"
+
+
+class ScopePart(RebacMixin):
+    message = models.ForeignKey(ScopeMessage, on_delete=models.CASCADE)
+    fragment_id = models.BigIntegerField(db_index=True)
+
+    class Meta:
+        rebac_resource_type = "scope/part"

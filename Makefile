@@ -20,7 +20,7 @@ ARGS ?=
 # not reference_exhaustive, slow or schema_vendors.
 PG_DELTA_MARKS := (postgresql or pg_delta) and not slow and not reference_exhaustive and not schema_vendors
 SLOW_MARKS := slow and not reference_exhaustive and not schema_vendors
-FULL_MARKS := not reference_exhaustive and not schema_vendors
+FULL_MARKS := not reference_exhaustive and not schema_vendors and not scale
 REFERENCE_MARKS := reference_exhaustive or not reference_exhaustive
 
 # The default per-test timeout is 10 s (pyproject.toml). Targets that select
@@ -28,7 +28,7 @@ REFERENCE_MARKS := reference_exhaustive or not reference_exhaustive
 LONG := --timeout=300
 
 # Tier 3, in the order test-release runs it.
-RELEASE_PARTS := test-slow test-postgres test-reference test-schema-vendors test-random
+RELEASE_PARTS := test-slow test-postgres test-pg-scale test-reference test-schema-vendors test-random
 
 # A disposable PostgreSQL 16 with the credentials CI uses.
 PG_CONTAINER := rebac-test-pg
@@ -65,6 +65,11 @@ test:
 # a freshly started PostgreSQL, so it is wider than tier 1's.
 test-pg: require-postgres
 	$(PYTEST) $(PG) -n $(PG_WORKERS) --dist worksteal -m '$(PG_DELTA_MARKS)' --timeout=60 --durations=10 $(ARGS)
+
+# Timing and planner measurements run alone, without worker contention.
+.PHONY: test-pg-scale
+test-pg-scale: require-postgres
+	$(PYTEST) $(PG) -m scale --timeout=900 -s tests/test_scope_plans.py $(ARGS)
 
 # Tier 3 parts.
 test-slow:

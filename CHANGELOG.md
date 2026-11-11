@@ -5,6 +5,36 @@ pre-1.0; breaking changes within a minor version are explicitly called out.
 
 ## [Unreleased]
 
+## [0.33.1] — 2026-11-11
+
+### Changed
+
+- Evaluator-scoped reads can witness constant grants reached through positive
+  field arrows. Own and inherited witnesses reuse the read's caveat
+  preparation; a read without an own witness pays at most one extra
+  first-read statement per evaluator scope, including with expiration or inside
+  a transaction. Pending own and inherited probes share one statement. If a
+  `check_access()` first caches a negative own witness, the first list can
+  still cost two statements (inherited probe and data); repeats cost one.
+  A positive inherited witness selects the live constant recheck alone, with
+  live-target membership. It survives library revocations even for fresh
+  querysets in the same scope, which can return `[]` despite other target
+  grants. An own-witness target read can refresh the shared answer, so results
+  depend on read order. This staleness can only deny, never admit extra rows;
+  a fresh evaluator scope returns the exact ordinary result.
+  Target presence, compile-time TRUE/FALSE handling and backing errors retain
+  the ordinary compiler's behavior. Compound actor-shape TRUE targets are
+  excluded from witnessing, preserving dangling-FK reads. Version 0.33.1;
+  performance acceptance is recorded in proposal 0018.
+- Scale checks document two strict pre-existing 0.33.0 limitations, with
+  follow-up in [proposal 0018, Known limitations / follow-up](docs/proposals/0018-selective-permission-scopes.md#known-limitations--follow-up):
+  eight sparse-member broad-listing timeouts per vendor and 56 PG17 shared-read
+  multi-row CTE-rescan cells (including eight outside-evaluator admin cells).
+  Bounded timeout cells must retain baseline SQL, parameters and plan; rescan
+  cells must reproduce the exact baseline identity and failure. Resolved
+  rescans and unrelated failures remain hard failures. Per-cell pytest subtests
+  keep the remaining matrix visible; test development now requires pytest 9.
+
 ## [0.33.0] — 2026-11-10
 
 ### Added

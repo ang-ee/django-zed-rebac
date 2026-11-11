@@ -255,55 +255,74 @@ class PermissionEvaluator:
                 self._visibility_decision_ids -= len(oldest[-3])
         return answers
 
-    def _constant_witness(
+    def _constant_witness_batch(
         self,
         backend: LocalBackend,
-        statement: Hashable,
-        kept: tuple[Hashable, ...] | None,
-        decide: Callable[[], bool],
+        statements: list[tuple[Hashable, tuple[Hashable, ...] | None]],
+        decide: Callable[[list[int]], list[bool]],
         *,
         recheck: bool = False,
-    ) -> bool | None:
-        """The answer of a constant-arm witness statement, decided at most when needed.
+        advisory: frozenset[int] = frozenset(),
+        primary: int | None = None,
+    ) -> list[bool | None]:
+        """Batch missing witnesses, sharing decisions between own and inherited reads.
 
-        ``kept`` is the decision cache's key for every type the witness reads
-        (``_backend_cache_key``), or ``None`` where nothing may be kept. A
-        remembered answer serves only under the ``kept`` it was decided at:
+        ``kept`` is the decision-cache key for every type the witness reads
+        (``_backend_cache_key``), or None where nothing may be kept. An own
+        positive is re-decided when nothing may be kept, the key changes after
+        a library write, or ``recheck`` is set. An own negative serves only at
+        the same key; when nothing may be kept it returns None so the ordinary
+        statement evaluates every arm. A changed cacheable key is re-decided.
 
-        - a ``True`` is decided again where nothing may be kept, after the
-          key changed (a tuple write through the library), or on ``recheck``;
-        - a ``False`` is remembered in every context, and returned as
-          ``False`` (the arms may be left out) only under the same ``kept``.
-          Elsewhere it is ``None``, which selects the policy's statement: that
-          statement evaluates the arms itself, so the answer stays exact
-          whatever changes later. Where something may be kept and the key
-          changed, it is decided again.
+        ``advisory`` inherited answers are retained regardless of ``kept``
+        until rechecked or the scope ends. A positive selects a live constant
+        recheck, so revocation may deny other target grants even for a fresh
+        queryset after a library write. A negative keeps the complete policy.
+        An own read can refresh the shared entry: results may depend on read
+        order, but inherited staleness only denies, never admits extra rows.
 
-        ``statement`` names the witness statement, its actor and its database
-        alias (``rebac.compile.read._constant_witness``). An unhashable
-        statement key is decided every time.
+        A positive ``primary`` own witness makes pending targets redundant.
+        Otherwise all pending signatures are decided together. A cached own
+        negative is not pending, so inherited probes may need a new statement.
+        Signatures include SQL, parameters, actor and database alias; an
+        unhashable signature is decided every time.
         """
-        key = (_BackendKey(backend), statement)
-        try:
-            found = self._constant_witnesses.get(key)
-        except TypeError:
-            held = decide()
-            return True if held else (False if kept is not None else None)
-        if found is not None:
-            held, at = found
-            current = kept is not None and at == kept
-            if held and current and not recheck:
-                self._constant_witnesses.move_to_end(key)
-                return True
-            if not held and (current or kept is None):
-                self._constant_witnesses.move_to_end(key)
-                return False if current else None
-        held = decide()
-        self._constant_witnesses[key] = (held, kept)
-        self._constant_witnesses.move_to_end(key)
-        while len(self._constant_witnesses) > self._max_size:
-            self._constant_witnesses.popitem(last=False)
-        return True if held else (False if kept is not None else None)
+        answers: list[bool | None] = [None] * len(statements)
+        pending = []
+        cacheable = set()
+        for index, (statement, kept) in enumerate(statements):
+            key = (_BackendKey(backend), statement)
+            try:
+                found = self._constant_witnesses.get(key)
+            except TypeError:
+                pending.append(index)
+                continue
+            cacheable.add(index)
+            if found is not None:
+                held, at = found
+                current = kept is not None and at == kept
+                if index in advisory and not recheck:
+                    answers[index] = held
+                    self._constant_witnesses.move_to_end(key)
+                    continue
+                if (held and current and not recheck) or (not held and (current or kept is None)):
+                    self._constant_witnesses.move_to_end(key)
+                    answers[index] = held if current else None
+                    continue
+            pending.append(index)
+        if primary is not None and answers[primary] is True:
+            pending = []
+        if pending:
+            for index, held in zip(pending, decide(pending), strict=True):
+                statement, kept = statements[index]
+                if index in cacheable:
+                    key = (_BackendKey(backend), statement)
+                    self._constant_witnesses[key] = (held, kept)
+                    self._constant_witnesses.move_to_end(key)
+                    while len(self._constant_witnesses) > self._max_size:
+                        self._constant_witnesses.popitem(last=False)
+                answers[index] = True if held else (False if kept is not None else None)
+        return answers
 
     # ----- introspection (for tests + debugging) -----
 

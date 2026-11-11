@@ -324,7 +324,7 @@ wheels = [
 
 [[package]]
 name = "django-zed-rebac"
-version = "0.33.0"
+version = "0.33.1"
 source = { editable = "." }
 dependencies = [
     { name = "django" },
@@ -389,7 +389,7 @@ dev = [
     { name = "django-stubs-ext", specifier = ">=6.1,<6.2" },
     { name = "mypy", specifier = ">=2.4" },
     { name = "pyright", specifier = ">=1.1.350" },
-    { name = "pytest", specifier = ">=8.0" },
+    { name = "pytest", specifier = ">=9.0" },
     { name = "pytest-django", specifier = ">=4.8" },
     { name = "pytest-randomly", specifier = ">=3.16" },
     { name = "pytest-timeout", specifier = ">=2.3" },

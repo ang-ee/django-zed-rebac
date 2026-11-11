@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "django-zed-rebac"
-version = "0.33.0"
+version = "0.33.1"
 description = "Drop-in REBAC engine for Django, SpiceDB-compatible, with a pure-Django LocalBackend."
 readme = "README.md"
 license = "Apache-2.0"
@@ -49,7 +49,7 @@ strawberry-django = [
 # default; ``make check`` also needs the ``caveats`` extra (mypy imports celpy).
 [dependency-groups]
 dev = [
-    "pytest>=8.0",
+    "pytest>=9.0",
     "pytest-django>=4.8",
     "pytest-randomly>=3.16",
     "pytest-xdist>=3.6",
@@ -79,11 +79,14 @@ include = ["rebac*"]
 rebac = ["py.typed"]
 
 [tool.pytest.ini_options]
+# Show every per-cell known limitation in the scale matrix.
+verbosity_subtests = 1
 DJANGO_SETTINGS_MODULE = "tests.settings"
 python_files = ["test_*.py"]
 testpaths = ["tests"]
 addopts = "-p no:randomly -m 'not reference_exhaustive and not slow and not schema_vendors'"
 markers = [
+    "scale: isolated PostgreSQL read and planning measurements",
     "slow: opt-in expensive tests, excluded from the default suite",
     "reference_exhaustive: opt-in complete reference expression and tuple-presence sweep",
     "reference_shard: independently schedulable shard of the exhaustive reference sweep",

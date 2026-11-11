@@ -25,7 +25,7 @@ from datetime import datetime
 from enum import StrEnum
 from typing import Any, Final, Protocol, cast
 
-from django.core.exceptions import EmptyResultSet, FieldDoesNotExist
+from django.core.exceptions import EmptyResultSet
 from django.db import connections, models
 from django.db.models import Exists, Expression, F, OuterRef, Q, QuerySet, Value
 from django.db.models.expressions import Col
@@ -325,24 +325,6 @@ def _fixed(relation: Relation | None) -> bool:
     )
 
 
-def _multi_valued(model: type[models.Model], lookup: str) -> bool:
-    """Whether a lookup path crosses a reverse or many-to-many relation."""
-    current: Any = model
-    for part in lookup.split("__"):
-        try:
-            field = current._meta.pk if part == "pk" else current._meta.get_field(part)
-        except FieldDoesNotExist:
-            return False
-        if not field.is_relation:
-            return False
-        if field.many_to_many or field.one_to_many:
-            return True
-        current = field.related_model
-        if not isinstance(current, type):
-            return False
-    return False
-
-
 class Compiler:
     """One predicate compiler for scopes and point membership.
 
@@ -355,6 +337,9 @@ class Compiler:
 
     ``fold`` names a permission whose constant arms (``constant_arms``) are
     known not to hold for the actor: the lower bound compiles them as false.
+    ``witnessed`` names inherited targets whose positive constant-arm answers
+    select their live recheck alone at the lower bound. Stale answers can deny
+    other grants until the next evaluator scope, but never admit extra rows.
     """
 
     def __init__(
@@ -371,6 +356,7 @@ class Compiler:
         parametric: bool = False,
         point: PointRow | None = None,
         fold: Key | None = None,
+        witnessed: frozenset[Key] = frozenset(),
     ) -> None:
         self.schema = tagged.schema if tagged is not None else schema
         self.actor = actor
@@ -391,6 +377,7 @@ class Compiler:
         self.program = program if program is not None else CompileProgram.build(self.schema)
         self.parametric = parametric
         self.point = point
+        self.witnessed = witnessed
         self.shape = actor_shape(self.schema, actor, using)
         self._memo: dict[tuple[Any, ...], Q] = {}
         self._relevant: dict[Key, frozenset[Key]] = {}
@@ -401,6 +388,7 @@ class Compiler:
         self._id_set_names: dict[bytes, CTE] = {}
         # The constant arms compiled as false at the lower bound, by identity:
         # the policy's own expression nodes.
+        self._constant_arm_memo: dict[Key, tuple[PermExpr, ...]] = {}
         self._folded = frozenset(map(id, self.constant_arms(fold))) if fold else frozenset()
 
     def _cte_name(self, name: str) -> str:
@@ -532,6 +520,11 @@ class Compiler:
         alone. Empty when ``key`` has no other disjunct, whose statement is
         these arms already, or holds outright for this actor's shape.
         """
+        if key not in self._constant_arm_memo:
+            self._constant_arm_memo[key] = self._find_constant_arms(key)
+        return self._constant_arm_memo[key]
+
+    def _find_constant_arms(self, key: Key) -> tuple[PermExpr, ...]:
         definition = self.schema.get_definition(key[0])
         permission = self.schema.get_permission(*key)
         if definition is None or permission is None:
@@ -566,7 +559,23 @@ class Compiler:
                     pending.extend(self._union_arms(named.expression))
             elif not isinstance(arm, PermNil):
                 other = True
-        return tuple(found) if other else ()
+        if not found or not other:
+            return ()
+        # Ask the ordinary compiler, including compound Boolean folds. Keep
+        # its exploratory id sets out of the witness statement's owner.
+        ordinary = Compiler(
+            self.schema,
+            self.actor,
+            self.using,
+            tagged=self.tagged,
+            verdicts=self.verdicts,
+            now=self.now,
+            depth_limit=self.depth_limit,
+            program=self.program,
+            parametric=self.parametric,
+        )
+        at = At(key[0], Value("", output_field=models.TextField()), None, False)
+        return () if is_true(ordinary.holds(key, at)) else tuple(found)
 
     def constant_types(self, key: Key) -> tuple[str, ...]:
         """The resource types ``key``'s constant arms name: what their decision reads."""
@@ -634,8 +643,13 @@ class Compiler:
         memo = (key, at, bound, self._path(key, visits), depth_possible)
         found = self._memo.get(memo)
         if found is None:
-            found = self._memo[memo] = self._node(
-                key, at, bound, visits, depth_possible=depth_possible
+            # A positive inherited witness selects the same denial-only
+            # statement as an own witness: recheck its constant arms now.
+            # Live-target membership remains owned by _subject_rows/the relation.
+            found = self._memo[memo] = (
+                self.constant(key)
+                if bound is Bound.LOWER and key in self.witnessed
+                else self._node(key, at, bound, visits, depth_possible=depth_possible)
             )
         return found
 
@@ -1373,7 +1387,11 @@ class Compiler:
                 result = _truth(self.shape.anonymous)
             else:
                 result = self._holds(
-                    (type_, expr.name), at, bound, visits, depth_possible=depth_possible
+                    (type_, expr.name),
+                    at,
+                    bound,
+                    visits,
+                    depth_possible=depth_possible,
                 )
         elif isinstance(expr, PermArrow):
             relation = next((r for r in definition.relations if r.name == expr.via), None)
@@ -1665,22 +1683,23 @@ class Compiler:
             )
             through_rows = False
         else:
-            source_q = Q(
-                **{
-                    f"{target_path}__in": self._ids(
-                        subjects.order_by().values(resolved.target_id_attr)
-                    )
-                }
+            target_ids = subjects.order_by().values(resolved.target_id_attr)
+            key = (allowed.type, name)
+            inline = (
+                bound is Bound.LOWER
+                and bool(self.witnessed)
+                and (
+                    key in self.witnessed
+                    or self.witnessed.intersection(self.program.inherited_targets(key))
+                )
             )
+            source_q = Q(**{f"{target_path}__in": target_ids if inline else self._ids(target_ids)})
         # A GenericForeignKey backing holds the rows of one content type.
         generic = resolved.generic_q(self.using, exists=not through_rows)
         source_q = Q(**resolved.filters) & generic & source_q
         # Two arms over one multi-valued path must not share its join, so
         # only a single-valued lookup may be inlined into the caller's filter.
-        single = not _multi_valued(resolved.source_model, resolved.path) and not any(
-            _multi_valued(resolved.source_model, lookup) for lookup in resolved.filters
-        )
-        if at.row and single:
+        if at.row and resolved.single_valued:
             return source_q
         rows = resolved.source_model._base_manager.using(self.using).filter(source_q)
         return self._model_membership(at, rows, resolved.source_model, resolved.source_id_attr)

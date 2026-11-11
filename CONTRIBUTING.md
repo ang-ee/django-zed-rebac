@@ -110,8 +110,9 @@ practice:
 - `make test` runs the tier 1 selection serially, for debugging.
   `make test-random` checks isolation under a reproducible random order.
 - Default pytest configuration deselects `reference_exhaustive`, `slow` and
-  `schema_vendors`. There is no scale suite at the moment: no test holds time,
-  statement or query-plan budgets for large tables.
+  `schema_vendors`. `scale` selects the PostgreSQL scale matrix
+  (`make test-pg-scale`): it runs alone, never beside parallel workers, and the
+  whole-suite selection excludes it.
   `reference_exhaustive` selects the complete reference sweep;
   `reference_shard` labels independently schedulable cases within it. Default runs
   retain every named regression, all one/two-leaf expressions and deterministic
