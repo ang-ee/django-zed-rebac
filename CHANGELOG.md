@@ -29,6 +29,10 @@ pre-1.0; breaking changes within a minor version are explicitly called out.
   read may still be narrower, never wider.
 - Nothing is left out under a subtraction, in the depth statement or in a
   recursion's convergence test, where a missing arm would admit.
+- An actor that holds a grant through a stored subject set (a group or role
+  that is granted something) has no profile, and its statements are compiled
+  in full. With only set-reached arms left, PostgreSQL misestimates the id set
+  and a broad read measured about five times slower at 500,000 rows.
 
 ### Added
 

@@ -2191,9 +2191,13 @@ caveats are not read, so the profile is a superset of what the actor holds.
   narrower, never wider, until the scope ends when a grant of a kind the actor
   did not hold is written by another process or behind the library; a check in
   the same scope refreshes the profile and reads are exact after it.
-- **Who has one.** An actor that is a plain subject: no subject relation, not
-  anonymous, a real id. Outside an evaluator scope, and for any other actor,
-  every statement is compiled as before.
+- **Who has one.** An actor that is a plain subject (no subject relation, not
+  anonymous, a real id) and holds no row through a stored subject set. The
+  planner cannot estimate an id set reached through a set: with the other arms
+  gone it joins by nested loop and scans that id set for each row, which
+  measured about five times slower on a broad read of 500,000 rows. Such an
+  actor's statements are compiled in full, as are every actor's outside an
+  evaluator scope. Membership of a set that holds no grant costs nothing.
 - **Kept statements.** A statement is kept per profile and shared by every
   actor with that profile. The 512-entry statement cache therefore holds fewer
   permissions when many distinct profiles are in use.

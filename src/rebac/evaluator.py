@@ -121,9 +121,10 @@ class PermissionEvaluator:
         # entries and by the candidate ids they hold together.
         self._visibility_decisions: OrderedDict[tuple[Any, ...], frozenset[str]] = OrderedDict()
         self._visibility_decision_ids = 0
-        # The stored relation keys an actor can hold, per backend, database and
-        # actor, with the relationship generation it was read at (proposal 0019).
-        self._profiles: dict[Hashable, tuple[int, frozenset[tuple[str, str]]]] = {}
+        # The stored relation keys an actor can hold (None: the actor has no
+        # profile), per backend, database and actor, with the relationship
+        # generation it was read at (proposal 0019).
+        self._profiles: dict[Hashable, tuple[int, frozenset[tuple[str, str]] | None]] = {}
         self._max_size = max_size
         self._schema_scope = SchemaScope()
 

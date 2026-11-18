@@ -33,7 +33,11 @@ inside the operand of an exclusion, in the depth statement, or in the convergenc
 evaluation path is added.
 
 **Scope.** A profile exists only inside an evaluator scope, for an actor that is a plain subject (no subject
-relation, not anonymous, a real id). It is read by one statement at the first compile for that actor and
+relation, not anonymous, a real id) and holds no row through a stored subject set. The release tier's scale
+matrix showed why the second condition is needed: PostgreSQL cannot estimate an id set reached through a set (21
+rows estimated, 2,500 actual), and a statement left with only such arms loses the wide statement's hash joins. A
+broad read of 500,000 rows that embeds the scope twice then scans the id set for each row, about five times
+slower on PostgreSQL 16 and 17. Such an actor's statements are compiled in full. It is read by one statement at the first compile for that actor and
 database, kept for the scope, and read again after a library relationship write
 (`mark_relationships_changed`). Outside an evaluator scope every statement is compiled as today.
 
@@ -114,6 +118,9 @@ shorten that path.
 
 ## Known limits
 
+- An actor that holds any grant through a stored subject set gets no profile, however small the set's reach. In
+  the scale matrix an actor reaching one thread through nested groups read in 2.3 ms with a profile and 25 to
+  114 ms without. A rule bounded by how many rows the sets reach would keep that gain; it is not built.
 - A statement is kept per profile, so the 512-entry statement cache serves fewer permissions when many distinct
   profiles are in use. Keying by the part of the profile a permission can reach (below) is the remedy.
 - The profile's statement follows every stored subject set the actor is in. Its cost for an actor with very many

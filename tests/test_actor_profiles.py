@@ -340,6 +340,37 @@ def test_nested_subject_sets_and_wildcards_reach_the_actor(threads):
         assert messages(ADMIN)[0] == [3]
 
 
+@KEPT
+def test_an_actor_granted_through_a_subject_set_has_no_profile(threads):
+    """The planner cannot estimate an id set reached through a set, so every arm stays."""
+    team = SubjectRef.of("auth/group", "team", "member")
+    threads.write_relationships(
+        [grant("auth/group", "team", "member"), grant("scope/thread", 1, "reader", team)]
+    )
+    outside, _plain = messages()
+    with evaluator_scope():
+        inside, scoped = messages()
+        again, repeated = messages()
+        assert read._actor_profile(threads, MEMBER, "default") is None
+    assert inside == outside == again == [1, 2]
+    # The rows are read once to learn it, and the answer is kept for the scope.
+    assert profile_statements(scoped) == 1
+    assert profile_statements(repeated) == 0
+    assert "'direct'" in scoped[-1]
+
+
+@KEPT
+def test_a_group_that_holds_no_grant_leaves_its_members_their_profile(threads):
+    threads.write_relationships(
+        [grant("auth/group", "team", "member"), grant("scope/thread", 1, "reader")]
+    )
+    with evaluator_scope():
+        found, statements = messages()
+        assert read._actor_profile(threads, MEMBER, "default") is not None
+    assert found == [1, 2]
+    assert "'direct'" not in statements[-1]
+
+
 def subtracting(seed: int) -> tuple[str, list[RelationshipTuple]]:
     """A policy in which every permission subtracts, and rows that make the subtraction bite.
 
@@ -387,7 +418,8 @@ definition scope/part {{
     group = SubjectRef.of("auth/group", "g", "member")
     tuples = []
     for actor in (ADMIN, MEMBER):
-        if rng.random() < 0.5:
+        # Rarely: an actor granted through the group has no profile to test.
+        if rng.random() < 0.15:
             tuples.append(RelationshipTuple(ObjectRef("auth/group", "g"), "member", actor))
     for type_, count, relations in (
         ("scope/thread", 2, ("direct", "banned", "muted")),
@@ -435,7 +467,9 @@ def assert_missing_keys_only_lose_rows(schema, tuples, seed, storage, settings, 
         }
         with evaluator_scope():
             held = read._actor_profile(local, actor, "default")
-        assert held is not None
+        if held is None:
+            # A grant held through a subject set: no profile, every arm is compiled.
+            continue
         keys = sorted(held)
         stale = {frozenset(), *(frozenset(keys) - {key} for key in keys)}
         stale |= {frozenset(rng.sample(keys, size)) for size in range(1, len(keys))}
