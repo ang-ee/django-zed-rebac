@@ -76,21 +76,21 @@
     },
     "17/denormalized-shared-inside/off-large-narrow-count": {
       "kind": "rescan",
-      "params_sha256": "b29ec9212901b4be16ad319e283230b9b911a3772dfe2f8c1b42d79cb595b045",
+      "params_sha256": "32bfe929af45a6c209df6a7862c761125878bb8bef7da9e13e68f2419712d3af",
       "plan_capture": "EXPLAIN (ANALYZE, BUFFERS, FORMAT JSON, MEMORY)",
-      "plan_sha256": "17bde57ea61b474b14608e6be3bc79419d8e54042d199f3f22ac4be151f6d881",
-      "reason": "Pre-existing 0.33.0 PG17 multi-row CTE rescan; identical SQL, parameters, structural plan and rescan count; proposal 0018, Known limitations / follow-up",
+      "plan_sha256": "dfe22ac301fe55269ec73fc1afa5146ab8138ad5c98f1a8a80cd7d3a3744ef13",
+      "reason": "PG17 multi-row CTE rescan of proposal 0018 on the 0.35.0 actor-profile statement; SQL, parameters, structural plan and rescan count re-taken on 9db3ffb3; proposal 0019, Known limits",
       "rescans": 1,
-      "sql_sha256": "795cc3990ae0f64620afa7458fe5399fb4a501580900db486bebeb7df3ea0a88"
+      "sql_sha256": "94ce6ac72704c39fb2123a41463a1a1f9ba1c9e70dfd616d6e37c2c35ec8a3f6"
     },
     "17/denormalized-shared-inside/off-large-narrow-listing": {
       "kind": "rescan",
-      "params_sha256": "b29ec9212901b4be16ad319e283230b9b911a3772dfe2f8c1b42d79cb595b045",
+      "params_sha256": "32bfe929af45a6c209df6a7862c761125878bb8bef7da9e13e68f2419712d3af",
       "plan_capture": "EXPLAIN (ANALYZE, BUFFERS, FORMAT JSON, MEMORY)",
-      "plan_sha256": "f9c32a887af2b76fa229648f1a3a6403f194e4911c3d3610fa7790ec1af784c3",
-      "reason": "Pre-existing 0.33.0 PG17 multi-row CTE rescan; identical SQL, parameters, structural plan and rescan count; proposal 0018, Known limitations / follow-up",
+      "plan_sha256": "17ece6fe1b21ef1875507d4c579f8d71de08498e7e102c7e3dff297ed5b3162b",
+      "reason": "PG17 multi-row CTE rescan of proposal 0018 on the 0.35.0 actor-profile statement; SQL, parameters, structural plan and rescan count re-taken on 9db3ffb3; proposal 0019, Known limits",
       "rescans": 1,
-      "sql_sha256": "6dbaaa78c89b64381243b6b40c64b8afb567aede39d0d6e66b8acce3d596f39c"
+      "sql_sha256": "e54c0ad5058b72640455c411800772227a6d6dbd910301c889deec5bb1488170"
     },
     "17/denormalized-shared-inside/off-member-narrow-count": {
       "kind": "rescan",
@@ -130,21 +130,21 @@
     },
     "17/denormalized-shared-inside/on-large-narrow-count": {
       "kind": "rescan",
-      "params_sha256": "b29ec9212901b4be16ad319e283230b9b911a3772dfe2f8c1b42d79cb595b045",
+      "params_sha256": "32bfe929af45a6c209df6a7862c761125878bb8bef7da9e13e68f2419712d3af",
       "plan_capture": "EXPLAIN (ANALYZE, BUFFERS, FORMAT JSON, MEMORY)",
-      "plan_sha256": "17bde57ea61b474b14608e6be3bc79419d8e54042d199f3f22ac4be151f6d881",
-      "reason": "Pre-existing 0.33.0 PG17 multi-row CTE rescan; identical SQL, parameters, structural plan and rescan count; proposal 0018, Known limitations / follow-up",
+      "plan_sha256": "dfe22ac301fe55269ec73fc1afa5146ab8138ad5c98f1a8a80cd7d3a3744ef13",
+      "reason": "PG17 multi-row CTE rescan of proposal 0018 on the 0.35.0 actor-profile statement; SQL, parameters, structural plan and rescan count re-taken on 9db3ffb3; proposal 0019, Known limits",
       "rescans": 1,
-      "sql_sha256": "795cc3990ae0f64620afa7458fe5399fb4a501580900db486bebeb7df3ea0a88"
+      "sql_sha256": "94ce6ac72704c39fb2123a41463a1a1f9ba1c9e70dfd616d6e37c2c35ec8a3f6"
     },
     "17/denormalized-shared-inside/on-large-narrow-listing": {
       "kind": "rescan",
-      "params_sha256": "b29ec9212901b4be16ad319e283230b9b911a3772dfe2f8c1b42d79cb595b045",
+      "params_sha256": "32bfe929af45a6c209df6a7862c761125878bb8bef7da9e13e68f2419712d3af",
       "plan_capture": "EXPLAIN (ANALYZE, BUFFERS, FORMAT JSON, MEMORY)",
-      "plan_sha256": "f9c32a887af2b76fa229648f1a3a6403f194e4911c3d3610fa7790ec1af784c3",
-      "reason": "Pre-existing 0.33.0 PG17 multi-row CTE rescan; identical SQL, parameters, structural plan and rescan count; proposal 0018, Known limitations / follow-up",
+      "plan_sha256": "17ece6fe1b21ef1875507d4c579f8d71de08498e7e102c7e3dff297ed5b3162b",
+      "reason": "PG17 multi-row CTE rescan of proposal 0018 on the 0.35.0 actor-profile statement; SQL, parameters, structural plan and rescan count re-taken on 9db3ffb3; proposal 0019, Known limits",
       "rescans": 1,
-      "sql_sha256": "6dbaaa78c89b64381243b6b40c64b8afb567aede39d0d6e66b8acce3d596f39c"
+      "sql_sha256": "e54c0ad5058b72640455c411800772227a6d6dbd910301c889deec5bb1488170"
     },
     "17/denormalized-shared-inside/on-member-narrow-count": {
       "kind": "rescan",
@@ -364,21 +364,21 @@
     },
     "17/registry-shared-inside/off-large-narrow-count": {
       "kind": "rescan",
-      "params_sha256": "b29ec9212901b4be16ad319e283230b9b911a3772dfe2f8c1b42d79cb595b045",
+      "params_sha256": "32bfe929af45a6c209df6a7862c761125878bb8bef7da9e13e68f2419712d3af",
       "plan_capture": "EXPLAIN (ANALYZE, BUFFERS, FORMAT JSON, MEMORY)",
-      "plan_sha256": "054ee6720b1138992769370240efe5b1e1405920e50b1eb7e32644beddb9c6bf",
-      "reason": "Pre-existing 0.33.0 PG17 multi-row CTE rescan; identical SQL, parameters, structural plan and rescan count; proposal 0018, Known limitations / follow-up",
+      "plan_sha256": "53532e39de00da159abe6e0e7e350c56cea23238bafe12a14844efd4374a1970",
+      "reason": "PG17 multi-row CTE rescan of proposal 0018 on the 0.35.0 actor-profile statement; SQL, parameters, structural plan and rescan count re-taken on 9db3ffb3; proposal 0019, Known limits",
       "rescans": 1,
-      "sql_sha256": "bc84359a3e10a3dfbe8e308a9d74abde4a4e342cf347a0df3bdb4e09188745f5"
+      "sql_sha256": "750240dbf4d35745268ac8d3e05f1cf6a3ef863b75827bee77972647a666dcc0"
     },
     "17/registry-shared-inside/off-large-narrow-listing": {
       "kind": "rescan",
-      "params_sha256": "b29ec9212901b4be16ad319e283230b9b911a3772dfe2f8c1b42d79cb595b045",
+      "params_sha256": "32bfe929af45a6c209df6a7862c761125878bb8bef7da9e13e68f2419712d3af",
       "plan_capture": "EXPLAIN (ANALYZE, BUFFERS, FORMAT JSON, MEMORY)",
-      "plan_sha256": "3437992f1dfb902a57f146ceb8fa5311a457c2b2b3a29c75da556dc0b10d2309",
-      "reason": "Pre-existing 0.33.0 PG17 multi-row CTE rescan; identical SQL, parameters, structural plan and rescan count; proposal 0018, Known limitations / follow-up",
+      "plan_sha256": "ad744311c74e87b409e88075892049fc8e13fd6e1507e060a5ccb7380a59630d",
+      "reason": "PG17 multi-row CTE rescan of proposal 0018 on the 0.35.0 actor-profile statement; SQL, parameters, structural plan and rescan count re-taken on 9db3ffb3; proposal 0019, Known limits",
       "rescans": 1,
-      "sql_sha256": "308152b225b1a2ea68c615550ccd808a2904988fb319c338cac419ff76e95083"
+      "sql_sha256": "5dd11ede61703b8fee34d0b84f6f8107c8bc28f31b2d9dba43c5425d1f219c69"
     },
     "17/registry-shared-inside/off-member-narrow-count": {
       "kind": "rescan",
@@ -418,21 +418,21 @@
     },
     "17/registry-shared-inside/on-large-narrow-count": {
       "kind": "rescan",
-      "params_sha256": "b29ec9212901b4be16ad319e283230b9b911a3772dfe2f8c1b42d79cb595b045",
+      "params_sha256": "32bfe929af45a6c209df6a7862c761125878bb8bef7da9e13e68f2419712d3af",
       "plan_capture": "EXPLAIN (ANALYZE, BUFFERS, FORMAT JSON, MEMORY)",
-      "plan_sha256": "054ee6720b1138992769370240efe5b1e1405920e50b1eb7e32644beddb9c6bf",
-      "reason": "Pre-existing 0.33.0 PG17 multi-row CTE rescan; identical SQL, parameters, structural plan and rescan count; proposal 0018, Known limitations / follow-up",
+      "plan_sha256": "53532e39de00da159abe6e0e7e350c56cea23238bafe12a14844efd4374a1970",
+      "reason": "PG17 multi-row CTE rescan of proposal 0018 on the 0.35.0 actor-profile statement; SQL, parameters, structural plan and rescan count re-taken on 9db3ffb3; proposal 0019, Known limits",
       "rescans": 1,
-      "sql_sha256": "bc84359a3e10a3dfbe8e308a9d74abde4a4e342cf347a0df3bdb4e09188745f5"
+      "sql_sha256": "750240dbf4d35745268ac8d3e05f1cf6a3ef863b75827bee77972647a666dcc0"
     },
     "17/registry-shared-inside/on-large-narrow-listing": {
       "kind": "rescan",
-      "params_sha256": "b29ec9212901b4be16ad319e283230b9b911a3772dfe2f8c1b42d79cb595b045",
+      "params_sha256": "32bfe929af45a6c209df6a7862c761125878bb8bef7da9e13e68f2419712d3af",
       "plan_capture": "EXPLAIN (ANALYZE, BUFFERS, FORMAT JSON, MEMORY)",
-      "plan_sha256": "3437992f1dfb902a57f146ceb8fa5311a457c2b2b3a29c75da556dc0b10d2309",
-      "reason": "Pre-existing 0.33.0 PG17 multi-row CTE rescan; identical SQL, parameters, structural plan and rescan count; proposal 0018, Known limitations / follow-up",
+      "plan_sha256": "ad744311c74e87b409e88075892049fc8e13fd6e1507e060a5ccb7380a59630d",
+      "reason": "PG17 multi-row CTE rescan of proposal 0018 on the 0.35.0 actor-profile statement; SQL, parameters, structural plan and rescan count re-taken on 9db3ffb3; proposal 0019, Known limits",
       "rescans": 1,
-      "sql_sha256": "308152b225b1a2ea68c615550ccd808a2904988fb319c338cac419ff76e95083"
+      "sql_sha256": "5dd11ede61703b8fee34d0b84f6f8107c8bc28f31b2d9dba43c5425d1f219c69"
     },
     "17/registry-shared-inside/on-member-narrow-count": {
       "kind": "rescan",

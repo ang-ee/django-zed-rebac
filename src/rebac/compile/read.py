@@ -24,8 +24,10 @@ from django.db.models.fields.tuple_lookups import TupleIn
 from django.db.models.lookups import Exact, GreaterThanOrEqual, In, IntegerFieldExact, LessThan
 from django.db.models.sql.where import WhereNode
 from django.utils import timezone
+from django_cte import CTE, with_cte
 
 from rebac._id import _NATIVE_INTEGER_FIELDS, model_identity_fields, resource_id_attr
+from rebac.actors import is_anonymous_actor
 from rebac.codec import identity_codec
 from rebac.composition import TaggedComposition, compose_tagged, split_stale_overrides
 from rebac.conf import app_settings
@@ -55,7 +57,7 @@ from rebac.types import CheckItem, CheckResult, ObjectRef, SubjectRef
 
 from . import At, Bound, Compiler, ctes
 from .conditions import CaveatVerdicts, caveated_relations
-from .ctes import Marker
+from .ctes import Marker, safe_name, table_names
 from .evaluate import named_subjects, residual
 from .predicate import (
     PointRow,
@@ -329,6 +331,8 @@ class _Operation:
     context: Mapping[str, Any] | None
     shape: tuple[Any, ...]
     _verdicts: dict[Key, CaveatVerdicts] = field(default_factory=dict)
+    # The stored relation keys the actor can hold, or None when undecided.
+    profile: frozenset[Key] | None = None
 
     @classmethod
     def begin(
@@ -338,8 +342,11 @@ class _Operation:
         using: str,
         context: Mapping[str, Any] | None = None,
         policy: _Policy | None = None,
+        *,
+        fresh: bool = False,
     ) -> _Operation:
         policy = policy if policy is not None else _policy(backend)
+        profile = _actor_profile(backend, actor, using, fresh=fresh)
         return cls(
             backend,
             policy,
@@ -356,7 +363,10 @@ class _Operation:
                 connections[using].vendor,
                 app_settings.REBAC_DEPTH_LIMIT,
                 active_relationship_model()._meta.label_lower,
+                # A statement compiled for a profile serves every actor with it.
+                profile,
             ),
+            profile=profile,
         )
 
     def verdicts(self, key: Key) -> CaveatVerdicts:
@@ -394,6 +404,7 @@ class _Operation:
             point=point,
             fold=fold,
             witnessed=witnessed,
+            profile=self.profile,
         )
 
     def gate(self, *, parametric: bool = True) -> models.QuerySet[Any]:
@@ -486,6 +497,99 @@ class _Operation:
             else:
                 result.append(param)
         return result
+
+
+# ---------- The actor's grant profile ----------
+
+
+def _actor_profile(
+    backend: LocalBackend, actor: SubjectRef, using: str, *, fresh: bool = False
+) -> frozenset[Key] | None:
+    """The stored relation keys ``actor`` can hold, decided once per evaluator scope.
+
+    A key is in the profile when a relationship row of it names the actor, a
+    wildcard of the actor's type, or a stored subject set the actor is in.
+    Expiry and caveats are not read, so the profile is a superset of what the
+    actor holds: an arm outside it cannot match, and one inside it is compiled
+    and evaluated as ever. It is read again after a library relationship write
+    (``mark_relationships_changed``); a row written by anything else is missed
+    until the scope ends, which can only leave rows out (proposal 0019).
+
+    ``None`` leaves every arm compiled: outside an evaluator scope, for an actor
+    that is a subject set, anonymous or without an id, and for an actor that
+    holds a row through a stored subject set. The planner cannot estimate an id
+    set reached through a set, and a statement left with only such arms has lost
+    the wide statement's hash joins: a broad read then scans the id set for each
+    row (about five times slower at 500,000 rows). ``fresh`` reads the rows now,
+    whatever the scope kept.
+    """
+    if not app_settings.REBAC_ACTOR_PROFILES:
+        return None
+    evaluator = current_evaluator()
+    if evaluator is None:
+        return None
+    if actor.optional_relation or not actor.subject_id or is_anonymous_actor(actor):
+        return None
+    from rebac.backends import local
+
+    relationships = active_relationship_model()
+    key = (id(backend), using, relationships._meta.label_lower, actor)
+    generation = local._relationship_generation
+    # Rows this thread wrote in a transaction still open may roll back: until
+    # it ends, the profile is read at each compile.
+    volatile = local.uncommitted_relationship_writes(using)
+    found = evaluator._profiles.get(key)
+    if not fresh and not volatile and found is not None and found[0] == generation:
+        return found[1]
+    rows = cast(Any, relationships.objects.using(using)).wire_projection()
+    columns = ("resource_type", "resource_id", "relation", "_rebac_through_set")
+
+    def through_set(value: int) -> Value:
+        return Value(value, output_field=models.IntegerField())
+
+    seed = (
+        rows.filter(
+            subject_type=actor.subject_type,
+            subject_relation="",
+            subject_id__in=(actor.subject_id, "*"),
+        )
+        .order_by()
+        .annotate(_rebac_through_set=through_set(0))
+        .values(*columns)
+    )
+
+    def body(cte: CTE) -> models.QuerySet[Any]:
+        step = (
+            cte.join(
+                rows,
+                subject_type=cte.col.resource_type,
+                subject_id=cte.col.resource_id,
+                subject_relation=cte.col.relation,
+            )
+            .order_by()
+            .annotate(_rebac_through_set=through_set(1))
+            .values(*columns)
+        )
+        return cast(models.QuerySet[Any], seed.union(step))
+
+    # Its own statement: not a definition of the one being compiled around it.
+    with ctes.isolated():
+        cte = CTE.recursive(body, name=safe_name("rebac_profile", table_names()))
+        selected = cte.queryset()
+        held = list(
+            with_cte(
+                cte,
+                select=models.QuerySet(model=selected.model, query=selected.query, using=using)
+                .values_list("resource_type", "relation", "_rebac_through_set")
+                .distinct(),
+            )
+        )
+    profile: frozenset[Key] | None = None
+    if not any(through for _type, _relation, through in held):
+        profile = frozenset((str(type_), str(relation)) for type_, relation, _through in held)
+    if not volatile:
+        evaluator._profiles[key] = (generation, profile)
+    return profile
 
 
 def _model_at(model: type[models.Model]) -> At:
@@ -834,12 +938,14 @@ def _point_result(
     types: Mapping[str, RowTypes] | None = None,
     witness: bool = False,
     fresh: bool = False,
+    profile_read: bool = False,
 ) -> tuple[bool, bool, bool, _Policy]:
     """``types`` are the row types already read for the resource's id
     (``_key_types``); without them, they are read here. ``witness`` decides
     the permission's constant arms first (``_constant_witness``); ``fresh``
-    keeps nothing of that decision."""
-    operation = _Operation.begin(backend, actor, using, context)
+    keeps nothing of that decision. ``profile_read`` marks the decision made
+    again after the actor's profile was read anew."""
+    operation = _Operation.begin(backend, actor, using, context, fresh=fresh)
     key = resource.resource_type, action
     if witness and _constant_witness(operation, key, recheck=True, fresh=fresh):
         # Decided by its own statement just now: a lower bound.
@@ -851,6 +957,28 @@ def _point_result(
     # CONDITIONAL, or a depth error.
     if _point(operation, key, resource.resource_id, "lower", row_types):
         return True, True, False, operation.policy
+    if (
+        not fresh
+        and not profile_read
+        and operation.profile is not None
+        and _actor_profile(backend, actor, using, fresh=True) != operation.profile
+    ):
+        # A check is exact: before it answers no, the profile it was compiled
+        # for is read again, and a profile that moved decides it anew. The
+        # scope now keeps the profile just read.
+        return _point_result(
+            backend=backend,
+            resource=resource,
+            action=action,
+            actor=actor,
+            context=context,
+            using=using,
+            lower_only=lower_only,
+            types=types,
+            witness=witness,
+            fresh=fresh,
+            profile_read=True,
+        )
     recursive = _recursive(operation, key)
     # The bounds differ only where a caveat or a recursion is in reach.
     if lower_only or not (recursive or not operation.verdicts(key).empty):
@@ -1440,7 +1568,9 @@ class _AccessibleResources:
         policy = _policy(self.backend)
         if policy.snapshot.revision != self.revision:
             return []
-        operation = _Operation.begin(self.backend, self.actor, self.using, self.context, policy)
+        operation = _Operation.begin(
+            self.backend, self.actor, self.using, self.context, policy, fresh=self.fresh
+        )
         return _accessible_branches(self, operation)
 
     def __iter__(self) -> Iterator[str]:

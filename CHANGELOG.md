@@ -5,6 +5,45 @@ pre-1.0; breaking changes within a minor version are explicitly called out.
 
 ## [Unreleased]
 
+## [0.35.0] — 2026-11-18
+
+### Changed
+
+- Inside an evaluator scope a statement is compiled for the stored grants its
+  actor can hold (proposal 0019, `docs/ARCHITECTURE.md § Actor grant
+  profiles`). One statement per scope, actor and database reads which stored
+  relations name the actor, directly, by wildcard or through stored subject
+  sets; the groups of a stored relation that end at the actor are not compiled
+  when no row names them. On a composed host of 129 readable types a member's
+  message read went from 1,618 KB of SQL and 1,217 MiB of planner memory to
+  523 KB and 694 MiB with the same rows, and a locked write path held its lock
+  for 0.7 s instead of 1.8–2.0 s.
+- On PostgreSQL a constant arm the profile folds leaves `(SELECT FALSE)` in a
+  statement that builds an id set: the planner's bound. It selects no row and
+  runs nothing, and keeps each id set planned as large as its table, as the
+  full statement plans it. Without it a broad read of 500,000 rows by an actor
+  with 25,000 direct grants hit the 30 s statement timeout in the registry
+  layout.
+- **Statement counts change inside an evaluator scope.** The first read of an
+  actor issues the profile's statement; a denied point check issues it again
+  before it answers; a read after a library relationship write issues it again.
+  A constant arm the actor holds no row for is folded, so its witness
+  statement is no longer issued. Outside an evaluator scope every statement is
+  as before.
+- After a grant written behind the library, a point check in the same scope
+  refreshes the profile, and reads after it see the grant. Before the check a
+  read may still be narrower, never wider.
+- Nothing is left out under a subtraction, in the depth statement or in a
+  recursion's convergence test, where a missing arm would admit.
+- An actor that holds a grant through a stored subject set (a group or role
+  that is granted something) has no profile, and its statements are compiled
+  in full.
+
+### Added
+
+- `REBAC_ACTOR_PROFILES` (default `True`). `False` compiles every statement
+  without a profile.
+
 ## [0.34.1] — 2026-11-11
 
 ### Fixed

@@ -5,6 +5,10 @@ recursive structural plans (the release comparison's keys, excluding estimates
 and measurements). Only the measured vendor, dimensions and work_mem qualify.
 The caller records individual subtest xfails after these guards, never a fixture
 xfail. A resolved rescan fails explicitly, like pytest's strict XPASS.
+
+Eight PostgreSQL 17 rescan cells hold 0.35.0 fingerprints: the directly granted
+actor inside an evaluator scope, whose statement the actor profile changed
+(proposal 0019, Known limits). Each entry's ``reason`` says which it is.
 """
 
 import hashlib

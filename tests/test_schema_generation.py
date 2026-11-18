@@ -76,6 +76,12 @@ def _generation_reads(queries):
     return sum(query["sql"].startswith('SELECT "rebac_schemageneration".') for query in queries)
 
 
+def _profile_reads(queries):
+    # The actor's grant profile, read at the first compile in an evaluator
+    # scope and kept for it (proposal 0019).
+    return sum("rebac_profile" in query["sql"] for query in queries)
+
+
 @pytest.mark.parametrize("scoped", [False, True], ids=["lazy", "scoped"])
 def test_a_subquery_check_adds_no_revision_read(synced, settings, scoped):
     """An actor-scoped subquery in a statement's clauses is checked in the
@@ -187,8 +193,11 @@ def test_evaluator_scope_query_budget(synced, atomic, surface):
 
         with CaptureQueriesContext(connection) as first:
             evaluate()
-        assert len(first) == (1 if surface == "new" else 2)
+        # The revision, the actor's profile, then the statement. A proposed
+        # object's check compiles no read, so it reads no profile.
+        assert len(first) == (1 if surface == "new" else 3)
         assert _generation_reads(first) == 1
+        assert _profile_reads(first) == (0 if surface == "new" else 1)
         for n in (1, 10, 100):
             with CaptureQueriesContext(connection) as repeated:
                 for _ in range(n):
@@ -518,7 +527,7 @@ def test_shared_backend_threads_parse_once(synced, monkeypatch):
                         assert evaluator.check(
                             local, subject=ACTOR, action="write", resource=resource
                         ).allowed
-            return _loads(repeated), len(repeated), local.schema()
+            return _loads(repeated), len(repeated), _profile_reads(repeated), local.schema()
         finally:
             BaseDatabaseWrapper.close(db)
 
@@ -526,9 +535,12 @@ def test_shared_backend_threads_parse_once(synced, monkeypatch):
         futures = [executor.submit(worker) for _ in range(8)]
         results = [future.result() for future in futures]
     parent_schema = local.schema()
-    for warm, cost, schema in results:
+    for warm, cost, profiles, schema in results:
         assert warm == 0
-        assert cost == 8
+        # Each scope: the revision, the actor's profile (a scope reads its own),
+        # then the check.
+        assert cost == 12
+        assert profiles == 4
         assert schema is parent_schema
     assert len(loads) == local._schema_generation == 1
 

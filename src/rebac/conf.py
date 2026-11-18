@@ -17,6 +17,8 @@ _DEFAULTS: dict[str, Any] = {
     "REBAC_RELATIONSHIP_MODEL": "rebac.Relationship",
     "REBAC_SCHEMA_DIR": None,  # resolves to <cwd>/rebac at use site
     "REBAC_DEPTH_LIMIT": 8,
+    # Compile an evaluator scope's statements for the stored grants its actor can hold (proposal 0019).
+    "REBAC_ACTOR_PROFILES": True,
     "REBAC_DEFAULT_CONSISTENCY": "minimize_latency",
     "REBAC_CACHE_ALIAS": "default",
     "REBAC_LOOKUP_CACHE_TTL": 60,

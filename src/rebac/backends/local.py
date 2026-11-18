@@ -5,11 +5,13 @@ Proposed-object evaluation lives in preflight and the shared schema walker.
 
 from __future__ import annotations
 
+import threading
 import time
 from collections.abc import Iterable
 from concurrent.futures import Future
 from dataclasses import dataclass
 from datetime import datetime
+from functools import partial
 from threading import Lock
 from typing import Any
 from weakref import WeakSet
@@ -64,6 +66,11 @@ class _SchemaFacts:
 
 
 _relationship_generation = 0
+# The transaction, per database alias, in which this thread wrote relationship
+# rows that may still roll back: a fact read from them is not kept (proposal
+# 0019). An ``atomic`` transaction is named by its outermost block.
+_uncommitted_relationships = threading.local()
+_MANUAL_TRANSACTION = object()
 
 
 class _LoadedSchema(tuple[Schema, datetime | None]):
@@ -1023,6 +1030,85 @@ def mark_relationships_changed() -> None:
     global _relationship_generation
     with _backend_registry_lock:
         _relationship_generation += 1
+    from django.db import connections, transaction
+
+    written = _uncommitted_transactions()
+    for connection in connections.all(initialized_only=True):
+        if _manual_transaction(connection):
+            written[connection.alias] = _MANUAL_TRANSACTION
+        elif connection.in_atomic_block and connection.atomic_blocks:
+            outermost = connection.atomic_blocks[0]
+            if written.get(connection.alias) is not outermost:
+                written[connection.alias] = outermost
+                transaction.on_commit(
+                    partial(_forget_uncommitted, connection.alias, outermost),
+                    using=connection.alias,
+                )
+
+
+def _manual_transaction(connection: Any) -> bool:
+    """Whether ``connection`` is in a transaction the application ends itself.
+
+    Autocommit is off and no ``atomic`` block owns the commit: none is open, or
+    the outermost was entered with autocommit already off and leaves the
+    transaction open on exit.
+    """
+    if connection.connection is None:
+        return False
+    if connection.in_atomic_block:
+        return not connection.commit_on_exit
+    return not connection.get_autocommit()
+
+
+def _uncommitted_transactions() -> dict[str, object]:
+    written: dict[str, object] | None = getattr(_uncommitted_relationships, "written", None)
+    if written is None:
+        written = _uncommitted_relationships.written = {}
+    return written
+
+
+def _forget_uncommitted(alias: str, transaction: object) -> None:
+    """The transaction committed: its rows stay, and every thread may read them now.
+
+    The generation moved when the rows were written. A scope on another thread
+    may have read between that write and this commit, so it moves again.
+    """
+    global _relationship_generation
+    written = _uncommitted_transactions()
+    if written.get(alias) is transaction:
+        del written[alias]
+    with _backend_registry_lock:
+        _relationship_generation += 1
+
+
+def uncommitted_relationship_writes(using: str) -> bool:
+    """Whether this thread wrote relationship rows in the transaction still open on ``using``.
+
+    The rows may roll back, so nothing read from them is kept until that
+    transaction ends: by commit, or when the connection is seen outside it. A
+    rolled-back transaction whose outermost ``atomic`` object is entered again
+    (a decorated function) still counts as open until the thread is seen
+    outside a transaction, and a transaction the application ends itself counts
+    as open until autocommit returns; both only cost reads.
+    """
+    from django.db import connections
+
+    written = _uncommitted_transactions()
+    recorded = written.get(using)
+    if recorded is None:
+        return False
+    connection = connections[using]
+    if recorded is _MANUAL_TRANSACTION:
+        still_open = _manual_transaction(connection)
+    else:
+        still_open = (
+            connection.in_atomic_block
+            and bool(connection.atomic_blocks)
+            and connection.atomic_blocks[0] is recorded
+        )
+    if not still_open:
+        del written[using]
+    return still_open
 
 
 def mark_db_loaded_schemas_stale(**kwargs: Any) -> None:
