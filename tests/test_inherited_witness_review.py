@@ -268,12 +268,19 @@ def test_embeddings_inside_and_outside_agree(storage, shape, actor, settings):
 
 
 def counts(make, reads=3):
+    """The statements of each read, and how many of them read the actor's grant profile.
+
+    Inside an evaluator scope the profile (proposal 0019) is read at the first
+    read for an actor, and kept for the scope.
+    """
     out = []
+    profiles = []
     for _ in range(reads):
         with CaptureQueriesContext(connection) as ctx:
             list(make().values_list("pk", flat=True))
         out.append(len(ctx.captured_queries))
-    return out
+        profiles.append(sum("rebac_profile" in query["sql"] for query in ctx.captured_queries))
+    return out, profiles
 
 
 @pytest.mark.django_db(transaction=True)
@@ -318,11 +325,17 @@ def test_statement_counts(storage, case, actor, settings):
     expected = ids(ScopePart.objects.with_actor(actor))
     context = transaction.atomic() if case == "atomic" else nullcontext()
     with context, evaluator_scope():
-        part = counts(lambda: ScopePart.objects.with_actor(actor))
+        part, profiles = counts(lambda: ScopePart.objects.with_actor(actor))
         result = ids(ScopePart.objects.with_actor(actor))
     assert result == expected
     base = 2 if case == "caveated_target" else 1
-    assert part == [base + 1, base, base]
+    # The first read reads the actor's profile. The administrator's holds the
+    # role's membership, so that read also decides the inherited witness; the
+    # member's holds none, so the profile folds the constant arm and no
+    # witness is decided.
+    witness = actor == ADMIN
+    assert profiles == [1, 0, 0]
+    assert part == [base + 1 + witness, base, base]
 
 
 # ---------------------------------------------------------------- SQL growth
@@ -504,7 +517,14 @@ def test_own_witness_statement_counts(storage, case, actor, settings):
     )
     ids(ScopeMessage.objects.with_actor(actor))
     with transaction.atomic() if case == "atomic" else nullcontext(), evaluator_scope():
-        observed = counts(lambda: ScopeMessage.objects.with_actor(actor))
+        observed, profiles = counts(lambda: ScopeMessage.objects.with_actor(actor))
     base = 2 if case == "caveated_target" else 1
     repeat = base + (actor == ADMIN and case in ("atomic", "expiring"))
-    assert observed == [base + 1, repeat, repeat]
+    # The first read reads the actor's profile, kept for the scope: no
+    # relationship row is written in it. The administrator's holds the role's
+    # membership, so that read also decides the own witness; the member's
+    # holds none, so the profile folds the constant arm and no witness is
+    # decided.
+    witness = actor == ADMIN
+    assert profiles == [1, 0, 0]
+    assert observed == [base + 1 + witness, repeat, repeat]

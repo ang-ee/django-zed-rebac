@@ -343,6 +343,7 @@ class Compiler:
         point: PointRow | None = None,
         fold: Key | None = None,
         witnessed: frozenset[Key] = frozenset(),
+        profile: frozenset[Key] | None = None,
     ) -> None:
         self.schema = tagged.schema if tagged is not None else schema
         self.actor = actor
@@ -364,6 +365,13 @@ class Compiler:
         self.parametric = parametric
         self.point = point
         self.witnessed = witnessed
+        # The stored relation keys the actor can hold, or None when undecided
+        # (proposal 0019): a decidable arm outside it is not compiled.
+        self.profile = profile
+        self._decidable_sets: dict[Key, bool] = {}
+        # How many negations enclose what is being compiled. The profile leaves
+        # an arm out only at zero: under a subtraction a missing arm would admit.
+        self._negated = 0
         self.shape = actor_shape(self.program, actor, using)
         self._memo: dict[tuple[Any, ...], Q] = {}
         self._relevant: dict[Key, frozenset[Key]] = {}
@@ -609,8 +617,13 @@ class Compiler:
         """
         if not self.has_recursion(key):
             return _FALSE
-        upper_without_depth = self._holds(key, at, Bound.UPPER, {}, depth_possible=False)
-        lower_without_depth = self._holds(key, at, Bound.LOWER, {}, depth_possible=False)
+        # The upper bound is negated here: compile both without the profile.
+        self._negated += 1
+        try:
+            upper_without_depth = self._holds(key, at, Bound.UPPER, {}, depth_possible=False)
+            lower_without_depth = self._holds(key, at, Bound.LOWER, {}, depth_possible=False)
+        finally:
+            self._negated -= 1
         return _or(_not(upper_without_depth), lower_without_depth)
 
     # ---------- Nodes ----------
@@ -626,7 +639,7 @@ class Compiler:
     ) -> Q:
         if key not in self.program.dependencies:
             return _FALSE
-        memo = (key, at, bound, self._path(key, visits), depth_possible)
+        memo = (key, at, bound, self._path(key, visits), depth_possible, self._negated > 0)
         found = self._memo.get(memo)
         if found is None:
             # A positive inherited witness selects the same denial-only
@@ -1312,7 +1325,12 @@ class Compiler:
         )
         result = _or(point, self._wire_membership(at, every, closure))
         if bound is Bound.UPPER and depth_possible:
-            known = base_at(At(key[0], F("resource_id"), None, False))
+            # Negated by the convergence test: compiled without the profile.
+            self._negated += 1
+            try:
+                known = base_at(At(key[0], F("resource_id"), None, False))
+            finally:
+                self._negated -= 1
             if known is not _TRUE:
                 result = _or(
                     result, _and(self._not_converged(edges, closure, known), _not_null(at.ref))
@@ -1481,6 +1499,21 @@ class Compiler:
         depth_possible: bool,
     ) -> Q:
         """De Morgan's rule gives one anti-join per disjunct, never NOT IN."""
+        self._negated += 1
+        try:
+            return self._negation(definition, expr, at, bound, visits, depth_possible)
+        finally:
+            self._negated -= 1
+
+    def _negation(
+        self,
+        definition: Definition,
+        expr: PermExpr,
+        at: At,
+        bound: Bound,
+        visits: Mapping[Key, int],
+        depth_possible: bool,
+    ) -> Q:
         arms = self._union_arms(expr)
         if len(arms) > 1:
             return _and(
@@ -1837,11 +1870,22 @@ class Compiler:
                 group = ("subject", allowed.type, allowed.id)
             shapes[group] = _or(shapes.get(group, _FALSE), shape)
         admitted = _FALSE
+        # The actor holds no row of this relation, itself or through a stored
+        # subject set: the groups that end at the actor cannot match.
+        absent = (
+            self.profile is not None
+            and not self._negated
+            and (definition.resource_type, relation.name) not in self.profile
+        )
         # Tests that nest a subquery go last (see ``_tuple_identity_rows``).
         order = {"subject": 0, "wildcard": 1, "set": 2, "arrow": 3}
         for (kind, allowed_type, detail), shape in sorted(
             shapes.items(), key=lambda item: (order[item[0][0]], item[0][1], item[0][2])
         ):
+            if absent and (
+                kind == "subject" or (kind == "set" and self._decidable_set((allowed_type, detail)))
+            ):
+                continue
             subject_at = At(allowed_type, F("subject_id"), None, False)
             if kind == "arrow":
                 assert target is not None
@@ -1877,6 +1921,37 @@ class Compiler:
         if admitted is _FALSE:
             return _FALSE
         return self._tuple_membership(at, self._live(rows, relation, bound), admitted)
+
+    def _decidable_set(self, key: Key, seen: frozenset[Key] = frozenset()) -> bool:
+        """Whether membership of a subject set is read from relationship rows alone.
+
+        The profile follows stored subject sets only: a set whose relation is
+        backed, or that admits a set which is, may hold the actor without a row
+        the profile reads, so an arm through it is always compiled.
+        """
+        found = self._decidable_sets.get(key)
+        if found is not None:
+            return found
+        if key in seen:
+            return True
+        definition = self.schema.get_definition(key[0])
+        relation = next(
+            (item for item in definition.relations if item.name == key[1])
+            if definition
+            else iter(()),
+            None,
+        )
+        decidable = relation is not None and relation.backing is None
+        if decidable:
+            assert relation is not None
+            decidable = all(
+                not allowed.relation
+                or self._decidable_set((allowed.type, allowed.relation), seen | {key})
+                for allowed in relation.allowed_subjects
+            )
+        if not seen:
+            self._decidable_sets[key] = decidable
+        return decidable
 
     def _is_relation(self, type_: str, name: str) -> bool:
         definition = self.schema.get_definition(type_)

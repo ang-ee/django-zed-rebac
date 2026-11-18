@@ -1174,6 +1174,7 @@ All settings prefixed `REBAC_`. No nested dict. Read via the public `app_setting
 | `REBAC_AUDIT_DENIALS` | `False` | `bool` | Also write a `PermissionAuditEvent` row per denied check. Off by default: denial traffic (an attacker fuzzing ids) can dominate the table. |
 | `REBAC_LINT_BARE_PREFETCH` | `True` | `bool` | Toggle for `rebac.W003` — the structural warning that an RBAC-bound model has an FK / O2O / M2M to another RBAC-bound model. A bare-string `select_related` can load unguarded joined rows; a bare-string `prefetch_related` follows the related manager's source pin, or ambient/non-strict scope when no pin exists. Enabled by default so the risky shape is visible; use `rebac_select_related()` / `rebac_prefetch_related()` or the Strawberry-Django optimizer for protected paths. |
 | `REBAC_EVALUATOR_CACHE_SIZE` | `10000` | `int` | Max entries in the per-scope evaluator's check cache, and the bound on its field-visibility memo (least recently used dropped first). |
+| `REBAC_ACTOR_PROFILES` | `True` | `bool` | Inside an evaluator scope, compile statements for the stored grants the actor can hold: one extra statement per scope, actor and database reads which stored relations name the actor, and arms outside that set are not compiled. See [Actor grant profiles](#actor-grant-profiles). |
 | `REBAC_ZOOKIE_TRANSPORT` | `"none"` | `"none"` \| `"header"` \| `"session"` | Optional cross-request transport for the current Zookie. |
 | `REBAC_ZOOKIE_HEADER_NAME` | `"X-Rebac-Zookie"` | `str` | Header name used when `REBAC_ZOOKIE_TRANSPORT = "header"`. |
 | `REBAC_ZOOKIE_SESSION_KEY` | `"_rebac_zookie"` | `str` | Session key used when `REBAC_ZOOKIE_TRANSPORT = "session"`. |
@@ -2124,8 +2125,9 @@ django-cte renders the outer prefix from frozen bodies on a cache miss; no SQL
 is parsed or rewritten. Compiler query identity and mutation state remain
 Django's own.
 The statement-template key includes the policy, operation and permission, actor shape, database
-alias and vendor, depth limit, active relationship model and scope model.
-The key contains no membership lists, row decisions or fact verdicts. The
+alias and vendor, depth limit, active relationship model and scope model, and inside an evaluator
+scope the actor's grant profile (see [Actor grant profiles](#actor-grant-profiles)).
+The key contains no ids, membership lists, row decisions or fact verdicts. The
 actor shape includes its type and relation suffix, canonical identity
 status, named id and authentication status. Actor id, application clock,
 point resource id, a bounded read's candidate identities and manual-schema
@@ -2155,6 +2157,48 @@ again. Before any policy is published the
 fence matches nothing and reads are closed. A manual schema (`set_schema()`, `rebac.testing.install_schema()`)
 has a digest of the schema as its revision, and the generation row must
 exist.
+
+#### Actor grant profiles
+
+Inside an evaluator scope a statement is compiled for the stored grants its
+actor can hold (proposal 0019). The actor's **profile** is the set of stored
+relation keys `(resource_type, relation)` in which a relationship row names the
+actor, a wildcard of the actor's type, or a stored subject set the actor is in,
+subject sets followed to a fixed point over relationship rows. Expiry and
+caveats are not read, so the profile is a superset of what the actor holds.
+
+- **What is left out.** In a stored relation whose key is not in the profile,
+  the allowed-subject groups that end at the actor are not compiled: the plain
+  subject, and a subject set whose relation is stored and admits only plain
+  subjects and other such sets. A wildcard, an arrow through the relation, and
+  a subject set whose relation is backed compile as ever. The ordinary
+  traversal folds the algebra, so a constant arm the actor cannot hold needs no
+  witness.
+- **Granting positions only.** Nothing is left out inside the operand of an
+  exclusion, in the depth statement or in a recursion's convergence test: there
+  a missing arm would admit instead of deny.
+- **When it is read.** One statement at the first compile for an actor and
+  database in the scope. It is kept for the scope and read again after a
+  library relationship write. It is not kept while the thread has written
+  relationship rows in a transaction that is still open, because those rows may
+  roll back: until that transaction ends it is read at each compile, and a
+  queryset read compiles twice (its scope, then its statement). A later
+  transaction, or one that writes no relationship row, keeps its profile. A
+  call with an explicit consistency requirement reads it at that call.
+- **Freshness.** A revoked or expired grant is still compiled and evaluated
+  live. A point check is exact: before it answers no it reads the profile
+  again, and a profile that moved decides the check anew. A read may be
+  narrower, never wider, until the scope ends when a grant of a kind the actor
+  did not hold is written by another process or behind the library; a check in
+  the same scope refreshes the profile and reads are exact after it.
+- **Who has one.** An actor that is a plain subject: no subject relation, not
+  anonymous, a real id. Outside an evaluator scope, and for any other actor,
+  every statement is compiled as before.
+- **Kept statements.** A statement is kept per profile and shared by every
+  actor with that profile. The 512-entry statement cache therefore holds fewer
+  permissions when many distinct profiles are in use.
+
+`REBAC_ACTOR_PROFILES = False` compiles every statement without a profile.
 
 #### The clock
 

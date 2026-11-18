@@ -13,6 +13,15 @@ from tests.testapp.models import Folder, Post, ScopePart
 pytestmark = [pytest.mark.django_db(transaction=True), pytest.mark.pg_delta]
 
 
+def _profiles(captured: CaptureQueriesContext) -> int:
+    """The statements that read the actor's grant profile (proposal 0019).
+
+    Inside an evaluator scope it is read once, at the first compile for the
+    actor, before any witness.
+    """
+    return sum("rebac_profile" in query["sql"] for query in captured.captured_queries)
+
+
 @pytest.mark.parametrize("storage", ["denormalized", "registry"])
 @pytest.mark.parametrize("chain", [False, True])
 def test_inherited_witness_rechecks_revocation(storage, chain, settings):
@@ -29,7 +38,9 @@ def test_inherited_witness_rechecks_revocation(storage, chain, settings):
     with evaluator_scope():
         with CaptureQueriesContext(connection) as first:
             prepared = ScopePart.objects.with_actor(ADMIN).scoped()
-        assert len(first) == 1  # One distinct witness; the policy is already warm.
+        # The actor's profile, then one distinct witness; the policy is already warm.
+        assert len(first) == 2
+        assert _profiles(first) == 1
         assert list(prepared.values_list("fragment_id", flat=True)) == [1, 2, 3]
         with CaptureQueriesContext(connection) as again:
             ScopePart.objects.with_actor(ADMIN).scoped()
@@ -118,7 +129,9 @@ def test_own_and_distinct_inherited_witnesses_share_one_statement(storage, setti
     with evaluator_scope() as evaluator:
         with CaptureQueriesContext(connection) as first:
             prepared = Post.objects.with_actor(ADMIN).scoped()
-        assert len(first) == 1
+        # The actor's profile, then one statement for both witnesses.
+        assert len(first) == 2
+        assert _profiles(first) == 1
         assert evaluator.stats()["constant_witness_entries"] == 2
         assert list(prepared.values_list("pk", flat=True)) == [post.pk]
         with CaptureQueriesContext(connection) as repeat:

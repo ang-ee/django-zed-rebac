@@ -13,6 +13,11 @@ the answer for the request, and for every other actor the arms leave the
 statement, with the union branch that lists every row of the model. Elsewhere
 the witness is decided at each read and the statement keeps every arm.
 
+Inside a scope the actor's grant profile (proposal 0019) is read first, by a
+statement of its own. An actor who holds no row of the relation a constant arm
+reads (``org/role#member`` here) has the arm folded by the profile: no witness
+is decided for it.
+
 Tests that need the kept answer run outside a transaction (``KEPT``).
 """
 
@@ -216,14 +221,24 @@ def _without_revision(sql: str) -> str:
     return re.sub(r"'[0-9a-f]{32}'", "'revision'", sql)
 
 
+def _profiles(statements: list[str]) -> int:
+    """How many of ``statements`` read the actor's grant profile (proposal 0019).
+
+    Inside an evaluator scope it is read at the first compile for an actor,
+    after a library relationship write, and again before a check answers no.
+    """
+    return sum("rebac_profile" in sql for sql in statements)
+
+
 @KEPT
 def test_an_actor_holding_a_constant_arm_reads_without_the_policy(console):
     _local, _folders, posts = console
     with evaluator_scope():
         ids, statements = _read(ADMIN)
     assert ids == [post.pk for post in posts]
-    # The witness, then the read.
-    assert len(statements) == 2
+    # The actor's profile, the witness, then the read.
+    assert len(statements) == 3
+    assert _profiles(statements) == 1
     statement = statements[-1]
     # The read is the policy fence and the constant arm: no arm of the post,
     # no folder, no console type, and the post table only as the selecting
@@ -240,10 +255,42 @@ def test_the_member_statement_is_the_policy_without_its_constant_arms(console):
     with evaluator_scope():
         ids, statements = _read(MEMBER)
     assert ids == [posts[0].pk, posts[1].pk, posts[2].pk, posts[4].pk]
-    # The same policy without the post's constant arm, read outside a scope.
+    # The same policy without the post's constant arm, read in a scope of its
+    # own: both statements are compiled for the member's profile, which leaves
+    # out every arm the member holds no row of (proposal 0019).
     install_schema(_console(POST_ARMS))
     read.reset()
-    reference_ids, reference = _read(MEMBER)
+    with evaluator_scope():
+        reference_ids, reference = _read(MEMBER)
+    assert reference_ids == ids
+    assert _without_revision(statements[-1]) == _without_revision(reference[-1])
+
+
+@KEPT
+def test_a_member_of_another_role_has_the_witness_decide_the_constant_arms(console):
+    local, _folders, posts = console
+    # A membership of another role: the member's profile holds ``org/role#member``,
+    # so it folds no constant arm, and the witness decides them.
+    local.write_relationships([RelationshipTuple(ObjectRef("org/role", "other"), "member", MEMBER)])
+    with evaluator_scope() as evaluator:
+        ids, statements = _read(MEMBER)
+        again_ids, again = _read(MEMBER)
+        assert evaluator.stats()["constant_witness_entries"] == 1
+    # Decided false: the member reads the rows of the other arms, not every post.
+    assert ids == again_ids == [posts[0].pk, posts[1].pk, posts[2].pk, posts[4].pk]
+    # The profile, the witness, then the read. The answer is kept: the next
+    # read is the same statement alone.
+    assert len(statements) == 3
+    assert _profiles(statements) == 1
+    assert again == statements[-1:]
+    # The post's own constant arm leaves the statement; the folder's stays, as
+    # an inherited witness that does not hold keeps the ordinary predicate.
+    assert statements[-1].count("'org/role'") == 1
+    # The same policy without the post's constant arm, read for the same profile.
+    install_schema(_console(POST_ARMS))
+    read.reset()
+    with evaluator_scope():
+        reference_ids, reference = _read(MEMBER)
     assert reference_ids == ids
     assert _without_revision(statements[-1]) == _without_revision(reference[-1])
 
@@ -251,7 +298,10 @@ def test_the_member_statement_is_the_policy_without_its_constant_arms(console):
 @KEPT
 def test_the_witness_is_kept_for_the_request(console):
     _local, folders, _posts = console
-    for actor in (ADMIN, MEMBER):
+    # The administrator's profile holds the role's membership: the arm is
+    # witnessed. The member's holds none, so the profile folds the arm and no
+    # witness is decided at all.
+    for actor, witnesses in ((ADMIN, 1), (MEMBER, 0)):
         with evaluator_scope() as evaluator:
             _ids, first = _read(actor)
             # Another read of the same permission, and one of another type
@@ -259,11 +309,18 @@ def test_the_witness_is_kept_for_the_request(console):
             _ids, again = _read(actor, folder=folders[1])
             with CaptureQueriesContext(connection) as captured:
                 list(Folder.objects.with_actor(actor).values_list("pk", flat=True))
-            assert evaluator.stats()["constant_witness_entries"] == 1
-        assert (len(first), len(again), len(captured.captured_queries)) == (2, 1, 1)
+            assert evaluator.stats()["constant_witness_entries"] == witnesses, actor
+        # The profile, the witness where there is one, then the read.
+        assert (len(first), len(again), len(captured.captured_queries)) == (
+            2 + witnesses,
+            1,
+            1,
+        ), actor
+        assert _profiles(first) == 1, actor
         with evaluator_scope():
             _ids, next_request = _read(actor)
-        assert len(next_request) == 2
+        assert len(next_request) == 2 + witnesses, actor
+        assert _profiles(next_request) == 1, actor
 
 
 @KEPT
@@ -279,15 +336,22 @@ def test_a_model_backed_relation_of_the_user_type_leaves_the_types_that_never_re
     for type_ in ("auth/user", "blog/post", "console/desk"):
         assert local._cache_generation(type_) is None, type_
     # So the witness of ``org/role`` is kept for the request: one per request
-    # for the administrator, as for the member.
-    for actor in (ADMIN, MEMBER):
+    # for the administrator. The member's profile holds no role membership, so
+    # it folds the arm and no witness is decided (proposal 0019).
+    for actor, witnesses in ((ADMIN, 1), (MEMBER, 0)):
         with evaluator_scope() as evaluator:
             _ids, first = _read(actor)
             _ids, again = _read(actor, folder=folders[1])
             with CaptureQueriesContext(connection) as captured:
                 list(Folder.objects.with_actor(actor).values_list("pk", flat=True))
-            assert evaluator.stats()["constant_witness_entries"] == 1
-        assert (len(first), len(again), len(captured.captured_queries)) == (2, 1, 1)
+            assert evaluator.stats()["constant_witness_entries"] == witnesses, actor
+        # The profile, the witness where there is one, then the read.
+        assert (len(first), len(again), len(captured.captured_queries)) == (
+            2 + witnesses,
+            1,
+            1,
+        ), actor
+        assert _profiles(first) == 1, actor
     for actor in (ADMIN, MEMBER, OUTSIDER):
         with evaluator_scope():
             # The kept witness first, so that the comparison reads the
@@ -325,19 +389,31 @@ def test_inside_a_transaction_a_held_arm_is_decided_at_each_read(console):
         with CaptureQueriesContext(connection) as checks:
             assert _check(local, ADMIN, posts[5])
             assert _check(local, MEMBER, posts[4])
-        assert evaluator.stats()["constant_witness_entries"] == 2
+        # The administrator's only: the member's profile folds the arm.
+        assert evaluator.stats()["constant_witness_entries"] == 1
+    # The fixture's library writes are not committed, so the profile is not
+    # kept: each compile reads it, both the read's scope, which decides the
+    # witness, and its statement.
     # The administrator: the witness, then the constant statement, every time.
     for ids, statements in admin:
         assert ids == [post.pk for post in posts]
-        assert len(statements) == 2
-    # The member: one witness for the request; its remembered answer selects
-    # the policy's statement, every arm in it, and runs nothing.
+        assert len(statements) == 4
+        assert _profiles(statements) == 2
+    # The member holds no role membership: the profile folds the constant
+    # arms, so no witness is decided, and both reads run one statement, the
+    # policy's without the arms the member holds no row of, the constant
+    # arms among them.
     (first_ids, first), (again_ids, again) = member
     assert len(first_ids) == len(again_ids) == 4
-    assert len(first) == 2 and len(again) == 1
-    assert first[-1] == again[-1] == policy[-1]
-    # A check: the witness for the administrator, the lower bound for the member.
-    assert len(checks.captured_queries) == 2
+    assert len(first) == len(again) == 3
+    assert _profiles(first) == _profiles(again) == 2
+    assert first[-1] == again[-1]
+    assert "'org/role'" in policy[-1]
+    assert "'org/role'" not in first[-1]
+    # A check: the witness for the administrator, the lower bound for the
+    # member, each after its profile.
+    assert len(checks.captured_queries) == 4
+    assert _profiles([query["sql"] for query in checks.captured_queries]) == 2
 
 
 def test_outside_an_evaluator_scope_the_statement_keeps_every_arm(console):
@@ -383,19 +459,27 @@ def test_a_constant_arm_granted_within_a_request_waits_for_the_next_read_scope(c
 
 
 @KEPT
-def test_after_a_write_behind_the_library_a_read_and_a_check_can_disagree_until_the_scope_ends(
-    console,
-):
-    local, _folders, _posts = console
+def test_after_a_write_behind_the_library_reads_stay_narrower_until_a_check(console):
+    local, _folders, posts = console
     with sudo(reason="constant arms fixture"):
         alone = Post.objects.create(title="no folder")
     with evaluator_scope():
         assert alone.pk not in _read(MEMBER)[0]
         _grant_behind_the_library("member")
-        # The check evaluates every arm; the read keeps the arms out (a known
+        # The profile read at the first read holds no role membership, and no
+        # library write marks it stale: the read keeps the arms out (a known
         # limit: the read is narrower, never wider).
+        ids, statements = _read(MEMBER)
+        assert alone.pk not in ids
+        assert _profiles(statements) == 0
+        # A check is exact: before it answers no it reads the profile again,
+        # finds the membership and decides anew.
         assert _check(local, MEMBER, alone)
-        assert alone.pk not in _read(MEMBER)[0]
+        # The scope keeps the profile the check read: the reads after it hold
+        # the constant arm.
+        ids, statements = _read(MEMBER)
+        assert ids == [*(post.pk for post in posts), alone.pk]
+        assert _profiles(statements) == 0
     with evaluator_scope():
         assert alone.pk in _read(MEMBER)[0]
 
@@ -408,17 +492,20 @@ def test_a_point_check_decides_the_constant_arms_again(console):
     with evaluator_scope():
         with CaptureQueriesContext(connection) as captured:
             assert _check(local, ADMIN, posts[5])
-        # The witness is the check.
-        assert len(captured.captured_queries) == 1
+        # The actor's profile, then the witness, which is the check.
+        assert len(captured.captured_queries) == 2
+        assert _profiles([query["sql"] for query in captured.captured_queries]) == 1
         _revoke_behind_the_library("admin")
         # A remembered answer never grants by itself.
         assert not _check(local, ADMIN, posts[5])
     with evaluator_scope():
-        # The witness is kept as false for the member.
+        # The member's profile holds no role membership: it folds the arm, and
+        # no witness is decided.
         assert not _check(local, MEMBER, alone)
         _grant_behind_the_library("member")
-        # A point check never leaves the constant arms out: it sees the grant,
-        # without a depth error.
+        # A point check never leaves the constant arms out: before it answers
+        # no it reads the profile again, and sees the grant, without a depth
+        # error.
         assert _check(local, MEMBER, alone)
 
 
@@ -567,8 +654,10 @@ def test_a_permission_projection_of_an_administrator_is_the_constant_statement(c
     with evaluator_scope():
         with CaptureQueriesContext(connection) as captured:
             assert list(rows.values_list("readable", flat=True)) == [True] * len(posts)
-    # The projection decides the witness when its SQL is compiled, then reads.
-    assert len(captured.captured_queries) == 2
+    # The projection reads the actor's profile and decides the witness when its
+    # SQL is compiled, then reads.
+    assert len(captured.captured_queries) == 3
+    assert _profiles([query["sql"] for query in captured.captured_queries]) == 1
     assert "console/t" not in captured.captured_queries[-1]["sql"]
 
 
@@ -591,7 +680,11 @@ def test_a_permission_that_holds_outright_runs_no_witness():
     with evaluator_scope():
         ids, statements = _read(MEMBER)
     assert ids == [post.pk for post in posts]
-    assert len(statements) == 1
+    # The actor's profile, then the policy's statement, its fence alone: no
+    # witness. This transaction writes no relationship row, so the profile is
+    # read once, whatever an earlier test's transaction wrote.
+    assert len(statements) == 2
+    assert _profiles(statements) == 1
 
 
 # Policies over posts whose constant arms sit in each position the analysis
@@ -679,8 +772,13 @@ def test_only_a_disjunct_of_the_permission_is_a_constant_arm(shape):
     if shape == "constant-relation":
         assert len(reference[ROLE]) == 3
         with evaluator_scope():
-            # Decided from the actor's shape when the statement is compiled.
-            assert len(_read(ROLE)[1]) == len(_read(ADMIN)[1]) == 1
+            # Decided from the actor's shape when the statement is compiled:
+            # no witness. The fixture's library writes are not committed, so
+            # the actor's profile is not kept: the read's scope and its
+            # statement each read it.
+            role, admin = _read(ROLE)[1], _read(ADMIN)[1]
+            assert len(role) == len(admin) == 3
+            assert _profiles(role) == _profiles(admin) == 2
 
 
 @KEPT
@@ -724,11 +822,14 @@ def test_the_witness_is_kept_per_database(tmp_path):
             )
         viewed = list(Post._base_manager.order_by("pk").values_list("pk", flat=True))[:1]
         with evaluator_scope() as evaluator:
-            # It holds none on the default one: kept there, for that database.
+            # It holds none on the default one: the member's profile there
+            # folds the arm, and no witness is decided for that database.
             assert _read(MEMBER)[0] == viewed
+            # The other database's profile holds the role's membership: the
+            # witness is decided, and kept, there alone.
             ids = Post.objects.using(alias).with_actor(MEMBER).order_by("pk")
             assert list(ids.values_list("pk", flat=True)) == [post.pk for post in remote]
-            assert evaluator.stats()["constant_witness_entries"] == 2
+            assert evaluator.stats()["constant_witness_entries"] == 1
     finally:
         other.close()
         del connections[alias]
@@ -873,12 +974,14 @@ def test_keys_whose_constant_arms_overlap_share_each_arms_witness():
         post = Post.objects.create(title="post", folder=folder)
     local.write_relationships([RelationshipTuple(ObjectRef("org/role", "admin"), "member", ADMIN)])
     read.reset()
-    for actor, expected in ((ADMIN, [post.pk]), (MEMBER, [])):
+    # The member's profile holds no role membership: it folds both arms, and no
+    # witness is decided.
+    for actor, expected, witnesses in ((ADMIN, [post.pk], 2), (MEMBER, [], 0)):
         with evaluator_scope() as evaluator:
             list(Folder.objects.with_actor(actor).values_list("pk", flat=True))
             with CaptureQueriesContext(connection) as captured:
                 ids = list(Post.objects.with_actor(actor).values_list("pk", flat=True))
             # Each arm is one witness: the folder's read decided the post's arm.
-            assert evaluator.stats()["constant_witness_entries"] == 2
+            assert evaluator.stats()["constant_witness_entries"] == witnesses, actor
         assert ids == expected
         assert len(captured.captured_queries) == 1, actor

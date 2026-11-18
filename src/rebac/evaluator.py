@@ -104,6 +104,7 @@ class PermissionEvaluator:
         "_check_cache",
         "_constant_witnesses",
         "_max_size",
+        "_profiles",
         "_schema_scope",
         "_visibility_decision_ids",
         "_visibility_decisions",
@@ -120,6 +121,9 @@ class PermissionEvaluator:
         # entries and by the candidate ids they hold together.
         self._visibility_decisions: OrderedDict[tuple[Any, ...], frozenset[str]] = OrderedDict()
         self._visibility_decision_ids = 0
+        # The stored relation keys an actor can hold, per backend, database and
+        # actor, with the relationship generation it was read at (proposal 0019).
+        self._profiles: dict[Hashable, tuple[int, frozenset[tuple[str, str]]]] = {}
         self._max_size = max_size
         self._schema_scope = SchemaScope()
 
@@ -182,6 +186,7 @@ class PermissionEvaluator:
         """
         self._check_cache.clear()
         self._constant_witnesses.clear()
+        self._profiles.clear()
         self._visibility_decisions.clear()
         self._visibility_decision_ids = 0
         self._schema_scope.clear()

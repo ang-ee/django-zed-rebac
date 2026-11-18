@@ -23,6 +23,15 @@ from tests.backend_setup import atomic_source_write
 from tests.testapp.models import Post
 
 
+def _profile_reads(captured: CaptureQueriesContext) -> int:
+    """The statements that read the actor's grant profile (proposal 0019).
+
+    Inside an evaluator scope it is read at the first compile, and again after
+    a library relationship write.
+    """
+    return sum("rebac_profile" in query["sql"] for query in captured.captured_queries)
+
+
 @pytest.mark.pg_delta
 @pytest.mark.django_db(transaction=True)
 @override_settings(REBAC_FIELD_READ_MODE="redact")
@@ -54,18 +63,24 @@ def test_field_visibility_evaluator_memo_skips_second_materialization():
             first_rows = list(Post.objects.with_actor(actor))
         with CaptureQueriesContext(connection) as second:
             second_rows = list(Post.objects.with_actor(actor))
-        assert len(first) == 2  # One row statement and one shared visibility statement.
+        # The actor's profile, one row statement and one shared visibility statement.
+        assert len(first) == 3
+        assert _profile_reads(first) == 1
         assert len(second) == 1  # The row statement only, zero visibility statements.
         assert evaluator.stats()["visibility_entries"] == 2
         owner = RelationshipTuple(resource, "owner", actor)
         active.write_relationships([owner])
         with CaptureQueriesContext(connection) as after_grant:
             granted_rows = list(Post.objects.with_actor(actor))
-        assert len(after_grant) == 2  # The relationship generation invalidated the memo.
+        # The relationship generation invalidated the memo and the profile: the
+        # profile is read again, then both statements.
+        assert len(after_grant) == 3
+        assert _profile_reads(after_grant) == 1
         active.delete_relationship(owner)
         with CaptureQueriesContext(connection) as after_revoke:
             revoked_rows = list(Post.objects.with_actor(actor))
-        assert len(after_revoke) == 2
+        assert len(after_revoke) == 3
+        assert _profile_reads(after_revoke) == 1
     assert first_rows[0].title is None and first_rows[0].body is None
     assert second_rows[0].title is None and second_rows[0].body is None
     assert granted_rows[0].title == "private" and granted_rows[0].body == "private"

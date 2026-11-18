@@ -171,7 +171,11 @@ def test_lazy_with_actor_count_is_one_statement(direct_scope):
         with CaptureQueriesContext(connection) as queries:
             count = Post.objects.with_actor(ACTOR).count()
     assert count == 1
-    assert len(queries) == 1
+    # One count statement. The fixture's library write is not committed, so
+    # the actor's profile is not kept (proposal 0019): the count's scope and
+    # its statement each read it first.
+    assert len(queries) == 3
+    assert sum("rebac_profile" in query["sql"] for query in queries.captured_queries) == 2
 
 
 def test_tuple_write_inside_evaluator_scope_is_visible_next_statement(direct_scope):
