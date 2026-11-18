@@ -33,7 +33,7 @@ created records. 0.35.0 and 0.35.1 read every such row and looked each one up as
 |---|---|---|
 | a few | 0.5–1.3 ms, one statement | 0.9–2.2 ms, one statement |
 | 25,000 (scale fixture) | 52–53 ms | 7–9 ms, two statements |
-| 100,000 (a consumer's composed policy) | 240 ms | 8 ms, two statements |
+| 100,000 (a consumer's composed policy) | 240 ms | 4–14 ms, two statements |
 
 - One statement reads at most 1,000 rows that name the actor or a wildcard of its type, and at most 1,000 that
   name a subject set the actor is in, and counts them by key (`_PROFILE_ROWS`).
@@ -207,8 +207,11 @@ shorten that path.
   every statement already does. An actor in very many sets pays for them; one in more than 64 whose sets hold
   more than 1,000 rows has no profile.
 - **A relation name is probed for every schema relation that can hold stored rows.** A policy with hundreds of
-  distinct relation names makes the second statement that long. Measured at 8 ms in all for an actor with
-  100,000 rows on a composed policy of 541 relations.
+  distinct relation names makes the second statement that long. A composed policy of 541 relations has 25 such
+  names: an 8.6 KB statement that plans in 1.6 ms and runs in 0.2 ms.
+- **The statements are built by the ORM at each reading.** For the actor with 100,000 rows the two statements
+  take about 4 ms and the reading about 9 ms; for an actor with a few rows, 0.6 ms and 1.9 ms. Keeping their
+  text per policy, as permission statements are kept, would remove most of the difference. It is not built.
 - **16 PostgreSQL 17 manifest cells were re-taken for 0.35.2.** The directly granted and the group-granted
   actors of the scale matrix both pass the bound, so their statements name relations by name. The capture run
   showed the frozen rescan unchanged in each cell (same count), and no other cell failed.

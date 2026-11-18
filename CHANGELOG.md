@@ -26,9 +26,9 @@ pre-1.0; breaking changes within a minor version are explicitly called out.
     never narrower: rows and decisions do not change.
   - An actor in more than 64 subject sets whose rows pass the bound has no
     profile, and its statements are compiled in full.
-  - Measured in the registry layout: 100,000 rows, 240 ms to 8 ms; 25,000
-    rows, 52–53 ms to 7–9 ms. An actor with a few rows reads its profile in
-    0.9–2.2 ms, against 0.5–1.3 ms: the statement is longer.
+  - Measured in the registry layout: 100,000 rows, 240 ms to 4–14 ms;
+    25,000 rows, 52–53 ms to 7–9 ms. An actor with a few rows reads its
+    profile in 0.9–2.2 ms, against 0.5–1.3 ms: the statement is longer.
 
 ### Changed
 
