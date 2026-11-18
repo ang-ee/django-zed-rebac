@@ -5,6 +5,8 @@ pre-1.0; breaking changes within a minor version are explicitly called out.
 
 ## [Unreleased]
 
+## [0.35.0] — 2026-11-18
+
 ### Changed
 
 - Inside an evaluator scope a statement is compiled for the stored grants its
