@@ -119,6 +119,10 @@ witness semantics:
   is expected; changed identity, a different rescan count, or a resolved
   rescan is a hard failure (strict unexpected pass). Follow up with the PG17
   shared-plan shape and remove the corresponding entries when it improves.
+  Eight of the non-admin cells (the directly granted actor inside an evaluator
+  scope, both layouts and JIT modes) were re-taken on 0.35.0 with the owner's
+  approval: its actor profile changes their statement, and the rescan, its
+  count and its time are unchanged (proposal 0019, Known limits).
 
 The per-cell mechanism reports pytest subtest xfails, never marks an entire
 32-cell fixture xfail. SQL/parameter/plan drift and every unrelated assertion

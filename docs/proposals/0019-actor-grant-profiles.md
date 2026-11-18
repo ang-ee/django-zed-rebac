@@ -1,9 +1,10 @@
 # 0019: Actor grant profiles
 
-Status: **accepted by the owner on 2026-11-18 for 0.35.0, then amended before any release.** The first build
-passed tiers 1 and 2 and failed the scale matrix; **the planner's bound** below is the amendment and awaits the
-owner's review. It generalises the negative constant-arm fold and the scope-local contract of proposal 0018 from
-constant arms to stored grants. The contract is specified in `docs/ARCHITECTURE.md § Actor grant profiles`.
+Status: **accepted by the owner on 2026-11-18 for 0.35.0 and amended before release.** The first build passed
+tiers 1 and 2 and failed the scale matrix; **the planner's bound** below is the amendment, which the owner
+approved the same day with the eight re-taken PostgreSQL 17 manifest cells. It generalises the negative
+constant-arm fold and the scope-local contract of proposal 0018 from constant arms to stored grants. The contract
+is specified in `docs/ARCHITECTURE.md § Actor grant profiles`.
 
 ## Problem
 
@@ -99,8 +100,8 @@ Tier 1: 4,441 pass. Tier 2 on PostgreSQL 17: 990 pass. Lint, format, mypy and py
 
 The scale matrix (50,000 messages, 500,000 parts, both storage layouts, three shapes, inside and outside a
 scope) on PostgreSQL 16, the release tier's version: 16 pass and the 8 frozen known limitations are unchanged,
-with no manifest edit. On PostgreSQL 17 every cell passes or is a frozen known limitation except eight, listed
-under Known limits.
+with no manifest edit. On PostgreSQL 17 every cell passes or is a frozen known limitation; eight of those were
+re-taken for this release (Known limits).
 
 Fifty-three existing tests pinned what the profile changes and were re-taken one by one, each against the
 statements actually issued: 51 statement or parameter counts (the profile's own statement, witnesses that are no
@@ -155,11 +156,12 @@ shorten that path.
   sparse-member listing timeout of proposal 0018, and more do on PostgreSQL 17. The new statement times out in
   the same PostgreSQL 16 cells. Re-taking frozen entries is the owner's decision, so the rule stays in this
   build.
-- **Eight PostgreSQL 17 cells need the owner's decision.** The directly granted actor's narrow reads in the
-  shared shape, inside a scope, both layouts and JIT modes, are frozen as the PostgreSQL 17 shared-read rescan of
-  proposal 0018. The profiled statement rescans the same way and reads as fast (332–359 ms against 329–397 ms
-  in the registry layout), but its text is new, so the harness reports identity drift. The release tier runs
-  PostgreSQL 16 and is not affected.
+- **Eight PostgreSQL 17 manifest cells were re-taken, with the owner's approval.** The directly granted
+  actor's narrow reads in the shared shape, inside a scope, both layouts and JIT modes, are frozen as the
+  PostgreSQL 17 shared-read rescan of proposal 0018. The profiled statement rescans the same way, with the same
+  rescan count, and reads as fast (332–359 ms against 329–397 ms in the registry layout). Its text is new, so
+  those eight entries now hold the 0.35.0 statement's fingerprints. The release tier runs PostgreSQL 16 and is
+  not affected.
 - **The bound keeps the full statement's caution, and its cost.** A sparse actor's broad read is planned as if
   it could see every row, as today. The first build read such a cell in 2.3 ms where the full statement takes
   25 to 114 ms; that gain is given up.
