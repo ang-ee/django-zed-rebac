@@ -231,6 +231,24 @@ class _Param(Expression):
         return "%s", (self.marker,)
 
 
+class _PlannerBound(Expression):
+    """A condition that never holds and that PostgreSQL cannot fold: an id set's planning size.
+
+    It stands where an actor's profile folded a constant arm (proposal 0019).
+    PostgreSQL plans a scalar subquery as a parameter it does not know, so the
+    arm keeps the size of its table in the estimate, and runs nothing: the
+    false parameter gates the scan. PostgreSQL has no other way to be told
+    that a set may be large.
+    """
+
+    def __init__(self) -> None:
+        # A Boolean output makes it a condition a filter accepts.
+        super().__init__(output_field=models.BooleanField())
+
+    def as_sql(self, compiler: Any, connection: Any) -> tuple[str, tuple[Any, ...]]:
+        return "(SELECT FALSE)", ()
+
+
 def clock() -> Expression:
     """The statement's instant, as one parameter bound when the statement runs."""
     return _Param(CLOCK, models.DateTimeField())
@@ -372,6 +390,8 @@ class Compiler:
         # How many negations enclose what is being compiled. The profile leaves
         # an arm out only at zero: under a subtraction a missing arm would admit.
         self._negated = 0
+        # This compiler without the profile, built when first asked (``_left_out``).
+        self._unprofiled: Compiler | None = None
         self.shape = actor_shape(self.program, actor, using)
         self._memo: dict[tuple[Any, ...], Q] = {}
         self._relevant: dict[Key, frozenset[Key]] = {}
@@ -1746,13 +1766,14 @@ class Compiler:
             ):
                 target_q = _TRUE
             else:
+                fixed = At(allowed.type, Value(resolved.target_id), None, False)
                 target_q = self._holds(
-                    target_key,
-                    At(allowed.type, Value(resolved.target_id), None, False),
-                    bound,
-                    visits,
-                    depth_possible=depth_possible,
+                    target_key, fixed, bound, visits, depth_possible=depth_possible
                 )
+                if target_q is _FALSE and self._left_out(
+                    target_key, fixed, at, bound, visits, depth_possible
+                ):
+                    target_q = Q(_PlannerBound())
         else:
             target_q = _truth(
                 self.shape.type == allowed.type
@@ -1769,6 +1790,43 @@ class Compiler:
             self._model_membership(at, rows, resolved.source_model, resolved.source_id_attr),
             target_q,
         )
+
+    def _left_out(
+        self,
+        key: Key,
+        fixed: At,
+        at: At,
+        bound: Bound,
+        visits: Mapping[Key, int],
+        depth_possible: bool,
+    ) -> bool:
+        """Whether a constant arm that sizes an id set is false by the profile alone.
+
+        The full statement plans every id set of the arm's type as large as the
+        type, because the arm may admit every row. Without the arm PostgreSQL
+        trusts its estimate of the actor's own rows, and where that is low it
+        scans the id set once for each row of a statement that embeds the scope
+        twice (``_PlannerBound``). A check of one object sizes no id set.
+        """
+        if self.profile is None or self._negated or _one_object(at.ref):
+            return False
+        if connections[self.using].vendor != "postgresql":
+            return False
+        if self._unprofiled is None:
+            # Its exploratory id sets must not become this statement's definitions.
+            self._unprofiled = Compiler(
+                self.schema,
+                self.actor,
+                self.using,
+                tagged=self.tagged,
+                verdicts=self.verdicts,
+                now=self.now,
+                depth_limit=self.depth_limit,
+                program=self.program,
+                parametric=self.parametric,
+            )
+        full = self._unprofiled._holds(key, fixed, bound, visits, depth_possible=depth_possible)
+        return full is not _FALSE
 
     def _attribute_relation(
         self,

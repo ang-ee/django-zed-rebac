@@ -15,9 +15,15 @@ pre-1.0; breaking changes within a minor version are explicitly called out.
   relations name the actor, directly, by wildcard or through stored subject
   sets; the groups of a stored relation that end at the actor are not compiled
   when no row names them. On a composed host of 129 readable types a member's
-  message read went from 1,618 KB of SQL and 977–997 ms to 454 KB and
-  365–387 ms with the same rows, and a locked write path held its lock for
-  0.3 s instead of 1.5 s.
+  message read went from 1,618 KB of SQL and 1,217 MiB of planner memory to
+  523 KB and 694 MiB with the same rows, and a locked write path held its lock
+  for 0.7 s instead of 1.8–2.0 s.
+- On PostgreSQL a constant arm the profile folds leaves `(SELECT FALSE)` in a
+  statement that builds an id set: the planner's bound. It selects no row and
+  runs nothing, and keeps each id set planned as large as its table, as the
+  full statement plans it. Without it a broad read of 500,000 rows by an actor
+  with 25,000 direct grants hit the 30 s statement timeout in the registry
+  layout.
 - **Statement counts change inside an evaluator scope.** The first read of an
   actor issues the profile's statement; a denied point check issues it again
   before it answers; a read after a library relationship write issues it again.
@@ -31,8 +37,7 @@ pre-1.0; breaking changes within a minor version are explicitly called out.
   recursion's convergence test, where a missing arm would admit.
 - An actor that holds a grant through a stored subject set (a group or role
   that is granted something) has no profile, and its statements are compiled
-  in full. With only set-reached arms left, PostgreSQL misestimates the id set
-  and a broad read measured about five times slower at 500,000 rows.
+  in full.
 
 ### Added
 

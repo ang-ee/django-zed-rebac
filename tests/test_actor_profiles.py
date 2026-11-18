@@ -371,6 +371,66 @@ def test_a_group_that_holds_no_grant_leaves_its_members_their_profile(threads):
     assert "'direct'" not in statements[-1]
 
 
+CONSTANT = """
+definition auth/user {}
+definition scope/role { relation direct: auth/user }
+definition scope/thread {
+    relation admin: scope/role // rebac:const=admin
+    relation reader: auth/user
+    permission read = admin->direct + reader
+}
+definition scope/message {
+    relation thread: scope/thread // rebac:field=thread
+    permission read = thread->read
+}
+definition scope/part {
+    relation message: scope/message // rebac:field=message
+    permission read = message->read
+}
+"""
+BOUND = "(SELECT FALSE)"
+
+
+@KEPT
+@pytest.mark.postgresql
+def test_a_constant_arm_the_profile_folds_leaves_the_planners_bound(settings):
+    """The full statement plans a thread id set as large as the table: the administrator's arm
+    may admit every thread. A statement without the arm has PostgreSQL trust its estimate of
+    the actor's own rows (proposal 0019, the scale matrix)."""
+    local = install_schema(CONSTANT)
+    ScopeThread._base_manager.bulk_create([ScopeThread(id=1), ScopeThread(id=2)])
+    ScopeMessage._base_manager.bulk_create(
+        [ScopeMessage(id=1, thread_id=1), ScopeMessage(id=2, thread_id=2)]
+    )
+    local.write_relationships([grant("scope/thread", 1, "reader")])
+    outside, plain = messages()
+    with evaluator_scope():
+        inside, narrowed = messages()
+        with CaptureQueriesContext(connection) as checked:
+            assert local.check_access(
+                subject=MEMBER, action="read", resource=ObjectRef("scope/thread", "1")
+            ).allowed
+    assert inside == outside == [1]
+    # Outside a scope the arm itself is compiled.
+    assert "'admin'" in plain[-1] and BOUND not in plain[-1]
+    if connection.vendor != "postgresql":
+        assert "'admin'" not in narrowed[-1] and BOUND not in narrowed[-1]
+        return
+    # Inside one the member's profile folds it, and its place keeps the bound.
+    assert "'admin'" not in narrowed[-1]
+    assert narrowed[-1].count(BOUND) == 1
+    # Nothing else is issued for it: no witness statement, and a check of one
+    # thread, which sizes no id set of threads, does not carry it.
+    assert not any("'admin'" in sql for sql in narrowed)
+    assert not any(BOUND in query["sql"] for query in checked.captured_queries)
+    # An arm the actor can hold is compiled, with no bound beside it.
+    local.write_relationships([grant("scope/role", "admin", "direct")])
+    with evaluator_scope():
+        found, statements = messages()
+    assert found == [1, 2]
+    assert not any(BOUND in sql for sql in statements)
+
+
 def subtracting(seed: int) -> tuple[str, list[RelationshipTuple]]:
     """A policy in which every permission subtracts, and rows that make the subtraction bite.
 

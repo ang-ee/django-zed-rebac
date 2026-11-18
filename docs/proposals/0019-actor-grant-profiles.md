@@ -1,8 +1,9 @@
 # 0019: Actor grant profiles
 
-Status: **accepted by the owner on 2026-11-18 for 0.35.0.** It generalises the negative constant-arm fold and
-the scope-local contract of proposal 0018 from constant arms to stored grants. The contract is specified in
-`docs/ARCHITECTURE.md § Actor grant profiles`.
+Status: **accepted by the owner on 2026-11-18 for 0.35.0, then amended before any release.** The first build
+passed tiers 1 and 2 and failed the scale matrix; **the planner's bound** below is the amendment and awaits the
+owner's review. It generalises the negative constant-arm fold and the scope-local contract of proposal 0018 from
+constant arms to stored grants. The contract is specified in `docs/ARCHITECTURE.md § Actor grant profiles`.
 
 ## Problem
 
@@ -32,14 +33,36 @@ inside the operand of an exclusion, in the depth statement, or in the convergenc
 (`Compiler._negated`). The ordinary traversal folds the algebra. No ids are decided or bound, and no alternate
 evaluation path is added.
 
+**The planner's bound.** Where the profile folds a constant arm in a statement that builds an id set, the arm's
+place keeps a condition that never holds and that PostgreSQL cannot fold: `(SELECT FALSE)`
+(`Compiler._left_out`, `_PlannerBound`). The reason is what the full statement does for the planner, not for
+the rows. A constant arm may admit every row of its type, so PostgreSQL plans every id set of that type as
+large as the table and joins by hash. The first build removed the arm, and PostgreSQL then trusted its estimate
+of the actor's own rows. Where that estimate is low, a statement that embeds the scope twice scans the id set
+once for each row. Measured at 50,000 messages and 500,000 parts, for an actor with 25,000 direct grants:
+
+| | Full statement | Arm removed | Arm removed, bound kept |
+|---|---|---|---|
+| Registry layout, broad read | 316–488 ms | statement timeout (30 s) | equal to the full statement |
+| Grants reached through a group, broad read (the subject-set rule lifted) | 100–200 ms | about five times slower | equal to the full statement |
+| Registry layout, skewed statistics, the actor named by its registry row | 307–312 ms | statement timeout (30 s) | 429–509 ms against 494–535 ms alternated |
+
+The skewed fixture adds 150 actors with 25,000 grants each and a million with one, so that the statistics'
+most-common list no longer holds the actor read.
+
+PostgreSQL plans the scalar subquery as a parameter it does not know. The arm therefore keeps the table's size
+in the estimate and runs nothing, because the false parameter gates its scan. PostgreSQL has no other way to be
+told that a set may be large. The bound is emitted on PostgreSQL only, only where the full statement would
+compile the arm, and not in a witness statement or a check of the one object the arm names, which size no id set.
+Naming the actor by its registry row instead of joining the registry on its type and id was tried first. It
+fixes the estimate where the actor is in the column's most-common list and nowhere else, so it was dropped.
+
 **Scope.** A profile exists only inside an evaluator scope, for an actor that is a plain subject (no subject
-relation, not anonymous, a real id) and holds no row through a stored subject set. The release tier's scale
-matrix showed why the second condition is needed: PostgreSQL cannot estimate an id set reached through a set (21
-rows estimated, 2,500 actual), and a statement left with only such arms loses the wide statement's hash joins. A
-broad read of 500,000 rows that embeds the scope twice then scans the id set for each row, about five times
-slower on PostgreSQL 16 and 17. Such an actor's statements are compiled in full. It is read by one statement at the first compile for that actor and
-database, kept for the scope, and read again after a library relationship write
-(`mark_relationships_changed`). Outside an evaluator scope every statement is compiled as today.
+relation, not anonymous, a real id) and holds no row through a stored subject set. It is read by one statement
+at the first compile for that actor and database, kept for the scope, and read again after a library
+relationship write (`mark_relationships_changed`). Outside an evaluator scope every statement is compiled as
+today. The second condition was added when the first build's group-granted actor read five times slower. With
+the planner's bound the measurement no longer needs it (see Known limits).
 
 **Kept statements.** The profile is part of the statement key beside the actor's shape, so a kept statement is
 shared by every actor with the same profile.
@@ -72,7 +95,12 @@ their witness statements.
 
 ## Results
 
-Tier 1: 4,438 pass. Tier 2 on PostgreSQL 17: 989 pass. Lint, format, mypy and pyright pass.
+Tier 1: 4,441 pass. Tier 2 on PostgreSQL 17: 990 pass. Lint, format, mypy and pyright pass.
+
+The scale matrix (50,000 messages, 500,000 parts, both storage layouts, three shapes, inside and outside a
+scope) on PostgreSQL 16, the release tier's version: 16 pass and the 8 frozen known limitations are unchanged,
+with no manifest edit. On PostgreSQL 17 every cell passes or is a frozen known limitation except eight, listed
+under Known limits.
 
 Fifty-three existing tests pinned what the profile changes and were re-taken one by one, each against the
 statements actually issued: 51 statement or parameter counts (the profile's own statement, witnesses that are no
@@ -96,16 +124,18 @@ off and on, identical rows on every document:
 
 | Member reads | Off | On |
 |---|---|---|
-| Selected message, wall | 977–997 ms | 365–387 ms |
-| Selected message, statements | 25 | 23, the profile's included |
-| Selected message, SQL | 1,618 KB | 454 KB |
-| Selected message, planner allocation | 1,246,520 KiB | 643,905 KiB |
-| Largest statement, permission id sets | 174 | 121 |
-| Administrator, selected message | 23 statements, 64–72 ms | 24 statements, 60–66 ms |
+| Selected message, wall | 1,227 ms | 691 ms |
+| Selected message, statements | 25 | 24, the profile's included |
+| Selected message, SQL | 1,618 KB | 523 KB |
+| Selected message, planner allocation | 1,246,520 KiB | 710,627 KiB |
+| Largest statement, permission id sets | 174 | 138 |
+| Administrator, selected message | 23 statements, 144 ms | 24 statements, 112 ms |
+
+The bound costs part of what the first build measured without it (454 KB, 643,905 KiB, 23 statements).
 
 On a consumer's locked write path (one evaluator scope around the unit of work, two concurrent writers): the
-lock is held 0.29–0.30 s instead of 1.47–1.49 s, permission SQL per unit falls from about 3,900 KB to about
-710 KB, and one profile statement is issued per unit. An evaluator scope alone, with profiles off, does not
+lock is held 0.67–0.74 s instead of 1.79–2.05 s, permission SQL per unit falls from about 3,900 KB to about
+1,310 KB, and one profile statement is issued per unit. An evaluator scope alone, with profiles off, does not
 shorten that path.
 
 ## Decisions taken
@@ -118,9 +148,23 @@ shorten that path.
 
 ## Known limits
 
-- An actor that holds any grant through a stored subject set gets no profile, however small the set's reach. In
-  the scale matrix an actor reaching one thread through nested groups read in 2.3 ms with a profile and 25 to
-  114 ms without. A rule bounded by how many rows the sets reach would keep that gain; it is not built.
+- **An actor that holds any grant through a stored subject set gets no profile.** With the planner's bound the
+  rule is no longer needed for speed: with it lifted, the matrix's two group-granted actors read as fast as
+  with the full statement on PostgreSQL 16 (alternated runs), and tier 1 passes. Lifting it changes those
+  actors' statements. On PostgreSQL 16 four cells of the frozen scale manifest pin the old text for the
+  sparse-member listing timeout of proposal 0018, and more do on PostgreSQL 17. The new statement times out in
+  the same PostgreSQL 16 cells. Re-taking frozen entries is the owner's decision, so the rule stays in this
+  build.
+- **Eight PostgreSQL 17 cells need the owner's decision.** The directly granted actor's narrow reads in the
+  shared shape, inside a scope, both layouts and JIT modes, are frozen as the PostgreSQL 17 shared-read rescan of
+  proposal 0018. The profiled statement rescans the same way and reads as fast (332–359 ms against 329–397 ms
+  in the registry layout), but its text is new, so the harness reports identity drift. The release tier runs
+  PostgreSQL 16 and is not affected.
+- **The bound keeps the full statement's caution, and its cost.** A sparse actor's broad read is planned as if
+  it could see every row, as today. The first build read such a cell in 2.3 ms where the full statement takes
+  25 to 114 ms; that gain is given up.
+- A type with no constant arm has no bound. Its id sets are estimated from the actor's rows with or without a
+  profile, as today.
 - A statement is kept per profile, so the 512-entry statement cache serves fewer permissions when many distinct
   profiles are in use. Keying by the part of the profile a permission can reach (below) is the remedy.
 - The profile's statement follows every stored subject set the actor is in. Its cost for an actor with very many

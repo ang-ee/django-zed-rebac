@@ -263,7 +263,16 @@ def test_the_member_statement_is_the_policy_without_its_constant_arms(console):
     with evaluator_scope():
         reference_ids, reference = _read(MEMBER)
     assert reference_ids == ids
-    assert _without_revision(statements[-1]) == _without_revision(reference[-1])
+    if connection.vendor != "postgresql":
+        assert _without_revision(statements[-1]) == _without_revision(reference[-1])
+        return
+    # On PostgreSQL the folded arm leaves the planner's bound: one more arm of
+    # the post id set that selects no row and reads no role. The reference
+    # policy has no constant arm on the post, so it has one bound fewer.
+    bound = "(SELECT FALSE)"
+    assert "'org/role'" not in statements[-1]
+    assert statements[-1].count(bound) == reference[-1].count(bound) + 1
+    assert f'FROM "testapp_post" "U0" WHERE {bound}' in statements[-1]
 
 
 @KEPT

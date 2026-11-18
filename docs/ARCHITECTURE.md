@@ -2177,6 +2177,17 @@ caveats are not read, so the profile is a superset of what the actor holds.
 - **Granting positions only.** Nothing is left out inside the operand of an
   exclusion, in the depth statement or in a recursion's convergence test: there
   a missing arm would admit instead of deny.
+- **The planner's bound.** A constant arm may admit every row of its type, so
+  PostgreSQL plans each id set of that type as large as the table and joins
+  by hash. Where the profile folds such an arm in a statement that builds an
+  id set, its place keeps `(SELECT FALSE)`: a condition that never holds,
+  that PostgreSQL plans as a parameter it does not know, and whose false value
+  gates the scan so nothing runs. Without it PostgreSQL trusts its estimate of
+  the actor's own rows; where that is low, a broad read over 500,000 rows
+  that embeds the scope twice scanned a 25,000-row id set once for each
+  candidate row and did not finish in 30 seconds. The bound is emitted on
+  PostgreSQL only, only where the full statement would compile the arm, and
+  not in a witness statement or a check of the one object the arm names.
 - **When it is read.** One statement at the first compile for an actor and
   database in the scope. It is kept for the scope and read again after a
   library relationship write. It is not kept while the thread has written
@@ -2192,12 +2203,12 @@ caveats are not read, so the profile is a superset of what the actor holds.
   did not hold is written by another process or behind the library; a check in
   the same scope refreshes the profile and reads are exact after it.
 - **Who has one.** An actor that is a plain subject (no subject relation, not
-  anonymous, a real id) and holds no row through a stored subject set. The
-  planner cannot estimate an id set reached through a set: with the other arms
-  gone it joins by nested loop and scans that id set for each row, which
-  measured about five times slower on a broad read of 500,000 rows. Such an
+  anonymous, a real id) and holds no row through a stored subject set. Such an
   actor's statements are compiled in full, as are every actor's outside an
-  evaluator scope. Membership of a set that holds no grant costs nothing.
+  evaluator scope. Membership of a set that holds no grant costs nothing. The
+  second condition predates the planner's bound, which removes the slow plan
+  it was added for; lifting it changes statements the frozen scale manifest
+  pins (proposal 0019, Known limits).
 - **Kept statements.** A statement is kept per profile and shared by every
   actor with that profile. The 512-entry statement cache therefore holds fewer
   permissions when many distinct profiles are in use.
