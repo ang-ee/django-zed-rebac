@@ -2,7 +2,8 @@
 
 Status: **accepted by the owner on 2026-11-18 for 0.35.0 and amended before release.** The first build passed
 tiers 1 and 2 and failed the scale matrix; **the planner's bound** below is the amendment, which the owner
-approved the same day with the eight re-taken PostgreSQL 17 manifest cells. It generalises the negative
+approved the same day with the eight re-taken PostgreSQL 17 manifest cells. **0.35.1 lifts the subject-set
+rule**, with the owner's approval and 24 more re-taken cells (Known limits). It generalises the negative
 constant-arm fold and the scope-local contract of proposal 0018 from constant arms to stored grants. The contract
 is specified in `docs/ARCHITECTURE.md § Actor grant profiles`.
 
@@ -59,11 +60,12 @@ Naming the actor by its registry row instead of joining the registry on its type
 fixes the estimate where the actor is in the column's most-common list and nowhere else, so it was dropped.
 
 **Scope.** A profile exists only inside an evaluator scope, for an actor that is a plain subject (no subject
-relation, not anonymous, a real id) and holds no row through a stored subject set. It is read by one statement
-at the first compile for that actor and database, kept for the scope, and read again after a library
-relationship write (`mark_relationships_changed`). Outside an evaluator scope every statement is compiled as
-today. The second condition was added when the first build's group-granted actor read five times slower. With
-the planner's bound the measurement no longer needs it (see Known limits).
+relation, not anonymous, a real id). It is read by one statement at the first compile for that actor and
+database, kept for the scope, and read again after a library relationship write
+(`mark_relationships_changed`). Outside an evaluator scope every statement is compiled as today. 0.35.0 also
+required that the actor hold no row through a stored subject set, a rule added when the first build's
+group-granted actor read five times slower. The planner's bound removed that slow plan, and 0.35.1 lifts the
+rule (see Known limits).
 
 **Kept statements.** The profile is part of the statement key beside the actor's shape, so a kept statement is
 shared by every actor with the same profile.
@@ -149,13 +151,14 @@ shorten that path.
 
 ## Known limits
 
-- **An actor that holds any grant through a stored subject set gets no profile.** With the planner's bound the
-  rule is no longer needed for speed: with it lifted, the matrix's two group-granted actors read as fast as
-  with the full statement on PostgreSQL 16 (alternated runs), and tier 1 passes. Lifting it changes those
-  actors' statements. On PostgreSQL 16 four cells of the frozen scale manifest pin the old text for the
-  sparse-member listing timeout of proposal 0018, and more do on PostgreSQL 17. The new statement times out in
-  the same PostgreSQL 16 cells. Re-taking frozen entries is the owner's decision, so the rule stays in this
-  build.
+- **0.35.0 gave no profile to an actor that holds a grant through a stored subject set; 0.35.1 does.** With
+  the planner's bound the matrix's two group-granted actors read as fast with a profile as with the full
+  statement: 0.90 to 1.05 times its time over 16 cells in both layouts on PostgreSQL 16 (eight runs each in
+  balanced order), and equal within noise on PostgreSQL 17. Their statements change, so 24 frozen cells of the
+  scale manifest were re-taken with the owner's approval, each after the capture run showed the same
+  limitation under the new statement: the sparse-member listing timeout (four cells on PostgreSQL 16, four on
+  17) and the PostgreSQL 17 shared-read rescan with the same count (16 cells). No other cell of either matrix
+  failed.
 - **Eight PostgreSQL 17 manifest cells were re-taken, with the owner's approval.** The directly granted
   actor's narrow reads in the shared shape, inside a scope, both layouts and JIT modes, are frozen as the
   PostgreSQL 17 shared-read rescan of proposal 0018. The profiled statement rescans the same way, with the same

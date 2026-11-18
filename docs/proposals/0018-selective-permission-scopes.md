@@ -122,7 +122,9 @@ witness semantics:
   Eight of the non-admin cells (the directly granted actor inside an evaluator
   scope, both layouts and JIT modes) were re-taken on 0.35.0 with the owner's
   approval: its actor profile changes their statement, and the rescan, its
-  count and its time are unchanged (proposal 0019, Known limits).
+  count and its time are unchanged (proposal 0019, Known limits). 0.35.1
+  re-took the 16 group-granted cells inside a scope the same way, and the
+  eight sparse-member timeout cells inside a scope, which time out as before.
 
 The per-cell mechanism reports pytest subtest xfails, never marks an entire
 32-cell fixture xfail. SQL/parameter/plan drift and every unrelated assertion
