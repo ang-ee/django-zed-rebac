@@ -5,6 +5,41 @@ pre-1.0; breaking changes within a minor version are explicitly called out.
 
 ## [Unreleased]
 
+## [0.35.2] — 2026-11-18
+
+### Fixed
+
+- **Reading an actor's grant profile no longer costs more for an actor with
+  more rows.** 0.35.0 and 0.35.1 read every relationship row that names the
+  actor and looked each one up as a possible subject set: 52–95 ms for an
+  actor with 25,000 grants and 240 ms for 100,000, once per evaluator scope,
+  and at each compile inside a transaction that holds uncommitted relationship
+  writes. A consumer that writes one relationship for each record a user
+  creates gives its users that many rows. With 100,000 of them a small read
+  was slower inside a scope than without profiles.
+  - The profile's statement now reads at most 1,000 rows that name the actor
+    and 1,000 that name its subject sets, and follows a row as a subject set
+    only where the schema allows one.
+  - Past a bound, a second statement asks for each relation name that can hold
+    stored rows whether a row of that name names the subject, and the profile
+    holds that relation on every resource type. Wider than the exact profile,
+    never narrower: rows and decisions do not change.
+  - An actor in more than 64 subject sets whose rows pass the bound has no
+    profile, and its statements are compiled in full.
+  - Measured in the registry layout: 100,000 rows, 240 ms to 4–14 ms;
+    25,000 rows, 52–53 ms to 7–9 ms. An actor with a few rows reads its
+    profile in 0.9–2.2 ms, against 0.5–1.3 ms: the statement is longer.
+
+### Changed
+
+- An actor within the bounds issues one profile statement where 0.35.1 issued
+  one; past them it issues two, or three when its subject sets pass the bound.
+  Counts pinned for actors with few rows do not move.
+- The scale manifest's 16 PostgreSQL 17 cells for the directly granted actor
+  and the actor granted through one group hold the new statements'
+  fingerprints. Both actors pass the bound. The frozen rescan is unchanged in
+  each cell.
+
 ## [0.35.1] — 2026-11-18
 
 ### Changed

@@ -125,6 +125,9 @@ witness semantics:
   count and its time are unchanged (proposal 0019, Known limits). 0.35.1
   re-took the 16 group-granted cells inside a scope the same way, and the
   eight sparse-member timeout cells inside a scope, which time out as before.
+  0.35.2 re-took the eight cells of the directly granted actor and the eight
+  of the group granted through one set again: both pass the profile's row
+  bound, so their statements name relations by name.
 
 The per-cell mechanism reports pytest subtest xfails, never marks an entire
 32-cell fixture xfail. SQL/parameter/plan drift and every unrelated assertion

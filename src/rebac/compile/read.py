@@ -17,7 +17,7 @@ from typing import TYPE_CHECKING, Any, cast
 
 from django.core.exceptions import EmptyResultSet
 from django.db import connections, models
-from django.db.models import Exists, Expression, F, Q, Value
+from django.db.models import Count, Exists, Expression, F, Q, Value
 from django.db.models.expressions import Col, ColPairs
 from django.db.models.fields.related_lookups import RelatedExact
 from django.db.models.fields.tuple_lookups import TupleIn
@@ -60,6 +60,7 @@ from .conditions import CaveatVerdicts, caveated_relations
 from .ctes import Marker, safe_name, table_names
 from .evaluate import named_subjects, residual
 from .predicate import (
+    PROFILE_ANY,
     PointRow,
     _and,
     _Param,
@@ -75,6 +76,12 @@ if TYPE_CHECKING:
     from rebac.backends.local import LocalBackend
 
 _MANUAL_REVISION = Marker("manual schema revision")
+# The most relationship rows an actor's grant profile reads to learn exact
+# keys, for the rows that name the actor and again for those that name its
+# subject sets. Past it the relations are learnt by name (``_actor_profile``).
+_PROFILE_ROWS = 1000
+# The most subject sets whose relations a profile learns by name.
+_PROFILE_SETS = 64
 _RESOURCE_WIRE = Marker("resource wire id")
 _LIMIT = 512
 # The most literal identities a scoped read is bounded to; a longer list uses
@@ -180,6 +187,10 @@ class _Policy:
     caveat_deadlines: tuple[datetime, ...]
     inherited: dict[tuple[Any, ...], tuple[Key, ...]] = field(default_factory=dict)
     caveated: dict[Key, frozenset[Key]] = field(default_factory=dict)
+    # What a grant profile needs of the schema (``_profile_facts``), derived once.
+    profiled: list[tuple[tuple[str, ...], tuple[str, ...], tuple[str, ...]]] = field(
+        default_factory=list
+    )
 
     @property
     def schema(self) -> Schema:
@@ -346,7 +357,7 @@ class _Operation:
         fresh: bool = False,
     ) -> _Operation:
         policy = policy if policy is not None else _policy(backend)
-        profile = _actor_profile(backend, actor, using, fresh=fresh)
+        profile = _actor_profile(backend, actor, using, fresh=fresh, policy=policy)
         return cls(
             backend,
             policy,
@@ -503,7 +514,12 @@ class _Operation:
 
 
 def _actor_profile(
-    backend: LocalBackend, actor: SubjectRef, using: str, *, fresh: bool = False
+    backend: LocalBackend,
+    actor: SubjectRef,
+    using: str,
+    *,
+    fresh: bool = False,
+    policy: _Policy | None = None,
 ) -> frozenset[Key] | None:
     """The stored relation keys ``actor`` can hold, decided once per evaluator scope.
 
@@ -515,9 +531,14 @@ def _actor_profile(
     (``mark_relationships_changed``); a row written by anything else is missed
     until the scope ends, which can only leave rows out (proposal 0019).
 
-    ``None`` leaves every arm compiled: outside an evaluator scope, and for an
-    actor that is a subject set, anonymous or without an id. ``fresh`` reads the
-    rows now, whatever the scope kept.
+    Reading it costs the same however many rows name the actor
+    (``_read_profile``). Past ``_PROFILE_ROWS`` rows the profile names a
+    relation on every type, ``(PROFILE_ANY, relation)``: wider, never narrower.
+
+    ``None`` leaves every arm compiled: outside an evaluator scope, for an
+    actor that is a subject set, anonymous or without an id, and for one in
+    more than ``_PROFILE_SETS`` subject sets whose rows pass the bound.
+    ``fresh`` reads the rows now, whatever the scope kept.
     """
     if not app_settings.REBAC_ACTOR_PROFILES:
         return None
@@ -528,8 +549,10 @@ def _actor_profile(
         return None
     from rebac.backends import local
 
+    policy = policy if policy is not None else _policy(backend)
     relationships = active_relationship_model()
-    key = (id(backend), using, relationships._meta.label_lower, actor)
+    # The subject sets followed and the relations named are the policy's.
+    key = (id(backend), using, relationships._meta.label_lower, actor, policy.key)
     generation = local._relationship_generation
     # Rows this thread wrote in a transaction still open may roll back: until
     # it ends, the profile is read at each compile.
@@ -537,44 +560,167 @@ def _actor_profile(
     found = evaluator._profiles.get(key)
     if not fresh and not volatile and found is not None and found[0] == generation:
         return found[1]
-    rows = cast(Any, relationships.objects.using(using)).wire_projection()
-    seed = (
-        rows.filter(
-            subject_type=actor.subject_type,
-            subject_relation="",
-            subject_id__in=(actor.subject_id, "*"),
-        )
-        .order_by()
-        .values("resource_type", "resource_id", "relation")
-    )
-
-    def body(cte: CTE) -> models.QuerySet[Any]:
-        step = (
-            cte.join(
-                rows,
-                subject_type=cte.col.resource_type,
-                subject_id=cte.col.resource_id,
-                subject_relation=cte.col.relation,
-            )
-            .order_by()
-            .values("resource_type", "resource_id", "relation")
-        )
-        return cast(models.QuerySet[Any], seed.union(step))
-
-    # Its own statement: not a definition of the one being compiled around it.
-    with ctes.isolated():
-        cte = CTE.recursive(body, name=safe_name("rebac_profile", table_names()))
-        selected = cte.queryset()
-        held = with_cte(
-            cte,
-            select=models.QuerySet(model=selected.model, query=selected.query, using=using)
-            .values_list("resource_type", "relation")
-            .distinct(),
-        )
-        profile = frozenset((str(resource_type), str(relation)) for resource_type, relation in held)
+    profile = _read_profile(policy, actor, using)
     if not volatile:
         evaluator._profiles[key] = (generation, profile)
     return profile
+
+
+def _profile_facts(policy: _Policy) -> tuple[tuple[str, ...], tuple[str, ...], tuple[str, ...]]:
+    """What a grant profile needs of the policy's schema.
+
+    The resource types and the relation names that an allowed subject set
+    names (``auth/group#member``), and the names of the relations that can
+    hold stored rows: every relation but a field-backed or constant one.
+    """
+    if not policy.profiled:
+        set_types: set[str] = set()
+        set_names: set[str] = set()
+        stored: set[str] = set()
+        for definition in policy.schema.definitions:
+            for relation in definition.relations:
+                if not isinstance(relation.backing, (FieldBinding, ConstBinding)):
+                    stored.add(relation.name)
+                for allowed in relation.allowed_subjects:
+                    if allowed.relation:
+                        set_types.add(allowed.type)
+                        set_names.add(allowed.relation)
+        policy.profiled.append(
+            (tuple(sorted(set_types)), tuple(sorted(set_names)), tuple(sorted(stored)))
+        )
+    return policy.profiled[0]
+
+
+def _read_profile(policy: _Policy, actor: SubjectRef, using: str) -> frozenset[Key] | None:
+    """Read ``actor``'s grant profile at a cost that does not grow with its rows.
+
+    One statement reads at most ``_PROFILE_ROWS + 1`` rows that name the actor
+    or a wildcard of its type, and as many that name a subject set the actor is
+    in, and counts them by key. The sets are the closure of the actor's
+    memberships over the relations the schema allows as subject sets, so a row
+    is never probed as a set it cannot be.
+
+    Where a part stops at the bound, its rows are not all read, and a second
+    statement asks, for each relation name that can hold stored rows, whether
+    one row of that name names the subject: one index probe per name. The
+    profile then holds that name on every type. Such a part of an actor in more
+    sets than ``_PROFILE_SETS`` gives no profile.
+
+    A consumer that writes a relationship for each record a user creates gives
+    its users as many rows as they have created records. Reading every row
+    cost 240 ms for 100,000 of them.
+    """
+    set_types, set_names, stored = _profile_facts(policy)
+    rows = cast(Any, active_relationship_model().objects.using(using)).wire_projection()
+    direct = rows.filter(
+        subject_type=actor.subject_type,
+        subject_relation="",
+        subject_id__in=(actor.subject_id, "*"),
+    ).order_by()
+    columns = ("_rebac_part", "resource_type", "relation")
+    tables = table_names()
+
+    def part(value: int) -> Value:
+        return Value(value, output_field=models.IntegerField())
+
+    def plain(cte: CTE) -> models.QuerySet[Any]:
+        # The CTE's own columns: not the relationship model's wire translation.
+        selected = cte.queryset()
+        return models.QuerySet(model=selected.model, query=selected.query, using=using)
+
+    def sets_cte() -> CTE:
+        member = {"resource_type__in": set_types, "relation__in": set_names}
+        fields = ("resource_type", "resource_id", "relation")
+        seed = direct.filter(**member).values(*fields)
+
+        def body(cte: CTE) -> models.QuerySet[Any]:
+            step = (
+                cte.join(
+                    rows,
+                    subject_type=cte.col.resource_type,
+                    subject_id=cte.col.resource_id,
+                    subject_relation=cte.col.relation,
+                )
+                .filter(**member)
+                .order_by()
+                .values(*fields)
+            )
+            return cast(models.QuerySet[Any], seed.union(step))
+
+        return CTE.recursive(body, name=safe_name("rebac_profile_sets", tables))
+
+    # Its own statements: not definitions of the one being compiled around them.
+    with ctes.isolated():
+        own = CTE(
+            direct.annotate(_rebac_part=part(0)).values(*columns)[: _PROFILE_ROWS + 1],
+            name=safe_name("rebac_profile", tables),
+        )
+        definitions = samples = [own]
+        if set_names:
+            sets = sets_cte()
+            through = CTE(
+                sets.join(
+                    rows,
+                    subject_type=sets.col.resource_type,
+                    subject_id=sets.col.resource_id,
+                    subject_relation=sets.col.relation,
+                )
+                .order_by()
+                .annotate(_rebac_part=part(1))
+                .values(*columns)[: _PROFILE_ROWS + 1],
+                name=safe_name("rebac_profile_through", tables),
+            )
+            definitions, samples = [sets, own, through], [own, through]
+        counted = [
+            plain(sample)
+            .values(*columns)
+            .annotate(_rebac_rows=Count("relation"))
+            .values_list(*columns, "_rebac_rows")
+            for sample in samples
+        ]
+        select = counted[0] if len(counted) == 1 else counted[0].union(*counted[1:], all=True)
+        keys: set[Key] = set()
+        read = {0: 0, 1: 0}
+        for which, resource_type, relation, count in with_cte(*definitions, select=select):
+            keys.add((str(resource_type), str(relation)))
+            read[int(which)] += int(count)
+        named = Q()
+        if read[0] > _PROFILE_ROWS:
+            named |= Q(subject_type=actor.subject_type, subject_id__in=(actor.subject_id, "*"))
+        if read[1] > _PROFILE_ROWS:
+            every = sets_cte()
+            listed = plain(every).values_list("resource_type", "resource_id")
+            reached = list(with_cte(every, select=listed[: _PROFILE_SETS + 1]))
+            if len(reached) > _PROFILE_SETS:
+                return None
+            by_type: dict[str, list[str]] = {}
+            for resource_type, resource_id in reached:
+                by_type.setdefault(str(resource_type), []).append(str(resource_id))
+            for resource_type, ids in sorted(by_type.items()):
+                named |= Q(subject_type=resource_type, subject_id__in=sorted(set(ids)))
+        if named:
+            # Any subject relation: the rows are met in index order, and the
+            # first of a name answers. Wider than the subject, never narrower.
+            probes = {
+                f"rebac_profile_{index}": Exists(rows.filter(named, relation=name).order_by())
+                for index, name in enumerate(stored)
+            }
+            answers = next(
+                iter(
+                    SchemaGeneration.objects.using(using)
+                    .filter(pk=1)
+                    .order_by()
+                    .annotate(**probes)
+                    .values_list(*probes)
+                ),
+                None,
+            )
+            if answers is None:
+                return None
+            keys.update(
+                (PROFILE_ANY, name) for name, held in zip(stored, answers, strict=True) if held
+            )
+    return frozenset(keys)
 
 
 def _model_at(model: type[models.Model]) -> At:
@@ -946,7 +1092,8 @@ def _point_result(
         not fresh
         and not profile_read
         and operation.profile is not None
-        and _actor_profile(backend, actor, using, fresh=True) != operation.profile
+        and _actor_profile(backend, actor, using, fresh=True, policy=operation.policy)
+        != operation.profile
     ):
         # A check is exact: before it answers no, the profile it was compiled
         # for is read again, and a profile that moved decides it anew. The

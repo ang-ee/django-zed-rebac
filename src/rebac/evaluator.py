@@ -123,7 +123,7 @@ class PermissionEvaluator:
         self._visibility_decision_ids = 0
         # The stored relation keys an actor can hold, per backend, database and
         # actor, with the relationship generation it was read at (proposal 0019).
-        self._profiles: dict[Hashable, tuple[int, frozenset[tuple[str, str]]]] = {}
+        self._profiles: dict[Hashable, tuple[int, frozenset[tuple[str, str]] | None]] = {}
         self._max_size = max_size
         self._schema_scope = SchemaScope()
 
