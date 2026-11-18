@@ -5,6 +5,24 @@ pre-1.0; breaking changes within a minor version are explicitly called out.
 
 ## [Unreleased]
 
+## [0.35.1] — 2026-11-18
+
+### Changed
+
+- An actor that holds a grant through a stored subject set (a group or role
+  that is granted something) now has a grant profile like any other plain
+  subject. 0.35.0 compiled such an actor's statements in full. With the
+  planner's bound of 0.35.0 the profiled statements read as fast as the full
+  ones at 50,000 messages and 500,000 parts in both storage layouts on
+  PostgreSQL 16 and 17.
+- **Statement counts change inside an evaluator scope for those actors**, as
+  0.35.0 describes for the others: a constant arm the actor cannot hold is
+  folded and its witness is no longer issued. Rows do not change.
+- The scale manifest's 24 cells for those actors inside a scope hold the new
+  statements' fingerprints. The limitations themselves are unchanged: the
+  sparse-member listing timeout and the PostgreSQL 17 shared-read rescan of
+  proposal 0018.
+
 ## [0.35.0] — 2026-11-18
 
 ### Changed

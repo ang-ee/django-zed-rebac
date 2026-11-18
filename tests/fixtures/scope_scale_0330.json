@@ -5,20 +5,20 @@
     "16/denormalized-single-inside/off-member-broad-listing": {
       "baseline_error": "canceling statement due to statement timeout",
       "kind": "timeout",
-      "params_sha256": "24a5174858d5a95d23fc6c9311be3e81206f602b904f8aaae81b778b86f0f8f7",
+      "params_sha256": "c3d873f96436e45369ec9c0313c47ed38c46513179fcb6bbb0064a8d52bb349e",
       "plan_capture": "EXPLAIN (FORMAT JSON)",
-      "plan_sha256": "9f53829d1e5cf363e92945db1bf821a639302e16ef4497a413133c61a51f896d",
-      "reason": "Pre-existing 0.33.0 sparse-member broad-listing 30 s statement timeout; bounded after SQL/parameters/non-executing plan identity checks; proposal 0018, Known limitations / follow-up",
-      "sql_sha256": "7444dfb6eec6ec2885189ae543113daa273374ab2e1a476f9d5d3f9f98960dbc"
+      "plan_sha256": "c2c43a60d495439c3799ca5b7de73abfbea558344645b3fc2b39e7cb7499e58a",
+      "reason": "Sparse-member broad-listing 30 s statement timeout of proposal 0018 on the 0.35.1 actor-profile statement; timeout re-measured and SQL, parameters and non-executing plan re-taken; proposal 0019, Known limits",
+      "sql_sha256": "37f436dd7595422f1aeb30b7b4dd9cf2f43cafa35f0ad626640cf1a44a14eae8"
     },
     "16/denormalized-single-inside/on-member-broad-listing": {
       "baseline_error": "canceling statement due to statement timeout",
       "kind": "timeout",
-      "params_sha256": "24a5174858d5a95d23fc6c9311be3e81206f602b904f8aaae81b778b86f0f8f7",
+      "params_sha256": "c3d873f96436e45369ec9c0313c47ed38c46513179fcb6bbb0064a8d52bb349e",
       "plan_capture": "EXPLAIN (FORMAT JSON)",
-      "plan_sha256": "9f53829d1e5cf363e92945db1bf821a639302e16ef4497a413133c61a51f896d",
-      "reason": "Pre-existing 0.33.0 sparse-member broad-listing 30 s statement timeout; bounded after SQL/parameters/non-executing plan identity checks; proposal 0018, Known limitations / follow-up",
-      "sql_sha256": "7444dfb6eec6ec2885189ae543113daa273374ab2e1a476f9d5d3f9f98960dbc"
+      "plan_sha256": "c2c43a60d495439c3799ca5b7de73abfbea558344645b3fc2b39e7cb7499e58a",
+      "reason": "Sparse-member broad-listing 30 s statement timeout of proposal 0018 on the 0.35.1 actor-profile statement; timeout re-measured and SQL, parameters and non-executing plan re-taken; proposal 0019, Known limits",
+      "sql_sha256": "37f436dd7595422f1aeb30b7b4dd9cf2f43cafa35f0ad626640cf1a44a14eae8"
     },
     "16/denormalized-single-outside/off-member-broad-listing": {
       "baseline_error": "canceling statement due to statement timeout",
@@ -41,20 +41,20 @@
     "16/registry-single-inside/off-member-broad-listing": {
       "baseline_error": "canceling statement due to statement timeout",
       "kind": "timeout",
-      "params_sha256": "24a5174858d5a95d23fc6c9311be3e81206f602b904f8aaae81b778b86f0f8f7",
+      "params_sha256": "c3d873f96436e45369ec9c0313c47ed38c46513179fcb6bbb0064a8d52bb349e",
       "plan_capture": "EXPLAIN (FORMAT JSON)",
-      "plan_sha256": "bf0bb8ec4c2f3a18daece6c5e35b4caad4baf6385f3b29192d4ad3615d20d785",
-      "reason": "Pre-existing 0.33.0 sparse-member broad-listing 30 s statement timeout; bounded after SQL/parameters/non-executing plan identity checks; proposal 0018, Known limitations / follow-up",
-      "sql_sha256": "98f219188f5390283d41da6945853f4fb6c13888d5441a9bfab4d762987a76b3"
+      "plan_sha256": "e239f4db79e6017fd309897ae7a0ae22ead22165e657eb13f4d2818afc84dac0",
+      "reason": "Sparse-member broad-listing 30 s statement timeout of proposal 0018 on the 0.35.1 actor-profile statement; timeout re-measured and SQL, parameters and non-executing plan re-taken; proposal 0019, Known limits",
+      "sql_sha256": "f02680ec92083415f0987f647bb45f847c62edb08108c814961c2edf09822d57"
     },
     "16/registry-single-inside/on-member-broad-listing": {
       "baseline_error": "canceling statement due to statement timeout",
       "kind": "timeout",
-      "params_sha256": "24a5174858d5a95d23fc6c9311be3e81206f602b904f8aaae81b778b86f0f8f7",
+      "params_sha256": "c3d873f96436e45369ec9c0313c47ed38c46513179fcb6bbb0064a8d52bb349e",
       "plan_capture": "EXPLAIN (FORMAT JSON)",
-      "plan_sha256": "bf0bb8ec4c2f3a18daece6c5e35b4caad4baf6385f3b29192d4ad3615d20d785",
-      "reason": "Pre-existing 0.33.0 sparse-member broad-listing 30 s statement timeout; bounded after SQL/parameters/non-executing plan identity checks; proposal 0018, Known limitations / follow-up",
-      "sql_sha256": "98f219188f5390283d41da6945853f4fb6c13888d5441a9bfab4d762987a76b3"
+      "plan_sha256": "e239f4db79e6017fd309897ae7a0ae22ead22165e657eb13f4d2818afc84dac0",
+      "reason": "Sparse-member broad-listing 30 s statement timeout of proposal 0018 on the 0.35.1 actor-profile statement; timeout re-measured and SQL, parameters and non-executing plan re-taken; proposal 0019, Known limits",
+      "sql_sha256": "f02680ec92083415f0987f647bb45f847c62edb08108c814961c2edf09822d57"
     },
     "16/registry-single-outside/off-member-broad-listing": {
       "baseline_error": "canceling statement due to statement timeout",
@@ -94,39 +94,39 @@
     },
     "17/denormalized-shared-inside/off-member-narrow-count": {
       "kind": "rescan",
-      "params_sha256": "6aee81f48070a0660b2915b121c427e56dfe591a33306794c2121f66ea6e8db1",
+      "params_sha256": "fd79d1dfdb7b73143dd2c7831b2a3154fe82b55aba1e09777d9bd8982573225e",
       "plan_capture": "EXPLAIN (ANALYZE, BUFFERS, FORMAT JSON, MEMORY)",
-      "plan_sha256": "0d1e1c6cfe088abb6313f1a398c8c30830c77bc64c9c4e96babb94d053142040",
-      "reason": "Pre-existing 0.33.0 PG17 multi-row CTE rescan; identical SQL, parameters, structural plan and rescan count; proposal 0018, Known limitations / follow-up",
+      "plan_sha256": "bf9b3b27410531faee156fd713bd10a859a2351a810928ece82141e78002db4e",
+      "reason": "PG17 multi-row CTE rescan of proposal 0018 on the 0.35.1 actor-profile statement; SQL, parameters, structural plan and rescan count re-taken; proposal 0019, Known limits",
       "rescans": 1,
-      "sql_sha256": "795cc3990ae0f64620afa7458fe5399fb4a501580900db486bebeb7df3ea0a88"
+      "sql_sha256": "ef1abc0056e8342a8288b9e460d453c3f1c3152c435380dea9a35788204a794a"
     },
     "17/denormalized-shared-inside/off-member-narrow-listing": {
       "kind": "rescan",
-      "params_sha256": "6aee81f48070a0660b2915b121c427e56dfe591a33306794c2121f66ea6e8db1",
+      "params_sha256": "fd79d1dfdb7b73143dd2c7831b2a3154fe82b55aba1e09777d9bd8982573225e",
       "plan_capture": "EXPLAIN (ANALYZE, BUFFERS, FORMAT JSON, MEMORY)",
-      "plan_sha256": "877d1a6430cf557ea732e5daae8403b58ece33f1a97ecd2ba94a7e8262d16895",
-      "reason": "Pre-existing 0.33.0 PG17 multi-row CTE rescan; identical SQL, parameters, structural plan and rescan count; proposal 0018, Known limitations / follow-up",
+      "plan_sha256": "5652fe2fa43014fe3a83ad5c43c55485c0789c8f81cbb6953a822fda168140c4",
+      "reason": "PG17 multi-row CTE rescan of proposal 0018 on the 0.35.1 actor-profile statement; SQL, parameters, structural plan and rescan count re-taken; proposal 0019, Known limits",
       "rescans": 1,
-      "sql_sha256": "6dbaaa78c89b64381243b6b40c64b8afb567aede39d0d6e66b8acce3d596f39c"
+      "sql_sha256": "5412ea98c4b1901be29f05125bc4eca4f3abe821dbe32b0673ee88ddd5a09261"
     },
     "17/denormalized-shared-inside/off-team-narrow-count": {
       "kind": "rescan",
-      "params_sha256": "0d04a7c64793d6d130068f7a309f9da5528855e27de5cb0bd83e6e6b07ebc0f4",
+      "params_sha256": "f2621fe242a57624ccea3d9f178fb0fbd213fd79ac0bd14680e62631de1e26d0",
       "plan_capture": "EXPLAIN (ANALYZE, BUFFERS, FORMAT JSON, MEMORY)",
-      "plan_sha256": "f5c6bd8f3b7bd14750dc1a8abd98f439d3b862b076479a7895798e2f6b18efec",
-      "reason": "Pre-existing 0.33.0 PG17 multi-row CTE rescan; identical SQL, parameters, structural plan and rescan count; proposal 0018, Known limitations / follow-up",
+      "plan_sha256": "0f63a5e1b5334318e66e82f5d14872bea5a7a48973ed35b5307c65352cc7d9e4",
+      "reason": "PG17 multi-row CTE rescan of proposal 0018 on the 0.35.1 actor-profile statement; SQL, parameters, structural plan and rescan count re-taken; proposal 0019, Known limits",
       "rescans": 1,
-      "sql_sha256": "795cc3990ae0f64620afa7458fe5399fb4a501580900db486bebeb7df3ea0a88"
+      "sql_sha256": "2aacf321542282698f624af6c5f69730e935d872f89b19c462b3adede79cccbf"
     },
     "17/denormalized-shared-inside/off-team-narrow-listing": {
       "kind": "rescan",
-      "params_sha256": "0d04a7c64793d6d130068f7a309f9da5528855e27de5cb0bd83e6e6b07ebc0f4",
+      "params_sha256": "f2621fe242a57624ccea3d9f178fb0fbd213fd79ac0bd14680e62631de1e26d0",
       "plan_capture": "EXPLAIN (ANALYZE, BUFFERS, FORMAT JSON, MEMORY)",
-      "plan_sha256": "2d69b109e561ecef0e4af49f99f400fc8b5d87029454a910553aeeeef30a8dcd",
-      "reason": "Pre-existing 0.33.0 PG17 multi-row CTE rescan; identical SQL, parameters, structural plan and rescan count; proposal 0018, Known limitations / follow-up",
+      "plan_sha256": "8af661c5dd8407eeed6f8633e6d5ed4a2c5ac924113ed882cd3f3aeceda6713c",
+      "reason": "PG17 multi-row CTE rescan of proposal 0018 on the 0.35.1 actor-profile statement; SQL, parameters, structural plan and rescan count re-taken; proposal 0019, Known limits",
       "rescans": 1,
-      "sql_sha256": "6dbaaa78c89b64381243b6b40c64b8afb567aede39d0d6e66b8acce3d596f39c"
+      "sql_sha256": "192d4cbe7a9ba22f35ee111182e518282646e287e6d1fa6c13f533e04591f453"
     },
     "17/denormalized-shared-inside/on-large-narrow-count": {
       "kind": "rescan",
@@ -148,39 +148,39 @@
     },
     "17/denormalized-shared-inside/on-member-narrow-count": {
       "kind": "rescan",
-      "params_sha256": "6aee81f48070a0660b2915b121c427e56dfe591a33306794c2121f66ea6e8db1",
+      "params_sha256": "fd79d1dfdb7b73143dd2c7831b2a3154fe82b55aba1e09777d9bd8982573225e",
       "plan_capture": "EXPLAIN (ANALYZE, BUFFERS, FORMAT JSON, MEMORY)",
-      "plan_sha256": "0d1e1c6cfe088abb6313f1a398c8c30830c77bc64c9c4e96babb94d053142040",
-      "reason": "Pre-existing 0.33.0 PG17 multi-row CTE rescan; identical SQL, parameters, structural plan and rescan count; proposal 0018, Known limitations / follow-up",
+      "plan_sha256": "bf9b3b27410531faee156fd713bd10a859a2351a810928ece82141e78002db4e",
+      "reason": "PG17 multi-row CTE rescan of proposal 0018 on the 0.35.1 actor-profile statement; SQL, parameters, structural plan and rescan count re-taken; proposal 0019, Known limits",
       "rescans": 1,
-      "sql_sha256": "795cc3990ae0f64620afa7458fe5399fb4a501580900db486bebeb7df3ea0a88"
+      "sql_sha256": "ef1abc0056e8342a8288b9e460d453c3f1c3152c435380dea9a35788204a794a"
     },
     "17/denormalized-shared-inside/on-member-narrow-listing": {
       "kind": "rescan",
-      "params_sha256": "6aee81f48070a0660b2915b121c427e56dfe591a33306794c2121f66ea6e8db1",
+      "params_sha256": "fd79d1dfdb7b73143dd2c7831b2a3154fe82b55aba1e09777d9bd8982573225e",
       "plan_capture": "EXPLAIN (ANALYZE, BUFFERS, FORMAT JSON, MEMORY)",
-      "plan_sha256": "877d1a6430cf557ea732e5daae8403b58ece33f1a97ecd2ba94a7e8262d16895",
-      "reason": "Pre-existing 0.33.0 PG17 multi-row CTE rescan; identical SQL, parameters, structural plan and rescan count; proposal 0018, Known limitations / follow-up",
+      "plan_sha256": "5652fe2fa43014fe3a83ad5c43c55485c0789c8f81cbb6953a822fda168140c4",
+      "reason": "PG17 multi-row CTE rescan of proposal 0018 on the 0.35.1 actor-profile statement; SQL, parameters, structural plan and rescan count re-taken; proposal 0019, Known limits",
       "rescans": 1,
-      "sql_sha256": "6dbaaa78c89b64381243b6b40c64b8afb567aede39d0d6e66b8acce3d596f39c"
+      "sql_sha256": "5412ea98c4b1901be29f05125bc4eca4f3abe821dbe32b0673ee88ddd5a09261"
     },
     "17/denormalized-shared-inside/on-team-narrow-count": {
       "kind": "rescan",
-      "params_sha256": "0d04a7c64793d6d130068f7a309f9da5528855e27de5cb0bd83e6e6b07ebc0f4",
+      "params_sha256": "f2621fe242a57624ccea3d9f178fb0fbd213fd79ac0bd14680e62631de1e26d0",
       "plan_capture": "EXPLAIN (ANALYZE, BUFFERS, FORMAT JSON, MEMORY)",
-      "plan_sha256": "f5c6bd8f3b7bd14750dc1a8abd98f439d3b862b076479a7895798e2f6b18efec",
-      "reason": "Pre-existing 0.33.0 PG17 multi-row CTE rescan; identical SQL, parameters, structural plan and rescan count; proposal 0018, Known limitations / follow-up",
+      "plan_sha256": "0f63a5e1b5334318e66e82f5d14872bea5a7a48973ed35b5307c65352cc7d9e4",
+      "reason": "PG17 multi-row CTE rescan of proposal 0018 on the 0.35.1 actor-profile statement; SQL, parameters, structural plan and rescan count re-taken; proposal 0019, Known limits",
       "rescans": 1,
-      "sql_sha256": "795cc3990ae0f64620afa7458fe5399fb4a501580900db486bebeb7df3ea0a88"
+      "sql_sha256": "2aacf321542282698f624af6c5f69730e935d872f89b19c462b3adede79cccbf"
     },
     "17/denormalized-shared-inside/on-team-narrow-listing": {
       "kind": "rescan",
-      "params_sha256": "0d04a7c64793d6d130068f7a309f9da5528855e27de5cb0bd83e6e6b07ebc0f4",
+      "params_sha256": "f2621fe242a57624ccea3d9f178fb0fbd213fd79ac0bd14680e62631de1e26d0",
       "plan_capture": "EXPLAIN (ANALYZE, BUFFERS, FORMAT JSON, MEMORY)",
-      "plan_sha256": "2d69b109e561ecef0e4af49f99f400fc8b5d87029454a910553aeeeef30a8dcd",
-      "reason": "Pre-existing 0.33.0 PG17 multi-row CTE rescan; identical SQL, parameters, structural plan and rescan count; proposal 0018, Known limitations / follow-up",
+      "plan_sha256": "8af661c5dd8407eeed6f8633e6d5ed4a2c5ac924113ed882cd3f3aeceda6713c",
+      "reason": "PG17 multi-row CTE rescan of proposal 0018 on the 0.35.1 actor-profile statement; SQL, parameters, structural plan and rescan count re-taken; proposal 0019, Known limits",
       "rescans": 1,
-      "sql_sha256": "6dbaaa78c89b64381243b6b40c64b8afb567aede39d0d6e66b8acce3d596f39c"
+      "sql_sha256": "192d4cbe7a9ba22f35ee111182e518282646e287e6d1fa6c13f533e04591f453"
     },
     "17/denormalized-shared-outside/off-admin-narrow-count": {
       "kind": "rescan",
@@ -329,20 +329,20 @@
     "17/denormalized-single-inside/off-member-broad-listing": {
       "baseline_error": "canceling statement due to statement timeout",
       "kind": "timeout",
-      "params_sha256": "24a5174858d5a95d23fc6c9311be3e81206f602b904f8aaae81b778b86f0f8f7",
+      "params_sha256": "c3d873f96436e45369ec9c0313c47ed38c46513179fcb6bbb0064a8d52bb349e",
       "plan_capture": "EXPLAIN (FORMAT JSON)",
-      "plan_sha256": "5109f3b93b48a381402bd7adfa94652f444d38c8e0773769359a70323e81db5d",
-      "reason": "Pre-existing 0.33.0 sparse-member broad-listing 30 s statement timeout; bounded after SQL/parameters/non-executing plan identity checks; proposal 0018, Known limitations / follow-up",
-      "sql_sha256": "7444dfb6eec6ec2885189ae543113daa273374ab2e1a476f9d5d3f9f98960dbc"
+      "plan_sha256": "577f94d4609b38cf715ac419944b5ad75ad78a3295ef4937a8777627389c1f2a",
+      "reason": "Sparse-member broad-listing 30 s statement timeout of proposal 0018 on the 0.35.1 actor-profile statement; timeout re-measured and SQL, parameters and non-executing plan re-taken; proposal 0019, Known limits",
+      "sql_sha256": "37f436dd7595422f1aeb30b7b4dd9cf2f43cafa35f0ad626640cf1a44a14eae8"
     },
     "17/denormalized-single-inside/on-member-broad-listing": {
       "baseline_error": "canceling statement due to statement timeout",
       "kind": "timeout",
-      "params_sha256": "24a5174858d5a95d23fc6c9311be3e81206f602b904f8aaae81b778b86f0f8f7",
+      "params_sha256": "c3d873f96436e45369ec9c0313c47ed38c46513179fcb6bbb0064a8d52bb349e",
       "plan_capture": "EXPLAIN (FORMAT JSON)",
-      "plan_sha256": "5109f3b93b48a381402bd7adfa94652f444d38c8e0773769359a70323e81db5d",
-      "reason": "Pre-existing 0.33.0 sparse-member broad-listing 30 s statement timeout; bounded after SQL/parameters/non-executing plan identity checks; proposal 0018, Known limitations / follow-up",
-      "sql_sha256": "7444dfb6eec6ec2885189ae543113daa273374ab2e1a476f9d5d3f9f98960dbc"
+      "plan_sha256": "577f94d4609b38cf715ac419944b5ad75ad78a3295ef4937a8777627389c1f2a",
+      "reason": "Sparse-member broad-listing 30 s statement timeout of proposal 0018 on the 0.35.1 actor-profile statement; timeout re-measured and SQL, parameters and non-executing plan re-taken; proposal 0019, Known limits",
+      "sql_sha256": "37f436dd7595422f1aeb30b7b4dd9cf2f43cafa35f0ad626640cf1a44a14eae8"
     },
     "17/denormalized-single-outside/off-member-broad-listing": {
       "baseline_error": "canceling statement due to statement timeout",
@@ -382,39 +382,39 @@
     },
     "17/registry-shared-inside/off-member-narrow-count": {
       "kind": "rescan",
-      "params_sha256": "6aee81f48070a0660b2915b121c427e56dfe591a33306794c2121f66ea6e8db1",
+      "params_sha256": "fd79d1dfdb7b73143dd2c7831b2a3154fe82b55aba1e09777d9bd8982573225e",
       "plan_capture": "EXPLAIN (ANALYZE, BUFFERS, FORMAT JSON, MEMORY)",
-      "plan_sha256": "05ec85aaac5bd168039f3e0dfcda52ff713dcb339aff343cc23e63323585a135",
-      "reason": "Pre-existing 0.33.0 PG17 multi-row CTE rescan; identical SQL, parameters, structural plan and rescan count; proposal 0018, Known limitations / follow-up",
+      "plan_sha256": "ae7ade4093dc6e08c8c6b67e56ca9fa610af7ebf6b3c96f14c868ae9c4d632da",
+      "reason": "PG17 multi-row CTE rescan of proposal 0018 on the 0.35.1 actor-profile statement; SQL, parameters, structural plan and rescan count re-taken; proposal 0019, Known limits",
       "rescans": 1,
-      "sql_sha256": "bc84359a3e10a3dfbe8e308a9d74abde4a4e342cf347a0df3bdb4e09188745f5"
+      "sql_sha256": "08bb34423599911616d18dca71b6cde677419b0f837eb5ae6ea92993fb0bdd51"
     },
     "17/registry-shared-inside/off-member-narrow-listing": {
       "kind": "rescan",
-      "params_sha256": "6aee81f48070a0660b2915b121c427e56dfe591a33306794c2121f66ea6e8db1",
+      "params_sha256": "fd79d1dfdb7b73143dd2c7831b2a3154fe82b55aba1e09777d9bd8982573225e",
       "plan_capture": "EXPLAIN (ANALYZE, BUFFERS, FORMAT JSON, MEMORY)",
-      "plan_sha256": "57b20cdc6f1217df2c3d816db4577f5e8986249219d77792eafc595e4d26b493",
-      "reason": "Pre-existing 0.33.0 PG17 multi-row CTE rescan; identical SQL, parameters, structural plan and rescan count; proposal 0018, Known limitations / follow-up",
+      "plan_sha256": "ad33c3cd7c718596f6040ccd3e3c9730f5bbffbaee207cefcd7a7359294cb244",
+      "reason": "PG17 multi-row CTE rescan of proposal 0018 on the 0.35.1 actor-profile statement; SQL, parameters, structural plan and rescan count re-taken; proposal 0019, Known limits",
       "rescans": 1,
-      "sql_sha256": "308152b225b1a2ea68c615550ccd808a2904988fb319c338cac419ff76e95083"
+      "sql_sha256": "218b3c7448da731ff55a7b054244db9cbc1c566b5d2b67dde85782b967a8ed5c"
     },
     "17/registry-shared-inside/off-team-narrow-count": {
       "kind": "rescan",
-      "params_sha256": "0d04a7c64793d6d130068f7a309f9da5528855e27de5cb0bd83e6e6b07ebc0f4",
+      "params_sha256": "f2621fe242a57624ccea3d9f178fb0fbd213fd79ac0bd14680e62631de1e26d0",
       "plan_capture": "EXPLAIN (ANALYZE, BUFFERS, FORMAT JSON, MEMORY)",
-      "plan_sha256": "e2ce3e8a737edcd588811b5a379e5d482804ba2953f43edc12719a6813f7c0d7",
-      "reason": "Pre-existing 0.33.0 PG17 multi-row CTE rescan; identical SQL, parameters, structural plan and rescan count; proposal 0018, Known limitations / follow-up",
+      "plan_sha256": "be24f8fa7fc4009036d6cc41d6119b495f411403446cdb0c81ab85dc3f5c7995",
+      "reason": "PG17 multi-row CTE rescan of proposal 0018 on the 0.35.1 actor-profile statement; SQL, parameters, structural plan and rescan count re-taken; proposal 0019, Known limits",
       "rescans": 1,
-      "sql_sha256": "bc84359a3e10a3dfbe8e308a9d74abde4a4e342cf347a0df3bdb4e09188745f5"
+      "sql_sha256": "2e5805b74da037620bfe273684c17afba34d1f68dad62db591fba26baa5ea49c"
     },
     "17/registry-shared-inside/off-team-narrow-listing": {
       "kind": "rescan",
-      "params_sha256": "0d04a7c64793d6d130068f7a309f9da5528855e27de5cb0bd83e6e6b07ebc0f4",
+      "params_sha256": "f2621fe242a57624ccea3d9f178fb0fbd213fd79ac0bd14680e62631de1e26d0",
       "plan_capture": "EXPLAIN (ANALYZE, BUFFERS, FORMAT JSON, MEMORY)",
-      "plan_sha256": "eb8c122575ff1e0753f70316c84bc54d71e68b09f1f3f28e2125e82b80d5f5ac",
-      "reason": "Pre-existing 0.33.0 PG17 multi-row CTE rescan; identical SQL, parameters, structural plan and rescan count; proposal 0018, Known limitations / follow-up",
+      "plan_sha256": "71ef41ce279d977175d9e6f82af1ffd000482346060faaaa49692ee344af964a",
+      "reason": "PG17 multi-row CTE rescan of proposal 0018 on the 0.35.1 actor-profile statement; SQL, parameters, structural plan and rescan count re-taken; proposal 0019, Known limits",
       "rescans": 1,
-      "sql_sha256": "308152b225b1a2ea68c615550ccd808a2904988fb319c338cac419ff76e95083"
+      "sql_sha256": "b99bb3fd03fb8b6805179d5369cc828bbb08588e310a847cd45d40cb8adb5a6d"
     },
     "17/registry-shared-inside/on-large-narrow-count": {
       "kind": "rescan",
@@ -436,39 +436,39 @@
     },
     "17/registry-shared-inside/on-member-narrow-count": {
       "kind": "rescan",
-      "params_sha256": "6aee81f48070a0660b2915b121c427e56dfe591a33306794c2121f66ea6e8db1",
+      "params_sha256": "fd79d1dfdb7b73143dd2c7831b2a3154fe82b55aba1e09777d9bd8982573225e",
       "plan_capture": "EXPLAIN (ANALYZE, BUFFERS, FORMAT JSON, MEMORY)",
-      "plan_sha256": "05ec85aaac5bd168039f3e0dfcda52ff713dcb339aff343cc23e63323585a135",
-      "reason": "Pre-existing 0.33.0 PG17 multi-row CTE rescan; identical SQL, parameters, structural plan and rescan count; proposal 0018, Known limitations / follow-up",
+      "plan_sha256": "ae7ade4093dc6e08c8c6b67e56ca9fa610af7ebf6b3c96f14c868ae9c4d632da",
+      "reason": "PG17 multi-row CTE rescan of proposal 0018 on the 0.35.1 actor-profile statement; SQL, parameters, structural plan and rescan count re-taken; proposal 0019, Known limits",
       "rescans": 1,
-      "sql_sha256": "bc84359a3e10a3dfbe8e308a9d74abde4a4e342cf347a0df3bdb4e09188745f5"
+      "sql_sha256": "08bb34423599911616d18dca71b6cde677419b0f837eb5ae6ea92993fb0bdd51"
     },
     "17/registry-shared-inside/on-member-narrow-listing": {
       "kind": "rescan",
-      "params_sha256": "6aee81f48070a0660b2915b121c427e56dfe591a33306794c2121f66ea6e8db1",
+      "params_sha256": "fd79d1dfdb7b73143dd2c7831b2a3154fe82b55aba1e09777d9bd8982573225e",
       "plan_capture": "EXPLAIN (ANALYZE, BUFFERS, FORMAT JSON, MEMORY)",
-      "plan_sha256": "57b20cdc6f1217df2c3d816db4577f5e8986249219d77792eafc595e4d26b493",
-      "reason": "Pre-existing 0.33.0 PG17 multi-row CTE rescan; identical SQL, parameters, structural plan and rescan count; proposal 0018, Known limitations / follow-up",
+      "plan_sha256": "ad33c3cd7c718596f6040ccd3e3c9730f5bbffbaee207cefcd7a7359294cb244",
+      "reason": "PG17 multi-row CTE rescan of proposal 0018 on the 0.35.1 actor-profile statement; SQL, parameters, structural plan and rescan count re-taken; proposal 0019, Known limits",
       "rescans": 1,
-      "sql_sha256": "308152b225b1a2ea68c615550ccd808a2904988fb319c338cac419ff76e95083"
+      "sql_sha256": "218b3c7448da731ff55a7b054244db9cbc1c566b5d2b67dde85782b967a8ed5c"
     },
     "17/registry-shared-inside/on-team-narrow-count": {
       "kind": "rescan",
-      "params_sha256": "0d04a7c64793d6d130068f7a309f9da5528855e27de5cb0bd83e6e6b07ebc0f4",
+      "params_sha256": "f2621fe242a57624ccea3d9f178fb0fbd213fd79ac0bd14680e62631de1e26d0",
       "plan_capture": "EXPLAIN (ANALYZE, BUFFERS, FORMAT JSON, MEMORY)",
-      "plan_sha256": "e2ce3e8a737edcd588811b5a379e5d482804ba2953f43edc12719a6813f7c0d7",
-      "reason": "Pre-existing 0.33.0 PG17 multi-row CTE rescan; identical SQL, parameters, structural plan and rescan count; proposal 0018, Known limitations / follow-up",
+      "plan_sha256": "be24f8fa7fc4009036d6cc41d6119b495f411403446cdb0c81ab85dc3f5c7995",
+      "reason": "PG17 multi-row CTE rescan of proposal 0018 on the 0.35.1 actor-profile statement; SQL, parameters, structural plan and rescan count re-taken; proposal 0019, Known limits",
       "rescans": 1,
-      "sql_sha256": "bc84359a3e10a3dfbe8e308a9d74abde4a4e342cf347a0df3bdb4e09188745f5"
+      "sql_sha256": "2e5805b74da037620bfe273684c17afba34d1f68dad62db591fba26baa5ea49c"
     },
     "17/registry-shared-inside/on-team-narrow-listing": {
       "kind": "rescan",
-      "params_sha256": "0d04a7c64793d6d130068f7a309f9da5528855e27de5cb0bd83e6e6b07ebc0f4",
+      "params_sha256": "f2621fe242a57624ccea3d9f178fb0fbd213fd79ac0bd14680e62631de1e26d0",
       "plan_capture": "EXPLAIN (ANALYZE, BUFFERS, FORMAT JSON, MEMORY)",
-      "plan_sha256": "eb8c122575ff1e0753f70316c84bc54d71e68b09f1f3f28e2125e82b80d5f5ac",
-      "reason": "Pre-existing 0.33.0 PG17 multi-row CTE rescan; identical SQL, parameters, structural plan and rescan count; proposal 0018, Known limitations / follow-up",
+      "plan_sha256": "71ef41ce279d977175d9e6f82af1ffd000482346060faaaa49692ee344af964a",
+      "reason": "PG17 multi-row CTE rescan of proposal 0018 on the 0.35.1 actor-profile statement; SQL, parameters, structural plan and rescan count re-taken; proposal 0019, Known limits",
       "rescans": 1,
-      "sql_sha256": "308152b225b1a2ea68c615550ccd808a2904988fb319c338cac419ff76e95083"
+      "sql_sha256": "b99bb3fd03fb8b6805179d5369cc828bbb08588e310a847cd45d40cb8adb5a6d"
     },
     "17/registry-shared-outside/off-admin-narrow-count": {
       "kind": "rescan",
@@ -617,20 +617,20 @@
     "17/registry-single-inside/off-member-broad-listing": {
       "baseline_error": "canceling statement due to statement timeout",
       "kind": "timeout",
-      "params_sha256": "24a5174858d5a95d23fc6c9311be3e81206f602b904f8aaae81b778b86f0f8f7",
+      "params_sha256": "c3d873f96436e45369ec9c0313c47ed38c46513179fcb6bbb0064a8d52bb349e",
       "plan_capture": "EXPLAIN (FORMAT JSON)",
-      "plan_sha256": "958e9634f41ee048089a50ee51bbcd4330cb41377f2f987513559b6ceb236638",
-      "reason": "Pre-existing 0.33.0 sparse-member broad-listing 30 s statement timeout; bounded after SQL/parameters/non-executing plan identity checks; proposal 0018, Known limitations / follow-up",
-      "sql_sha256": "98f219188f5390283d41da6945853f4fb6c13888d5441a9bfab4d762987a76b3"
+      "plan_sha256": "090754788808db34a9ff71c693b88e0e215b5e0540a9567227d82e55951052c3",
+      "reason": "Sparse-member broad-listing 30 s statement timeout of proposal 0018 on the 0.35.1 actor-profile statement; timeout re-measured and SQL, parameters and non-executing plan re-taken; proposal 0019, Known limits",
+      "sql_sha256": "f02680ec92083415f0987f647bb45f847c62edb08108c814961c2edf09822d57"
     },
     "17/registry-single-inside/on-member-broad-listing": {
       "baseline_error": "canceling statement due to statement timeout",
       "kind": "timeout",
-      "params_sha256": "24a5174858d5a95d23fc6c9311be3e81206f602b904f8aaae81b778b86f0f8f7",
+      "params_sha256": "c3d873f96436e45369ec9c0313c47ed38c46513179fcb6bbb0064a8d52bb349e",
       "plan_capture": "EXPLAIN (FORMAT JSON)",
-      "plan_sha256": "958e9634f41ee048089a50ee51bbcd4330cb41377f2f987513559b6ceb236638",
-      "reason": "Pre-existing 0.33.0 sparse-member broad-listing 30 s statement timeout; bounded after SQL/parameters/non-executing plan identity checks; proposal 0018, Known limitations / follow-up",
-      "sql_sha256": "98f219188f5390283d41da6945853f4fb6c13888d5441a9bfab4d762987a76b3"
+      "plan_sha256": "090754788808db34a9ff71c693b88e0e215b5e0540a9567227d82e55951052c3",
+      "reason": "Sparse-member broad-listing 30 s statement timeout of proposal 0018 on the 0.35.1 actor-profile statement; timeout re-measured and SQL, parameters and non-executing plan re-taken; proposal 0019, Known limits",
+      "sql_sha256": "f02680ec92083415f0987f647bb45f847c62edb08108c814961c2edf09822d57"
     },
     "17/registry-single-outside/off-member-broad-listing": {
       "baseline_error": "canceling statement due to statement timeout",

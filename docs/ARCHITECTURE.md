@@ -2203,12 +2203,9 @@ caveats are not read, so the profile is a superset of what the actor holds.
   did not hold is written by another process or behind the library; a check in
   the same scope refreshes the profile and reads are exact after it.
 - **Who has one.** An actor that is a plain subject (no subject relation, not
-  anonymous, a real id) and holds no row through a stored subject set. Such an
-  actor's statements are compiled in full, as are every actor's outside an
-  evaluator scope. Membership of a set that holds no grant costs nothing. The
-  second condition predates the planner's bound, which removes the slow plan
-  it was added for; lifting it changes statements the frozen scale manifest
-  pins (proposal 0019, Known limits).
+  anonymous, a real id), however its grants reach it: directly, by wildcard
+  or through stored subject sets. Every other actor's statements are compiled
+  in full, as are every actor's outside an evaluator scope.
 - **Kept statements.** A statement is kept per profile and shared by every
   actor with that profile. The 512-entry statement cache therefore holds fewer
   permissions when many distinct profiles are in use.

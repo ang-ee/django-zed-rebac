@@ -515,13 +515,9 @@ def _actor_profile(
     (``mark_relationships_changed``); a row written by anything else is missed
     until the scope ends, which can only leave rows out (proposal 0019).
 
-    ``None`` leaves every arm compiled: outside an evaluator scope, for an actor
-    that is a subject set, anonymous or without an id, and for an actor that
-    holds a row through a stored subject set. The planner cannot estimate an id
-    set reached through a set, and a statement left with only such arms has lost
-    the wide statement's hash joins: a broad read then scans the id set for each
-    row (about five times slower at 500,000 rows). ``fresh`` reads the rows now,
-    whatever the scope kept.
+    ``None`` leaves every arm compiled: outside an evaluator scope, and for an
+    actor that is a subject set, anonymous or without an id. ``fresh`` reads the
+    rows now, whatever the scope kept.
     """
     if not app_settings.REBAC_ACTOR_PROFILES:
         return None
@@ -542,11 +538,6 @@ def _actor_profile(
     if not fresh and not volatile and found is not None and found[0] == generation:
         return found[1]
     rows = cast(Any, relationships.objects.using(using)).wire_projection()
-    columns = ("resource_type", "resource_id", "relation", "_rebac_through_set")
-
-    def through_set(value: int) -> Value:
-        return Value(value, output_field=models.IntegerField())
-
     seed = (
         rows.filter(
             subject_type=actor.subject_type,
@@ -554,8 +545,7 @@ def _actor_profile(
             subject_id__in=(actor.subject_id, "*"),
         )
         .order_by()
-        .annotate(_rebac_through_set=through_set(0))
-        .values(*columns)
+        .values("resource_type", "resource_id", "relation")
     )
 
     def body(cte: CTE) -> models.QuerySet[Any]:
@@ -567,8 +557,7 @@ def _actor_profile(
                 subject_relation=cte.col.relation,
             )
             .order_by()
-            .annotate(_rebac_through_set=through_set(1))
-            .values(*columns)
+            .values("resource_type", "resource_id", "relation")
         )
         return cast(models.QuerySet[Any], seed.union(step))
 
@@ -576,17 +565,13 @@ def _actor_profile(
     with ctes.isolated():
         cte = CTE.recursive(body, name=safe_name("rebac_profile", table_names()))
         selected = cte.queryset()
-        held = list(
-            with_cte(
-                cte,
-                select=models.QuerySet(model=selected.model, query=selected.query, using=using)
-                .values_list("resource_type", "relation", "_rebac_through_set")
-                .distinct(),
-            )
+        held = with_cte(
+            cte,
+            select=models.QuerySet(model=selected.model, query=selected.query, using=using)
+            .values_list("resource_type", "relation")
+            .distinct(),
         )
-    profile: frozenset[Key] | None = None
-    if not any(through for _type, _relation, through in held):
-        profile = frozenset((str(type_), str(relation)) for type_, relation, _through in held)
+        profile = frozenset((str(resource_type), str(relation)) for resource_type, relation in held)
     if not volatile:
         evaluator._profiles[key] = (generation, profile)
     return profile
