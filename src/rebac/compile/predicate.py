@@ -217,6 +217,10 @@ def _one_object(ref: Any) -> bool:
 
 
 ACTOR_WIRE: Final = Marker("actor wire id")
+# In an actor's grant profile, the resource type of an entry that names a
+# relation on every type: ``(PROFILE_ANY, "reader")`` (``read._actor_profile``).
+# No resource type is spelled this way.
+PROFILE_ANY: Final = "*"
 CLOCK: Final = Marker("clock")
 
 
@@ -1934,6 +1938,7 @@ class Compiler:
             self.profile is not None
             and not self._negated
             and (definition.resource_type, relation.name) not in self.profile
+            and (PROFILE_ANY, relation.name) not in self.profile
         )
         # Tests that nest a subquery go last (see ``_tuple_identity_rows``).
         order = {"subject": 0, "wildcard": 1, "set": 2, "arrow": 3}

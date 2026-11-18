@@ -3,9 +3,10 @@
 Status: **accepted by the owner on 2026-11-18 for 0.35.0 and amended before release.** The first build passed
 tiers 1 and 2 and failed the scale matrix; **the planner's bound** below is the amendment, which the owner
 approved the same day with the eight re-taken PostgreSQL 17 manifest cells. **0.35.1 lifts the subject-set
-rule**, with the owner's approval and 24 more re-taken cells (Known limits). It generalises the negative
-constant-arm fold and the scope-local contract of proposal 0018 from constant arms to stored grants. The contract
-is specified in `docs/ARCHITECTURE.md § Actor grant profiles`.
+rule**, with the owner's approval and 24 more re-taken cells (Known limits). **0.35.2 bounds what reading the
+profile costs** (Reading the profile, below), which the first two releases left unmeasured. It generalises the
+negative constant-arm fold and the scope-local contract of proposal 0018 from constant arms to stored grants.
+The contract is specified in `docs/ARCHITECTURE.md § Actor grant profiles`.
 
 ## Problem
 
@@ -23,6 +24,29 @@ domains, Oso's principal facts, RLS initPlans). This engine resolves them inside
 at least one relationship row names the actor, a wildcard of the actor's type, or a stored subject set the
 actor is in, the subject sets followed to a fixed point over relationship rows. Expiry and caveats are not read,
 so it is a superset of what the actor holds now.
+
+**Reading the profile** (0.35.2, `_read_profile`). Its cost must not grow with the rows that name the actor: a
+consumer that writes one relationship for each record a user creates gives its users as many rows as they have
+created records. 0.35.0 and 0.35.1 read every such row and looked each one up as a possible subject set.
+
+| Rows naming the actor, registry layout | 0.35.1 | 0.35.2 |
+|---|---|---|
+| a few | 0.5–1.3 ms, one statement | 0.9–2.2 ms, one statement |
+| 25,000 (scale fixture) | 52–53 ms | 7–9 ms, two statements |
+| 100,000 (a consumer's composed policy) | 240 ms | 8 ms, two statements |
+
+- One statement reads at most 1,000 rows that name the actor or a wildcard of its type, and at most 1,000 that
+  name a subject set the actor is in, and counts them by key (`_PROFILE_ROWS`).
+- The subject sets are the closure of the actor's memberships over the relations the schema allows as subject
+  sets (`auth/group#member`). A row is never looked up as a set it cannot be. The profile is kept per policy for
+  that reason.
+- Within both bounds the profile is exact, as before.
+- Where a part stops at its bound, a second statement asks, for each relation name that can hold stored rows,
+  whether one row of that name names the subject: one index probe per name, on
+  `(subject, relation)`. The profile then holds `(PROFILE_ANY, relation)`, that relation on every resource type.
+  It is wider than the exact profile and never narrower, so the direction of every guarantee below is unchanged.
+- For the part that names subject sets, the sets are first listed by a statement of their own. An actor in more
+  than 64 of them (`_PROFILE_SETS`) has no profile.
 
 **Decidable arms.** In `Compiler._stored_relation`, the allowed-subject groups that end at the actor: the plain
 subject group, and a subject-set group whose set relation is stored and admits only plain subjects and other
@@ -95,6 +119,9 @@ relationship write that a read follows; one for a denied point check, whether or
 compile while the thread's transaction holds uncommitted relationship writes, where a queryset read compiles
 twice (its scope, then its statement). The profile also folds constant arms the actor cannot hold, which removes
 their witness statements.
+
+Each of those readings is one statement for an actor within the bounds, two where the rows that name the actor
+pass the bound, and three where the rows that name its subject sets do.
 
 ## Results
 
@@ -172,8 +199,19 @@ shorten that path.
   profile, as today.
 - A statement is kept per profile, so the 512-entry statement cache serves fewer permissions when many distinct
   profiles are in use. Keying by the part of the profile a permission can reach (below) is the remedy.
-- The profile's statement follows every stored subject set the actor is in. Its cost for an actor with very many
-  grants or memberships has not been measured.
+- **Past the bound a relation is known by name, not by type.** An actor with more than 1,000 rows keeps the arms
+  of a relation it holds compiled on every type that declares a relation of that name. In the scale matrix the
+  directly granted actor's statement is 11–13 KB that way, against 4 KB with exact keys and 17 KB in full.
+  Exact types for a relation with few rows would need a bounded read per name; it is not built.
+- **Memberships are still read in full.** The closure of the sets an actor is in reads each membership row, as
+  every statement already does. An actor in very many sets pays for them; one in more than 64 whose sets hold
+  more than 1,000 rows has no profile.
+- **A relation name is probed for every schema relation that can hold stored rows.** A policy with hundreds of
+  distinct relation names makes the second statement that long. Measured at 8 ms in all for an actor with
+  100,000 rows on a composed policy of 541 relations.
+- **16 PostgreSQL 17 manifest cells were re-taken for 0.35.2.** The directly granted and the group-granted
+  actors of the scale matrix both pass the bound, so their statements name relations by name. The capture run
+  showed the frozen rescan unchanged in each cell (same count), and no other cell failed.
 - Two cases keep reading the profile at each compile longer than they need to, which costs statements and never
   rows: a rolled-back transaction whose outermost `atomic` object is entered again (a decorated function), until
   the thread is seen outside a transaction; and a transaction the application ends itself, until autocommit

@@ -10,7 +10,9 @@ The cells inside an evaluator scope hold later fingerprints, because the actor
 profile changed their statements and left the limitation as it was (proposal
 0019, Known limits): eight PostgreSQL 17 rescan cells of the directly granted
 actor from 0.35.0, and from 0.35.1 the 16 rescan cells and eight timeout cells
-of the group-granted actors. Each entry's ``reason`` says which it is.
+of the group-granted actors. 0.35.2 re-took 16 of the PostgreSQL 17 rescan cells
+again, for the two actors whose rows pass the profile's bound. Each entry's
+``reason`` says which it is.
 """
 
 import hashlib

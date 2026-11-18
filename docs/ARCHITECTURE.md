@@ -2196,6 +2196,16 @@ caveats are not read, so the profile is a superset of what the actor holds.
   queryset read compiles twice (its scope, then its statement). A later
   transaction, or one that writes no relationship row, keeps its profile. A
   call with an explicit consistency requirement reads it at that call.
+- **What reading it costs.** The same however many rows name the actor. One
+  statement reads at most 1,000 rows that name the actor or a wildcard of its
+  type and at most 1,000 that name a subject set it is in, following a row as
+  a subject set only where the schema allows one. Within both bounds the
+  profile is exact. Past one, a second statement probes each relation name
+  that can hold stored rows, once, on the `(subject, relation)` index, and the
+  profile holds that relation on every resource type: wider, never narrower.
+  An actor in more than 64 subject sets whose rows pass the bound has no
+  profile. A consumer that writes a relationship per record gives its users
+  as many rows as records; reading them all cost 240 ms for 100,000.
 - **Freshness.** A revoked or expired grant is still compiled and evaluated
   live. A point check is exact: before it answers no it reads the profile
   again, and a profile that moved decides the check anew. A read may be

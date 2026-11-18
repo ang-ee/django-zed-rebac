@@ -417,6 +417,144 @@ def test_an_actor_granted_through_a_subject_set_has_a_profile(threads):
     assert "'direct'" not in scoped[-1]
 
 
+@pytest.fixture
+def bound(monkeypatch):
+    """Two rows are the most a profile reads for exact keys."""
+    monkeypatch.setattr(read, "_PROFILE_ROWS", 2)
+
+
+def profile(local) -> frozenset[tuple[str, str]] | None:
+    return read._actor_profile(local, MEMBER, "default")
+
+
+@KEPT
+def test_an_actor_at_the_bound_has_an_exact_profile_from_one_statement(threads, bound):
+    threads.write_relationships([grant("scope/thread", n, "reader") for n in (1, 2)])
+    outside, _plain = messages()
+    with evaluator_scope():
+        inside, statements = messages()
+        assert profile(threads) == {("scope/thread", "reader")}
+    assert inside == outside == [1, 2, 3]
+    assert profile_statements(statements) == 1
+    # One row past the bound says there are more: no statement reads them all.
+    assert "LIMIT 3" in next(sql for sql in statements if "rebac_profile" in sql)
+
+
+@KEPT
+def test_past_the_bound_an_actors_relations_are_known_by_name(threads, bound):
+    """A consumer that writes a relationship per record gives a user as many rows as records.
+    The profile then costs two small statements however many there are."""
+    threads.write_relationships([grant("scope/thread", n, "reader") for n in (1, 2, 7)])
+    outside, _plain = messages()
+    with evaluator_scope():
+        inside, statements = messages()
+        again, repeated = messages()
+        held = profile(threads)
+    assert inside == outside == again == [1, 2, 3]
+    assert held == {("scope/thread", "reader"), (read.PROFILE_ANY, "reader")}
+    # The sample that stopped at the bound, then one probe per relation name.
+    assert profile_statements(statements) == 2
+    assert profile_statements(repeated) == 0
+    # A name the member holds no row of is still left out.
+    assert "'reader'" in statements[-1]
+    assert "'direct'" not in statements[-1]
+
+
+NAMED_TWICE = SCHEMA.replace(
+    "relation direct: auth/user\n    permission read = thread->read + direct",
+    "relation direct: auth/user\n    relation reader: auth/user\n"
+    "    permission read = thread->read + direct + reader",
+)
+
+
+@KEPT
+@pytest.mark.parametrize("rows", [2, 3])
+def test_a_relation_known_by_name_is_compiled_on_every_type(rows, monkeypatch):
+    """Wider, never narrower: past the bound the message's ``reader`` arm is compiled although
+    the member holds that relation on threads only."""
+    assert NAMED_TWICE != SCHEMA
+    monkeypatch.setattr(read, "_PROFILE_ROWS", rows)
+    local = install_schema(NAMED_TWICE)
+    ScopeThread._base_manager.bulk_create([ScopeThread(id=1), ScopeThread(id=2)])
+    ScopeMessage._base_manager.bulk_create(
+        [ScopeMessage(id=1, thread_id=1), ScopeMessage(id=2, thread_id=2)]
+    )
+    local.write_relationships([grant("scope/thread", n, "reader") for n in (1, 7, 8)])
+    outside, plain = messages()
+    with evaluator_scope():
+        inside, statements = messages()
+    assert inside == outside == [1]
+    exact = rows == 3
+    assert profile_statements(statements) == (1 if exact else 2)
+    # Both types' ``reader`` arms outside a scope; inside one, the thread's alone when the
+    # profile is exact, and both again when the relation is known by name.
+    assert statements[-1].count("'reader'") == (1 if exact else plain[-1].count("'reader'"))
+    assert plain[-1].count("'reader'") == 2
+
+
+@KEPT
+def test_past_the_bound_a_subject_sets_relations_are_known_by_name(threads, bound):
+    team = SubjectRef.of("auth/group", "team", "member")
+    threads.write_relationships(
+        [
+            grant("auth/group", "team", "member"),
+            *[grant("scope/thread", n, "reader", team) for n in (1, 2, 7)],
+        ]
+    )
+    outside, _plain = messages()
+    with evaluator_scope():
+        inside, statements = messages()
+        held = profile(threads)
+    assert inside == outside == [1, 2, 3]
+    # The member's own rows are within the bound and stay exact; the team's are named.
+    assert held == {
+        ("auth/group", "member"),
+        ("scope/thread", "reader"),
+        (read.PROFILE_ANY, "reader"),
+    }
+    # The sample, the sets the member is in, then one probe per relation name.
+    assert profile_statements(statements) == 3
+    assert "'direct'" not in statements[-1]
+
+
+@KEPT
+def test_an_actor_in_more_sets_than_are_named_has_no_profile(threads, bound, monkeypatch):
+    monkeypatch.setattr(read, "_PROFILE_SETS", 1)
+    team = SubjectRef.of("auth/group", "team", "member")
+    threads.write_relationships(
+        [
+            grant("auth/group", "team", "member"),
+            grant("auth/group", "crew", "member"),
+            *[grant("scope/thread", n, "reader", team) for n in (1, 2, 7)],
+        ]
+    )
+    outside, _plain = messages()
+    with evaluator_scope():
+        inside, statements = messages()
+        again, repeated = messages()
+        assert profile(threads) is None
+    assert inside == outside == again == [1, 2, 3]
+    # Learnt once and kept for the scope; every arm is compiled.
+    assert profile_statements(statements) == 2
+    assert profile_statements(repeated) == 0
+    assert "'direct'" in statements[-1]
+
+
+@KEPT
+def test_a_row_is_followed_as_a_subject_set_only_where_the_schema_allows_one(threads):
+    """``scope/thread#reader`` is no allowed subject set, so a thread the member reads is not
+    looked up as one: the profile's cost does not grow with the actor's rows."""
+    threads.write_relationships(
+        [grant("scope/thread", 1, "reader"), grant("auth/group", "team", "member")]
+    )
+    with evaluator_scope():
+        _found, statements = messages()
+    sample = next(sql for sql in statements if "rebac_profile" in sql)
+    sets = sample[sample.index("rebac_profile_sets") : sample.index('"rebac_profile" AS')]
+    assert "'member'" in sets and "'auth/group'" in sets
+    assert "'reader'" not in sets
+
+
 def subtracting(seed: int) -> tuple[str, list[RelationshipTuple]]:
     """A policy in which every permission subtracts, and rows that make the subtraction bite.
 
@@ -487,7 +625,7 @@ definition scope/part {{
     return schema, tuples
 
 
-def assert_missing_keys_only_lose_rows(schema, tuples, seed, storage, settings, monkeypatch):
+def seeded(schema, tuples, storage, settings):
     settings.REBAC_LOCAL_BACKEND_STORAGE = storage
     local = install_schema(schema)
     ScopeThread._base_manager.bulk_create([ScopeThread(id=1), ScopeThread(id=2)])
@@ -503,6 +641,11 @@ def assert_missing_keys_only_lose_rows(schema, tuples, seed, storage, settings, 
     )
     if tuples:
         local.write_relationships(tuples)
+    return local
+
+
+def assert_missing_keys_only_lose_rows(schema, tuples, seed, storage, settings, monkeypatch):
+    local = seeded(schema, tuples, storage, settings)
     rng = random.Random(seed)
     models = ((ScopePart, "scope/part"), (ScopeMessage, "scope/message"))
     for actor in (ADMIN, MEMBER):
@@ -568,3 +711,40 @@ def test_a_profile_with_keys_removed_never_admits_a_row_under_a_subtraction(
     seed, storage, settings, monkeypatch
 ):
     assert_missing_keys_only_lose_rows(*subtracting(seed), seed, storage, settings, monkeypatch)
+
+
+def assert_a_bounded_profile_reads_what_no_profile_reads(schema, tuples, storage, settings):
+    local = seeded(schema, tuples, storage, settings)
+    models = ((ScopePart, "scope/part"), (ScopeMessage, "scope/message"))
+    for actor in (ADMIN, MEMBER):
+        expected = {
+            model: set(model.objects.with_actor(actor).values_list("pk", flat=True))
+            for model, _type in models
+        }
+        with evaluator_scope():
+            for model, resource_type in models:
+                found = set(model.objects.with_actor(actor).values_list("pk", flat=True))
+                assert found == expected[model], (actor, model.__name__, schema)
+                for pk in model._base_manager.values_list("pk", flat=True):
+                    allowed = local.check_access(
+                        subject=actor, action="read", resource=ObjectRef(resource_type, str(pk))
+                    ).allowed
+                    assert allowed == (pk in expected[model]), (actor, resource_type, pk, schema)
+
+
+@pytest.mark.django_db(transaction=True)
+@pytest.mark.parametrize("storage", ["denormalized", "registry"])
+@pytest.mark.pg_delta
+@pytest.mark.parametrize("sets", [0, 64])
+@pytest.mark.parametrize("rows", [0, 1])
+@pytest.mark.parametrize("seed", range(24))
+def test_a_profile_past_its_bound_reads_what_no_profile_reads(
+    seed, rows, sets, storage, settings, monkeypatch
+):
+    """Exactness under the bound's three outcomes: relations known by name for the actor, for
+    its subject sets, and no profile for an actor in more sets than are named. Reads and
+    checks inside an evaluator scope equal those outside one, where no profile exists."""
+    monkeypatch.setattr(read, "_PROFILE_ROWS", rows)
+    monkeypatch.setattr(read, "_PROFILE_SETS", sets)
+    generate = subtracting if seed % 2 else build
+    assert_a_bounded_profile_reads_what_no_profile_reads(*generate(seed), storage, settings)
