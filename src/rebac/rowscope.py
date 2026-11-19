@@ -87,7 +87,6 @@ from .compile.predicate import (
     is_true,
 )
 from .field_backing import resolve_const_backing
-from .models import active_relationship_model
 from .resources import model_resource_type
 from .schema.ast import (
     ConstBinding,
@@ -209,7 +208,7 @@ def row_conditions(
     walk = walking._walk(local, actor, using, None)
     if walk is None or walking._integer_identity(model) is None:
         return None
-    key = (walk.policy.key, active_relationship_model(), model, action, actor, using, _SUBQUERIES)
+    key = (walk.policy.key, walking._relationships(), model, action, actor, using, _SUBQUERIES)
     with _lock:
         if key in _built:
             _built.move_to_end(key)
@@ -435,7 +434,7 @@ class _Rows:
         if not parts:
             return _FALSE
         live = Q(expires_at__isnull=True)
-        tuples: Any = active_relationship_model().objects.using(self.using)
+        tuples: Any = walking._relationships().objects.using(self.using)
         rows = (
             tuples.wire_projection()
             .filter(

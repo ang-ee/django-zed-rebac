@@ -65,7 +65,6 @@ from .actors import is_anonymous_actor
 from .clock import application_now
 from .codec import identity_codec
 from .field_backing import ResolvedFieldBacking, resolve_const_backing, resolve_field_backing
-from .models import active_relationship_model
 from .resources import model_for_resource_type, stores_rows
 from .schema.ast import (
     ConstBinding,
@@ -83,6 +82,18 @@ from .types import SubjectRef
 
 if TYPE_CHECKING:
     from .backends.local import LocalBackend
+
+
+def _relationships() -> Any:
+    """The relationship model, imported when a walk reads it.
+
+    ``rebac.managers`` imports this module, and applications import the managers
+    before the app registry is populated; a model cannot be imported then.
+    """
+    from .models import active_relationship_model
+
+    return active_relationship_model()
+
 
 # Arrows followed from the question's own type before the proving walk gives up.
 _DEPTH = 4
@@ -580,7 +591,7 @@ class _Walk:
         if relation.with_expiration:
             live |= Q(expires_at__gt=application_now())
         rows = (
-            active_relationship_model()
+            _relationships()
             .objects.using(self.using)
             .filter(
                 live,
@@ -742,7 +753,7 @@ class _Walk:
         if relation.with_expiration:
             live |= Q(expires_at__gt=application_now())
         rows = (
-            active_relationship_model()
+            _relationships()
             .objects.using(self.using)
             .filter(
                 live,
