@@ -34,6 +34,8 @@ MECHANISMS: dict[str, dict[str, Any]] = {
     "walk": {"REBAC_BOUNDED_WALK": "decide"},
     "trusted": {"REBAC_TRUSTED_IDS": True},
     "noprofile": {"REBAC_ACTOR_PROFILES": False},
+    # Django's own queries: nothing enforced, so every actor reads every row.
+    "plain": {"REBAC_ENFORCE_PERMISSIONS": False},
     "all": {
         "REBAC_STRUCTURAL_PREFETCH": True,
         "REBAC_ROW_SCOPE": True,
@@ -100,7 +102,7 @@ def main() -> None:
             explain=False,
             uncommitted=False,
         )
-        failed = [row for row in reads(bench, everything) if "error" in row or not row["same"]]
+        failed = [row for row in reads(bench, everything) if "error" in row or row["same"] is False]
         sys.exit(f"{len(failed)} read(s) failed or differed" if failed else 0)
     bench = data.load(settings.REBAC_BENCH_POLICY, arguments.size)
     if arguments.command == "build":
@@ -199,9 +201,13 @@ def reads(bench: Any, arguments: argparse.Namespace) -> list[dict[str, Any]]:
                         row.update(_explain(connection, statements))
                 compiled.reset()
                 rowscope._built.clear()
-                if baseline is None:
-                    baseline = result
-                row["same"] = result == baseline
+                if mechanism == "plain":
+                    # Not a mechanism to compare results with: it reads what is there.
+                    row["same"] = None
+                else:
+                    if baseline is None:
+                        baseline = result
+                    row["same"] = result == baseline
                 report.append(row)
                 line = (
                     f"{name:<14}{who:<9}{mechanism:<11}{row['rows']:>5}{row['statements']:>6}"
@@ -209,7 +215,7 @@ def reads(bench: Any, arguments: argparse.Namespace) -> list[dict[str, Any]]:
                 )
                 if "plan_ms" in row:
                     line += f"{row['plan_ms']:>9}{row['exec_ms']:>9}{row['plan_mib']:>9}"
-                print(line + ("" if row["same"] else "  DIFFERS"), flush=True)
+                print(line + ("  DIFFERS" if row["same"] is False else ""), flush=True)
     return report
 
 

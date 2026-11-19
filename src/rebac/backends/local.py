@@ -104,6 +104,40 @@ def _enforced_schema_errors(schema: Schema) -> list[str]:
     return backing_errors + subject_relation_errors(schema)
 
 
+_UNENFORCED = "permissions are not enforced"
+
+
+def _enforcing() -> bool:
+    from ..actors import enforcing
+
+    return enforcing()
+
+
+def _every_id(resource_type: str, using: str) -> list[str]:
+    """Every object of ``resource_type``, as ``accessible`` answers when nothing is enforced.
+
+    The rows of a type that stores rows; for a type whose objects exist only in
+    relationships, the ids relationships name as resources.
+    """
+    from .._id import resource_id_attr
+    from ..models import active_relationship_model
+    from ..resources import model_for_resource_type, stores_rows
+
+    model = model_for_resource_type(resource_type)
+    if model is not None and stores_rows(model):
+        keys = (
+            model._base_manager.using(using)
+            .order_by()
+            .values_list(resource_id_attr(model), flat=True)
+        )
+        return [str(key) for key in keys]
+    named: Any = active_relationship_model().objects.using(using)
+    rows = (
+        named.filter(resource_type=resource_type).order_by().values_list("resource_id", flat=True)
+    )
+    return sorted({str(value) for value in rows})
+
+
 class LocalBackend:
     """Evaluates permissions as queries over the application's own tables.
 
@@ -569,6 +603,8 @@ class LocalBackend:
         consistency: Consistency | None = None,
         at_zookie: Zookie | None = None,
     ) -> CheckResult:
+        if not _enforcing():
+            return CheckResult.has(reason=_UNENFORCED)
         self._validate_consistency(consistency, at_zookie)
         from ..compile.read import check
         from ..models import active_relationship_model
@@ -590,6 +626,8 @@ class LocalBackend:
         consistency: Consistency | None = None,
         at_zookie: Zookie | None = None,
     ) -> list[CheckResult]:
+        if not _enforcing():
+            return [CheckResult.has(reason=_UNENFORCED) for _item in items]
         self._validate_consistency(consistency, at_zookie)
         from ..compile.read import check_many
         from ..models import active_relationship_model
@@ -608,6 +646,8 @@ class LocalBackend:
         using: str,
     ) -> models.Q:
         """The compiled scope of ``model`` rows; no row for a model without a resource type."""
+        if not _enforcing():
+            return models.Q()
         from ..compile.read import scope_q
 
         return scope_q(backend=self, model=model, action=action, actor=subject, using=using)
@@ -622,6 +662,8 @@ class LocalBackend:
         using: str,
         identity: models.Expression,
     ) -> models.Expression:
+        if not _enforcing():
+            return models.Value(True, output_field=models.BooleanField())
         from ..compile.read import scope_expression
 
         return scope_expression(
@@ -647,6 +689,8 @@ class LocalBackend:
         from ..compile.read import accessible_ids
         from ..models import active_relationship_model
 
+        if not _enforcing():
+            return _every_id(resource_type, active_relationship_model().objects.db)
         self._validate_consistency(consistency, at_zookie)
         return list(
             accessible_ids(
@@ -676,6 +720,8 @@ class LocalBackend:
         from ..compile.read import held
         from ..models import active_relationship_model
 
+        if not _enforcing():
+            return {value for value in ids if value}
         alias = using or active_relationship_model().objects.db
         settled: set[str] = set()
         if walk.enabled():
@@ -719,6 +765,11 @@ class LocalBackend:
         from ..compile.read import held_many
         from ..models import active_relationship_model
 
+        if not _enforcing():
+            if isinstance(actions, str):
+                raise TypeError("actions must be an iterable of names, not a bare string")
+            candidates = {value for value in ids if value}
+            return {name: set(candidates) for name in dict.fromkeys(actions)}
         alias = using or active_relationship_model().objects.db
         if isinstance(actions, str):
             raise TypeError("actions must be an iterable of names, not a bare string")
@@ -765,6 +816,8 @@ class LocalBackend:
         context: dict[str, Any] | None = None,
     ) -> bool:
         """Whether the actor holds the action on every object of the type."""
+        if not _enforcing():
+            return True
         from ..compile.read import grants_all
         from ..models import active_relationship_model
 
