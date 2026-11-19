@@ -5,6 +5,11 @@ pre-1.0; breaking changes within a minor version are explicitly called out.
 
 ## [Unreleased]
 
+## [0.36.0] — 2026-11-19
+
+Nothing changes for a deployment that sets none of the settings below: statements, statement counts and
+decisions are those of 0.35.2.
+
 ### Added
 
 - **`REBAC_ENABLED`** (`True` by default). `False` enforces nothing: every
@@ -15,8 +20,9 @@ pre-1.0; breaking changes within a minor version are explicitly called out.
   database. The library reports the state with system check `rebac.W011` and one
   warning on the `rebac` logger at startup. See `docs/ARCHITECTURE.md § Unenforced
   deployments` and proposal 0021.
-- **Switchable read mechanisms** ([proposal 0020](docs/proposals/0020-switchable-read-mechanisms.md)), each a
-  setting that is off by default and changes no statement while it is off:
+- **Switchable read mechanisms, experimental** ([proposal 0020](docs/proposals/0020-switchable-read-mechanisms.md)),
+  each a setting that is off by default and changes no statement while it is off. They are released to be
+  measured, and may change or be withdrawn in a minor release:
   - `REBAC_STRUCTURAL_PREFETCH`: children of parents a prefetch just admitted are read by foreign key where the
     policy proves the parent's action grants theirs.
   - `REBAC_ROW_SCOPE`: the scope of a statement a queryset runs itself is written as conditions on each row
@@ -30,6 +36,18 @@ pre-1.0; breaking changes within a minor version are explicitly called out.
   - `rebac.testing.compare_mechanisms` and `format_mechanisms` run one read under combinations of settings and
     report statements, SQL size, time and whether the result changed. `rebac.rowscope.explain` says whether a
     permission is written as row conditions and what stops it.
+
+  A compiled answer is one statement and reads one state of the data. `REBAC_STRUCTURAL_PREFETCH` and
+  `REBAC_BOUNDED_WALK` read several statements, each seeing the state committed when it runs: they are exact
+  inside one snapshot (a transaction on a connection configured for repeatable read) and can assemble a decision
+  from adjacent states otherwise. The proposal's known limits list this and the rest.
+- **`rebac.skeleton.export(directory)`** writes a project's effective policy (`policy.zed`) and, for each model
+  the policy touches, only what the policy reads of it (`skeleton.json`). No row is read.
+- **A policy benchmark** in the repository's `tests/bench` (`tests/bench/README.md`,
+  `docs/ARCHITECTURE.md § The policy benchmark`): stand-in models built from an export, rows and grants generated
+  to a chosen size, and a runner that reads the same scenarios under each mechanism and reports statements, SQL
+  size, planning and execution time. `make bench-smoke` builds the smallest size on SQLite and fails if a
+  mechanism changes what a read returns. Nothing in it is collected by pytest.
 
 ## [0.35.2] — 2026-11-18
 
