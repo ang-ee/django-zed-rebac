@@ -5,6 +5,24 @@ pre-1.0; breaking changes within a minor version are explicitly called out.
 
 ## [Unreleased]
 
+### Added
+
+- **Switchable read mechanisms** ([proposal 0020](docs/proposals/0020-switchable-read-mechanisms.md)), each a
+  setting that is off by default and changes no statement while it is off:
+  - `REBAC_STRUCTURAL_PREFETCH`: children of parents a prefetch just admitted are read by foreign key where the
+    policy proves the parent's action grants theirs.
+  - `REBAC_ROW_SCOPE`: the scope of a statement a queryset runs itself is written as conditions on each row
+    instead of membership in the ids the actor holds. PostgreSQL's JIT must be off for it.
+  - `REBAC_BOUNDED_WALK`: `held` and `held_many` are answered by lookups on the rows the ids name; `"decide"`
+    reads the whole permission and answers no as well.
+  - `REBAC_DISPLAY_FIELDS` with `Meta.rebac_display_fields` or `rebac.display.declare`: what a related row
+    shows to a reader of the row that refers to it.
+  - `REBAC_TRUSTED_IDS`: a stored id of an integer identity is converted by the cast alone.
+  - `rebac.snapshot.read_snapshot()`: one transaction for a unit of reading in which decisions are kept.
+  - `rebac.testing.compare_mechanisms` and `format_mechanisms` run one read under combinations of settings and
+    report statements, SQL size, time and whether the result changed. `rebac.rowscope.explain` says whether a
+    permission is written as row conditions and what stops it.
+
 ## [0.35.2] — 2026-11-18
 
 ### Fixed
