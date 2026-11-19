@@ -1292,6 +1292,7 @@ class YourAppConfig(AppConfig):
 | Surface | With `REBAC_ENFORCE_PERMISSIONS = False` |
 |---|---|
 | Querysets (`with_actor`, ambient actor, no actor) | No scope is added, whatever actor is pinned; a strict call without an actor does not raise. |
+| Fetched rows | Still stamped with their reader (`instance.actor()`): the queryset's actor, the carrying row's, or the ambient one. Code that trusts a prefetched row by its stamp keeps doing so. |
 | `rebac_select_related`, `rebac_prefetch_related` | Django's own statements: no guard, no scoped prefetch. |
 | Field read gates | Nothing is redacted or omitted. |
 | Model `save`, `delete`, `check_access`; bulk `update`, `delete`, `bulk_create`; many-to-many and backed-edge gates | Allowed, without an actor. |

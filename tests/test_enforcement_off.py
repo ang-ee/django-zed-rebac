@@ -193,3 +193,25 @@ def test_the_system_check_says_so(settings):
     settings.REBAC_ENFORCE_PERMISSIONS = False
     [warning] = check_permissions_enforced()
     assert warning.id == "rebac.W011" and "no permission is checked" in warning.msg
+
+
+def test_rows_still_carry_their_reader(world, settings):
+    """Nothing is enforced for the reader, and the reader is still who read the rows: code that
+    trusts a prefetched row by its stamp keeps trusting it."""
+    settings.REBAC_ENFORCE_PERMISSIONS = False
+    thread = (
+        ScopeThread.objects.with_actor(OUTSIDER)
+        .rebac_prefetch_related("scopemessage_set__scopepart_set")
+        .get(pk=2)
+    )
+    [message] = thread.scopemessage_set.all()
+    [part] = message.scopepart_set.all()
+    assert thread.actor() == message.actor() == part.actor() == OUTSIDER
+    joined = (
+        ScopePart.objects.with_actor(OUTSIDER).rebac_select_related("message__thread").get(pk=1)
+    )
+    assert joined.actor() == joined.message.actor() == joined.message.thread.actor() == OUTSIDER
+    with actor_context(MEMBER):
+        assert ScopeThread.objects.get(pk=2).actor() == MEMBER
+    # No reader, no stamp.
+    assert ScopeThread.objects.get(pk=2).actor() is None
