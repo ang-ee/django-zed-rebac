@@ -1,15 +1,18 @@
-"""One read-only snapshot for a unit of reading (proposal 0020).
+"""One transaction for a unit of reading, in which decisions are kept (proposal 0020).
 
 Facts read early in a request (a parent admitted, an actor's grant profile, a
-constant arm decided) are used by statements that run later in it. Between two
-autocommit statements another transaction may commit, so "later" may see other
-data than "earlier" did. Inside one repeatable-read transaction it cannot: every
-statement reads the same snapshot.
+constant arm decided) are used by statements that run later in it. The library
+keeps no decision inside a transaction, because a rollback could leave it
+stale. ``read_snapshot()`` is the transaction of which the library knows that
+cannot happen: nothing it has decided inside can be rolled back, since a
+relationship write through the library ends the snapshot's standing.
 
-``read_snapshot()`` opens that transaction, read-only on PostgreSQL, and tells
-the library that decisions may be kept inside it. Outside one, the library keeps
-no decision in a transaction, because a rollback would leave it stale. A
-read-only transaction has nothing to roll back.
+How consistent the reads are with each other under other transactions' commits
+is the transaction's isolation level, which the application chooses: Django's
+``OPTIONS["isolation_level"]`` for the connection, or its own transaction
+entered before this one. ``isolated()`` reports what the connection is
+configured for. The library issues no database-specific SQL, so it neither
+sets nor reads a level per transaction.
 """
 
 from __future__ import annotations
@@ -20,12 +23,14 @@ from contextvars import ContextVar
 
 from django.db import connections, transaction
 
-# The database aliases reading inside a snapshot this module opened or accepted.
+from .errors import RebacError
+
+# The database aliases reading inside a snapshot.
 _aliases: ContextVar[frozenset[str]] = ContextVar("rebac_read_snapshot", default=frozenset())
 
 
-class SnapshotUnavailable(RuntimeError):
-    """The connection is already in a transaction that is not a snapshot."""
+class SnapshotUnavailable(RebacError):
+    """The open transaction already holds relationship writes that may roll back."""
 
 
 def covers(alias: str) -> bool:
@@ -34,54 +39,49 @@ def covers(alias: str) -> bool:
 
 
 def broken(alias: str) -> None:
-    """A library write on ``alias``: what is read from here on is not what was read before."""
+    """A library write on ``alias``: what is decided from here on may be rolled back."""
     current = _aliases.get()
     if alias in current:
         _aliases.set(current - {alias})
 
 
+def isolated(alias: str) -> bool:
+    """Whether the connection's transactions each read one snapshot of the data.
+
+    SQLite's always do. PostgreSQL's do when the connection is configured for
+    repeatable read or serializable (``OPTIONS["isolation_level"]``); a level
+    the application sets by its own statement is not visible here.
+    """
+    connection = connections[alias]
+    if connection.vendor == "sqlite":
+        return True
+    level = getattr(connection, "isolation_level", None)
+    return getattr(level, "name", "") in ("REPEATABLE_READ", "SERIALIZABLE")
+
+
 @contextmanager
 def read_snapshot(using: str | None = None) -> Iterator[None]:
-    """Run the block's reads on ``using`` in one consistent, read-only snapshot.
+    """Run the block's reads on ``using`` in one transaction, keeping decisions inside it.
 
-    Opens a transaction; on PostgreSQL it is ``REPEATABLE READ READ ONLY``, so a
-    write inside the block is refused by the database. A block entered inside a
-    transaction that already is repeatable read or serializable joins it. Any
-    other open transaction raises ``SnapshotUnavailable``: its isolation level
-    cannot be changed after its first statement.
-
-    SQLite's transactions are snapshots already and cannot be made read-only; a
-    relationship write through the library inside the block ends the snapshot's
-    standing and the library keeps no decision after it.
+    Opens a transaction, or joins the one already open. Joining a transaction
+    in which this thread has written relationship rows raises
+    ``SnapshotUnavailable``: those rows may still roll back. A relationship
+    write through the library inside the block ends the snapshot's standing,
+    and the library keeps no decision after it.
     """
+    from .backends import local
     from .models import active_relationship_model
 
     alias = using or active_relationship_model().objects.db
     if covers(alias):
         yield
         return
-    connection = connections[alias]
-    postgresql = connection.vendor == "postgresql"
-    if connection.in_atomic_block:
-        if postgresql:
-            with connection.cursor() as cursor:
-                cursor.execute("SHOW transaction_isolation")
-                level = cursor.fetchone()[0]
-            if level not in ("repeatable read", "serializable"):
-                raise SnapshotUnavailable(
-                    f"read_snapshot() was entered inside a {level} transaction on {alias!r}. "
-                    "Enter it before the transaction, or open that transaction as repeatable read."
-                )
-        token = _aliases.set(_aliases.get() | {alias})
-        try:
-            yield
-        finally:
-            _aliases.reset(token)
-        return
+    if local.uncommitted_relationship_writes(alias):
+        raise SnapshotUnavailable(
+            f"read_snapshot() was entered on {alias!r} inside a transaction that has written "
+            "relationship rows. Enter it before those writes, or after the transaction ends."
+        )
     with transaction.atomic(using=alias):
-        if postgresql:
-            with connection.cursor() as cursor:
-                cursor.execute("SET TRANSACTION ISOLATION LEVEL REPEATABLE READ READ ONLY")
         token = _aliases.set(_aliases.get() | {alias})
         try:
             yield

@@ -62,7 +62,6 @@ from .errors import (
 )
 from .evaluator import PermissionEvaluator, current_evaluator, evaluator_scope
 from .preflight import check_new
-from .snapshot import SnapshotUnavailable, read_snapshot
 from .types import (
     CheckItem,
     CheckResult,
@@ -230,8 +229,6 @@ __all__ = [
     "PermissionEvaluator",
     "current_evaluator",
     "evaluator_scope",
-    "read_snapshot",
-    "SnapshotUnavailable",
     # preflight — create-time check against not-yet-persisted resources
     "check_new",
     # consistency
