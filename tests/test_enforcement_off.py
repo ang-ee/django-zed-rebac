@@ -217,3 +217,25 @@ def test_no_read_mechanism_runs_when_nothing_is_enforced(world, settings):
     statements = [query["sql"] for query in captured.captured_queries]
     assert len(statements) == 4 and not permission_statements(statements)
     assert not any("EXISTS" in sql for sql in statements)
+
+
+def test_rows_still_carry_their_reader(world, settings):
+    """Nothing is enforced for the reader, and the reader is still who read the rows: code that
+    trusts a prefetched row by its stamp keeps trusting it."""
+    settings.REBAC_ENFORCE_PERMISSIONS = False
+    thread = (
+        ScopeThread.objects.with_actor(OUTSIDER)
+        .rebac_prefetch_related("scopemessage_set__scopepart_set")
+        .get(pk=2)
+    )
+    [message] = thread.scopemessage_set.all()
+    [part] = message.scopepart_set.all()
+    assert thread.actor() == message.actor() == part.actor() == OUTSIDER
+    joined = (
+        ScopePart.objects.with_actor(OUTSIDER).rebac_select_related("message__thread").get(pk=1)
+    )
+    assert joined.actor() == joined.message.actor() == joined.message.thread.actor() == OUTSIDER
+    with actor_context(MEMBER):
+        assert ScopeThread.objects.get(pk=2).actor() == MEMBER
+    # No reader, no stamp.
+    assert ScopeThread.objects.get(pk=2).actor() is None

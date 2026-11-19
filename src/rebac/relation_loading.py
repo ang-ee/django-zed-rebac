@@ -158,6 +158,32 @@ def guard_selected_related_instances(
         apply_field_visibility(rows, model=model, actor=actor, mode=mode)
 
 
+def stamp_selected_related_instances(
+    instances: Iterable[Any],
+    *,
+    root_model: type[models.Model],
+    paths: Sequence[str],
+    actor: SubjectRef,
+    mode: FieldDenyMode,
+) -> None:
+    """Stamp selected to-one related objects with their reader, checking nothing.
+
+    For ``REBAC_ENFORCE_PERMISSIONS = False``: the rows a join loaded carry the
+    reader the root rows carry.
+    """
+    batches: dict[type[models.Model], dict[str, dict[int, models.Model]]] = {}
+    for instance in instances:
+        if not isinstance(instance, models.Model):
+            continue
+        for path in paths:
+            _collect_cached_related(instance, root_model=root_model, path=path, batches=batches)
+    for rows_by_id in batches.values():
+        for copies in rows_by_id.values():
+            for row in copies.values():
+                row._rebac_actor = actor  # type: ignore[attr-defined]
+                row._rebac_field_deny = mode  # type: ignore[attr-defined]
+
+
 def scope_prefetch_lookups(
     model: type[models.Model],
     lookups: Sequence[Any],
