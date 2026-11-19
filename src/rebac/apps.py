@@ -22,11 +22,11 @@ class RebacConfig(AppConfig):
         signals.connect_tracked_signals()
         from .conf import app_settings
 
-        if not app_settings.REBAC_ENFORCE_PERMISSIONS:
+        if not app_settings.REBAC_ENABLED:
             # A server that never runs the system checks still says so once.
             import logging
 
             logging.getLogger("rebac").warning(
-                "REBAC_ENFORCE_PERMISSIONS is False: no permission is checked. "
+                "REBAC_ENABLED is False: no permission is checked. "
                 "Every caller reads and writes every row."
             )

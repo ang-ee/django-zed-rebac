@@ -7,7 +7,7 @@ pre-1.0; breaking changes within a minor version are explicitly called out.
 
 ### Added
 
-- **`REBAC_ENFORCE_PERMISSIONS`** (`True` by default). `False` enforces nothing: every
+- **`REBAC_ENABLED`** (`True` by default). `False` enforces nothing: every
   caller, with an actor or without, reads and writes every row; no scope, guard or
   field gate is applied and no permission statement is issued. For a deployment with
   one trusted user, and for measuring an application's own queries. Relationships and

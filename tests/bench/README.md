@@ -51,7 +51,7 @@ reads the actor's profile at every compile.
 (median of `--repeats`), and with `--explain` on PostgreSQL the planning time, the execution time and the
 planner's memory, summed over the statements. A mechanism is a named set of settings (`today`, `structural`,
 `rows`, `named`, `walk`, `trusted`, `noprofile`, `all`); a line ends in `DIFFERS` if it read something else than
-the first mechanism did. `plain` is `REBAC_ENFORCE_PERMISSIONS = False`: Django's own queries, with every row
+the first mechanism did. `plain` is `REBAC_ENABLED = False`: Django's own queries, with every row
 readable, as the floor the others can be compared with.
 
 ## The cast

@@ -242,11 +242,11 @@ def check_policy_models(app_configs: Any = None, **kwargs: Any) -> list[checks.C
 @checks.register("rebac")
 def check_permissions_enforced(app_configs: Any = None, **kwargs: Any) -> list[checks.CheckMessage]:
     """W011: the deployment enforces no permission."""
-    if app_settings.REBAC_ENFORCE_PERMISSIONS:
+    if app_settings.REBAC_ENABLED:
         return []
     return [
         checks.Warning(
-            "REBAC_ENFORCE_PERMISSIONS is False: no permission is checked. Every caller, "
+            "REBAC_ENABLED is False: no permission is checked. Every caller, "
             "signed in or not, reads and writes every row.",
             id="rebac.W011",
             hint=(

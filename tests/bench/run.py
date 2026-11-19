@@ -35,7 +35,7 @@ MECHANISMS: dict[str, dict[str, Any]] = {
     "trusted": {"REBAC_TRUSTED_IDS": True},
     "noprofile": {"REBAC_ACTOR_PROFILES": False},
     # Django's own queries: nothing enforced, so every actor reads every row.
-    "plain": {"REBAC_ENFORCE_PERMISSIONS": False},
+    "plain": {"REBAC_ENABLED": False},
     "all": {
         "REBAC_STRUCTURAL_PREFETCH": True,
         "REBAC_ROW_SCOPE": True,

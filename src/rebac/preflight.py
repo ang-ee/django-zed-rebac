@@ -79,7 +79,7 @@ def _check_new_model(
     from .field_backing import proposed_forward_relationships
     from .resources import model_resource_type
 
-    if not app_settings.REBAC_ENFORCE_PERMISSIONS:
+    if not app_settings.REBAC_ENABLED:
         return CheckResult.has(reason="permissions are not enforced")
     active_backend = backend if backend is not None else _current_backend()
     resource_type = model_resource_type(type(instance))
@@ -165,7 +165,7 @@ def check_new(
     membership checks — a declared relation. An unknown name yields a
     diagnostic ``NO_PERMISSION``.
     """
-    if not app_settings.REBAC_ENFORCE_PERMISSIONS:
+    if not app_settings.REBAC_ENABLED:
         return CheckResult.has(reason="permissions are not enforced")
     from .backends import backend as _current_backend
 

@@ -1,6 +1,7 @@
 # 0021: Unenforced deployments
 
-Status: **draft, not accepted.** One setting, `REBAC_ENFORCE_PERMISSIONS`, `True` by default. The contract is
+Status: **accepted by the owner on 2026-11-19 for 0.36.0**, who also chose the setting's name. One setting,
+`REBAC_ENABLED`, `True` by default. The contract is
 specified in `docs/ARCHITECTURE.md § Unenforced deployments`.
 
 ## Problem
@@ -17,7 +18,7 @@ Two legitimate uses have no supported answer today.
 
 ## Contract
 
-With `REBAC_ENFORCE_PERMISSIONS = False`:
+With `REBAC_ENABLED = False`:
 
 1. Every read is Django's own read. A queryset gets no scope whatever actor it carries, a strict call without an
    actor does not raise, related rows load without a guard, no field is redacted.
@@ -40,8 +41,9 @@ With `REBAC_ENFORCE_PERMISSIONS = False`:
 
 - System check `rebac.W011` (a warning) whenever the setting is `False`.
 - One `WARNING` on the `rebac` logger when the application starts, for a server that never runs the checks.
-- The name states the consequence in plain words and the default is the safe value, so the unsafe state has to be
-  written out as `REBAC_ENFORCE_PERMISSIONS = False`.
+- The default is the safe value, so the unsafe state has to be written out as `REBAC_ENABLED = False`.
+- The name is about enforcement. With `False` the library is still installed: it stores relationships and
+  synchronises the policy as before (contract, point 5), and only stops deciding.
 
 ## Implementation
 

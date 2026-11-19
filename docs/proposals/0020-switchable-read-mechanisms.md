@@ -1,8 +1,10 @@
 # 0020: Switchable read mechanisms
 
-Status: **draft, not accepted.** Every mechanism below is a setting that is off by default, so that a consumer
+Status: **accepted by the owner on 2026-11-19 for 0.36.0, as experimental settings.** Every mechanism below is a
+setting that is off by default, so that a consumer
 can turn each on, compare cost and results with `rebac.testing.compare_mechanisms`, and decide. Nothing here
-changes a statement while its setting is off. None is released.
+changes a statement while its setting is off. Each may change or be withdrawn in a minor release: they are in the
+release to be measured, and the known limits below are part of what is accepted.
 
 ## Problem
 
@@ -86,7 +88,7 @@ is two runs.
 The fixture above reaches a handful of relations from each read. `tests/bench` runs a project's real policy over
 generated data (`docs/ARCHITECTURE.md § The policy benchmark`); the policy here is a composed application's, 147
 definitions over 142 models, in which a message's read reaches 125 relations. Registry layout, PostgreSQL 17, JIT
-off. `plain` is `REBAC_ENFORCE_PERMISSIONS = False` (proposal 0021): Django's own queries.
+off. `plain` is `REBAC_ENABLED = False` (proposal 0021): Django's own queries.
 
 **One message with its thread, sender, parts, files and people**
 
