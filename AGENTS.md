@@ -70,7 +70,7 @@ how design intent erodes.
 | Python module | `rebac` |
 | Settings prefix | `REBAC_*` |
 | Management command | `manage.py rebac <subcommand>` |
-| System-check IDs | `rebac.E001` … `rebac.E024`, `rebac.W001` … `rebac.W010` (with gaps and retired IDs documented in the check table) |
+| System-check IDs | `rebac.E001` … `rebac.E024`, `rebac.W001` … `rebac.W011` (with gaps and retired IDs documented in the check table) |
 | Schema header comments | `// @rebac_package`, `// @rebac_package_version`, `// @rebac_schema_revision` |
 | App label | `rebac` |
 | Public Python imports | `from rebac import ...` |
@@ -128,6 +128,13 @@ glues type and permission together — they're always separate arguments.
 A queryset that escapes its actor scope **must raise `MissingActorError`**,
 not silently return all rows. This is the django-scopes / django-tenants
 design that prevents the worst data-leakage bug class.
+
+The one exception is a deployment that enforces nothing:
+`REBAC_ENFORCE_PERMISSIONS = False` (proposal 0021,
+`docs/ARCHITECTURE.md § Unenforced deployments`). It is a state of the whole
+process, read from settings and reported by `rebac.W011`; it is not a bypass,
+and nothing in a request can switch it. Every surface that decides must honour
+it, and a new surface is tested with it in `tests/test_enforcement_off.py`.
 
 - `REBAC_STRICT_MODE = True` is the production default.
 - Bypass requires explicit `.sudo(reason="...")` or `with sudo(reason="..."):`.

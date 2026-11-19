@@ -15,7 +15,7 @@ from typing import Any
 from rest_framework.filters import BaseFilterBackend
 from rest_framework.permissions import BasePermission
 
-from .actors import current_actor, to_subject_ref
+from .actors import current_actor, enforcing, to_subject_ref
 from .backends import backend
 from .errors import NoActorResolvedError
 from .resources import _resource_registry, model_resource_type, to_object_ref
@@ -58,6 +58,8 @@ class RebacPermission(BasePermission):  # type: ignore[misc]  # untyped third-pa
     # pyright infers BasePermission's `return True` body as `Literal[True]`;
     # widening to `bool` is the correct override, not an incompatibility.
     def has_permission(self, request: Any, view: Any) -> bool:  # pyright: ignore[reportIncompatibleMethodOverride]
+        if not enforcing():
+            return True
         rebac_action = self._action_for_view(request, view)
         if rebac_action is None:
             return False
@@ -84,6 +86,8 @@ class RebacPermission(BasePermission):  # type: ignore[misc]  # untyped third-pa
         )
 
     def has_object_permission(self, request: Any, view: Any, obj: Any) -> bool:  # pyright: ignore[reportIncompatibleMethodOverride]
+        if not enforcing():
+            return True
         rebac_action = self._action_for_view(request, view)
         if rebac_action is None:
             return False

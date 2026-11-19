@@ -1300,7 +1300,8 @@ class YourAppConfig(AppConfig):
 | `held`, `held_many` | Every candidate id. `grants_all` is `True`. |
 | `accessible` | Every row of a type that stores rows; for a type whose objects exist only in relationships, the ids relationships name as resources. |
 | `queryset_filter`, `permission_expression` | `Q()` and a true value. |
-| `@require_permission`, the Django auth backend, the DRF, GraphQL and MCP adapters | Allowed: each asks one of the surfaces above. |
+| `check_new`; `@require_permission`; the Django auth backend (`has_perm`, `has_module_perms`); the DRF permission class; the MCP tool gate | Allowed, without an actor. Each of these decides by itself and reads the setting. |
+| The GraphQL adapter, the DRF filter backend, the permission expression | Unrestricted: each asks a queryset or the backend above. |
 | `write_relationships`, `delete_relationships`, `rebac sync`, `lookup_subjects` | Unchanged. Relationships and the policy are still stored, so the same database decides again when the setting is removed. |
 
 No permission statement is issued on any of these paths, and no bypass audit row is written: there is no bypass to give a reason for. The library says so instead: `rebac.W011` in the system checks, and one `WARNING` on the `rebac` logger when the application starts.
