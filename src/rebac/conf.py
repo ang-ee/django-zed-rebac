@@ -31,6 +31,17 @@ _DEFAULTS: dict[str, Any] = {
     # ids the actor holds (proposal 0020). "named": only where the queryset's own conditions bind
     # its primary key or a foreign key to literal values. True: for every read the policy allows.
     "REBAC_ROW_SCOPE": False,
+    # Deliver a related row that rebac_select_related loaded with its declared display fields
+    # (Meta.rebac_display_fields) where the actor may not read the row (proposal 0020).
+    # "fallback": instead of raising. True: always and without the check, for a model that
+    # declares display fields.
+    "REBAC_DISPLAY_FIELDS": False,
+    # Convert a stored id of an integer identity to its key by the cast alone, without the
+    # guard that passes over an id that is not the key's canonical text (proposal 0020). For
+    # an application whose relationship rows are all written with canonical ids. A row that
+    # is not then makes PostgreSQL raise on the statement, and SQLite read it by its numeric
+    # value ("01" as 1).
+    "REBAC_TRUSTED_IDS": False,
     "REBAC_DEFAULT_CONSISTENCY": "minimize_latency",
     "REBAC_CACHE_ALIAS": "default",
     "REBAC_LOOKUP_CACHE_TTL": 60,

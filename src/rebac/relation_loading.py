@@ -93,16 +93,28 @@ def guard_selected_related_instances(
             "is available to check them."
         )
 
+    from . import display
+
+    showing = display.mode()
+    # Rows cut off from a display row: they hung off one of its hidden foreign keys.
+    detached: set[int] = set()
+    if showing == "always":
+        # A model that declares display fields is delivered with them, unchecked.
+        for model in [model for model in protected_batches if display.fields(model)]:
+            rows = [
+                row for copies in protected_batches.pop(model).values() for row in copies.values()
+            ]
+            detached |= display.deliver(rows, model=model, actor=actor, field_mode=mode)
+
     active_backend = backend()
+    outside: dict[type[models.Model], list[str]] = {}
+    held_by_model: dict[type[models.Model], set[str]] = {}
     for model, rows_by_id in protected_batches.items():
-        rebac_type = model_resource_type(model)
-        if not rebac_type:
+        for resource_id in [key for key, copies in rows_by_id.items() if copies.keys() <= detached]:
+            del rows_by_id[resource_id]
+        if not rows_by_id or not model_resource_type(model):
             continue
         action = str(getattr(model._meta, "rebac_default_action", "read"))
-        # Django creates a separate related instance for each joined root row.
-        # Check IDs once, but stamp and redact every in-memory copy of that ID.
-        rows = [row for copies in rows_by_id.values() for row in copies.values()]
-
         allowed = set(
             held_ids(
                 active_backend,
@@ -112,14 +124,34 @@ def guard_selected_related_instances(
                 resource_ids=rows_by_id,
             )
         )
-        denied = sorted(set(rows_by_id) - allowed)
+        held_by_model[model] = allowed
+        outside[model] = sorted(set(rows_by_id) - allowed)
+    if showing == "fallback":
+        # A row the actor does not hold, of a model with display fields, is shown with them.
+        for model, denied in outside.items():
+            if denied and display.fields(model):
+                rows = [row for key in denied for row in protected_batches[model][key].values()]
+                detached |= display.deliver(rows, model=model, actor=actor, field_mode=mode)
+                outside[model] = []
+    for model, denied in outside.items():
+        rows_by_id = protected_batches[model]
+        denied = [key for key in denied if not rows_by_id[key].keys() <= detached]
         if denied:
             sample = ", ".join(denied[:5])
             raise PermissionDenied(
                 f"select_related({model.__name__}) loaded {len(denied)} "
                 f"related row(s) outside actor scope (e.g. {sample})."
             )
-
+    for model, allowed in held_by_model.items():
+        # Django creates a separate related instance for each joined root row.
+        # IDs are checked once; every in-memory copy of that ID is stamped and redacted.
+        rows = [
+            row
+            for key, copies in protected_batches[model].items()
+            if key in allowed
+            for row in copies.values()
+            if id(row) not in detached
+        ]
         for row in rows:
             row._rebac_actor = actor  # type: ignore[attr-defined]
             row._rebac_field_deny = mode  # type: ignore[attr-defined]
