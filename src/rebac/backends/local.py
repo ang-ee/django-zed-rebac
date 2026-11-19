@@ -428,10 +428,14 @@ class LocalBackend:
             connections[active_relationship_model().objects.db],
             connections[SchemaDefinition.objects.db],
         )
+        from ..snapshot import covers
+
         for candidate in candidates:
-            if candidate.in_atomic_block or (
-                candidate.connection is not None and not candidate.get_autocommit()
-            ):
+            if (
+                candidate.in_atomic_block
+                or (candidate.connection is not None and not candidate.get_autocommit())
+            ) and not covers(candidate.alias):
+                # A read snapshot has nothing to roll back: decisions keep inside it.
                 return None
         snapshot = self._schema_snapshot()
         if snapshot.generation == -1 or (snapshot.revision is None and not self._schema_is_manual):
@@ -712,18 +716,36 @@ class LocalBackend:
         using: str | None = None,
     ) -> set[str]:
         """The candidate ids on which the subject holds the action."""
+        from .. import walk
         from ..compile.read import held
         from ..models import active_relationship_model
 
         if not _enforcing():
             return {value for value in ids if value}
-        return held(
+        alias = using or active_relationship_model().objects.db
+        settled: set[str] = set()
+        if walk.enabled():
+            # What small lookups on the named rows answer; the compiled statement decides the rest.
+            ids = tuple(dict.fromkeys(ids))
+            settled, answered = walk.decided(
+                backend=self,
+                resource_type=resource_type,
+                action=action,
+                actor=subject,
+                ids=ids,
+                using=alias,
+                context=context,
+            )
+            ids = tuple(value for value in ids if value not in answered)
+            if not ids:
+                return settled
+        return settled | held(
             backend=self,
             resource_type=resource_type,
             action=action,
             actor=subject,
             ids=ids,
-            using=using or active_relationship_model().objects.db,
+            using=alias,
             context=context,
         )
 
@@ -739,6 +761,7 @@ class LocalBackend:
         using: str | None = None,
     ) -> dict[str, set[str]]:
         """The held candidate ids per action, equal permissions decided once."""
+        from .. import walk
         from ..compile.read import held_many
         from ..models import active_relationship_model
 
@@ -747,15 +770,41 @@ class LocalBackend:
                 raise TypeError("actions must be an iterable of names, not a bare string")
             candidates = {value for value in ids if value}
             return {name: set(candidates) for name in dict.fromkeys(actions)}
-        return held_many(
+        alias = using or active_relationship_model().objects.db
+        if isinstance(actions, str):
+            raise TypeError("actions must be an iterable of names, not a bare string")
+        names = tuple(dict.fromkeys(actions))
+        answers: dict[str, set[str]] = {}
+        if walk.enabled() and names:
+            # As ``held``: the walk's answers first, the compiled statement for what is open.
+            ids = tuple(dict.fromkeys(ids))
+            walked = walk.decided_many(
+                backend=self,
+                resource_type=resource_type,
+                actions=names,
+                actor=subject,
+                ids=ids,
+                using=alias,
+                context=context,
+            )
+            answers = {name: set(walked[name][0]) for name in names}
+            open_ids = {value for name in names for value in ids if value not in walked[name][1]}
+            names = tuple(name for name in names if not open_ids <= walked[name][1])
+            ids = tuple(value for value in ids if value in open_ids)
+            if not names:
+                return answers
+        found = held_many(
             backend=self,
             resource_type=resource_type,
-            actions=actions,
+            actions=names,
             actor=subject,
             ids=ids,
-            using=using or active_relationship_model().objects.db,
+            using=alias,
             context=context,
         )
+        for name, held_ids in found.items():
+            answers[name] = answers.get(name, set()) | held_ids
+        return answers
 
     @_schema_operation
     def grants_all(
@@ -1083,6 +1132,11 @@ def mark_relationships_changed() -> None:
     global _relationship_generation
     with _backend_registry_lock:
         _relationship_generation += 1
+    from ..models import active_relationship_model
+    from ..snapshot import broken
+
+    # A write inside a read snapshot (SQLite cannot refuse it) ends its standing.
+    broken(active_relationship_model().objects.db)
     from django.db import connections, transaction
 
     written = _uncommitted_transactions()

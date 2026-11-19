@@ -173,6 +173,7 @@ class _Conversion(Func):
             connection.features.has_native_uuid_field,
             self.codec,
             self.to_wire,
+            _trusted(self.codec),
         )
         fragment = _fragments.get(key)
         if fragment is None:
@@ -198,6 +199,10 @@ class _Conversion(Func):
         return sql, tuple(params)
 
     def _expression(self, original: Any, connection: BaseDatabaseWrapper) -> Expression:
+        if _trusted(self.codec):
+            # REBAC_TRUSTED_IDS: every stored id of an integer identity is its
+            # canonical text, so the conversion is the cast alone.
+            return Cast(original, models.TextField() if self.to_wire else self.codec.field)
         text = Cast(original, models.TextField())
         candidate: Expression = text
         if (
@@ -249,6 +254,13 @@ class _Conversion(Func):
         if field.max_length is None:
             return models.TextField()
         return models.CharField(max_length=field.max_length)
+
+
+def _trusted(codec: _IdentityCodec) -> bool:
+    """Whether the conversion of ``codec``'s ids is the bare cast (``REBAC_TRUSTED_IDS``)."""
+    from .conf import app_settings
+
+    return codec.kind == "integer" and bool(app_settings.REBAC_TRUSTED_IDS)
 
 
 def identity_codec(model: type[models.Model], attr: str | None = None) -> Codec:

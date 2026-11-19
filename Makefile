@@ -71,6 +71,12 @@ test-pg: require-postgres
 test-pg-scale: require-postgres
 	$(PYTEST) $(PG) -m scale --timeout=900 -s tests/test_scope_plans.py $(ARGS)
 
+# The policy benchmark (tests/bench/README.md): a real policy over generated rows. This target
+# builds the tiny size in SQLite and fails if a mechanism changes what a read returns.
+.PHONY: bench-smoke
+bench-smoke:
+	DJANGO_SETTINGS_MODULE=tests.settings_bench REBAC_TEST_POSTGRES_URL= uv run --no-sync python -m tests.bench.run smoke
+
 # Tier 3 parts.
 test-slow:
 	$(PYTEST) -n auto --dist worksteal -m '$(SLOW_MARKS)' $(LONG) --durations=25 $(ARGS)

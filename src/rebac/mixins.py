@@ -58,6 +58,9 @@ REBAC_META_OPTIONS = (
     # is `Meta.rebac_id_attr` → `app_settings.REBAC_RESOURCE_ID_ATTR`
     # → ``"pk"``. See `_id.resource_id_attr`.
     "rebac_id_attr",
+    # The fields shown on a row delivered to a reader of a row that refers to
+    # it (``rebac.display``, proposal 0020). Read only under REBAC_DISPLAY_FIELDS.
+    "rebac_display_fields",
 )
 
 

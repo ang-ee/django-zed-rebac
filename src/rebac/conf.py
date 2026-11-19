@@ -19,6 +19,29 @@ _DEFAULTS: dict[str, Any] = {
     "REBAC_DEPTH_LIMIT": 8,
     # Compile an evaluator scope's statements for the stored grants its actor can hold (proposal 0019).
     "REBAC_ACTOR_PROFILES": True,
+    # Read a prefetch's children without their permission statement where the policy proves
+    # that the parents just admitted imply them (proposal 0020). Off: every prefetch is scoped.
+    "REBAC_STRUCTURAL_PREFETCH": False,
+    # Answer a bounded question (held, the select_related guard) by small lookups on the rows it
+    # names, the compiled statement only for what they leave (proposal 0020). "prove" (or True)
+    # settles the ids a grant on the row, a column or a parent shows held; "decide" reads the
+    # whole permission and answers no as well.
+    "REBAC_BOUNDED_WALK": False,
+    # Write a queryset's scope as conditions on each of its rows instead of membership in the
+    # ids the actor holds (proposal 0020). "named": only where the queryset's own conditions bind
+    # its primary key or a foreign key to literal values. True: for every read the policy allows.
+    "REBAC_ROW_SCOPE": False,
+    # Deliver a related row that rebac_select_related loaded with its declared display fields
+    # (Meta.rebac_display_fields) where the actor may not read the row (proposal 0020).
+    # "fallback": instead of raising. True: always and without the check, for a model that
+    # declares display fields.
+    "REBAC_DISPLAY_FIELDS": False,
+    # Convert a stored id of an integer identity to its key by the cast alone, without the
+    # guard that passes over an id that is not the key's canonical text (proposal 0020). For
+    # an application whose relationship rows are all written with canonical ids. A row that
+    # is not then makes PostgreSQL raise on the statement, and SQLite read it by its numeric
+    # value ("01" as 1).
+    "REBAC_TRUSTED_IDS": False,
     "REBAC_DEFAULT_CONSISTENCY": "minimize_latency",
     "REBAC_CACHE_ALIAS": "default",
     "REBAC_LOOKUP_CACHE_TTL": 60,

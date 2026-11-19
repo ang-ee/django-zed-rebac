@@ -337,6 +337,11 @@ engine**. Hard rule:
   agnostic; it knows nothing about any consumer.
 - **No references to a specific consumer framework** in user-facing docs
   (`README.md`, `docs/`).
+- **One exception, for data only:** `tests/bench/policies/<name>/` holds exports
+  of real projects' policies (`rebac.skeleton.export`), under their own names,
+  as benchmark fixtures. Nothing in `src/` or in the test suite imports them,
+  no document under `docs/` names them, and each records where it came from in
+  its `skeleton.json`.
 - **No `[tool.<framework>]` config conventions** in `pyproject.toml`.
 
 Downstream frameworks may adopt `django-zed-rebac` as a dependency. The

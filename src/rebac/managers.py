@@ -28,6 +28,7 @@ from django.db.models.sql import Query
 from django.db.models.sql.subqueries import UpdateQuery
 from django.db.models.sql.where import ExtraWhere, NothingNode, WhereNode
 
+from . import rowscope, structural
 from ._id import resource_id_attr
 from .actors import (
     ActorLike,
@@ -1272,9 +1273,17 @@ class RebacQuerySet(models.QuerySet[_M]):
         from .backends import backend
 
         action = str(self._rebac_action or getattr(model._meta, "rebac_default_action", "read"))
-        predicate = backend().queryset_filter(
-            model=model, subject=actor, action=action, using=self.db
-        )
+        if query is self.query and structural.delivers(query, model, actor, action):
+            # Children of parents the running prefetch admitted, where the
+            # policy proves the parent's action grants theirs (proposal 0020).
+            return
+        # The scope as conditions on each row, where the setting and the policy
+        # allow it (proposal 0020); the compiled id sets otherwise.
+        predicate = rowscope.predicate(query, model, actor, action, self.db)
+        if predicate is None:
+            predicate = backend().queryset_filter(
+                model=model, subject=actor, action=action, using=self.db
+            )
         # The compiled predicate keeps the authorization clause identifiable,
         # including in Django's cloned and combined WHERE trees, so a changed
         # actor never intersects a stale scope. ``build_where`` works even on
@@ -1555,7 +1564,9 @@ class RebacQuerySet(models.QuerySet[_M]):
         """Keep guards, SQL compilation and nested prefetches in one evaluation."""
         fetching = self._result_cache is None
         if fetching:
-            self._apply_scope_in_place()
+            # This query is run as it stands: its scope may refer to its own rows.
+            with rowscope.executing(self.query):
+                self._apply_scope_in_place()
         actor, sudo = self.effective_actor(strict=True)
         self._audit_bypass_once()
         field_mode = self._effective_field_mode()
@@ -1576,8 +1587,28 @@ class RebacQuerySet(models.QuerySet[_M]):
             # prefetches run: a related manager reads the row's actor pin.
             self._result_cache = list(native._iterable_class(self))
             self._stamp(self._result_cache, actor, sudo)
+        # These rows are the ones this actor holds the action on: a prefetch
+        # may deliver the children the policy grants with them (proposal 0020).
+        admits = (
+            fetching
+            and actor is not None
+            and not sudo
+            and self._rebac_scope_decision == (actor, False)
+            and bool(model_resource_type(self.model))
+            and structural.enabled()
+        )
+        action = str(
+            self._rebac_action or getattr(self.model._meta, "rebac_default_action", "read")
+        )
+        if admits and actor is not None:
+            # Read inside a running prefetch: the parents of its next level.
+            structural.admit(actor, self.model, action, self._result_cache or [])
         if native._prefetch_related_lookups and not native._prefetch_done:
-            native._prefetch_related_objects()
+            if admits and actor is not None:
+                with structural.delivering(actor, self.model, action, self._result_cache or []):
+                    native._prefetch_related_objects()
+            else:
+                native._prefetch_related_objects()
         if self._result_cache is not None and not self._rebac_visibility_applied:
             if actor is not None and not sudo:
                 if redact:

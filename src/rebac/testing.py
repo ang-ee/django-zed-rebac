@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from collections.abc import Iterable
+from collections.abc import Callable, Iterable, Mapping, Sequence
 from typing import Any
 
 from django.db import router
@@ -96,3 +96,121 @@ def assert_decisions(
 
 
 __all__ = ["assert_decisions", "install_schema"]
+
+
+def compare_mechanisms(
+    run: Callable[[], Any],
+    mechanisms: Mapping[str, Sequence[Any]],
+    *,
+    repeats: int = 5,
+    using: str = "default",
+) -> list[dict[str, Any]]:
+    """Run one read under every combination of library settings and report each one's cost and result.
+
+    ``mechanisms`` maps a setting (``"REBAC_ACTOR_PROFILES"``,
+    ``"REBAC_STRUCTURAL_PREFETCH"``) to the values to try; the first value of
+    each is the baseline. ``run`` performs the read and returns what it read,
+    as something comparable: a list of ids, a mapping, a GraphQL data dict.
+
+    Each combination is run once to warm it and then ``repeats`` times. A row
+    of the report holds the settings, the statements and SQL size of one run,
+    the median and best time, and whether the result equals the baseline's.
+    For two sets, lists or mappings it also says how many items were lost and
+    gained. The baseline is the first row.
+
+    It changes settings and clears the library's kept statements, so it is for
+    a test or a benchmark, never a running application.
+    """
+    from itertools import product
+    from statistics import median
+    from time import perf_counter
+
+    from django.db import connections
+    from django.test import override_settings
+
+    from .compile import read
+
+    names = list(mechanisms)
+    report: list[dict[str, Any]] = []
+    baseline: Any = None
+    for values in product(*(mechanisms[name] for name in names)):
+        chosen = dict(zip(names, values, strict=True))
+        with override_settings(**chosen):
+            read.reset()
+            result = run()
+            statements: list[str] = []
+
+            def capture(
+                execute: Callable[..., Any],
+                sql: str,
+                params: Any,
+                many: bool,
+                context: Any,
+                seen: list[str] = statements,
+            ) -> Any:
+                seen.append(sql)
+                return execute(sql, params, many, context)
+
+            with connections[using].execute_wrapper(capture):
+                run()
+            times = []
+            for _ in range(repeats):
+                started = perf_counter()
+                run()
+                times.append((perf_counter() - started) * 1000)
+        read.reset()
+        row: dict[str, Any] = {
+            "settings": chosen,
+            "statements": len(statements),
+            "sql_kb": round(sum(len(sql) for sql in statements) / 1024, 1),
+            "ms": round(median(times), 1),
+            "best_ms": round(min(times), 1),
+        }
+        if not report:
+            baseline = result
+            row["result"] = "baseline"
+        else:
+            row["result"] = "same" if result == baseline else "differs"
+            if result != baseline:
+                row.update(_difference(baseline, result))
+        report.append(row)
+    return report
+
+
+def _difference(before: Any, after: Any) -> dict[str, int]:
+    """How many items a result lost and gained, where both are collections of the same kind."""
+
+    def items(value: Any) -> set[Any] | None:
+        try:
+            if isinstance(value, Mapping):
+                return {(key, repr(item)) for key, item in value.items()}
+            if isinstance(value, (list, tuple, set, frozenset)):
+                return {repr(item) for item in value}
+        except TypeError:
+            return None
+        return None
+
+    old, new = items(before), items(after)
+    if old is None or new is None:
+        return {}
+    return {"lost": len(old - new), "gained": len(new - old)}
+
+
+def format_mechanisms(report: Sequence[Mapping[str, Any]]) -> str:
+    """``compare_mechanisms``'s report as a text table."""
+    names = list(report[0]["settings"]) if report else []
+    header = [name.removeprefix("REBAC_").lower() for name in names]
+    header += ["statements", "sql_kb", "ms", "best_ms", "result"]
+    lines = [header]
+    for row in report:
+        cells = [str(row["settings"][name]) for name in names]
+        cells += [str(row[key]) for key in ("statements", "sql_kb", "ms", "best_ms")]
+        result = str(row["result"])
+        if "lost" in row:
+            result += f" (lost {row['lost']}, gained {row['gained']})"
+        lines.append([*cells, result])
+    widths = [max(len(line[index]) for line in lines) for index in range(len(header))]
+    return "\n".join(
+        "  ".join(cell.ljust(width) for cell, width in zip(line, widths, strict=True)).rstrip()
+        for line in lines
+    )

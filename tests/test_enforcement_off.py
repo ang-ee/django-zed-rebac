@@ -195,6 +195,30 @@ def test_the_system_check_says_so(settings):
     assert warning.id == "rebac.W011" and "no permission is checked" in warning.msg
 
 
+def test_no_read_mechanism_runs_when_nothing_is_enforced(world, settings):
+    """The switchable mechanisms (proposal 0020) decide how a permission is read. With none
+    enforced, none of them has anything to read."""
+    settings.REBAC_STRUCTURAL_PREFETCH = True
+    settings.REBAC_ROW_SCOPE = True
+    settings.REBAC_BOUNDED_WALK = "decide"
+    settings.REBAC_DISPLAY_FIELDS = True
+    settings.REBAC_ENABLED = False
+    with CaptureQueriesContext(connection) as captured:
+        threads = list(
+            ScopeThread.objects.with_actor(OUTSIDER)
+            .order_by("pk")
+            .rebac_prefetch_related("scopemessage_set__scopepart_set")
+        )
+        parts = list(ScopePart.objects.with_actor(OUTSIDER).rebac_select_related("message__thread"))
+        held = backend().held(
+            subject=OUTSIDER, action="read", resource_type="scope/part", ids=["1", "2"]
+        )
+    assert [thread.pk for thread in threads] == [1, 2] and len(parts) == 2 and held == {"1", "2"}
+    statements = [query["sql"] for query in captured.captured_queries]
+    assert len(statements) == 4 and not permission_statements(statements)
+    assert not any("EXISTS" in sql for sql in statements)
+
+
 def test_rows_still_carry_their_reader(world, settings):
     """Nothing is enforced for the reader, and the reader is still who read the rows: code that
     trusts a prefetched row by its stamp keeps trusting it."""

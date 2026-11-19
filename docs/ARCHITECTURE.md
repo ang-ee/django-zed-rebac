@@ -1176,6 +1176,11 @@ All settings prefixed `REBAC_`. No nested dict. Read via the public `app_setting
 | `REBAC_EVALUATOR_CACHE_SIZE` | `10000` | `int` | Max entries in the per-scope evaluator's check cache, and the bound on its field-visibility memo (least recently used dropped first). |
 | `REBAC_ENABLED` | `True` | `bool` | `False` enforces nothing: every caller, with an actor or without, reads and writes every row, and the library issues no permission statement. For a deployment with one trusted user, and for measuring an application's queries without the library's. System check `rebac.W011`. See [Unenforced deployments](#unenforced-deployments). |
 | `REBAC_ACTOR_PROFILES` | `True` | `bool` | Inside an evaluator scope, compile statements for the stored grants the actor can hold: one extra statement per scope, actor and database reads which stored relations name the actor, and arms outside that set are not compiled. See [Actor grant profiles](#actor-grant-profiles). |
+| `REBAC_STRUCTURAL_PREFETCH` | `False` | `bool` | Experimental. Children of parents a prefetch just admitted are read by foreign key, without their permission statement, where the policy proves the parent's action grants theirs. See [Switchable read mechanisms](#switchable-read-mechanisms). |
+| `REBAC_ROW_SCOPE` | `False` | `bool \| "named"` | Experimental. The scope of a statement a queryset runs itself is written as conditions on each row instead of membership in the ids the actor holds. `"named"`: only where the queryset's own conditions bind its primary key or a foreign key to literal values. Needs PostgreSQL's JIT off. |
+| `REBAC_BOUNDED_WALK` | `False` | `bool \| "prove" \| "decide"` | Experimental. `held` and `held_many` are answered by lookups on the rows the ids name. `"prove"` (or `True`) settles the ids a grant, a column or a parent shows held; `"decide"` reads the whole permission and answers no as well. |
+| `REBAC_DISPLAY_FIELDS` | `False` | `bool \| "fallback"` | Experimental. A related row `rebac_select_related` loaded is delivered with the display fields its model declares (`Meta.rebac_display_fields`). `"fallback"`: where the actor may not read the row, instead of raising. `True`: always, without the check. |
+| `REBAC_TRUSTED_IDS` | `False` | `bool` | Experimental. A stored id of an integer identity is converted to its key by the cast alone. A relationship row whose id is not canonical then makes PostgreSQL raise on the statement. |
 | `REBAC_ZOOKIE_TRANSPORT` | `"none"` | `"none"` \| `"header"` \| `"session"` | Optional cross-request transport for the current Zookie. |
 | `REBAC_ZOOKIE_HEADER_NAME` | `"X-Rebac-Zookie"` | `str` | Header name used when `REBAC_ZOOKIE_TRANSPORT = "header"`. |
 | `REBAC_ZOOKIE_SESSION_KEY` | `"_rebac_zookie"` | `str` | Session key used when `REBAC_ZOOKIE_TRANSPORT = "session"`. |
@@ -2245,6 +2250,43 @@ caveats are not read, so the profile is a superset of what the actor holds.
 
 `REBAC_ACTOR_PROFILES = False` compiles every statement without a profile.
 
+#### Switchable read mechanisms
+
+Experimental, [proposal 0020](./proposals/0020-switchable-read-mechanisms.md). Each is a setting that is off by
+default and changes no statement while it is off. They exist so that a consumer can turn one on, compare cost and
+results on its own reads (`rebac.testing.compare_mechanisms`, the [policy benchmark](#the-policy-benchmark)) and
+decide. None changes what a read returns: where a mechanism cannot read a policy exactly, it leaves the compiled
+statement in place.
+
+| Setting | What it does | What keeps the compiled statement |
+|---|---|---|
+| `REBAC_STRUCTURAL_PREFETCH` | A prefetch's children are read by the foreign key that names their parents, with no permission statement, where the child's action is a union with the arm `relation->parent_action` over that unfiltered foreign key (`rebac.structural`) | An intersection or exclusion above the arm, a filtered or generic backing, an override |
+| `REBAC_ROW_SCOPE` | The scope becomes `EXISTS` conditions on the row: a grant row on its id, a parent row that satisfies the parent's conditions, a constant's fixed object (`rebac.rowscope`) | A recursion; a caveated or expiring relation; a backing the walk does not read; more than 24 subqueries; a queryset embedded in another, combined, counted or aggregated |
+| `REBAC_BOUNDED_WALK` | `held` and `held_many` read the permission from the candidate rows by one lookup per relation (`rebac.walk`) | A recursive or caveated part is asked of the compiled statement alone; candidates that name no row keep their compiled answer |
+| `REBAC_DISPLAY_FIELDS` | A joined row is delivered with its key and declared display fields, the rest hidden as a denied field is (`rebac.display`) | A model that declares no display fields |
+| `REBAC_TRUSTED_IDS` | The id conversion is the cast alone (`rebac.codec`) | Text and UUID identities |
+
+- **The row scope needs PostgreSQL's JIT off.** A statement of correlated subqueries is estimated expensive and
+  the JIT compiles each one: a 40-subquery scope over three rows ran 6 s with `jit = on`. The library sets no
+  database option.
+- **The row scope asks each row the caller's conditions select.** Where those select many rows and the actor
+  holds few, the id set would have named the few: on 3.2 million rows of which the actor holds none, a page cost
+  152 ms against 17 ms compiled. `"named"` confines it to queries that name their rows.
+- **`rebac.rowscope.explain(model, actor, action)`** says whether a permission is written as row conditions, with
+  how many subqueries, and each obstacle by the relation it sits on.
+- **`rebac.snapshot.read_snapshot()`** opens or joins one transaction for a unit of reading in which the library
+  keeps decisions; a relationship write through the library inside it ends its standing. The isolation level is
+  the application's to configure.
+- **A fence, as on a compiled statement.** The walk's lookups and the row conditions admit nothing while the
+  published policy revision is not the one they were built for.
+- **Nothing runs when nothing is enforced.** `REBAC_ENABLED = False` answers before any of them.
+- **Several statements, several states.** A compiled answer is one statement. Structural prefetch and the walk
+  read several, each seeing the state committed when it runs, so under READ COMMITTED a decision can be assembled
+  from adjacent states. They are exact inside one snapshot (a transaction on a connection configured for
+  repeatable read; any transaction on SQLite). After an exclusion the walk reads the fence again, so a policy
+  revision published under it answers nothing.
+- **Display fields need a `RebacMixin` model**, whose `save` leaves hidden columns alone.
+
 #### The clock
 
 The clock is the application's: `django.utils.timezone.now()`, read through
@@ -2655,7 +2697,7 @@ The headline feature. By inclusion, every model operation is gated against the e
 3. `save_base` owner — create/write and field gates before consumer `pre_save` receivers.
 4. `delete` owner — root gate and a deletion ContextVar carrying the root actor/bypass for collector children; explicit-sender `pre_delete` gates those children only. Owners batch identity tuple cleanup.
 5. Queryset materialisation hooks (`_fetch_all()` and iterators) stamp the resolved actor onto every loaded instance. `from_db()` snapshots original field values for write checks.
-6. `Meta` extension — the metaclass captures `rebac_resource_type`, `rebac_id_attr`, `rebac_default_action` and `rebac_subject_relation` (the `REBAC_META_OPTIONS` tuple), strips them before Django's `Options` sees them, and re-attaches them on `_meta`. `rebac_subject_relation` makes `to_subject_ref(instance)` emit the model's object reference as a subject set (`auth/group:<id>#member`); `rebac.E011` checks the relation exists. See [proposal 0006](./proposals/0006-model-subject-identity.md). A model with no `Meta` of its own takes the Django options (`ordering`, `indexes`, `constraints`, `permissions`, verbose names and the rest of Django's `DEFAULT_NAMES`) of the first base that has a `Meta`, as Django itself does. The `rebac_*` options are per model: they pass to a child only through a `Meta` the child writes (`class Meta(Parent.Meta)`), never to a child with no `Meta`.
+6. `Meta` extension — the metaclass captures `rebac_resource_type`, `rebac_id_attr`, `rebac_default_action`, `rebac_subject_relation` and `rebac_display_fields` (the `REBAC_META_OPTIONS` tuple), strips them before Django's `Options` sees them, and re-attaches them on `_meta`. `rebac_subject_relation` makes `to_subject_ref(instance)` emit the model's object reference as a subject set (`auth/group:<id>#member`); `rebac.E011` checks the relation exists. See [proposal 0006](./proposals/0006-model-subject-identity.md). `rebac_display_fields` names the fields a row shows to a reader of a row that refers to it; it is read only under `REBAC_DISPLAY_FIELDS` ([Switchable read mechanisms](#switchable-read-mechanisms)). A model with no `Meta` of its own takes the Django options (`ordering`, `indexes`, `constraints`, `permissions`, verbose names and the rest of Django's `DEFAULT_NAMES`) of the first base that has a `Meta`, as Django itself does. The `rebac_*` options are per model: they pass to a child only through a `Meta` the child writes (`class Meta(Parent.Meta)`), never to a child with no `Meta`.
 
 ### Manager and queryset surface
 
@@ -3848,6 +3890,23 @@ backend. Test databases and temporary files must be worker-local, and fixtures
 must restore process-local state between tests, so any test can run on any
 worker in any order. Random ordering is opt-in with
 `-p randomly --randomly-seed=137` (`make test-random`).
+
+### The policy benchmark
+
+Outside the tiers. `tests/bench` runs a project's real policy over generated data of any size, with none of the
+project's code or data ([tests/bench/README.md](../tests/bench/README.md)):
+
+- `rebac.skeleton.export(directory)`, run inside a project with its policy published, writes `policy.zed` and
+  `skeleton.json`: for every model the policy touches, its table and key, its relations to the other such models
+  and the columns a backing's filters read. No row is read.
+- `tests.benchapp` rebuilds one stand-in model per entry; `tests.bench.data` generates rows and relationship
+  rows in SQL, with a fixed cast of users; a policy's `profile.py` holds the reads an application makes.
+- `python -m tests.bench.run build|read|census` under `DJANGO_SETTINGS_MODULE=tests.settings_bench`.
+  `make bench-smoke` builds the tiny size in SQLite and fails if a mechanism changes what a read returns.
+
+The export checked in under `tests/bench/policies/` is a composed application of 147 definitions over 142
+models; its origin is recorded in its `skeleton.json`. Nothing in the benchmark is collected by pytest or run in
+CI.
 
 ### Test tiers
 
