@@ -1174,6 +1174,7 @@ All settings prefixed `REBAC_`. No nested dict. Read via the public `app_setting
 | `REBAC_AUDIT_DENIALS` | `False` | `bool` | Also write a `PermissionAuditEvent` row per denied check. Off by default: denial traffic (an attacker fuzzing ids) can dominate the table. |
 | `REBAC_LINT_BARE_PREFETCH` | `True` | `bool` | Toggle for `rebac.W003` — the structural warning that an RBAC-bound model has an FK / O2O / M2M to another RBAC-bound model. A bare-string `select_related` can load unguarded joined rows; a bare-string `prefetch_related` follows the related manager's source pin, or ambient/non-strict scope when no pin exists. Enabled by default so the risky shape is visible; use `rebac_select_related()` / `rebac_prefetch_related()` or the Strawberry-Django optimizer for protected paths. |
 | `REBAC_EVALUATOR_CACHE_SIZE` | `10000` | `int` | Max entries in the per-scope evaluator's check cache, and the bound on its field-visibility memo (least recently used dropped first). |
+| `REBAC_ENABLED` | `True` | `bool` | `False` enforces nothing: every caller, with an actor or without, reads and writes every row, and the library issues no permission statement. For a deployment with one trusted user, and for measuring an application's queries without the library's. System check `rebac.W011`. See [Unenforced deployments](#unenforced-deployments). |
 | `REBAC_ACTOR_PROFILES` | `True` | `bool` | Inside an evaluator scope, compile statements for the stored grants the actor can hold: one extra statement per scope, actor and database reads which stored relations name the actor, and arms outside that set are not compiled. See [Actor grant profiles](#actor-grant-profiles). |
 | `REBAC_ZOOKIE_TRANSPORT` | `"none"` | `"none"` \| `"header"` \| `"session"` | Optional cross-request transport for the current Zookie. |
 | `REBAC_ZOOKIE_HEADER_NAME` | `"X-Rebac-Zookie"` | `str` | Header name used when `REBAC_ZOOKIE_TRANSPORT = "header"`. |
@@ -1245,6 +1246,7 @@ System checks (in `rebac/checks.py`):
 | `rebac.W008` | Warning | `REBAC_FIELD_READ_MODE = "raise"` currently degrades to `"redact"` until descriptor-based protected fields land. |
 | `rebac.W009` | Warning | A text attribute-backed column declares a case-insensitive collation (`*_ci`, or the MySQL default), so SQL scoping and Python checks could disagree on container ids. Best-effort detection. |
 | `rebac.W010` | Warning | A stored override references a relation or permission removed from the current baseline; that override is ignored until updated or deleted. |
+| `rebac.W011` | Warning | `REBAC_ENABLED` is `False`: no permission is checked, and every caller reads and writes every row. |
 | `rebac.W101` | Retired | Not reused. |
 
 `rebac.E014`, `rebac.E015`, `rebac.E016` and the backing-path form of
@@ -1282,6 +1284,27 @@ class YourAppConfig(AppConfig):
         "yourapp.archive_post": "archive",
     }
 ```
+
+### Unenforced deployments
+
+`REBAC_ENABLED = False` switches enforcement off for the whole process ([proposal 0021](./proposals/0021-unenforced-deployments.md)). It is a deployment's statement that it has one trusted user, or a way to measure an application's own queries; it is not a bypass, and nothing about it is per request. `False` stops the deciding only: the library still stores relationships and synchronises the policy.
+
+| Surface | With `REBAC_ENABLED = False` |
+|---|---|
+| Querysets (`with_actor`, ambient actor, no actor) | No scope is added, whatever actor is pinned; a strict call without an actor does not raise. |
+| Fetched rows | Still stamped with their reader (`instance.actor()`): the queryset's actor, the carrying row's, or the ambient one. Code that trusts a prefetched row by its stamp keeps doing so. |
+| `rebac_select_related`, `rebac_prefetch_related` | Django's own statements: no guard, no scoped prefetch. |
+| Field read gates | Nothing is redacted or omitted. |
+| Model `save`, `delete`, `check_access`; bulk `update`, `delete`, `bulk_create`; many-to-many and backed-edge gates | Allowed, without an actor. |
+| `backend().check_access`, `has_access`, `check_bulk_permissions` | Allowed, reason `"permissions are not enforced"`. |
+| `held`, `held_many` | Every candidate id. `grants_all` is `True`. |
+| `accessible` | Every row of a type that stores rows; for a type whose objects exist only in relationships, the ids relationships name as resources. |
+| `queryset_filter`, `permission_expression` | `Q()` and a true value. |
+| `check_new`; `@require_permission`; the Django auth backend (`has_perm`, `has_module_perms`); the DRF permission class; the MCP tool gate | Allowed, without an actor. Each of these decides by itself and reads the setting. |
+| The GraphQL adapter, the DRF filter backend, the permission expression | Unrestricted: each asks a queryset or the backend above. |
+| `write_relationships`, `delete_relationships`, `rebac sync`, `lookup_subjects` | Unchanged. Relationships and the policy are still stored, so the same database decides again when the setting is removed. |
+
+No permission statement is issued on any of these paths, and no bypass audit row is written: there is no bypass to give a reason for. The library says so instead: `rebac.W011` in the system checks, and one `WARNING` on the `rebac` logger when the application starts.
 
 **Superuser bypass.** Preserved by default for operational ergonomics. When `REBAC_SUPERUSER_BYPASS = True` (default) and the user is an *active* superuser, two surfaces short-circuit:
 

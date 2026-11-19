@@ -46,13 +46,14 @@ from __future__ import annotations
 import functools
 import inspect
 import warnings
-from collections.abc import Awaitable, Callable, Mapping, Sequence
+from collections.abc import Awaitable, Callable, Iterator, Mapping, Sequence
+from contextlib import contextmanager
 from typing import Any, TypeVar, cast
 
 from asgiref.sync import sync_to_async
 from django.utils.module_loading import import_string
 
-from .actors import actor_context, current_actor
+from .actors import actor_context, current_actor, enforcing
 from .backends import backend
 from .codec import identity_codec
 from .conf import app_settings
@@ -263,6 +264,16 @@ def _deny_message(
     return f"Denied: {actor} cannot {action} {target}{detail}"
 
 
+@contextmanager
+def _acting(actor: SubjectRef | None) -> Iterator[None]:
+    """The tool's actor for the block; no actor when none resolved and nothing is enforced."""
+    if actor is None:
+        yield
+        return
+    with actor_context(actor):
+        yield
+
+
 def _authorize(
     *,
     func: Callable[..., Any],
@@ -274,17 +285,20 @@ def _authorize(
     signature: inspect.Signature,
     args: tuple[Any, ...],
     kwargs: dict[str, Any],
-) -> SubjectRef:
+) -> SubjectRef | None:
     """Resolve the actor and run the permission check. Raises
     :class:`PermissionDenied` on no-actor or deny; returns the actor on allow.
 
     Shared by the sync and async wrappers so the authorization contract lives
-    in exactly one place.
+    in exactly one place. With ``REBAC_ENABLED = False`` nothing is
+    checked and the actor may be ``None``: the tool runs as whoever called it.
     """
     bound = signature.bind(*args, **kwargs)
     bound.apply_defaults()
 
     actor = _resolve_actor(_find_context(bound))
+    if not enforcing():
+        return actor
     if actor is None:
         raise PermissionDenied(
             f"{func.__name__}: no actor resolved for MCP tool call "
@@ -397,7 +411,7 @@ def rebac_mcp_tool(
     def decorator(func: _F) -> _F:
         signature = inspect.signature(func)
 
-        def authorize(call_args: tuple[Any, ...], call_kwargs: dict[str, Any]) -> SubjectRef:
+        def authorize(call_args: tuple[Any, ...], call_kwargs: dict[str, Any]) -> SubjectRef | None:
             # Single argument-binding site shared by all three wrappers below.
             return _authorize(
                 func=func,
@@ -422,7 +436,7 @@ def rebac_mcp_tool(
                 iterator = cast(Callable[..., Any], func)(*args, **kwargs)
                 try:
                     while True:
-                        with actor_context(actor):
+                        with _acting(actor):
                             try:
                                 item = await anext(iterator)
                             except StopAsyncIteration:
@@ -431,7 +445,7 @@ def rebac_mcp_tool(
                 finally:
                     # Early close/cancellation must also run the tool's cleanup
                     # under its actor and restore the closing task's context.
-                    with actor_context(actor):
+                    with _acting(actor):
                         await iterator.aclose()
 
             return cast(_F, asyncgen_wrapper)
@@ -445,7 +459,7 @@ def rebac_mcp_tool(
                 # — same posture as ``rebac.audit.aemit`` — then re-enter the
                 # actor context on the loop so the awaited body inherits it.
                 actor = await sync_to_async(authorize, thread_sensitive=True)(args, kwargs)
-                with actor_context(actor):
+                with _acting(actor):
                     return await cast(Callable[..., Awaitable[Any]], func)(*args, **kwargs)
 
             return cast(_F, async_wrapper)
@@ -453,7 +467,7 @@ def rebac_mcp_tool(
         @functools.wraps(func)
         def sync_wrapper(*args: Any, **kwargs: Any) -> Any:
             actor = authorize(args, kwargs)
-            with actor_context(actor):
+            with _acting(actor):
                 return func(*args, **kwargs)
 
         return cast(_F, sync_wrapper)

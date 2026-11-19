@@ -7,7 +7,7 @@ from functools import wraps
 from inspect import signature
 from typing import Any
 
-from .actors import current_actor, is_sudo
+from .actors import current_actor, enforcing, is_sudo
 from .errors import NoActorResolvedError, PermissionDenied
 from .resources import rebac_resource as _rebac_resource_register
 from .resources import to_object_ref
@@ -39,6 +39,8 @@ def check_permission(
     from .mixins import RebacMixin
 
     subject: SubjectRef | None
+    if not enforcing():
+        return CheckResult.has(reason="permissions are not enforced")
     if actor is None and isinstance(resource, RebacMixin):
         subject, unscoped = resource.effective_actor(strict=False)
         if unscoped:
@@ -91,7 +93,9 @@ def require_permission(
 
         @wraps(fn)
         def _wrapped(*args: Any, **kwargs: Any) -> Any:
-
+            if not enforcing():
+                # REBAC_ENABLED = False: nothing is checked, with an actor or without.
+                return fn(*args, **kwargs)
             bound = fn_signature.bind(*args, **kwargs)
             bound.apply_defaults()
 

@@ -240,6 +240,25 @@ def check_policy_models(app_configs: Any = None, **kwargs: Any) -> list[checks.C
 
 
 @checks.register("rebac")
+def check_permissions_enforced(app_configs: Any = None, **kwargs: Any) -> list[checks.CheckMessage]:
+    """W011: the deployment enforces no permission."""
+    if app_settings.REBAC_ENABLED:
+        return []
+    return [
+        checks.Warning(
+            "REBAC_ENABLED is False: no permission is checked. Every caller, "
+            "signed in or not, reads and writes every row.",
+            id="rebac.W011",
+            hint=(
+                "This is for a deployment with one trusted user, or for measuring an "
+                "application's queries without the library's. Remove the setting to enforce "
+                "the policy; silence the warning with SILENCED_SYSTEM_CHECKS = ['rebac.W011']."
+            ),
+        )
+    ]
+
+
+@checks.register("rebac")
 def check_field_read_mode_setting(
     app_configs: Any = None, **kwargs: Any
 ) -> list[checks.CheckMessage]:
