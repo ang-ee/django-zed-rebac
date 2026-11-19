@@ -19,6 +19,9 @@ _DEFAULTS: dict[str, Any] = {
     "REBAC_DEPTH_LIMIT": 8,
     # Compile an evaluator scope's statements for the stored grants its actor can hold (proposal 0019).
     "REBAC_ACTOR_PROFILES": True,
+    # Read a prefetch's children without their permission statement where the policy proves
+    # that the parents just admitted imply them (proposal 0020). Off: every prefetch is scoped.
+    "REBAC_STRUCTURAL_PREFETCH": False,
     "REBAC_DEFAULT_CONSISTENCY": "minimize_latency",
     "REBAC_CACHE_ALIAS": "default",
     "REBAC_LOOKUP_CACHE_TTL": 60,
