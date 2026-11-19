@@ -105,6 +105,7 @@ That's the end-to-end flow. The same `Post.objects.with_actor(...)` pattern work
 |---|---|
 | **[docs/ARCHITECTURE.md](./docs/ARCHITECTURE.md)** | You're integrating, contributing, or evaluating fit. Architecture, public API, the three storage tiers, settings, surface integrations, determinism, testing, roadmap. |
 | **[docs/ZED.md](./docs/ZED.md)** | You're writing permission schemas. How to define permissions for users, groups, AI agents (Grant pattern), Celery tasks, MCP tools, hierarchical resources, time-bound access, arbitrary Python entities. Patterns library and anti-patterns. |
+| **[tests/bench/README.md](./tests/bench/README.md)** | You want to know what your own policy costs with real amounts of data. Export its skeleton with `rebac.skeleton.export`, generate rows to any size, and read them under each setting. |
 
 ## Why use this
 

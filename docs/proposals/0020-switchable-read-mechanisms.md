@@ -44,10 +44,10 @@ Each module's docstring is its specification: `rebac.structural`, `rebac.rowscop
   JIT compiles each one: a 40-subquery scope over three rows ran 6 s with `jit = on`, 2 ms with it off. The
   library sets no database option.
 - **Row scope asks each row the caller's conditions select.** Where those select many rows and the actor holds
-  few, the id set would have named the few. Measured on 50,000 threads for an actor with three grants at the end
-  of the id range, the first page in id order cost 19.5 ms against 33 ms compiled, so this fixture does not show
-  the loss; a table a hundred times larger would. `"named"` confines it to queries whose own conditions bind
-  their primary key or a foreign key to literal values.
+  few, the id set would have named the few. On 50,000 threads, for an actor with three grants at the end of the
+  id range, the first page in id order cost 19.5 ms against 33 ms compiled: no loss at that size. On 3.2 million
+  rows of which the actor holds none, a page cost 152 ms against 17 ms compiled (the benchmark below). `"named"`
+  confines it to queries whose own conditions bind their primary key or a foreign key to literal values.
 - **Display fields `True`:** a related row of a model that declares display fields is never delivered whole
   through `rebac_select_related`, even to an actor who may read it. Read the row itself for more.
 - **Trusted ids:** a relationship row whose id is not the canonical text of its integer key makes PostgreSQL
@@ -80,6 +80,57 @@ is two runs.
   structural prefetch (64 ms), trusted ids (42 ms with it) and the deciding walk (74 to 27 ms) still apply.
 - django-guardian on the same data: 3 statements, 2.1 KB, 28–30 ms.
 
+## A real policy at scale
+
+The fixture above reaches a handful of relations from each read. `tests/bench` runs a project's real policy over
+generated data (`docs/ARCHITECTURE.md § The policy benchmark`); the policy here is ang-ee/angee-django's, 147
+definitions over 142 models, in which a message's read reaches 125 relations. Registry layout, PostgreSQL 17, JIT
+off. `plain` is `REBAC_ENFORCE_PERMISSIONS = False` (proposal 0021): Django's own queries.
+
+**One message with its thread, sender, parts, files and people**
+
+| Model rows | Heavy member, today | every setting on | Administrator | Plain |
+|---|---|---|---|---|
+| 7,900 | 14 statements, 906 KB, 490 ms (385 ms planning, 596 MiB planner memory) | | 14 KB, 12 ms | |
+| 383,000 | 802 KB, 1.9–2.3 s (1.7–2.0 s execution) | 357 KB, 0.7–0.8 s | 14 KB, 21 ms | 10 statements, 3 KB, 3.9 ms |
+| 15.3 million | 28.8 s | 17.7 s | 29 ms | |
+
+**383,000 rows, heavy member** (statements / SQL / wall, median of 3)
+
+| Read | Today | Every setting on |
+|---|---|---|
+| A thread's messages with parts and people | 9 / 387 KB / 1,330 ms | 9 / 120 KB / 394 ms |
+| First page of threads with messages and parts | 7 / 353 KB / 1,266 ms | 7 / 188 KB / 651 ms |
+| Newest 50 files | 5 / 194 KB / 813 ms | 5 / 164 KB / 717 ms |
+| Which of 100 files are readable | 5 / 195 KB / 710 ms | 24 / 171 KB / 613 ms |
+| Two single checks | 10 / 368 KB / 1,044 ms | 10 / 298 KB / 945 ms |
+
+The denormalized layout is about twice as fast on the same reads (the message: 1,147 ms today, 406 ms with every
+setting on, PostgreSQL 16).
+
+**15.3 million rows, 5.6 million relationships** (wall time of one run each; today, then every setting on)
+
+| Read | Light member | Heavy member | Author | Administrator |
+|---|---|---|---|---|
+| First page of threads | 12.1 s, 6.6 s | 11.7 s, 14.0 s | 2.6 s, 1.5 s | 35 ms |
+| One message | 18.5 s, 7.4 s | 28.8 s, 17.7 s | 4.5 s, 2.0 s | 29 ms |
+| Newest 50 files | 47.1 s, 46.0 s | 8.3 s, 11.5 s | 37.8 s, 37.1 s | 18 ms |
+| Which of 100 files are readable | 45.7 s, 44.9 s | 7.4 s, 21.0 s | 38.2 s, 38.1 s | 22 ms |
+| Two single checks | 7.0 s, 6.4 s | 8.0 s, 15.8 s | 2.0 s, 2.1 s | 22 ms |
+| Newest 50 changesets | 17 ms, 152 ms | 16 ms, 168 ms | 609 ms, 516 ms | 12 ms |
+
+What this shows:
+
+- **On a policy this wide the cost is the policy.** A read that Django answers in 4 ms costs a member seconds at
+  383,000 rows and tens of seconds at 15 million, in every statement shape. The administrator, whose statements
+  fold to a constant arm, stays at tens of milliseconds.
+- **The settings help most where children are read through their parents** (the message, the transcript: 2.8 to
+  3.4 times at 383,000 rows) and little on a single wide statement (the files page).
+- **At 15 million rows they are not reliably a gain.** The heavy member's bounded check went from 7.4 s to 21 s
+  and its two single checks from 8 s to 16 s. These are single runs, and the cause was not investigated.
+- **The member with fewer grants is slower than the one with more** on the files page (47 s against 8 s): the
+  plans differ. Not investigated.
+
 ## Verification
 
 - For each mechanism, random policies in both storage layouts where the result with the setting on equals the
@@ -89,6 +140,8 @@ is two runs.
   structural prefetch's and the first seeds of the others (68 cases); the rest are marked `slow`.
 - Planted bugs fail them: an ignored exclusion, a subject set taken as held, an expired row counted, ignored
   backing filters.
+- On the Angee policy, every scenario of the benchmark returns the same rows with and without the settings, for
+  four of the cast on SQLite (`make bench-smoke`) and for the reads in the tables above on PostgreSQL 16 and 17.
 - The whole suite with a setting on: no result differs. What fails pins a statement count, a witness entry or
   statement text: 14 tests with the walk deciding, 30 with the row scope.
 - Both the walk and the row conditions carry the compiled statement's fence: they answer nothing while the
@@ -98,7 +151,9 @@ is two runs.
 
 - **Policy width.** A condition on a row cannot be named and reused, so a permission that others refer to is
   written out at each use. Each subquery is planned at every execution (0.3–0.4 ms in the registry layout). The
-  row scope stops at 24. `rowscope.explain(model, actor, action)` says whether it applies and what stops it.
+  row scope stops at 24. `rowscope.explain(model, actor, action)` says whether it applies and what stops it. On
+  the Angee policy it applies to 31 of 130 models with a read permission; the other 99 reach a median of 32
+  relations and up to 185.
 - **Field backings the walk reads:** one enforced foreign key between integer keys, with source filters. A path
   through several relations, a reverse or many-to-many relation, a generic foreign key, an attribute backing and
   a non-integer key keep the compiled statement.
