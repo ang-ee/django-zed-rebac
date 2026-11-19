@@ -49,7 +49,8 @@ Each module's docstring is its specification: `rebac.structural`, `rebac.rowscop
   rows of which the actor holds none, a page cost 152 ms against 17 ms compiled (the benchmark below). `"named"`
   confines it to queries whose own conditions bind their primary key or a foreign key to literal values.
 - **Display fields `True`:** a related row of a model that declares display fields is never delivered whole
-  through `rebac_select_related`, even to an actor who may read it. Read the row itself for more.
+  through `rebac_select_related`, even to an actor who may read it. Read the row itself for more. Only a
+  `RebacMixin` model can declare display fields: its `save` leaves hidden columns alone.
 - **Trusted ids:** a relationship row whose id is not the canonical text of its integer key makes PostgreSQL
   raise on the statement and SQLite read it by its numeric value. With the guard such a row is passed over.
 
@@ -83,7 +84,7 @@ is two runs.
 ## A real policy at scale
 
 The fixture above reaches a handful of relations from each read. `tests/bench` runs a project's real policy over
-generated data (`docs/ARCHITECTURE.md § The policy benchmark`); the policy here is ang-ee/angee-django's, 147
+generated data (`docs/ARCHITECTURE.md § The policy benchmark`); the policy here is a composed application's, 147
 definitions over 142 models, in which a message's read reaches 125 relations. Registry layout, PostgreSQL 17, JIT
 off. `plain` is `REBAC_ENFORCE_PERMISSIONS = False` (proposal 0021): Django's own queries.
 
@@ -140,7 +141,7 @@ What this shows:
   structural prefetch's and the first seeds of the others (68 cases); the rest are marked `slow`.
 - Planted bugs fail them: an ignored exclusion, a subject set taken as held, an expired row counted, ignored
   backing filters.
-- On the Angee policy, every scenario of the benchmark returns the same rows with and without the settings, for
+- On that application's policy, every scenario of the benchmark returns the same rows with and without the settings, for
   four of the cast on SQLite (`make bench-smoke`) and for the reads in the tables above on PostgreSQL 16 and 17.
 - The whole suite with a setting on: no result differs. What fails pins a statement count, a witness entry or
   statement text: 14 tests with the walk deciding, 30 with the row scope.
@@ -149,10 +150,18 @@ What this shows:
 
 ## Known limits
 
+- **Consistency.** A compiled answer is one statement and reads one state of the data. Structural prefetch and
+  the walk are several: each statement reads the state committed when it runs, so under READ COMMITTED a
+  conjunction can be assembled from adjacent states (children read under parents admitted a moment earlier; a
+  row read under a parent it has since left; an exclusion read after it was lifted and the grant withdrawn).
+  Inside one snapshot they are exact: a transaction on a connection configured for repeatable read, or any
+  transaction on SQLite. Whether a decision may be assembled from adjacent states is the application's choice
+  to make, as it already is for a prefetch; it is the reason these settings are off by default. A policy
+  revision published during a walk is handled: the walk reads the fence again after an exclusion.
 - **Policy width.** A condition on a row cannot be named and reused, so a permission that others refer to is
   written out at each use. Each subquery is planned at every execution (0.3–0.4 ms in the registry layout). The
   row scope stops at 24. `rowscope.explain(model, actor, action)` says whether it applies and what stops it. On
-  the Angee policy it applies to 31 of 130 models with a read permission; the other 99 reach a median of 32
+  the benchmark's application policy it applies to 31 of 130 models with a read permission; the other 99 reach a median of 32
   relations and up to 185.
 - **Field backings the walk reads:** one enforced foreign key between integer keys, with source filters. A path
   through several relations, a reverse or many-to-many relation, a generic foreign key, an attribute backing and

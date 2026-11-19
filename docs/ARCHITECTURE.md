@@ -1305,7 +1305,8 @@ class YourAppConfig(AppConfig):
 | `held`, `held_many` | Every candidate id. `grants_all` is `True`. |
 | `accessible` | Every row of a type that stores rows; for a type whose objects exist only in relationships, the ids relationships name as resources. |
 | `queryset_filter`, `permission_expression` | `Q()` and a true value. |
-| `@require_permission`, the Django auth backend, the DRF, GraphQL and MCP adapters | Allowed: each asks one of the surfaces above. |
+| `check_new`; `@require_permission`; the Django auth backend (`has_perm`, `has_module_perms`); the DRF permission class; the MCP tool gate | Allowed, without an actor. Each of these decides by itself and reads the setting. |
+| The GraphQL adapter, the DRF filter backend, the permission expression | Unrestricted: each asks a queryset or the backend above. |
 | `write_relationships`, `delete_relationships`, `rebac sync`, `lookup_subjects` | Unchanged. Relationships and the policy are still stored, so the same database decides again when the setting is removed. |
 
 No permission statement is issued on any of these paths, and no bypass audit row is written: there is no bypass to give a reason for. The library says so instead: `rebac.W011` in the system checks, and one `WARNING` on the `rebac` logger when the application starts.
@@ -2279,6 +2280,12 @@ statement in place.
 - **A fence, as on a compiled statement.** The walk's lookups and the row conditions admit nothing while the
   published policy revision is not the one they were built for.
 - **Nothing runs when nothing is enforced.** `REBAC_ENFORCE_PERMISSIONS = False` answers before any of them.
+- **Several statements, several states.** A compiled answer is one statement. Structural prefetch and the walk
+  read several, each seeing the state committed when it runs, so under READ COMMITTED a decision can be assembled
+  from adjacent states. They are exact inside one snapshot (a transaction on a connection configured for
+  repeatable read; any transaction on SQLite). After an exclusion the walk reads the fence again, so a policy
+  revision published under it answers nothing.
+- **Display fields need a `RebacMixin` model**, whose `save` leaves hidden columns alone.
 
 #### The clock
 
@@ -3897,8 +3904,9 @@ project's code or data ([tests/bench/README.md](../tests/bench/README.md)):
 - `python -m tests.bench.run build|read|census` under `DJANGO_SETTINGS_MODULE=tests.settings_bench`.
   `make bench-smoke` builds the tiny size in SQLite and fails if a mechanism changes what a read returns.
 
-`tests/bench/policies/angee` is the export of ang-ee/angee-django: 147 definitions over 142 models. Nothing in
-the benchmark is collected by pytest or run in CI.
+The export checked in under `tests/bench/policies/` is a composed application of 147 definitions over 142
+models; its origin is recorded in its `skeleton.json`. Nothing in the benchmark is collected by pytest or run in
+CI.
 
 ### Test tiers
 

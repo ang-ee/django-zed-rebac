@@ -376,9 +376,10 @@ def test_several_actions_share_what_they_read(deciding):
     assert found == {"read": {"1"}, "guarded": {"1"}, "both": set()}
     statements = [query["sql"] for query in captured.captured_queries]
     assert not compiled(statements)
-    # The rows, then one lookup per relation and open id set: reader, team, the admin role,
-    # blocked, and team again for the row the union did not need it on.
-    assert len(statements) <= 6, "\n".join(statements)
+    # The rows, then one lookup per relation and open id set (reader, team, the admin role,
+    # blocked, and team again for the row the union did not need it on), then the fence once
+    # more, because an exclusion was read.
+    assert len(statements) <= 7, "\n".join(statements)
 
 
 @pytest.mark.parametrize("state", ["absent", "empty"])
@@ -448,3 +449,61 @@ def test_an_application_shaped_policy_is_decided_without_the_compiled_statement(
                     i for i in ("3",) if resource_type == "scope/thread"
                 }, (actor, resource_type, action, seed)
     assert asked == []
+
+
+def test_the_proving_walk_credits_no_id_the_compiled_check_drops(local, settings):
+    """A relationship row can be stored under ``01``. The compiled check drops a candidate that
+    is not a key's own spelling; so does the walk."""
+    local.write_relationships(
+        [grant("scope/thread", "01", "reader"), grant("scope/thread", 1, "reader")]
+    )
+    for setting in (False, True, "decide"):
+        settings.REBAC_BOUNDED_WALK = setting
+        assert held(local, "scope/thread", ["01", "1"])[0] == {"1"}, setting
+    assert proved(local, "scope/thread", ["01", "1"]) == {"1"}
+
+
+ALIASED = """
+definition auth/user {}
+definition scope/thread {
+    relation reader: auth/user
+    permission read = reader
+    permission read__label = reader
+    permission read__id = reader
+}
+"""
+
+
+def test_the_proving_walk_reads_a_relation_once_for_every_action_that_names_it(local, settings):
+    backend = install_schema(ALIASED)
+    backend.write_relationships([grant("scope/thread", 1, "reader")])
+    settings.REBAC_BOUNDED_WALK = True
+    with CaptureQueriesContext(connection) as captured:
+        found = backend.held_many(
+            subject=MEMBER,
+            actions=["read", "read__label", "read__id"],
+            resource_type="scope/thread",
+            ids=["1"],
+        )
+    assert found == {"read": {"1"}, "read__label": {"1"}, "read__id": {"1"}}
+    assert len(captured.captured_queries) == 1
+
+
+def test_a_walk_the_fence_closed_under_answers_nothing(deciding, monkeypatch):
+    """A fenced lookup of an excluded side reads nothing when the policy changes under it, and
+    would exclude nobody. The walk reads the fence again after an exclusion."""
+    deciding.write_relationships(
+        [grant("scope/thread", 1, "reader"), grant("scope/thread", 1, "blocked")]
+    )
+    question = dict(
+        backend=deciding,
+        resource_type="scope/thread",
+        actor=MEMBER,
+        ids=["1", "2"],
+        using="default",
+    )
+    assert walk.decided(action="guarded", **question) == (set(), {"1", "2"})
+    monkeypatch.setattr(walk._Walk, "open", lambda self: False)
+    assert walk.decided(action="guarded", **question) == (set(), set())
+    # A permission with no exclusion reads nothing negatively: its fenced lookups fail closed.
+    assert walk.decided(action="read", **question) == ({"1"}, {"1", "2"})

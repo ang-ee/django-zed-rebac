@@ -69,23 +69,18 @@ def guard_selected_related_instances(
     """Batch-check selected to-one related objects before callers serialize them."""
     if not paths or bypass:
         return
+    roots = [instance for instance in instances if isinstance(instance, models.Model)]
 
-    batches: dict[type[models.Model], dict[str, dict[int, models.Model]]] = {}
-    for instance in instances:
-        if not isinstance(instance, models.Model):
-            continue
-        for path in paths:
-            _collect_cached_related(
-                instance,
-                root_model=root_model,
-                path=path,
-                batches=batches,
-            )
+    def reached() -> dict[type[models.Model], dict[str, dict[int, models.Model]]]:
+        """The protected related rows the roots lead to now, by model and id."""
+        batches: dict[type[models.Model], dict[str, dict[int, models.Model]]] = {}
+        for instance in roots:
+            for path in paths:
+                _collect_cached_related(instance, root_model=root_model, path=path, batches=batches)
+        return {model: rows for model, rows in batches.items() if model_resource_type(model)}
 
-    protected_batches = {
-        model: rows for model, rows in batches.items() if model_resource_type(model)
-    }
-    if not protected_batches:
+    protected = reached()
+    if not protected:
         return
     if actor is None:
         raise MissingActorError(
@@ -96,26 +91,24 @@ def guard_selected_related_instances(
     from . import display
 
     showing = display.mode()
-    # Rows cut off from a display row: they hung off one of its hidden foreign keys.
-    detached: set[int] = set()
-    if showing == "always":
+    shown = {model for model in protected if showing and display.fields(model)}
+    if showing == "always" and shown:
         # A model that declares display fields is delivered with them, unchecked.
-        for model in [model for model in protected_batches if display.fields(model)]:
-            rows = [
-                row for copies in protected_batches.pop(model).values() for row in copies.values()
-            ]
-            detached |= display.deliver(rows, model=model, actor=actor, field_mode=mode)
+        for model in shown:
+            rows = [row for copies in protected[model].values() for row in copies.values()]
+            display.deliver(rows, model=model, actor=actor, field_mode=mode)
+        # A display row's hidden foreign keys read as absent: collect what is still reached.
+        protected = reached()
 
     active_backend = backend()
-    outside: dict[type[models.Model], list[str]] = {}
     held_by_model: dict[type[models.Model], set[str]] = {}
-    for model, rows_by_id in protected_batches.items():
-        for resource_id in [key for key, copies in rows_by_id.items() if copies.keys() <= detached]:
-            del rows_by_id[resource_id]
-        if not rows_by_id or not model_resource_type(model):
+    for model, rows_by_id in protected.items():
+        if showing == "always" and model in shown:
             continue
         action = str(getattr(model._meta, "rebac_default_action", "read"))
-        allowed = set(
+        # Django creates a separate related instance for each joined root row.
+        # IDs are checked once; every in-memory copy of that ID is stamped and redacted.
+        held_by_model[model] = set(
             held_ids(
                 active_backend,
                 subject=actor,
@@ -124,18 +117,25 @@ def guard_selected_related_instances(
                 resource_ids=rows_by_id,
             )
         )
-        held_by_model[model] = allowed
-        outside[model] = sorted(set(rows_by_id) - allowed)
     if showing == "fallback":
         # A row the actor does not hold, of a model with display fields, is shown with them.
-        for model, denied in outside.items():
-            if denied and display.fields(model):
-                rows = [row for key in denied for row in protected_batches[model][key].values()]
-                detached |= display.deliver(rows, model=model, actor=actor, field_mode=mode)
-                outside[model] = []
-    for model, denied in outside.items():
-        rows_by_id = protected_batches[model]
-        denied = [key for key in denied if not rows_by_id[key].keys() <= detached]
+        delivered = False
+        for model in shown & held_by_model.keys():
+            rows = [
+                row
+                for key, copies in protected[model].items()
+                if key not in held_by_model[model]
+                for row in copies.values()
+            ]
+            if rows:
+                display.deliver(rows, model=model, actor=actor, field_mode=mode)
+                delivered = True
+        if delivered:
+            protected = reached()
+    for model, allowed in held_by_model.items():
+        if showing == "fallback" and model in shown:
+            continue
+        denied = sorted(set(protected.get(model, {})) - allowed)
         if denied:
             sample = ", ".join(denied[:5])
             raise PermissionDenied(
@@ -143,14 +143,11 @@ def guard_selected_related_instances(
                 f"related row(s) outside actor scope (e.g. {sample})."
             )
     for model, allowed in held_by_model.items():
-        # Django creates a separate related instance for each joined root row.
-        # IDs are checked once; every in-memory copy of that ID is stamped and redacted.
         rows = [
             row
-            for key, copies in protected_batches[model].items()
+            for key, copies in protected.get(model, {}).items()
             if key in allowed
             for row in copies.values()
-            if id(row) not in detached
         ]
         for row in rows:
             row._rebac_actor = actor  # type: ignore[attr-defined]

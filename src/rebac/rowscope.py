@@ -63,6 +63,7 @@ from collections.abc import Iterator
 from contextlib import contextmanager
 from contextvars import ContextVar
 from dataclasses import dataclass
+from threading import Lock
 from typing import Any, cast
 
 from django.core.exceptions import FieldError
@@ -109,6 +110,8 @@ _SUBQUERIES = 24
 # permission that keeps the compiled scope.
 _built: OrderedDict[tuple[Any, ...], Q | None] = OrderedDict()
 _BUILT_LIMIT = 1024
+# Requests on other threads read and evict the same entries.
+_lock = Lock()
 # The query a queryset is about to run itself.
 _executing: ContextVar[Any] = ContextVar("rebac_row_scope_executing", default=None)
 
@@ -207,9 +210,10 @@ def row_conditions(
     if walk is None or walking._integer_identity(model) is None:
         return None
     key = (walk.policy.key, active_relationship_model(), model, action, actor, using, _SUBQUERIES)
-    if key in _built:
-        _built.move_to_end(key)
-        return _built[key]
+    with _lock:
+        if key in _built:
+            _built.move_to_end(key)
+            return _built[key]
     rows = _Rows(walk, limit=_SUBQUERIES)
     try:
         found = rows.holds((resource_type, action), _At(model, None), frozenset())
@@ -221,9 +225,10 @@ def row_conditions(
         # Closed while the published revision is not this policy's, as a compiled statement is.
         fence = Q(Exists(_fence(walk.policy, backend=local, using=using, parametric=False)))
         found = Q(pk__in=[]) if is_false(found) else fence if is_true(found) else fence & found
-    _built[key] = found
-    while len(_built) > _BUILT_LIMIT:
-        _built.popitem(last=False)
+    with _lock:
+        _built[key] = found
+        while len(_built) > _BUILT_LIMIT:
+            _built.popitem(last=False)
     return found
 
 
@@ -403,26 +408,10 @@ class _Rows:
         if relation.with_expiration:
             # The compiled scope binds one instant per statement.
             return self._no(f"{definition.resource_type}#{relation.name}: an expiring relation")
-        named: set[str] = set()
-        through: set[Key] = set()
-        for allowed in relation.allowed_subjects:
-            if allowed.with_caveat:
-                return None
-            if allowed.relation and not self.walk._is_relation(allowed.type, allowed.relation):
-                continue
-            if target is not None:
-                if allowed.relation or allowed.wildcard or allowed.id:
-                    return None
-                through.add((allowed.type, ""))
-            elif allowed.relation:
-                if allowed.wildcard or allowed.id:
-                    return None
-                through.add((allowed.type, allowed.relation))
-            elif allowed.type == self.actor.subject_type:
-                if allowed.wildcard:
-                    named.add("*")
-                elif not allowed.id or allowed.id == self.actor.subject_id:
-                    named.add(self.actor.subject_id)
+        shapes = self.walk.stored_shapes(relation, target)
+        if shapes is None:
+            return self._no(f"{definition.resource_type}#{relation.name}: its subject shape")
+        named, through = shapes
         parts: list[Q] = []
         if named:
             parts.append(

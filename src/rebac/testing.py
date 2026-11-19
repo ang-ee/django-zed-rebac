@@ -128,7 +128,6 @@ def compare_mechanisms(
     from django.db import connections
     from django.test import override_settings
 
-    from . import rowscope
     from .compile import read
 
     names = list(mechanisms)
@@ -138,7 +137,6 @@ def compare_mechanisms(
         chosen = dict(zip(names, values, strict=True))
         with override_settings(**chosen):
             read.reset()
-            rowscope._built.clear()
             result = run()
             statements: list[str] = []
 
@@ -161,7 +159,6 @@ def compare_mechanisms(
                 run()
                 times.append((perf_counter() - started) * 1000)
         read.reset()
-        rowscope._built.clear()
         row: dict[str, Any] = {
             "settings": chosen,
             "statements": len(statements),

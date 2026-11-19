@@ -7,6 +7,7 @@ remain predicates in the statement and are read when it executes.
 
 from __future__ import annotations
 
+import sys
 from collections import OrderedDict
 from collections.abc import Callable, Hashable, Iterable, Iterator, Mapping, Sequence
 from dataclasses import dataclass, field
@@ -167,6 +168,11 @@ def reset() -> None:
         _policies.clear()
         _statements.clear()
         _generic_columns.clear()
+    # What the switchable mechanisms keep is derived from a policy too (proposal 0020).
+    for module, name in (("rebac.rowscope", "_built"), ("rebac.structural", "_PROOFS")):
+        kept = getattr(sys.modules.get(module), name, None)
+        if kept is not None:
+            kept.clear()
     evaluator = current_evaluator()
     if evaluator is not None:
         # The open scope's pinned policy may predate this invalidation.

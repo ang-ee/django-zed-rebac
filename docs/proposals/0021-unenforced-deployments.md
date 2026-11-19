@@ -47,8 +47,16 @@ With `REBAC_ENFORCE_PERMISSIONS = False`:
 
 - `actors.resolve`, through which every queryset, model instance and signal gate resolves its authority,
   answers `(None, True)` first. `actors.bypassing()` replaces the direct reads of the ambient sudo state in the
-  bulk write paths and the decorators.
+  bulk write paths.
 - `LocalBackend`'s decision methods answer before compiling anything.
+- The surfaces that decide by themselves read the setting: `check_new`, `@require_permission`, the Django auth
+  backend, the DRF permission class and the MCP tool gate.
+- A fetched row is still stamped with its reader, so `instance.actor()` answers as it does when enforcing.
+
+## Repository rules this changes
+
+`AGENTS.md § 3` (a queryset that escapes its actor scope must raise) gains this setting as its one exception, in
+the same change. That amendment is the owner's to accept with the proposal.
 
 ## Tests
 
@@ -56,4 +64,5 @@ With `REBAC_ENFORCE_PERMISSIONS = False`:
 one that holds something return every row with no permission statement; `rebac_select_related` and
 `rebac_prefetch_related` issue Django's statements alone; no field is redacted; every check allows; every write is
 allowed without an actor; a guarded function runs; relationships written meanwhile decide again when the setting
-is restored; the system check fires.
+is restored; the system check fires; rows keep their reader's stamp; `check_new`, the MCP gate, the DRF
+permission class and the auth backend refuse when enforcing and allow, with no statement, when not.

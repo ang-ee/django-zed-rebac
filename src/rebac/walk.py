@@ -37,6 +37,19 @@ set whatever the setting.
 
 A foreign key is read from its column: its target is taken to be a row, which
 the database guarantees for an enforced key once the transaction commits.
+
+**Consistency.** The compiled answer is one statement, which reads one state of
+the data. The walk is several: each lookup reads the state committed when it
+runs. Under READ COMMITTED a grant, a foreign key or a blocking row that
+changes between two lookups can give an answer that held in neither state (a
+row read under a parent it has since left; an exclusion read after it was
+lifted and the grant withdrawn). Inside one snapshot the walk is exact: a
+transaction on a connection configured for repeatable read
+(``snapshot.isolated``), or any transaction on SQLite. Whether a bounded
+decision may be assembled from adjacent states is the application's decision,
+as it is for a prefetch; that is why the setting is off by default. A policy
+revision published during a walk is handled: after an exclusion the fence is
+read again, and a walk it closed under answers nothing.
 """
 
 from __future__ import annotations
@@ -65,6 +78,7 @@ from .schema.ast import (
     PermRef,
     Relation,
 )
+from .structural import _union_arms
 from .types import SubjectRef
 
 if TYPE_CHECKING:
@@ -125,7 +139,7 @@ def proved(
     walk = _walk(backend, actor, using, context)
     if walk is None:
         return set()
-    return walk.holds(resource_type, action, set(ids), frozenset())
+    return walk.holds(resource_type, action, walk.canonical(resource_type, set(ids)), frozenset())
 
 
 def decided(
@@ -186,12 +200,19 @@ def decided_many(
                 else None
             )
             if found is None:
-                found = walk.holds(resource_type, name, chunk, frozenset())
+                found = walk.holds(
+                    resource_type, name, walk.canonical(resource_type, chunk), frozenset()
+                )
                 answered |= found
             else:
                 assert rows is not None
                 answered |= rows
             held |= found
+    if walk.excluded and not walk.open():
+        # A policy published while the walk read: a fenced lookup of an excluded
+        # side read nothing and excluded nobody. Nothing is answered; the compiled
+        # statement, fenced as a whole, decides.
+        return {name: (set(), set()) for name in names}
     return result
 
 
@@ -205,7 +226,12 @@ class _Walk:
         self.using = using
         # What exact() has settled: key -> id -> held.
         self._known: dict[Key, dict[str, bool]] = {}
+        # What the proving walk has read of a relation: key -> id -> proved.
+        self._proved: dict[Key, dict[str, bool]] = {}
         self._costly: dict[Key, bool] = {}
+        # Whether an exclusion was read: its lookups are fenced, and a fence that
+        # closed under them would have excluded nobody (``decided_many``).
+        self.excluded = False
         from .compile.read import _fence
 
         # Every lookup reads nothing while the published policy revision is not
@@ -244,6 +270,14 @@ class _Walk:
             .values_list(identity.attname, flat=True)
         )
         return {str(key) for key in found} & ids
+
+    def canonical(self, resource_type: str, ids: set[str]) -> set[str]:
+        """The candidates that can name a row of the type: the compiled check drops the others."""
+        model = model_for_resource_type(resource_type)
+        if model is None or not stores_rows(model):
+            return ids
+        codec = identity_codec(model, resource_id_attr(model))
+        return {value for value in ids if codec.is_canonical(value, using=self.using)}
 
     def handed_over(self, key: Key) -> bool:
         """Whether ``key`` is the compiler's to read whole.
@@ -421,6 +455,7 @@ class _Walk:
             right = self._expression(definition, expr.right, left, path, negated)
             return None if right is None else left & right
         # What is excluded is read whole: nothing below may be asked of the compiler.
+        self.excluded = True
         right = self._expression(definition, expr.right, left, path, True)
         return None if right is None else left - right
 
@@ -537,26 +572,10 @@ class _Walk:
         negated: bool,
     ) -> set[str] | None:
         """Live, uncaveated relationship rows on the ids, by the shapes the relation declares."""
-        named: set[str] = set()  # subject ids that are the actor
-        through: set[Key] = set()  # (subject type, subject relation) whose subjects are asked
-        for allowed in relation.allowed_subjects:
-            if allowed.with_caveat:
-                return None
-            if allowed.relation and not self._is_relation(allowed.type, allowed.relation):
-                continue
-            if target is not None:
-                if allowed.relation or allowed.wildcard or allowed.id:
-                    return None
-                through.add((allowed.type, ""))
-            elif allowed.relation:
-                if allowed.wildcard or allowed.id:
-                    return None
-                through.add((allowed.type, allowed.relation))
-            elif allowed.type == self.actor.subject_type:
-                if allowed.wildcard:
-                    named.add("*")
-                elif not allowed.id or allowed.id == self.actor.subject_id:
-                    named.add(self.actor.subject_id)
+        read_as = self.stored_shapes(relation, target)
+        if read_as is None:
+            return None
+        named, through = read_as
         live = Q(expires_at__isnull=True)
         if relation.with_expiration:
             live |= Q(expires_at__gt=application_now())
@@ -618,6 +637,41 @@ class _Walk:
             found |= {resource_id for resource_id, subject in pairs if subject in members}
         return found
 
+    def stored_shapes(
+        self, relation: Relation, target: str | None
+    ) -> tuple[set[str], set[Key]] | None:
+        """How a stored relation's rows are read for the actor, as the compiler groups them.
+
+        ``named``: the subject ids that are the actor itself (its id, its type's
+        wildcard). ``through``: the ``(subject type, subject relation)`` shapes
+        whose subjects are then asked (the relation is empty for an arrow).
+        ``None`` for a shape the walk does not read: a caveated subject, a
+        wildcard or a fixed id on a subject set or an arrow. The walk and the row
+        scope both read a stored relation through this, so they cannot come to
+        read the same policy differently.
+        """
+        named: set[str] = set()
+        through: set[Key] = set()
+        for allowed in relation.allowed_subjects:
+            if allowed.with_caveat:
+                return None
+            if allowed.relation and not self._is_relation(allowed.type, allowed.relation):
+                continue
+            if target is not None:
+                if allowed.relation or allowed.wildcard or allowed.id:
+                    return None
+                through.add((allowed.type, ""))
+            elif allowed.relation:
+                if allowed.wildcard or allowed.id:
+                    return None
+                through.add((allowed.type, allowed.relation))
+            elif allowed.type == self.actor.subject_type:
+                if allowed.wildcard:
+                    named.add("*")
+                elif not allowed.id or allowed.id == self.actor.subject_id:
+                    named.add(self.actor.subject_id)
+        return named, through
+
     def _is_relation(self, resource_type: str, name: str) -> bool:
         definition = self.schema.get_definition(resource_type)
         return definition is not None and any(r.name == name for r in definition.relations)
@@ -658,11 +712,19 @@ class _Walk:
         return found
 
     def _relation(self, definition: Definition, relation: Relation, ids: set[str]) -> set[str]:
-        if relation.backing is None:
-            return self._stored(definition, relation, ids)
-        if isinstance(relation.backing, FieldBinding):
-            return self._column(definition, relation, ids)
-        return set()
+        """The ids proved through one relation; an id is read once however many actions name it."""
+        known = self._proved.setdefault((definition.resource_type, relation.name), {})
+        unread = {value for value in ids if value not in known}
+        if unread:
+            if relation.backing is None:
+                found = self._stored(definition, relation, unread)
+            elif isinstance(relation.backing, FieldBinding):
+                found = self._column(definition, relation, unread)
+            else:
+                found = set()
+            for value in unread:
+                known[value] = value in found
+        return {value for value in ids if known[value]}
 
     def _stored(self, definition: Definition, relation: Relation, ids: set[str]) -> set[str]:
         """Live, uncaveated rows of a stored relation that name the actor or its type's wildcard."""
@@ -701,25 +763,16 @@ class _Walk:
     def _backed(
         self, definition: Definition, relation: Relation
     ) -> tuple[ResolvedFieldBacking, models.Field[Any, Any]] | None:
-        """A backing the walk can read: one enforced foreign key between integer identities."""
-        try:
-            resolved = resolve_field_backing(definition, relation)
-        except ValueError:
-            return None  # the compiler reports it
-        if (
-            resolved is None
-            or resolved.generic is not None
-            or "__" in resolved.path
-            or not resolved.single_valued
-            or not isinstance(resolved.field, (models.ForeignKey, models.OneToOneField))
-            or not getattr(resolved.field, "db_constraint", False)
-            or not resolved.targets_identity_directly()
-            or len(relation.allowed_subjects) != 1
-        ):
-            return None
+        """A backing the walk can read: one enforced foreign key between integer identities.
+
+        ``backing_obstacle`` is the one list of what makes a backing unreadable.
+        """
+        if backing_obstacle(definition, relation) is not None:
+            return None  # where it does not resolve, the compiler reports it
+        resolved = resolve_field_backing(definition, relation)
+        assert resolved is not None
         source = _integer_identity(resolved.source_model)
-        if source is None or _integer_identity(resolved.target_model) is None:
-            return None
+        assert source is not None
         return resolved, source
 
     def _targets(
@@ -854,17 +907,3 @@ def model_for_resource_type_of(model: type[models.Model]) -> Any:
 
     resource_type = model_resource_type(model)
     return model_for_resource_type(resource_type) if resource_type else None
-
-
-def _union_arms(definition: Definition, expr: PermExpr, seen: frozenset[str]) -> Iterator[PermExpr]:
-    """The arms of a union, a named permission of the same definition opened into its own."""
-    if isinstance(expr, PermBinOp) and expr.op == "+":
-        yield from _union_arms(definition, expr.left, seen)
-        yield from _union_arms(definition, expr.right, seen)
-        return
-    if isinstance(expr, PermRef) and expr.name not in seen:
-        named = next((item for item in definition.permissions if item.name == expr.name), None)
-        if named is not None:
-            yield from _union_arms(definition, named.expression, seen | {expr.name})
-            return
-    yield expr

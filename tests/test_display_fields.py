@@ -128,3 +128,103 @@ def test_the_meta_option_is_read_from_the_model():
             rebac_display_fields = ("name",)
 
     assert Shown._meta.rebac_display_fields == ("name",)
+
+
+JOINED = """
+definition auth/user {}
+definition scope/thread {
+    relation reader: auth/user
+    permission read = reader
+}
+definition scope/message {
+    relation thread: scope/thread // rebac:field=thread
+    relation direct: auth/user
+    permission read = direct
+}
+definition scope/profile {
+    relation owner: scope/message // rebac:field=owner
+    relation reader: auth/user
+    permission read = reader
+    permission write = reader
+}
+"""
+
+
+@pytest.fixture
+def profiled(local):
+    """Message 1 has a profile and sits in thread 1. The member reads the message alone."""
+    from tests.testapp.models import ScopeProfile
+
+    backend = install_schema(JOINED)
+    ScopeProfile._base_manager.bulk_create([ScopeProfile(id=1, owner_id=1, nick="nick")])
+    backend.write_relationships([grant("scope/message", 1, "direct")])
+    display.declare(ScopeProfile, "nick")
+    yield backend
+    display.declare(ScopeProfile)
+
+
+def joined():
+    return list(
+        ScopeMessage.objects.with_actor(MEMBER)
+        .filter(pk=1)
+        .rebac_select_related("profile", "thread")
+    )
+
+
+@pytest.mark.parametrize("setting", ["fallback", True])
+def test_a_display_row_does_not_hide_its_siblings_from_the_guard(profiled, settings, setting):
+    """Django caches the message back on the profile it joined. The profile's hidden key to the
+    message must not take the message's other relations out of the check with it."""
+    with pytest.raises(PermissionDenied, match="outside actor scope"):
+        joined()
+    settings.REBAC_DISPLAY_FIELDS = setting
+    with pytest.raises(PermissionDenied, match="ScopeThread"):
+        joined()
+    profiled.write_relationships([grant("scope/thread", 1, "reader")])
+    [message] = joined()
+    assert message.thread.pk == 1 and not display.is_display_row(message.thread)
+    # The display row is still the message's profile, and shows what it declares.
+    assert display.is_display_row(message.profile) and message.profile.nick == "nick"
+    assert message.profile.owner_id is None and "owner" in redacted_fields(message.profile)
+
+
+def test_a_field_gate_added_by_a_later_policy_is_honoured(profiled, settings):
+    from tests.testapp.models import ScopeProfile
+
+    assert display.fields(ScopeProfile) == {"nick"}
+    gated = JOINED.replace(
+        "    permission write = reader\n}",
+        "    permission write = reader\n    permission read__nick = reader\n}",
+    )
+    assert gated != JOINED
+    install_schema(gated)
+    # The gate decides the field now; the declaration no longer shows it.
+    assert display.fields(ScopeProfile) == frozenset()
+
+
+def test_only_a_model_whose_save_leaves_hidden_fields_alone_declares_display_fields():
+    from django.contrib.auth import get_user_model
+
+    user = get_user_model()
+    display.declare(user, "username")
+    try:
+        with pytest.raises(ImproperlyConfigured, match="RebacMixin"):
+            display.fields(user)
+    finally:
+        display.declare(user)
+
+
+def test_saving_a_display_row_writes_no_hidden_column(profiled, settings):
+    from tests.testapp.models import ScopeProfile
+
+    profiled.write_relationships(
+        [grant("scope/thread", 1, "reader"), grant("scope/profile", 1, "reader")]
+    )
+    settings.REBAC_DISPLAY_FIELDS = True
+    [message] = joined()
+    profile = message.profile
+    assert display.is_display_row(profile) and profile.owner_id is None
+    profile.nick = "renamed"
+    profile.save()
+    stored = ScopeProfile._base_manager.get(pk=1)
+    assert stored.nick == "renamed" and stored.owner_id == 1

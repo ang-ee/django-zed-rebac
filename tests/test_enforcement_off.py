@@ -239,3 +239,48 @@ def test_rows_still_carry_their_reader(world, settings):
         assert ScopeThread.objects.get(pk=2).actor() == MEMBER
     # No reader, no stamp.
     assert ScopeThread.objects.get(pk=2).actor() is None
+
+
+def test_the_create_preflight_and_the_adapters_allow(world, settings):
+    """``check_new``, the MCP tool gate, the DRF permission class and the Django auth backend
+    each decide by themselves: none of them may still refuse."""
+    from types import SimpleNamespace
+
+    from rebac import PermissionDenied, check_new
+    from rebac.backends.auth import RebacBackend
+    from rebac.drf import RebacPermission
+    from rebac.mcp import rebac_mcp_tool
+
+    @rebac_mcp_tool(resource_type="scope/thread", action="write", resource_id="2")
+    def edit(body: str, ctx: object = None) -> str:
+        return body
+
+    hidden = ScopeThread._base_manager.get(pk=2)
+    request = SimpleNamespace(user=None, method="DELETE", META={})
+    view = SimpleNamespace(action="unmapped", queryset=None)
+    stranger = SimpleNamespace(is_active=False, is_superuser=False, pk=None)
+    new_message = dict(
+        subject=OUTSIDER,
+        action="create",
+        resource_type="scope/message",
+        relationships={"thread": [SubjectRef.of("scope/thread", "2")]},
+    )
+
+    with pytest.raises(PermissionDenied):
+        edit("no actor")
+    assert not check_new(**new_message).allowed
+    assert not RebacPermission().has_permission(request, view)
+    assert not RebacPermission().has_object_permission(request, view, hidden)
+    assert not RebacBackend().has_perm(stranger, "testapp.change_scopethread", hidden)
+
+    settings.REBAC_ENFORCE_PERMISSIONS = False
+    with CaptureQueriesContext(connection) as captured:
+        assert edit("no actor") == "no actor"
+        with actor_context(OUTSIDER):
+            assert edit("an actor that holds nothing") == "an actor that holds nothing"
+        assert check_new(**new_message).allowed
+        assert RebacPermission().has_permission(request, view)
+        assert RebacPermission().has_object_permission(request, view, hidden)
+        assert RebacBackend().has_perm(stranger, "testapp.change_scopethread", hidden)
+        assert RebacBackend().has_module_perms(stranger, "testapp")
+    assert not captured.captured_queries

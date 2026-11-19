@@ -635,3 +635,13 @@ class ScopePart(RebacMixin):
 
     class Meta:
         rebac_resource_type = "scope/part"
+
+
+class ScopeProfile(RebacMixin):
+    """One per message, reached from it through a reverse one-to-one."""
+
+    owner = models.OneToOneField(ScopeMessage, on_delete=models.CASCADE, related_name="profile")
+    nick = models.CharField(max_length=32, default="")
+
+    class Meta:
+        rebac_resource_type = "scope/profile"
