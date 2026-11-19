@@ -5,6 +5,11 @@ pre-1.0; breaking changes within a minor version are explicitly called out.
 
 ## [Unreleased]
 
+## [0.37.0] — 2026-11-19
+
+PostgreSQL statements change for an actor whose profile folds more than one constant arm of a permission: they
+are shorter. Rows, decisions and statement counts do not change, and no other database is affected.
+
 ### Changed
 
 - **Folded constant arms leave one planner's bound, not one each** (proposal 0019, PostgreSQL). Where an actor's

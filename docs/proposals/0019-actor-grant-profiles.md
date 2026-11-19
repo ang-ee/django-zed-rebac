@@ -176,7 +176,7 @@ shorten that path.
 3. **Outside evaluator scopes** nothing changes. A consumer whose work runs outside one (tasks, workflow steps)
    gains only when it opens a scope around a unit of work.
 
-## One bound per id set
+## One bound per id set (0.37.0)
 
 A bound was first emitted for each folded constant arm, as a condition of its own and not as a false one. So a
 union of two folded arms was an id set of two branches, a named permission made of folded arms was a common table
