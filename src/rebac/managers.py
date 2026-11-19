@@ -28,7 +28,7 @@ from django.db.models.sql import Query
 from django.db.models.sql.subqueries import UpdateQuery
 from django.db.models.sql.where import ExtraWhere, NothingNode, WhereNode
 
-from . import structural
+from . import rowscope, structural
 from ._id import resource_id_attr
 from .actors import (
     ActorLike,
@@ -1276,9 +1276,13 @@ class RebacQuerySet(models.QuerySet[_M]):
             # Children of parents the running prefetch admitted, where the
             # policy proves the parent's action grants theirs (proposal 0020).
             return
-        predicate = backend().queryset_filter(
-            model=model, subject=actor, action=action, using=self.db
-        )
+        # The scope as conditions on each row, where the setting and the policy
+        # allow it (proposal 0020); the compiled id sets otherwise.
+        predicate = rowscope.predicate(query, model, actor, action, self.db)
+        if predicate is None:
+            predicate = backend().queryset_filter(
+                model=model, subject=actor, action=action, using=self.db
+            )
         # The compiled predicate keeps the authorization clause identifiable,
         # including in Django's cloned and combined WHERE trees, so a changed
         # actor never intersects a stale scope. ``build_where`` works even on
@@ -1559,7 +1563,9 @@ class RebacQuerySet(models.QuerySet[_M]):
         """Keep guards, SQL compilation and nested prefetches in one evaluation."""
         fetching = self._result_cache is None
         if fetching:
-            self._apply_scope_in_place()
+            # This query is run as it stands: its scope may refer to its own rows.
+            with rowscope.executing(self.query):
+                self._apply_scope_in_place()
         actor, sudo = self.effective_actor(strict=True)
         self._audit_bypass_once()
         field_mode = self._effective_field_mode()

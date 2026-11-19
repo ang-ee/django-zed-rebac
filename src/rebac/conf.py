@@ -27,6 +27,10 @@ _DEFAULTS: dict[str, Any] = {
     # settles the ids a grant on the row, a column or a parent shows held; "decide" reads the
     # whole permission and answers no as well.
     "REBAC_BOUNDED_WALK": False,
+    # Write a queryset's scope as conditions on each of its rows instead of membership in the
+    # ids the actor holds (proposal 0020). "named": only where the queryset's own conditions bind
+    # its primary key or a foreign key to literal values. True: for every read the policy allows.
+    "REBAC_ROW_SCOPE": False,
     "REBAC_DEFAULT_CONSISTENCY": "minimize_latency",
     "REBAC_CACHE_ALIAS": "default",
     "REBAC_LOOKUP_CACHE_TTL": 60,

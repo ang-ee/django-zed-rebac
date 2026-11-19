@@ -154,7 +154,16 @@ def _policy() -> Any:
 def _bound_parents(
     query: Any, model: type[models.Model]
 ) -> Iterator[tuple[models.ForeignKey[Any, Any], set[Any]]]:
-    """The foreign keys ``query`` binds to literal parents, with those parents' keys.
+    """The foreign keys ``query`` binds to literal parents, with those parents' keys."""
+    for column, values in bound_fields(query, model):
+        if isinstance(column, models.ForeignKey):
+            yield column, values
+
+
+def bound_fields(
+    query: Any, model: type[models.Model]
+) -> Iterator[tuple[models.Field[Any, Any], set[Any]]]:
+    """The columns of ``model`` that ``query`` binds to literal values, with those values.
 
     Only conditions every row must meet are read: the positive ``AND`` path of
     the WHERE clause, on the query's own table. A subquery, an expression or a
@@ -174,7 +183,7 @@ def _bound_parents(
         if type(column) is not Col or column.alias != alias:
             continue
         fk = column.target
-        if not isinstance(fk, models.ForeignKey) or fk.model is not model:
+        if not isinstance(fk, models.Field) or fk.model is not model:
             continue
         value = node.rhs
         values = value if type(node) in (In, RelatedIn) else (value,)

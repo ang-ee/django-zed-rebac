@@ -8,8 +8,11 @@ from django.test.utils import CaptureQueriesContext
 
 from rebac import ObjectRef, RelationshipTuple, SubjectRef, walk
 from rebac.testing import install_schema
+from tests.mechanism_policies import application_shaped, label_threads
 from tests.test_actor_profiles import seeded, subtracting
 from tests.test_inherited_witness_reference import build
+from tests.test_schema_generation import ACTOR as PUBLISHED_ACTOR
+from tests.test_schema_generation import _unpublish, synced  # noqa: F401
 from tests.testapp.models import ScopeMessage, ScopePart, ScopeThread
 
 pytestmark = [pytest.mark.django_db, pytest.mark.pg_delta]
@@ -376,3 +379,72 @@ def test_several_actions_share_what_they_read(deciding):
     # The rows, then one lookup per relation and open id set: reader, team, the admin role,
     # blocked, and team again for the row the union did not need it on.
     assert len(statements) <= 6, "\n".join(statements)
+
+
+@pytest.mark.parametrize("state", ["absent", "empty"])
+@pytest.mark.parametrize("setting", [True, "decide"])
+def test_the_walk_answers_nothing_while_no_policy_is_published(
+    synced,  # noqa: F811
+    settings,
+    setting,
+    state,
+):
+    """A compiled statement is fenced to its policy's revision; so is every lookup of the walk."""
+    local, resource = synced
+    settings.REBAC_BOUNDED_WALK = setting
+    question = dict(
+        backend=local, resource_type="blog/post", action="write", actor=PUBLISHED_ACTOR,
+        ids=[resource.resource_id], using="default",
+    )  # fmt: skip
+    assert walk.decided(**question) == ({resource.resource_id}, {resource.resource_id})
+    _unpublish(local, state)
+    assert walk.decided(**question) == (set(), set())
+    assert walk.proved(**question) == set()
+    assert local.held(
+        subject=PUBLISHED_ACTOR, action="write", resource_type="blog/post",
+        ids=[resource.resource_id],
+    ) == set()  # fmt: skip
+
+
+@pytest.mark.django_db(transaction=True)
+@pytest.mark.parametrize("storage", ["denormalized", "registry"])
+@pytest.mark.parametrize("seed", range(60))
+def test_an_application_shaped_policy_is_decided_without_the_compiled_statement(
+    seed, storage, settings, monkeypatch
+):
+    """Flat groups, roles, a constant administrator, parents and filtered constants under
+    exclusions: every part is one the walk reads, so it never asks the compiler, and ``held``
+    is the compiled answer."""
+    schema, tuples, labels = application_shaped(seed)
+    local = seeded(schema, tuples, storage, settings)
+    label_threads(labels)
+    asked: list[tuple[str, str]] = []
+    monkeypatch.setattr(walk._Walk, "_compiled", lambda self, key, ids: asked.append(key))
+    candidates = {
+        "scope/thread": (["1", "2", "3", "x"], ["read", "write"]),
+        "scope/message": (["1", "2", "3", "4", "01"], ["read"]),
+        "scope/part": (["1", "2", "3", "9"], ["read"]),
+    }
+    for actor in (ADMIN, MEMBER):
+        for resource_type, (ids, actions) in candidates.items():
+            settings.REBAC_BOUNDED_WALK = False
+            expected = local.held_many(
+                subject=actor, actions=actions, resource_type=resource_type, ids=ids
+            )
+            settings.REBAC_BOUNDED_WALK = "decide"
+            found = local.held_many(
+                subject=actor, actions=actions, resource_type=resource_type, ids=ids
+            )
+            assert found == expected, (actor, resource_type, seed)
+            walked = walk.decided_many(
+                backend=local, resource_type=resource_type, actions=actions, actor=actor,
+                ids=ids, using="default",
+            )  # fmt: skip
+            for action in actions:
+                held_ids, answered = walked[action]
+                assert held_ids == expected[action] & answered, (actor, resource_type, action, seed)
+                # Every candidate that is a row is answered by the walk alone.
+                assert answered >= {i for i in ids if i in ("1", "2", "3")} - {
+                    i for i in ("3",) if resource_type == "scope/thread"
+                }, (actor, resource_type, action, seed)
+    assert asked == []

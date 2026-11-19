@@ -45,7 +45,7 @@ from collections.abc import Iterable, Iterator, Mapping
 from typing import TYPE_CHECKING, Any, cast
 
 from django.db import models
-from django.db.models import Q
+from django.db.models import Exists, Q
 
 from ._id import _NATIVE_INTEGER_FIELDS, model_identity_fields, resource_id_attr
 from .actors import is_anonymous_actor
@@ -206,6 +206,18 @@ class _Walk:
         # What exact() has settled: key -> id -> held.
         self._known: dict[Key, dict[str, bool]] = {}
         self._costly: dict[Key, bool] = {}
+        from .compile.read import _fence
+
+        # Every lookup reads nothing while the published policy revision is not
+        # this policy's: the walk then answers nothing, and the compiled
+        # statement, fenced the same way, denies.
+        self.fence = Q(Exists(_fence(policy, backend=backend, using=using, parametric=False)))
+
+    def open(self) -> bool:
+        """Whether the fence admits reads now, for a question that makes no lookup of its own."""
+        from .models.generation import SchemaGeneration
+
+        return SchemaGeneration.objects.using(self.using).filter(pk=1).filter(self.fence).exists()
 
     # ---------- Deciding: the whole of a permission ----------
 
@@ -217,7 +229,7 @@ class _Walk:
         """
         model = model_for_resource_type(resource_type)
         if model is None or not stores_rows(model):
-            return set(ids)
+            return set(ids) if self.open() else set()
         identity = _integer_identity(model)
         if identity is None:
             return None
@@ -227,6 +239,7 @@ class _Walk:
         found = (
             model._base_manager.using(self.using)
             .filter(**{f"{identity.attname}__in": keys})
+            .filter(self.fence)
             .order_by()
             .values_list(identity.attname, flat=True)
         )
@@ -472,26 +485,47 @@ class _Walk:
         path: frozenset[Key],
         negated: bool,
     ) -> set[str] | None:
-        """A fixed object: the relation holds on every id or on none."""
+        """A fixed object: the relation holds on every id its filters select, or on none."""
         resolved = resolve_const_backing(definition, relation)
-        if resolved is None or resolved.filters or len(relation.allowed_subjects) != 1:
+        if resolved is None or len(relation.allowed_subjects) != 1:
             return None
         [allowed] = relation.allowed_subjects
         if allowed.wildcard or allowed.id or allowed.with_caveat:
             return None
         if allowed.relation and not self._is_relation(allowed.type, allowed.relation):
             return set()
+        filters = resolved.filters
+        identity = _integer_identity(resolved.source_model) if filters else None
+        if filters and identity is None:
+            return None
         name = target if target is not None else (allowed.relation or None)
         if name is None:
-            itself = (
+            reached = (
                 allowed.type == self.actor.subject_type
                 and resolved.target_id == self.actor.subject_id
             )
-            return set(ids) if itself else set()
-        holds = self.exact(allowed.type, name, {resolved.target_id}, path, negated=negated)
-        if holds is None:
-            return None
-        return set(ids) if resolved.target_id in holds else set()
+        else:
+            holds = self.exact(allowed.type, name, {resolved.target_id}, path, negated=negated)
+            if holds is None:
+                return None
+            reached = resolved.target_id in holds
+        if not reached:
+            return set()
+        if identity is None:
+            return set(ids)
+        # Only the rows its source-column filters select carry the edge.
+        keys = _keys(resolved.source_model, identity, ids, self.using)
+        if not keys:
+            return set()
+        rows = (
+            resolved.source_model._base_manager.using(self.using)
+            .filter(**{f"{identity.attname}__in": keys})
+            .filter(**filters)
+            .filter(self.fence)
+            .order_by()
+            .values_list(identity.attname, flat=True)
+        )
+        return {str(key) for key in rows} & ids
 
     def _through_stored(
         self,
@@ -535,6 +569,7 @@ class _Walk:
                 relation=relation.name,
                 caveat_name="",
             )
+            .filter(self.fence)
             .order_by()
         )
         if not named and not through:
@@ -657,6 +692,7 @@ class _Walk:
                 optional_subject_relation="",
                 caveat_name="",
             )
+            .filter(self.fence)
             .order_by()
             .values_list("resource_id", flat=True)
         )
@@ -665,7 +701,7 @@ class _Walk:
     def _backed(
         self, definition: Definition, relation: Relation
     ) -> tuple[ResolvedFieldBacking, models.Field[Any, Any]] | None:
-        """A backing the walk can read: one unfiltered foreign key between integer identities."""
+        """A backing the walk can read: one enforced foreign key between integer identities."""
         try:
             resolved = resolve_field_backing(definition, relation)
         except ValueError:
@@ -673,7 +709,6 @@ class _Walk:
         if (
             resolved is None
             or resolved.generic is not None
-            or resolved.filters
             or "__" in resolved.path
             or not resolved.single_valued
             or not isinstance(resolved.field, (models.ForeignKey, models.OneToOneField))
@@ -690,13 +725,18 @@ class _Walk:
     def _targets(
         self, resolved: ResolvedFieldBacking, source: models.Field[Any, Any], ids: set[str]
     ) -> Iterator[tuple[str, str]]:
-        """``(source id, target id)`` for the candidate rows whose foreign key is set."""
+        """``(source id, target id)`` for the candidate rows that carry the edge.
+
+        Their foreign key is set, and the backing's source-column filters select them.
+        """
         keys = _keys(resolved.source_model, source, ids, self.using)
         if not keys:
             return
         rows = (
             resolved.source_model._base_manager.using(self.using)
             .filter(**{f"{source.attname}__in": keys})
+            .filter(**resolved.filters)
+            .filter(self.fence)
             .order_by()
             .values_list(source.attname, cast(models.ForeignKey[Any, Any], resolved.field).attname)
         )
