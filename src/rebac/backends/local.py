@@ -394,10 +394,14 @@ class LocalBackend:
             connections[active_relationship_model().objects.db],
             connections[SchemaDefinition.objects.db],
         )
+        from ..snapshot import covers
+
         for candidate in candidates:
-            if candidate.in_atomic_block or (
-                candidate.connection is not None and not candidate.get_autocommit()
-            ):
+            if (
+                candidate.in_atomic_block
+                or (candidate.connection is not None and not candidate.get_autocommit())
+            ) and not covers(candidate.alias):
+                # A read snapshot has nothing to roll back: decisions keep inside it.
                 return None
         snapshot = self._schema_snapshot()
         if snapshot.generation == -1 or (snapshot.revision is None and not self._schema_is_manual):
@@ -1048,6 +1052,11 @@ def mark_relationships_changed() -> None:
     global _relationship_generation
     with _backend_registry_lock:
         _relationship_generation += 1
+    from ..models import active_relationship_model
+    from ..snapshot import broken
+
+    # A write inside a read snapshot (SQLite cannot refuse it) ends its standing.
+    broken(active_relationship_model().objects.db)
     from django.db import connections, transaction
 
     written = _uncommitted_transactions()
