@@ -8,7 +8,14 @@ from django.test.utils import CaptureQueriesContext
 
 from rebac.compile import read
 from rebac.testing import install_schema
-from tests.mechanism_policies import ADMIN, MEMBER, application_shaped, grant, label_threads
+from tests.mechanism_policies import (
+    ADMIN,
+    MEMBER,
+    application_shaped,
+    grant,
+    label_threads,
+    seeds,
+)
 from tests.test_actor_profiles import seeded
 from tests.test_bounded_walk import SCHEMA
 from tests.test_bounded_walk import local as local
@@ -65,7 +72,7 @@ def test_an_id_that_is_not_canonical_is_passed_over_only_by_the_guard(local, set
 
 @pytest.mark.django_db(transaction=True)
 @pytest.mark.parametrize("storage", ["denormalized", "registry"])
-@pytest.mark.parametrize("seed", range(20))
+@pytest.mark.parametrize("seed", seeds(20, fast=4))
 def test_rows_read_are_the_same_on_canonical_ids(seed, storage, settings):
     schema, tuples, labels = application_shaped(seed)
     seeded(schema, tuples, storage, settings)

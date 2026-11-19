@@ -9,6 +9,9 @@ so a test over them exercises the mechanisms and not their fallback.
 from __future__ import annotations
 
 import random
+from typing import Any
+
+import pytest
 
 from rebac import ObjectRef, RelationshipTuple, SubjectRef
 from tests.testapp.models import ScopeThread
@@ -45,6 +48,18 @@ definition scope/part {
     permission opening = first->read
 }
 """
+
+
+def seeds(count: int, fast: int = 6) -> list[Any]:
+    """``count`` seeds: the first ``fast`` run in the default suite, the rest in the slow tier.
+
+    A random-policy case reads every model as two actors under each setting,
+    a third of a second apiece; the default suite keeps both generators and
+    both storage layouts, and the slow tier the breadth.
+    """
+    return [
+        seed if seed < fast else pytest.param(seed, marks=pytest.mark.slow) for seed in range(count)
+    ]
 
 
 def group(name: str) -> SubjectRef:

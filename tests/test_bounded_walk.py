@@ -8,7 +8,7 @@ from django.test.utils import CaptureQueriesContext
 
 from rebac import ObjectRef, RelationshipTuple, SubjectRef, walk
 from rebac.testing import install_schema
-from tests.mechanism_policies import application_shaped, label_threads
+from tests.mechanism_policies import application_shaped, label_threads, seeds
 from tests.test_actor_profiles import seeded, subtracting
 from tests.test_inherited_witness_reference import build
 from tests.test_schema_generation import ACTOR as PUBLISHED_ACTOR
@@ -153,7 +153,7 @@ def test_a_subject_set_an_anonymous_actor_and_a_caveat_context_are_not_walked(lo
 
 @pytest.mark.django_db(transaction=True)
 @pytest.mark.parametrize("storage", ["denormalized", "registry"])
-@pytest.mark.parametrize("seed", range(40))
+@pytest.mark.parametrize("seed", seeds(40))
 def test_held_with_the_walk_is_held_without_it(seed, storage, settings):
     """Random policies with unions, intersections, exclusions, caveats, expiration, wildcards and
     subject sets: for every model, action and actor, ``held`` returns the same ids with the
@@ -317,7 +317,7 @@ def test_deciding_leaves_an_id_that_is_no_row_to_the_compiled_statement(deciding
 
 @pytest.mark.django_db(transaction=True)
 @pytest.mark.parametrize("storage", ["denormalized", "registry"])
-@pytest.mark.parametrize("seed", range(60))
+@pytest.mark.parametrize("seed", seeds(60))
 def test_held_decided_by_the_walk_is_held_without_it(seed, storage, settings):
     """The same random policies: for every model, action and actor, ``held`` returns the same ids
     when the walk decides, and what the walk answers alone is the compiled answer for those ids."""
@@ -408,7 +408,7 @@ def test_the_walk_answers_nothing_while_no_policy_is_published(
 
 @pytest.mark.django_db(transaction=True)
 @pytest.mark.parametrize("storage", ["denormalized", "registry"])
-@pytest.mark.parametrize("seed", range(60))
+@pytest.mark.parametrize("seed", seeds(60))
 def test_an_application_shaped_policy_is_decided_without_the_compiled_statement(
     seed, storage, settings, monkeypatch
 ):

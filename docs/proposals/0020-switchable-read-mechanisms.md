@@ -85,7 +85,8 @@ is two runs.
 - For each mechanism, random policies in both storage layouts where the result with the setting on equals the
   result with it off: 80 cases for structural prefetch, 320 for the walk, 200 for the row scope, 40 for trusted
   ids. 120 of the walk's and 120 of the row scope's are policies shaped like an application's, in which every
-  part is one the mechanism reads, so they exercise it and not its fallback.
+  part is one the mechanism reads, so they exercise it and not its fallback. The default suite runs all 80 of
+  structural prefetch's and the first seeds of the others (68 cases); the rest are marked `slow`.
 - Planted bugs fail them: an ignored exclusion, a subject set taken as held, an expired row counted, ignored
   backing filters.
 - The whole suite with a setting on: no result differs. What fails pins a statement count, a witness entry or

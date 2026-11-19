@@ -18,6 +18,7 @@ from tests.mechanism_policies import (
     group,
     label_threads,
     role,
+    seeds,
 )
 from tests.test_actor_profiles import seeded, subtracting
 from tests.test_bounded_walk import DECIDING
@@ -244,7 +245,7 @@ def assert_same_rows(seed, settings, actions=("read",), *, whole: bool, monkeypa
 
 @pytest.mark.django_db(transaction=True)
 @pytest.mark.parametrize("storage", ["denormalized", "registry"])
-@pytest.mark.parametrize("seed", range(60))
+@pytest.mark.parametrize("seed", seeds(60))
 def test_rows_read_with_row_conditions_are_the_rows_read_without(
     seed, storage, settings, monkeypatch
 ):
@@ -258,7 +259,7 @@ def test_rows_read_with_row_conditions_are_the_rows_read_without(
 
 @pytest.mark.django_db(transaction=True)
 @pytest.mark.parametrize("storage", ["denormalized", "registry"])
-@pytest.mark.parametrize("seed", range(40))
+@pytest.mark.parametrize("seed", seeds(40))
 def test_the_setting_changes_no_rows_on_policies_it_reads_in_part(seed, storage, settings):
     """The library's own random policies, with caveats, expiration and recursion-free unions:
     where the row scope applies and where it falls back, the rows are the same."""
