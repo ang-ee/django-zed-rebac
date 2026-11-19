@@ -5,6 +5,19 @@ pre-1.0; breaking changes within a minor version are explicitly called out.
 
 ## [Unreleased]
 
+## [0.36.1] — 2026-11-19
+
+### Fixed
+
+- **`rebac.managers` imports before the app registry is populated again.** In 0.36.0 it imported two of the new
+  modules (`rebac.rowscope`, `rebac.walk`), which imported the relationship model as they loaded, so
+  `from rebac.managers import RebacQuerySet` raised `ImproperlyConfigured` in a module imported before
+  `django.setup()`: an application's own base classes, or a pytest plugin. 0.35.2 and earlier allowed it. The two
+  modules now read the model when a walk runs. Nothing else changes; statements and decisions are those of 0.36.0.
+- A test imports every module of the package with no settings configured, except a named list of the ones that
+  define models or read settings as they load, so a module on an application's import path cannot start needing
+  the registry unnoticed.
+
 ## [0.36.0] — 2026-11-19
 
 Nothing changes for a deployment that sets none of the settings below: statements, statement counts and
