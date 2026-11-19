@@ -159,6 +159,39 @@ def names_its_rows(query: Any, model: type[models.Model]) -> bool:
     )
 
 
+def explain(
+    model: type[models.Model], actor: SubjectRef, action: str, using: str = "default"
+) -> dict[str, Any]:
+    """Whether ``action`` on ``model`` is written as row conditions for ``actor``, and if not, why.
+
+    ``{"applies": bool, "subqueries": int | None, "blocked": [reasons]}``. For a
+    test, a benchmark or a system check: it builds the conditions without keeping them.
+    """
+    from .backends import backend
+    from .backends.local import LocalBackend
+
+    local = backend()
+    resource_type = model_resource_type(model)
+    if not isinstance(local, LocalBackend) or not resource_type:
+        return {"applies": False, "subqueries": None, "blocked": ["no local policy for the model"]}
+    walk = walking._walk(local, actor, using, None)
+    if walk is None:
+        return {"applies": False, "subqueries": None, "blocked": ["the actor or an override"]}
+    if walking._integer_identity(model) is None:
+        return {
+            "applies": False,
+            "subqueries": None,
+            "blocked": ["the model's key is not an integer"],
+        }
+    rows = _Rows(walk, limit=None)
+    found = rows.holds((resource_type, action), _At(model, None), frozenset())
+    size = None if found is None else rows._size(found)
+    blocked = list(rows.blocked)
+    if size is not None and size > _SUBQUERIES:
+        blocked.append(f"{size} subqueries, past the limit of {_SUBQUERIES}")
+    return {"applies": found is not None and not blocked, "subqueries": size, "blocked": blocked}
+
+
 def row_conditions(
     model: type[models.Model], actor: SubjectRef, action: str, using: str
 ) -> Q | None:
@@ -177,7 +210,7 @@ def row_conditions(
     if key in _built:
         _built.move_to_end(key)
         return _built[key]
-    rows = _Rows(walk)
+    rows = _Rows(walk, limit=_SUBQUERIES)
     try:
         found = rows.holds((resource_type, action), _At(model, None), frozenset())
     except _TooLarge:
@@ -207,23 +240,32 @@ class _At:
 
 
 class _Rows:
-    def __init__(self, walk: walking._Walk) -> None:
+    def __init__(self, walk: walking._Walk, *, limit: int | None = _SUBQUERIES) -> None:
         self.walk = walk
+        self.limit = limit
         self.schema = walk.schema
         self.program = walk.program
         self.actor = walk.actor
         self.using = walk.using
         self._memo: dict[tuple[Any, ...], Q | None] = {}
+        # Why the permission keeps the compiled scope, where it does (``explain``).
+        self.blocked: list[str] = []
         # The subqueries each condition built here is written with, by identity.
         self._sizes: dict[int, tuple[Q, int]] = {}
 
     # ---------- Size: a condition is written out wherever it is used ----------
 
+    def _no(self, reason: str) -> Q | None:
+        """This part cannot be written as a row condition: remember why, and say so."""
+        if reason not in self.blocked:
+            self.blocked.append(reason)
+        return None
+
     def _size(self, condition: Q) -> int:
         return self._sizes.get(id(condition), (condition, 0))[1]
 
     def _sized(self, condition: Q, size: int) -> Q:
-        if size > _SUBQUERIES:
+        if self.limit is not None and size > self.limit:
             raise _TooLarge
         self._sizes[id(condition)] = (condition, size)
         return condition
@@ -253,7 +295,10 @@ class _Rows:
         if key not in self.program.dependencies:
             return _FALSE
         if key in path or self.walk.handed_over(key):
-            return None
+            kind = (
+                "a recursion" if key in self.program.recursive else "a caveated relation or a cycle"
+            )
+            return self._no(f"{key[0]}#{key[1]}: {kind}")
         memo = (key, at.model, _ref_key(at.ref))
         if memo in self._memo:
             return self._memo[memo]
@@ -335,7 +380,7 @@ class _Rows:
         if isinstance(relation.backing, ConstBinding):
             return self._constant(definition, relation, target, at, path)
         if relation.backing is not None:
-            return None
+            return self._no(f"{definition.resource_type}#{relation.name}: an attribute backing")
         return self._stored(definition, relation, target, at, path)
 
     def _below(self, at: _At) -> Any:
@@ -356,7 +401,8 @@ class _Rows:
         path: frozenset[Key],
     ) -> Q | None:
         if relation.with_expiration:
-            return None  # the compiled scope binds one instant per statement
+            # The compiled scope binds one instant per statement.
+            return self._no(f"{definition.resource_type}#{relation.name}: an expiring relation")
         named: set[str] = set()
         through: set[Key] = set()
         for allowed in relation.allowed_subjects:
@@ -424,11 +470,14 @@ class _Rows:
     ) -> Q | None:
         backed = self.walk._backed(definition, relation)
         if backed is None:
-            return None
+            cause = (
+                walking.backing_obstacle(definition, relation) or "a backing the walk does not read"
+            )
+            return self._no(f"{definition.resource_type}#{relation.name}: {cause}")
         resolved, source = backed
         [allowed] = relation.allowed_subjects
         if allowed.wildcard or allowed.id or allowed.with_caveat:
-            return None
+            return self._no(f"{definition.resource_type}#{relation.name}: its subject shape")
         if allowed.relation and not self.walk._is_relation(allowed.type, allowed.relation):
             return _FALSE
         column = cast(models.ForeignKey[Any, Any], resolved.field).attname

@@ -792,6 +792,35 @@ class _Walk:
         return {key for key, parent in pairs if parent in parents}
 
 
+def backing_obstacle(definition: Definition, relation: Relation) -> str | None:
+    """Why the walk does not read a field backing; ``None`` when it does (``_Walk._backed``)."""
+    try:
+        resolved = resolve_field_backing(definition, relation)
+    except ValueError:
+        return "a backing that does not resolve"
+    if resolved is None:
+        return "a backing that does not resolve"
+    if resolved.generic is not None:
+        return "a generic foreign key"
+    if "__" in resolved.path:
+        return "a path through several relations"
+    if not isinstance(resolved.field, (models.ForeignKey, models.OneToOneField)):
+        return "a reverse or many-to-many relation"
+    if not resolved.single_valued:
+        return "filters that follow a to-many relation"
+    if not getattr(resolved.field, "db_constraint", False):
+        return "a foreign key the database does not enforce"
+    if not resolved.targets_identity_directly():
+        return "a foreign key to a column that is not the target's identity"
+    if len(relation.allowed_subjects) != 1:
+        return "several subject types"
+    if _integer_identity(resolved.source_model) is None:
+        return "a source key that is not an integer"
+    if _integer_identity(resolved.target_model) is None:
+        return "a target key that is not an integer"
+    return None
+
+
 def _keys(
     model: type[models.Model], identity: models.Field[Any, Any], ids: Iterable[str], using: str
 ) -> list[Any]:

@@ -326,3 +326,15 @@ def test_only_a_statement_the_queryset_runs_itself_is_written_as_row_conditions(
     assert "rebac_ids" in count and "rebac_ids" in exists
     # The message statement is the queryset's own; the thread queryset inside it is embedded.
     assert "rebac_ids" in embedded
+
+
+def test_explain_says_why_a_permission_keeps_the_compiled_scope(local, settings):
+    install_schema(FIXED)
+    told = rowscope.explain(ScopePart, MEMBER, "read")
+    assert told["applies"] and told["subqueries"] and told["blocked"] == []
+    install_schema(DECIDING)
+    told = rowscope.explain(ScopeThread, MEMBER, "read")
+    assert not told["applies"] and told["blocked"] == ["auth/group#member: a recursion"]
+    install_schema(DEEP)
+    told = rowscope.explain(ScopeThread, MEMBER, "read")
+    assert not told["applies"] and "past the limit" in told["blocked"][0]
