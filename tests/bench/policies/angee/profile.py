@@ -66,6 +66,8 @@ MAIN_TYPES = (
 )  # fmt: skip
 # Relations with one grant for every row: the framework writes one per changeset.
 ONE_PER_ROW = (("provenance/changeset", "actor"),)
+# The relationship ``read --uncommitted`` writes for the actor, on an object that does not exist.
+UNCOMMITTED_GRANT = ("messaging/thread", "reader")
 
 
 def _under(child: str, parent: str) -> Any:

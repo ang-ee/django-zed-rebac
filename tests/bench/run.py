@@ -20,6 +20,8 @@ import argparse
 import json
 import os
 import sys
+from collections.abc import Iterator
+from contextlib import contextmanager
 from statistics import median
 from time import perf_counter
 from typing import Any
@@ -58,6 +60,11 @@ def main() -> None:
     read.add_argument(
         "--explain", action="store_true", help="planning, execution and planner memory (PostgreSQL)"
     )
+    read.add_argument(
+        "--uncommitted",
+        action="store_true",
+        help="read inside a transaction that has written a relationship and not committed it",
+    )
     read.add_argument("--json", default="")
     commands.add_parser("smoke")
     census = commands.add_parser("census")
@@ -91,6 +98,7 @@ def main() -> None:
             mechanism="today,all",
             repeats=1,
             explain=False,
+            uncommitted=False,
         )
         failed = [row for row in reads(bench, everything) if "error" in row or not row["same"]]
         sys.exit(f"{len(failed)} read(s) failed or differed" if failed else 0)
@@ -144,7 +152,8 @@ def reads(bench: Any, arguments: argparse.Namespace) -> list[dict[str, Any]]:
                             return scenarios[name](bench, actor)
 
                     try:
-                        result = run()
+                        with _transaction(bench, actor, arguments.uncommitted):
+                            result = run()
                     except DatabaseError as error:
                         # A statement past REBAC_BENCH_TIMEOUT, most likely.
                         connection.close()
@@ -168,13 +177,15 @@ def reads(bench: Any, arguments: argparse.Namespace) -> list[dict[str, Any]]:
                         seen.append((sql, params))
                         return execute(sql, params, many, context)
 
-                    with connection.execute_wrapper(capture):
-                        run()
+                    with _transaction(bench, actor, arguments.uncommitted):
+                        with connection.execute_wrapper(capture):
+                            run()
                     times = []
                     for _ in range(arguments.repeats):
-                        started = perf_counter()
-                        run()
-                        times.append((perf_counter() - started) * 1000)
+                        with _transaction(bench, actor, arguments.uncommitted):
+                            started = perf_counter()
+                            run()
+                            times.append((perf_counter() - started) * 1000)
                     row: dict[str, Any] = {
                         "scenario": name,
                         "actor": who,
@@ -200,6 +211,33 @@ def reads(bench: Any, arguments: argparse.Namespace) -> list[dict[str, Any]]:
                     line += f"{row['plan_ms']:>9}{row['exec_ms']:>9}{row['plan_mib']:>9}"
                 print(line + ("" if row["same"] else "  DIFFERS"), flush=True)
     return report
+
+
+@contextmanager
+def _transaction(bench: Any, actor: Any, uncommitted: bool) -> Iterator[None]:
+    """With ``uncommitted``: a transaction that has written one relationship, rolled back after.
+
+    This is how a test that seeds grants inside its own transaction reads, and how a
+    request reads after it has written: the library keeps no decision and no profile
+    while a relationship write may still roll back.
+    """
+    if not uncommitted:
+        yield
+        return
+    from django.db import transaction
+
+    from rebac import ObjectRef, RelationshipTuple
+    from rebac.backends import backend
+
+    resource_type, relation = bench.profile.UNCOMMITTED_GRANT
+    with transaction.atomic(using=bench.using):
+        backend().write_relationships(
+            [RelationshipTuple(ObjectRef(resource_type, "0"), relation, actor)]
+        )
+        try:
+            yield
+        finally:
+            transaction.set_rollback(True, using=bench.using)
 
 
 def _count(result: Any) -> int:
