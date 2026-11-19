@@ -668,16 +668,34 @@ class LocalBackend:
         using: str | None = None,
     ) -> set[str]:
         """The candidate ids on which the subject holds the action."""
+        from .. import walk
         from ..compile.read import held
         from ..models import active_relationship_model
 
-        return held(
+        alias = using or active_relationship_model().objects.db
+        settled: set[str] = set()
+        if walk.enabled():
+            # The ids a few indexed lookups prove; the compiled statement decides the rest.
+            ids = tuple(dict.fromkeys(ids))
+            settled = walk.proved(
+                backend=self,
+                resource_type=resource_type,
+                action=action,
+                actor=subject,
+                ids=ids,
+                using=alias,
+                context=context,
+            )
+            ids = tuple(value for value in ids if value not in settled)
+            if not ids:
+                return settled
+        return settled | held(
             backend=self,
             resource_type=resource_type,
             action=action,
             actor=subject,
             ids=ids,
-            using=using or active_relationship_model().objects.db,
+            using=alias,
             context=context,
         )
 
