@@ -1,4 +1,4 @@
-"""``REBAC_ENFORCE_PERMISSIONS = False``: nothing is checked, scoped, guarded or redacted."""
+"""``REBAC_ENABLED = False``: nothing is checked, scoped, guarded or redacted."""
 
 from __future__ import annotations
 
@@ -81,7 +81,7 @@ def test_enforced_by_default(world):
 
 
 def test_every_read_is_the_plain_read(world, settings):
-    settings.REBAC_ENFORCE_PERMISSIONS = False
+    settings.REBAC_ENABLED = False
     with CaptureQueriesContext(connection) as captured:
         # No actor, an actor that holds nothing, an actor that holds something: the same rows.
         assert sorted(ScopeThread.objects.values_list("pk", flat=True)) == [1, 2]
@@ -97,7 +97,7 @@ def test_every_read_is_the_plain_read(world, settings):
 
 
 def test_related_rows_load_without_a_guard_or_a_scope(world, settings):
-    settings.REBAC_ENFORCE_PERMISSIONS = False
+    settings.REBAC_ENABLED = False
     with CaptureQueriesContext(connection) as captured:
         parts = list(
             ScopePart.objects.with_actor(OUTSIDER)
@@ -120,13 +120,13 @@ def test_no_field_is_redacted(world, settings):
     settings.REBAC_FIELD_READ_MODE = "redact"
     thread = ScopeThread.objects.with_actor(MEMBER).get(pk=1)
     assert thread.label is None and redacted_fields(thread) == {"label"}
-    settings.REBAC_ENFORCE_PERMISSIONS = False
+    settings.REBAC_ENABLED = False
     thread = ScopeThread.objects.with_actor(MEMBER).get(pk=1)
     assert thread.label == "one" and redacted_fields(thread) == frozenset()
 
 
 def test_every_check_allows(world, settings):
-    settings.REBAC_ENFORCE_PERMISSIONS = False
+    settings.REBAC_ENABLED = False
     local = backend()
     hidden = ObjectRef("scope/thread", "2")
     with CaptureQueriesContext(connection) as captured:
@@ -155,7 +155,7 @@ def test_every_check_allows(world, settings):
 
 
 def test_every_write_is_allowed_without_an_actor(world, settings):
-    settings.REBAC_ENFORCE_PERMISSIONS = False
+    settings.REBAC_ENABLED = False
     # Explicit keys: the fixture's rows were written with theirs, past the sequences.
     thread = ScopeThread.objects.create(id=3, label="three")
     message = ScopeMessage.objects.create(id=3, thread=thread)
@@ -175,22 +175,22 @@ def test_a_guarded_function_runs(world, settings):
     hidden = ScopeThread._base_manager.get(pk=2)
     with actor_context(OUTSIDER), pytest.raises(Exception):  # noqa: B017
         rename(hidden)
-    settings.REBAC_ENFORCE_PERMISSIONS = False
+    settings.REBAC_ENABLED = False
     assert rename(hidden) == "renamed"
 
 
 def test_relationships_are_still_stored_and_decide_again_when_enforced(world, settings):
-    settings.REBAC_ENFORCE_PERMISSIONS = False
+    settings.REBAC_ENABLED = False
     backend().write_relationships(
         [RelationshipTuple(ObjectRef("scope/thread", "2"), "reader", OUTSIDER)]
     )
     assert sorted(ScopeThread.objects.with_actor(OUTSIDER).values_list("pk", flat=True)) == [1, 2]
-    settings.REBAC_ENFORCE_PERMISSIONS = True
+    settings.REBAC_ENABLED = True
     assert list(ScopeThread.objects.with_actor(OUTSIDER).values_list("pk", flat=True)) == [2]
 
 
 def test_the_system_check_says_so(settings):
-    settings.REBAC_ENFORCE_PERMISSIONS = False
+    settings.REBAC_ENABLED = False
     [warning] = check_permissions_enforced()
     assert warning.id == "rebac.W011" and "no permission is checked" in warning.msg
 
@@ -198,7 +198,7 @@ def test_the_system_check_says_so(settings):
 def test_rows_still_carry_their_reader(world, settings):
     """Nothing is enforced for the reader, and the reader is still who read the rows: code that
     trusts a prefetched row by its stamp keeps trusting it."""
-    settings.REBAC_ENFORCE_PERMISSIONS = False
+    settings.REBAC_ENABLED = False
     thread = (
         ScopeThread.objects.with_actor(OUTSIDER)
         .rebac_prefetch_related("scopemessage_set__scopepart_set")
@@ -249,7 +249,7 @@ def test_the_create_preflight_and_the_adapters_allow(world, settings):
     assert not RebacPermission().has_object_permission(request, view, hidden)
     assert not RebacBackend().has_perm(stranger, "testapp.change_scopethread", hidden)
 
-    settings.REBAC_ENFORCE_PERMISSIONS = False
+    settings.REBAC_ENABLED = False
     with CaptureQueriesContext(connection) as captured:
         assert edit("no actor") == "no actor"
         with actor_context(OUTSIDER):

@@ -94,7 +94,7 @@ def require_permission(
         @wraps(fn)
         def _wrapped(*args: Any, **kwargs: Any) -> Any:
             if not enforcing():
-                # REBAC_ENFORCE_PERMISSIONS = False: nothing is checked, with an actor or without.
+                # REBAC_ENABLED = False: nothing is checked, with an actor or without.
                 return fn(*args, **kwargs)
             bound = fn_signature.bind(*args, **kwargs)
             bound.apply_defaults()

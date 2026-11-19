@@ -290,7 +290,7 @@ def _authorize(
     :class:`PermissionDenied` on no-actor or deny; returns the actor on allow.
 
     Shared by the sync and async wrappers so the authorization contract lives
-    in exactly one place. With ``REBAC_ENFORCE_PERMISSIONS = False`` nothing is
+    in exactly one place. With ``REBAC_ENABLED = False`` nothing is
     checked and the actor may be ``None``: the tool runs as whoever called it.
     """
     bound = signature.bind(*args, **kwargs)

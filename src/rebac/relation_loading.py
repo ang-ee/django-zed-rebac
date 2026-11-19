@@ -136,7 +136,7 @@ def stamp_selected_related_instances(
 ) -> None:
     """Stamp selected to-one related objects with their reader, checking nothing.
 
-    For ``REBAC_ENFORCE_PERMISSIONS = False``: the rows a join loaded carry the
+    For ``REBAC_ENABLED = False``: the rows a join loaded carry the
     reader the root rows carry.
     """
     batches: dict[type[models.Model], dict[str, dict[int, models.Model]]] = {}

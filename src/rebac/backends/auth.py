@@ -72,7 +72,7 @@ class RebacBackend:
     # ---------- Permission resolution ----------
 
     def has_perm(self, user_obj: Any, perm: str, obj: Any = None) -> bool:
-        if not app_settings.REBAC_ENFORCE_PERMISSIONS:
+        if not app_settings.REBAC_ENABLED:
             return True
         if not getattr(user_obj, "is_active", False):
             return False
@@ -117,7 +117,7 @@ class RebacBackend:
         return await sync_to_async(self.has_perm, thread_sensitive=True)(user_obj, perm, obj)
 
     def has_module_perms(self, user_obj: Any, app_label: str) -> bool:
-        if not app_settings.REBAC_ENFORCE_PERMISSIONS:
+        if not app_settings.REBAC_ENABLED:
             return True
         if not getattr(user_obj, "is_active", False):
             return False

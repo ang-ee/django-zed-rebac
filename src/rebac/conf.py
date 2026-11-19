@@ -27,7 +27,7 @@ _DEFAULTS: dict[str, Any] = {
     # every row; no scope, guard or field gate is applied and no permission statement is issued.
     # For a deployment with one trusted user, and for measuring an application's queries without
     # the library's. Relationships and the policy are still stored. System check rebac.W011.
-    "REBAC_ENFORCE_PERMISSIONS": True,
+    "REBAC_ENABLED": True,
     "REBAC_REQUIRE_SUDO_REASON": True,
     "REBAC_ALLOW_SUDO": True,
     "REBAC_GC_INTERVAL_SECONDS": 300,

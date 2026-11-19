@@ -116,12 +116,12 @@ def is_sudo() -> bool:
 
 
 def enforcing() -> bool:
-    """Whether permissions are enforced: ``REBAC_ENFORCE_PERMISSIONS``, ``True`` by default.
+    """Whether permissions are enforced: ``REBAC_ENABLED``, ``True`` by default.
 
     ``False`` is not a bypass block. Nothing is being bypassed for a reason
     that could be audited: the deployment has no enforcement at all.
     """
-    return bool(app_settings.REBAC_ENFORCE_PERMISSIONS)
+    return bool(app_settings.REBAC_ENABLED)
 
 
 def bypassing() -> bool:
@@ -152,7 +152,7 @@ def resolve(
     answers ``(None, False)`` for an observer, and non-strict mode falls
     through unscoped.
 
-    With ``REBAC_ENFORCE_PERMISSIONS = False`` the answer is ``(None, True)``
+    With ``REBAC_ENABLED = False`` the answer is ``(None, True)``
     whatever is pinned: an actor on the queryset scopes nothing.
     """
     if not enforcing():

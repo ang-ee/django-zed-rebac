@@ -130,7 +130,7 @@ not silently return all rows. This is the django-scopes / django-tenants
 design that prevents the worst data-leakage bug class.
 
 The one exception is a deployment that enforces nothing:
-`REBAC_ENFORCE_PERMISSIONS = False` (proposal 0021,
+`REBAC_ENABLED = False` (proposal 0021,
 `docs/ARCHITECTURE.md § Unenforced deployments`). It is a state of the whole
 process, read from settings and reported by `rebac.W011`; it is not a bypass,
 and nothing in a request can switch it. Every surface that decides must honour
