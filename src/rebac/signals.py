@@ -529,14 +529,15 @@ def _gate_m2m(
     wrapper can exempt exactly those rows from the per-row gates; an early
     return yields no pairs, and the per-row gates then decide for themselves.
     """
-    from .actors import is_sudo
+    from .actors import enforcing, is_sudo
     from .mixins import RebacMixin
     from .resources import model_for_resource_type
     from .watch import gate_policy
 
     pinned = getattr(instance, "actor", None)
-    if is_sudo() and (
-        not isinstance(instance, RebacMixin) or not callable(pinned) or pinned() is None
+    if not enforcing() or (
+        is_sudo()
+        and (not isinstance(instance, RebacMixin) or not callable(pinned) or pinned() is None)
     ):
         return set()
     owner_model = sender._meta.auto_created

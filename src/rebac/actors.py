@@ -115,6 +115,20 @@ def is_sudo() -> bool:
     return _sudo_state.get() is not None
 
 
+def enforcing() -> bool:
+    """Whether permissions are enforced: ``REBAC_ENFORCE_PERMISSIONS``, ``True`` by default.
+
+    ``False`` is not a bypass block. Nothing is being bypassed for a reason
+    that could be audited: the deployment has no enforcement at all.
+    """
+    return bool(app_settings.REBAC_ENFORCE_PERMISSIONS)
+
+
+def bypassing() -> bool:
+    """Whether the ambient state decides for the caller: a sudo block, or no enforcement."""
+    return is_sudo() or not enforcing()
+
+
 def current_sudo_reason() -> str | None:
     state = _sudo_state.get()
     return None if state is None else state.get("reason")
@@ -137,7 +151,12 @@ def resolve(
     ``(None, False)``; otherwise strict mode raises for a strict call and
     answers ``(None, False)`` for an observer, and non-strict mode falls
     through unscoped.
+
+    With ``REBAC_ENFORCE_PERMISSIONS = False`` the answer is ``(None, True)``
+    whatever is pinned: an actor on the queryset scopes nothing.
     """
+    if not enforcing():
+        return None, True
     if mode == "row" and pinned_sudo:
         return None, True
     if mode != "ambient" and pinned_actor is not None:

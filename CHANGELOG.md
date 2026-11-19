@@ -5,6 +5,17 @@ pre-1.0; breaking changes within a minor version are explicitly called out.
 
 ## [Unreleased]
 
+### Added
+
+- **`REBAC_ENFORCE_PERMISSIONS`** (`True` by default). `False` enforces nothing: every
+  caller, with an actor or without, reads and writes every row; no scope, guard or
+  field gate is applied and no permission statement is issued. For a deployment with
+  one trusted user, and for measuring an application's own queries. Relationships and
+  the policy are still stored, so removing the setting restores enforcement on the same
+  database. The library reports the state with system check `rebac.W011` and one
+  warning on the `rebac` logger at startup. See `docs/ARCHITECTURE.md § Unenforced
+  deployments` and proposal 0021.
+
 ## [0.35.2] — 2026-11-18
 
 ### Fixed

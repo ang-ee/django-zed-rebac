@@ -2308,7 +2308,7 @@ class TrackedQuerySet[T: models.Model](models.QuerySet[T]):
             query.__class__ = _BypassAuditQuery
 
     def update(self, **kwargs: Any) -> int:
-        from .actors import current_actor, is_sudo
+        from .actors import bypassing, current_actor
         from .mixins import RebacMixin
         from .signals import _edge_actor, _gate_backed_rows, audit_backed_denials
         from .watch import by_key, gate_policy, model_write, refuse_moving_edges, statement_keys
@@ -2319,7 +2319,7 @@ class TrackedQuerySet[T: models.Model](models.QuerySet[T]):
             model_write(model=self.model, using=self.db, names=kwargs) as watched,
         ):
             related_owner = cast(Any, self)._hints.get("instance")
-            if not is_sudo() and (related_owner is not None or current_actor() is not None):
+            if not bypassing() and (related_owner is not None or current_actor() is not None):
                 # A generic related manager re-points edges through here.
                 refuse_moving_edges(gate_policy(self.db), self.model, kwargs)
             related_fk_write = any(
@@ -2340,7 +2340,7 @@ class TrackedQuerySet[T: models.Model](models.QuerySet[T]):
             actor, bypass = (
                 _edge_actor(related_owner, relation=True)
                 if related_owner is not None
-                else (None, is_sudo())
+                else (None, bypassing())
             )
             if bypass:
                 return super().update(**kwargs)
@@ -2354,7 +2354,7 @@ class TrackedQuerySet[T: models.Model](models.QuerySet[T]):
             return sum(models.QuerySet.update(rows, **kwargs) for rows in by_key(self, keys))
 
     def delete(self) -> tuple[int, dict[str, int]]:
-        from .actors import is_sudo
+        from .actors import bypassing
         from .mixins import RebacMixin, delete_collected, deletion_owner
         from .signals import _gate_backed_rows, audit_backed_denials
         from .watch import by_key, model_write, statement_keys
@@ -2370,7 +2370,7 @@ class TrackedQuerySet[T: models.Model](models.QuerySet[T]):
             if (
                 not watched
                 or issubclass(self.model, RebacMixin)
-                or is_sudo()
+                or bypassing()
                 or self.query.is_sliced
             ):
                 with deletion_owner(self, self.db, actor, unscoped):
@@ -2394,7 +2394,7 @@ class TrackedQuerySet[T: models.Model](models.QuerySet[T]):
         update_fields: Collection[str] | None = None,
         unique_fields: Collection[str] | None = None,
     ) -> list[T]:
-        from .actors import is_sudo
+        from .actors import bypassing
         from .mixins import RebacMixin
         from .signals import _gate_backed_rows, audit_backed_denials
         from .watch import gate_policy, model_write
@@ -2404,7 +2404,7 @@ class TrackedQuerySet[T: models.Model](models.QuerySet[T]):
         with audit_backed_denials(), model_write(model=self.model, using=self.db) as watched:
             if not issubclass(self.model, RebacMixin):
                 policy = gate_policy(self.db) if watched else None
-                if update_conflicts and update_fields and not is_sudo() and policy is not None:
+                if update_conflicts and update_fields and not bypassing() and policy is not None:
                     watch = policy.watched.get(self.model._meta.label_lower)
                     if watch is not None and any(
                         {field.name, field.attname} & set(update_fields) & watch.fields
@@ -2414,7 +2414,7 @@ class TrackedQuerySet[T: models.Model](models.QuerySet[T]):
                             "Conflicting bulk create cannot check both sides of a backed edge; "
                             "use checked saves or sudo."
                         )
-                _gate_backed_rows(candidates, using=self.db, bypass=is_sudo())
+                _gate_backed_rows(candidates, using=self.db, bypass=bypassing())
             return super().bulk_create(
                 candidates,
                 batch_size,
