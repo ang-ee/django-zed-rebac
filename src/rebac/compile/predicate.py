@@ -120,7 +120,7 @@ def is_false(q: Q) -> bool:
 
 
 def _or(*parts: Q) -> Q:
-    kept = [part for part in parts if part is not _FALSE]
+    kept = _one_bound([part for part in parts if part is not _FALSE])
     if any(part is _TRUE for part in kept):
         return _TRUE
     if not kept:
@@ -135,6 +135,9 @@ def _and(*parts: Q) -> Q:
     kept = [part for part in parts if part is not _TRUE]
     if any(part is _FALSE for part in kept):
         return _FALSE
+    if any(part is _BOUND for part in kept):
+        # Never holds, whatever stands beside it; the planning size stays.
+        return _BOUND
     if not kept:
         return _TRUE
     result = kept[0]
@@ -146,9 +149,17 @@ def _and(*parts: Q) -> Q:
 def _not(q: Q) -> Q:
     if q is _TRUE:
         return _FALSE
-    if q is _FALSE:
+    if q is _FALSE or q is _BOUND:
         return _TRUE
     return ~q
+
+
+def _one_bound(parts: list[Q]) -> list[Q]:
+    """``parts`` with one planner's bound at most: a second sizes nothing the first does not."""
+    if sum(part is _BOUND for part in parts) < 2:
+        return parts
+    first = parts.index(_BOUND)
+    return [part for index, part in enumerate(parts) if part is not _BOUND or index == first]
 
 
 def _one_level_out(ref: Any) -> Any:
@@ -251,6 +262,13 @@ class _PlannerBound(Expression):
 
     def as_sql(self, compiler: Any, connection: Any) -> tuple[str, tuple[Any, ...]]:
         return "(SELECT FALSE)", ()
+
+
+# The one condition that stands for a folded constant arm. It is false like
+# ``_FALSE`` and is kept where ``_FALSE`` is dropped, once per disjunction: a
+# union of bounds is one bound, a bound beside or less anything is that bound,
+# so a permission made of folded arms alone builds no id set of its own.
+_BOUND: Final = Q(_PlannerBound())
 
 
 def clock() -> Expression:
@@ -1461,7 +1479,7 @@ class Compiler:
                 )
                 anti = (
                     _FALSE
-                    if left is _FALSE and live is None
+                    if (left is _FALSE or left is _BOUND) and live is None
                     else self._anti_expression(
                         definition,
                         expr.right,
@@ -1471,7 +1489,11 @@ class Compiler:
                         depth_possible=depth_possible,
                     )
                 )
-                result = _and(left, _or(anti, _not(live)) if live is not None else anti)
+                if left is _BOUND and live is None:
+                    # Nothing to take away from what never holds.
+                    result = _BOUND
+                else:
+                    result = _and(left, _or(anti, _not(live)) if live is not None else anti)
             else:
                 raise SchemaError(f"Unknown permission operator {expr.op!r}")
         else:
@@ -1583,7 +1605,7 @@ class Compiler:
 
     def _union(self, at: At, parts: Sequence[Q]) -> Q:
         """Normalize a row disjunction to one semi-join over a UNION of ids."""
-        kept = [part for part in parts if part is not _FALSE]
+        kept = _one_bound([part for part in parts if part is not _FALSE])
         if any(part is _TRUE for part in kept):
             return _TRUE
         if not kept:
@@ -1654,13 +1676,15 @@ class Compiler:
         bound: Bound,
         visits: Mapping[Key, int],
         depth_possible: bool,
-    ) -> QuerySet[Any] | bool:
+    ) -> QuerySet[Any] | bool | Q:
         """The subject-model rows that admit the actor; ``True`` for every row.
 
         With ``name`` (an arrow target or a subject-set relation) a row admits
         the actor when the actor holds it there, or, for a bare subject set,
         when the actor is that very subject set.  Without it the actor must be
         the row.  A set decided before the statement comes back as its keys.
+        ``_BOUND`` when no row does and only folded constant arms say so: the
+        relation through them is then a bound of its own type (``_bounded``).
         """
         rows = model._base_manager.using(self.using)
         own = self.shape.type == allowed_type and self._canonical(model, identity)
@@ -1681,6 +1705,8 @@ class Compiler:
             member = _or(member, Q(**{identity: self._native(model, identity)}))
         if member is _FALSE:
             return False
+        if member is _BOUND:
+            return _BOUND
         if member is _TRUE:
             return True
         return rows.filter(member)
@@ -1714,6 +1740,9 @@ class Compiler:
         )
         if subjects is False:
             return _FALSE
+        if subjects is _BOUND:
+            return self._bounded(at)
+        assert not isinstance(subjects, Q)
         # Whether the predicate reads the targets' own rows; otherwise a
         # reference that nothing constrains is checked against them.
         through_rows = True
@@ -1777,7 +1806,7 @@ class Compiler:
                 if target_q is _FALSE and self._left_out(
                     target_key, fixed, at, bound, visits, depth_possible
                 ):
-                    target_q = Q(_PlannerBound())
+                    target_q = _BOUND
         else:
             target_q = _truth(
                 self.shape.type == allowed.type
@@ -1794,6 +1823,15 @@ class Compiler:
             self._model_membership(at, rows, resolved.source_model, resolved.source_id_attr),
             target_q,
         )
+
+    def _bounded(self, at: At) -> Q:
+        """What a relation is whose every subject is ruled out by folded constant arms alone.
+
+        Its own bound: the full statement could admit every row here through
+        it, and one bound says so without a subquery that selects nothing. A
+        check of one object sizes no id set, and carries none.
+        """
+        return _FALSE if _one_object(at.ref) else _BOUND
 
     def _left_out(
         self,
@@ -1858,6 +1896,9 @@ class Compiler:
         )
         if found is False:
             return _FALSE
+        if found is _BOUND:
+            return self._bounded(at)
+        assert not isinstance(found, Q)
         every = resolved.target_model._base_manager.using(self.using)
         subjects = (every if found is True else found).filter(Q(**resolved.filters))
         if resolved.resource is not None:
@@ -1983,6 +2024,8 @@ class Compiler:
             admitted = _or(admitted, _and(shape, member))
         if admitted is _FALSE:
             return _FALSE
+        if admitted is _BOUND:
+            return self._bounded(at)
         return self._tuple_membership(at, self._live(rows, relation, bound), admitted)
 
     def _decidable_set(self, key: Key, seen: frozenset[Key] = frozenset()) -> bool:

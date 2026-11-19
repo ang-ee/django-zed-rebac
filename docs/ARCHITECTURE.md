@@ -2216,6 +2216,16 @@ caveats are not read, so the profile is a superset of what the actor holds.
   candidate row and did not finish in 30 seconds. The bound is emitted on
   PostgreSQL only, only where the full statement would compile the arm, and
   not in a witness statement or a check of the one object the arm names.
+  **One bound sizes an id set.** The bound is false, and is kept where a
+  false arm is dropped: once for a disjunction. A union of bounds is one
+  bound, a bound beside another condition or less an exclusion is that bound,
+  and a permission that compiles to bounds alone builds no id set of its own.
+  A relation into such a permission (an arrow through a field, a stored
+  relation or an attribute, or a subject set) is a bound of its own type,
+  with no subquery over the target that selects nothing. Several constant arms
+  an actor holds none of (the administrator's, a role
+  held on every row, a role named through other permissions and narrowed by
+  an exclusion) therefore cost what one costs.
 - **When it is read.** One statement at the first compile for an actor and
   database in the scope. It is kept for the scope and read again after a
   library relationship write. It is not kept while the thread has written
