@@ -55,7 +55,8 @@ Each module's docstring is its specification: `rebac.structural`, `rebac.rowscop
 
 ## Measured
 
-Scale fixture, flat groups and roles, PostgreSQL 16, JIT off, median of 5. Statements / SQL / time.
+Scale fixture, flat groups and roles, PostgreSQL 16, JIT off, median of 5. Statements / SQL / time. A range
+is two runs.
 
 | Read by the actor with 25,000 grants | Registry layout | Denormalized layout |
 |---|---|---|
@@ -64,13 +65,13 @@ Scale fixture, flat groups and roles, PostgreSQL 16, JIT off, median of 5. State
 | … structural prefetch | 6 / 8.5 KB / 64 ms | 6 / 6.9 KB / 29 ms |
 | … row scope | 3 / 14.5 KB / 37 ms | 3 / 10.5 KB / 24 ms |
 | … structural prefetch and row scope | 3 / 3.9 KB / 23 ms | 3 / 3.1 KB / 13.5 ms |
-| 200 messages joined to their thread, today | 5 / 15 KB / 358 ms | 5 / 13 KB / 91 ms |
+| 200 messages joined to their thread, today | 5 / 15 KB / 336–358 ms | 5 / 13 KB / 91 ms |
 | … the walk decides | 7 / 15 KB / 90 ms | 7 / 12 KB / 67 ms |
-| … row scope and the walk decides | 4 / 9.4 KB / 25 ms | 4 / 7.4 KB / 10 ms |
-| … row scope and display fields | 1 / 5.6 KB / 8.4 ms | 1 / 4.0 KB / 7.2 ms |
-| Which of 100 part ids, half of them readable, today | 4 / 12 KB / 78 ms | 4 / 10 KB / 61 ms |
-| … the walk proves | 8 / 16 KB / 97 ms | 8 / 13 KB / 64 ms |
-| … the walk decides | 8 / 8.3 KB / 21 ms | 8 / 7.1 KB / 7.1 ms |
+| … row scope and the walk decides | 4 / 9.4 KB / 24–25 ms | 4 / 7.4 KB / 10 ms |
+| … row scope and display fields | 1 / 5.6 KB / 8.4–8.6 ms | 1 / 4.0 KB / 7.2 ms |
+| Which of 100 part ids, half of them readable, today | 4 / 12 KB / 71–78 ms | 4 / 10 KB / 61 ms |
+| … the walk proves | 8 / 16 KB / 86–97 ms | 8 / 13 KB / 64 ms |
+| … the walk decides | 8 / 8.3 KB / 20–21 ms | 8 / 7.1 KB / 7.1 ms |
 
 - An actor granted 2,500 threads through a group: 60 ms to 5.6 ms for the first read.
 - PostgreSQL 17, registry layout: 23.5 ms and 8.3 ms for the two combined rows. Its baseline for the joined
