@@ -180,3 +180,199 @@ def test_held_with_the_walk_is_held_without_it(seed, storage, settings):
                 using="default",
             )
             assert alone <= expected, (actor, resource_type, seed, sorted(alone - expected))
+
+
+# ---------- "decide": the whole permission, read from the rows it names ----------
+
+DECIDING = """
+definition auth/user {}
+definition auth/group { relation member: auth/user | auth/group#member }
+definition scope/role { relation member: auth/user | auth/group#member }
+definition scope/thread {
+    relation admin: scope/role // rebac:const=admin
+    relation reader: auth/user | auth/group#member | auth/user:*
+    relation team: scope/role#member
+    relation blocked: auth/user | auth/group#member
+    permission read = reader + team + admin->member
+    permission guarded = read - blocked
+    permission both = reader & team
+}
+definition scope/message {
+    relation thread: scope/thread // rebac:field=thread
+    relation direct: auth/user
+    permission read = thread->read + direct
+    permission guarded = thread->guarded
+}
+definition scope/part {
+    relation message: scope/message // rebac:field=message
+    permission read = message->read
+}
+"""
+TEAM = SubjectRef.of("scope/role", "team", "member")
+
+
+@pytest.fixture
+def deciding(local, settings):
+    backend = install_schema(DECIDING)
+    settings.REBAC_BOUNDED_WALK = "decide"
+    return backend
+
+
+def compiled(statements: list[str]) -> list[str]:
+    """The statements that read an id set or a recursion: the compiler's, not the walk's."""
+    return [sql for sql in statements if "rebac_ids" in sql or "WITH " in sql]
+
+
+def test_deciding_answers_no_without_the_compiled_statement(deciding):
+    deciding.write_relationships([grant("scope/thread", 1, "reader")])
+    found, statements = held(deciding, "scope/part", [1, 2, 3])
+    assert found == {"1", "2"}
+    # Part 3 is refused by the same lookups that grant the others.
+    assert not compiled(statements)
+
+
+def test_deciding_reads_a_subject_set_and_a_constant_arm(deciding):
+    deciding.write_relationships(
+        [
+            grant("scope/role", "team", "member"),
+            grant("scope/thread", 2, "team", TEAM),
+            grant("scope/role", "admin", "member", ADMIN),
+        ]
+    )
+    found, statements = held(deciding, "scope/thread", [1, 2])
+    assert found == {"2"} and not compiled(statements)
+    found, statements = held(deciding, "scope/part", [1, 2, 3], actor=ADMIN)
+    assert found == {"1", "2", "3"} and not compiled(statements)
+
+
+def test_deciding_reads_an_intersection_and_an_exclusion(deciding):
+    deciding.write_relationships(
+        [
+            grant("scope/thread", 1, "reader"),
+            grant("scope/thread", 2, "reader"),
+            grant("scope/role", "team", "member"),
+            grant("scope/thread", 2, "team", TEAM),
+            grant("scope/thread", 1, "blocked"),
+        ]
+    )
+    found, statements = held(deciding, "scope/thread", [1, 2], action="both")
+    assert found == {"2"} and not compiled(statements)
+    found, statements = held(deciding, "scope/thread", [1, 2], action="guarded")
+    assert found == {"2"} and not compiled(statements)
+    found, statements = held(deciding, "scope/message", [1, 2, 3], action="guarded")
+    assert found == {"3"} and not compiled(statements)
+
+
+def test_deciding_asks_the_compiler_for_a_recursion_and_for_that_part_alone(deciding):
+    """Group membership nests: the walk asks the compiled statement which of the groups named on
+    the candidates the actor is in, and reads the rest itself."""
+    inner = SubjectRef.of("auth/group", "inner", "member")
+    outer = SubjectRef.of("auth/group", "outer", "member")
+    deciding.write_relationships(
+        [
+            grant("auth/group", "inner", "member"),
+            grant("auth/group", "outer", "member", inner),
+            grant("scope/thread", 2, "reader", outer),
+        ]
+    )
+    found, statements = held(deciding, "scope/part", [1, 2, 3])
+    assert found == {"3"}
+    asked = compiled(statements)
+    assert asked and all("scope_part" not in sql and "scope_message" not in sql for sql in asked)
+
+
+def test_deciding_leaves_what_is_below_an_exclusion_and_unreadable_to_the_compiler(deciding):
+    """``blocked`` admits a nested group below the exclusion: the permission above it is compiled."""
+    inner = SubjectRef.of("auth/group", "inner", "member")
+    deciding.write_relationships(
+        [
+            grant("scope/thread", 1, "reader"),
+            grant("scope/thread", 2, "reader"),
+            grant("auth/group", "inner", "member"),
+            grant("scope/thread", 1, "blocked", inner),
+        ]
+    )
+    found, statements = held(deciding, "scope/thread", [1, 2], action="guarded")
+    assert found == {"2"} and compiled(statements)
+
+
+def test_deciding_leaves_an_id_that_is_no_row_to_the_compiled_statement(deciding):
+    deciding.write_relationships(
+        [grant("scope/thread", 1, "reader"), grant("scope/thread", 77, "reader")]
+    )
+    found, _statements = held(deciding, "scope/thread", ["1", "77", "01", "x"])
+    walked, answered = walk.decided(
+        backend=deciding, resource_type="scope/thread", action="read", actor=MEMBER,
+        ids=["1", "77", "01", "x"], using="default",
+    )  # fmt: skip
+    assert (walked, answered) == ({"1"}, {"1"})
+    settings_off = deciding.held(
+        subject=MEMBER, action="read", resource_type="scope/thread", ids=["1", "77", "01", "x"]
+    )
+    assert found == settings_off
+
+
+@pytest.mark.django_db(transaction=True)
+@pytest.mark.parametrize("storage", ["denormalized", "registry"])
+@pytest.mark.parametrize("seed", range(60))
+def test_held_decided_by_the_walk_is_held_without_it(seed, storage, settings):
+    """The same random policies: for every model, action and actor, ``held`` returns the same ids
+    when the walk decides, and what the walk answers alone is the compiled answer for those ids."""
+    generate = subtracting if seed % 2 else build
+    local = seeded(*generate(seed), storage, settings)
+    candidates = {
+        "scope/thread": ["1", "2", "3", "x"],
+        "scope/message": ["1", "2", "3", "4", "01"],
+        "scope/part": ["1", "2", "3", "9"],
+    }
+    for actor in (ADMIN, MEMBER):
+        for resource_type, ids in candidates.items():
+            actions = ["read"]
+            if local._schema_snapshot().schema.get_permission(resource_type, "view") is not None:
+                actions.append("view")
+            for action in actions:
+                settings.REBAC_BOUNDED_WALK = False
+                expected = local.held(
+                    subject=actor, action=action, resource_type=resource_type, ids=ids
+                )
+                settings.REBAC_BOUNDED_WALK = "decide"
+                found = local.held(
+                    subject=actor, action=action, resource_type=resource_type, ids=ids
+                )
+                assert found == expected, (actor, resource_type, action, seed)
+                walked, answered = walk.decided(
+                    backend=local,
+                    resource_type=resource_type,
+                    action=action,
+                    actor=actor,
+                    ids=ids,
+                    using="default",
+                )
+                assert walked == expected & answered, (actor, resource_type, action, seed)
+            for setting in (True, "decide"):
+                settings.REBAC_BOUNDED_WALK = False
+                expected_many = local.held_many(
+                    subject=actor, actions=actions, resource_type=resource_type, ids=ids
+                )
+                settings.REBAC_BOUNDED_WALK = setting
+                found_many = local.held_many(
+                    subject=actor, actions=actions, resource_type=resource_type, ids=ids
+                )
+                assert found_many == expected_many, (actor, resource_type, setting, seed)
+
+
+def test_several_actions_share_what_they_read(deciding):
+    deciding.write_relationships([grant("scope/thread", 1, "reader")])
+    with CaptureQueriesContext(connection) as captured:
+        found = deciding.held_many(
+            subject=MEMBER,
+            actions=["read", "guarded", "both"],
+            resource_type="scope/thread",
+            ids=["1", "2"],
+        )
+    assert found == {"read": {"1"}, "guarded": {"1"}, "both": set()}
+    statements = [query["sql"] for query in captured.captured_queries]
+    assert not compiled(statements)
+    # The rows, then one lookup per relation and open id set: reader, team, the admin role,
+    # blocked, and team again for the row the union did not need it on.
+    assert len(statements) <= 6, "\n".join(statements)

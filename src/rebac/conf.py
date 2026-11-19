@@ -22,8 +22,10 @@ _DEFAULTS: dict[str, Any] = {
     # Read a prefetch's children without their permission statement where the policy proves
     # that the parents just admitted imply them (proposal 0020). Off: every prefetch is scoped.
     "REBAC_STRUCTURAL_PREFETCH": False,
-    # Settle the ids of a bounded question (held, the select_related guard) by small lookups on the
-    # rows they name before the compiled statement is asked about the rest (proposal 0020).
+    # Answer a bounded question (held, the select_related guard) by small lookups on the rows it
+    # names, the compiled statement only for what they leave (proposal 0020). "prove" (or True)
+    # settles the ids a grant on the row, a column or a parent shows held; "decide" reads the
+    # whole permission and answers no as well.
     "REBAC_BOUNDED_WALK": False,
     "REBAC_DEFAULT_CONSISTENCY": "minimize_latency",
     "REBAC_CACHE_ALIAS": "default",
