@@ -1,0 +1,1935 @@
+definition agents/agent {
+    relation actor: auth/user // rebac:field=user
+    relation admin: angee/role // rebac:const=admin
+    relation caller: auth/group#member | auth/user
+    relation editor: auth/group#member | auth/user
+    relation owner: auth/user // rebac:field=owner
+    relation reader: auth/group#member | auth/user
+
+    permission call = ((owner + caller) + admin->member)
+    permission create = admin->member
+    permission delete = (owner + admin->member)
+    permission read = (((owner + reader) + editor) + admin->member)
+    permission share = ((owner + editor) + admin->member)
+    permission share_call = (owner + admin->member)
+    permission transfer = (owner + admin->member)
+    permission write = ((owner + editor) + admin->member)
+    permission write__owner = transfer
+    permission write__resource_reader = admin->member
+}
+
+definition agents/inference_model {
+    relation admin: angee/role // rebac:const=admin
+    relation provider: agents/inference_provider // rebac:field=provider
+
+    permission create = admin->member
+    permission delete = (provider->write + admin->member)
+    permission read = (provider->read + admin->member)
+    permission write = (provider->write + admin->member)
+}
+
+definition agents/inference_provider {
+    relation admin: angee/role // rebac:const=admin
+    relation integration: integrate/integration // rebac:field=integration_ptr
+
+    permission create = admin->member
+    permission delete = (integration->write + admin->member)
+    permission read = (integration->read + admin->member)
+    permission write = (integration->write + admin->member)
+    permission write__owner = integration->transfer
+}
+
+definition agents/mcp_server {
+    relation admin: angee/role // rebac:const=admin
+    relation selected_agent: agents/agent // rebac:field=agents
+
+    permission create = admin->member
+    permission delete = admin->member
+    permission read = (selected_agent->actor + admin->member)
+    permission write = admin->member
+}
+
+definition agents/session {
+    relation admin: angee/role // rebac:const=admin
+    relation agent: agents/agent // rebac:field=agent
+    relation user: auth/user // rebac:field=user
+
+    permission create = ((user & agent->call) + admin->member)
+    permission delete = (agent->delete + admin->member)
+    permission post = ((user & agent->call) + admin->member)
+    permission read = ((user + agent->actor) + admin->member)
+    permission write = ((user + agent->actor) + admin->member)
+}
+
+definition agents/skill {
+    relation admin: angee/role // rebac:const=admin
+    relation source: integrate_vcs/source // rebac:field=source
+
+    permission create = admin->member
+    permission delete = (source->write + admin->member)
+    permission read = (source->read + admin->member)
+    permission write = (source->write + admin->member)
+}
+
+definition agents/tool_grant {
+    relation admin: angee/role // rebac:const=admin
+    relation approver: auth/user
+    relation grantee: auth/group#member | auth/user
+    relation person: iam/kind // rebac:const=person
+    relation role: agents/toolrole
+    relation selected_agent: auth/user // rebac:field=agents__user
+    relation server: agents/mcp_server // rebac:field=server
+
+    permission create = admin->member
+    permission delete = (server->write + admin->member)
+    permission read = (server->read + admin->member)
+    permission use = (((selected_agent + grantee) + role->effective_member) + admin->member)
+    permission use_approved = ((((grantee + role->effective_member) & approver) + admin->member) & person->active_member)
+    permission write = (server->write + admin->member)
+}
+
+definition agents/toolrole {
+    relation admin: angee/role // rebac:const=admin
+    relation includes: agents/toolrole
+    relation member: angee/role:admin#member | auth/group#member | auth/user
+
+    permission effective_member = ((member + includes->effective_member) + admin->member)
+}
+
+definition agents/turn {
+    relation session: agents/session // rebac:field=session
+
+    permission create = session->write
+    permission delete = session->delete
+    permission read = session->read
+    permission write = session->write
+}
+
+definition angee/role {
+    relation member: auth/group#member | auth/user
+
+    permission effective_member = member
+}
+
+definition auth/group {
+    relation admin: angee/role // rebac:const=admin
+    relation member: auth/user
+
+    permission create = admin->member
+    permission delete = admin->member
+    permission read = (member + admin->member)
+    permission write = admin->member
+}
+
+definition auth/user {
+    relation active: iam/audience // rebac:const={"filters":{"is_active":true},"target_id":"active"}
+    relation admin: angee/role // rebac:const=admin
+    relation directory: iam/directory // rebac:const=main
+    relation directory_reader: auth/user
+    relation person: parties/person // rebac:field={"filters":{"is_active":true},"path":"person"}
+    relation self: auth/user // rebac:attribute={"field":"id"}
+    relation staff: iam/audience // rebac:const={"filters":{"is_staff":true},"target_id":"staff"}
+
+    permission active_account = (((((colleague + view_as) + issue_password) + reset_password) + issue_sign_in_link) & active->disclosed)
+    permission administer = admin->member
+    permission colleague = ((self + list) + person->read)
+    permission create = admin->member
+    permission delete = admin->member
+    permission issue_password = admin->member
+    permission issue_sign_in_link = admin->member
+    permission list = ((directory_reader + directory->reader) + admin->member)
+    permission nonstaff_account = (((((((view_as + write) + set_active) + rename) + reset_password) + issue_password) + issue_sign_in_link) - staff->disclosed)
+    permission read = authenticated
+    permission read__email = read_private
+    permission read__is_active = read_private
+    permission read__is_staff = read_private
+    permission read__last_login = read_private
+    permission read__preferences = read_private
+    permission read__username = read_private
+    permission read_private = (self + list)
+    permission rename = admin->member
+    permission reset_password = admin->member
+    permission set_active = admin->member
+    permission view_as = admin->member
+    permission write = admin->member
+    permission write__date_joined = admin->member
+    permission write__email = admin->member
+    permission write__is_active = admin->member
+    permission write__is_staff = admin->member
+    permission write__is_superuser = admin->member
+    permission write__kind = admin->member
+    permission write__last_login = admin->member
+    permission write__password = admin->member
+    permission write__preferences = admin->member
+    permission write__username = admin->member
+}
+
+definition calendar/calendar {
+    relation admin: angee/role // rebac:const=admin
+    relation directory: integrate/integration // rebac:field=record_links__stream__integration
+    relation editor: auth/group#member | auth/user
+    relation free_busy: auth/group#member | auth/user
+    relation holder: auth/user // rebac:field=party__person__user
+    relation owner: auth/user // rebac:field=owner
+    relation party: parties/party // rebac:field=party
+    relation reader: auth/group#member | auth/user
+
+    permission create = (party->write + admin->member)
+    permission delete = ((owner + holder) + admin->member)
+    permission read = read_granted
+    permission read_granted = (reader + write)
+    permission see_busy = (read + free_busy)
+    permission share = (((owner + holder) + editor) + admin->member)
+    permission statement_source = directory
+    permission transfer = (owner + admin->member)
+    permission write = (((owner + holder) + editor) + admin->member)
+    permission write__owner = transfer
+    permission write_statements = (write + statement_source)
+}
+
+definition calendar/calendar_source {
+    relation admin: angee/role // rebac:const=admin
+    relation integration: integrate/integration // rebac:field=integration_ptr
+
+    permission create = authenticated
+    permission delete = (integration->write + admin->member)
+    permission read = (integration->read + admin->member)
+    permission write = (integration->write + admin->member)
+    permission write__owner = integration->transfer
+}
+
+definition calendar/event {
+    relation admin: angee/role // rebac:const=admin
+    relation calendar: calendar/calendar // rebac:field=calendar
+    relation default_calendar: calendar/calendar // rebac:field={"filters":{"visibility":"default"},"path":"calendar"}
+    relation public_calendar: calendar/calendar // rebac:field={"filters":{"visibility":"public"},"path":"calendar"}
+
+    permission create = (calendar->write + admin->member)
+    permission delete = (calendar->write + admin->member)
+    permission read = read_granted
+    permission read_granted = ((default_calendar->read + public_calendar->see_busy) + write)
+    permission see_busy = (calendar->see_busy + admin->member)
+    permission write = (calendar->write + admin->member)
+}
+
+definition calendar/event_attendee {
+    relation admin: angee/role // rebac:const=admin
+    relation event: calendar/event // rebac:field=event
+
+    permission create = (event->write + admin->member)
+    permission delete = (event->write + admin->member)
+    permission read = (event->read + admin->member)
+    permission write = (event->write + admin->member)
+}
+
+definition checklists/evidence {
+    relation result: checklists/result // rebac:field=result
+
+    permission create = result->target_write
+    permission delete = nil
+    permission hidden = ((authenticated + anonymous) - record_read)
+    permission read = (result->target_read & record_read)
+    permission record_read = nil
+    permission write = nil
+}
+
+definition checklists/result {
+    relation evidence: checklists/evidence // rebac:field=evidence
+
+    permission create = target_write
+    permission delete = nil
+    permission evidence_hidden = evidence->hidden
+    permission read = (target_read - evidence_hidden)
+    permission target_read = nil
+    permission target_write = nil
+    permission write = nil
+}
+
+definition dashboards/dashboard {
+    relation admin: angee/role // rebac:const=admin
+    relation editor: auth/group#member | auth/user
+    relation owner: auth/user // rebac:field=owner
+    relation shared: dashboards/dashboard // rebac:const={"filters":{"is_baseline":true},"target_id":"shared"}
+    relation trashed: dashboards/dashboard // rebac:const={"filters":{"is_trashed":true},"target_id":"trashed"}
+    relation viewer: auth/group#member | auth/user
+
+    permission conceal = authenticated
+    permission create = (authenticated - shared->shared_reader)
+    permission delete = (owner + admin->member)
+    permission read = ((read_granted - withheld) + delete)
+    permission read_granted = (((shared->shared_reader + owner) + viewer) + editor)
+    permission reset = owner
+    permission share = (owner + admin->member)
+    permission shared_reader = authenticated
+    permission transfer = ((owner + admin->member) - shared->shared_reader)
+    permission withheld = trashed->conceal
+    permission write = ((owner + editor) + admin->member)
+    permission write__is_baseline = nil
+    permission write__owner = transfer
+}
+
+definition dashboards/widget {
+    relation dashboard: dashboards/dashboard // rebac:field=dashboard
+
+    permission create = dashboard->write
+    permission delete = dashboard->write
+    permission read = dashboard->read
+    permission write = dashboard->write
+}
+
+definition decisions/decision {
+    relation access_need: intake/need // rebac:field=access_needs
+    relation admin: angee/role // rebac:const=admin
+    relation assignee: auth/user // rebac:field=assignees
+    relation person: iam/kind // rebac:const=person
+    relation requester: auth/user // rebac:field=requester
+    relation requesting_step: workflows/step_run // rebac:field=requesting_steps
+
+    permission act = (eligible + ((admin->member & person->active_actor) - owner_managed))
+    permission create = admin->member
+    permission delete = admin->member
+    permission eligible = ((((assignee - requester) - owner_managed) + owner_eligible) & person->active_actor)
+    permission owner_eligible = (nil + access_need->share)
+    permission owner_managed = (nil + access_need->decision_managed)
+    permission read = (read_granted + requesting_step->operate)
+    permission read_granted = ((assignee + requester) + admin->member)
+    permission write = admin->member
+}
+
+definition decisions/record {
+    relation admin: angee/role // rebac:const=admin
+    relation decision: decisions/decision // rebac:field=decision
+
+    permission create = admin->member
+    permission delete = admin->member
+    permission read = decision->read
+    permission write = admin->member
+}
+
+definition extraction/extraction {
+    relation admin: angee/role // rebac:const=admin
+    relation creator: auth/user // rebac:field=created_by
+    relation file: storage/file // rebac:field=file
+    relation message: messaging/message // rebac:field=message
+    relation viewer: auth/group#member | auth/user
+
+    permission read = ((((creator + viewer) + file->read) + message->read) + admin->member)
+    permission read__document_map = read__result
+    permission read__outcome = read__result
+    permission read__result = (read & (file->read + message->read))
+    permission read__retired_identities = read__result
+    permission share = (creator + admin->member)
+}
+
+definition extraction/extraction_page {
+    relation extraction: extraction/extraction // rebac:field=extraction
+    relation source: extraction/extraction_source // rebac:field=source
+
+    permission read = (extraction->read & source->read_content)
+}
+
+definition extraction/extraction_part {
+    relation extraction: extraction/extraction // rebac:field=extraction
+    relation source: extraction/extraction_source // rebac:field=source
+
+    permission read = (extraction->read & source->read_content)
+}
+
+definition extraction/extraction_source {
+    relation extraction: extraction/extraction // rebac:field=extraction
+    relation file: storage/file // rebac:field=file
+    relation message_part: messaging/part // rebac:field=message_part
+
+    permission read = extraction->read
+    permission read_content = (file->read + message_part->read)
+}
+
+definition iam/audience {
+    permission disclosed = authenticated
+}
+
+definition iam/directory {
+    relation reader: auth/user
+}
+
+definition iam/kind {
+    relation active_actor: auth/user // rebac:attribute={"field":"is_active","resource":"person","value":true}
+    relation active_member: auth/user // rebac:attribute={"field":"kind","filters":{"is_active":true},"resource":"person","value":"person"}
+    relation member: auth/user // rebac:attribute={"field":"kind","resource":"person","value":"person"}
+}
+
+definition iam/protected {
+    relation admin: angee/role // rebac:const=admin
+
+    permission member = admin->effective_member
+}
+
+definition intake/need {
+    relation person: iam/kind // rebac:const=person
+    relation project: projects/project // rebac:field=project
+    relation task: projects/task // rebac:field=task
+
+    permission create = (task->write + project->write)
+    permission decision_managed = person->active_actor
+    permission delete = (task->write + project->write)
+    permission read = (task->read + project->read)
+    permission read__access_decision = share
+    permission read__admitted_user = share
+    permission read__claimed_email = (task->write + project->write)
+    permission share = (task->share + project->share)
+    permission write = (task->write + project->write)
+    permission write__admitted_user = share
+    permission write__party = (task->share + project->share)
+}
+
+definition integrate/credential {
+    relation admin: angee/role // rebac:const=admin
+    relation user: auth/user // rebac:field=user
+
+    permission create = admin->member
+    permission delete = (user + admin->member)
+    permission read = (user + admin->member)
+    permission write = (user + admin->member)
+}
+
+definition integrate/external_account {
+    relation admin: angee/role // rebac:const=admin
+    relation owner: auth/user // rebac:field=owner
+
+    permission create = admin->member
+    permission delete = (owner + admin->member)
+    permission read = (owner + admin->member)
+    permission transfer = admin->member
+    permission write = (owner + admin->member)
+    permission write__owner = transfer
+}
+
+definition integrate/integration {
+    relation admin: angee/role // rebac:const=admin
+    relation channel_team: spaces/group // rebac:field=channel__team
+    relation owner: auth/user // rebac:field=owner
+    relation project: projects/project // rebac:field=project_bindings__project
+    relation reader: auth/group#member | auth/user
+
+    permission create = admin->member
+    permission delete = (((owner + admin->member) + project->write) + channel_team->write)
+    permission read = ((((owner + reader) + admin->member) + project->read) + channel_team->post)
+    permission resume = admin->member
+    permission retry_discovery = (owner + admin->member)
+    permission transfer = (owner + admin->member)
+    permission write = (((owner + admin->member) + project->write) + channel_team->write)
+    permission write__owner = transfer
+}
+
+definition integrate/oauth_client {
+    relation admin: angee/role // rebac:const=admin
+
+    permission create = admin->member
+    permission delete = admin->member
+    permission read = admin->member
+    permission write = admin->member
+}
+
+definition integrate/record_link {
+    relation stream: integrate/sync_stream // rebac:field=stream
+
+    permission create = stream->write
+    permission delete = stream->delete
+    permission read = stream->read
+    permission write = stream->write
+}
+
+definition integrate/sync_stream {
+    relation integration: integrate/integration // rebac:field=integration
+
+    permission create = integration->write
+    permission delete = integration->delete
+    permission read = (integration + integration->read)
+    permission write = integration->write
+}
+
+definition integrate/vendor {
+    relation admin: angee/role // rebac:const=admin
+
+    permission create = admin->member
+    permission delete = admin->member
+    permission read = admin->member
+    permission write = admin->member
+}
+
+definition integrate/webhook_subscription {
+    relation admin: angee/role // rebac:const=admin
+    relation owner: auth/user // rebac:field=owner
+
+    permission create = admin->member
+    permission delete = (owner + admin->member)
+    permission read = (owner + admin->member)
+    permission transfer = (owner + admin->member)
+    permission write = (owner + admin->member)
+    permission write__owner = transfer
+}
+
+definition integrate_vcs/repository {
+    relation admin: angee/role // rebac:const=admin
+    relation vcs_bridge: integrate_vcs/vcs_bridge // rebac:field=vcs_bridge
+
+    permission create = admin->member
+    permission delete = (vcs_bridge->write + admin->member)
+    permission read = (vcs_bridge->read + admin->member)
+    permission write = (vcs_bridge->write + admin->member)
+}
+
+definition integrate_vcs/source {
+    relation admin: angee/role // rebac:const=admin
+    relation repository: integrate_vcs/repository // rebac:field=repository
+
+    permission create = admin->member
+    permission delete = (repository->write + admin->member)
+    permission read = (repository->read + admin->member)
+    permission write = (repository->write + admin->member)
+}
+
+definition integrate_vcs/template {
+    relation admin: angee/role // rebac:const=admin
+    relation source: integrate_vcs/source // rebac:field=source
+
+    permission create = admin->member
+    permission delete = (source->write + admin->member)
+    permission read = (source->read + admin->member)
+    permission write = (source->write + admin->member)
+}
+
+definition integrate_vcs/vcs_bridge {
+    relation admin: angee/role // rebac:const=admin
+    relation integration: integrate/integration // rebac:field=integration_ptr
+
+    permission create = admin->member
+    permission delete = (integration->write + admin->member)
+    permission read = (integration->read + admin->member)
+    permission write = (integration->write + admin->member)
+    permission write__owner = integration->transfer
+}
+
+definition knowledge/link {
+    relation source_page: knowledge/page // rebac:field=source_page
+
+    permission delete = source_page->write
+    permission read = source_page->read
+    permission write = source_page->write
+}
+
+definition knowledge/markdown_page {
+    relation page: knowledge/page // rebac:field=page_ptr
+
+    permission create = page->write
+    permission delete = page->write
+    permission read = page->read
+    permission write = page->write
+}
+
+definition knowledge/page {
+    relation parent: knowledge/page // rebac:field=parent
+    relation trashed: knowledge/page // rebac:const={"filters":{"is_trashed":true},"target_id":"trashed"}
+    relation vault: knowledge/vault // rebac:field=vault
+    relation viewer: auth/group#member | auth/user
+
+    permission conceal = authenticated
+    permission create = vault->write
+    permission delete = (parent->delete + vault->delete)
+    permission read = ((read_granted - withheld) + vault->delete)
+    permission read_as_subject = (viewer + vault->read_as_subject)
+    permission read_granted = ((viewer + parent->read_granted) + vault->read)
+    permission withheld = (trashed->conceal + vault->withheld)
+    permission write = ((write_granted - withheld) + vault->delete)
+    permission write_as_subject = vault->write_as_subject
+    permission write_granted = (parent->write_granted + vault->write)
+}
+
+definition knowledge/record_binding {
+    relation note: notes/note // rebac:field=target
+    relation page: knowledge/page // rebac:field=page
+    relation project: projects/project // rebac:field=target
+    relation task: projects/task // rebac:field=target
+    relation vault: knowledge/vault // rebac:field=vault
+
+    permission create = ((page->write + vault->write) & target_write)
+    permission delete = ((page->write + vault->write) & target_write)
+    permission read = ((page->read + vault->read) & target_read)
+    permission target_read = ((nil + (task->read + project->read)) + note->read)
+    permission target_write = ((nil + (task->write + project->write)) + note->write)
+    permission write = nil
+}
+
+definition knowledge/role {
+    relation member: angee/role:admin#member | auth/group#member | auth/user
+}
+
+definition knowledge/vault {
+    relation admin: angee/role // rebac:const=admin
+    relation editor: auth/group#member | auth/user
+    relation knowledge_admin: knowledge/role // rebac:const=knowledge_admin
+    relation owner: auth/user // rebac:field=owner
+    relation project: projects/project // rebac:field=project_bindings__project
+    relation team: spaces/group // rebac:field=team
+    relation trashed: knowledge/vault // rebac:const={"filters":{"is_trashed":true},"target_id":"trashed"}
+    relation vault_admin: knowledge/role // rebac:const=vault_admin
+    relation vault_editor: knowledge/role // rebac:const=vault_editor
+    relation vault_viewer: knowledge/role // rebac:const=vault_viewer
+    relation viewer: auth/group#member | auth/user
+
+    permission conceal = authenticated
+    permission create = authenticated
+    permission delete = (((owner + vault_admin->member) + knowledge_admin->member) + admin->member)
+    permission read = ((read_granted - withheld) + delete)
+    permission read_as_subject = (((((((owner + editor) + viewer) + vault_viewer->member) + vault_editor->member) + vault_admin->member) + knowledge_admin->member) + admin->member)
+    permission read_granted = (((((((((owner + editor) + viewer) + vault_viewer->member) + vault_editor->member) + vault_admin->member) + knowledge_admin->member) + admin->member) + project->read) + team->post)
+    permission share = ((owner + admin->member) + project->share)
+    permission transfer = (owner + admin->member)
+    permission withheld = trashed->conceal
+    permission write = ((write_granted - withheld) + delete)
+    permission write__owner = transfer
+    permission write__team = share
+    permission write_as_subject = (((((owner + editor) + vault_editor->member) + vault_admin->member) + knowledge_admin->member) + admin->member)
+    permission write_granted = (((((((owner + editor) + vault_editor->member) + vault_admin->member) + knowledge_admin->member) + admin->member) + project->write) + team->write)
+}
+
+definition knowledge_graph_pgvector/entity {
+    relation evidence: knowledge_graph_pgvector/passage // rebac:field=mentions__passage
+    relation vault: knowledge/vault // rebac:field=vault
+
+    permission delete = vault->delete
+    permission read = (vault->read & evidence->graph_read)
+}
+
+definition knowledge_graph_pgvector/entity_edge {
+    relation passage: knowledge_graph_pgvector/passage // rebac:field=passage
+
+    permission delete = passage->delete
+    permission read = passage->graph_read
+}
+
+definition knowledge_graph_pgvector/entity_mention {
+    relation passage: knowledge_graph_pgvector/passage // rebac:field=passage
+
+    permission delete = passage->delete
+    permission read = passage->graph_read
+}
+
+definition knowledge_graph_pgvector/passage {
+    relation live_page: knowledge/page // rebac:field={"filters":{"page__is_trashed":false,"page__vault__is_trashed":false},"path":"page"}
+    relation page: knowledge/page // rebac:field=page
+
+    permission delete = page->write
+    permission graph_read = live_page->read
+    permission read = page->read
+    permission write = page->write
+}
+
+definition knowledge_graph_pgvector/passage_embedding {
+    relation model: agents/inference_model // rebac:field=model
+    relation passage: knowledge_graph_pgvector/passage // rebac:field=passage
+
+    permission delete = (passage->write + model->delete)
+    permission read = passage->read
+    permission write = passage->write
+}
+
+definition knowledge_integrate_notion/notion_connection {
+    relation admin: angee/role // rebac:const=admin
+    relation integration: integrate/integration // rebac:field=integration_ptr
+
+    permission create = admin->member
+    permission delete = integration->write
+    permission read = integration->read
+    permission write = integration->write
+    permission write__owner = integration->transfer
+}
+
+definition messaging/channel {
+    relation admin: angee/role // rebac:const=admin
+    relation annotator: auth/group#member | auth/user
+    relation integration: integrate/integration // rebac:field=integration_ptr
+    relation reader: auth/group#member | auth/user
+    relation replier: auth/group#member | auth/user
+
+    permission annotate = (annotator + write)
+    permission create = admin->member
+    permission delete = (integration->write + admin->member)
+    permission read = (((integration->read + reader) + replier) + admin->member)
+    permission reply = ((replier + integration->write) + admin->member)
+    permission write = (integration->write + admin->member)
+    permission write__owner = integration->transfer
+    permission write__team = (integration->owner + admin->member)
+}
+
+definition messaging/message {
+    relation admin: angee/role // rebac:const=admin
+    relation channel: messaging/channel // rebac:field=channel
+    relation editor: auth/group#member | auth/user
+    relation identity_role: provenance/role // rebac:const=messaging_identity_source
+    relation reader: auth/group#member | auth/user
+    relation thread: messaging/thread // rebac:field=thread
+    relation trashed: messaging/message // rebac:const={"filters":{"is_trashed":true},"target_id":"trashed"}
+
+    permission annotate = (((write + thread->annotate_granted) + channel->annotate) & read)
+    permission conceal = authenticated
+    permission create = authenticated
+    permission delete = (((thread->delete + channel->write) + editor) + admin->member)
+    permission identity_source = identity_role->effective_member
+    permission read = (((thread->read + read_granted) - withheld) + withheld_keeper)
+    permission read_granted = ((channel->read + editor) + reader)
+    permission read_inbox = (((thread->read_inbox + read_granted) - withheld) + withheld_keeper)
+    permission send_held = (channel->write + admin->member)
+    permission withheld = trashed->conceal
+    permission withheld_keeper = ((channel->write + identity_source) + admin->member)
+    permission write = ((((thread->write + channel->write) + editor) + identity_source) + admin->member)
+}
+
+definition messaging/message_edge {
+    relation admin: angee/role // rebac:const=admin
+    relation dst: messaging/message // rebac:field=dst
+    relation editor: auth/group#member | auth/user
+    relation reader: auth/group#member | auth/user
+    relation src: messaging/message // rebac:field=src
+
+    permission create = authenticated
+    permission delete = ((src->delete + dst->delete) + admin->member)
+    permission read = ((((src->read & dst->read) + editor) + reader) + admin->member)
+    permission write = (((src->write & dst->write) + editor) + admin->member)
+}
+
+definition messaging/message_star {
+    relation admin: angee/role // rebac:const=admin
+    relation message: messaging/message // rebac:field=message
+    relation user: auth/user // rebac:field=user
+
+    permission create = authenticated
+    permission delete = (user + admin->member)
+    permission read = ((user + message->read) + admin->member)
+    permission write = (user + admin->member)
+}
+
+definition messaging/part {
+    relation admin: angee/role // rebac:const=admin
+    relation editor: auth/group#member | auth/user
+    relation message: messaging/message // rebac:field=message
+    relation reader: auth/group#member | auth/user
+
+    permission create = authenticated
+    permission delete = (message->delete + admin->member)
+    permission read = (((message->read + editor) + reader) + admin->member)
+    permission read_inbox = message->read_inbox
+    permission write = ((message->write + editor) + admin->member)
+}
+
+definition messaging/participant {
+    relation admin: angee/role // rebac:const=admin
+    relation editor: auth/group#member | auth/user
+    relation membership_thread: messaging/thread // rebac:field={"filters":{"message__isnull":true},"path":"thread"}
+    relation message: messaging/message // rebac:field=message
+    relation reader: auth/group#member | auth/user
+    relation thread: messaging/thread // rebac:field=thread
+
+    permission create = authenticated
+    permission delete = ((membership_thread->delete + message->delete) + admin->member)
+    permission read = ((((thread->read + message->read) + editor) + reader) + admin->member)
+    permission write = (((membership_thread->write + message->write) + editor) + admin->member)
+}
+
+definition messaging/reaction {
+    relation admin: angee/role // rebac:const=admin
+    relation editor: auth/group#member | auth/user
+    relation message: messaging/message // rebac:field=message
+    relation reader: auth/group#member | auth/user
+
+    permission create = authenticated
+    permission delete = (message->delete + admin->member)
+    permission read = (((message->read + editor) + reader) + admin->member)
+    permission write = ((message->write + editor) + admin->member)
+}
+
+definition messaging/thread {
+    relation admin: angee/role // rebac:const=admin
+    relation channel: messaging/channel // rebac:field=channel
+    relation editor: auth/group#member | auth/user
+    relation identity_role: provenance/role // rebac:const=messaging_identity_source
+    relation owner: auth/user // rebac:field=owner
+    relation project: projects/project // rebac:field=project_bindings__project
+    relation reader: auth/group#member | auth/user
+    relation record_event: calendar/event // rebac:field={"filters":{"attachments__role":"chatter"},"path":"attachments__calendar_calendarevent"}
+    relation record_page: knowledge/page // rebac:field={"filters":{"attachments__role":"chatter"},"path":"attachments__knowledge_page"}
+    relation record_project: projects/project // rebac:field={"filters":{"attachments__role":"chatter"},"path":"attachments__projects_project"}
+    relation record_task: projects/task // rebac:field={"filters":{"attachments__role":"chatter"},"path":"attachments__projects_task"}
+    relation selected_group: spaces/group // rebac:field=groups
+
+    permission annotate = (annotate_granted & read)
+    permission annotate_granted = (write + channel->annotate)
+    permission chatter_read = (((nil + record_event->read) + record_page->read) + (record_project->read + record_task->read))
+    permission create = authenticated
+    permission delete = ((owner + channel->delete) + admin->member)
+    permission identity_source = identity_role->effective_member
+    permission read = (read_granted + chatter_read)
+    permission read_granted = (((((((channel->read + owner) + editor) + reader) + identity_source) + admin->member) + project->read) + selected_group->read)
+    permission read_inbox = read_granted
+    permission share = ((owner + editor) + admin->member)
+    permission transfer = (owner + admin->member)
+    permission write = ((((((channel->write + owner) + editor) + identity_source) + admin->member) + project->write) + selected_group->post)
+    permission write__owner = transfer
+}
+
+definition messaging/thread_attachment {
+    relation admin: angee/role // rebac:const=admin
+    relation editor: auth/group#member | auth/user
+    relation event: calendar/event // rebac:field=target
+    relation file: storage/file // rebac:field=target
+    relation knowledge_page: knowledge/page // rebac:field=target
+    relation note: notes/note // rebac:field=target
+    relation project: projects/project // rebac:field=target
+    relation reader: auth/group#member | auth/user
+    relation round: proposals/round // rebac:field=target
+    relation source: messaging/thread_attachment // rebac:const={"filters":{"role":"source"},"target_id":"source"}
+    relation task: projects/task // rebac:field=target
+    relation thread: messaging/thread // rebac:field=thread
+
+    permission create = (source->retains & target_write)
+    permission delete = ((thread->write + (source->retains & target_write)) + admin->member)
+    permission read = (((thread->read + editor) + reader) + admin->member)
+    permission retains = authenticated
+    permission target_write = (((((file->write + event->write) + knowledge_page->write) + (task->write + project->write)) + round->write) + note->write)
+    permission write = ((thread->write + editor) + admin->member)
+}
+
+definition messaging/thread_follower {
+    relation admin: angee/role // rebac:const=admin
+    relation attachment: messaging/thread_attachment // rebac:field=attachment
+    relation thread: messaging/thread // rebac:field=thread
+    relation user: auth/user // rebac:field=party__person__user
+
+    permission create = authenticated
+    permission delete = (((user + thread->write) + attachment->write) + admin->member)
+    permission read = (((user + thread->read) + attachment->read) + admin->member)
+    permission write = (((user + thread->write) + attachment->write) + admin->member)
+}
+
+definition messaging/thread_notification {
+    relation admin: angee/role // rebac:const=admin
+    relation attachment: messaging/thread_attachment // rebac:field=attachment
+    relation message: messaging/message // rebac:field=message
+    relation thread: messaging/thread // rebac:field=thread
+    relation user: auth/user // rebac:field=user
+
+    permission create = authenticated
+    permission delete = (user + admin->member)
+    permission read = ((((user + thread->read) + attachment->read) + message->read) + admin->member)
+    permission read_inbox = user
+    permission write = (user + admin->member)
+}
+
+definition money/currency {
+    relation admin: angee/role // rebac:const=admin
+    relation manager: money/role:money_admin
+
+    permission create = (admin->member + manager->effective_member)
+    permission delete = (admin->member + manager->effective_member)
+    permission read = authenticated
+    permission write = (admin->member + manager->effective_member)
+}
+
+definition money/rate {
+    relation admin: angee/role // rebac:const=admin
+    relation manager: money/role:money_admin
+    relation shared: money/rate // rebac:const={"filters":{"context_content_type_id__isnull":true,"context_object_id":"","reference_currency_id__isnull":true},"target_id":"shared"}
+
+    permission create = (admin->member + manager->effective_member)
+    permission delete = (admin->member + manager->effective_member)
+    permission read = ((shared->shared_reader + admin->member) + manager->effective_member)
+    permission shared_reader = authenticated
+    permission write = (admin->member + manager->effective_member)
+}
+
+definition money/role {
+    relation admin: angee/role // rebac:const=admin
+    relation member: angee/role:admin#member | auth/group#member | auth/user
+
+    permission effective_member = (member + admin->member)
+}
+
+definition nexus/cadence {
+    relation party: parties/party // rebac:field=party
+    relation user: auth/user // rebac:field=user
+
+    permission create = (user & party->read_private)
+    permission delete = (user & party->read_private)
+    permission read = (user & party->read_private)
+    permission write = (user & party->read_private)
+}
+
+definition nexus/tie {
+    relation admin: angee/role // rebac:const=admin
+    relation party_a: parties/party // rebac:field=party_a
+    relation party_b: parties/party // rebac:field=party_b
+
+    permission create = admin->member
+    permission delete = admin->member
+    permission read = (party_a->read_private & party_b->read_private)
+    permission write = admin->member
+}
+
+definition notes/note {
+    relation admin: angee/role // rebac:const=admin
+    relation editor: auth/group#member | auth/user
+    relation owner: auth/user // rebac:field=owner
+    relation reader: auth/group#member | auth/user
+    relation reviewer: auth/user // rebac:field=reviewer
+    relation trigger_editor: notes/role // rebac:const=trigger_editor
+
+    permission create = authenticated
+    permission delete = (owner + admin->member)
+    permission read = (((((owner + editor) + reader) + reviewer) + trigger_editor->member) + admin->member)
+    permission read__is_starred = owner
+    permission read__reminder_at = owner
+    permission share = ((owner + editor) + admin->member)
+    permission transfer = (owner + admin->member)
+    permission write = (((owner + editor) + trigger_editor->member) + admin->member)
+    permission write__owner = transfer
+    permission write__status = (((owner + editor) + trigger_editor->member) + admin->member)
+}
+
+definition notes/role {
+    relation member: angee/role:admin#member | auth/user
+}
+
+definition operator/connection {
+    relation admin: angee/role // rebac:const=admin
+    relation reader: operator/role // rebac:const=operator_admin
+
+    permission read = (admin->member + reader->effective_member)
+}
+
+definition operator/role {
+    relation admin: angee/role // rebac:const=admin
+    relation includes: operator/role
+    relation member: angee/role:admin#member | auth/group#member | auth/user
+
+    permission effective_member = ((member + includes->effective_member) + admin->member)
+}
+
+definition parties/address {
+    relation admin: angee/role // rebac:const=admin
+    relation creator: auth/user // rebac:field=created_by
+    relation directory: integrate/integration // rebac:field=party__record_links__stream__integration
+    relation editor: auth/group#member | auth/user
+    relation reader: auth/group#member | auth/user
+    relation statement_role: provenance/role // rebac:const=parties_statement_source
+
+    permission create = authenticated
+    permission delete = (creator + admin->member)
+    permission read = read_granted
+    permission read_granted = ((((creator + editor) + reader) + statement_source) + admin->member)
+    permission statement_source = (directory + statement_role->effective_member)
+    permission write = (((creator + editor) + statement_source) + admin->member)
+}
+
+definition parties/circle {
+    relation admin: angee/role // rebac:const=admin
+    relation editor: auth/group#member | auth/user
+    relation owner: auth/user // rebac:field=owner
+    relation reader: auth/group#member | auth/user
+
+    permission create = authenticated
+    permission delete = (owner + admin->member)
+    permission read = (((owner + editor) + reader) + admin->member)
+    permission transfer = (owner + admin->member)
+    permission write = ((owner + editor) + admin->member)
+    permission write__owner = transfer
+}
+
+definition parties/circle_member {
+    relation admin: angee/role // rebac:const=admin
+    relation creator: auth/user // rebac:field=created_by
+    relation editor: auth/group#member | auth/user
+    relation reader: auth/group#member | auth/user
+
+    permission create = authenticated
+    permission delete = (creator + admin->member)
+    permission read = (((creator + editor) + reader) + admin->member)
+    permission write = ((creator + editor) + admin->member)
+}
+
+definition parties/directory {
+    relation admin: angee/role // rebac:const=admin
+    relation integration: integrate/integration // rebac:field=integration_ptr
+
+    permission create = admin->member
+    permission delete = (integration->write + admin->member)
+    permission read = (integration->read + admin->member)
+    permission write = (integration->write + admin->member)
+    permission write__owner = integration->transfer
+}
+
+definition parties/folder {
+    relation admin: angee/role // rebac:const=admin
+    relation directory: integrate/integration // rebac:field=record_links__stream__integration
+    relation editor: auth/group#member | auth/user
+    relation owner: auth/user // rebac:field=owner
+    relation reader: auth/group#member | auth/user
+
+    permission create = authenticated
+    permission delete = (owner + admin->member)
+    permission read = (((owner + editor) + reader) + admin->member)
+    permission transfer = (owner + admin->member)
+    permission write = ((owner + editor) + admin->member)
+    permission write__owner = transfer
+    permission write_statements = (write + directory)
+}
+
+definition parties/handle {
+    relation admin: angee/role // rebac:const=admin
+    relation calendar_event: calendar/event // rebac:field=event_attendees__event
+    relation creator: auth/user // rebac:field=created_by
+    relation directory: integrate/integration // rebac:field=party__record_links__stream__integration
+    relation editor: auth/group#member | auth/user
+    relation reader: auth/group#member | auth/user
+    relation statement_role: provenance/role // rebac:const=parties_statement_source
+
+    permission create = authenticated
+    permission delete = (creator + admin->member)
+    permission read = read_granted
+    permission read_granted = (((((creator + editor) + reader) + statement_source) + admin->member) + calendar_event->read)
+    permission statement_source = (directory + statement_role->effective_member)
+    permission write = ((creator + editor) + admin->member)
+}
+
+definition parties/organization {
+    relation admin: angee/role // rebac:const=admin
+    relation directory: integrate/integration // rebac:field=party_ptr__record_links__stream__integration
+    relation editor: auth/group#member | auth/user
+    relation owner: auth/user // rebac:field=owner
+    relation party: parties/party // rebac:field=party_ptr
+    relation reader: auth/group#member | auth/user
+    relation statement_role: provenance/role // rebac:const=parties_statement_source
+
+    permission create = authenticated
+    permission delete = (owner + admin->member)
+    permission read = read_granted
+    permission read__first_met_note = read_private
+    permission read__handle_count = read_private
+    permission read__notes = read_private
+    permission read_granted = (((((owner + editor) + reader) + party->identity_reader) + statement_source) + admin->member)
+    permission read_private = (((owner + editor) + reader) + admin->member)
+    permission statement_source = (directory + statement_role->effective_member)
+    permission write = (((owner + editor) + statement_source) + admin->member)
+    permission write__owner = party->transfer
+}
+
+definition parties/party {
+    relation admin: angee/role // rebac:const=admin
+    relation directory: integrate/integration // rebac:field=record_links__stream__integration
+    relation editor: auth/group#member | auth/user
+    relation filed_task: projects/task // rebac:field=needs__task
+    relation followed_thread: messaging/thread // rebac:field=thread_followers__thread
+    relation identity_reader: auth/group#member | auth/user
+    relation owner: auth/user // rebac:field=owner
+    relation reader: auth/group#member | auth/user
+    relation statement_role: provenance/role // rebac:const=parties_statement_source
+
+    permission create = authenticated
+    permission delete = (owner + admin->member)
+    permission read = read_granted
+    permission read__first_met_note = read_private
+    permission read__handle_count = read_private
+    permission read__notes = read_private
+    permission read_as_subject = (((owner + editor) + reader) + admin->member)
+    permission read_granted = (((((((owner + editor) + reader) + identity_reader) + statement_source) + admin->member) + filed_task->read) + followed_thread->read)
+    permission read_private = (((owner + editor) + reader) + admin->member)
+    permission statement_source = (directory + statement_role->effective_member)
+    permission transfer = (owner + admin->member)
+    permission write = (((owner + editor) + statement_source) + admin->member)
+    permission write__owner = transfer
+    permission write_as_subject = ((owner + editor) + admin->member)
+}
+
+definition parties/person {
+    relation admin: angee/role // rebac:const=admin
+    relation directory: integrate/integration // rebac:field=party_ptr__record_links__stream__integration
+    relation editor: auth/group#member | auth/user
+    relation filed_task: projects/task // rebac:field=needs__task
+    relation followed_thread: messaging/thread // rebac:field=party_ptr__thread_followers__thread
+    relation owner: auth/user // rebac:field=owner
+    relation party: parties/party // rebac:field=party_ptr
+    relation reader: auth/group#member | auth/user
+    relation statement_role: provenance/role // rebac:const=parties_statement_source
+
+    permission create = authenticated
+    permission delete = (owner + admin->member)
+    permission read = read_granted
+    permission read__anniversary = read_private
+    permission read__birthday = read_private
+    permission read__first_met_note = read_private
+    permission read__handle_count = read_private
+    permission read__nickname = read_private
+    permission read__notes = read_private
+    permission read_granted = (((((((owner + editor) + reader) + party->identity_reader) + statement_source) + admin->member) + filed_task->read) + followed_thread->read)
+    permission read_private = (((owner + editor) + reader) + admin->member)
+    permission statement_source = (directory + statement_role->effective_member)
+    permission write = (((owner + editor) + statement_source) + admin->member)
+    permission write__owner = party->transfer
+}
+
+definition parties/relationship {
+    relation admin: angee/role // rebac:const=admin
+    relation creator: auth/user // rebac:field=created_by
+    relation directory: integrate/integration // rebac:field=party__record_links__stream__integration
+    relation editor: auth/group#member | auth/user
+    relation other_directory: integrate/integration // rebac:field=other_party__record_links__stream__integration
+    relation reader: auth/group#member | auth/user
+    relation statement_role: provenance/role // rebac:const=parties_statement_source
+
+    permission create = authenticated
+    permission delete = (creator + admin->member)
+    permission read = read_granted
+    permission read_granted = ((((creator + editor) + reader) + statement_source) + admin->member)
+    permission statement_source = ((directory + other_directory) + statement_role->effective_member)
+    permission write = (((creator + editor) + statement_source) + admin->member)
+}
+
+definition parties/relationship_kind {
+    relation admin: angee/role // rebac:const=admin
+    relation creator: auth/user // rebac:field=created_by
+
+    permission create = authenticated
+    permission delete = (creator + admin->member)
+    permission read = authenticated
+    permission write = (creator + admin->member)
+}
+
+definition platform/addon {
+    relation admin: angee/role // rebac:const=admin
+
+    permission read = admin->member
+}
+
+definition platform/explorer {
+    relation admin: angee/role // rebac:const=admin
+
+    permission read = admin->member
+}
+
+definition platform_integrate_vcs/catalog {
+    relation admin: angee/role // rebac:const=admin
+
+    permission read = admin->member
+}
+
+definition portfolio/initiative {
+    relation manager: portfolio/role // rebac:const=portfolio_admin
+    relation owner: auth/user // rebac:field=owner
+
+    permission create = manager->effective_member
+    permission delete = (owner + manager->effective_member)
+    permission read = (authenticated + manager->effective_member)
+    permission transfer = (owner + manager->effective_member)
+    permission write = (owner + manager->effective_member)
+    permission write__owner = transfer
+}
+
+definition portfolio/initiative_project {
+    relation initiative: portfolio/initiative // rebac:field=initiative
+    relation manager: portfolio/role // rebac:const=portfolio_admin
+    relation project: projects/project // rebac:field=project
+
+    permission create = manager->effective_member
+    permission delete = manager->effective_member
+    permission read = (authenticated + manager->effective_member)
+    permission write = manager->effective_member
+}
+
+definition portfolio/product {
+    relation manager: portfolio/role // rebac:const=portfolio_admin
+    relation owner: auth/user // rebac:field=owner
+
+    permission create = manager->effective_member
+    permission delete = (owner + manager->effective_member)
+    permission read = (authenticated + manager->effective_member)
+    permission transfer = (owner + manager->effective_member)
+    permission write = (owner + manager->effective_member)
+    permission write__owner = transfer
+}
+
+definition portfolio/release {
+    relation manager: portfolio/role // rebac:const=portfolio_admin
+    relation product: portfolio/product // rebac:field=product
+
+    permission create = manager->effective_member
+    permission delete = manager->effective_member
+    permission read = (authenticated + manager->effective_member)
+    permission write = manager->effective_member
+}
+
+definition portfolio/role {
+    relation admin: angee/role // rebac:const=admin
+    relation member: angee/role:admin#member | auth/group#member | auth/user
+
+    permission effective_member = (member + admin->member)
+}
+
+definition portfolio/update {
+    relation initiative: portfolio/initiative // rebac:field=target
+    relation manager: portfolio/role // rebac:const=portfolio_admin
+    relation project: projects/project // rebac:field=target
+
+    permission create = ((project->write + initiative->write) + manager->effective_member)
+    permission delete = ((project->write + initiative->write) + manager->effective_member)
+    permission read = (authenticated + manager->effective_member)
+    permission write = ((project->write + initiative->write) + manager->effective_member)
+}
+
+definition posts/feed {
+    relation admin: angee/role // rebac:const=admin
+    relation channel: messaging/channel // rebac:field=channel_ptr
+    relation integration: integrate/integration // rebac:field=channel_ptr__integration_ptr
+
+    permission create = admin->member
+    permission delete = (channel->write + admin->member)
+    permission read = (channel->read + admin->member)
+    permission write = (channel->write + admin->member)
+    permission write__owner = integration->transfer
+}
+
+definition posts/feed_follow {
+    relation admin: angee/role // rebac:const=admin
+    relation creator: auth/user // rebac:field=created_by
+    relation editor: auth/group#member | auth/user
+    relation reader: auth/group#member | auth/user
+
+    permission create = authenticated
+    permission delete = (creator + admin->member)
+    permission read = (((creator + editor) + reader) + admin->member)
+    permission write = ((creator + editor) + admin->member)
+}
+
+definition posts/post_metrics {
+    relation admin: angee/role // rebac:const=admin
+    relation creator: auth/user // rebac:field=created_by
+    relation message: messaging/message // rebac:field=message
+
+    permission create = authenticated
+    permission delete = (creator + admin->member)
+    permission read = ((message->read + creator) + admin->member)
+    permission write = (creator + admin->member)
+}
+
+definition posts/quota {
+    relation admin: angee/role // rebac:const=admin
+    relation integration: integrate/integration // rebac:field=integration
+
+    permission create = admin->member
+    permission delete = (integration->write + admin->member)
+    permission read = (integration->read + admin->member)
+    permission write = (integration->write + admin->member)
+}
+
+definition projects/activity_type {
+    relation admin: angee/role // rebac:const=admin
+
+    permission create = admin->member
+    permission delete = admin->member
+    permission read = authenticated
+    permission write = admin->member
+}
+
+definition projects/link {
+    relation admin: angee/role // rebac:const=admin
+    relation project: projects/project // rebac:field=target
+    relation task: projects/task // rebac:field=target
+
+    permission create = ((project->write + task->write) + admin->member)
+    permission delete = ((project->write + task->write) + admin->member)
+    permission read = ((project->read + task->read) + admin->member)
+    permission write = ((project->write + task->write) + admin->member)
+}
+
+definition projects/milestone {
+    relation admin: angee/role // rebac:const=admin
+    relation directory: integrate/integration // rebac:field=record_links__stream__integration
+    relation project: projects/project // rebac:field=project
+
+    permission create = (project->write + admin->member)
+    permission delete = (project->write + admin->member)
+    permission reach = (project->write + admin->member)
+    permission read = (project->read + admin->member)
+    permission statement_source = directory
+    permission write = (project->write + admin->member)
+    permission write_statements = (write + statement_source)
+}
+
+definition projects/participant {
+    relation admin: angee/role // rebac:const=admin
+    relation project: projects/project // rebac:field=project
+
+    permission create = (project->write + admin->member)
+    permission delete = (project->write + admin->member)
+    permission read = (project->read + admin->member)
+    permission write = (project->write + admin->member)
+}
+
+definition projects/project {
+    relation admin: angee/role // rebac:const=admin
+    relation directory: integrate/integration // rebac:field=record_links__stream__integration
+    relation editor: auth/group#member | auth/user
+    relation owner: auth/user // rebac:field=owner
+    relation proposal_viewer: auth/group#member | auth/user
+    relation reader: auth/group#member | auth/user
+    relation round_responder: auth/user // rebac:field={"filters":{"proposal_rounds__proposals__retired_at__isnull":true},"path":"proposal_rounds__proposals__responder"}
+    relation source_proposal: proposals/proposal // rebac:field=source_proposal
+    relation team: spaces/group // rebac:field=team
+
+    permission create = authenticated
+    permission delete = (owner + admin->member)
+    permission read = (((((owner + reader) + editor) + admin->member) + (source_proposal->read_track + round_responder)) + team->post)
+    permission share = (((owner + editor) + admin->member) + source_proposal->manage)
+    permission statement_source = directory
+    permission transfer = (owner + admin->member)
+    permission write = ((((owner + editor) + admin->member) + source_proposal->write_track) + team->write)
+    permission write__owner = transfer
+    permission write__owns_items = share
+    permission write__team = share
+    permission write_statements = (write + statement_source)
+}
+
+definition projects/project_binding {
+    relation admin: angee/role // rebac:const=admin
+    relation drive: storage/drive // rebac:field=target
+    relation folder: storage/folder // rebac:field=target
+    relation integration: integrate/integration // rebac:field=target
+    relation project: projects/project // rebac:field=project
+    relation thread: messaging/thread // rebac:field=target
+    relation vault: knowledge/vault // rebac:field=target
+
+    permission create = (project->share & target_share)
+    permission delete = (project->share & target_share)
+    permission read = (project->read + admin->member)
+    permission target_share = ((((drive->share + folder->write) + integration->write) + thread->share) + vault->share)
+    permission write = nil
+}
+
+definition projects/task {
+    relation admin: angee/role // rebac:const=admin
+    relation all_responders_question: proposals/round // rebac:field={"filters":{"assignee__isnull":true,"clarification_by_manager":true,"clarification_passed_at__isnull":false},"path":"clarification_round"}
+    relation assignee: auth/user // rebac:field=assignee
+    relation clarification_asker: auth/user // rebac:field={"filters":{"clarification_surrendered":false},"path":"clarification_asker"}
+    relation clarification_recipient: auth/user // rebac:field={"filters":{"clarification_round__isnull":false},"path":"assignee"}
+    relation clarification_round: proposals/round // rebac:field=clarification_round
+    relation comment_asker: auth/user // rebac:field=clarification_asker
+    relation directory: integrate/integration // rebac:field=record_links__stream__integration
+    relation editor: auth/group#member | auth/user
+    relation inherited_project: projects/project // rebac:field={"filters":{"visibility":"inherited"},"path":"project"}
+    relation inherited_queue: work/queue // rebac:field={"filters":{"stage__isnull":false,"visibility":"inherited"},"path":"queue"}
+    relation manager_asked_round: proposals/round // rebac:field={"filters":{"clarification_by_manager":true},"path":"clarification_round"}
+    relation named_round: proposals/round // rebac:field={"filters":{"clarification_round__clarification_askers":"named"},"path":"clarification_round"}
+    relation owner: auth/user // rebac:field=owner
+    relation parent: projects/task // rebac:field=parent
+    relation project: projects/project // rebac:field=project
+    relation promoted_project: projects/project // rebac:field=promoted_projects
+    relation proposal_viewer: auth/group#member | auth/user
+    relation queue: work/queue // rebac:field=queue
+    relation reader: auth/group#member | auth/user
+    relation requester: auth/user // rebac:field=needs__admitted_user
+    relation responder_shared_round: proposals/round // rebac:field={"filters":{"shared_with_responders":true},"path":"project__source_proposal__round"}
+    relation round_responder: auth/user // rebac:field={"filters":{"proposal_rounds__proposals__retired_at__isnull":true},"path":"proposal_rounds__proposals__responder"}
+    relation shared_clarification_round: proposals/round // rebac:field={"filters":{"visibility":"inherited"},"path":"clarification_round"}
+    relation subject_initiative: portfolio/initiative // rebac:field=subject
+    relation subject_note: notes/note // rebac:field=subject
+    relation subject_page: knowledge/page // rebac:field=subject
+    relation subject_party: parties/party // rebac:field=subject
+    relation subject_product: portfolio/product // rebac:field=subject
+    relation subject_project: projects/project // rebac:field=subject
+    relation subject_round: proposals/round // rebac:field=subject
+    relation subject_task: projects/task // rebac:field=subject
+    relation subject_vault: knowledge/vault // rebac:field=subject
+    relation track_proposal: proposals/proposal // rebac:field=project__source_proposal
+    relation trashed: projects/task // rebac:const={"filters":{"is_trashed":true},"target_id":"trashed"}
+    relation unbound: projects/task // rebac:const={"filters":{"subject_object_id__isnull":true},"target_id":"unbound"}
+
+    permission comment = (((((((((comment_granted & unbound->free) + subject_write) - withheld) - concealed) - comment_withheld) - subject_withheld) + concealed_keeper) + admin->member) + (read & (((clarification_round->manage + comment_asker) + clarification_recipient) + all_responders_question->respond)))
+    permission comment_granted = ((write_granted + requester) + inherited_queue->post)
+    permission comment_withheld = (nil + ((comment_granted & clarification_round->discuss_clarification) - (((clarification_round->manage + comment_asker) + clarification_recipient) + all_responders_question->respond)))
+    permission conceal = authenticated
+    permission concealed = trashed->conceal
+    permission concealed_keeper = (delete_granted & concealed)
+    permission create = (((unbound->free + subject_write) - subject_withheld) + admin->member)
+    permission delete = (((((((delete_granted & unbound->free) + subject_write) - subject_withheld) - withheld) - concealed) + concealed_keeper) + admin->member)
+    permission delete_granted = ((inherited_project->write + owner) + inherited_queue->write)
+    permission free = authenticated
+    permission keeper_as_subject = owner
+    permission narrow = (write + (clarification_asker - clarification_round->retired))
+    permission read = ((((((((read_granted & unbound->free) + subject_read) - withheld) - concealed) - subject_withheld) + concealed_keeper) + subject_keeper) + admin->member)
+    permission read__clarification_asker = (((clarification_round->manage + clarification_asker) + named_round->read) + manager_asked_round->read)
+    permission read_as_subject = (((((owner + assignee) + reader) + editor) + admin->member) + inherited_queue->read)
+    permission read_granted = (((((((inherited_project->read + owner) + assignee) + reader) + editor) + requester) + (((((round_responder + shared_clarification_round->respond) + clarification_asker) + responder_shared_round->respond) + track_proposal->manage) + clarification_round->manage)) + inherited_queue->read)
+    permission read_promoted_phase = (promoted_project->read + admin->member)
+    permission restore = delete
+    permission share = (((((((share_granted & unbound->free) + subject_write) - withheld) - concealed) - subject_withheld) + concealed_keeper) + admin->member)
+    permission share_granted = ((((inherited_project->share + owner) + editor) + (track_proposal->manage + clarification_round->manage)) + inherited_queue->write)
+    permission statement_source = directory
+    permission subject_keeper = (nil + subject_task->keeper_as_subject)
+    permission subject_read = ((((nil + (subject_product->read + subject_initiative->read)) + ((((subject_task->read_as_subject + subject_project->read) + subject_party->read_as_subject) + subject_page->read_as_subject) + subject_vault->read_as_subject)) + subject_round->manage) + subject_note->read)
+    permission subject_withheld = (nil + subject_task->withheld_as_subject)
+    permission subject_write = ((((nil + (subject_product->write + subject_initiative->write)) + ((((subject_task->write_as_subject + subject_project->write) + subject_party->write_as_subject) + subject_page->write_as_subject) + subject_vault->write_as_subject)) + subject_round->manage) + subject_note->write)
+    permission transfer = ((((owner & unbound->free) + subject_write) - subject_withheld) + admin->member)
+    permission widen = ((((((project->share + owner) & unbound->free) + subject_write) - subject_withheld) + admin->member) + clarification_round->manage)
+    permission withheld = (nil + clarification_round->retired)
+    permission withheld_as_subject = concealed
+    permission write = (((((((((write_granted & unbound->free) + subject_write) - withheld) - concealed) - write_withheld) - subject_withheld) + concealed_keeper) + admin->member) + ((track_proposal->manage + clarification_round->manage) & read))
+    permission write__assignee = share
+    permission write__owner = transfer
+    permission write_as_subject = ((((owner + assignee) + editor) + admin->member) + inherited_queue->write)
+    permission write_granted = ((((inherited_project->write + owner) + assignee) + editor) + inherited_queue->write)
+    permission write_statements = (write + statement_source)
+    permission write_withheld = (nil + clarification_recipient)
+}
+
+definition projects/task_relation {
+    relation admin: angee/role // rebac:const=admin
+    relation related_task: projects/task // rebac:field=related_task
+    relation task: projects/task // rebac:field=task
+
+    permission create = (task->write + admin->member)
+    permission delete = (task->write + admin->member)
+    permission read = ((task->read & related_task->read) + admin->member)
+    permission write = (task->write + admin->member)
+}
+
+definition proposals/answer {
+    relation narrowed: proposals/proposal // rebac:field={"filters":{"visibility":"responder"},"path":"proposal"}
+    relation proposal: proposals/proposal // rebac:field=proposal
+    relation reader: auth/group#member | auth/user
+    relation responder_shared_round: proposals/round // rebac:field={"filters":{"shared_with_responders":true},"path":"proposal__round"}
+    relation round: proposals/round // rebac:field=proposal__round
+    relation shared: proposals/proposal // rebac:field={"filters":{"visibility":"round"},"path":"proposal"}
+
+    permission create = proposal->write
+    permission delete = ((proposal->manage + shared->drafter) + narrowed->drafter)
+    permission manage = proposal->manage
+    permission narrow = ((manage + shared->responder) + narrowed->responder)
+    permission read = (manage + ((((shared->read_answers + narrowed->read_narrowed) + reader) + responder_shared_round->respond) - round->retired))
+    permission write = ((proposal->manage + shared->drafter) + narrowed->drafter)
+}
+
+definition proposals/proposal {
+    relation disclosed_round: proposals/round // rebac:field={"filters":{"disclosed_at__isnull":false},"path":"round"}
+    relation drafter: auth/user // rebac:field={"filters":{"retired_at__isnull":true,"round__closed_at__isnull":true,"state":"draft"},"path":"responder"}
+    relation private_round: proposals/round // rebac:field={"filters":{"round__opening_policy":"facilitator_only"},"path":"round"}
+    relation published_round: proposals/round // rebac:field={"filters":{"track_published_at__isnull":false},"path":"round"}
+    relation publisher: auth/user // rebac:field={"filters":{"retired_at__isnull":true,"round__status":"opened"},"path":"responder"}
+    relation reader: auth/group#member | auth/user
+    relation responder: auth/user // rebac:field={"filters":{"retired_at__isnull":true},"path":"responder"}
+    relation round: proposals/round // rebac:field=round
+
+    permission create = round->manage
+    permission delete = (drafter + round->manage)
+    permission evaluate = (round->evaluate + round->manage)
+    permission manage = round->manage
+    permission oversee = ((((reader + round->evaluate) + round->requester) + round->view_proposals) - round->retired)
+    permission peer_read = disclosed_round->recipient
+    permission publish = (publisher + round->manage)
+    permission read = read_answers
+    permission read__confidence = read_offer
+    permission read__cost = read_offer
+    permission read__currency = read_offer
+    permission read__responder = ((responder + round->manage) + round->see_roster)
+    permission read__source_message = read_offer
+    permission read__staffing = read_offer
+    permission read__statement = read_offer
+    permission read__timeframe_end = read_offer
+    permission read__timeframe_start = read_offer
+    permission read__valid_until = read_offer
+    permission read_answers = ((round->manage + read_narrowed) + peer_read)
+    permission read_narrowed = (responder + oversee)
+    permission read_offer = ((round->manage + responder) + ((round->evaluate + round->requester) - round->retired))
+    permission read_track = ((round->manage + responder) + (published_round->receive_track - private_round->receive_track))
+    permission read_track_status = (read_track + round->roster_status)
+    permission share = round->share
+    permission withdraw = (responder + round->manage)
+    permission write = (drafter + round->manage)
+    permission write_track = (responder + round->manage)
+}
+
+definition proposals/review {
+    relation person: iam/kind // rebac:const=person
+    relation proposal: proposals/proposal // rebac:field=proposal
+    relation reviewer: auth/user // rebac:field=reviewer
+
+    permission create = (reviewer & proposal->evaluate)
+    permission delete = (reviewer & person->active_member)
+    permission read = (reviewer + proposal->evaluate)
+    permission write = (reviewer & person->active_member)
+}
+
+definition proposals/role {
+    relation admin: angee/role // rebac:const=admin
+    relation member: angee/role:admin#member | auth/group#member | auth/user
+
+    permission effective_member = (member + admin->member)
+}
+
+definition proposals/round {
+    relation admin: angee/role // rebac:const=admin
+    relation evaluator: auth/group#member | auth/user
+    relation facilitator: auth/user // rebac:field=facilitator
+    relation global_viewer: proposals/role // rebac:const=proposal_viewer
+    relation person: iam/kind // rebac:const=person
+    relation project: projects/project // rebac:field=project
+    relation proposal_viewer: auth/group#member | auth/user
+    relation reader: auth/group#member | auth/user
+    relation recipient: auth/user // rebac:field={"filters":{"proposals__disclosed_at__isnull":false,"proposals__retired_at__isnull":true},"path":"proposals__responder"}
+    relation requester: auth/user // rebac:field=requester_party__person__user
+    relation responder: auth/user // rebac:field={"filters":{"proposals__retired_at__isnull":true},"path":"proposals__responder"}
+    relation retired: auth/user // rebac:field={"filters":{"proposals__retired_at__isnull":false},"path":"proposals__responder"}
+    relation roster_names: auth/user // rebac:field={"filters":{"proposals__retired_at__isnull":true,"roster_visibility":"named"},"path":"proposals__responder"}
+    relation status_roster_responder: auth/user // rebac:field={"filters":{"proposals__retired_at__isnull":true,"roster_visibility":"status"},"path":"proposals__responder"}
+    relation task: projects/task // rebac:field=task
+    relation task_project: projects/project // rebac:field={"filters":{"task__visibility":"inherited"},"path":"task__project"}
+    relation team: spaces/group // rebac:field=team
+    relation track_recipient: auth/user // rebac:field={"filters":{"proposals__retired_at__isnull":true,"proposals__submitted_at__isnull":false},"path":"proposals__responder"}
+
+    permission ask = (manage + respond)
+    permission create = ((task->write + project->write) + admin->member)
+    permission delete = manage
+    permission discuss_clarification = authenticated
+    permission evaluate = (evaluator & person->active_member)
+    permission manage = (((facilitator + team->write) & person->active_member) + admin->member)
+    permission read = ((manage + team->post) + (((((respond + reader) + evaluate) + requester) + view_proposals) - retired))
+    permission read__clarification_askers = manage
+    permission read__roster_visibility = manage
+    permission receive_track = (recipient + track_recipient)
+    permission respond = responder
+    permission roster_status = (manage + status_roster_responder)
+    permission see_roster = ((manage + roster_names) + roster_status)
+    permission share = manage
+    permission view_proposals = (((((proposal_viewer + project->proposal_viewer) + task->proposal_viewer) + task_project->proposal_viewer) + global_viewer->effective_member) + admin->member)
+    permission write = manage
+}
+
+definition proposals/topic {
+    relation round: proposals/round // rebac:field=round
+
+    permission create = round->write
+    permission delete = round->write
+    permission read = round->read
+    permission write = round->write
+}
+
+definition provenance/changeset {
+    relation actor: auth/user | provenance/rule | provenance/seed
+    relation actor_integration: integrate/integration
+    relation admin: angee/role // rebac:const=admin
+
+    permission create = ((actor + admin->member) + actor_integration)
+    permission delete = nil
+    permission read = ((actor + admin->member) + actor_integration)
+    permission write = ((actor + admin->member) + actor_integration)
+}
+
+definition provenance/role {
+    relation member: angee/role:admin#member | provenance/rule | provenance/seed
+
+    permission effective_member = member
+}
+
+definition provenance/rule {
+    relation admin: angee/role // rebac:const=admin
+
+    permission create = admin->member
+    permission delete = nil
+    permission read = (authenticated + admin->member)
+    permission write = admin->member
+}
+
+definition provenance/seed {
+    relation admin: angee/role // rebac:const=admin
+
+    permission create = admin->member
+    permission delete = nil
+    permission read = (authenticated + admin->member)
+    permission write = admin->member
+}
+
+definition sequence/role {
+    relation admin: angee/role // rebac:const=admin
+    relation includes: sequence/role
+    relation member: angee/role:admin#member | auth/group#member | auth/user
+
+    permission effective_member = ((member + includes->effective_member) + admin->member)
+}
+
+definition sequence/sequence {
+    relation admin: angee/role // rebac:const=admin
+    relation manager: sequence/role:sequence_admin
+
+    permission create = (admin->member + manager->effective_member)
+    permission delete = (admin->member + manager->effective_member)
+    permission read = (admin->member + manager->effective_member)
+    permission write = (admin->member + manager->effective_member)
+}
+
+definition spaces/group {
+    relation admin: angee/role // rebac:const=admin
+    relation owner: auth/user // rebac:field=owner
+    relation reader: spaces/group // rebac:const={"filters":{"visibility":"public"},"target_id":"shared"}
+    relation roster_member: auth/user // rebac:field={"filters":{"memberships__is_confirmed":true,"memberships__is_dismissed":false,"memberships__role":"member"},"path":"memberships__party__person__user"}
+    relation roster_moderator: auth/user // rebac:field={"filters":{"memberships__is_confirmed":true,"memberships__is_dismissed":false,"memberships__role":"moderator"},"path":"memberships__party__person__user"}
+    relation roster_owner: auth/user // rebac:field={"filters":{"memberships__is_confirmed":true,"memberships__is_dismissed":false,"memberships__role":"owner"},"path":"memberships__party__person__user"}
+    relation roster_viewer: auth/user // rebac:field={"filters":{"memberships__is_confirmed":true,"memberships__is_dismissed":false,"memberships__role":"viewer"},"path":"memberships__party__person__user"}
+
+    permission create = authenticated
+    permission delete = ((owner + roster_owner) + admin->member)
+    permission manage_roster = ((owner + roster_owner) + admin->member)
+    permission post = ((((owner + roster_member) + roster_moderator) + roster_owner) + admin->member)
+    permission read = ((((((owner + roster_viewer) + roster_member) + roster_moderator) + roster_owner) + reader->shared_reader) + admin->member)
+    permission shared_reader = authenticated
+    permission transfer = (owner + admin->member)
+    permission write = (((owner + roster_moderator) + roster_owner) + admin->member)
+    permission write__owner = transfer
+}
+
+definition spaces/membership {
+    relation admin: angee/role // rebac:const=admin
+    relation group: spaces/group // rebac:field=group
+    relation holder: auth/user // rebac:field={"filters":{"is_confirmed":true,"is_dismissed":false},"path":"party__person__user"}
+    relation member_of: spaces/group // rebac:field={"filters":{"role":"member"},"path":"group"}
+    relation viewer_of: spaces/group // rebac:field={"filters":{"role":"viewer"},"path":"group"}
+
+    permission create = (((group->manage_roster + member_of->write) + viewer_of->write) + admin->member)
+    permission delete = (((group->manage_roster + member_of->write) + viewer_of->write) + admin->member)
+    permission read = (group->read + admin->member)
+    permission set_notifications = holder
+    permission write = (((group->manage_roster + member_of->write) + viewer_of->write) + admin->member)
+    permission write__group = admin->member
+    permission write__role = (group->manage_roster + admin->member)
+}
+
+definition storage/backend {
+    relation admin: angee/role // rebac:const=admin
+    relation manager: storage/role // rebac:const=storage_admin
+
+    permission create = (admin->member + manager->effective_member)
+    permission delete = (admin->member + manager->effective_member)
+    permission read = (admin->member + manager->effective_member)
+    permission write = (admin->member + manager->effective_member)
+}
+
+definition storage/drive {
+    relation admin: angee/role // rebac:const=admin
+    relation editor: auth/group#member | auth/user | auth/user:*
+    relation manager: storage/role // rebac:const=storage_admin
+    relation owner: auth/user // rebac:field=owner
+    relation project: projects/project // rebac:field=project_bindings__project
+    relation viewer: auth/group#member | auth/user | auth/user:*
+
+    permission create = (admin->member + manager->effective_member)
+    permission delete = ((owner + admin->member) + manager->effective_member)
+    permission read = (((((owner + editor) + viewer) + admin->member) + manager->effective_member) + project->read)
+    permission share = ((((owner + editor) + admin->member) + manager->effective_member) + project->share)
+    permission transfer = (owner + admin->member)
+    permission write = ((((owner + editor) + admin->member) + manager->effective_member) + project->write)
+    permission write__owner = transfer
+    permission write__owns_items = share
+}
+
+definition storage/file {
+    relation admin: angee/role // rebac:const=admin
+    relation draft_owner: auth/user // rebac:field={"filters":{"upload_state":"draft"},"path":"owner"}
+    relation drive: storage/drive // rebac:field=drive
+    relation folder: storage/folder // rebac:field=folder
+    relation inherited_drive: storage/drive // rebac:field={"filters":{"visibility":"inherited"},"path":"drive"}
+    relation inherited_folder: storage/folder // rebac:field={"filters":{"visibility":"inherited"},"path":"folder"}
+    relation inherited_owner: auth/user // rebac:field={"filters":{"visibility":"inherited"},"path":"owner"}
+    relation message_part: messaging/part // rebac:field=message_parts
+    relation note_record: notes/note // rebac:field={"filters":{"visibility":"record"},"path":"attachments__note"}
+    relation owner: auth/user // rebac:field=owner
+    relation task_record: projects/task // rebac:field={"filters":{"visibility":"record"},"path":"attachments__task"}
+    relation trashed: storage/file // rebac:const={"filters":{"is_trashed":true},"target_id":"trashed"}
+    relation viewer: auth/group#member | auth/user | auth/user:*
+
+    permission conceal = authenticated
+    permission delete = ((owner_writer + inherited_drive->write) + admin->member)
+    permission owner_writer = ((inherited_owner + draft_owner) + (owner & write_granted))
+    permission read = ((read_granted - withheld) + delete)
+    permission read_granted = ((((((((inherited_drive->read + inherited_folder->read) + inherited_owner) + draft_owner) + viewer) + admin->member) + message_part->read) + task_record->read) + note_record->read)
+    permission share = ((share_granted - withheld) + delete)
+    permission share_granted = (((inherited_drive->share + inherited_owner) + admin->member) + task_record->share)
+    permission transfer = (owner_writer + admin->member)
+    permission withheld = trashed->conceal
+    permission write = (((((((inherited_drive->write + inherited_folder->write) + inherited_owner) + draft_owner) + admin->member) + write_granted) - withheld) + delete)
+    permission write__owner = transfer
+    permission write_granted = ((nil + task_record->write) + note_record->write)
+}
+
+definition storage/file_attachment {
+    relation admin: angee/role // rebac:const=admin
+    relation file: storage/file // rebac:field=file
+    relation note: notes/note // rebac:field=target
+    relation task: projects/task // rebac:field=target
+
+    permission create = target_write
+    permission delete = (file->write + admin->member)
+    permission read = (file->read + admin->member)
+    permission target_write = ((nil + task->write) + note->write)
+    permission write = (file->write + admin->member)
+}
+
+definition storage/folder {
+    relation admin: angee/role // rebac:const=admin
+    relation drive: storage/drive // rebac:field=drive
+    relation home_project: projects/project // rebac:field=projects
+    relation owner: auth/user // rebac:field=owner
+    relation parent: storage/folder // rebac:field=parent
+    relation project: projects/project // rebac:field=project_bindings__project
+
+    permission delete = ((drive->write + owner) + admin->member)
+    permission read = ((((drive->read + parent->read) + owner) + admin->member) + (project->read + home_project->read))
+    permission transfer = (owner + admin->member)
+    permission write = ((((drive->write + parent->write) + owner) + admin->member) + (project->write + home_project->write))
+    permission write__owner = transfer
+}
+
+definition storage/role {
+    relation admin: angee/role // rebac:const=admin
+    relation includes: storage/role
+    relation member: angee/role:admin#member | auth/group#member | auth/user
+
+    permission effective_member = ((member + includes->effective_member) + admin->member)
+}
+
+definition storage_integrate/mount {
+    relation admin: angee/role // rebac:const=admin
+    relation integration: integrate/integration // rebac:field=integration_ptr
+
+    permission create = admin->member
+    permission delete = (integration->write + admin->member)
+    permission read = (integration->read + admin->member)
+    permission write = (integration->write + admin->member)
+    permission write__owner = integration->transfer
+}
+
+definition tags/role {
+    relation admin: angee/role // rebac:const=admin
+    relation member: angee/role:admin#member | auth/group#member | auth/user
+
+    permission effective_member = (member + admin->member)
+}
+
+definition tags/tag {
+    relation admin: angee/role // rebac:const=admin
+    relation manager: tags/role // rebac:const=tags_admin
+
+    permission create = (admin->member + manager->effective_member)
+    permission delete = (admin->member + manager->effective_member)
+    permission read = ((authenticated + admin->member) + manager->effective_member)
+    permission write = (admin->member + manager->effective_member)
+}
+
+definition tags/tag_assignment {
+    relation admin: angee/role // rebac:const=admin
+    relation event: calendar/event // rebac:field=target
+    relation file: storage/file // rebac:field=target
+    relation handle: parties/handle // rebac:field=target
+    relation message: messaging/message // rebac:field=target
+    relation page: knowledge/page // rebac:field=target
+    relation party: parties/party // rebac:field=target
+    relation project: projects/project // rebac:field=target
+    relation tag: tags/tag // rebac:field=tag
+    relation task: projects/task // rebac:field=target
+    relation thread: messaging/thread // rebac:field=target
+
+    permission create = target_write
+    permission delete = target_write
+    permission read = ((tag->read & target_read) + admin->member)
+    permission target_read = ((((((nil + event->read) + page->read) + (thread->read + message->read)) + (party->read + handle->read)) + (task->read + project->read)) + file->read)
+    permission target_write = ((((((nil + event->write) + page->write) + (thread->annotate + message->annotate)) + (party->write + handle->write)) + (task->write + project->write)) + file->write)
+    permission write = nil
+}
+
+definition tags/tag_category {
+    relation admin: angee/role // rebac:const=admin
+    relation manager: tags/role // rebac:const=tags_admin
+
+    permission create = (admin->member + manager->effective_member)
+    permission delete = (admin->member + manager->effective_member)
+    permission read = ((authenticated + admin->member) + manager->effective_member)
+    permission write = (admin->member + manager->effective_member)
+}
+
+definition uom/category {
+    relation admin: angee/role // rebac:const=admin
+    relation manager: uom/role:uom_admin
+
+    permission create = (admin->member + manager->effective_member)
+    permission delete = (admin->member + manager->effective_member)
+    permission read = ((authenticated + admin->member) + manager->effective_member)
+    permission write = (admin->member + manager->effective_member)
+}
+
+definition uom/role {
+    relation admin: angee/role // rebac:const=admin
+    relation member: angee/role:admin#member | auth/group#member | auth/user
+
+    permission effective_member = (member + admin->member)
+}
+
+definition uom/uom {
+    relation admin: angee/role // rebac:const=admin
+    relation manager: uom/role:uom_admin
+
+    permission create = (admin->member + manager->effective_member)
+    permission delete = (admin->member + manager->effective_member)
+    permission read = ((authenticated + admin->member) + manager->effective_member)
+    permission write = (admin->member + manager->effective_member)
+}
+
+definition work/cycle {
+    relation queue: work/queue // rebac:field=queue
+
+    permission create = queue->write
+    permission delete = queue->write
+    permission read = queue->read
+    permission write = queue->write
+}
+
+definition work/queue {
+    relation group: spaces/group // rebac:field=group_ptr
+
+    permission create = authenticated
+    permission delete = group->delete
+    permission post = group->post
+    permission read = (group->write + (group->read - withheld))
+    permission share = group->manage_roster
+    permission withheld = nil
+    permission write = group->write
+    permission write__owner = group->transfer
+}
+
+definition work/stage {
+    relation queue: work/queue // rebac:field=queue
+
+    permission create = queue->write
+    permission delete = queue->write
+    permission read = queue->read
+    permission write = queue->write
+}
+
+definition workflows/run {
+    relation admin: angee/role // rebac:const=admin
+    relation operator: auth/group#member | auth/user
+    relation parent: workflows/run // rebac:field=parent_step__run
+    relation reader: auth/group#member | auth/user
+    relation run_as: auth/user // rebac:field=run_as
+    relation workflow: workflows/workflow // rebac:field=version__workflow
+
+    permission create = (workflow->start + admin->member)
+    permission delete = admin->member
+    permission operate = (((run_as + operator) + workflow->operator) + admin->member)
+    permission read = (((operate + workflow->monitor) + reader) + parent->read)
+    permission read__error = write
+    permission write = (operate + workflow->write)
+}
+
+definition workflows/step_attempt {
+    relation admin: angee/role // rebac:const=admin
+    relation step_run: workflows/step_run // rebac:field=step_run
+
+    permission create = admin->member
+    permission delete = admin->member
+    permission read = (step_run->read + admin->member)
+    permission read__error = step_run->read_error
+    permission read__stacktrace = step_run->operate
+    permission write = admin->member
+}
+
+definition workflows/step_record {
+    relation admin: angee/role // rebac:const=admin
+    relation run: workflows/run // rebac:field=run
+
+    permission create = admin->member
+    permission delete = admin->member
+    permission read = (run->read + admin->member)
+    permission write = admin->member
+}
+
+definition workflows/step_run {
+    relation admin: angee/role // rebac:const=admin
+    relation run: workflows/run // rebac:field=run
+
+    permission create = admin->member
+    permission delete = admin->member
+    permission operate = run->operate
+    permission read = (run->read + admin->member)
+    permission read_error = operate
+    permission write = admin->member
+}
+
+definition workflows/step_watch {
+    relation admin: angee/role // rebac:const=admin
+    relation step_run: workflows/step_run // rebac:field=step_run
+
+    permission create = admin->member
+    permission delete = admin->member
+    permission read = (step_run->read + admin->member)
+    permission write = admin->member
+}
+
+definition workflows/trigger {
+    relation admin: angee/role // rebac:const=admin
+    relation workflow: workflows/workflow // rebac:field=workflow
+
+    permission create = (workflow->write + admin->member)
+    permission delete = (workflow->write + admin->member)
+    permission monitor = (workflow->monitor + admin->member)
+    permission read = (workflow->read + admin->member)
+    permission write = (workflow->write + admin->member)
+}
+
+definition workflows/trigger_event {
+    relation admin: angee/role // rebac:const=admin
+    relation started_run: workflows/run // rebac:field=started_run
+    relation trigger: workflows/trigger // rebac:field=trigger
+
+    permission create = admin->member
+    permission delete = admin->member
+    permission read = ((trigger->write + started_run->operate) + admin->member)
+    permission write = admin->member
+}
+
+definition workflows/version {
+    relation admin: angee/role // rebac:const=admin
+    relation workflow: workflows/workflow // rebac:field=workflow
+
+    permission create = (workflow->write + admin->member)
+    permission delete = admin->member
+    permission read = (workflow->read + admin->member)
+    permission write = admin->member
+}
+
+definition workflows/workflow {
+    relation admin: angee/role // rebac:const=admin
+    relation continues: workflows/workflow
+    relation editor: auth/group#member | auth/user
+    relation operator: auth/group#member | auth/user
+    relation owner: auth/user // rebac:field=owner
+    relation principal: auth/user // rebac:field=user
+    relation starter: auth/group#member | auth/user
+    relation viewer: auth/group#member | auth/user
+
+    permission create = admin->member
+    permission delete = (owner + admin->member)
+    permission monitor = (((owner + editor) + viewer) + admin->member)
+    permission read = (((((owner + editor) + viewer) + starter) + operator) + admin->member)
+    permission read__draft = monitor
+    permission read__draft_revision = monitor
+    permission read__layout = monitor
+    permission start = ((((((principal + owner) + editor) + starter) + operator) + continues->principal) + admin->member)
+    permission transfer = (owner + admin->member)
+    permission write = ((owner + editor) + admin->member)
+    permission write__owner = transfer
+}
