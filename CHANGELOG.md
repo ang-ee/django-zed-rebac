@@ -204,6 +204,8 @@ pre-1.0; breaking changes within a minor version are explicitly called out.
 - System check `rebac.E028`: a setting whose value has a type it does not accept (above). System check
   `rebac.W015`: the same for a setting the library does not read.
 
+- Database check `rebac.W014`: the stored policy lets a name be read two ways (Changed).
+
 ### Changed
 
 - `rebac.E018` accepts `REBAC_TRACKED_MODELS` as a tuple of labels, as the library already read it.
@@ -213,7 +215,72 @@ pre-1.0; breaking changes within a minor version are explicitly called out.
   effect. The settings catalog described a swappable relationship model, a default consistency, an `accessible()`
   cache with a TTL and an expiration task that the library does not have. They stay accepted in this release.
 
+- **Structural prefetch delivers children below parents admitted under an action that implies the arm's**
+  (proposal 0022, experimental, `REBAC_STRUCTURAL_PREFETCH`). A child's arm `rel->T` was accepted only below
+  parents admitted under `T` itself, so a list that admits rows under one action and reads their children under
+  another read every child statement in full. The arm is now accepted when the policy proves that holding the
+  parent's action grants `T` on the parent's type (`rebac.structural.implies`): from equal expressions, unions,
+  dropped conjuncts, exclusions whose subtrahend withholds no less, and arrows over a relation of one subject type,
+  with every name read as the compiler reads it. A recursive permission is opened on the held side only, and in a
+  subtrahend on neither side; several subject types, two relations, an exclusion or a conjunct added on the right
+  are refused, and nothing is proven while the policy carries an override of any kind, nor about a type that reads
+  a name two ways (a relation named as a built-in compared equal to the built-in inside an expression). Each rule is
+  sound; the search may miss a true implication. The proof is kept per policy, and `rebac.structural.explain(...)`
+  says why an edge is refused. `rebac.structural.edges()` lists, for the policy in force
+  (`rebac.structural.current_policy()`, which `explain` and `parent_implies_children` take when none is passed;
+  for tests and tooling, never a request path),
+  every foreign key the mechanism serves and the parent actions under which it serves the child's read; it agrees
+  with what a delivery does on the same policy (experimental). On the benchmark's application policy at the small
+  size, a page of 25 messages admitted under their inbox action, with parts, participants, reactions and stars,
+  fell from 535 KB and 484 ms to 62 KB and 52 ms for the heavy member, with equal results. With the setting off no
+  statement changes.
+
+- **New input may not read a name two ways** (`rebac.schema.ast.name_conflicts`, the rules `validate_schema`
+  states): a built-in's name (`authenticated`, `anonymous`) as a relation, a definition or a relation's subject
+  type, and a name declared twice (two relations, two permissions, or a relation and a permission). Only
+  `rebac sync` and `rebac check` ran those rules. `LocalBackend.set_schema()` and `rebac.testing.install_schema()`
+  now refuse such a `Schema` built in code with `SchemaError`, and so does a write to the stored policy (through
+  the schema models' managers, `schema_changes()` or `rebac sync`) that adds such a place: one the composed policy
+  holds when the outermost write owner exits and did not hold when it started, each place counted once per
+  occurrence. A place already stored blocks no other write,
+  and renaming it is a repair. A stored policy that already holds one, written directly to its tables, loads and
+  decides as in 0.37.0, and the database check **`rebac.W014`** reports each place (a warning, so that `migrate`
+  proceeds; `manage.py check` without `--database` does not run it). The experimental read mechanisms prove nothing
+  from such a policy and leave its compiled statements in place: structural prefetch proves nothing about such a
+  type (the parent's, the child's, or one an arrow lifts to), and the bounded walk and the row scope refuse the
+  whole policy. A parsed schema that `rebac sync` accepts is unaffected.
+
 ### Fixed
+
+- **A stored expression that does not parse no longer blocks the write that repairs it** (0.25.0 and later). The
+  write owner reads every stored override, expired ones included, when a write starts, and so does every decision.
+  An override whose expression does not parse (written past the guards), expired or in force, made every decision
+  raise and every policy write raise as it started, the one deleting that override included: the policy could not
+  be repaired through the API. Such a policy is now one being repaired, as one that does not compose already was:
+  the write is not validated again, and the override can be deleted through the API. Decisions keep raising until
+  it is. A stored permission whose expression does not parse is treated the same way: it can be repaired too.
+
+- **A stored policy loads whatever its names contain.** The local backend refused to load a policy (0.17.1 and
+  later), and to install one with `set_schema()` (0.17.0 and later), for every `validate_schema` finding whose text
+  contained `"backing"` or `"backed relation"`, meant to catch the backed relations' shape. A finding that only named a type,
+  relation or permission containing `backing` (`doc/backing`, `feedbacking`) was taken for one: a stored policy
+  with an unknown reference in such a type failed every protected read, every write gated by the policy and the
+  database checks, where the same policy under another name loaded and decided. With the name rule below, a
+  relation and a permission both named `backing` would have done the same. The rules the runtime enforces are now
+  chosen by what they check (`rebac.schema.parser.backing_errors` and the subject relations), never by their
+  message; the messages are unchanged.
+
+- **Structural prefetch delivers children only under the policy their parents were scoped under**
+  (`REBAC_STRUCTURAL_PREFETCH`, experimental and off by default; 0.36.0 and later). An eager `scoped()` queryset
+  keeps the statement it was built with. Prefetched after an in-process `LocalBackend.set_schema()` (what
+  `rebac.testing.install_schema()` calls) installed another policy, its rows delivered the children the new policy
+  grants to holders of the parents' action, though the parents were shown to hold it under the old policy alone:
+  children that neither policy grants. (After a stored-policy write, `rebac sync` included, the eager statement's
+  revision fence reads no parent, so nothing was delivered.) The
+  scope now carries, beside its decision, the key of the policy it was built under
+  (`rebac.compile.read.policy_key`); the parents' rows are admitted with that key, and children are delivered only
+  under the same one. An evaluation reads one pinned policy throughout, its prefetches included, so what a
+  prefetch delivers within one evaluation is unchanged.
 
 - **Statements are valid under psycopg's server-side binding and prepared statements.** With Django's
   PostgreSQL option `server_side_binding: True`, parameters reach PostgreSQL apart from the statement, and it

@@ -329,7 +329,8 @@ class Definition:
 # What a name means where the compiler reads it. The permission compiler, the reachability
 # its program and its caveat verdicts follow (compile.program, compile.conditions), and the
 # union arms structural prefetch proves an edge from, which the bounded walk's "prove" mode
-# reads too (structural._union_arms), resolve names through these two.
+# reads too (structural._union_arms), and the implication prover resolve names through these
+# two.
 
 
 def is_builtin_reference(name: str) -> bool:
@@ -355,6 +356,59 @@ def member(definition: Definition, name: str) -> Relation | Permission | None:
         if permission.name == name:
             return permission
     return None
+
+
+def name_conflicts(definition: Definition) -> list[str]:
+    """Where ``definition`` lets a name be read two ways, one sentence per place; empty when nowhere.
+
+    A built-in's name (``is_builtin_reference``) is the actor's state inside an
+    expression: no definition is one, no relation carries one and no relation admits
+    one as a subject type. A name is declared once, as one relation or as one
+    permission: ``member`` reads a relation first, and a reader that asked for a
+    permission of the name would read another thing. ``validate_schema`` states these
+    rules; the backend refuses new input that adds a place breaking one, a stored
+    policy that already holds one keeps loading (``rebac.W014``), and the experimental
+    read mechanisms refuse a policy that holds one.
+
+    A place counts once per occurrence: a name declared three times as a relation is
+    two places.
+    """
+    type_ = definition.resource_type
+    found: list[str] = []
+    if type_ in BUILTIN_ACTOR_TYPES:
+        found.append(
+            f"{type_!r} is a reserved built-in actor and cannot be declared as a definition"
+        )
+    relations: set[str] = set()
+    for relation in definition.relations:
+        if relation.name in BUILTIN_ACTOR_TYPES:
+            found.append(
+                f"{type_}#{relation.name}: reserved built-in actors cannot be declared as relations"
+            )
+        if relation.name in relations:
+            found.append(f"{type_}#{relation.name}: duplicate relation name")
+        relations.add(relation.name)
+        for subject in relation.allowed_subjects:
+            if subject.type in BUILTIN_ACTOR_TYPES:
+                found.append(
+                    f"{type_}#{relation.name}: reserved built-in actor {subject.type!r} is valid "
+                    "only inside permission expressions"
+                )
+    permissions: set[str] = set()
+    for permission in definition.permissions:
+        if permission.name in permissions:
+            found.append(f"{type_}#{permission.name}: duplicate permission name")
+        elif permission.name in relations:
+            found.append(
+                f"{type_}#{permission.name}: name collision between a relation and a permission"
+            )
+        permissions.add(permission.name)
+    return found
+
+
+def schema_name_conflicts(schema: Schema) -> list[str]:
+    """``name_conflicts`` of every definition of ``schema``, in order."""
+    return [found for definition in schema.definitions for found in name_conflicts(definition)]
 
 
 @dataclass

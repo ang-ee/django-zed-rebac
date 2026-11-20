@@ -22,8 +22,11 @@ SCHEMA = """
 definition auth/user {}
 definition scope/thread {
     relation reader: auth/user
+    relation auditor: auth/user
+    relation muted: auth/user
     permission read = reader
-    permission audit = reader
+    permission audit = auditor
+    permission inbox = reader - muted
 }
 definition scope/message {
     relation thread: scope/thread // rebac:field=thread
@@ -82,10 +85,12 @@ def proves(
     )  # fmt: skip
 
 
-def threads_with_messages(actor: SubjectRef = MEMBER, **kwargs):
-    """Each readable thread's message ids, and the statements that read them."""
-    queryset = ScopeThread.objects.with_actor(actor).rebac_prefetch_related(
-        "scopemessage_set", **kwargs
+def threads_with_messages(actor: SubjectRef = MEMBER, action: str = "read"):
+    """Each thread the actor holds ``action`` on, its readable message ids, and the statements."""
+    queryset = (
+        ScopeThread.objects.with_actor(actor)
+        .with_action(action)
+        .rebac_prefetch_related("scopemessage_set")
     )
     with CaptureQueriesContext(connection) as captured:
         found = {
@@ -97,9 +102,28 @@ def threads_with_messages(actor: SubjectRef = MEMBER, **kwargs):
 def test_a_union_arm_through_the_foreign_key_proves_the_children():
     assert proves(SCHEMA)
     assert proves(SCHEMA, child=ScopePart, fk="message", parent=ScopeMessage)
-    # The arm names another action of the parent: holding ``audit`` proves nothing.
+    # The arm names another action of the parent: holding ``audit`` does not grant ``read``.
     assert not proves(SCHEMA, parent_action="audit")
     assert not proves(SCHEMA, action="write")
+    # Holding ``inbox`` (``reader - muted``) does (proposal 0022).
+    assert proves(SCHEMA, parent_action="inbox")
+
+
+def test_why_an_edge_is_refused_is_explained():
+    policy_ = policy(SCHEMA)
+
+    def why(**kwargs):
+        edge = {"child_model": ScopeMessage, "fk_name": "thread", "parent_model": ScopeThread}
+        return structural.explain(
+            policy_, **{**edge, "child_action": "read", "parent_action": "read", **kwargs}
+        )
+
+    assert why() is None and why(parent_action="inbox") is None
+    assert why(parent_action="audit") == (
+        "thread->read: audit is not proven to grant read on scope/thread"
+    )
+    assert why(parent_action="share") == "scope/thread has no permission share"
+    assert why(fk_name="other") == "no arm of read's union goes through other"
 
 
 @pytest.mark.parametrize(
@@ -141,6 +165,106 @@ def test_children_of_admitted_parents_are_read_without_their_permission_statemen
     # A plain read by foreign key: no relationship row, no id set.
     assert "rebac_" not in child
     assert '"thread_id" IN' in child
+
+
+def test_children_of_parents_admitted_under_an_action_that_grants_theirs_are_delivered(
+    rows, structural_on
+):
+    """Threads admitted under ``inbox``; their messages read under ``read``, whose arm is
+    ``thread->read``: holding ``inbox`` on a thread grants ``read`` on it (proposal 0022)."""
+    local = install_schema(SCHEMA)
+    local.write_relationships(
+        [
+            grant("scope/thread", 1, "reader"),
+            grant("scope/thread", 2, "reader"),
+            grant("scope/thread", 2, "muted"),
+        ]
+    )
+    found, statements = threads_with_messages(action="inbox")
+    # The muted thread is not in the inbox; its message is not read through it.
+    assert found == {1: [1, 2]}
+    child = next(sql for sql in statements if 'FROM "testapp_scopemessage"' in sql)
+    assert "rebac_" not in child
+    assert '"thread_id" IN' in child
+
+
+def test_children_of_parents_admitted_under_an_action_that_does_not_grant_theirs_are_scoped(
+    rows, structural_on
+):
+    local = install_schema(SCHEMA)
+    local.write_relationships(
+        [
+            grant("scope/thread", 1, "auditor"),
+            grant("scope/thread", 2, "auditor"),
+            grant("scope/message", 1, "direct"),
+        ]
+    )
+    found, statements = threads_with_messages(action="audit")
+    # An auditor reads a message only by its own grant.
+    assert found == {1: [1], 2: []}
+    assert "rebac_" in next(sql for sql in statements if 'FROM "testapp_scopemessage"' in sql)
+
+
+def test_each_edge_is_kept_with_its_parent_action():
+    policy_ = policy(SCHEMA)
+
+    def proven(parent_action: str) -> bool:
+        return structural.parent_implies_children(
+            policy_, child_model=ScopeMessage, fk_name="thread", parent_model=ScopeThread,
+            child_action="read", parent_action=parent_action,
+        )  # fmt: skip
+
+    assert proven("inbox")
+    assert not proven("audit")
+    assert proven("inbox")
+
+
+def test_a_child_query_must_name_only_admitted_parents(rows):
+    install_schema(SCHEMA)
+    [first] = ScopeThread._base_manager.filter(pk=1)
+    with structural.delivering(MEMBER, ScopeThread, "read", [first]):
+
+        def delivered(*threads: int) -> bool:
+            query = ScopeMessage.objects.filter(thread_id__in=threads).query
+            return structural.delivers(query, ScopeMessage, MEMBER, "read", using="default")
+
+        assert delivered(1)
+        # Thread 2 was not admitted: a query that may read its messages is not delivered.
+        assert not delivered(1, 2)
+
+
+def test_a_filtered_backing_is_refused():
+    schema = SCHEMA.replace(
+        "relation message: scope/message // rebac:field=message\n    permission read = message->read",
+        'relation message: scope/message // rebac:field={"path":"message","filters":{"fragment_id":1}}'
+        "\n    permission read = message->read",
+    )
+    assert schema != SCHEMA
+    assert not proves(schema, child=ScopePart, fk="message", parent=ScopeMessage)
+    assert structural.explain(
+        policy(schema), child_model=ScopePart, fk_name="message", parent_model=ScopeMessage,
+        child_action="read", parent_action="read",
+    ) == "message->read: the backing is filtered"  # fmt: skip
+
+
+def refusal(schema: str, child, fk: str, parent) -> str | None:
+    """Why the edge ``child.fk`` is refused below parents held under ``read``, if it is."""
+    edge = {"child_model": child, "fk_name": fk, "parent_model": parent}
+    return structural.explain(policy(schema), **edge, child_action="read", parent_action="read")
+
+
+@pytest.mark.parametrize("shape", ["tree", "mutual"])
+def test_an_edge_inside_a_recursion_is_refused_with_its_reason(shape):
+    from tests.test_structural_depth_frontier import MUTUAL, TREE
+    from tests.testapp.models import Folder, Post
+
+    schema, child, fk = (TREE, Folder, "parent") if shape == "tree" else (MUTUAL, Post, "folder")
+    assert refusal(schema, child, fk, Folder) == (
+        f"{fk}->read: read on blog/folder is recursive with read: the child reads it one hop "
+        "deeper than its parent was admitted at"
+    )
+    # An arrow into the recursion from outside it is read with the whole limit.
+    assert refusal(TREE, Post, "folder", Folder) is None
 
 
 def test_off_by_default_every_prefetch_is_scoped(rows):
@@ -229,9 +353,11 @@ def test_children_read_after_the_prefetch_are_scoped(rows, structural_on):
     assert any("rebac_" in q["sql"] for q in captured.captured_queries)
 
 
-def prefetched(actor):
-    threads = ScopeThread.objects.with_actor(actor).rebac_prefetch_related(
-        "scopemessage_set__scopepart_set"
+def prefetched(actor, action="read"):
+    threads = (
+        ScopeThread.objects.with_actor(actor)
+        .with_action(action)
+        .rebac_prefetch_related("scopemessage_set__scopepart_set")
     )
     return {
         thread.pk: {
@@ -247,16 +373,19 @@ def prefetched(actor):
 def test_structural_delivery_reads_what_scoped_prefetches_read(seed, storage, settings):
     """Random policies with unions, intersections, exclusions, caveats, wildcards and subject sets:
     with the setting on, a nested prefetch returns exactly what it returns with the setting off,
-    inside an evaluator scope and outside one."""
+    inside an evaluator scope and outside one, with the threads admitted under each of their
+    actions (the inherited-witness policies give threads ``view`` beside ``read``)."""
     generate = subtracting if seed % 2 else build
     seeded(*generate(seed), storage, settings)
+    actions = ("read", "view") if generate is build else ("read",)
     for actor in (SubjectRef.of("auth/user", "admin"), MEMBER):
-        settings.REBAC_STRUCTURAL_PREFETCH = False
-        expected = prefetched(actor)
-        settings.REBAC_STRUCTURAL_PREFETCH = True
-        assert prefetched(actor) == expected, (actor, seed)
-        with evaluator_scope():
-            assert prefetched(actor) == expected, (actor, seed)
+        for action in actions:
+            settings.REBAC_STRUCTURAL_PREFETCH = False
+            expected = prefetched(actor, action)
+            settings.REBAC_STRUCTURAL_PREFETCH = True
+            assert prefetched(actor, action) == expected, (actor, action, seed)
+            with evaluator_scope():
+                assert prefetched(actor, action) == expected, (actor, action, seed)
 
 
 def test_the_mechanisms_of_one_read_are_compared_side_by_side(rows):
@@ -285,3 +414,23 @@ def test_the_mechanisms_of_one_read_are_compared_side_by_side(rows):
         "best_ms",
         "result",
     ]
+
+
+def test_parents_admitted_under_an_implying_action_compare_equal(rows):
+    from rebac.testing import compare_mechanisms
+
+    local = install_schema(SCHEMA)
+    local.write_relationships(
+        [
+            grant("scope/thread", 1, "reader"),
+            grant("scope/thread", 2, "reader"),
+            grant("scope/thread", 2, "muted"),
+        ]
+    )
+    report = compare_mechanisms(
+        lambda: threads_with_messages(action="inbox")[0],
+        {"REBAC_STRUCTURAL_PREFETCH": (False, True)},
+        repeats=1,
+    )
+    assert [row["result"] for row in report] == ["baseline", "same"]
+    assert report[1]["sql_kb"] < report[0]["sql_kb"]

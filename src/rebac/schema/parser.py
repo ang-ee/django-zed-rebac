@@ -32,6 +32,7 @@ from .ast import (
     Schema,
     backing_from_dict,
     backing_to_dict,
+    name_conflicts,
 )
 
 _HEADER_RE = re.compile(r"^//\s*@(?P<key>[A-Za-z_][A-Za-z0-9_]*)\s*:\s*(?P<value>.+?)\s*$")
@@ -653,57 +654,15 @@ def validate_schema(schema: Schema) -> list[str]:
         errors.extend(_caveat_identifier_errors(caveat.name, caveat.expression, declared))
 
     for definition in schema.definitions:
-        if definition.resource_type in BUILTIN_ACTOR_TYPES:
-            errors.append(
-                f"{definition.resource_type!r} is a reserved built-in actor "
-                "and cannot be declared as a definition"
-            )
+        # Names read one way: the rules the backend also holds new input to (name_conflicts).
+        errors.extend(name_conflicts(definition))
         relation_names = {r.name for r in definition.relations}
         permission_names = {p.name for p in definition.permissions}
-        if len(relation_names) != len(definition.relations):
-            errors.append(f"{definition.resource_type}: duplicate relation name")
-        if len(permission_names) != len(definition.permissions):
-            errors.append(f"{definition.resource_type}: duplicate permission name")
 
         for relation in definition.relations:
-            if relation.name in BUILTIN_ACTOR_TYPES:
-                errors.append(
-                    f"{definition.resource_type}#{relation.name}: "
-                    "reserved built-in actors cannot be declared as relations"
-                )
-            if relation.backing is not None:
-                try:
-                    backing_from_dict(backing_to_dict(relation.backing))
-                except (ValueError, TypeError) as exc:
-                    errors.append(f"{definition.resource_type}#{relation.name}: {exc}")
-                if len(relation.allowed_subjects) != 1:
-                    errors.append(
-                        f"{definition.resource_type}#{relation.name}: "
-                        "backed relation must declare exactly one subject type"
-                    )
-                if relation.with_expiration:
-                    errors.append(
-                        f"{definition.resource_type}#{relation.name}: "
-                        "backed relation cannot use expiration"
-                    )
+            # The backed relation's shape: what the runtime also refuses (backing_errors).
+            errors.extend(_relation_backing_errors(definition, relation))
             for sub in relation.allowed_subjects:
-                if relation.backing is not None:
-                    if sub.wildcard or sub.relation or sub.id:
-                        errors.append(
-                            f"{definition.resource_type}#{relation.name}: "
-                            "backed relation must point at one concrete type"
-                        )
-                    if sub.with_caveat:
-                        errors.append(
-                            f"{definition.resource_type}#{relation.name}: "
-                            "backed relation cannot use a caveat"
-                        )
-                if sub.type in BUILTIN_ACTOR_TYPES:
-                    errors.append(
-                        f"{definition.resource_type}#{relation.name}: "
-                        f"reserved built-in actor {sub.type!r} is valid only "
-                        "inside permission expressions"
-                    )
                 # An unresolved target definition may belong to another package,
                 # so fragment validation defers it until the effective schema is
                 # loaded. When the target is present, however, its
@@ -722,13 +681,45 @@ def validate_schema(schema: Schema) -> list[str]:
                     perm.expression, definition, perm.name, relation_names, permission_names
                 )
             )
-        # Detect duplicate names within a definition.
-        all_names = list(relation_names) + list(permission_names)
-        if len(all_names) != len(set(all_names)):
-            errors.append(
-                f"{definition.resource_type}: name collision between relations and permissions"
-            )
 
+    return errors
+
+
+def backing_errors(schema: Schema) -> list[str]:
+    """The backed relations of ``schema`` whose shape the runtime cannot evaluate.
+
+    A backing that does not round-trip, more or fewer than one subject type, a
+    subject that is not one concrete type, a caveat or an expiration. These are
+    the rules of ``validate_schema`` that the local backend enforces at
+    installation and when it loads a stored policy, chosen by what they check,
+    never by what their message says.
+    """
+    return [
+        error
+        for definition in schema.definitions
+        for relation in definition.relations
+        for error in _relation_backing_errors(definition, relation)
+    ]
+
+
+def _relation_backing_errors(definition: Definition, relation: Relation) -> list[str]:
+    if relation.backing is None:
+        return []
+    errors: list[str] = []
+    place = f"{definition.resource_type}#{relation.name}"
+    try:
+        backing_from_dict(backing_to_dict(relation.backing))
+    except (ValueError, TypeError) as exc:
+        errors.append(f"{place}: {exc}")
+    if len(relation.allowed_subjects) != 1:
+        errors.append(f"{place}: backed relation must declare exactly one subject type")
+    if relation.with_expiration:
+        errors.append(f"{place}: backed relation cannot use expiration")
+    for sub in relation.allowed_subjects:
+        if sub.wildcard or sub.relation or sub.id:
+            errors.append(f"{place}: backed relation must point at one concrete type")
+        if sub.with_caveat:
+            errors.append(f"{place}: backed relation cannot use a caveat")
     return errors
 
 

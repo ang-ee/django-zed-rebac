@@ -594,8 +594,10 @@ def _without_scope(node: WhereNode) -> WhereNode:
 
 def _without_query_scope(query: Query) -> Query:
     clone = query.clone()
-    # The decision belongs to the scope removed here (RebacQuerySet._apply_scope_in_place).
+    # The decision belongs to the scope removed here (RebacQuerySet._apply_scope_in_place),
+    # and so does the policy it was built under (``_scope_query``).
     clone.__dict__.pop("_rebac_scope_for", None)
+    clone.__dict__.pop("_rebac_scope_policy", None)
     if isinstance(clone, _RebacQuery) and clone._rebac_boolean_operand:
         clone._rebac_check = None
         clone._rebac_checked = False
@@ -1427,6 +1429,12 @@ class RebacQuerySet(models.QuerySet[_M]):
         """
         root = query if root is None else root
         using = self.db if using is None else using
+        if query is root:
+            # The policy this scope is built under, carried with its decision: children
+            # are delivered under the rows it reads only under that policy (proposal 0022).
+            cast(Any, query)._rebac_scope_policy = (
+                structural.policy_key() if structural.enabled() else None
+            )
         for operand in _nested_queries(query.where, boolean_operands_only=True):
             self._scope_query(operand, actor, root=root, using=using)
             if isinstance(operand, _RebacQuery):
@@ -1774,24 +1782,28 @@ class RebacQuerySet(models.QuerySet[_M]):
         rows: list[Any] = list(native._iterable_class(reading))
         self._stamp(rows, actor, sudo)
         # These rows are the ones this actor holds the action on: a prefetch
-        # may deliver the children the policy grants with them (proposal 0020).
+        # may deliver the children the policy grants with them (proposal 0020),
+        # under the policy their scope was built under (``_scope_query``), which
+        # the query carries with its decision.
+        pinned = getattr(query, "_rebac_scope_policy", None)
         admits = (
             actor is not None
             and not sudo
             and bool(model_resource_type(self.model))
             and structural.enabled()
+            and pinned is not None
         )
         action = str(
             self._rebac_action or getattr(self.model._meta, "rebac_default_action", "read")
         )
         if admits and actor is not None:
             # Read inside a running prefetch: the parents of its next level.
-            structural.admit(actor, self.model, action, rows)
+            structural.admit(actor, self.model, action, rows, policy=pinned)
         lookups = native._prefetch_related_lookups
         prefetching = bool(lookups) and not native._prefetch_done
         if prefetching:
             if admits and actor is not None:
-                with structural.delivering(actor, self.model, action, rows):
+                with structural.delivering(actor, self.model, action, rows, policy=pinned):
                     models.prefetch_related_objects(rows, *lookups)
             else:
                 models.prefetch_related_objects(rows, *lookups)

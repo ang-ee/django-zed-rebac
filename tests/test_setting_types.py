@@ -405,6 +405,7 @@ def test_a_database_check_that_cannot_run_fails_a_database_run():
         "rebac.E015",
         "rebac.E016",
         "rebac.E018",
+        "rebac.W014",
     }
     assert all("check_policy_models did not run" in issue.msg for issue in reported)
 

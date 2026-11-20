@@ -114,6 +114,28 @@ def inbox(bench: Any, actor: Any) -> Any:
     return [(t.pk, sorted((m.pk, len(m.parts.all())) for m in t.messages.all())) for t in threads]
 
 
+def inbox_messages(bench: Any, actor: Any) -> Any:
+    """The newest messages of the actor's inbox (``read_inbox``), each with its parts, people,
+    reactions and stars, which are read under ``read`` through ``message->read``."""
+    messages = (
+        bench.models["messaging.Message"]
+        .objects.with_actor(actor)
+        .with_action("read_inbox")
+        .order_by("-pk")
+        .rebac_prefetch_related("parts", "participants", "reactions", "stars")[:25]
+    )
+    return [
+        (
+            m.pk,
+            sorted(p.pk for p in m.parts.all()),
+            sorted(p.pk for p in m.participants.all()),
+            sorted(r.pk for r in m.reactions.all()),
+            sorted(s.pk for s in m.stars.all()),
+        )
+        for m in messages
+    ]
+
+
 def selected(bench: Any, actor: Any) -> Any:
     """One message with what a reader shows: its thread, sender, parts and files, people, reactions."""
     pk = bench.readable("messaging.Message", actor)
@@ -240,6 +262,7 @@ def point(bench: Any, actor: Any) -> Any:
 
 SCENARIOS = {
     "inbox": inbox,
+    "inbox_messages": inbox_messages,
     "selected": selected,
     "transcript": transcript,
     "files": files,

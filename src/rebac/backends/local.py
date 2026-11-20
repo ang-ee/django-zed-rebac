@@ -93,15 +93,26 @@ class _LoadedSchema(tuple[Schema, datetime | None]):
 
 
 def _enforced_schema_errors(schema: Schema) -> list[str]:
-    """Return contracts the local runtime must reject before evaluation."""
-    from ..schema.parser import subject_relation_errors, validate_schema
+    """Return contracts the local runtime must reject before evaluation.
 
-    backing_errors = [
-        error
-        for error in validate_schema(schema)
-        if "backed relation" in error or "backing" in error
-    ]
-    return backing_errors + subject_relation_errors(schema)
+    The backed relations' shape and the subject relations, chosen by the rule
+    that found them. Other ``validate_schema`` findings (an unknown reference,
+    a name read two ways) do not stop a policy from loading, whatever names it
+    uses.
+    """
+    from ..schema.parser import backing_errors, subject_relation_errors
+
+    return backing_errors(schema) + subject_relation_errors(schema)
+
+
+def _name_conflicts(schema: Schema) -> list[str]:
+    """Where ``schema`` lets a name be read two ways (``rebac.schema.ast.name_conflicts``),
+    refused in new input: a built-in's name as a relation, a definition or a subject
+    type, and a name declared twice. A stored policy that holds one keeps loading
+    (``rebac.W014``)."""
+    from ..schema.ast import schema_name_conflicts
+
+    return schema_name_conflicts(schema)
 
 
 _UNENFORCED = "permissions are not enforced"
@@ -219,8 +230,13 @@ class LocalBackend:
     # ---------- Schema management ----------
 
     def set_schema(self, schema: Schema) -> None:
-        """Install the in-memory schema. Called by the sync command."""
-        schema_errors = _enforced_schema_errors(schema)
+        """Install an in-memory schema in place of the stored policy
+        (``rebac.testing.install_schema``).
+
+        Each of its names must be read one way (``rebac.schema.ast.name_conflicts``),
+        whoever built it.
+        """
+        schema_errors = _name_conflicts(schema) + _enforced_schema_errors(schema)
         if schema_errors:
             raise SchemaError("; ".join(schema_errors))
         from ..schema.serialization import digest

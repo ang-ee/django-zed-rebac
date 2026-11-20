@@ -73,6 +73,9 @@ def main() -> None:
     census.add_argument("--size", default="small")
     census.add_argument("--actor", default="light")
     census.add_argument("--json", default="")
+    edges = commands.add_parser("edges")
+    edges.add_argument("--parent", default="messaging.Message")
+    edges.add_argument("--action", default="read_inbox")
     arguments = parser.parse_args()
 
     os.environ.setdefault("DJANGO_SETTINGS_MODULE", "tests.settings_bench")
@@ -91,6 +94,9 @@ def main() -> None:
         call_command("migrate", app, verbosity=0)
     call_command("migrate", run_syncdb=True, verbosity=0)
     install_schema(standins.POLICY)
+    if arguments.command == "edges":
+        edges_of(standins.MODELS, arguments.parent, arguments.action)
+        return
     if arguments.command == "smoke":
         bench = data.load(settings.REBAC_BENCH_POLICY, "tiny")
         data.build(bench)
@@ -273,7 +279,7 @@ def census_of(bench: Any, who: str) -> dict[str, Any]:
     from rebac import rowscope, structural
 
     actor = bench.actor(who)
-    policy = structural._policy()
+    policy = structural.current_policy()
     program, schema = policy.program, policy.schema
     found: dict[str, Any] = {}
     for label, model in sorted(bench.models.items()):
@@ -296,6 +302,40 @@ def census_of(bench: Any, who: str) -> dict[str, Any]:
         print(
             f"  {label:<34}{entry['relations']:>5} relations  {'rows' if entry['applies'] else '; '.join(entry['blocked'])[:90]}"
         )
+    return found
+
+
+def edges_of(models: dict[str, Any], parent_label: str, action: str) -> list[dict[str, Any]]:
+    """Each model with a foreign key to ``parent_label``: are its children delivered by structural
+    prefetch (``read``) when the parents were admitted under ``read``, and under ``action``?"""
+    from django.db.models import ForeignKey
+
+    from rebac import structural
+
+    policy = structural.current_policy()
+    parent = models[parent_label]
+    found: list[dict[str, Any]] = []
+    for label, model in sorted(models.items()):
+        for field in model._meta.get_fields():
+            if not isinstance(field, ForeignKey) or field.related_model is not parent:
+                continue
+            row: dict[str, Any] = {"child": label, "fk": field.name}
+            for admitted in dict.fromkeys(("read", action)):
+                row[admitted] = structural.explain(
+                    policy,
+                    child_model=model,
+                    fk_name=field.name,
+                    parent_model=parent,
+                    child_action="read",
+                    parent_action=admitted,
+                )
+            found.append(row)
+    print(f"children of {parent_label} read under read, with the parent admitted under:")
+    for row in found:
+        print(f"  {row['child'] + '.' + row['fk']:<44}")
+        for admitted in dict.fromkeys(("read", action)):
+            reason = row[admitted]
+            print(f"      {admitted:<12}{'delivered' if reason is None else 'scoped: ' + reason}")
     return found
 
 

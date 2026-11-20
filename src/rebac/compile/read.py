@@ -51,6 +51,7 @@ from rebac.schema.ast import (
     PermExpr,
     PermRef,
     Schema,
+    schema_name_conflicts,
 )
 from rebac.schema.cache import SchemaSnapshot, schema_operation
 from rebac.schema.walker import find_permission, find_relation
@@ -197,6 +198,10 @@ class _Policy:
     profiled: list[tuple[tuple[str, ...], tuple[str, ...], tuple[str, ...]]] = field(
         default_factory=list
     )
+    # Where the policy lets a name be read two ways (``rebac.schema.ast.name_conflicts``):
+    # only a stored policy from before the rule was held at runtime. The experimental read
+    # mechanisms refuse such a policy.
+    name_conflicts: tuple[str, ...] = ()
 
     @property
     def schema(self) -> Schema:
@@ -213,18 +218,29 @@ def _schema(backend: LocalBackend) -> tuple[Schema, SchemaSnapshot]:
     return snapshot.schema, snapshot
 
 
-def _policy(backend: LocalBackend) -> _Policy:
-    from rebac.models import SchemaOverride
-
-    _effective, snapshot = _schema(backend)
+def _key_of(backend: LocalBackend, snapshot: SchemaSnapshot) -> tuple[Any, ...]:
     baseline = snapshot.baseline or snapshot.schema
-    key = (
+    return (
         snapshot.using,
         snapshot.revision,
         backend._schema_is_manual,
         id(baseline),
         tuple(getattr(row, "pk", None) for row in snapshot.overrides),
     )
+
+
+def policy_key(backend: LocalBackend) -> tuple[Any, ...]:
+    """The key of the policy ``_policy`` would return now, without building it."""
+    _effective, snapshot = _schema(backend)
+    return _key_of(backend, snapshot)
+
+
+def _policy(backend: LocalBackend) -> _Policy:
+    from rebac.models import SchemaOverride
+
+    _effective, snapshot = _schema(backend)
+    baseline = snapshot.baseline or snapshot.schema
+    key = _key_of(backend, snapshot)
     selected_at = timezone.now()
     with _lock:
         kept = _policies.get(key)
@@ -277,6 +293,7 @@ def _policy(backend: LocalBackend) -> _Policy:
         CompileProgram.build(tagged.schema, tagged=tagged),
         selected_at,
         deadlines,
+        name_conflicts=tuple(schema_name_conflicts(tagged.schema)),
     )
     if not ahead:
         # A deadline ahead will change a prebuilt scope's composition, so a

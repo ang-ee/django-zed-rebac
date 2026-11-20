@@ -563,6 +563,46 @@ default), and returns the backend. It builds nothing: permissions on `using`
 are decided from the rows already stored.
 `rebac.backends.reset_backend()` undoes it; call it in teardown.
 
+#### Names read one way
+
+`rebac.schema.ast.name_conflicts(definition)` lists every place where a
+definition lets a name be read two ways: a built-in's name (`authenticated`,
+`anonymous`, the actor's state inside an expression) as the definition's type,
+as a relation or as a relation's subject type; and a name declared twice, as two
+relations, two permissions, or a relation and a permission (`member` reads the
+relation first; a reader that asked for the permission would read another
+thing). `schema_name_conflicts(schema)` lists them for every definition.
+`validate_schema` states these rules through it. They hold for new input:
+`LocalBackend.set_schema()` (and so `rebac.testing.install_schema()`) with a
+`Schema` built in code, and a write to the stored policy that adds such a place,
+are refused with `SchemaError`. What a write adds is what the composed stored
+policy holds when the outermost write owner exits and did not hold when it
+started, each place counted once per occurrence: a place already stored blocks
+no other write, and renaming it is a repair. It holds for a repair too: a write
+that starts from a stored policy that is refused, cannot be read or cannot be
+composed is not validated again, but it may remove a place, never add one (the
+places are counted on the stored names and subject types, which no override
+changes). A stored policy that already holds
+one, written directly to its tables, loads and decides as in 0.37.0; the
+database check `rebac.W014` names each place and the repair. It is a warning, so
+that it never stops an upgrade: `manage.py check --database default` and
+`migrate`, which runs the database checks, report it and proceed. The
+experimental read mechanisms prove nothing from it and leave the compiled
+statements in place: structural prefetch proves nothing about such a type (the
+parent's, the child's, or one an arrow lifts to), and the bounded walk and the
+row scope refuse the whole policy.
+
+`validate_schema`'s rules and the runtime:
+
+| Rule | At runtime |
+|---|---|
+| Names read one way (`name_conflicts`) | Refused in new input; stored: `rebac.W014` |
+| A backed relation's shape (one concrete subject type, no caveat, no expiry, a backing that round-trips; `rebac.schema.parser.backing_errors`) | Refused at installation and when a stored policy is loaded, chosen by the rule, whatever the names in its message |
+| A subject relation names a relation of its type | Refused at installation and when a stored policy is loaded |
+| A permission's references name a relation, a permission or a built-in; an arrow's relation is a relation | Not held: the compiler reads an unknown name or relation as nothing, which grants nothing |
+| A relation's caveat is declared | Not held at installation: no relationship can be written with an undeclared caveat (`ValueError: unknown caveat`), so no stored grant carries one |
+| A caveat body names only its parameters | Not held: CEL fails to evaluate an unknown name and the read raises `CaveatUnsupportedError`; it never grants |
+
 `rebac.testing.assert_decisions(checks=(), accessible=())` asserts a decision
 table against the active backend. Each `checks` row is `(subject, action,
 resource, allowed)`: an `ActorLike`, an action, an `ObjectRef` or anything
@@ -1178,7 +1218,7 @@ All settings prefixed `REBAC_`. No nested dict. Read via the public `app_setting
 | `REBAC_EVALUATOR_CACHE_SIZE` | `10000` | `int` | Max entries in the per-scope evaluator's check cache, and the bound on its field-visibility memo (least recently used dropped first). |
 | `REBAC_ENABLED` | `True` | `bool` | `False` enforces nothing: every caller, with an actor or without, reads and writes every row, and the library issues no permission statement. For a deployment with one trusted user, and for measuring an application's queries without the library's. System check `rebac.W011`. See [Unenforced deployments](#unenforced-deployments). |
 | `REBAC_ACTOR_PROFILES` | `True` | `bool` | Inside an evaluator scope, compile statements for the stored grants the actor can hold: one extra statement per scope, actor and database reads which stored relations name the actor, and arms outside that set are not compiled. See [Actor grant profiles](#actor-grant-profiles). |
-| `REBAC_STRUCTURAL_PREFETCH` | `False` | `bool` | Experimental. Children of parents a prefetch just admitted are read by foreign key, without their permission statement, where the policy proves the parent's action grants theirs. See [Switchable read mechanisms](#switchable-read-mechanisms). |
+| `REBAC_STRUCTURAL_PREFETCH` | `False` | `bool` | Experimental. Children of parents a prefetch just admitted are read by foreign key, without their permission statement, where the policy proves the parent's action grants theirs, the parent's action being the one the child's arm names or one the policy proves implies it. See [Switchable read mechanisms](#switchable-read-mechanisms). |
 | `REBAC_ROW_SCOPE` | `False` | `bool \| "named"` | Experimental. The scope of a statement a queryset runs itself is written as conditions on each row instead of membership in the ids the actor holds. `"named"`: only where the queryset's own conditions bind its primary key or a foreign key to literal values. Needs PostgreSQL's JIT off. |
 | `REBAC_BOUNDED_WALK` | `False` | `bool \| "prove" \| "decide"` | Experimental. `held` and `held_many` are answered by lookups on the rows the ids name. `"prove"` (or `True`) settles the ids a grant, a column or a parent shows held; `"decide"` reads the whole permission and answers no as well. |
 | `REBAC_DISPLAY_FIELDS` | `False` | `bool \| "fallback"` | Experimental. A related row `rebac_select_related` loaded is delivered with the display fields its model declares (`Meta.rebac_display_fields`). `"fallback"`: where the actor may not read the row, instead of raising. `True`: always, without the check. |
@@ -1304,14 +1344,16 @@ System checks (in `rebac/checks.py`):
 | `rebac.W009` | Warning | A text attribute-backed column declares a case-insensitive collation (`*_ci`, or the MySQL default), so SQL scoping and Python checks could disagree on container ids. Best-effort detection. |
 | `rebac.W010` | Warning | A stored override references a relation or permission removed from the current baseline; that override is ignored until updated or deleted. |
 | `rebac.W011` | Warning | `REBAC_ENABLED` is `False`: no permission is checked, and every caller reads and writes every row. |
+| `rebac.W014` | Warning (database) | The stored policy lets a name be read two ways (`rebac.schema.ast.name_conflicts`): a built-in's name as a relation, a definition or a subject type, or a name declared twice. It loads and decides as stored; new input with such a place is refused. The experimental read mechanisms prove nothing from it: structural prefetch about such a type, the bounded walk and the row scope about the whole policy. A warning, so that `migrate` proceeds. Rename the relation or the permission; silence it with `SILENCED_SYSTEM_CHECKS = ['rebac.W014']`. See [Names read one way](#names-read-one-way). |
 | `rebac.W015` | Warning | A reserved setting the library does not read (`REBAC_RELATIONSHIP_MODEL`, `REBAC_DEFAULT_CONSISTENCY`, `REBAC_CACHE_ALIAS`, `REBAC_LOOKUP_CACHE_TTL`, `REBAC_GC_INTERVAL_SECONDS`) has a value of another type than documented. It has no effect either way. |
 | `rebac.W101` | Retired | Not reused. |
 
-`rebac.E025` to `rebac.E027` and `rebac.W012` to `rebac.W014` are not assigned in this release.
+`rebac.E025` to `rebac.E027`, `rebac.W012` and `rebac.W013` are not assigned in this release.
 
-`rebac.E014`, `rebac.E015`, `rebac.E016` and the backing-path form of
-`rebac.E018` read the stored schema, so they run only as database checks:
-`manage.py check --database <alias>`, and the checks `migrate` runs.
+`rebac.E014`, `rebac.E015`, `rebac.E016`, the backing-path form of
+`rebac.E018` and `rebac.W014` read the stored schema, so they run only as
+database checks: `manage.py check --database <alias>`, and the checks `migrate`
+runs.
 
 Users silence individual checks via Django's `SILENCED_SYSTEM_CHECKS = ["rebac.W001"]`.
 
@@ -2345,9 +2387,9 @@ statement in place.
 
 | Setting | What it does | What keeps the compiled statement |
 |---|---|---|
-| `REBAC_STRUCTURAL_PREFETCH` | A prefetch's children are read by the foreign key that names their parents, with no permission statement, where the child's action is a union with the arm `relation->parent_action` over that unfiltered foreign key (`rebac.structural`) | An intersection or exclusion above the arm, a filtered or generic backing, an edge inside a recursion, another database than the parents', an override of any kind |
-| `REBAC_ROW_SCOPE` | The scope becomes `EXISTS` conditions on the row: a grant row on its id, a parent row that satisfies the parent's conditions, a constant's fixed object (`rebac.rowscope`) | A recursion; a caveated or expiring relation; a backing the walk does not read; more than 24 subqueries; a queryset embedded in another, combined, counted or aggregated |
-| `REBAC_BOUNDED_WALK` | `held` and `held_many` read the permission from the candidate rows by one lookup per relation (`rebac.walk`) | A recursive or caveated part is asked of the compiled statement alone; candidates that name no row keep their compiled answer |
+| `REBAC_STRUCTURAL_PREFETCH` | A prefetch's children are read by the foreign key that names their parents, with no permission statement, where the child's action is a union with the arm `relation->T` over that unfiltered foreign key and holding the parent's action grants `T`: `T` is that action, or the policy proves the action implies it (`rebac.structural`) | An intersection or exclusion above the arm, a filtered or generic backing, an action not proven to imply the arm's, an edge inside a recursion, another database than the parents', parents scoped under another policy than the children are decided under, a type that reads a name two ways, an override of any kind |
+| `REBAC_ROW_SCOPE` | The scope becomes `EXISTS` conditions on the row: a grant row on its id, a parent row that satisfies the parent's conditions, a constant's fixed object (`rebac.rowscope`) | A recursion; a caveated or expiring relation; a backing the walk does not read; more than 24 subqueries; a queryset embedded in another, combined, counted or aggregated; a policy that reads a name two ways |
+| `REBAC_BOUNDED_WALK` | `held` and `held_many` read the permission from the candidate rows by one lookup per relation (`rebac.walk`) | A recursive or caveated part is asked of the compiled statement alone; candidates that name no row keep their compiled answer; a policy that reads a name two ways |
 | `REBAC_DISPLAY_FIELDS` | A joined row is delivered with its key and declared display fields, the rest hidden as a denied field is (`rebac.display`) | A model that declares no display fields |
 | `REBAC_TRUSTED_IDS` | The id conversion is the cast alone (`rebac.codec`) | Text and UUID identities |
 
@@ -2357,6 +2399,26 @@ statement in place.
 - **The row scope asks each row the caller's conditions select.** Where those select many rows and the actor
   holds few, the id set would have named the few: on 3.2 million rows of which the actor holds none, a page cost
   152 ms against 17 ms compiled. `"named"` confines it to queries that name their rows.
+- **Structural prefetch proves an implication between two actions** of the parent's type from the policy's text
+  (`rebac.structural.implies`, [proposal 0022](./proposals/0022-structural-delivery-under-an-implied-action.md)):
+  equal expressions, an operand of a union, a dropped conjunct, an exclusion whose subtrahend withholds no less, an
+  arrow over a relation of one subject type lifted to that type, with every name read as the compiler reads it
+  (`rebac.schema.ast.is_builtin_reference`, `member`). A recursive permission is opened on the held side only, and
+  inside a subtrahend on neither side. A relation of several subject types, two relations, an exclusion or a
+  conjunct added on the right are refused, and nothing is proven while the policy carries an override of any kind,
+  nor about a type that reads a name two ways ([Names read one way](#names-read-one-way)).
+  Each rule is sound; the search may miss a true implication. It is kept per policy, and
+  `rebac.structural.explain(...)` says why an edge is refused. `rebac.structural.edges()` lists, for the policy in
+  force (`rebac.structural.current_policy()`, which `explain` and `parent_implies_children` take when none is
+  passed, and `implies` takes as its first argument),
+  every foreign key the mechanism serves, as `Edge(child_model, fk_name, parent_model, child_action,
+  parent_actions)`: each model with a resource type read under its read action (or `child_action=`), each of its
+  forward foreign keys or one-to-one fields to the primary key of another, and the parent's permissions under which
+  the child's read is proven. It is the static half of a delivery, the half a consumer pins or audits: a running
+  delivery also needs parents admitted by the prefetch, on the children's database and under the same policy. It
+  is for tests and tooling, never a request path: it proves every pair of foreign key and parent permission (300 to
+  600 ms on the benchmark's application policy) and keeps none of those proofs. Experimental, outside the stable
+  API.
 - **No delivery across an edge of a recursion.** A child whose permission, or a permission its union opens on the
   way to the arm, is in the recursive component of the arm's target reads the parent's permission one hop into
   the component, with one hop less of `REBAC_DEPTH_LIMIT` than the parent was admitted with: such children keep
@@ -2370,6 +2432,11 @@ statement in place.
   serves the thread, and the asyncio task in it, that runs the prefetch, until the prefetch ends: a context copied
   while it runs (a signal receiver's `contextvars.copy_context()`, a task or a thread started then) delivers and
   admits nothing, there or after. Django's async ORM runs a whole evaluation in one worker thread, and delivers.
+- **A delivery is decided under the policy the parents were scoped under.** An evaluation reads one pinned policy
+  throughout, its prefetches included, but an eager `scoped()` queryset keeps the statement it was built with. The
+  scope carries, beside its decision, the key of the policy it was built under (`compile.read.policy_key`); the
+  parents' rows are admitted with that key, and children are delivered only under the same one. Parents scoped
+  before a policy change deliver nothing after it: their children keep their statement.
 - **A union's arms are read as the compiler reads them.** Structural prefetch and the walk open a permission named
   in a union into its own arms, and a built-in name there is the actor's state, never a permission declared under
   it (`rebac.schema.ast.is_builtin_reference`, `member`, which the compiler resolves names through).

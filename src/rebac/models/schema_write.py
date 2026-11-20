@@ -2,10 +2,11 @@
 
 from __future__ import annotations
 
+from collections import Counter
 from collections.abc import Collection, Iterable, Iterator
 from contextlib import contextmanager
 from contextvars import ContextVar
-from typing import TYPE_CHECKING, Any, cast
+from typing import TYPE_CHECKING, Any, NamedTuple, cast
 
 from django.db import models, router
 from django.db.models.base import ModelBase
@@ -19,29 +20,79 @@ if TYPE_CHECKING:
 _owners: ContextVar[frozenset[str]] = ContextVar("rebac_schema_owners", default=frozenset())
 
 
-def _stored_policy_errors(using: str) -> list[str] | None:
-    """What refuses the stored policy; ``None`` when it cannot be read as one.
+class _StoredPolicy(NamedTuple):
+    #: What refuses the stored policy; ``None`` when it cannot be read as one.
+    errors: list[str] | None
+    #: The places where it lets a name be read two ways (``name_conflicts``), each once.
+    conflicts: Counter[str]
 
-    Only the policy's own rules are checked: its structure and the shape of
-    its recursion.  Whether its backings resolve against the current models
-    is a system check (``rebac.E009``), not a condition of writing a row, so a
-    stored policy can be repaired while it disagrees with the models.
+
+def _stored_policy_errors(using: str) -> _StoredPolicy:
+    """What refuses the stored policy, and the places where it reads a name two ways.
+
+    Only the policy's own rules refuse it: its structure, its composition and
+    the shape of its recursion.  Whether its backings resolve against the
+    current models is a system check (``rebac.E009``), not a condition of
+    writing a row, so a stored policy can be repaired while it disagrees with
+    the models.  A name read two ways does not refuse it either: a write may not
+    add one (``schema_index_write``), and ``rebac.W014`` reports those it holds.
+    The places are counted on the stored names, which no override changes, so
+    they are known while the policy cannot be read or composed.
     """
-    from ..backends.local import LocalBackend
+    from ..backends.local import LocalBackend, _name_conflicts
     from ..compile.program import CompileProgram
     from ..composition import compose_tagged, split_stale_overrides
+    from ..schema.parser import ParseError
 
     try:
         loaded = LocalBackend()._load_schema_from_db(using)
-    except SchemaError:
-        return None
+    except SchemaError, ParseError:
+        return _StoredPolicy(None, Counter(_stored_name_conflicts(using)))
     baseline = getattr(loaded, "baseline", loaded[0])
-    overrides, _stale = split_stale_overrides(baseline, list(getattr(loaded, "overrides", ())))
+    conflicts = Counter(_name_conflicts(baseline))
     try:
+        # Every stored override, expired ones included: one that does not parse or does
+        # not compose leaves a policy being repaired, as a refused one does.
+        overrides, _stale = split_stale_overrides(baseline, list(getattr(loaded, "overrides", ())))
         CompileProgram.build(compose_tagged(baseline, overrides).schema)
-    except SchemaError as exc:
-        return [str(exc)]
-    return []
+    except (SchemaError, ParseError) as exc:
+        return _StoredPolicy([str(exc)], conflicts)
+    return _StoredPolicy([], conflicts)
+
+
+def _stored_name_conflicts(using: str) -> list[str]:
+    """``name_conflicts`` of the stored definitions, read from their names and subject
+    types alone, which is all the rule reads: it holds for a policy that cannot be read."""
+    from ..schema.ast import (
+        AllowedSubject,
+        Definition,
+        Permission,
+        PermNil,
+        Relation,
+        name_conflicts,
+    )
+    from .schema import SchemaDefinition
+
+    found: list[str] = []
+    rows = SchemaDefinition.objects.using(using).prefetch_related("relations", "permissions")
+    for row in rows.order_by("resource_type"):
+        relations = tuple(
+            Relation(
+                relation.name,
+                tuple(
+                    AllowedSubject(type=str(item.get("type", "")))
+                    for item in (relation.allowed_subjects or [])
+                    if isinstance(item, dict)
+                ),
+            )
+            for relation in sorted(row.relations.all(), key=lambda relation: relation.name)
+        )
+        permissions = tuple(
+            Permission(permission.name, PermNil())
+            for permission in sorted(row.permissions.all(), key=lambda permission: permission.name)
+        )
+        found.extend(name_conflicts(Definition(row.resource_type, relations, permissions)))
+    return found
 
 
 @contextmanager
@@ -52,7 +103,15 @@ def schema_index_write(using: str) -> Iterator[None]:
     exits, the composed policy is validated under that lock, so two changes
     that are each valid cannot combine into a refused one.  A policy that was
     already refused when the owner started is being repaired and is not
-    validated again.
+    validated again, and neither is one that could not be read or composed.
+
+    A write may not add a place where a name is read two ways, a repair
+    included
+    (``rebac.schema.ast.name_conflicts``: a built-in's name as a relation, a
+    definition or a subject type; a name declared twice).  What it adds is what
+    the composed policy holds when the owner exits and did not hold when it
+    started, each place counted once per occurrence.  A place already stored
+    therefore blocks no write, and renaming it is a repair.
     """
     if using in _owners.get():
         with schema_write_atomic(using):
@@ -61,21 +120,33 @@ def schema_index_write(using: str) -> Iterator[None]:
     with schema_write_atomic(using):
         SchemaGeneration.objects.lock(using)
         before = SchemaGeneration.objects.revision(using)
-        sound = _stored_policy_errors(using) == []
+        started = _stored_policy_errors(using)
+        sound = started.errors == []
         token = _owners.set(_owners.get() | {using})
         try:
             yield
         finally:
             _owners.reset(token)
-        if sound and SchemaGeneration.objects.revision(using) != before:
-            errors = _stored_policy_errors(using)
-            if errors is None:
+        if SchemaGeneration.objects.revision(using) != before:
+            ended = _stored_policy_errors(using)
+            if sound and ended.errors is None:
                 # Raise the reader's own account of what is wrong.
                 from ..backends.local import LocalBackend
 
                 LocalBackend()._load_schema_from_db(using)
-            elif errors:
-                raise SchemaError("; ".join(errors))
+            # A repair (a policy refused, unreadable or not composable when the owner
+            # started) is not validated again, but it may remove a name read two ways,
+            # never add one.
+            conflicting = ended.conflicts - started.conflicts
+            refused = [
+                *((ended.errors or ()) if sound else ()),
+                *(
+                    f"{place}: a write may not add a name read two ways (rebac.W014)"
+                    for place in sorted(conflicting.elements())
+                ),
+            ]
+            if refused:
+                raise SchemaError("; ".join(refused))
 
 
 @contextmanager

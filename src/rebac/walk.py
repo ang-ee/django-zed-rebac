@@ -135,6 +135,10 @@ def _walk(
     # An override retags arms the walk would read as plain expressions.
     if policy.tagged.arms or policy.tagged.sites:
         return None
+    # A name read two ways (``rebac.schema.ast.name_conflicts``): the walk and the row scope
+    # read names as the compiler does only where each is read one way.
+    if policy.name_conflicts:
+        return None
     return _Walk(policy, backend, actor, using)
 
 

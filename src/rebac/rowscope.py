@@ -178,7 +178,11 @@ def explain(
         return {"applies": False, "subqueries": None, "blocked": ["no local policy for the model"]}
     walk = walking._walk(local, actor, using, None)
     if walk is None:
-        return {"applies": False, "subqueries": None, "blocked": ["the actor or an override"]}
+        return {
+            "applies": False,
+            "subqueries": None,
+            "blocked": ["the actor, an override or a name the policy reads two ways"],
+        }
     if walking._integer_identity(model) is None:
         return {
             "applies": False,

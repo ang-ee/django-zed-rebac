@@ -235,9 +235,38 @@ def _schema_on_alias(using: str) -> Schema | None:
     return None
 
 
-@_register(checks.Tags.database, ids=("rebac.E014", "rebac.E015", "rebac.E016", "rebac.E018"))
+def _names_read_two_ways(schema: Schema, using: str) -> list[checks.CheckMessage]:
+    """W014: places where the stored policy on ``using`` lets a name be read two ways.
+
+    ``rebac.schema.ast.name_conflicts``: a built-in's name as a relation, a definition
+    or a subject type, or a name declared twice. Such a policy loads and decides as it
+    did before the rule was held at runtime; only new input is refused. The
+    experimental read mechanisms prove nothing from it: structural prefetch about such
+    a type, the bounded walk and the row scope about the whole policy.
+    """
+    from .schema.ast import schema_name_conflicts
+
+    return [
+        checks.Warning(
+            f"The stored policy on {using!r} lets a name be read two ways: {error}.",
+            hint="Rename the relation or the permission through the schema write API "
+            "(SchemaRelation or SchemaPermission rows), or sync a corrected .zed file with "
+            "'manage.py rebac sync'. The policy decides as stored meanwhile; a write that adds "
+            "such a place is refused, and the experimental read mechanisms prove nothing from it "
+            "(structural prefetch about such a type, the bounded walk and the row scope about "
+            "the policy). Silence the warning with SILENCED_SYSTEM_CHECKS = ['rebac.W014'].",
+            id="rebac.W014",
+        )
+        for error in schema_name_conflicts(schema)
+    ]
+
+
+@_register(
+    checks.Tags.database,
+    ids=("rebac.E014", "rebac.E015", "rebac.E016", "rebac.E018", "rebac.W014"),
+)
 def check_policy_models(app_configs: Any = None, **kwargs: Any) -> list[checks.CheckMessage]:
-    """E014-E018; all schema I/O is opt-in via database checks."""
+    """E014-E018 and W014; all schema I/O is opt-in via database checks."""
     if app_settings.REBAC_BACKEND != "local" or not kwargs.get("databases"):
         return []
     from django.apps import apps
@@ -259,6 +288,7 @@ def check_policy_models(app_configs: Any = None, **kwargs: Any) -> list[checks.C
         schema = _schema_on_alias(using)
         if schema is None:
             continue
+        issues.extend(_names_read_two_ways(schema, using))
         watched = watched_for(schema)
         fields = {
             (model._meta.label_lower, attr): (model, attr) for model, attr in codec_fields(schema)

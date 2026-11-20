@@ -28,7 +28,7 @@ Where the time goes:
 
 | Setting | What it changes | What keeps today's statement |
 |---|---|---|
-| `REBAC_STRUCTURAL_PREFETCH` | Children of parents a prefetch just admitted are read by foreign key, where the policy proves the parent's action grants theirs | An intersection or exclusion above the arm, a filtered or generic backing, an override |
+| `REBAC_STRUCTURAL_PREFETCH` | Children of parents a prefetch just admitted are read by foreign key, where the policy proves the parent's action grants theirs (an action that implies the arm's: [proposal 0022](./0022-structural-delivery-under-an-implied-action.md)) | An intersection or exclusion above the arm, a filtered or generic backing, an override |
 | `REBAC_ROW_SCOPE` (`True`, `"named"`) | The scope of a statement a queryset runs itself is written as conditions on each row (`EXISTS` a grant that reaches it) | A recursion, a caveated or expiring relation, a backing the walk does not read, more than 24 subqueries, an embedded, combined, counted or aggregated queryset |
 | `REBAC_BOUNDED_WALK` (`"prove"`, `"decide"`) | `held` and `held_many` are answered by lookups on the rows the ids name; `"decide"` reads the whole permission and answers no as well | The compiled statement is asked for a recursive or caveated part alone; ids that name no row keep their compiled answer |
 | `REBAC_DISPLAY_FIELDS` (`"fallback"`, `True`) | A related row `rebac_select_related` loaded is delivered with its declared display fields where the actor may not read it (`True`: always, without the check) | A model that declares no display fields |
@@ -156,10 +156,12 @@ What this shows:
   the walk are several: each statement reads the state committed when it runs, so under READ COMMITTED a
   conjunction can be assembled from adjacent states (children read under parents admitted a moment earlier; a
   row read under a parent it has since left; an exclusion read after it was lifted and the grant withdrawn).
-  Inside one snapshot they are exact: a transaction on a connection configured for repeatable read, or any
-  transaction on SQLite. Whether a decision may be assembled from adjacent states is the application's choice
-  to make, as it already is for a prefetch; it is the reason these settings are off by default. A policy
-  revision published during a walk is handled: the walk reads the fence again after an exclusion.
+  Inside one snapshot (a transaction on a connection configured for repeatable read, or any transaction on
+  SQLite) the data is the same for every statement; each still reads its own instant, so a deadline (a row's
+  expiry, a caveat that reads the time) can fall between two of them. Whether a decision may be assembled from
+  adjacent states is the application's choice to make, as it already is for a prefetch; it is the reason these
+  settings are off by default. A policy revision published during a walk is handled: the walk reads the fence
+  again after an exclusion.
 - **Policy width.** A condition on a row cannot be named and reused, so a permission that others refer to is
   written out at each use. Each subquery is planned at every execution (0.3–0.4 ms in the registry layout). The
   row scope stops at 24. `rowscope.explain(model, actor, action)` says whether it applies and what stops it. On
