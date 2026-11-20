@@ -36,6 +36,7 @@ from .field_visibility import (
     effective_field_deny_mode,
     gated_read_fields,
     redacted_fields,
+    refuse_hidden_fields,
     runtime_field_deny_mode,
 )
 from .managers import RebacManager, TrackedManager, TrackedQuerySet, _BypassEntry, _hidden_from
@@ -477,8 +478,9 @@ class RebacTrackedMixin(models.Model, metaclass=RebacModelBase):
 
         The verdict covers the fields the save writes.  Without
         ``update_fields``, ``save()`` leaves the fields redacted when the
-        instance was loaded out of the write, even when they were assigned, so
-        the check passes without them.  A caller that validates the instance
+        instance was loaded out of the write while they hold their
+        placeholder, and refuses one given a value, so a passing check covers
+        none of them.  A caller that validates the instance
         after a passing check, with more access than the actor (unique or
         constraint checks under ``system_context``), excludes the fields
         redacted when it loaded (``redacted_fields(instance)``), as
@@ -952,7 +954,38 @@ class RebacMixin(RebacTrackedMixin):
         fields: Iterable[str] | None = None,
         from_queryset: models.QuerySet[Any] | None = None,
     ) -> None:
+        """Django's ``refresh_from_db``; on a row with hidden fields, of the fields it shows.
+
+        A hidden field (``redacted_fields``: a denied ``read__<field>``, or a field
+        a display row does not show) is never read again. A refresh that names no
+        fields is ``refresh_from_db(fields=...)`` of the concrete fields the row
+        holds and shows, with the names of its prefetched relations, which
+        Django's refresh forgets, as it does in a refresh of the whole row; a
+        reverse one-to-one or generic relation the row has cached stays cached, as
+        with any ``fields``. A refresh that names a hidden field is refused
+        (``refuse_hidden_fields``). The hidden fields stay ``None``.
+
+        Django reads the values into an instance of its own, with ``only()``: the
+        hidden fields are deferred there, so model code that runs while it is
+        built (``__init__``, ``post_init``) finds them unset, and code that reads
+        one loads it with a statement of its own, as from any deferred field.
+        """
         redacted = redacted_fields(self)
+        if redacted and fields is not None:
+            fields = list(fields)
+            refuse_hidden_fields(
+                type(self), [self], fields, operation="refresh_from_db(fields=...)", reads=True
+            )
+        elif redacted:
+            deferred = self.get_deferred_fields()
+            fields = [
+                field.attname
+                for field in self._meta.concrete_fields
+                if field.attname not in deferred
+                and field.name not in redacted
+                and field.attname not in redacted
+            ]
+            fields += list(getattr(self, "_prefetched_objects_cache", None) or ())
         super().refresh_from_db(using=using, fields=fields, from_queryset=from_queryset)
         if redacted:
             from .field_visibility import mark_denied_fields
@@ -960,7 +993,8 @@ class RebacMixin(RebacTrackedMixin):
             mode: FieldDenyMode = (
                 "omit" if getattr(self, "_rebac_omitted_fields", frozenset()) else "redact"
             )
-            mark_denied_fields(self, redacted, mode=mode)
+            # The shown fields were just read; no hidden one was assigned.
+            mark_denied_fields(self, redacted, mode=mode, returned=None)
 
     def __getstate__(self) -> dict[str, Any]:
         """Strip per-instance REBAC binding before pickling.
@@ -1240,10 +1274,28 @@ class RebacMixin(RebacTrackedMixin):
         using: str | None = None,
         update_fields: Iterable[str] | None = None,
     ) -> None:
+        """Django's ``save_base``, which ``save()``, ``asave()`` and a direct call reach, raw or not.
+
+        ``update_fields`` is read once, as Django's ``save()`` reads it. On a row
+        with hidden fields, a save that names no fields writes the fields
+        ``_rebac_shown_update_fields`` gives, in each table Django writes (the
+        multi-table parents' too, except in a raw save); with none, it writes
+        nothing and sends no signal, as Django's ``save()`` does with empty
+        ``update_fields``.
+        """
         from .errors import PermissionDenied
         from .watch import model_write
 
         alias = using or router.db_for_write(type(self), instance=self)
+        if update_fields is not None:
+            update_fields = frozenset(update_fields)
+        else:
+            shown = self._rebac_shown_update_fields(
+                force_insert=force_insert, operation="save_base()"
+            )
+            if shown is not None and not shown:
+                return None
+            update_fields = shown
         if raw:
             return super().save_base(raw, force_insert, force_update, alias, update_fields)
         try:
@@ -1305,11 +1357,22 @@ class RebacMixin(RebacTrackedMixin):
         )
 
     def _rebac_save(self, *args: Any, **kwargs: Any) -> None:
-        """Keep new resource instances insert-only and exclude redacted update fields.
+        """Keep new resource instances insert-only; a save that names no fields writes the shown ones.
 
-        Explicit ``save(update_fields=[...])`` remains visible to the save_base
-        owner, which fails closed if a redacted field is named.
+        On a row with hidden fields, a save without ``update_fields`` is given
+        the fields ``_rebac_shown_update_fields`` names before Django's
+        ``save()`` runs, which would otherwise name a deferred row's loaded
+        fields itself, the hidden ones (held as ``None``) among them.
+        ``save_base`` applies the same rule to a direct call. Explicit
+        ``save(update_fields=[...])`` reaches the save_base owner, which refuses
+        a named hidden field.
         """
+        shown = None
+        if not args and kwargs.get("update_fields") is None:
+            # Before anything else, the bypass audit of a new row included.
+            shown = self._rebac_shown_update_fields(
+                force_insert=kwargs.get("force_insert"), operation="save()"
+            )
         if self._state.adding and model_resource_type(self):
             if kwargs.get("force_update") or kwargs.get("update_fields") is not None:
                 raise ValueError(
@@ -1330,11 +1393,78 @@ class RebacMixin(RebacTrackedMixin):
                     *concrete_model._meta.all_parents,
                     concrete_model,
                 )
-        if not args and not self._state.adding and kwargs.get("update_fields") is None:
-            redacted = redacted_fields(self)
-            if redacted:
-                kwargs["update_fields"] = self._rebac_update_fields_excluding(redacted)
+        if shown is not None:
+            kwargs["update_fields"] = shown
         super().save(*args, **kwargs)
+
+    def _rebac_shown_update_fields(self, *, force_insert: Any, operation: str) -> list[str] | None:
+        """The fields a save that names none writes from this row; ``None`` for Django's own choice.
+
+        ``None`` for a row with no hidden field (``redacted_fields``). A save
+        that would insert a row from one that has hidden fields (``force_insert``,
+        a row marked as being added, a primary key other than the one loaded)
+        is refused before any statement: it would store the hidden fields'
+        placeholders as data. Otherwise the fields the row shows whose loaded
+        value changed. A hidden field that still holds its placeholder
+        (``_rebac_holds_placeholder``) is left out; one that holds anything else
+        was given a value by the caller and is refused before any statement
+        (``refuse_hidden_fields``), since it would not be written.
+        """
+        hidden = redacted_fields(self)
+        if not hidden:
+            return None
+        if force_insert or self._state.adding or self._rebac_key_moved():
+            refuse_hidden_fields(type(self), [self], hidden, operation=operation, inserted=True)
+        assigned = [
+            field.name
+            for field in type(self)._meta.concrete_fields
+            if field.name in hidden and not self._rebac_holds_placeholder(field)
+        ]
+        if assigned:
+            refuse_hidden_fields(type(self), [self], assigned, operation=operation, assigned=True)
+        return self._rebac_update_fields_excluding(hidden)
+
+    def _rebac_key_moved(self) -> bool:
+        """Whether the primary key differs from the one the row was loaded with."""
+        loaded: dict[str, Any] | None = getattr(self, "_rebac_loaded_values", None)
+        key = self._meta.pk
+        if not loaded or key is None or key.attname not in loaded:
+            return False
+        before, now = loaded[key.attname], vars(self).get(key.attname)
+        try:
+            return bool(key.get_prep_value(before) != key.get_prep_value(now))
+        except Exception:
+            return bool(before != now)
+
+    def _rebac_holds_placeholder(self, field: models.Field[Any, Any]) -> bool:
+        """Whether hidden ``field`` holds the ``None`` it was hidden with, as the field gives it.
+
+        The column holds ``None``, or what the field's own descriptor makes of
+        ``None`` when it is read, of that value's type and equal to it (a file
+        field's ``FieldFile`` with no name); a relation caches no object.
+        Anything else was given by the caller (a nameless ``ContentFile`` is not
+        a ``FieldFile``). A descriptor that wraps ``None`` in a value equal to no
+        other such wrapper, or that cannot be read on a bare instance, reads as
+        given a value.
+        """
+        value = vars(self).get(field.attname)
+        if value is not None:
+            # The descriptor reads None from a bare instance of the model, as from this row.
+            bare = type(self).__new__(type(self))
+            vars(bare)[field.attname] = None
+            try:
+                placeholder = getattr(bare, field.attname)
+                if (
+                    placeholder is None
+                    or type(value) is not type(placeholder)
+                    or not (value == placeholder)
+                ):
+                    return False
+            except Exception:
+                return False
+        if isinstance(field, models.ForeignObject) and field.is_cached(self):
+            return field.get_cached_value(self) is None
+        return True
 
     def _rebac_update_fields_excluding(self, excluded: frozenset[str]) -> list[str]:
         names: list[str] = []
@@ -1433,6 +1563,8 @@ def _gate_save(
     # ambient sudo, while an explicit instance bypass still wins locally.
     actor, unscoped = instance.effective_actor(strict=True)
     if unscoped:
+        # Under a bypass as under an actor (below), after the gates that come first there.
+        _refuse_hidden_writes(sender, instance, update_fields)
         return
     assert actor is not None
 
@@ -1471,12 +1603,7 @@ def _gate_save(
             resource=resource,
             update_fields=update_fields,
         )
-        _enforce_redacted_field_writes(
-            sender=sender,
-            instance=instance,
-            resource=resource,
-            update_fields=update_fields,
-        )
+        _refuse_hidden_writes(sender, instance, update_fields)
         _enforce_per_field_writes(
             sender=sender,
             instance=instance,
@@ -1484,6 +1611,20 @@ def _gate_save(
             resource=resource,
             update_fields=update_fields,
         )
+
+
+def _refuse_hidden_writes(
+    sender: type[models.Model], instance: Any, update_fields: Iterable[str] | None
+) -> None:
+    """A save that names a field hidden on the row is refused, under any actor or bypass.
+
+    The row holds None there, not its stored value: ``bulk_update()`` refuses the
+    same fields by the same record (``refuse_hidden_fields``). A save that names no
+    fields leaves out the hidden ones that hold their placeholder and refuses one
+    given a value (``_rebac_shown_update_fields``).
+    """
+    if not instance._state.adding and update_fields is not None:
+        refuse_hidden_fields(sender, [instance], update_fields, operation="save(update_fields=...)")
 
 
 def _refuse_moving_edge(sender: type[models.Model], instance: Any, *, using: str) -> None:
@@ -1614,26 +1755,6 @@ def _enforce_expression_reads(
             resource=resource,
         ).allowed:
             raise PermissionDenied(f"Write expression reads denied field read__{field_name}.")
-
-
-def _enforce_redacted_field_writes(
-    *,
-    sender: type[models.Model],
-    instance: Any,
-    resource: ObjectRef,
-    update_fields: Iterable[str] | None,
-) -> None:
-    redacted = redacted_fields(instance)
-    if not redacted or update_fields is None:
-        return
-    requested = set(_normalise_update_field_names(sender=sender, update_fields=update_fields))
-    bad = redacted & requested
-    if bad:
-        names = ", ".join(sorted(bad))
-        raise PermissionDenied(
-            f"Cannot write redacted field(s) {names} on {resource}: "
-            "read__<field> denied on the loaded instance."
-        )
 
 
 def _resource_id_for_existing_instance(*, sender: type[models.Model], instance: Any) -> str:

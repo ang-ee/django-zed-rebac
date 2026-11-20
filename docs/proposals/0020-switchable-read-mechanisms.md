@@ -36,7 +36,8 @@ Where the time goes:
 | `rebac.snapshot.read_snapshot()` | One transaction for a unit of reading in which the library keeps decisions | A transaction that already holds relationship writes |
 
 Each module's docstring is its specification: `rebac.structural`, `rebac.rowscope`, `rebac.walk`,
-`rebac.display`, `rebac.snapshot`.
+`rebac.display`, `rebac.snapshot`. Proposal 0024 extends `REBAC_DISPLAY_FIELDS` to a foreign-key prefetch
+whose queryset asks for display rows (`for_display()`).
 
 ## What a consumer gives up
 

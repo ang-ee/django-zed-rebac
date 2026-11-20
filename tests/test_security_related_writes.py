@@ -1300,6 +1300,8 @@ def test_outerref_reads_destination_gated_column(method):
 @override_settings(REBAC_FIELD_READ_MODE="redact")
 @pytest.mark.parametrize("fields", [None, ["body"]], ids=["all", "body"])
 def test_refresh_from_db_keeps_redacted_field_hidden(fields):
+    """A refresh reads the fields the row shows and no other; naming the redacted one is
+    refused."""
     with sudo(reason="test.fixture"):
         post = Post.objects.create(title="public", body="secret body")
     _grant("blog/post", post.pk, "viewer", READER)
@@ -1307,9 +1309,37 @@ def test_refresh_from_db_keeps_redacted_field_hidden(fields):
     assert row.body is None
     assert row._rebac_redacted_fields == frozenset({"body"})
 
-    row.refresh_from_db(fields=fields)
+    with CaptureQueriesContext(connection) as captured:
+        if fields is None:
+            row.refresh_from_db()
+        else:
+            with pytest.raises(PermissionDenied, match="has body hidden"):
+                row.refresh_from_db(fields=fields)
 
-    assert row.body != "secret body"
+    assert row.body is None
+    assert all('"body"' not in query["sql"] for query in captured.captured_queries)
+
+
+@override_settings(REBAC_FIELD_READ_MODE="redact")
+def test_refresh_from_db_leaves_deferred_fields_deferred():
+    """A redacted row loaded with only(): the refresh reads the loaded fields it shows, and the
+    deferred ones stay deferred, as Django's refresh of such a row leaves them."""
+    with sudo(reason="test.fixture"):
+        post = Post.objects.create(title="public", body="secret body")
+    _grant("blog/post", post.pk, "viewer", READER)
+    row = Post.objects.with_actor(READER).only("title", "body").get(pk=post.pk)
+    deferred = row.get_deferred_fields()
+    assert deferred and row.body is None and row.title == "public"
+    Post._base_manager.filter(pk=post.pk).update(title="moved")
+
+    with CaptureQueriesContext(connection) as captured:
+        row.refresh_from_db()
+
+    [refresh] = [query["sql"] for query in captured.captured_queries]
+    assert row.get_deferred_fields() == deferred
+    columns = {Post._meta.get_field(name).column for name in deferred} | {"body"}
+    assert '"title"' in refresh and not any(f'"{column}"' in refresh for column in columns)
+    assert (row.title, row.body) == ("moved", None)
 
 
 # ---------- bulk guard ----------

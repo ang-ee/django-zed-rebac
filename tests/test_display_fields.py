@@ -117,6 +117,121 @@ def test_a_declaration_must_name_the_models_own_columns():
     assert display.fields(ScopeThread) == frozenset()
 
 
+def test_a_relation_is_refused_as_a_display_field(local, settings):
+    """Shown, a foreign key let a joined display row load the row it names, whole and unchecked,
+    by following it. A display field is a plain column; the related row has display fields of
+    its own."""
+    backend = install_schema(FIXED)
+    backend.write_relationships([grant("scope/message", 1, "direct")])
+    settings.REBAC_DISPLAY_FIELDS = True
+    display.declare(ScopeMessage, "id", "thread")
+    try:
+        with pytest.raises(ImproperlyConfigured, match="is a relation"):
+            list(ScopePart.objects.with_actor(MEMBER).rebac_select_related("message"))
+    finally:
+        display.declare(ScopeMessage)
+
+
+def test_a_one_to_one_is_refused_as_a_display_field():
+    from tests.testapp.models import ScopeProfile
+
+    display.declare(ScopeProfile, "nick", "owner")
+    try:
+        with pytest.raises(ImproperlyConfigured, match="'owner' is a relation"):
+            display.fields(ScopeProfile)
+    finally:
+        display.declare(ScopeProfile)
+
+
+def test_a_model_whose_primary_key_is_a_relation_declares_no_display_fields():
+    """A display row shows its key. A card's key is a one-to-one to an account that is not a
+    parent link: following it from a display card read the account whole, unchecked. Such a
+    model is refused wherever its declaration is read, and so is a multi-table child of it, whose
+    own key is a parent link but whose parent's key is that one-to-one; a multi-table child's
+    parent link is not such a key."""
+    from tests.testapp.models import LabCard, LabGiftCard, LabShop
+
+    display.declare(LabCard, "label")
+    display.declare(LabGiftCard, "amount")
+    display.declare(LabShop, "till")
+    try:
+        with pytest.raises(ImproperlyConfigured, match="primary key 'account' of LabCard"):
+            display.fields(LabCard)
+        with pytest.raises(
+            ImproperlyConfigured, match="LabGiftCard: the primary key 'account' of LabCard"
+        ):
+            display.fields(LabGiftCard)
+        assert display.declaration_problems(LabShop) == []
+        assert e026() == [
+            ("testapp.LabCard", "primary key"),
+            ("testapp.LabGiftCard", "primary key"),
+        ]
+    finally:
+        display.declare(LabCard)
+        display.declare(LabGiftCard)
+        display.declare(LabShop)
+
+
+@pytest.mark.parametrize("setting", [False, "fallback", True])
+def test_the_system_check_does_not_depend_on_the_setting(settings, setting):
+    """A wrong declaration is a hole the moment the setting is turned on: it is reported with the
+    setting off too."""
+    settings.REBAC_DISPLAY_FIELDS = setting
+    display.declare(ScopeMessage, "id", "thread")
+    try:
+        assert e026() == [("testapp.ScopeMessage", "is a relation")]
+    finally:
+        display.declare(ScopeMessage)
+
+
+def e026() -> list[tuple[str, str]]:
+    """``(model label, what is wrong)`` of every ``rebac.E026`` the display check reports."""
+    from rebac.checks import check_display_declarations
+
+    kinds = ("RebacMixin", "not a field", "own columns", "primary key", "is a relation")
+    return sorted(
+        (str(message.obj._meta.label), next(kind for kind in kinds if kind in message.msg))
+        for message in check_display_declarations()
+        if message.id == "rebac.E026"
+    )
+
+
+def test_the_system_check_reports_every_wrong_declaration_at_startup(monkeypatch):
+    """Both ways of declaring, every condition the first read would refuse."""
+    from django.contrib.auth import get_user_model
+    from django.core.management import call_command
+    from django.core.management.base import SystemCheckError
+
+    from tests.testapp.models import ScopeProfile
+
+    assert e026() == []
+    user = get_user_model()
+    display.declare(ScopeMessage, "id", "thread", "profile", "missing")
+    display.declare(ScopeProfile, "nick", "owner")
+    display.declare(user, "username")
+    monkeypatch.setattr(
+        ScopeThread._meta, "rebac_display_fields", ("label", "scopemessage"), raising=False
+    )
+    try:
+        assert e026() == sorted(
+            [
+                ("testapp.ScopeMessage", "is a relation"),
+                ("testapp.ScopeMessage", "own columns"),
+                ("testapp.ScopeMessage", "not a field"),
+                ("testapp.ScopeProfile", "is a relation"),
+                ("testapp.ScopeThread", "own columns"),
+                (user._meta.label, "RebacMixin"),
+            ]
+        )
+        with pytest.raises(SystemCheckError, match=r"rebac\.E026"):
+            call_command("check")
+    finally:
+        for model in (ScopeMessage, ScopeProfile, user):
+            display.declare(model)
+    # The declare() calls are withdrawn; the Meta declaration is still the model's.
+    assert e026() == [("testapp.ScopeThread", "own columns")]
+
+
 def test_the_meta_option_is_read_from_the_model():
     class Shown(RebacMixin, models.Model):
         name = models.CharField(max_length=10)

@@ -128,9 +128,12 @@ def test_a_changed_field_is_checked_as_the_save_checks_it(world):
     assert _agree(retitled, update_fields=[])
 
 
-def test_a_redacted_field_is_left_unwritten_and_named_by_denied_read_fields(world, settings):
-    """The check passes without the redacted field: a caller validating after it
-    excludes what ``denied_read_fields()`` names."""
+def test_a_redacted_field_is_left_unwritten_or_refused_and_named_by_denied_read_fields(
+    world, settings
+):
+    """While the redacted field holds None, the check passes without it: a caller validating
+    after it excludes what ``denied_read_fields()`` names. Assigned a value, it is refused by the
+    check as by the save, since a save that names no fields would not write it."""
     settings.REBAC_FIELD_READ_MODE = "redact"
     install_schema(
         backend(),
@@ -144,12 +147,15 @@ def test_a_redacted_field_is_left_unwritten_and_named_by_denied_read_fields(worl
     _alice, bob, _carol, _mine, _theirs, post = world
     edited = _loaded(bob, post)
     assert edited.title is None
-    edited.title = "a title bob can neither read nor write"
     edited.body = "an edit"
     assert _agree(edited)
     assert edited.denied_read_fields() == {"title"}
+    edited.title = "a title bob can neither read nor write"
+    assert not _agree(edited)
+    assert "has title hidden" in edited.check_save().reason
+    with pytest.raises(PermissionDenied, match="has title hidden"):
+        edited.save()
     saved = _loaded(bob, post)
-    saved.title = "a title bob can neither read nor write"
     saved.body = "an edit"
     saved.save()
     with sudo(reason="test.verify"):

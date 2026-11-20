@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import warnings
-from collections.abc import Iterable
+from collections.abc import Iterable, Mapping
 from typing import TYPE_CHECKING, Any, cast
 
 from django.core.exceptions import ImproperlyConfigured
@@ -265,19 +265,140 @@ def redacted_fields(instance: models.Model) -> frozenset[str]:
     return frozenset(getattr(instance, "_rebac_redacted_fields", frozenset()) or frozenset())
 
 
+def refuse_hidden_fields(
+    model: type[models.Model],
+    rows: Iterable[Any],
+    fields: Iterable[str],
+    *,
+    operation: str,
+    reads: bool = False,
+    assigned: bool = False,
+    inserted: bool = False,
+) -> None:
+    """Refuse ``operation`` on ``fields`` of ``rows`` when one of them is hidden on a row.
+
+    A hidden field is one ``redacted_fields`` names on the row: a ``read__<field>``
+    its reader was denied, or a field a display row does not show. The row holds
+    ``None`` there in place of the stored value: writing the field from it would
+    store ``None``, and reading it again (``reads``) would read what was hidden.
+    ``bulk_update()``, ``save(update_fields=...)`` and
+    ``refresh_from_db(fields=...)`` name theirs and are refused here, under any
+    actor or bypass; the bulk ones and the refresh before any statement. A save
+    that names no fields leaves out a hidden field that still holds its
+    placeholder, and refuses here, before any statement, one given another value
+    (``assigned``), which it would not write. An insert of the row (``inserted``:
+    a save that would insert it, ``bulk_create()``, ``refuse_copies``) is refused
+    here before any statement, as it would store the placeholders as data.
+    ``fields`` are names or attnames
+    (Django's ``get_field`` reads both; the record holds names); one that is not
+    a field of ``model`` is left to Django to refuse.
+    """
+    from django.core.exceptions import FieldDoesNotExist
+
+    from .errors import PermissionDenied
+
+    named: set[str] = set()
+    for name in fields:
+        try:
+            named.add(model._meta.get_field(name).name)
+        except FieldDoesNotExist:
+            continue
+    if not named:
+        return
+    for row in rows:
+        hidden = sorted(named & redacted_fields(row))
+        if not hidden:
+            continue
+        key = row.pk
+        if inserted and model._meta.pk is not None:
+            # The row as it was read: a copy's own key may be None or another one.
+            loaded = getattr(row, "_rebac_loaded_values", None) or {}
+            key = loaded.get(model._meta.pk.attname, key)
+        found = (
+            f"{operation} refused: {model._meta.label} row {key!r} has {', '.join(hidden)} "
+            "hidden (redacted_fields: a read__<field> its reader was denied, or a field a "
+            "display row does not show)"
+        )
+        if inserted:
+            raise PermissionDenied(
+                f"{found}, and {operation} would insert it as a new row, storing the None it holds "
+                "there as data. A row with hidden fields is not copied by any insert: build the "
+                "new row from values of your own, or from a row read whole (for_write() on a "
+                "scoped read; a display row read again by a scoped read of its model)."
+            )
+        if assigned:
+            raise PermissionDenied(
+                f"{found}, and holds a value given to it after it was hidden. A save that names "
+                "no fields writes no hidden field, so the value would not be written. Write it "
+                "from a row read for writing, or with QuerySet.update()."
+            )
+        effect = "read what was hidden" if reads else "store None over the stored value"
+        raise PermissionDenied(
+            f"{found}. The row holds None there in place of the stored value, and "
+            f"{operation} would {effect}. Name only the fields the row shows."
+        )
+
+
+_ABSENT = object()
+# The row's own record of the values the database returned for it.
+_RECORDED = object()
+
+
+def refuse_copies(model: type[models.Model], rows: Iterable[Any], *, operation: str) -> None:
+    """Refuse ``operation``, which inserts ``rows``, when one of them has a hidden field.
+
+    Such a row holds placeholders in its hidden fields; inserting it stores them as
+    data. ``bulk_create()`` and ``abulk_create()`` through any manager, in every
+    form (``ignore_conflicts``, ``update_conflicts``), are refused here before any
+    statement. A row the caller built (``Model(**values)``) carries no record.
+    """
+    copied = [row for row in rows if redacted_fields(row)]
+    if copied:
+        names = [field.name for field in model._meta.concrete_fields]
+        refuse_hidden_fields(model, copied, names, operation=operation, inserted=True)
+
+
 def mark_denied_fields(
     instance: models.Model,
     fields: Iterable[str],
     *,
     mode: FieldDenyMode,
+    returned: Mapping[str, Any] | None | object = _RECORDED,
 ) -> None:
+    """Hide ``fields`` on ``instance``: each is set to ``None`` and recorded as hidden.
+
+    Each field is hidden through ``setattr``, so its descriptor and the model's own
+    ``__setattr__`` run as for any assignment. Every shown column the hide changed
+    (an ``ImageField``'s descriptor sets its width and height) is then put back as
+    ``returned`` gives it: the values the database returned for the row (by default
+    the row's ``_rebac_loaded_values``), never what model code derived while Django
+    built the row, from a hidden value among others. A column the database did not
+    return (deferred) is left deferred, so reading it loads the stored value.
+    ``returned=None``, or a row without the record (built by hand, unpickled), puts
+    back what the column held before the hide: ``refresh_from_db()`` hides again
+    after reading the shown fields itself, and assigns no hidden one.
+    """
     field_set = frozenset(fields)
     if not field_set:
         return
     _remember_resource_id(instance)
+    if returned is _RECORDED:
+        returned = getattr(instance, "_rebac_loaded_values", None)
+    shown = _shown_columns(instance, field_set | redacted_fields(instance))
     for field_name in field_set:
         setattr(instance, field_name, None)
         _scrub_loaded_value(instance, field_name)
+    held = vars(instance)
+    for attname, before in shown.items():
+        if held.get(attname, _ABSENT) is before:
+            continue
+        value = (
+            before if returned is None else cast(Mapping[str, Any], returned).get(attname, _ABSENT)
+        )
+        if value is _ABSENT:
+            held.pop(attname, None)
+        else:
+            held[attname] = value
     redacted = set(redacted_fields(instance))
     redacted.update(field_set)
     instance._rebac_redacted_fields = frozenset(redacted)  # type: ignore[attr-defined]
@@ -285,6 +406,16 @@ def mark_denied_fields(
         omitted = set(getattr(instance, "_rebac_omitted_fields", frozenset()) or frozenset())
         omitted.update(field_set)
         instance._rebac_omitted_fields = frozenset(omitted)  # type: ignore[attr-defined]
+
+
+def _shown_columns(instance: models.Model, hidden: frozenset[str]) -> dict[str, Any]:
+    """What the row's shown columns hold, by attname; ``_ABSENT`` for a deferred one."""
+    held = vars(instance)
+    return {
+        field.attname: held.get(field.attname, _ABSENT)
+        for field in type(instance)._meta.concrete_fields
+        if field.name not in hidden and field.attname not in hidden
+    }
 
 
 def _model_field_name(model: type[models.Model], name: str) -> str | None:

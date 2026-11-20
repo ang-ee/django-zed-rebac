@@ -7,6 +7,51 @@ pre-1.0; breaking changes within a minor version are explicitly called out.
 
 ### Breaking
 
+- **A relation declared as a display field is refused** (`REBAC_DISPLAY_FIELDS`, under Fixed). A model that
+  declares a foreign key or one-to-one in `Meta.rebac_display_fields` or `rebac.display.declare()`, or declares any
+  display field while its primary key (or a multi-table parent's) is a relation other than a parent link, gets
+  `ImproperlyConfigured` where the declaration is read, and `rebac.E026` at `manage.py check`. The check does not
+  depend on the setting: **a deployment with `REBAC_DISPLAY_FIELDS` off is refused too**, since such a declaration
+  is a hole the moment the setting is turned on. `manage.py check`, and every management command that runs the
+  system checks, stops on `rebac.E026`; reads do not consult the declaration while the setting is off. To change:
+  take the relation out of the declaration and declare the related model's own display fields (a prefetch with
+  `for_display()` or `rebac_select_related` then shows them), and withdraw the declaration of a model whose
+  primary key is such a relation, or give it a primary key of its own.
+
+- **A write that names a hidden field raises** (under Fixed). `bulk_update()` and `abulk_update()`, through any
+  manager, given a row on which a named field is hidden (`redacted_fields`: a denied `read__<field>` under
+  `REBAC_FIELD_READ_MODE` `"redact"` or `"omit"`, or a display row's hidden field), raise `rebac.PermissionDenied`
+  before any statement, under any actor or bypass, where they stored `None` (NULL) over the stored value, or failed on
+  a column that refuses NULL. So do `save()` and `asave()` with `update_fields` naming one under a bypass, which
+  stored `None` too; under an actor they already refused it, after the same checks as before, and now with the message
+  the others give. `refresh_from_db(fields=…)` naming a hidden field raises the same exception. Upgrading says how to
+  find these calls.
+
+- **A save that names no fields raises for a hidden field given a value** (under Fixed). On a row with a hidden field,
+  `save()`, `asave()` and `save_base()` without `update_fields` raise `rebac.PermissionDenied` before any statement,
+  under any actor or bypass, when that field holds anything but its placeholder: the `None` it was hidden with, or
+  what the field's own descriptor makes of that `None` when it is read, of its type (a file or image field's
+  `FieldFile` with no name), with no object cached for a relation. That is a value the caller gave it: assigned to its
+  column or relation, or set on the file it holds. `save()` and `asave()` wrote the other fields, left that one out
+  and reported success, and `save_base()` wrote it. A hidden field that holds its placeholder is left out as before,
+  read or not, and so is one assigned `None`, which cannot be told from it. `check_save()` answers `NO_PERMISSION` for
+  such a save, where it answered `HAS_PERMISSION`. A related manager's `add(bulk=False)` of such a row raises the same
+  way, and so does the save of a `ModelForm` or serializer that assigns a hidden field a value other than `None`.
+  Upgrading says how to find these calls.
+
+- **A row with hidden fields cannot be copied, by any insert** (under Fixed). `save()`, `asave()` and
+  `save_base()` (raw or not) of a row with a hidden field raise `rebac.PermissionDenied` before any statement,
+  under any actor or bypass, when the save would insert a row: with `force_insert=True`, with the row marked as
+  being added (`_state.adding = True`), or with a primary key other than the one it was loaded with (`pk = None`
+  included). So do `bulk_create()` and `abulk_create()`, through any manager and in every form (plain,
+  `ignore_conflicts`, `update_conflicts`), when their list holds such a row; the message names the model and the
+  row's loaded key. The copy idiom (`pk = None` and `_state.adding = True`) and `bulk_create()` stored the hidden
+  fields' `None` as data in the new row, and the update of `bulk_create(update_conflicts=True)` stored it over the
+  stored value of each named hidden field; with a changed key a save wrote the changed shown fields to the row
+  that key names (raising when there was none), or nothing at all when none had changed; `save(force_insert=True)`
+  raised `ValueError` when a shown field had changed and wrote nothing otherwise. A row the caller builds
+  (`Model(**values)`) has no hidden field and is saved or bulk-created as before. Upgrading says what to do.
+
 - **An object id of `None` is the empty id.** `ObjectRef(type, None)` and `SubjectRef(ObjectRef(type, None))` hold
   the id `""` where they held `None`, `SubjectRef.of(type, None)` gives `""` where it gave the text `"None"`, and
   `held()` and `held_many()` read a `None` candidate as `""`. Every entry answers a `None` id as it answers the
@@ -174,6 +219,48 @@ pre-1.0; breaking changes within a minor version are explicitly called out.
     (a username `"None"`), alone. A row with an empty or `"None"` resource id names no object. Writing a row with
     an empty subject id again refuses its batch. The principals listed cannot act.
 
+- **Writes and refreshes that name a hidden field, saves that give one a value, and copies.**
+  - *Who is affected:* code that passes rows read with fields hidden to `bulk_update()` or `abulk_update()` and names
+    a hidden field, passes such a row to `bulk_create()` or `abulk_create()` in any form, saves such a row under a
+    bypass with `update_fields` naming one, saves such a row without `update_fields` after giving one of its hidden
+    fields a value (directly, through a related manager's `add(bulk=False)`, or through a `ModelForm` or serializer
+    whose fields include it), saves such a row as a new one (`force_insert=True`, `_state.adding = True`, a changed
+    or cleared `pk`), or refreshes one with `fields` naming one. Rows have hidden fields under
+    `REBAC_FIELD_READ_MODE = "redact"` or `"omit"` where the reader was denied a `read__<field>`, and under
+    `REBAC_DISPLAY_FIELDS` on display rows.
+  - *How to find out:* `rebac.field_visibility.redacted_fields(row)` names the fields hidden on a row. The calls
+    raise `rebac.PermissionDenied` with the model, the row's key and the fields; for a save that names no fields,
+    the message says the field holds a value given to it; for a save or `bulk_create()` that would insert the
+    row, that it would insert it as a new row.
+  - *What to do:* name only the fields the row shows, give none of its hidden fields a value, or leave them out of
+    the form or serializer. Build a new row from values of your own (`Model(**values)`), or copy a row read
+    whole. Values read off a row with hidden fields are its placeholders where a field is hidden, not the stored
+    values (`model_to_dict(row)` of such a row carries `None` there), so a row built from them stores the
+    placeholders. A row that must be written whole is read for writing: `for_write()` turns field redaction off on a
+    scoped read, and a display row is read again by a scoped read of its own model. `QuerySet.update()` writes a
+    value without reading a row. A field whose descriptor wraps the `None` it reads (as a file field's does) is
+    read as holding its placeholder when its wrapper is of the type of, and compares equal to, another wrapper of
+    `None`; a third-party wrapper that does not is read as a given value, and declares its placeholder by defining
+    that equality, as `FieldFile` compares names. Anything else put there is a given value, a nameless
+    `ContentFile` included. The refusal from a related manager's `add(row, bulk=False)` is raised inside
+    Django's `atomic(savepoint=False)`, so the transaction around it cannot run another statement until it is
+    rolled back, as after any exception on that path. When the library hides a field, the field's descriptor and
+    the model's own `__setattr__` run as before, and every shown column the hide changed (an image field's width
+    and height, which its descriptor sets) is then put back as the database returned it, or deferred again where
+    it was not read; an attribute that is no model field keeps what the hide left in it.
+  - *If nothing is done:* those calls raise where they stored `None` over each named hidden field; where a save
+    that names no fields wrote the other fields and left the given value unwritten; and where a copy stored the
+    hidden fields' `None` as data, or a save under a changed key wrote nothing or wrote to another row.
+
+- **Refreshing a row with hidden fields keeps its cached reverse one-to-one and generic relations.**
+  - *Who is affected:* code that calls `refresh_from_db()` with no `fields` on a row with hidden fields (above) and
+    reads a reverse one-to-one or a generic relation that the row had cached before, expecting it read again.
+    Django's refresh of a whole row forgets them; this refresh names fields, and keeps them, as any refresh with
+    `fields` does.
+  - *How to find out:* after such a refresh, the relation returns the object it held before, with no statement.
+  - *What to do:* read the row again where the relation must be current.
+  - *If nothing is done:* the relation shows the object it held before the refresh.
+
 - **Settings of the wrong type.**
   - *Who is affected:* a deployment that sets a `REBAC_*` setting to a value of another type than the one
     ARCHITECTURE.md § Settings catalog declares; most often a string read from the environment.
@@ -206,7 +293,73 @@ pre-1.0; breaking changes within a minor version are explicitly called out.
 
 - Database check `rebac.W014`: the stored policy lets a name be read two ways (Changed).
 
+- **Display rows through a prefetch** (proposal 0024, experimental, under `REBAC_DISPLAY_FIELDS`, off by default).
+  `RebacQuerySet.for_display()` (and the manager's) asks for display rows on the queryset of the prefetch of a
+  forward foreign key or one-to-one: `Prefetch("author", queryset=Account.objects.with_actor(actor).for_display())`.
+  Under either setting value, when the queryset is of the relation's target model itself, its only condition is
+  Django's own binding to the target's primary key, it carries nothing that changes a join, a column or the order of
+  the library's read (it may carry its actor, `with_action()`, `on_field_deny()`, `only()`, `defer()`, `reverse()`,
+  `fetch_mode()`, `prefetch_related()` and `using()` of the parents' database), and every key it asks for (compared
+  with its type) is a value the database returned for that foreign key on a row that a queryset scoped for the same
+  actor admitted to be read in the evaluation running in this thread and task (built by Django's own iterable with
+  no `extra(select=…)` and no union, on the same database, its type declaring no read gate on the field), the
+  library reads those rows
+  itself, from a bare queryset of the model that no manager of the application touches, by those values, selecting
+  their primary key and display columns alone and with **no permission statement**, and delivers them as joined
+  display rows are, each built with every hidden column given as `None`, so that model code that runs while it is
+  built (`__init__`, `post_init`) sees no hidden value and loads none. The queryset's own conditions never run, and
+  the check reads no row. A display row admits nothing. A row is **admitted to be read** under its type's read
+  action, or under an action `A` such that `rebac.structural.implies` (proposal 0022) proves, on the policy the
+  backend evaluates, that whoever holds `A` on a row of that type holds its read action
+  (`rebac.display.admits_reading`): an inbox that lists messages under `read_inbox` shows the threads and senders
+  they refer to. The proof is structural's own, kept per policy; nothing is proven while the policy carries an
+  override (only the read action counts then), nor about a type that reads a name two ways. It is decided where
+  the parents' scope is built and carried by their query with its decision, so a policy that changes before the
+  delivery is decided does not change what they were admitted to. Whether a queryset delivers display rows is
+  decided by an evaluation that scopes its query, and serves that evaluation alone: the queryset keeps nothing of
+  it, so a clone or the same queryset under another actor is decided again, and an embedding, a count and its own
+  `iterator()` are never delivered. A queryset whose query already carries a scope for the same decision keeps it,
+  as every queryset does since 0.38.0: after its own `count()`, `exists()`, `aggregate()`, `iterator()` or
+  `aiterator()`, and for an eager `scoped()` queryset, its evaluation reads by that permission statement. The
+  target's own `Meta.ordering` is not the caller's and does not disable the delivery (Django's prefetch clears it
+  anyway). In any other case (a reverse one-to-one, `to_field`, a proxy or subclass of the target, an action not
+  proven to imply read, a deferred or gated key, a root with `extra(select=…)` or a union, a many-to-many prefetch,
+  a target routed to another database, a thread or task started during the evaluation, any condition of the
+  caller's, outside an evaluation) the queryset reads as it would without the request: its permission statement,
+  whole rows the actor may read. Code that a task started during the evaluation hands back to the evaluation's
+  thread, outside any task (asgiref's thread-sensitive `sync_to_async` under `async_to_sync`), runs with the
+  evaluation's context and is served for the same actor until the evaluation ends; the chunks of `iterator()` and
+  `aiterator()` admit none of their rows, and inside a running evaluation for the same actor their to-one
+  prefetches are delivered for the keys its rows hold. A row the actor may read whole is a display row too, and a
+  display row equals and hashes as the same row read whole (proposal 0024, Known limits). **Who sees more:** with
+  the setting on, the one thing an actor can be shown that it could not before is the display fields of a row that
+  a foreign key names, where it was just admitted to read a row for which the database returned that key (under
+  the holding row's read action, or under an action that the policy that admitted it proves grants that read
+  action), and the holding row's type declares no read gate on that foreign key; whether or not it may read the
+  named row. With the setting off, or for a model without display fields, the request changes no statement.
+
+- System check **`rebac.E026`** reports every invalid display declaration at `manage.py check`, whatever
+  `REBAC_DISPLAY_FIELDS` is, off included, from `Meta.rebac_display_fields` or a `rebac.display.declare()` call made
+  before the checks run: a model that is not a `RebacMixin` model, a model whose primary key or a multi-table
+  parent's is a relation other than a parent link, or a name that is not a field, not one of the model's own
+  columns, or a relation. The conditions are `rebac.display.declaration_problems`, shared with the read that
+  consults the declaration, which still refuses it with `ImproperlyConfigured`.
+
+- `rebac.testing.compare_mechanisms` reports `changed` for two mapping results: the keys both hold whose values
+  differ. `lost` and `gained` keep their meaning (for a mapping, an item is a key with its value).
+
+- The policy benchmark has `labels`, `page_labels` and `inbox_labels` scenarios, display fields for three label
+  types, and the `labels` and `all_labels` mechanisms. `make bench-smoke` runs every scenario twice, without
+  display rows (`today`, `all`) and with them (`labels`, `all_labels`), each run compared with its own first
+  mechanism.
+
 ### Changed
+
+- `rebac.testing.compare_mechanisms` compares results by what they loaded: a model instance in a result (the
+  result itself, a mapping's value, or an item of a list, tuple or set, at any depth) is its model and the values
+  of the concrete fields it holds (a deferred field is left out and not loaded), where Django compares model and
+  key alone. A run that returns rows reported `same` when a mechanism changed their fields (0.36.0 and later), as
+  when a row read whole became a display row; it reports `differs`.
 
 - `rebac.E018` accepts `REBAC_TRACKED_MODELS` as a tuple of labels, as the library already read it.
 
@@ -300,6 +453,80 @@ pre-1.0; breaking changes within a minor version are explicitly called out.
   included, are marked `pg_delta`. Tier 1 fails a test during which a statement tests a parameter for NULL
   (`tests/conftest.py`, the forms it reads in `tests/test_untyped_parameter_check.py`): that one shape is caught on
   SQLite, in every test, and the tier 2 run under server-side binding is the guard for every other.
+
+- **A relation is refused as a display field** (`REBAC_DISPLAY_FIELDS`, proposal 0020; the hole has existed since
+  0.36.0). A foreign key or one-to-one declared in `Meta.rebac_display_fields` or `display.declare` was shown on a
+  display row as its key, and following it loaded the row it names lazily, whole and unchecked: a joined display row
+  of an account whose `keeper` was a display field returned the keeper's every column through `row.keeper`, to an
+  actor who may read neither. A display field is now a plain column of the model's own: a relation in a
+  declaration raises `ImproperlyConfigured` where the declaration is read, for joined and prefetched display rows
+  alike. **Breaking for a model that declared a relation as a display field:** take it out of the declaration,
+  declare the related model's own display fields, and load it with a prefetch whose queryset asks for display rows
+  (`Prefetch("keeper", queryset=Account.objects.with_actor(actor).for_display())`) or join it with
+  `rebac_select_related`, where it is checked or shown by its own display fields.
+
+- **A model whose primary key is a relation is refused display fields** (`REBAC_DISPLAY_FIELDS`; 0.36.0 and later
+  for joined display rows). A display row shows its primary key. Where that key is a one-to-one to another model
+  and not a multi-table parent link, following it from a display row read the row it names, whole and unchecked,
+  to an actor who may read neither. `rebac.display.declaration_problems` now names such a model (its own primary
+  key or a multi-table parent's), so it is refused where its declaration is read and reported by `rebac.E026`
+  (under Breaking). A parent link is not such a key: it gives the row's own parent part, built from the display
+  row's values.
+
+- **A write never stores the `None` of a hidden field over the stored value** (0.7.0 and later for fields hidden by a
+  denied `read__<field>`; 0.36.0 and later for display rows). A row read with fields hidden holds `None` in them.
+  `save()` without `update_fields` already left them out, and refused them, under an actor, when `update_fields` named
+  one. `save_base()` called directly without `update_fields`, raw or not, wrote every column it writes, the `None` of
+  each hidden one included, or failed on a column that refuses NULL: the rule now lives in `RebacMixin.save_base`,
+  which `save()`, `asave()` and a direct call reach, so it writes what `save()` writes, in every table of a
+  multi-table row (in its own table alone for a raw save, as Django's). `loaddata` saves through Django's own
+  `Model.save_base(raw=True)`, never the model's, and its rows, built from the fixture, hide nothing. `bulk_update()`
+  (and `abulk_update()`, a related manager's and the base manager's) wrote the `None` of every named field over the
+  stored value, or failed on a column that refuses NULL; so did `save(update_fields=…)` under a bypass, and the update
+  of `bulk_create(update_conflicts=True)` under a bypass or through the base manager, which is now refused whole with
+  any other insert of such a row (below). Each other now refuses a named hidden field, before any statement for the
+  bulk ones, reading the record `save()` reads (`redacted_fields`, through
+  `rebac.field_visibility.refuse_hidden_fields`). Under Breaking. A save that names no fields writes nothing and sends
+  neither `pre_save` nor `post_save` when the row has a hidden field, is not refused (under Breaking: an insert, or a
+  hidden field given a value), and no field it shows and loaded differs from its loaded value: so `save()` and
+  `asave()` did already (Django's `save()` returns so for empty `update_fields`), and so does a direct `save_base()`,
+  raw or not, which sent both and wrote every column. Not covered: the parent instance a multi-table row's parent link
+  gives is Django's, built from the row's values with the hidden fields `None` and nothing marking them, and saving it
+  writes them; `update_or_create()` saves a row it reads itself, so a value taken from another row is the caller's
+  own.
+
+- **A save that names no fields no longer drops a value given to a hidden field** (0.7.0 and later for fields
+  hidden by a denied `read__<field>`; 0.36.0 and later for display rows). Such a save left every hidden field out
+  of the write, assigned or not, and reported success: `folder.children.add(row, bulk=False)` with a display row
+  set the row's foreign key, saved, and left the row where it was. A hidden field that holds anything but its
+  placeholder (the `None` it was hidden with, or what its descriptor makes of it when read, such as a file field's
+  `FieldFile` with no name) is now refused before any statement (under Breaking), as a write that names one is;
+  one that holds its placeholder is left out as before. A related manager's `remove()` of a display row raises
+  Django's own `DoesNotExist`, as it did, since the row's foreign key reads `None`.
+
+- **A row with hidden fields is no longer copied with them** (0.7.0 and later for fields hidden by a denied
+  `read__<field>`; 0.36.0 and later for display rows). An insert from such a row stored the hidden fields' `None`
+  as data in the new row: the copy idiom (`pk = None`, `_state.adding = True`), `save_base(force_insert=True)`,
+  and `bulk_create()` and `abulk_create()` of a list that held it, in every form. A key changed and nothing else
+  wrote nothing and reported success. Each is refused before any statement (under Breaking).
+
+- **A hidden image field no longer erases its width and height** (0.7.0 and later for fields hidden by a denied
+  `read__<field>`; 0.36.0 and later for display rows). A row with a hidden `ImageField` that declares
+  `width_field` or `height_field` had those width and height columns set to `NULL` in the database by its next
+  save, though the reader was shown them: the library hid the field by assigning it `None`, Django's descriptor
+  then set the width and height on the row to `None`, and the save wrote them. A field is still hidden through its
+  descriptor and the model's own `__setattr__`, and every shown column the hide changed is then put back as the
+  database returned it, not as model code derived it while Django built the row, or deferred again where the read
+  did not load it (Upgrading); an attribute that is no model field keeps what the hide left in it.
+
+- **`refresh_from_db()` of a row with hidden fields reads only the fields it shows** (0.7.0 and later). It read the
+  whole row, every column, with no permission statement, and hid the fields again afterwards (from 0.24.0), so model
+  code that ran while Django built the refreshed values (`__init__`, `post_init`, a `from_db` override) saw the
+  hidden values. It is now `refresh_from_db(fields=…)` with the concrete fields the row holds and shows, and with its
+  prefetched relations, which Django's refresh forgets; the hidden fields are deferred on the instance Django reads
+  into, and stay `None` on the row; a field the row had deferred stays deferred. A reverse one-to-one or generic
+  relation the row had cached stays cached, as with any `fields`, where a refresh of the whole row forgot it
+  (Upgrading). Naming a hidden field in `fields` is refused (under Breaking).
 
 ### Documentation
 

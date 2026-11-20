@@ -68,6 +68,14 @@ MAIN_TYPES = (
 ONE_PER_ROW = (("provenance/changeset", "actor"),)
 # The relationship ``read --uncommitted`` writes for the actor, on an object that does not exist.
 UNCOMMITTED_GRANT = ("messaging/thread", "reader")
+# The types a reader sees as labels where a row it reads refers to them (``rebac.display``,
+# proposal 0024), and the fields a label shows. The stand-ins carry only the columns the policy
+# reads, no names: a label is the key, and a file's visibility.
+DISPLAY_FIELDS = {
+    "messaging.Thread": ("id",),
+    "parties.Party": ("id",),
+    "storage.File": ("visibility",),
+}
 
 
 def _under(child: str, parent: str) -> Any:
@@ -175,6 +183,103 @@ def transcript(bench: Any, actor: Any) -> Any:
     ]
 
 
+def _label(row: Any) -> Any:
+    """A label as a read delivered it: its key and whether it is a display row, or None."""
+    from rebac import display
+
+    return None if row is None else (row.pk, display.is_display_row(row))
+
+
+def _labelled(bench: Any, actor: Any, label: str) -> Any:
+    """The queryset of a label relation's prefetch: it asks for display rows, a request that
+    changes nothing unless ``REBAC_DISPLAY_FIELDS`` is on (the ``labels`` mechanism)."""
+    return bench.models[label].objects.with_actor(actor).for_display()
+
+
+def labels(bench: Any, actor: Any) -> Any:
+    """One message with the labels a reader shows: its thread, its sender's party, its files."""
+    from django.db.models import Prefetch
+
+    pk = bench.readable("messaging.Message", actor)
+    models = bench.models
+    messages = (
+        models["messaging.Message"]
+        .objects.with_actor(actor)
+        .filter(pk=pk)
+        .prefetch_related(
+            Prefetch("thread", queryset=_labelled(bench, actor, "messaging.Thread")),
+            Prefetch("sender", queryset=models["parties.Handle"].objects.with_actor(actor)),
+            Prefetch("sender__party", queryset=_labelled(bench, actor, "parties.Party")),
+            Prefetch("parts", queryset=models["messaging.Part"].objects.with_actor(actor)),
+            Prefetch("parts__file", queryset=_labelled(bench, actor, "storage.File")),
+        )
+    )
+    return [
+        (
+            m.pk,
+            _label(m.thread),
+            _label(m.sender and m.sender.party),
+            sorted((p.pk, _label(p.file)) for p in m.parts.all()),
+        )
+        for m in messages
+    ]
+
+
+def page_labels(bench: Any, actor: Any) -> Any:
+    """The newest 50 messages of the actor's first thread, each with its thread and sender's party."""
+    from django.db.models import Prefetch
+
+    thread = bench.readable("messaging.Thread", actor)
+    models = bench.models
+    messages = (
+        models["messaging.Message"]
+        .objects.with_actor(actor)
+        .filter(thread_id=thread)
+        .order_by("-pk")
+        .prefetch_related(
+            Prefetch("thread", queryset=_labelled(bench, actor, "messaging.Thread")),
+            Prefetch("sender", queryset=models["parties.Handle"].objects.with_actor(actor)),
+            Prefetch("sender__party", queryset=_labelled(bench, actor, "parties.Party")),
+        )[:50]
+    )
+    return [(m.pk, _label(m.thread), _label(m.sender and m.sender.party)) for m in messages]
+
+
+def inbox_labels(bench: Any, actor: Any) -> Any:
+    """The newest messages of the actor's inbox (``read_inbox``) as a list shows them: each with
+    its thread and its sender's party as labels, its parts (read under ``read`` through
+    ``message->read``) with their files as labels, and its participants."""
+    from django.db.models import Prefetch
+
+    models = bench.models
+    messages = (
+        models["messaging.Message"]
+        .objects.with_actor(actor)
+        .with_action("read_inbox")
+        .order_by("-pk")
+        .prefetch_related(
+            Prefetch("thread", queryset=_labelled(bench, actor, "messaging.Thread")),
+            Prefetch("sender", queryset=models["parties.Handle"].objects.with_actor(actor)),
+            Prefetch("sender__party", queryset=_labelled(bench, actor, "parties.Party")),
+            Prefetch("parts", queryset=models["messaging.Part"].objects.with_actor(actor)),
+            Prefetch("parts__file", queryset=_labelled(bench, actor, "storage.File")),
+            Prefetch(
+                "participants", queryset=models["messaging.Participant"].objects.with_actor(actor)
+            ),
+        )[:25]
+    )
+    return [
+        (
+            m.pk,
+            _label(m.thread),
+            _label(m.sender and m.sender.party),
+            sorted((p.pk, _label(p.file)) for p in m.parts.all()),
+            sorted(p.pk for p in m.participants.all()),
+        )
+        for m in messages
+    ]
+
+
 def files(bench: Any, actor: Any) -> Any:
     """The newest files the actor may read: a page of a large table."""
     rows = bench.models["storage.File"].objects.with_actor(actor).order_by("-pk")[:50]
@@ -264,6 +369,9 @@ SCENARIOS = {
     "inbox": inbox,
     "inbox_messages": inbox_messages,
     "selected": selected,
+    "labels": labels,
+    "page_labels": page_labels,
+    "inbox_labels": inbox_labels,
     "transcript": transcript,
     "files": files,
     "folder": folder,

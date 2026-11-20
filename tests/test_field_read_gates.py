@@ -11,10 +11,12 @@ import pickle
 from typing import Any, cast
 
 import pytest
+from django.core.files.base import ContentFile
 from django.db import connection
-from django.db.models import Count, F, FilteredRelation, Min, Value
+from django.db.models import CharField, Count, F, FilteredRelation, Min, Value
 from django.db.models.expressions import RawSQL
 from django.db.models.functions import Upper
+from django.db.models.query_utils import DeferredAttribute
 from django.test import override_settings
 from django.test.utils import CaptureQueriesContext
 
@@ -743,6 +745,448 @@ def test_full_save_excludes_redacted_fields_from_the_update(alice, bob):
 
 
 @override_settings(REBAC_FIELD_READ_MODE="redact")
+def test_full_save_refuses_a_redacted_field_given_a_value(alice, bob):
+    """A save that names no fields writes no redacted field: one given a value is refused before
+    any statement, where the save left it out and reported success. A None given to it cannot be
+    told from the redacted value, and is left out."""
+    from tests.testapp.models import Post
+
+    post = _post(title="stored secret", body="original")
+    _grant(post.pk, bob, "owner")
+    _grant(post.pk, alice, "viewer")
+    _grant(post.pk, alice, "editor")
+
+    instance = Post.objects.as_user(alice).get(pk=post.pk)
+    instance.title = "overwrite"
+    instance.body = "edited"
+    with CaptureQueriesContext(connection) as captured:
+        with pytest.raises(
+            PermissionDenied, match=r"has title hidden .*, and holds a value given to it"
+        ):
+            instance.save()
+    assert captured.captured_queries == []
+    instance.title = None
+    instance.save()
+
+    with sudo(reason="test.verify"):
+        fresh = Post.objects.get(pk=post.pk)
+    assert (fresh.title, fresh.body) == ("stored secret", "edited")
+
+
+@override_settings(REBAC_FIELD_READ_MODE="redact")
+@pytest.mark.parametrize("form", ["insert", "ignore_conflicts", "update_conflicts"])
+@pytest.mark.parametrize("queryset", ["actor", "sudo", "base manager"])
+def test_a_redacted_row_is_not_bulk_created(alice, bob, queryset, form):
+    """``bulk_create()`` of a redacted row would store its redacted None as data: refused before
+    any statement, in every form and through any manager."""
+    from tests.testapp.models import Post
+
+    post = _post(title="stored secret", body="original")
+    _grant(post.pk, alice, "viewer")
+    _grant(post.pk, alice, "editor")
+    instance = Post.objects.as_user(alice).get(pk=post.pk)
+    rows = {
+        "actor": Post.objects.as_user(alice),
+        "sudo": Post.objects.sudo(reason="test.copy"),
+        "base manager": Post._base_manager.all(),
+    }[queryset]
+    kwargs: dict[str, Any] = {
+        "insert": {},
+        "ignore_conflicts": {"ignore_conflicts": True},
+        "update_conflicts": {
+            "update_conflicts": True,
+            "unique_fields": ["id"],
+            "update_fields": ["body"],
+        },
+    }[form]
+    refused = rf"testapp\.Post row {post.pk} has title hidden .*bulk_create\(\) would insert"
+    with CaptureQueriesContext(connection) as captured:
+        with pytest.raises(PermissionDenied, match=refused):
+            rows.bulk_create([instance], **kwargs)
+    assert captured.captured_queries == []
+    with sudo(reason="test.verify"):
+        assert list(Post.objects.values_list("title", "body")) == [("stored secret", "original")]
+
+
+FILED_DOC_SCHEMA_TEXT = """
+definition auth/user {}
+
+definition test/fileddoc {
+    relation editor: auth/user
+    permission read = editor
+    permission write = editor
+    permission read__attachment = nil
+    permission read__picture = nil
+    permission read__content_type = nil
+    permission read__object_id = nil
+    permission read__kind = nil
+    permission read__note = nil
+}
+"""
+
+
+class _Unset:
+    """What the note field's descriptor makes of the None it reads."""
+
+    def __eq__(self, other: object) -> bool:
+        return isinstance(other, _Unset)
+
+    __hash__ = object.__hash__
+
+
+class _NoteDescriptor(DeferredAttribute):
+    """Stamps the shown ``stamp`` column on every assignment, and wraps a None it reads, for
+    which it reads the row's ``_state``: a bare instance of the model has none."""
+
+    def __get__(self, instance: Any, cls: Any = None) -> Any:
+        if instance is None:
+            return self
+        value = super().__get__(instance, cls)
+        if value is None:
+            instance._state  # noqa: B018
+            value = instance.__dict__[self.field.attname] = _Unset()
+        return value
+
+    def __set__(self, instance: Any, value: Any) -> None:
+        instance.__dict__[self.field.attname] = value
+        instance.__dict__["stamp"] = f"stamped {value}"
+
+
+class _NoteField(CharField):  # type: ignore[type-arg]
+    descriptor_class = _NoteDescriptor
+
+
+@pytest.fixture
+def filed_doc(transactional_db, alice):
+    """Document 1, which alice edits: she is denied its file, its image (whose width and height
+    she reads), the parts of its generic relation, its kind (which the model's ``__setattr__``
+    copies, upper-cased, to an attribute that is no field) and its note (whose descriptor stamps
+    the shown ``stamp`` column). The model and its table are the test's own: an ImageField
+    cannot be declared without Pillow."""
+    from django.contrib.contenttypes.fields import GenericForeignKey
+    from django.contrib.contenttypes.models import ContentType
+    from django.db import models
+    from django.test.utils import isolate_apps
+
+    from rebac import RebacMixin
+
+    with isolate_apps("tests.testapp"):
+
+        class FiledDoc(RebacMixin, models.Model):
+            name = models.CharField(max_length=20, default="")
+            attachment = models.FileField(null=True, blank=True, upload_to="docs/")
+            picture = models.ImageField(
+                null=True, upload_to="pictures/", width_field="width", height_field="height"
+            )
+            width = models.IntegerField(null=True)
+            height = models.IntegerField(null=True)
+            content_type = models.ForeignKey(
+                ContentType, null=True, on_delete=models.CASCADE, related_name="+"
+            )
+            object_id = models.PositiveIntegerField(null=True)
+            about = GenericForeignKey("content_type", "object_id")
+            kind = models.CharField(max_length=20, null=True)
+            note = _NoteField(max_length=20, null=True)
+            stamp = models.CharField(max_length=20, null=True)
+
+            class Meta:
+                app_label = "testapp"
+                rebac_resource_type = "test/fileddoc"
+
+            def __setattr__(self, name: str, value: Any) -> None:
+                if name == "kind":
+                    super().__setattr__("kind_upper", value.upper() if value else None)
+                super().__setattr__(name, value)
+
+        with connection.schema_editor() as editor:
+            editor.create_model(FiledDoc)
+        try:
+            install_schema(backend(), parse_zed(FILED_DOC_SCHEMA_TEXT))
+            kind = ContentType.objects.get_for_model(Post)
+            FiledDoc._base_manager.bulk_create(
+                [
+                    FiledDoc(
+                        id=1,
+                        name="doc",
+                        attachment="docs/a.txt",
+                        picture="pictures/a.png",
+                        width=10,
+                        height=20,
+                        content_type=kind,
+                        object_id=7,
+                        kind="secret",
+                        note="private",
+                        stamp="s1",
+                    )
+                ]
+            )
+            _grant_ref("test/fileddoc", "1", alice, "editor")
+            yield FiledDoc, kind
+        finally:
+            with connection.schema_editor() as editor:
+                editor.delete_model(FiledDoc)
+
+
+def _stored_doc(model: Any) -> tuple[Any, ...]:
+    return tuple(
+        model._base_manager.values_list(
+            "name",
+            "attachment",
+            "picture",
+            "width",
+            "height",
+            "content_type_id",
+            "object_id",
+            "kind",
+            "note",
+            "stamp",
+        ).get(pk=1)
+    )
+
+
+def _as_loaded(kind: Any, *, name: str = "doc") -> tuple[Any, ...]:
+    """Document 1 as stored by the fixture, with ``name``."""
+    return (name, "docs/a.txt", "pictures/a.png", 10, 20, kind.pk, 7, "secret", "private", "s1")
+
+
+# A redacted field read as Django gives it, through its descriptor.
+READS: dict[str, Any] = {
+    "the file": lambda row: bool(row.attachment),
+    "the image": lambda row: bool(row.picture),
+    "the foreign key": lambda row: row.content_type,
+    "the generic relation": lambda row: row.about,
+}
+
+
+@override_settings(REBAC_FIELD_READ_MODE="redact")
+@pytest.mark.parametrize("read", sorted(READS))
+def test_reading_a_redacted_field_gives_it_no_value(filed_doc, alice, read):
+    """A file field's descriptor writes a FieldFile with no name back onto the row when its None
+    is read; a relation caches None. Each still holds what it was hidden with, so the save of the
+    changed name writes the name alone, and ``check_save()`` passes."""
+    model, kind = filed_doc
+    row = model.objects.as_user(alice).get(pk=1)
+    READS[read](row)
+    row.name = "renamed"
+    assert row.check_save().allowed
+    row.save()
+    assert _stored_doc(model) == _as_loaded(kind, name="renamed")
+
+
+@override_settings(REBAC_FIELD_READ_MODE="redact")
+def test_hiding_runs_the_models_code_and_puts_back_what_it_changed_in_shown_columns(
+    filed_doc, alice
+):
+    """Each field is hidden through ``setattr``, so the model's own ``__setattr__`` and the field's
+    descriptor run, as on any assignment: the upper-cased copy of the kind, no field, is cleared
+    with it. A shown column the hide changed is put back as loaded: the image's width and height,
+    which its descriptor set to None, and the stamp the note's descriptor rewrote. A save of the
+    changed name writes the name alone."""
+    model, kind = filed_doc
+    row = model.objects.as_user(alice).get(pk=1)
+    assert redacted_fields(row) == {
+        "attachment",
+        "picture",
+        "content_type",
+        "object_id",
+        "kind",
+        "note",
+    }
+    assert (row.kind, row.kind_upper, vars(row)["note"]) == (None, None, None)
+    assert (row.width, row.height, row.stamp) == (10, 20, "s1")
+    row.name = "renamed"
+    row.save()
+    assert _stored_doc(model) == _as_loaded(kind, name="renamed")
+
+
+# A value given to a redacted field.
+GIVEN: dict[str, Any] = {
+    "a file name": lambda row, _kind: setattr(row, "attachment", "docs/b.txt"),
+    "a name on the file read": lambda row, _kind: setattr(row.attachment, "name", "docs/b.txt"),
+    "a content type": lambda row, kind: setattr(row, "content_type", kind),
+    "a nameless file": lambda row, _kind: setattr(row, "attachment", ContentFile(b"new data")),
+    "the note read": lambda row, _kind: row.note,
+}
+
+
+@override_settings(REBAC_FIELD_READ_MODE="redact")
+@pytest.mark.parametrize("given", sorted(GIVEN))
+def test_a_value_given_to_a_redacted_field_is_refused(filed_doc, alice, given):
+    """Anything put in a redacted field but its placeholder is a value given to it, refused before
+    any statement: a nameless ``ContentFile`` compares equal, by name, to the ``FieldFile`` with no
+    name, and is not one. The note's descriptor reads the row's state to wrap the None it reads,
+    and a bare instance has none: what it wrapped on the row reads as a value given too."""
+    model, kind = filed_doc
+    row = model.objects.as_user(alice).get(pk=1)
+    GIVEN[given](row, kind)
+    row.name = "renamed"
+    with CaptureQueriesContext(connection) as captured:
+        with pytest.raises(PermissionDenied, match="holds a value given to it"):
+            row.save()
+    assert captured.captured_queries == []
+    assert _stored_doc(model) == _as_loaded(kind)
+
+
+PAIR_SCHEMA_TEXT = """
+definition auth/user {}
+
+definition test/pairdoc {
+    relation editor: auth/user
+    permission read = editor
+    permission write = editor
+    permission read__a = nil
+    permission read__b = nil
+    permission read__picture = nil
+}
+"""
+
+
+@pytest.fixture(params=["notes first", "notes last"])
+def pair_doc(request, transactional_db, alice):
+    """Document 1: ``a``, ``b`` and an image hidden; ``a_note``, ``b_note``, ``width`` and ``height``
+    shown. The model's ``__setattr__`` writes ``b_note`` from ``a`` and ``a_note`` from ``b``, so
+    as Django builds a row it copies the hidden values into the shown notes when they are
+    declared first, and as the library hides ``a`` and ``b`` it rewrites both notes."""
+    from django.db import models
+    from django.test.utils import isolate_apps
+
+    from rebac import RebacMixin
+
+    def notes() -> dict[str, Any]:
+        return {
+            "a_note": models.CharField(max_length=40, null=True),
+            "b_note": models.CharField(max_length=40, null=True),
+        }
+
+    def hidden() -> dict[str, Any]:
+        return {
+            "a": models.CharField(max_length=40, null=True),
+            "b": models.CharField(max_length=40, null=True),
+        }
+
+    def __setattr__(self: Any, name: str, value: Any) -> None:
+        if name == "a":
+            models.Model.__setattr__(self, "b_note", f"from a: {value}")
+        if name == "b":
+            models.Model.__setattr__(self, "a_note", f"from b: {value}")
+        models.Model.__setattr__(self, name, value)
+
+    with isolate_apps("tests.testapp"):
+        first, last = (notes(), hidden()) if request.param == "notes first" else (hidden(), notes())
+        attrs: dict[str, Any] = {"__module__": __name__, **first, **last}
+        attrs["picture"] = models.ImageField(
+            null=True, upload_to="pictures/", width_field="width", height_field="height"
+        )
+        attrs["width"] = models.IntegerField(null=True)
+        attrs["height"] = models.IntegerField(null=True)
+        attrs["Meta"] = type(
+            "Meta", (), {"app_label": "testapp", "rebac_resource_type": "test/pairdoc"}
+        )
+        attrs["__setattr__"] = __setattr__
+        model = cast(Any, type("PairDoc", (RebacMixin, models.Model), attrs))
+        with connection.schema_editor() as editor:
+            editor.create_model(model)
+        try:
+            install_schema(backend(), parse_zed(PAIR_SCHEMA_TEXT))
+            with connection.cursor() as cursor:
+                cursor.execute(
+                    f"INSERT INTO {model._meta.db_table} (id, a, b, a_note, b_note, picture, width, "
+                    "height) VALUES (1, 'secret-a', 'secret-b', 'stored a_note', 'stored b_note', "
+                    "'pictures/x.png', 10, 20)"
+                )
+            _grant_ref("test/pairdoc", "1", alice, "editor")
+            yield model
+        finally:
+            with connection.schema_editor() as editor:
+                editor.delete_model(model)
+
+
+@override_settings(REBAC_FIELD_READ_MODE="redact")
+def test_hiding_puts_back_what_the_database_returned_for_a_shown_column(pair_doc, alice):
+    """A shown column the hide changed is put back as the database returned it, never as model
+    code derived it while Django built the row (from the hidden values, when the notes come
+    first): the notes and the image's width and height are as stored, and a save writes none of
+    them."""
+    row = pair_doc.objects.as_user(alice).get(pk=1)
+    assert redacted_fields(row) == {"a", "b", "picture"}
+    assert (row.a, row.b) == (None, None)
+    assert (row.a_note, row.b_note, row.width, row.height) == (
+        "stored a_note",
+        "stored b_note",
+        10,
+        20,
+    )
+    row.save()
+    assert pair_doc._base_manager.values_list("a", "b", "a_note", "b_note", "width", "height").get(
+        pk=1
+    ) == ("secret-a", "secret-b", "stored a_note", "stored b_note", 10, 20)
+
+
+@override_settings(REBAC_FIELD_READ_MODE="redact")
+def test_a_deferred_shown_column_the_hide_changed_is_deferred_again(pair_doc, alice):
+    """``a_note`` and ``width`` were not read; model code filled them as Django built the row
+    (``a_note`` from the hidden ``b`` when the notes come first, ``width`` by Django's image
+    field, which loads it), and the hide changed them: they are deferred again, and a read loads
+    what is stored."""
+    row = pair_doc.objects.as_user(alice).defer("a_note", "width").get(pk=1)
+    assert {"a_note", "width"} <= row.get_deferred_fields()
+    assert (row.a_note, row.width, row.height, row.b_note) == (
+        "stored a_note",
+        10,
+        20,
+        "stored b_note",
+    )
+    assert (row.a, row.b) == (None, None)
+
+
+@override_settings(REBAC_FIELD_READ_MODE="redact")
+def test_a_key_given_in_another_form_of_the_same_value_is_not_moved(alice, bob):
+    """The key compared as the field prepares it: ``"1"`` on an integer key is the row's own key,
+    so the save updates it and is no insert."""
+    from tests.testapp.models import Post
+
+    post = _post(title="stored secret", body="original")
+    _grant(post.pk, alice, "viewer")
+    _grant(post.pk, alice, "editor")
+    instance = Post.objects.as_user(alice).get(pk=post.pk)
+    instance.pk = str(post.pk)
+    instance.body = "edited"
+    instance.save()
+    with sudo(reason="test.verify"):
+        assert list(Post.objects.values_list("pk", "title", "body")) == [
+            (post.pk, "stored secret", "edited")
+        ]
+
+
+@override_settings(REBAC_FIELD_READ_MODE="redact")
+@pytest.mark.parametrize(
+    "copy",
+    ["key None, marked as being added", "key kept, marked as being added", "key None", "forced"],
+)
+def test_a_redacted_row_is_not_copied(alice, bob, copy):
+    """Saving a redacted row as a new one would store its redacted None as data: refused before
+    any statement, where the copy idiom stored a row with the title NULL. A new row built from
+    values the caller chose has nothing hidden and is saved as any."""
+    from tests.testapp.models import Post
+
+    post = _post(title="stored secret", body="original")
+    _grant(post.pk, alice, "viewer")
+    _grant(post.pk, alice, "editor")
+    instance = Post.objects.as_user(alice).get(pk=post.pk).sudo(reason="test.copy")
+    if copy != "key kept, marked as being added":
+        instance.pk = None
+    instance._state.adding = copy.endswith("marked as being added")
+    with CaptureQueriesContext(connection) as captured:
+        with pytest.raises(PermissionDenied, match="would insert it as a new row"):
+            instance.save(force_insert=copy == "forced")
+    assert captured.captured_queries == []
+    with sudo(reason="test.verify"):
+        assert Post.objects.count() == 1
+        Post(body=instance.body, title="chosen").save()
+        assert Post.objects.count() == 2
+
+
+@override_settings(REBAC_FIELD_READ_MODE="redact")
 def test_full_save_uses_dirty_fields_minus_redacted_fields(alice, bob):
     from tests.testapp.models import Post
 
@@ -781,6 +1225,52 @@ def test_bulk_update_still_works_when_read_gates_are_enabled(alice, bob):
         fresh = Post.objects.get(pk=post.pk)
     assert fresh.title == "bulk title"
     assert fresh.body == "bulk safe"
+
+
+@override_settings(REBAC_FIELD_READ_MODE="redact")
+def test_a_redacted_field_is_never_written_from_the_row_that_hid_it(alice, bob):
+    """The redacted ``title`` holds None on alice's row. ``bulk_update()`` naming it is refused
+    before any statement, under her and under a bypass, and so is ``save(update_fields=...)``
+    under the row's own bypass; naming only ``body`` writes. Until this release each of the
+    three stored None over the title."""
+    from tests.testapp.models import Post
+
+    post = _post(title="stored secret", body="original")
+    _grant(post.pk, bob, "owner")
+    _grant(post.pk, alice, "viewer")
+    _grant(post.pk, alice, "editor")
+    instance = Post.objects.as_user(alice).get(pk=post.pk)
+    assert instance.title is None
+    instance.body = "bulk safe"
+    for queryset in (Post.objects.as_user(alice), Post.objects.sudo(reason="test.bulk")):
+        with CaptureQueriesContext(connection) as captured:
+            with pytest.raises(PermissionDenied, match="has title hidden"):
+                queryset.bulk_update([instance], ["title", "body"])
+        assert captured.captured_queries == []
+    with pytest.raises(PermissionDenied, match="has title hidden"):
+        instance.sudo(reason="test.save").save(update_fields=["title", "body"])
+    with sudo(reason="test.verify"):
+        assert Post.objects.get(pk=post.pk).title == "stored secret"
+    assert Post.objects.as_user(alice).bulk_update([instance], ["body"]) == 1
+    with sudo(reason="test.verify"):
+        fresh = Post.objects.get(pk=post.pk)
+    assert (fresh.title, fresh.body) == ("stored secret", "bulk safe")
+
+
+@override_settings(REBAC_FIELD_READ_MODE="redact")
+def test_update_or_create_refuses_a_field_its_own_read_hides(alice, bob):
+    """``update_or_create`` reads its row under the queryset's actor and saves the fields it was
+    given: a field that read redacts is refused, whatever value was given for it."""
+    from tests.testapp.models import Post
+
+    post = _post(title="stored secret", body="original")
+    _grant(post.pk, bob, "owner")
+    _grant(post.pk, alice, "viewer")
+    _grant(post.pk, alice, "editor")
+    with pytest.raises(PermissionDenied, match="has title hidden"):
+        Post.objects.as_user(alice).update_or_create(pk=post.pk, defaults={"title": None})
+    with sudo(reason="test.verify"):
+        assert Post.objects.get(pk=post.pk).title == "stored secret"
 
 
 @override_settings(REBAC_FIELD_READ_MODE="redact")

@@ -90,6 +90,7 @@ def test_queryset_manager_extensions_keep_native_type_checks(tmp_path: Path) -> 
             assert_type(queryset.with_action("read"), PostQuerySet[Post])
             assert_type(queryset.on_field_deny("allow"), PostQuerySet[Post])
             assert_type(queryset.for_write(), PostQuerySet[Post])
+            assert_type(queryset.for_display(), PostQuerySet[Post])
             assert_type(queryset.scoped(), PostQuerySet[Post])
             assert_type(queryset.scoped_for_aggregate(), PostQuerySet[Post])
             assert_type(queryset.sudo(reason="typing"), PostQuerySet[Post])
@@ -268,6 +269,7 @@ def test_queryset_scope_clones_keep_concrete_class() -> None:
         original.with_action("read"),
         original.on_field_deny("allow"),
         original.for_write(),
+        original.for_display(),
         original.sudo(reason="typing"),
         original.system_context(reason="typing"),
         original.rebac_select_related(None),

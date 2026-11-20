@@ -11,7 +11,10 @@ PostgreSQL the planning and execution time and the planner's memory, summed
 over the statements. ``census`` says, per model, whether its read permission can
 be written as row conditions and how many relations it reaches. ``smoke`` builds
 the tiny size and runs every scenario with and without the mechanisms, failing
-if a result differs: it needs no database server (in-memory SQLite).
+if a result differs: it needs no database server (in-memory SQLite). It runs
+twice, without display rows and with them (``labels``), each run compared with
+its own first mechanism. A mechanism is compared with the first one of the run
+that reads alike: display rows on or off, and ``plain`` enforces none.
 """
 
 from __future__ import annotations
@@ -41,6 +44,17 @@ MECHANISMS: dict[str, dict[str, Any]] = {
         "REBAC_ROW_SCOPE": True,
         "REBAC_BOUNDED_WALK": "decide",
         "REBAC_TRUSTED_IDS": True,
+    },
+    # Display rows (proposal 0024): a prefetch that asks for them (the profile's ``labels``
+    # scenarios) reads the rows its parents refer to by key. It changes what those reads return,
+    # so its lines end in DIFFERS against a mechanism without it.
+    "labels": {"REBAC_DISPLAY_FIELDS": True},
+    "all_labels": {
+        "REBAC_STRUCTURAL_PREFETCH": True,
+        "REBAC_ROW_SCOPE": True,
+        "REBAC_BOUNDED_WALK": "decide",
+        "REBAC_TRUSTED_IDS": True,
+        "REBAC_DISPLAY_FIELDS": True,
     },
 }
 
@@ -97,18 +111,31 @@ def main() -> None:
     if arguments.command == "edges":
         edges_of(standins.MODELS, arguments.parent, arguments.action)
         return
+    import importlib
+
+    from rebac import display
+
+    # Inert unless a mechanism turns REBAC_DISPLAY_FIELDS on.
+    profile = importlib.import_module(f"tests.bench.policies.{settings.REBAC_BENCH_POLICY}.profile")
+    for label, fields in getattr(profile, "DISPLAY_FIELDS", {}).items():
+        display.declare(standins.MODELS[label], *fields)
     if arguments.command == "smoke":
         bench = data.load(settings.REBAC_BENCH_POLICY, "tiny")
         data.build(bench)
-        everything = argparse.Namespace(
-            scenario="",
-            actor="heavy,light,outsider,admin",
-            mechanism="today,all",
-            repeats=1,
-            explain=False,
-            uncommitted=False,
-        )
-        failed = [row for row in reads(bench, everything) if "error" in row or row["same"] is False]
+        failed = []
+        # Display rows change what a label read returns: each run has its own baseline.
+        for mechanisms in ("today,all", "labels,all_labels"):
+            everything = argparse.Namespace(
+                scenario="",
+                actor="heavy,light,outsider,admin",
+                mechanism=mechanisms,
+                repeats=1,
+                explain=False,
+                uncommitted=False,
+            )
+            failed += [
+                row for row in reads(bench, everything) if "error" in row or row["same"] is False
+            ]
         sys.exit(f"{len(failed)} read(s) failed or differed" if failed else 0)
     bench = data.load(settings.REBAC_BENCH_POLICY, arguments.size)
     if arguments.command == "build":
@@ -149,7 +176,8 @@ def reads(bench: Any, arguments: argparse.Namespace) -> list[dict[str, Any]]:
     for name in names:
         for who in arguments.actor.split(","):
             actor = bench.actor(who)
-            baseline: Any = None
+            # The first result of each way of reading (``alike``), the others' baseline.
+            baselines: dict[tuple[str, bool], Any] = {}
             for mechanism in arguments.mechanism.split(","):
                 with override_settings(**MECHANISMS[mechanism]):
                     compiled.reset()
@@ -207,13 +235,9 @@ def reads(bench: Any, arguments: argparse.Namespace) -> list[dict[str, Any]]:
                         row.update(_explain(connection, statements))
                 compiled.reset()
                 rowscope._built.clear()
-                if mechanism == "plain":
-                    # Not a mechanism to compare results with: it reads what is there.
-                    row["same"] = None
-                else:
-                    if baseline is None:
-                        baseline = result
-                    row["same"] = result == baseline
+                # Compared only with a mechanism that reads alike: display rows change what
+                # a label read returns, and ``plain`` reads every row.
+                row["same"] = result == baselines.setdefault(alike(mechanism), result)
                 report.append(row)
                 line = (
                     f"{name:<14}{who:<9}{mechanism:<11}{row['rows']:>5}{row['statements']:>6}"
@@ -223,6 +247,15 @@ def reads(bench: Any, arguments: argparse.Namespace) -> list[dict[str, Any]]:
                     line += f"{row['plan_ms']:>9}{row['exec_ms']:>9}{row['plan_mib']:>9}"
                 print(line + ("  DIFFERS" if row["same"] is False else ""), flush=True)
     return report
+
+
+def alike(mechanism: str) -> tuple[str, bool]:
+    """What decides what a mechanism reads: whether the policy is enforced, and whether display
+    rows are on."""
+    chosen = MECHANISMS[mechanism]
+    if chosen.get("REBAC_ENABLED") is False:
+        return "unenforced", False
+    return "published", bool(chosen.get("REBAC_DISPLAY_FIELDS"))
 
 
 @contextmanager

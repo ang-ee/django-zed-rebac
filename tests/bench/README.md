@@ -23,7 +23,8 @@ named in its `skeleton.json`: 147 definitions over 142 models. A message's read 
 ## Running it
 
 ```sh
-make bench-smoke                         # tiny, in-memory SQLite, every scenario; fails if a result differs
+make bench-smoke                         # tiny, in-memory SQLite, every scenario, without display rows and
+                                         # with them; fails if a result differs
 
 export DJANGO_SETTINGS_MODULE=tests.settings_bench
 export REBAC_TEST_POSTGRES_URL=postgresql://user:password@host:5432/bench    # an empty database
@@ -51,9 +52,16 @@ reads the actor's profile at every compile.
 `read` prints one line per scenario, actor and mechanism: rows read, statements, their SQL size, the wall time
 (median of `--repeats`), and with `--explain` on PostgreSQL the planning time, the execution time and the
 planner's memory, summed over the statements. A mechanism is a named set of settings (`today`, `structural`,
-`rows`, `named`, `walk`, `trusted`, `noprofile`, `all`); a line ends in `DIFFERS` if it read something else than
-the first mechanism did. `plain` is `REBAC_ENABLED = False`: Django's own queries, with every row
-readable, as the floor the others can be compared with.
+`rows`, `named`, `walk`, `trusted`, `noprofile`, `all`, `labels`, `all_labels`, `plain`); a line ends in `DIFFERS`
+if it read something else than the first mechanism of the run that reads alike: display rows on or off, or nothing
+enforced for `plain`. `labels` turns on `REBAC_DISPLAY_FIELDS` for the profile's `DISPLAY_FIELDS`: the `labels`,
+`page_labels` and `inbox_labels` scenarios ask for display rows on their label prefetches (proposal 0024), and read
+display rows where `today` reads whole rows or none, so they are compared only with a mechanism that has display
+rows too. `inbox_labels` reads a page of messages admitted under their inbox action (`read_inbox`), with their parts
+and participants, and their threads, senders' parties and parts' files as labels: children delivered under an
+action that implies theirs, and labels hanging off rows admitted under such an action.
+`plain` is `REBAC_ENABLED = False`: Django's own queries, with every row readable, as the floor the others can be
+compared with. The smoke run compares `all` with `today`, and `all_labels` with `labels`.
 
 ## The cast
 

@@ -82,11 +82,14 @@ def validation_rows(request: pytest.FixtureRequest, settings: Any) -> Iterator[S
 
 
 def test_unreadable_unwritten_values_cannot_reveal_hidden_duplicates(validation_rows):
+    """Validation leaves the redacted email out; the save that names no fields refuses the
+    value assigned to it, which it would not write."""
     with actor_context(validation_rows.alice):
         row = GuardedUniqueRow.objects.get(pk=validation_rows.mine.pk)
         row.email = "bob@example.com"
         row.full_clean()
-        row.save()
+        with pytest.raises(PermissionDenied, match="has email hidden"):
+            row.save()
     with system_context(reason="validation readback"):
         assert GuardedUniqueRow.objects.get(pk=row.pk).email == "alice@example.com"
 

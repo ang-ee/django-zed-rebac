@@ -5,7 +5,7 @@ from __future__ import annotations
 from collections.abc import Callable, Iterable, Mapping, Sequence
 from typing import Any
 
-from django.db import router
+from django.db import models, router
 
 from . import backends
 from .actors import ActorLike, to_subject_ref
@@ -115,8 +115,14 @@ def compare_mechanisms(
     Each combination is run once to warm it and then ``repeats`` times. A row
     of the report holds the settings, the statements and SQL size of one run,
     the median and best time, and whether the result equals the baseline's.
+    Results are compared by what they loaded: a model instance (the result, a
+    mapping's value, or an item of a list, tuple or set, at any depth) as its
+    model and the values of the concrete fields it holds, so a row read whole
+    and the same row read with fields hidden differ (``_loaded``).
     For two sets, lists or mappings it also says how many items were lost and
-    gained. The baseline is the first row.
+    gained (for a mapping an item is a key with its value), and for two
+    mappings how many keys both hold with another value (``changed``), each
+    item compared by the ``repr`` of that form. The baseline is the first row.
 
     It changes settings and clears the library's kept statements, so it is for
     a test or a benchmark, never a running application.
@@ -166,19 +172,60 @@ def compare_mechanisms(
             "ms": round(median(times), 1),
             "best_ms": round(min(times), 1),
         }
+        loaded = _loaded(result)
         if not report:
-            baseline = result
+            baseline = loaded
             row["result"] = "baseline"
         else:
-            row["result"] = "same" if result == baseline else "differs"
-            if result != baseline:
-                row.update(_difference(baseline, result))
+            row["result"] = "same" if loaded == baseline else "differs"
+            if loaded != baseline:
+                row.update(_difference(baseline, loaded))
         report.append(row)
     return report
 
 
+def _loaded(value: Any) -> Any:
+    """``value`` as ``compare_mechanisms`` compares it: a model instance as what it loaded.
+
+    Django compares two instances by model and primary key alone, so a row read
+    whole and the same row read with fields hidden are equal. Here an instance
+    is its model's label and the value of each concrete field it holds, by
+    attname (a deferred field is left out, and nothing is loaded). A mapping is
+    its keys with their values' forms; a list or a tuple is one of its items'
+    forms; a set or a frozenset is a frozenset of them, or itself where they
+    cannot be hashed; anything else is itself.
+    """
+    if isinstance(value, models.Model):
+        held = vars(value)
+        return (
+            value._meta.label,
+            tuple(
+                (field.attname, _loaded(held[field.attname]))
+                for field in value._meta.concrete_fields
+                if field.attname in held
+            ),
+        )
+    if isinstance(value, Mapping):
+        return {key: _loaded(item) for key, item in value.items()}
+    if isinstance(value, (set, frozenset)):
+        try:
+            return frozenset(_loaded(item) for item in value)
+        except TypeError:
+            return value
+    if type(value) in (list, tuple):
+        return type(value)(_loaded(item) for item in value)
+    return value
+
+
 def _difference(before: Any, after: Any) -> dict[str, int]:
-    """How many items a result lost and gained, where both are collections of the same kind."""
+    """How many items a result lost and gained, where both are collections of the same kind.
+
+    ``before`` and ``after`` are compared as ``_loaded`` gives them, each item by
+    its ``repr``. For two mappings an item is a key with its value, so a changed
+    value is one item lost and one gained; ``changed`` counts the keys both hold
+    whose values differ.
+    """
+    before, after = _loaded(before), _loaded(after)
 
     def items(value: Any) -> set[Any] | None:
         try:
@@ -193,7 +240,15 @@ def _difference(before: Any, after: Any) -> dict[str, int]:
     old, new = items(before), items(after)
     if old is None or new is None:
         return {}
-    return {"lost": len(old - new), "gained": len(new - old)}
+    found = {"lost": len(old - new), "gained": len(new - old)}
+    if isinstance(before, Mapping) and isinstance(after, Mapping):
+        try:
+            found["changed"] = sum(
+                1 for key in before.keys() & after.keys() if repr(before[key]) != repr(after[key])
+            )
+        except TypeError:
+            pass
+    return found
 
 
 def format_mechanisms(report: Sequence[Mapping[str, Any]]) -> str:
@@ -207,7 +262,8 @@ def format_mechanisms(report: Sequence[Mapping[str, Any]]) -> str:
         cells += [str(row[key]) for key in ("statements", "sql_kb", "ms", "best_ms")]
         result = str(row["result"])
         if "lost" in row:
-            result += f" (lost {row['lost']}, gained {row['gained']})"
+            changed = f", changed {row['changed']}" if "changed" in row else ""
+            result += f" (lost {row['lost']}, gained {row['gained']}{changed})"
         lines.append([*cells, result])
     widths = [max(len(line[index]) for line in lines) for index in range(len(header))]
     return "\n".join(

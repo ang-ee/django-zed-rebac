@@ -1221,7 +1221,7 @@ All settings prefixed `REBAC_`. No nested dict. Read via the public `app_setting
 | `REBAC_STRUCTURAL_PREFETCH` | `False` | `bool` | Experimental. Children of parents a prefetch just admitted are read by foreign key, without their permission statement, where the policy proves the parent's action grants theirs, the parent's action being the one the child's arm names or one the policy proves implies it. See [Switchable read mechanisms](#switchable-read-mechanisms). |
 | `REBAC_ROW_SCOPE` | `False` | `bool \| "named"` | Experimental. The scope of a statement a queryset runs itself is written as conditions on each row instead of membership in the ids the actor holds. `"named"`: only where the queryset's own conditions bind its primary key or a foreign key to literal values. Needs PostgreSQL's JIT off. |
 | `REBAC_BOUNDED_WALK` | `False` | `bool \| "prove" \| "decide"` | Experimental. `held` and `held_many` are answered by lookups on the rows the ids name. `"prove"` (or `True`) settles the ids a grant, a column or a parent shows held; `"decide"` reads the whole permission and answers no as well. |
-| `REBAC_DISPLAY_FIELDS` | `False` | `bool \| "fallback"` | Experimental. A related row `rebac_select_related` loaded is delivered with the display fields its model declares (`Meta.rebac_display_fields`). `"fallback"`: where the actor may not read the row, instead of raising. `True`: always, without the check. |
+| `REBAC_DISPLAY_FIELDS` | `False` | `bool \| "fallback"` | Experimental. A related row `rebac_select_related` loaded is delivered with the display fields its model declares (`Meta.rebac_display_fields`). `"fallback"`: where the actor may not read the row, instead of raising. `True`: always, without the check. Under either value, a forward foreign-key prefetch whose queryset asks for display rows (`for_display()`) reads the rows the foreign keys of its admitted parents name, by primary key, with no permission statement ([proposal 0024](./proposals/0024-display-rows-through-a-prefetch.md)). |
 | `REBAC_TRUSTED_IDS` | `False` | `bool` | Experimental. A stored id of an integer identity is converted to its key by the cast alone. A relationship row whose id is not canonical then makes PostgreSQL raise on the statement. |
 | `REBAC_ZOOKIE_TRANSPORT` | `"none"` | `"none"` \| `"header"` \| `"session"` | Optional cross-request transport for the current Zookie. |
 | `REBAC_ZOOKIE_HEADER_NAME` | `"X-Rebac-Zookie"` | `str` | Header name used when `REBAC_ZOOKIE_TRANSPORT = "header"`. |
@@ -1333,7 +1333,8 @@ System checks (in `rebac/checks.py`):
 | `rebac.E021` | Error | The schema declares a caveat but `cel-python` (the `caveats` extra) is not installed, so caveat bodies cannot be validated or evaluated. |
 | `rebac.E023` | Error | A `RebacMixin` / `RebacTrackedMixin` model's declared base manager returns a queryset that is not a `TrackedQuerySet`, or one that filters rows. The library reads a model's rows and owns its gated writes through the base manager. (`E020` and `E022` are reserved by proposals 0011 and 0013.) |
 | `rebac.E024` | Error | A `RebacMixin` model's default manager returns a queryset that is not a `RebacQuerySet`. Django's admin, model forms, related managers and `validate_unique()` read rows through `_default_manager`; a plain manager there leaves those reads unscoped with no `MissingActorError`. Override `objects` only with a `RebacManager` subclass. |
-| `rebac.E028` | Error | A setting's value is not one the setting accepts ([Settings catalog](#settings-catalog)): the message names the setting, the value's type and what it is read as, and the hint what to write. A boolean is read closed meanwhile, and any other setting raises `ImproperlyConfigured` where it is read. The storage layout and the tracked models are reported by `E006` and `E018`, the backend, the field read mode and the Zookie transport by `E001`, `E008` and `E007`, and the reserved settings by `W015`. (`E025` to `E027` are reserved.) |
+| `rebac.E026` | Error | A display declaration (`Meta.rebac_display_fields` or `rebac.display.declare()`) names something other than a plain column of a `RebacMixin` model's own: the model is not a `RebacMixin` model, its primary key or a multi-table parent's is a relation other than a parent link (a display row shows its key), or a name is not a field, not one of its own columns, or a relation. Reported whatever `REBAC_DISPLAY_FIELDS` is, off included: a wrong declaration is a hole the moment the setting is turned on. The conditions are `rebac.display.declaration_problems`, which the first read to consult the declaration also refuses with `ImproperlyConfigured`; the check finds it at startup. (`E025` is reserved by another change.) |
+| `rebac.E028` | Error | A setting's value is not one the setting accepts ([Settings catalog](#settings-catalog)): the message names the setting, the value's type and what it is read as, and the hint what to write. A boolean is read closed meanwhile, and any other setting raises `ImproperlyConfigured` where it is read. The storage layout and the tracked models are reported by `E006` and `E018`, the backend, the field read mode and the Zookie transport by `E001`, `E008` and `E007`, and the reserved settings by `W015`. (`E025` and `E027` are reserved.) |
 | `rebac.W001` | Warning | `rebac.backends.RebacBackend` not in `AUTHENTICATION_BACKENDS`. |
 | `rebac.W002` | Warning | A model with `Meta.rebac_resource_type` is missing `RebacMixin`. |
 | `rebac.W003` | Warning | An RBAC-bound relation exists where bare `select_related("rel")` / `prefetch_related("rel")` can be unsafe outside the REBAC helpers or Strawberry-Django optimizer. |
@@ -1348,7 +1349,7 @@ System checks (in `rebac/checks.py`):
 | `rebac.W015` | Warning | A reserved setting the library does not read (`REBAC_RELATIONSHIP_MODEL`, `REBAC_DEFAULT_CONSISTENCY`, `REBAC_CACHE_ALIAS`, `REBAC_LOOKUP_CACHE_TTL`, `REBAC_GC_INTERVAL_SECONDS`) has a value of another type than documented. It has no effect either way. |
 | `rebac.W101` | Retired | Not reused. |
 
-`rebac.E025` to `rebac.E027`, `rebac.W012` and `rebac.W013` are not assigned in this release.
+`rebac.E025`, `rebac.E027`, `rebac.W012` and `rebac.W013` are not assigned in this release.
 
 `rebac.E014`, `rebac.E015`, `rebac.E016`, the backing-path form of
 `rebac.E018` and `rebac.W014` read the stored schema, so they run only as
@@ -2382,15 +2383,17 @@ caveats are not read, so the profile is a superset of what the actor holds.
 Experimental, [proposal 0020](./proposals/0020-switchable-read-mechanisms.md). Each is a setting that is off by
 default and changes no statement while it is off. They exist so that a consumer can turn one on, compare cost and
 results on its own reads (`rebac.testing.compare_mechanisms`, the [policy benchmark](#the-policy-benchmark)) and
-decide. None changes what a read returns: where a mechanism cannot read a policy exactly, it leaves the compiled
-statement in place.
+decide. None changes what a read returns except display fields, which by design show a reader the display fields
+of the rows it refers to and hide their other fields. Where a mechanism cannot read a policy exactly, it leaves the
+compiled statement in place. `compare_mechanisms` counts the items a result lost and gained (for a mapping, a key
+with its value) and, for a mapping, the keys whose value `changed`.
 
 | Setting | What it does | What keeps the compiled statement |
 |---|---|---|
 | `REBAC_STRUCTURAL_PREFETCH` | A prefetch's children are read by the foreign key that names their parents, with no permission statement, where the child's action is a union with the arm `relation->T` over that unfiltered foreign key and holding the parent's action grants `T`: `T` is that action, or the policy proves the action implies it (`rebac.structural`) | An intersection or exclusion above the arm, a filtered or generic backing, an action not proven to imply the arm's, an edge inside a recursion, another database than the parents', parents scoped under another policy than the children are decided under, a type that reads a name two ways, an override of any kind |
 | `REBAC_ROW_SCOPE` | The scope becomes `EXISTS` conditions on the row: a grant row on its id, a parent row that satisfies the parent's conditions, a constant's fixed object (`rebac.rowscope`) | A recursion; a caveated or expiring relation; a backing the walk does not read; more than 24 subqueries; a queryset embedded in another, combined, counted or aggregated; a policy that reads a name two ways |
 | `REBAC_BOUNDED_WALK` | `held` and `held_many` read the permission from the candidate rows by one lookup per relation (`rebac.walk`) | A recursive or caveated part is asked of the compiled statement alone; candidates that name no row keep their compiled answer; a policy that reads a name two ways |
-| `REBAC_DISPLAY_FIELDS` | A joined row is delivered with its key and declared display fields, the rest hidden as a denied field is (`rebac.display`) | A model that declares no display fields |
+| `REBAC_DISPLAY_FIELDS` | A joined row is delivered with its key and declared display fields, the rest hidden as a denied field is (`rebac.display`); so is a row a `for_display()` prefetch of a forward foreign key asks for, read by the library by primary key without a statement, where every key asked for is held by a row admitted to be read, under its type's read action or one the policy proves implies it (proposal 0024) | A model that declares no display fields; a `for_display()` queryset fetched any other way, which reads as without the request |
 | `REBAC_TRUSTED_IDS` | The id conversion is the cast alone (`rebac.codec`) | Text and UUID identities |
 
 - **The row scope needs PostgreSQL's JIT off.** A statement of correlated subqueries is estimated expensive and
@@ -2455,7 +2458,113 @@ statement in place.
   row's expiry, a caveat that reads the time, an override's) can fall between two of them: a parent admitted, or
   an arm proved, just before it, is used by a statement that runs after it. After an exclusion the walk reads the
   fence again, so a policy revision published under it answers nothing.
-- **Display fields need a `RebacMixin` model**, whose `save` leaves hidden columns alone.
+- **Display fields need a `RebacMixin` model**, whose saves never write a hidden field over its stored value (next
+  item), and **are plain columns** of the model's own: a foreign key or one-to-one is refused for joined and
+  prefetched display rows alike, and so is any declaration of a model whose primary key, or a multi-table parent's,
+  is a relation other than a parent link, since a display row shows its key (following a one-to-one key read the
+  row it names, whole). So no field a display row shows leads to another row: a parent link gives the row's own
+  parent part, which Django builds from the display row's values without a statement. Its other relations, followed
+  lazily, load as they do from any row of this library; a display row adds nothing to that and takes nothing from
+  it. A reverse one-to-one is loaded by Django's descriptor through the base manager, whole and with no permission
+  statement (`rebac.W003` lists such relations, from the model that declares them); a reverse foreign key's or a
+  many-to-many's related manager reads by its scope. A related row's label is that row's own display fields,
+  prefetched with `for_display()`. `rebac.E026` reports a wrong declaration whatever `REBAC_DISPLAY_FIELDS` is.
+- **A hidden field is never written over its stored value from the row that hid it, nor copied from it.** On a display
+  row or a field-redacted row, a hidden field (`redacted_fields`) is set to `None` through `setattr`, so its
+  descriptor and the model's own `__setattr__` run as on any assignment, and every shown column the hide changed is
+  then put back as the database returned it (`_rebac_loaded_values`; an `ImageField`'s descriptor sets its width and
+  height to `None`), never as model code derived it while Django built the row, and deferred again where the read did
+  not load it; `refresh_from_db()`, which reads the shown fields itself and assigns no hidden one, puts back what they
+  held, as does a row without that record (built by hand, unpickled). An attribute that is no model field keeps what
+  the hide left in it. Its placeholder is that `None`, or what the field's own descriptor makes of it when it is read,
+  of that value's type and equal to it (a file or image field's `FieldFile` with no name; a nameless `ContentFile` is
+  not one), with no object cached for a relation. A save that names no fields (`save()`, `asave()`, and `save_base()`
+  called directly, a raw one included) that would insert a row (`force_insert=True`, the row marked as being added, a
+  primary key other than the one loaded) is refused before any statement, since it would store the placeholders as
+  data. Otherwise it writes the shown fields whose value differs from the loaded one, in every table of a multi-table
+  row (its own table alone for a raw save, as Django's), and leaves out a hidden field that holds its placeholder; a
+  hidden field that holds anything else was given a value (assigned, a related object cached, a name set on its file)
+  and is refused before any statement, since it would not be written, and a `None` assigned there cannot be told from
+  the placeholder and is left out. When no field it shows and loaded differs from its loaded value, it writes nothing
+  and sends neither `pre_save` nor `post_save`: `save()` and `asave()` so since 0.7.0 (Django's `save()` returns so
+  for empty `update_fields`), a direct `save_base()`, raw or not, since this release. `RebacMixin.save_base` holds
+  that rule, and `save()` applies it before Django's `save()`, which would name a deferred row's loaded fields, the
+  hidden ones among them. A third-party descriptor that wraps `None` in a value equal to no other such wrapper, or
+  that cannot be read on a bare instance of the model, reads as given a value: its wrapper declares the placeholder by
+  comparing equal to another wrapper of `None` of its type, as `FieldFile` compares names. So a related manager's
+  `add(bulk=False)` of such a row is refused (inside Django's `atomic(savepoint=False)`, so the enclosing transaction
+  must be rolled back), and its `remove()` raises Django's own `DoesNotExist`, since the row's foreign key reads
+  `None`. A write that names a hidden field is refused under any actor or bypass, before any statement for the bulk
+  ones (`rebac.field_visibility.refuse_hidden_fields`): `save()` and `asave()` with `update_fields`, `bulk_update()`
+  and `abulk_update()` through any manager (a related manager's and the base manager's included). A row with hidden
+  fields cannot be copied by any insert: `bulk_create()` and `abulk_create()` of a list that holds one, through any
+  manager and in every form (plain, `ignore_conflicts`, `update_conflicts`), are refused before any statement with the
+  same exception and message (`rebac.field_visibility.refuse_copies`); rows the caller built, which hide nothing,
+  insert as before, and the list is read once. `loaddata` saves through Django's own `Model.save_base(raw=True)`,
+  never the model's: its rows are built from the fixture, hide nothing, and are written whole. `update_or_create()`
+  saves a row it reads itself under the queryset's scope, so a value taken from another row is the caller's own value;
+  a field its own read hides is refused. The parent instance a multi-table row's parent link gives is Django's, built
+  from the row's values, with its hidden fields `None` and nothing marking them: saving that instance writes them.
+- **Refreshing a row with hidden fields** reads the fields it shows and no other, as `refresh_from_db(fields=…)`
+  with them and with its prefetched relations, which it forgets; the hidden fields stay `None`, a field the row had
+  deferred stays deferred, a reverse one-to-one or generic relation it had cached stays cached, as with any
+  `fields`, and naming a hidden field in `fields` is refused. Model code that runs while Django builds the
+  refreshed values finds the hidden fields deferred; code that reads one loads it with a statement of its own.
+- **Display rows through a prefetch** ([proposal 0024](./proposals/0024-display-rows-through-a-prefetch.md)).
+  `Prefetch("author", queryset=Account.objects.with_actor(actor).for_display())` asks for display rows. They are
+  delivered only for the prefetch of a forward foreign key or one-to-one to the target's primary key, on a queryset
+  of the target model itself whose only condition is Django's own binding (`TupleIn` over `ColPairs`) and which
+  carries nothing that changes a join, a column or the order of the library's read (it may carry its actor,
+  `with_action()`, `on_field_deny()`, `only()`, `defer()`, `reverse()`, `fetch_mode()`, `prefetch_related()` and
+  `using()` of the parents' database), when every
+  key it asks for, compared with its type, is a value the database returned for that foreign key (as
+  `RebacMixin.from_db` keeps it, never the row's attributes) on a row a queryset scoped for the same actor admitted
+  to be read in the evaluation running in this thread and task (code an asgiref task hands back to the evaluation's
+  thread, outside any task, counts as the evaluation's own): built by Django's own iterable with no
+  `extra(select=…)` and no union, on the same database, its type declaring no read gate on the field. A row is
+  admitted to be read under its type's read action, or under an action `A` such that `rebac.structural.implies`
+  proves, on the policy the backend evaluates, that whoever holds `A` on a row of that type holds its read action
+  (`rebac.display.admits_reading`): an inbox listing messages under `read_inbox` shows their labels. The proof is
+  kept per policy, and nothing is proven while the policy carries an override (only the read action counts) or
+  about a type that reads a name two ways. It is decided where the queryset's scope is built, and carried by its
+  query with its decision, so a policy that changes before the delivery is decided does not change what a row was
+  admitted to. The target's own `Meta.ordering` is not the caller's: a read by key needs no order (Django's
+  prefetch clears it anyway). The library then reads the rows itself from a bare `QuerySet` of the model, which no
+  manager of the application touches, on the parents' database, by those values, selecting the primary keys and the
+  display columns alone, and builds each with every hidden column given as `None`, so that model code run while it
+  is built (`__init__`, `post_init`) sees no hidden value and loads none. The queryset's own conditions never run,
+  and the check reads no row. A display row admits nothing. In any other case (a reverse one-to-one, `to_field`, a
+  proxy, an action not proven to imply read, a deferred or gated key, a many-to-many prefetch, a target routed to
+  another database, another thread or task, any condition of the caller's) the queryset reads as it would without
+  the request: its permission statement, whole rows the actor may read. `"fallback"` and `True` mean the same for
+  it. Who sees more: the one thing an actor can be shown that it could not before is the display fields of a row
+  that a foreign key names, where it was just admitted to read a row for which the database returned that key
+  (under the holding row's read action, or under an action that the policy that admitted it proves grants that read
+  action), and the holding row's type declares no read gate on that foreign key; whether or not it may read the
+  named row. A row the reader may read whole is a display row too, so switching a prefetch to `for_display()` loses
+  the other fields of those rows; and a display row equals, and hashes as, the same row read whole (Django compares
+  model and key), so a set, a deduplication or a dict keyed by instance can hold one in place of the other.
+- **A display delivery serves the evaluation that decided it**, as a structural one does. It is decided in
+  `_fetch_all` with the evaluation's scope, from the query as it is about to run, and its query carries the keys to
+  read and a scope that matches no row; the queryset keeps nothing of it. A clone, the same queryset under another
+  actor, bypass or database, and an evaluation after one that raised are decided again; an embedding of its query, a
+  count and its own `iterator()` are decided where they run and never delivered; a decision that is not a delivery
+  reads by the permission statement. A queryset whose query already carries a scope for the same decision keeps it
+  (the 0.38.0 rule, one comparison): after its own `count()`, `exists()`, `aggregate()`, `iterator()` or
+  `aiterator()`, and for an eager `scoped()` queryset and its clones, an evaluation under the same actor, bypass and
+  database reads by that permission statement, decided neither for display nor for structural delivery. The chunks
+  of `iterator()` and `aiterator()` open no record and admit none of their rows: inside a running evaluation for the
+  same actor their to-one prefetches are delivered for the keys its admitted rows hold.
+- **`rebac.display.referring()` and `rebac.display.admit()` are trusted.** They record rows as admitted with no
+  check that a scope read them and no bypass audit: called with rows of its own, code makes any foreign-key target
+  of those rows displayable to the actor it names while the block runs. They are the seam of the library's querysets
+  and of trusted framework code, not a public door.
+- **With `REBAC_DISPLAY_FIELDS` on, every actor-scoped queryset whose scope is built decides whether its action
+  admits its rows to be read**, used or not: a comparison for the read action; for any other, the lookup of the
+  policy the backend evaluates and of a kept proof, about 12 µs on the test suite's in-process policy, with no
+  statement added to the read (in-process or stored policy); the first read of a policy and action runs the proof.
+  `implies` never opens a recursive name on the side it proves, so under any action but the read action itself
+  (even `permission browse = read`) rows of a type whose read action is recursive refer to nothing.
 
 #### The clock
 
@@ -2867,7 +2976,7 @@ The headline feature. By inclusion, every model operation is gated against the e
 3. `save_base` owner — create/write and field gates before consumer `pre_save` receivers.
 4. `delete` owner — root gate and a deletion ContextVar carrying the root actor/bypass for collector children; explicit-sender `pre_delete` gates those children only. Owners batch identity tuple cleanup.
 5. Queryset materialisation hooks (`_fetch_all()` and iterators) stamp the resolved actor onto every loaded instance. `from_db()` snapshots original field values for write checks.
-6. `Meta` extension — the metaclass captures `rebac_resource_type`, `rebac_id_attr`, `rebac_default_action`, `rebac_subject_relation` and `rebac_display_fields` (the `REBAC_META_OPTIONS` tuple), strips them before Django's `Options` sees them, and re-attaches them on `_meta`. `rebac_subject_relation` makes `to_subject_ref(instance)` emit the model's object reference as a subject set (`auth/group:<id>#member`); `rebac.E011` checks the relation exists. See [proposal 0006](./proposals/0006-model-subject-identity.md). `rebac_display_fields` names the fields a row shows to a reader of a row that refers to it; it is read only under `REBAC_DISPLAY_FIELDS` ([Switchable read mechanisms](#switchable-read-mechanisms)). A model with no `Meta` of its own takes the Django options (`ordering`, `indexes`, `constraints`, `permissions`, verbose names and the rest of Django's `DEFAULT_NAMES`) of the first base that has a `Meta`, as Django itself does. The `rebac_*` options are per model: they pass to a child only through a `Meta` the child writes (`class Meta(Parent.Meta)`), never to a child with no `Meta`.
+6. `Meta` extension — the metaclass captures `rebac_resource_type`, `rebac_id_attr`, `rebac_default_action`, `rebac_subject_relation` and `rebac_display_fields` (the `REBAC_META_OPTIONS` tuple), strips them before Django's `Options` sees them, and re-attaches them on `_meta`. `rebac_subject_relation` makes `to_subject_ref(instance)` emit the model's object reference as a subject set (`auth/group:<id>#member`); `rebac.E011` checks the relation exists. See [proposal 0006](./proposals/0006-model-subject-identity.md). `rebac_display_fields` names the plain columns (never a relation) a row shows to a reader of a row that refers to it; reads consult it only under `REBAC_DISPLAY_FIELDS` ([Switchable read mechanisms](#switchable-read-mechanisms)), and system check `rebac.E026` checks it whatever the setting is. A model with no `Meta` of its own takes the Django options (`ordering`, `indexes`, `constraints`, `permissions`, verbose names and the rest of Django's `DEFAULT_NAMES`) of the first base that has a `Meta`, as Django itself does. The `rebac_*` options are per model: they pass to a child only through a `Meta` the child writes (`class Meta(Parent.Meta)`), never to a child with no `Meta`.
 
 ### Manager and queryset surface
 
@@ -2894,6 +3003,7 @@ class RebacManager:
     def with_action(self, action: str) -> RebacQuerySet: ...           # override read-scope action
     def on_field_deny(self, mode: FieldDenyMode) -> RebacQuerySet: ... # allow/redact/omit/raise
     def for_write(self) -> RebacQuerySet: ...                          # write-target: row scope kept, field redaction off
+    def for_display(self) -> RebacQuerySet: ...                        # display rows for a foreign-key prefetch (0024)
     def readable(self, field: str) -> Expression: ...                  # a gated column as the actor may read it
     def rebac_select_related(self, *fields) -> RebacQuerySet: ...      # guarded to-one joins
     def rebac_prefetch_related(self, *lookups) -> RebacQuerySet: ...   # scoped protected prefetches
@@ -2910,6 +3020,7 @@ class RebacQuerySet:
     def with_action(self, action: str) -> Self: ...                    # override read-scope action
     def on_field_deny(self, mode: FieldDenyMode) -> Self: ...          # override field-read deny mode
     def for_write(self) -> Self: ...                                   # write-target: row scope kept, field redaction off
+    def for_display(self) -> Self: ...                                 # display rows for a foreign-key prefetch (0024)
     def readable(self, field: str) -> Expression: ...                  # a gated column as the actor may read it
     def rebac_select_related(self, *fields) -> Self: ...               # select_related + related read guard
     def rebac_prefetch_related(self, *lookups) -> Self: ...            # prefetch_related + scoped targets
@@ -2937,6 +3048,7 @@ The three actor verbs are sugar over the same primitive:
 | `with_action(action)` | Pins the permission used for read-side queryset scoping instead of `read` / `Meta.rebac_default_action`. | Alternate read views such as `credential_lookup`, `list_admin`, or capability-specific resolver scopes. |
 | `on_field_deny(mode)` | Pins the field-read deny mode for `read__<field>` gates instead of the global setting. | Projection-sensitive paths that want `"omit"` while the global default stays `"allow"` or `"redact"`. |
 | `for_write()` | `on_field_deny("allow")` named for intent: keeps actor row scope but turns off `read__<field>` redaction so a load-then-mutate target carries every column. | Resolving an update/delete target while `REBAC_FIELD_READ_MODE` is `"redact"`/`"omit"`, where a redacted column must not be hidden from the row being written. |
+| `for_display()` | Asks for display rows. Experimental, under `REBAC_DISPLAY_FIELDS` and only for a model that declares display fields; otherwise it changes nothing. As the queryset of the prefetch of a forward foreign key to the model's primary key, its rows are read by the library by primary key, with their key and display fields and no permission statement, when every key asked for is held by a row this actor was just admitted to read, a row the actor may read whole included; fetched any other way it reads as without the request ([proposal 0024](./proposals/0024-display-rows-through-a-prefetch.md)). | `Prefetch("author", queryset=Account.objects.with_actor(actor).for_display())` for a label: a name shown wherever a row the reader reads names it by a foreign key. |
 | `readable(field)` | An expression worth the column on rows where the queryset's actor holds `read__<field>` and `NULL` elsewhere, the value redaction shows. The column itself under a bypass, or when the model gates no such field. | Filtering, ordering, grouping or selecting a gated field under an actor whose access depends on the row, which the field read guards refuse on the column itself. |
 | `rebac_select_related(*fields)` | Applies Django `select_related` and batch-checks selected REBAC-bound related rows before serialization. | To-one relation optimization when an unreadable related object should fail the field/query instead of leaking. |
 | `rebac_prefetch_related(*lookups)` | Applies Django `prefetch_related`, rewriting bare protected lookups to `Prefetch(queryset=Related.objects.with_actor(actor))`. | Reverse, M2M, and to-many loading where protected children should be scoped rather than loaded via `_base_manager`. |
@@ -3184,7 +3296,7 @@ tracked model's callable attribute named `actor` does not become an actor scope.
 | `instance.save()` (loaded/non-adding instance) | `write` on the row | `RebacMixin.save_base`, before consumer `pre_save`. |
 | `instance.save()` (new instance) | `create` on the proposed row's forward relations | `save_base` projects the constructed candidate into `check_new`. |
 | `instance.check_access("create")` / `has_access("create")` (new instance) | `create` on the proposed row's forward relations | The same projection into `check_new`, on the instance as it is now: without a caveat context it is the decision the save gate makes on the same alias, so a caller can check before validating or saving. What `save()` prepares later (an override, Django's refresh of a related object saved after it was assigned) is not seen. A context the caller supplies is used, though `save()` supplies none; a `consistency` the backend refuses is refused, and the candidate's reads take none. It can answer `CONDITIONAL_PERMISSION`, and raises what the projection raises (an invalid field value, an unavailable related row, `SchemaError` or another error from `proposed_relationships()`), as the save gate would. Any other action on a new instance asks the model-level sentinel; a loaded instance is checked as the row it is. |
-| `instance.check_save(*, using=None, update_fields=None)` | What the instance's first save through `save()` with the same arguments meets at the gates | Runs `save()` itself (the model's override; Django's preparation: a deferred instance's loaded fields, the key of a related object saved after it was assigned, the checks on `update_fields`; the redacted rewrite; the gates: the create candidate, or `write`, `write__<field>` on changed fields, a moving edge, expression reads, redacted writes, and the backed-edge gate) inside a transaction on the write alias that it rolls back, and stops where Django would send `pre_save` and write. `HAS_PERMISSION` when that save passes the gates or writes nothing, `NO_PERMISSION` with the denial's reason otherwise, even when an override swallows the denial. Nothing is audited inside: the instance's own bypass is taken, and audited, before; another bypass is left for the real save; no denial is audited. Other model instances the override saves get back their primary key and state. Not covered: a second save of the instance in the same override, `pre_save`/`post_save` receivers, effects outside that transaction (another alias, a durable block, anything outside the database). A caller that runs validation with more access than the actor (unique checks under `system_context`) asks it first, so validation never answers for a save the gates would refuse. The verdict covers the fields the save writes: without `update_fields`, `save()` leaves the fields redacted at load out of the write, even when assigned, and the check passes without them. Such a caller excludes the fields the actor may not read from the validation (`instance.validate_unique(exclude=redacted_fields(instance))`), or it answers for values the actor can neither read nor write. |
+| `instance.check_save(*, using=None, update_fields=None)` | What the instance's first save through `save()` with the same arguments meets at the gates | Runs `save()` itself (the model's override; Django's preparation: a deferred instance's loaded fields, the key of a related object saved after it was assigned, the checks on `update_fields`; the redacted rewrite, which refuses a redacted field given a value and an insert from a redacted row; the gates: the create candidate, or `write`, `write__<field>` on changed fields, a moving edge, expression reads, redacted writes, and the backed-edge gate) inside a transaction on the write alias that it rolls back, and stops where Django would send `pre_save` and write. `HAS_PERMISSION` when that save passes the gates or writes nothing, `NO_PERMISSION` with the denial's reason otherwise, even when an override swallows the denial. Nothing is audited inside: the instance's own bypass is taken, and audited, before; another bypass is left for the real save; no denial is audited. Other model instances the override saves get back their primary key and state. Not covered: a second save of the instance in the same override, `pre_save`/`post_save` receivers, effects outside that transaction (another alias, a durable block, anything outside the database). A caller that runs validation with more access than the actor (unique checks under `system_context`) asks it first, so validation never answers for a save the gates would refuse. The verdict covers the fields the save writes: without `update_fields`, `save()` leaves the fields redacted at load out of the write while they hold their placeholder, and refuses one given a value, so a passing check covers none of them. Such a caller excludes the fields the actor may not read from the validation (`instance.validate_unique(exclude=redacted_fields(instance))`), or it answers for values the actor can neither read nor write. |
 | `instance.delete()` | `delete` on the row | `RebacMixin.delete`; explicit-sender `pre_delete` checks collector children. |
 | `Model.objects.update(**kwargs)` | `write` on each affected row and every resource row whose backed FK edge changes | Under an actor the statement acts on the rows the queryset's scope admits (its action, `read` by default), the rows `count()` counts: a row outside the scope is not part of it, is neither checked nor written, and never causes a refusal. The primary keys of the rows in scope are selected; every one must be in the actor's `write` scope, and in `write__<field>` for a gated field it sets, or the update raises; exactly those rows are written, by key (see [Writes](#writes)). A backed FK update checks old and proposed source rows before SQL; expressions whose proposed FK cannot be resolved are refused. When the update touches a column the policy reads, the selected rows are gated from their stored values. Under an actor, `.distinct(*fields).update()` raises `TypeError`, as Django's `delete()` does: the rows `DISTINCT ON` selects are not the rows the UPDATE writes. |
 | `Model.objects.delete()` | `delete` on each row | The same rows: under an actor, those the queryset's scope admits, selected by primary key. Every one must be in the actor's `delete` scope, or the delete raises; exactly those rows are deleted, by key. Django's collector gathers the cascade first; every resource model it reaches outside those rows is checked for `delete` as one batch for the same actor before any row is removed. |
@@ -3527,19 +3639,37 @@ context and therefore treats `CONDITIONAL_PERMISSION` as denied by default;
 `REBAC_FIELD_READ_FAIL_CLOSED_ON_CONDITIONAL = False` flips conditional fields
 to visible.
 
-Redacted fields are fail-closed on writes. If a caller explicitly saves a
-redacted field via `save(update_fields=[...])`, the save_base owner raises
-`PermissionDenied`. A full `save()` on a redacted instance rewrites
-`update_fields` to exclude redacted fields, preventing a display-time `None`
-from overwriting the stored value.
+Redacted fields are fail-closed on writes. A write that names a redacted
+field of the row it is given raises `PermissionDenied`, under any actor or
+bypass (`rebac.field_visibility.refuse_hidden_fields`, which reads the
+instance's `redacted_fields`): `save(update_fields=[...])` and `asave()` in the
+save_base owner, `bulk_update()` and `abulk_update()` through any manager
+before any statement. An
+update of a redacted instance that names no fields (`save()`, `asave()`, and
+`save_base()` called directly, a raw one included) writes its changed fields
+other than the redacted ones, preventing a display-time `None` from
+overwriting the stored value, and refuses, before any statement, a redacted
+field that holds anything but its placeholder (`None`, or what its descriptor
+makes of it when read, such as a `FieldFile` with no name), which it would not
+write; a `None` assigned there cannot be told from the placeholder and is left
+out. An insert of a redacted instance is refused before any statement: a save
+that would insert it (`force_insert`, `_state.adding`, a changed primary key)
+and `bulk_create()` or `abulk_create()` of a list that holds it, in any form.
+Hiding sets a redacted field through `setattr` and puts back each shown column the
+hide changed as the database returned it (deferred again where it was not read).
 Write expressions may use a gated source column only after its `read__<field>`
 check succeeds. A subquery whose base model or a joined model declares gated
 fields is refused in both instance saves and bulk updates: SQL can read rows
 and aliases beyond the destination row, so a destination-row check cannot
 establish source access.
-`refresh_from_db()` preserves fields already redacted on that instance, even
-when the refresh explicitly names one of them; refresh never reveals a hidden
-database value through Django's unscoped base manager.
+`refresh_from_db()` of an instance with redacted fields reads the fields it
+shows and no other (`refresh_from_db(fields=...)` with them and with its
+prefetched relations), so the statement it builds selects no redacted column
+and the redacted fields stay `None`; its deferred fields stay deferred. A
+`from_queryset` the caller passes is read as given: one that annotates a
+redacted column selects it, and the instance does not receive it, since
+Django copies only the refreshed fields. A refresh that names a redacted field
+raises `PermissionDenied`.
 
 When the goal is to load a row *in order to mutate it* (resolve an
 update/delete target, then write a different column), redaction would hide

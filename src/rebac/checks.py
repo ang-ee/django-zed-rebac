@@ -875,6 +875,44 @@ def check_default_managers(app_configs: Any = None, **kwargs: Any) -> list[check
     return issues
 
 
+@_register(ids=("rebac.E026",))
+def check_display_declarations(app_configs: Any = None, **kwargs: Any) -> list[checks.CheckMessage]:
+    """E026: a display declaration names plain columns of a RebacMixin model's own.
+
+    The conditions are ``rebac.display.declaration_problems``, which the first
+    read to consult a declaration also refuses: reported here, a wrong one is
+    found at startup rather than by a request. Both ways of declaring are read:
+    ``Meta.rebac_display_fields`` and ``rebac.display.declare`` calls made before
+    the checks run. It is reported whatever ``REBAC_DISPLAY_FIELDS`` is: a wrong
+    declaration is a hole from the moment the setting is turned on.
+    """
+    from django.apps import apps
+
+    from . import display
+
+    configs = apps.get_app_configs() if app_configs is None else app_configs
+    issues: list[checks.CheckMessage] = []
+    # A declare() call is read with the model's Meta (display._declaration).
+    for model in (model for config in configs for model in config.get_models()):
+        for problem in display.declaration_problems(model):
+            issues.append(
+                checks.Error(
+                    f"{model._meta.label}: {problem.split(': ', 1)[1]}",
+                    hint=(
+                        "Correct Meta.rebac_display_fields or the rebac.display.declare() call: "
+                        "a display field is a plain column of the model's own, and a model whose "
+                        "primary key is a relation other than a parent link declares none. A "
+                        "related row is shown by its own model's display fields, prefetched with "
+                        "for_display(). Every read that consults this declaration refuses it. "
+                        "Reported whatever REBAC_DISPLAY_FIELDS is."
+                    ),
+                    obj=model,
+                    id="rebac.E026",
+                )
+            )
+    return issues
+
+
 @_register(ids=("rebac.W010",))
 def check_stale_override_references(
     app_configs: Any = None, **kwargs: Any

@@ -18,6 +18,7 @@ import re
 import weakref
 from collections import Counter
 from collections.abc import AsyncIterator, Callable, Collection, Iterable, Iterator
+from contextlib import ExitStack
 from contextvars import Context, ContextVar, copy_context
 from enum import Enum, auto
 from itertools import islice
@@ -30,7 +31,7 @@ from django.db.models.sql import Query
 from django.db.models.sql.subqueries import UpdateQuery
 from django.db.models.sql.where import ExtraWhere, NothingNode, WhereNode
 
-from . import rowscope, structural
+from . import display, rowscope, structural
 from ._id import resource_id_attr
 from .actors import (
     ActorLike,
@@ -53,6 +54,8 @@ from .field_visibility import (
     effective_field_deny_mode,
     gated_read_fields,
     held_ids,
+    refuse_copies,
+    refuse_hidden_fields,
     runtime_field_deny_mode,
     validate_field_deny_mode,
     warn_raise_mode_degrades,
@@ -598,6 +601,8 @@ def _without_query_scope(query: Query) -> Query:
     # and so does the policy it was built under (``_scope_query``).
     clone.__dict__.pop("_rebac_scope_for", None)
     clone.__dict__.pop("_rebac_scope_policy", None)
+    clone.__dict__.pop("_rebac_scope_reads", None)
+    clone.__dict__.pop("_rebac_display_keys", None)
     if isinstance(clone, _RebacQuery) and clone._rebac_boolean_operand:
         clone._rebac_check = None
         clone._rebac_checked = False
@@ -947,6 +952,10 @@ class RebacQuerySet(models.QuerySet[_M]):
     _rebac_bypass_entry: _BypassEntry
     _rebac_field_deny: FieldDenyMode | None
     _rebac_select_related_guards: tuple[str, ...]
+    # ``for_display()`` was asked; the request is carried by clones. Whether an
+    # evaluation delivers display rows is decided by that evaluation
+    # (``_apply_scope_in_place``) and carried by its query, never kept here.
+    _rebac_display_request: bool = False
 
     def __init__(self, *args: Any, **kwargs: Any) -> None:
         super().__init__(*args, **kwargs)
@@ -965,6 +974,7 @@ class RebacQuerySet(models.QuerySet[_M]):
         self._rebac_eager_scope = False
         self._rebac_aggregate_scope = False
         self._rebac_visibility_applied = False
+        self._rebac_display_request = False
 
     def __getstate__(self) -> dict[str, Any]:
         """Do not transport actor or sudo authority through a pickle."""
@@ -1119,6 +1129,29 @@ class RebacQuerySet(models.QuerySet[_M]):
         ``on_field_deny("allow")`` named for that intent.
         """
         return self.on_field_deny("allow")
+
+    def for_display(self) -> Self:
+        """Ask for display rows: the key and display fields of the rows a foreign key names.
+
+        For the queryset of a forward to-one prefetch (proposal 0024):
+        ``Prefetch("author", queryset=Account.objects.with_actor(actor).for_display())``.
+        Under ``REBAC_DISPLAY_FIELDS``, for a model that declares display
+        fields, the rows are read by primary key with their key and display
+        fields and no permission statement when every key asked for is the
+        value of that foreign key on a row this actor was just admitted to read
+        (``rebac.display.deliverable``). That is decided by each evaluation that
+        scopes the queryset's query, for it alone: the queryset keeps nothing of
+        it. One whose query an earlier ``count()``, ``exists()``,
+        ``aggregate()``, ``iterator()``, ``aiterator()`` or ``scoped()`` already
+        scoped for the same decision reuses that scope. Fetched in any other way
+        the queryset reads as it would without the request: by its permission
+        statement, whole rows. A row the actor may read whole is delivered as a
+        display row too. With the setting off, or on a model that declares no
+        display fields, it changes nothing.
+        """
+        clone = self._clone()
+        clone._rebac_display_request = True
+        return clone
 
     def readable(self, field: str) -> models.Expression:
         """A gated field as this queryset's actor may read it.
@@ -1356,9 +1389,12 @@ class RebacQuerySet(models.QuerySet[_M]):
         after, never one in between and never one with another's decision.
 
         Only an evaluation that runs its rows now (``executing``, ``_fetch_all``)
-        may be delivered by a running structural prefetch, and a delivered query
-        is returned for that evaluation alone: the queryset keeps the query it
-        had, so whatever reads it next decides again.
+        may be delivered by a running structural prefetch, or read as display
+        rows (``for_display()``, proposal 0024), and a delivered query is
+        returned for that evaluation alone: the queryset keeps the query it had,
+        so whatever reads it next decides again. A display delivery's query
+        carries the keys to read (``_rebac_display_keys``) and a scope that
+        matches no row: it is never run.
 
         The predicate tests each selected row's identity (``Meta.rebac_id_attr``
         or ``REBAC_RESOURCE_ID_ATTR``, ``"pk"`` by default) on the queryset's
@@ -1383,6 +1419,13 @@ class RebacQuerySet(models.QuerySet[_M]):
         cast(Any, scoped)._rebac_scope_for = decided
         if not bypass:
             if executing:
+                keys = self._display_keys(scoped, actor)
+                if keys is not None:
+                    # Rows the running evaluation's parents refer to, read by the library
+                    # by key without a permission statement, for this evaluation only.
+                    scoped.where = WhereNode([scoped.where, _ScopeWhere(children=[NothingNode()])])
+                    cast(Any, scoped)._rebac_display_keys = keys
+                    return scoped
                 # This query is run as it stands: its scope may refer to its own rows.
                 with rowscope.executing(scoped):
                     if self._scope_query(scoped, actor, deliver=True, using=using):
@@ -1393,6 +1436,16 @@ class RebacQuerySet(models.QuerySet[_M]):
                 self._scope_query(scoped, actor, using=using)
         self._query = scoped
         return scoped
+
+    def _display_keys(self, query: Query, actor: SubjectRef | None) -> list[Any] | None:
+        """The keys this evaluation reads as display rows, or ``None`` to read by its scope.
+
+        ``query`` is the evaluation's query, without a scope, carrying its
+        decision; ``rebac.display.deliverable`` reads it as it is about to run.
+        """
+        if not self._rebac_display_request or actor is None or not display.mode():
+            return None
+        return display.deliverable(self._reading(query), actor)
 
     def _reading(self, query: Query) -> Self:
         """This queryset as one evaluation reads it: its state, with the query the
@@ -1457,6 +1510,13 @@ class RebacQuerySet(models.QuerySet[_M]):
         from .backends import backend
 
         action = str(self._rebac_action or getattr(model._meta, "rebac_default_action", "read"))
+        if query is root:
+            # Whether the rows this scope admits are admitted to be read, on the policy it
+            # is built under, carried with its decision: what display rows hanging off them
+            # rest on (proposal 0024).
+            cast(Any, query)._rebac_scope_reads = bool(display.mode()) and display.admits_reading(
+                model, action
+            )
         if (
             deliver
             and query is root
@@ -1495,6 +1555,7 @@ class RebacQuerySet(models.QuerySet[_M]):
         clone._rebac_select_related_guards = self._rebac_select_related_guards
         clone._rebac_eager_scope = self._rebac_eager_scope
         clone._rebac_aggregate_scope = self._rebac_aggregate_scope
+        clone._rebac_display_request = self._rebac_display_request
         if not self._rebac_eager_scope:
             clone._reset_scope()
         return clone
@@ -1777,35 +1838,56 @@ class RebacQuerySet(models.QuerySet[_M]):
             and bool(gated_read_fields(self.model))
         )
         native = cast(Any, self)
-        # Django's own _fetch_all, with the rows stamped before their
-        # prefetches run: a related manager reads the row's actor pin.
-        rows: list[Any] = list(native._iterable_class(reading))
+        # Display rows this evaluation decided to deliver (proposal 0024): the
+        # library's own read by key, in place of the query, which never runs.
+        keys = cast(list[Any] | None, getattr(query, "_rebac_display_keys", None))
+        rows: list[Any]
+        if keys is not None:
+            rows = list(display.read(self.model, keys, using=reading.db))
+        else:
+            # Django's own _fetch_all, with the rows stamped before their
+            # prefetches run: a related manager reads the row's actor pin.
+            rows = list(native._iterable_class(reading))
         self._stamp(rows, actor, sudo)
+        if keys is not None and actor is not None:
+            # Before their own prefetches: a hidden foreign key leads nowhere.
+            display.deliver(rows, model=self.model, actor=actor, field_mode=field_mode)
         # These rows are the ones this actor holds the action on: a prefetch
         # may deliver the children the policy grants with them (proposal 0020),
         # under the policy their scope was built under (``_scope_query``), which
-        # the query carries with its decision.
-        pinned = getattr(query, "_rebac_scope_policy", None)
-        admits = (
+        # the query carries with its decision, and the rows they refer to as
+        # display rows (proposal 0024), as that scope admitted them. Display rows
+        # were read by no permission statement and admit nothing.
+        held = (
             actor is not None
             and not sudo
+            and keys is None
             and bool(model_resource_type(self.model))
-            and structural.enabled()
-            and pinned is not None
         )
+        pinned = getattr(query, "_rebac_scope_policy", None)
+        admits = held and structural.enabled() and pinned is not None
+        refers = held and display.tracks(reading)
+        reads = bool(getattr(query, "_rebac_scope_reads", False))
         action = str(
             self._rebac_action or getattr(self.model._meta, "rebac_default_action", "read")
         )
         if admits and actor is not None:
             # Read inside a running prefetch: the parents of its next level.
             structural.admit(actor, self.model, action, rows, policy=pinned)
+        if refers and actor is not None:
+            display.admit(actor, self.model, action, rows, reads=reads)
         lookups = native._prefetch_related_lookups
         prefetching = bool(lookups) and not native._prefetch_done
         if prefetching:
-            if admits and actor is not None:
-                with structural.delivering(actor, self.model, action, rows, policy=pinned):
-                    models.prefetch_related_objects(rows, *lookups)
-            else:
+            with ExitStack() as running:
+                if admits and actor is not None:
+                    running.enter_context(
+                        structural.delivering(actor, self.model, action, rows, policy=pinned)
+                    )
+                if refers and actor is not None:
+                    running.enter_context(
+                        display.referring(actor, self.model, action, rows, reads=reads)
+                    )
                 models.prefetch_related_objects(rows, *lookups)
         if redact:
             assert actor is not None
@@ -2186,9 +2268,12 @@ class RebacQuerySet(models.QuerySet[_M]):
         from .watch import model_write
 
         self._for_write = True
+        rows = list(objs)
+        # A row with hidden fields is not copied, in any form (rebac.field_visibility).
+        refuse_copies(self.model, rows, operation="bulk_create()")
         with audit_backed_denials(), model_write(model=self.model, using=self.db):
             return self._rebac_bulk_create(
-                list(objs),
+                rows,
                 batch_size,
                 ignore_conflicts,
                 update_conflicts,
@@ -2304,11 +2389,15 @@ class RebacQuerySet(models.QuerySet[_M]):
         # Django dispatches batches through update(); this outer owner keeps
         # all batches in one transaction.
         field_names = tuple(fields)
+        rows = tuple(objs)
+        # A field hidden on a row holds None there, not its value: refused before any
+        # statement, as save() refuses it (rebac.field_visibility.refuse_hidden_fields).
+        refuse_hidden_fields(self.model, rows, field_names, operation="bulk_update()")
         with (
             audit_backed_denials(),
             model_write(model=self.model, using=self.db, names=field_names),
         ):
-            return super().bulk_update(objs, field_names, batch_size=batch_size)
+            return super().bulk_update(rows, field_names, batch_size=batch_size)
 
     def _update_query(self) -> Query:
         """The query an ``UPDATE`` reads: an explicit ordering stays (MySQL emits
@@ -2589,6 +2678,8 @@ class RebacManager[M: models.Model](_RebacManagerBase[M]):  # pyright: ignore[re
 
         def for_write(self) -> RebacQuerySet[M]: ...
 
+        def for_display(self) -> RebacQuerySet[M]: ...
+
         def readable(self, field: str) -> models.Expression: ...
 
         def rebac_select_related(self, *fields: Any) -> RebacQuerySet[M]: ...
@@ -2718,6 +2809,9 @@ class TrackedQuerySet[T: models.Model](models.QuerySet[T]):
 
         self._for_write = True
         candidates = list(objs)
+        refuse_copies(self.model, candidates, operation="bulk_create()")
+        # Read once: the backed-edge check and Django each read the names.
+        update_fields = None if update_fields is None else list(update_fields)
         with audit_backed_denials(), model_write(model=self.model, using=self.db) as watched:
             if not issubclass(self.model, RebacMixin):
                 policy = gate_policy(self.db) if watched else None
@@ -2749,11 +2843,13 @@ class TrackedQuerySet[T: models.Model](models.QuerySet[T]):
 
         self._for_write = True
         field_names = tuple(fields)
+        rows = tuple(objs)
+        refuse_hidden_fields(self.model, rows, field_names, operation="bulk_update()")
         with (
             audit_backed_denials(),
             model_write(model=self.model, using=self.db, names=field_names),
         ):
-            return super().bulk_update(objs, field_names, batch_size=batch_size)
+            return super().bulk_update(rows, field_names, batch_size=batch_size)
 
 
 _TrackedManagerBase = models.Manager.from_queryset(TrackedQuerySet)

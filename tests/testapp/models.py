@@ -645,3 +645,105 @@ class ScopeProfile(RebacMixin):
 
     class Meta:
         rebac_resource_type = "scope/profile"
+
+
+class LabAccount(RebacMixin):
+    """A label target (proposal 0024): a key, a unique code, a name and a secret."""
+
+    code = models.CharField(max_length=20, unique=True)
+    name = models.CharField(max_length=32, default="")
+    secret = models.CharField(max_length=32, default="")
+
+    class Meta:
+        rebac_resource_type = "lab/account"
+
+
+class LabPublicAccount(LabAccount):
+    """A proxy of the label target with a resource type, and display fields, of its own."""
+
+    class Meta:
+        proxy = True
+        rebac_resource_type = "lab/publicaccount"
+
+
+class LabPlace(RebacMixin):
+    """A label target's parent table: a name, a secret and a keeper (an account)."""
+
+    name = models.CharField(max_length=32, default="")
+    secret = models.CharField(max_length=32, default="")
+    keeper = models.ForeignKey(LabAccount, null=True, on_delete=models.CASCADE, related_name="+")
+
+    class Meta:
+        rebac_resource_type = "lab/place"
+
+
+class LabShop(LabPlace):
+    """A multi-table label target: its own column, and its parent's."""
+
+    till = models.CharField(max_length=32, default="")
+
+    class Meta:
+        rebac_resource_type = "lab/shop"
+
+
+class LabNote(RebacMixin):
+    """A row that refers to label targets by their primary keys."""
+
+    owner = models.ForeignKey(
+        LabAccount, null=True, on_delete=models.CASCADE, related_name="owned_notes"
+    )
+    shop = models.ForeignKey(LabShop, null=True, on_delete=models.CASCADE, related_name="+")
+    title = models.CharField(max_length=32, default="")
+
+    class Meta:
+        rebac_resource_type = "lab/note"
+
+
+class LabGatedNote(LabNote):
+    """A proxy of a note with a resource type, and field gates, of its own."""
+
+    class Meta:
+        proxy = True
+        rebac_resource_type = "lab/gatednote"
+
+
+class LabBadge(RebacMixin):
+    """A row that holds a one-to-one to a label target's unique code, not its key."""
+
+    holder = models.OneToOneField(
+        LabAccount, to_field="code", on_delete=models.CASCADE, related_name="badge"
+    )
+    shown = models.CharField(max_length=32, default="")
+
+    class Meta:
+        rebac_resource_type = "lab/badge"
+
+
+class LabCard(RebacMixin):
+    """A row whose primary key is a one-to-one to an account, not a multi-table parent link."""
+
+    account = models.OneToOneField(
+        LabAccount, primary_key=True, on_delete=models.CASCADE, related_name="card"
+    )
+    label = models.CharField(max_length=32, default="")
+
+    class Meta:
+        rebac_resource_type = "lab/card"
+
+
+class LabGiftCard(LabCard):
+    """A multi-table child of a card: its own key is the parent link, its parent's a one-to-one."""
+
+    amount = models.CharField(max_length=32, default="")
+
+    class Meta:
+        rebac_resource_type = "lab/giftcard"
+
+
+class LabPlain(models.Model):
+    """A plain table with an integer column, to combine with a resource's rows."""
+
+    a = models.BigIntegerField(default=0)
+
+    class Meta:
+        app_label = "testapp"

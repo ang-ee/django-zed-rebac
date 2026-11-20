@@ -219,6 +219,35 @@ def test_no_read_mechanism_runs_when_nothing_is_enforced(world, settings):
     assert not any("EXISTS" in sql for sql in statements)
 
 
+def test_a_display_request_delivers_whole_rows_when_nothing_is_enforced(world, settings):
+    """``for_display()`` (proposal 0024) replaces a permission statement; with none to replace,
+    the prefetch is Django's own and its rows are whole."""
+    from django.db.models import Prefetch
+
+    from rebac import display
+
+    settings.REBAC_DISPLAY_FIELDS = True
+    settings.REBAC_ENABLED = False
+    display.declare(ScopeThread, "label")
+    try:
+        with CaptureQueriesContext(connection) as captured:
+            messages = list(
+                ScopeMessage.objects.with_actor(OUTSIDER)
+                .order_by("pk")
+                .prefetch_related(
+                    Prefetch(
+                        "thread", queryset=ScopeThread.objects.with_actor(OUTSIDER).for_display()
+                    )
+                )
+            )
+    finally:
+        display.declare(ScopeThread)
+    assert [(m.thread.pk, m.thread.label) for m in messages] == [(1, "one"), (2, "two")]
+    assert not any(display.is_display_row(m.thread) for m in messages)
+    statements = [query["sql"] for query in captured.captured_queries]
+    assert len(statements) == 2 and not permission_statements(statements)
+
+
 def test_rows_still_carry_their_reader(world, settings):
     """Nothing is enforced for the reader, and the reader is still who read the rows: code that
     trusts a prefetched row by its stamp keeps trusting it."""
