@@ -5,6 +5,24 @@ pre-1.0; breaking changes within a minor version are explicitly called out.
 
 ## [Unreleased]
 
+## [0.37.0] — 2026-11-19
+
+PostgreSQL statements change for an actor whose profile folds more than one constant arm of a permission: they
+are shorter. Rows, decisions and statement counts do not change, and no other database is affected.
+
+### Changed
+
+- **Folded constant arms leave one planner's bound, not one each** (proposal 0019, PostgreSQL). Where an actor's
+  profile folds a constant arm, its place keeps `(SELECT FALSE)` so that PostgreSQL still plans the id set as
+  large as its table. Each folded arm kept its own, and a bound was not treated as false: a union of them became
+  an id set, a permission made of them a common table expression, and an exclusion on them was compiled. A policy
+  that grants roles on every row through constant relations (`reads->member`, united through named permissions,
+  less an exclusion) paid for each in every statement of an actor that held none. A union of bounds is now one
+  bound, a bound beside a condition or less an exclusion is that bound, a permission that compiles to bounds
+  alone builds nothing, and an arrow into such a permission is a bound of its own type. Statements of actors with
+  several folded constant arms are shorter; rows and decisions do not change, and every id set that had a bound
+  keeps one.
+
 ## [0.36.1] — 2026-11-19
 
 ### Fixed

@@ -400,6 +400,101 @@ def test_a_constant_arm_the_profile_folds_leaves_the_planners_bound(settings):
     assert not any(BOUND in sql for sql in statements)
 
 
+# Roles held on every row, as an application declares them: constant relations to one role
+# object each, united through named permissions, with an exclusion on what they lend.
+ROLES = """
+definition auth/user {{}}
+definition scope/role {{ relation direct: auth/user }}
+definition scope/thread {{
+    relation admin: scope/role // rebac:const=admin
+    relation reads: scope/role // rebac:const=contact_reader
+    relation manages: scope/role // rebac:const=contact_manager
+    relation owns: scope/role // rebac:const=contact_admin
+    relation account: scope/thread // rebac:const={{"target_id":"account","filters":{{"label":"account"}}}}
+    relation reader: auth/user
+    permission free = authenticated
+    permission role_admin_any = owns->direct
+    permission role_manage_any = manages->direct + role_admin_any
+    permission role_identity = reads->direct + role_manage_any
+    permission role_withheld = account->free
+    permission role_read = role_identity - role_withheld
+    permission role_both = reads->direct & reader
+    permission admin_only = admin->direct
+    permission read = reader{arms}
+}}
+definition scope/message {{
+    relation thread: scope/thread // rebac:field=thread
+    permission read = thread->read{through}
+}}
+"""
+
+
+@KEPT
+@pytest.mark.postgresql
+def test_folded_constant_arms_leave_one_bound_and_build_nothing(settings):
+    """Three role arms an actor holds none of, united through named permissions and narrowed
+    by an exclusion, cost what the administrator's arm alone costs: one bound. A bound is
+    false, so a union of bounds is one, a bound less anything is that bound, and a permission
+    made of them builds no id set and keeps no exclusion."""
+
+    def seeded(arms: str, through: str = ""):
+        local = install_schema(ROLES.format(arms=arms, through=through))
+        local.write_relationships([grant("scope/thread", 1, "reader")])
+        return local
+
+    def statement(arms: str, through: str = "") -> str:
+        seeded(arms, through)
+        with evaluator_scope():
+            found, statements = messages()
+        assert found == [1]
+        return statements[-1]
+
+    ScopeThread._base_manager.bulk_create(
+        [ScopeThread(id=1), ScopeThread(id=2), ScopeThread(id=3, label="account")]
+    )
+    ScopeMessage._base_manager.bulk_create([ScopeMessage(id=n, thread_id=n) for n in (1, 2, 3)])
+    administrator = statement(" + admin->direct")
+    with_roles = statement(" + role_read + role_both + admin->direct")
+    one_role = statement(" + reads->direct")
+    roles_alone = statement(" + role_read + role_both")
+    narrowed_alone = statement(" + role_read")
+    if connection.vendor != "postgresql":
+        assert BOUND not in with_roles and len(with_roles) == len(administrator)
+        return
+    # Beside the administrator's arm the roles add nothing: its bound is theirs.
+    assert administrator.count(BOUND) == with_roles.count(BOUND) == 1
+    assert len(with_roles) == len(administrator)
+    assert "NOT (EXISTS" not in with_roles and "'account'" not in with_roles
+    # Without it they still leave the one bound their id set is planned by.
+    assert one_role.count(BOUND) == roles_alone.count(BOUND) == 1
+    assert len(roles_alone) == len(one_role)
+    assert "NOT (EXISTS" not in roles_alone
+    # A bound less an exclusion is still the bound, not nothing.
+    assert narrowed_alone.count(BOUND) == 1 and len(narrowed_alone) == len(one_role)
+    # An arrow into a permission of bounds alone is a bound of its own type: the messages
+    # carry it once, with no subquery over threads that selects nothing.
+    through_admin = statement("", " + thread->admin_only")
+    through_roles = statement("", " + thread->role_read + thread->role_identity")
+    assert through_admin.count(BOUND) == through_roles.count(BOUND) == 1
+    assert len(through_roles) == len(through_admin)
+
+    local = seeded(" + role_read + role_both + admin->direct")
+    # A role the actor holds is compiled, with its exclusion. The profile knows the relation,
+    # not the object, so the roles it does not hold are compiled beside it.
+    local.write_relationships([grant("scope/role", "contact_manager", "direct")])
+    with evaluator_scope():
+        found, statements = messages()
+    assert found == [1, 2]
+    assert "'contact_manager'" in statements[-1] and "'account'" in statements[-1]
+
+    # The administrator holds every arm: nothing is folded, nothing is bounded.
+    local.write_relationships([grant("scope/role", "admin", "direct")])
+    with evaluator_scope():
+        found, statements = messages()
+    assert found == [1, 2, 3]
+    assert not any(BOUND in sql for sql in statements)
+
+
 @KEPT
 def test_an_actor_granted_through_a_subject_set_has_a_profile(threads):
     team = SubjectRef.of("auth/group", "team", "member")

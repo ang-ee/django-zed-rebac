@@ -176,6 +176,28 @@ shorten that path.
 3. **Outside evaluator scopes** nothing changes. A consumer whose work runs outside one (tasks, workflow steps)
    gains only when it opens a scope around a unit of work.
 
+## One bound per id set (0.37.0)
+
+A bound was first emitted for each folded constant arm, as a condition of its own and not as a false one. So a
+union of two folded arms was an id set of two branches, a named permission made of folded arms was a common table
+expression that selected nothing, and an exclusion applied to one was compiled. A policy that holds roles on
+every row through constant relations, united through named permissions and narrowed by an exclusion, showed it:
+for an actor that held no role, each statement reaching the type carried four bounds, two id sets of bounds and
+the exclusion.
+
+The bound is one condition (`predicate._BOUND`), false like the compiler's false and kept where that is dropped,
+once for a disjunction:
+
+- a union of bounds is one bound;
+- a bound beside another condition, or less an exclusion, is that bound: the exclusion is not compiled;
+- a permission that compiles to bounds alone returns the bound, and builds no id set;
+- a relation into such a permission (an arrow through a field, a stored relation or an attribute, or a subject
+  set) is a bound of the type it is on, in place of a subquery over the target that selects nothing. A check of
+  one object carries none, as before.
+
+Every id set that had a bound keeps one, so what the bound is for holds: the set is planned as one that may be
+large. What changes is how many times that is said.
+
 ## Known limits
 
 - **0.35.0 gave no profile to an actor that holds a grant through a stored subject set; 0.35.1 does.** With
