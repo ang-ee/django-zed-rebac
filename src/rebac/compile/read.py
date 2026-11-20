@@ -610,7 +610,9 @@ def _read_profile(policy: _Policy, actor: SubjectRef, using: str) -> frozenset[K
     statement asks, for each relation name that can hold stored rows, whether
     one row of that name names the subject: one index probe per name. The
     profile then holds that name on every type. Such a part of an actor in more
-    sets than ``_PROFILE_SETS`` gives no profile.
+    sets than ``_PROFILE_SETS`` gives no profile. A policy with no relation
+    that can hold stored rows has no name to ask about: its profile is the
+    first statement's keys.
 
     A consumer that writes a relationship for each record a user creates gives
     its users as many rows as they have created records. Reading every row
@@ -690,6 +692,10 @@ def _read_profile(policy: _Policy, actor: SubjectRef, using: str) -> frozenset[K
         for which, resource_type, relation, count in with_cte(*definitions, select=select):
             keys.add((str(resource_type), str(relation)))
             read[int(which)] += int(count)
+        if not stored:
+            # No relation of the policy can hold stored rows: past the bound there is
+            # no name to probe, and the profile is what was read.
+            return frozenset(keys)
         named = Q()
         if read[0] > _PROFILE_ROWS:
             named |= Q(subject_type=actor.subject_type, subject_id__in=(actor.subject_id, "*"))

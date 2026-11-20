@@ -5,6 +5,15 @@ pre-1.0; breaking changes within a minor version are explicitly called out.
 
 ## [Unreleased]
 
+### Fixed
+
+- **An actor's grant profile is read past its bound under a policy with no stored relation** (0.35.2 and later).
+  When more than 1,000 relationship rows name an actor (left by an earlier policy, or of relations no longer
+  declared) and no relation of the policy can hold stored rows (every one is field- or constant-backed), a read
+  inside an evaluator scope raised `ValueError: zip() argument 2 is longer than argument 1`: the statement that
+  probes each stored relation name had no name to probe and selected the whole generation row. There is nothing
+  to probe then, and the profile is the keys the first statement read; no second statement is sent.
+
 ## [0.37.0] — 2026-11-19
 
 PostgreSQL statements change for an actor whose profile folds more than one constant arm of a permission: they

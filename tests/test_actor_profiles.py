@@ -14,7 +14,7 @@ from rebac.models import Relationship
 from rebac.testing import install_schema
 from rebac.types import Consistency
 from tests.test_inherited_witness_reference import build
-from tests.testapp.models import ScopeMessage, ScopePart, ScopeThread
+from tests.testapp.models import AuthoredPost, Folder, ScopeMessage, ScopePart, ScopeThread
 
 MEMBER = SubjectRef.of("auth/user", "member")
 ADMIN = SubjectRef.of("auth/user", "admin")
@@ -633,6 +633,66 @@ def test_an_actor_in_more_sets_than_are_named_has_no_profile(threads, bound, mon
     assert profile_statements(statements) == 2
     assert profile_statements(repeated) == 0
     assert "'direct'" in statements[-1]
+
+
+EARLIER = """
+definition auth/user {}
+definition scope/thread { relation reader: auth/user }
+"""
+# Every relation is backed by a column, so none can hold stored rows. A backed relation
+# cannot admit a subject set, so neither can any relation here.
+BACKED_ONLY = """
+definition auth/user {}
+definition blog/folder {
+    relation member: auth/user // rebac:field={"path":"authored_posts__author"}
+    permission view = member
+}
+definition blog/authoredpost {
+    relation author: auth/user // rebac:field=author
+    relation folder: blog/folder // rebac:field=folder
+    permission read = author + folder->view
+}
+"""
+
+
+@KEPT
+@pytest.mark.parametrize("storage", ["denormalized", "registry"])
+def test_past_the_bound_a_policy_with_no_stored_relation_probes_nothing(
+    storage, settings, bound, django_user_model
+):
+    """Rows an earlier policy left name the actor past the bound, and the policy has no
+    relation that can hold stored rows: there is no name to probe, and the profile is what
+    the first statement read."""
+    settings.REBAC_LOCAL_BACKEND_STORAGE = storage
+    author, other = (django_user_model.objects.create(username=name) for name in ("a", "o"))
+    actor = SubjectRef.of("auth/user", str(author.pk))
+    install_schema(EARLIER).write_relationships(
+        [grant("scope/thread", n, "reader", actor) for n in (1, 2, 7)]
+    )
+    local = install_schema(BACKED_ONLY)
+    Folder._base_manager.bulk_create([Folder(id=1, name="theirs"), Folder(id=2, name="shared")])
+    AuthoredPost._base_manager.bulk_create(
+        [
+            AuthoredPost(id=1, title="own", author=author),
+            AuthoredPost(id=2, title="theirs", author=other, folder_id=1),
+            AuthoredPost(id=3, title="mine too", author=author, folder_id=2),
+            AuthoredPost(id=4, title="shared", author=other, folder_id=2),
+        ]
+    )
+
+    def posts() -> tuple[list[int], list[str]]:
+        with CaptureQueriesContext(connection) as captured:
+            found = sorted(AuthoredPost.objects.with_actor(actor).values_list("pk", flat=True))
+        return found, [query["sql"] for query in captured.captured_queries]
+
+    outside, _plain = posts()
+    with evaluator_scope():
+        inside, statements = posts()
+        held = read._actor_profile(local, actor, "default")
+    assert inside == outside == [1, 3, 4]
+    assert held == {("scope/thread", "reader")}
+    # The sample, which stopped at the bound, and nothing past it.
+    assert profile_statements(statements) == 1
 
 
 @KEPT
