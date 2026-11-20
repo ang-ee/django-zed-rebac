@@ -7,6 +7,7 @@ python manage.py rebac sync --prune-stale --yes # retire removed package policy
 python manage.py rebac check                    # validate without writes
 python manage.py rebac build-zed                # emit effective.zed
 python manage.py rebac explain <type>.<perm>    # print compiled expression
+python manage.py rebac links                    # arrows REBAC_INHERIT_THROUGH_LINKS = False narrows
 python manage.py rebac migrate-storage --to registry   # registry-storage cutover
 python manage.py rebac grant storage/role:viewer auth/user:42
 python manage.py rebac revoke storage/role:viewer auth/user:42
@@ -25,7 +26,7 @@ from pathlib import Path
 from typing import TYPE_CHECKING, Any, cast
 
 from django.apps import apps
-from django.core.exceptions import FieldDoesNotExist
+from django.core.exceptions import FieldDoesNotExist, ImproperlyConfigured
 from django.core.management.base import BaseCommand, CommandError
 from django.db import connections, models, router
 from django.db.models import Model, Q
@@ -352,6 +353,13 @@ class Command(BaseCommand):
         p_explain = sub.add_parser("explain", help="Print compiled expression for <type>.<perm>")
         p_explain.add_argument("target", help="e.g. blog/post.read")
 
+        p_links = sub.add_parser(
+            "links",
+            help="List the arrows REBAC_INHERIT_THROUGH_LINKS = False narrows, and what is lent.",
+        )
+        p_links.add_argument("--type", dest="resource_type", help="Only arrows on this type.")
+        p_links.add_argument("--json", action="store_true", help="One JSON document.")
+
         p_mig = sub.add_parser(
             "migrate-storage",
             help="Copy rows between denormalized and registry storage shapes.",
@@ -425,6 +433,8 @@ class Command(BaseCommand):
             self._handle_build_zed(options)
         elif cmd == "explain":
             self._handle_explain(options)
+        elif cmd == "links":
+            self._handle_links(options)
         elif cmd == "migrate-storage":
             self._handle_migrate_storage(options)
         elif cmd == "unset-ids":
@@ -1635,7 +1645,8 @@ class Command(BaseCommand):
         from ...backends import backend
         from ...schema.rendering import _render_expr
 
-        schema = backend().schema()
+        active = backend()
+        schema = active._published_schema()
         definition = schema.get_definition(rt)
         if definition is None:
             raise CommandError(f"No definition: {rt}")
@@ -1643,3 +1654,72 @@ class Command(BaseCommand):
         if permission is None:
             raise CommandError(f"No permission {perm!r} on {rt}")
         self.stdout.write(f"{rt}#{perm} = {_render_expr(permission.expression)}")
+        try:
+            evaluated = active.evaluated_schema().get_permission(rt, perm)
+        except (SchemaError, ImproperlyConfigured) as exc:
+            # A narrowing that cannot be built (rebac.E025), or a setting that is not a
+            # bool (rebac.E028): the message names the check.
+            raise CommandError(str(exc)) from exc
+        if evaluated is not None and evaluated.expression != permission.expression:
+            # REBAC_INHERIT_THROUGH_LINKS = False evaluates another expression (proposal 0023).
+            self.stdout.write(
+                f"  evaluated without inheritance through links: {_render_expr(evaluated.expression)}"
+            )
+
+    # ---------- links ----------
+
+    def _handle_links(self, options: dict[str, Any]) -> None:
+        """Every arrow ``REBAC_INHERIT_THROUGH_LINKS = False`` narrows in the published policy."""
+        from ... import links
+
+        try:
+            # The report reads the published policy; the setting that says which policy is
+            # evaluated is read for the summary, and one that is not a bool is the check's
+            # error (rebac.E028), reported as the command's.
+            state = "on" if links.inherits_through_links() else "off"
+        except ImproperlyConfigured as exc:
+            raise CommandError(str(exc)) from exc
+        try:
+            found = links.narrowed_arrows()
+        except SchemaError as exc:
+            raise CommandError(str(exc)) from exc
+        only = options.get("resource_type")
+        if only:
+            found = [arrow for arrow in found if arrow.resource_type == only]
+        if options.get("json"):
+            self.stdout.write(
+                json.dumps(
+                    [
+                        {
+                            "resource_type": arrow.resource_type,
+                            "permission": arrow.permission,
+                            "relation": arrow.relation,
+                            "reason": arrow.reason,
+                            "target_types": list(arrow.target_types),
+                            "target": arrow.target,
+                            "lent": dict(arrow.lent),
+                            "reaches": arrow.reaches,
+                        }
+                        for arrow in found
+                    ],
+                    indent=1,
+                    sort_keys=True,
+                )
+            )
+            return
+        self.stdout.write(
+            f"{len(found)} arrow(s) narrowed by REBAC_INHERIT_THROUGH_LINKS = False "
+            f"(inheritance through links is {state} now)."
+        )
+        for arrow in found:
+            self.stdout.write(
+                f"{arrow.resource_type}#{arrow.permission}: {arrow.relation}->{arrow.target} "
+                f"({arrow.reason}; reaches {arrow.reaches})"
+            )
+            for subject, lent in arrow.lent:
+                self.stdout.write(f"    {subject}#{arrow.target} lends {lent}")
+        reasons: dict[str, int] = {}
+        for arrow in found:
+            reasons[arrow.reason] = reasons.get(arrow.reason, 0) + 1
+        for reason, count in sorted(reasons.items(), key=lambda item: (-item[1], item[0])):
+            self.stdout.write(f"  {count:>5}  {reason}")

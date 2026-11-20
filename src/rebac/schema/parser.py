@@ -642,12 +642,99 @@ def _caveat_identifier_errors(caveat_name: str, expression: str, declared: set[s
     ]
 
 
+def name_errors(schema: Schema) -> list[str]:
+    """Every name ``schema`` holds that its source could not spell.
+
+    A name is what the lexer reads as one (``_IDENT_RE``, ``_TYPE_NAME_RE``),
+    in the positions the parser reads it: a type where it takes a type, an
+    identifier where it takes an identifier, a keyword only where it accepts
+    one. A reference and an arrow's relation name a relation or a permission,
+    so they are identifiers too, and never ``nil`` (the parser reads it as the
+    empty set); a subject's caveat is never ``expiration`` (the parser reads
+    ``with expiration`` as the expiration modifier). A parsed schema whose
+    references resolve has no other names; one built in code
+    (``LocalBackend.set_schema``, ``Definition.extend``) or written to stored
+    rows does not pass through the parser, so the backend refuses such a name
+    where a schema is installed and where a stored-policy write adds one. A
+    stored policy that already holds one keeps loading (``rebac.W013``).
+    Caveat parameter types and CEL bodies are not names.
+    """
+
+    def name(value: object, *, keyword: bool = True) -> bool:
+        return (
+            isinstance(value, str)
+            and _IDENT_RE.fullmatch(value) is not None
+            and (keyword or value not in _KEYWORDS)
+        )
+
+    def type_name(value: object) -> bool:
+        return (
+            isinstance(value, str)
+            and _TYPE_NAME_RE.fullmatch(value) is not None
+            and value not in _KEYWORDS
+        )
+
+    errors: list[str] = []
+    for caveat in schema.caveats:
+        if not name(caveat.name, keyword=False):
+            errors.append(f"caveat {caveat.name!r}: not a name")
+        for param in caveat.params:
+            if not name(param.name, keyword=False):
+                errors.append(f"caveat {caveat.name}: parameter {param.name!r} is not a name")
+    for definition in schema.definitions:
+        type_ = definition.resource_type
+        if not type_name(type_):
+            errors.append(f"definition {type_!r}: not a type name")
+        for relation in definition.relations:
+            if not name(relation.name):
+                errors.append(f"{type_}: relation {relation.name!r} is not a name")
+            for subject in relation.allowed_subjects:
+                if not type_name(subject.type):
+                    errors.append(
+                        f"{type_}#{relation.name}: subject type {subject.type!r} is not a type name"
+                    )
+                if subject.relation and not name(subject.relation):
+                    errors.append(
+                        f"{type_}#{relation.name}: subject relation {subject.relation!r} is not a name"
+                    )
+                if subject.id and not name(subject.id):
+                    errors.append(
+                        f"{type_}#{relation.name}: subject id {subject.id!r} is not identifier-shaped"
+                    )
+                if subject.with_caveat and (
+                    not name(subject.with_caveat, keyword=False)
+                    or subject.with_caveat == "expiration"
+                ):
+                    errors.append(
+                        f"{type_}#{relation.name}: caveat {subject.with_caveat!r} is not a name"
+                    )
+        for permission in definition.permissions:
+            if not name(permission.name):
+                errors.append(f"{type_}: permission {permission.name!r} is not a name")
+            pending: list[PermExpr] = [permission.expression]
+            while pending:
+                node = pending.pop()
+                if isinstance(node, PermBinOp):
+                    pending.extend((node.left, node.right))
+                elif isinstance(node, PermRef) and not (name(node.name) and node.name != "nil"):
+                    errors.append(f"{type_}#{permission.name}: {node.name!r} is not a name")
+                elif isinstance(node, PermArrow) and not (
+                    name(node.via) and node.via != "nil" and name(node.target)
+                ):
+                    errors.append(
+                        f"{type_}#{permission.name}: {node.via}->{node.target} is not an arrow "
+                        "between names"
+                    )
+    return errors
+
+
 def validate_schema(schema: Schema) -> list[str]:
     """Cross-check references inside the schema. Returns a list of error strings.
 
     Empty list means valid.
     """
-    errors = subject_relation_errors(schema)
+    errors = name_errors(schema)
+    errors.extend(subject_relation_errors(schema))
     caveat_names = {c.name for c in schema.caveats}
     for caveat in schema.caveats:
         declared = {param.name for param in caveat.params}

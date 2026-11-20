@@ -350,7 +350,9 @@ def gate_policy(using: str, backend: LocalBackend | None = None) -> GatePolicy |
     # Where the schema lives on the written alias, the revision just read is
     # the one to load it at: one read per gated write.
     stored = not active._schema_is_manual and using == SchemaDefinition.objects.db
-    schema = active._schema_snapshot(revision if stored else None).schema
+    # The published policy: the columns a write must be gated for are its
+    # relations', which REBAC_INHERIT_THROUGH_LINKS does not change (proposal 0023).
+    schema = active._load_schema_snapshot(revision if stored else None).schema
     with _lock:
         kept = _policies.get(id(schema))
         if kept is not None and kept[0] is schema:

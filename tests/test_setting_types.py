@@ -79,6 +79,8 @@ RAISES = {
     "REBAC_TYPE_PREFIX": "a str or None",
     "REBAC_UNIVERSAL_ADMIN_ROLE": "a str or None",
     "REBAC_SCHEMA_DIR": "a str, a pathlib.Path or None",
+    # Each value chooses a policy: either reading of another would widen or narrow access.
+    "REBAC_INHERIT_THROUGH_LINKS": "True or False",
 }
 # No safe reading either, and reported by a check of their own.
 RAISES_OWN = {
@@ -107,6 +109,7 @@ WRONG = {
     "a str": [None, 5, b"text", ["x"]],
     "a str or None": [5, b"text", ["x"]],
     "a str, a pathlib.Path or None": [5, ["x"]],
+    "True or False": BOOL_WRONG,
 }
 SWITCHES = {"REBAC_DISPLAY_FIELDS", "REBAC_ROW_SCOPE", "REBAC_BOUNDED_WALK"}
 STORAGE_WRONG = [None, b"registry", "Registry", ["registry"], "columnar"]
@@ -405,6 +408,7 @@ def test_a_database_check_that_cannot_run_fails_a_database_run():
         "rebac.E015",
         "rebac.E016",
         "rebac.E018",
+        "rebac.W013",
         "rebac.W014",
     }
     assert all("check_policy_models did not run" in issue.msg for issue in reported)

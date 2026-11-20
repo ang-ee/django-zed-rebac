@@ -563,6 +563,31 @@ default), and returns the backend. It builds nothing: permissions on `using`
 are decided from the rows already stored.
 `rebac.backends.reset_backend()` undoes it; call it in teardown.
 
+#### Names a policy can spell
+
+`rebac.schema.parser.name_errors(schema)` lists every name the `.zed` language
+could not produce in its position: a type, relation, permission, caveat,
+caveat parameter, subject relation, subject id or caveat reference, and in an
+expression a reference or an arrow's relation that is not an identifier (or is
+`nil`) and an arrow's target that is not a name. A parsed schema whose
+references resolve has none; `validate_schema` includes them. New input is
+refused with `SchemaError`: `LocalBackend.set_schema()` (and so
+`rebac.testing.install_schema()`) with a `Schema` built in code, and a write to
+the stored policy that adds such a name. What a write adds is what the composed
+stored policy holds when the outermost write owner exits and did not hold when
+it started, each name at its place (type, position and, in an expression, the
+permission it is in): a name already stored blocks no other write, and
+renaming it is a repair. A repair of a stored policy that cannot be read or
+composed is not held to it, as the names it held are not known (the places
+where a name is read two ways are, and are held). A stored policy that already holds one, written
+directly to its tables, loads and decides as it is; the database check
+`rebac.W013` names the type, the name and the repair. It is a warning, so that
+it never stops an upgrade: `manage.py check --database default` and `migrate`,
+which runs the database checks, report it and proceed. Silence it with
+`SILENCED_SYSTEM_CHECKS = ['rebac.W013']`. With
+`REBAC_INHERIT_THROUGH_LINKS = False` such a policy is refused by the
+narrowing (`rebac.E025`) and every decision fails closed.
+
 #### Names read one way
 
 `rebac.schema.ast.name_conflicts(definition)` lists every place where a
@@ -584,25 +609,27 @@ composed is not validated again, but it may remove a place, never add one (the
 places are counted on the stored names and subject types, which no override
 changes). A stored policy that already holds
 one, written directly to its tables, loads and decides as in 0.37.0; the
-database check `rebac.W014` names each place and the repair. It is a warning, so
-that it never stops an upgrade: `manage.py check --database default` and
-`migrate`, which runs the database checks, report it and proceed. The
-experimental read mechanisms prove nothing from it and leave the compiled
-statements in place: structural prefetch proves nothing about such a type (the
-parent's, the child's, or one an arrow lifts to), and the bounded walk and the
-row scope refuse the whole policy.
+database check `rebac.W014` names each place and the repair: a sibling of
+`rebac.W013` rather than that check, since the name is spelled, the repair
+differs, and either is silenced alone. It is a warning, so that it never stops
+an upgrade: `manage.py check --database default` and `migrate`, which runs the
+database checks, report it and proceed. The experimental read mechanisms prove
+nothing from it and leave the compiled statements in place: structural prefetch
+and display rows' implied actions prove nothing about such a type (the parent's,
+the child's, or one an arrow lifts to), the bounded walk and the row scope
+refuse the whole policy, and the narrowing refuses it (`rebac.E025`).
 
 `validate_schema`'s rules and the runtime:
 
 | Rule | At runtime |
 |---|---|
+| Names the language can spell (`name_errors`) | Refused in new input; stored: `rebac.W013` |
 | Names read one way (`name_conflicts`) | Refused in new input; stored: `rebac.W014` |
 | A backed relation's shape (one concrete subject type, no caveat, no expiry, a backing that round-trips; `rebac.schema.parser.backing_errors`) | Refused at installation and when a stored policy is loaded, chosen by the rule, whatever the names in its message |
 | A subject relation names a relation of its type | Refused at installation and when a stored policy is loaded |
 | A permission's references name a relation, a permission or a built-in; an arrow's relation is a relation | Not held: the compiler reads an unknown name or relation as nothing, which grants nothing |
 | A relation's caveat is declared | Not held at installation: no relationship can be written with an undeclared caveat (`ValueError: unknown caveat`), so no stored grant carries one |
 | A caveat body names only its parameters | Not held: CEL fails to evaluate an unknown name and the read raises `CaveatUnsupportedError`; it never grants |
-
 `rebac.testing.assert_decisions(checks=(), accessible=())` asserts a decision
 table against the active backend. Each `checks` row is `(subject, action,
 resource, allowed)`: an `ActorLike`, an action, an `ObjectRef` or anything
@@ -1218,6 +1245,7 @@ All settings prefixed `REBAC_`. No nested dict. Read via the public `app_setting
 | `REBAC_EVALUATOR_CACHE_SIZE` | `10000` | `int` | Max entries in the per-scope evaluator's check cache, and the bound on its field-visibility memo (least recently used dropped first). |
 | `REBAC_ENABLED` | `True` | `bool` | `False` enforces nothing: every caller, with an actor or without, reads and writes every row, and the library issues no permission statement. For a deployment with one trusted user, and for measuring an application's queries without the library's. System check `rebac.W011`. See [Unenforced deployments](#unenforced-deployments). |
 | `REBAC_ACTOR_PROFILES` | `True` | `bool` | Inside an evaluator scope, compile statements for the stored grants the actor can hold: one extra statement per scope, actor and database reads which stored relations name the actor, and arms outside that set are not compiled. See [Actor grant profiles](#actor-grant-profiles). |
+| `REBAC_INHERIT_THROUGH_LINKS` | `True` | `bool` | Draft, [proposal 0023](./proposals/0023-no-inheritance-through-links.md). `False` evaluates every permission under a narrower policy derived from the published one: an arrow through a link (a relation that is not the row's own foreign key, a constant, a walk within one type or a membership) lends only what the linked record grants directly. It grants a subset of what the published policy grants, never more, and needs no sync. `manage.py rebac links` lists what it narrows; system check `rebac.W012` warns while it is `False`. Only the booleans mean anything: any other value is `rebac.E028`, and every decision raises `ImproperlyConfigured`. `LocalBackend.evaluated_schema()` is the policy it evaluates. See [Policies without inheritance through links](#policies-without-inheritance-through-links). |
 | `REBAC_STRUCTURAL_PREFETCH` | `False` | `bool` | Experimental. Children of parents a prefetch just admitted are read by foreign key, without their permission statement, where the policy proves the parent's action grants theirs, the parent's action being the one the child's arm names or one the policy proves implies it. See [Switchable read mechanisms](#switchable-read-mechanisms). |
 | `REBAC_ROW_SCOPE` | `False` | `bool \| "named"` | Experimental. The scope of a statement a queryset runs itself is written as conditions on each row instead of membership in the ids the actor holds. `"named"`: only where the queryset's own conditions bind its primary key or a foreign key to literal values. Needs PostgreSQL's JIT off. |
 | `REBAC_BOUNDED_WALK` | `False` | `bool \| "prove" \| "decide"` | Experimental. `held` and `held_many` are answered by lookups on the rows the ids name. `"prove"` (or `True`) settles the ids a grant, a column or a parent shows held; `"decide"` reads the whole permission and answers no as well. |
@@ -1249,7 +1277,11 @@ value it does not accept is read in one of four ways:
   `REBAC_DISPLAY_FIELDS`). `rebac.E028`.
 - **Raises** `ImproperlyConfigured` where it is read: a number, a name, a
   dotted path, a subject type or a directory has no safe reading (a default
-  could resolve actors another way or name other subjects), `rebac.E028`; the
+  could resolve actors another way or name other subjects), `rebac.E028`; so
+  has `REBAC_INHERIT_THROUGH_LINKS`, a boolean whose values choose a policy: read
+  as `True` another value would grant more than a deployment that asked for the
+  narrower policy, read as `False` it would take access away unannounced, so
+  every decision raises, `rebac.E028`; the
   storage layout, read at every query, since after a cutover the other table is
   a stale copy, `rebac.E006` (a `str` enum member whose value is one of the two
   is accepted; padding, a plain `Enum` member and a lazy string are not); the
@@ -1333,8 +1365,9 @@ System checks (in `rebac/checks.py`):
 | `rebac.E021` | Error | The schema declares a caveat but `cel-python` (the `caveats` extra) is not installed, so caveat bodies cannot be validated or evaluated. |
 | `rebac.E023` | Error | A `RebacMixin` / `RebacTrackedMixin` model's declared base manager returns a queryset that is not a `TrackedQuerySet`, or one that filters rows. The library reads a model's rows and owns its gated writes through the base manager. (`E020` and `E022` are reserved by proposals 0011 and 0013.) |
 | `rebac.E024` | Error | A `RebacMixin` model's default manager returns a queryset that is not a `RebacQuerySet`. Django's admin, model forms, related managers and `validate_unique()` read rows through `_default_manager`; a plain manager there leaves those reads unscoped with no `MissingActorError`. Override `objects` only with a `RebacManager` subclass. |
-| `rebac.E026` | Error | A display declaration (`Meta.rebac_display_fields` or `rebac.display.declare()`) names something other than a plain column of a `RebacMixin` model's own: the model is not a `RebacMixin` model, its primary key or a multi-table parent's is a relation other than a parent link (a display row shows its key), or a name is not a field, not one of its own columns, or a relation. Reported whatever `REBAC_DISPLAY_FIELDS` is, off included: a wrong declaration is a hole the moment the setting is turned on. The conditions are `rebac.display.declaration_problems`, which the first read to consult the declaration also refuses with `ImproperlyConfigured`; the check finds it at startup. (`E025` is reserved by another change.) |
-| `rebac.E028` | Error | A setting's value is not one the setting accepts ([Settings catalog](#settings-catalog)): the message names the setting, the value's type and what it is read as, and the hint what to write. A boolean is read closed meanwhile, and any other setting raises `ImproperlyConfigured` where it is read. The storage layout and the tracked models are reported by `E006` and `E018`, the backend, the field read mode and the Zookie transport by `E001`, `E008` and `E007`, and the reserved settings by `W015`. (`E025` and `E027` are reserved.) |
+| `rebac.E025` | Error | With `REBAC_INHERIT_THROUGH_LINKS = False`, the policy evaluated without inheritance through links cannot be built from the published one, or is refused (a name the schema language cannot spell, a generated name the policy declares). Every decision then raises `SchemaError` citing this ID, so reads and gated writes fail closed; a write that decides nothing does not depend on it. A refusal is kept; any other failure is retried by the next operation. See [Policies without inheritance through links](#policies-without-inheritance-through-links). |
+| `rebac.E026` | Error | A display declaration (`Meta.rebac_display_fields` or `rebac.display.declare()`) names something other than a plain column of a `RebacMixin` model's own: the model is not a `RebacMixin` model, its primary key or a multi-table parent's is a relation other than a parent link (a display row shows its key), or a name is not a field, not one of its own columns, or a relation. Reported whatever `REBAC_DISPLAY_FIELDS` is, off included: a wrong declaration is a hole the moment the setting is turned on. The conditions are `rebac.display.declaration_problems`, which the first read to consult the declaration also refuses with `ImproperlyConfigured`; the check finds it at startup. |
+| `rebac.E028` | Error | A setting's value is not one the setting accepts ([Settings catalog](#settings-catalog)): the message names the setting, the value's type and what it is read as, and the hint what to write. A boolean is read closed meanwhile, and any other setting raises `ImproperlyConfigured` where it is read. The storage layout and the tracked models are reported by `E006` and `E018`, the backend, the field read mode and the Zookie transport by `E001`, `E008` and `E007`, and the reserved settings by `W015`. (`E027` is not assigned.) |
 | `rebac.W001` | Warning | `rebac.backends.RebacBackend` not in `AUTHENTICATION_BACKENDS`. |
 | `rebac.W002` | Warning | A model with `Meta.rebac_resource_type` is missing `RebacMixin`. |
 | `rebac.W003` | Warning | An RBAC-bound relation exists where bare `select_related("rel")` / `prefetch_related("rel")` can be unsafe outside the REBAC helpers or Strawberry-Django optimizer. |
@@ -1345,16 +1378,18 @@ System checks (in `rebac/checks.py`):
 | `rebac.W009` | Warning | A text attribute-backed column declares a case-insensitive collation (`*_ci`, or the MySQL default), so SQL scoping and Python checks could disagree on container ids. Best-effort detection. |
 | `rebac.W010` | Warning | A stored override references a relation or permission removed from the current baseline; that override is ignored until updated or deleted. |
 | `rebac.W011` | Warning | `REBAC_ENABLED` is `False`: no permission is checked, and every caller reads and writes every row. |
-| `rebac.W014` | Warning (database) | The stored policy lets a name be read two ways (`rebac.schema.ast.name_conflicts`): a built-in's name as a relation, a definition or a subject type, or a name declared twice. It loads and decides as stored; new input with such a place is refused. The experimental read mechanisms prove nothing from it: structural prefetch about such a type, the bounded walk and the row scope about the whole policy. A warning, so that `migrate` proceeds. Rename the relation or the permission; silence it with `SILENCED_SYSTEM_CHECKS = ['rebac.W014']`. See [Names read one way](#names-read-one-way). |
+| `rebac.W012` | Warning | `REBAC_INHERIT_THROUGH_LINKS` is `False`: the backend evaluates a narrower policy than the published one that `rebac build-zed` exports. Silence it with `SILENCED_SYSTEM_CHECKS = ['rebac.W012']`. |
+| `rebac.W013` | Warning (database) | The stored policy holds a name the schema language cannot spell (a type, relation, permission, caveat or subject relation written directly to its tables). It loads and decides as stored; new input with such a name is refused. A warning, so that `migrate` proceeds: nothing decides differently from before names were checked. Rename it through the schema write API or sync a corrected `.zed` file; silence it with `SILENCED_SYSTEM_CHECKS = ['rebac.W013']`. With `REBAC_INHERIT_THROUGH_LINKS = False` the narrowing refuses it (`rebac.E025`). See [Names a policy can spell](#names-a-policy-can-spell). |
+| `rebac.W014` | Warning (database) | The stored policy lets a name be read two ways (`rebac.schema.ast.name_conflicts`): a built-in's name as a relation, a definition or a subject type, or a name declared twice. It loads and decides as stored; new input with such a place is refused. The experimental read mechanisms prove nothing from it (structural prefetch and display rows' implied actions about such a type, the bounded walk and the row scope about the whole policy), and with `REBAC_INHERIT_THROUGH_LINKS = False` the narrowing refuses it (`rebac.E025`). A sibling of `rebac.W013`: the name is spelled, the repair differs, and either is silenced alone. A warning, so that `migrate` proceeds. Rename the relation or the permission; silence it with `SILENCED_SYSTEM_CHECKS = ['rebac.W014']`. See [Names read one way](#names-read-one-way). |
 | `rebac.W015` | Warning | A reserved setting the library does not read (`REBAC_RELATIONSHIP_MODEL`, `REBAC_DEFAULT_CONSISTENCY`, `REBAC_CACHE_ALIAS`, `REBAC_LOOKUP_CACHE_TTL`, `REBAC_GC_INTERVAL_SECONDS`) has a value of another type than documented. It has no effect either way. |
 | `rebac.W101` | Retired | Not reused. |
 
-`rebac.E025`, `rebac.E027`, `rebac.W012` and `rebac.W013` are not assigned in this release.
+`rebac.E027` is not assigned in this release.
 
 `rebac.E014`, `rebac.E015`, `rebac.E016`, the backing-path form of
-`rebac.E018` and `rebac.W014` read the stored schema, so they run only as
-database checks: `manage.py check --database <alias>`, and the checks `migrate`
-runs.
+`rebac.E018`, `rebac.W013` and `rebac.W014` read the stored schema, so they run
+only as database checks: `manage.py check --database <alias>`, and the checks
+`migrate` runs.
 
 Users silence individual checks via Django's `SILENCED_SYSTEM_CHECKS = ["rebac.W001"]`.
 
@@ -2551,8 +2586,9 @@ with its value) and, for a mapping, the keys whose value `changed`.
   count and its own `iterator()` are decided where they run and never delivered; a decision that is not a delivery
   reads by the permission statement. A queryset whose query already carries a scope for the same decision keeps it
   (the 0.38.0 rule, one comparison): after its own `count()`, `exists()`, `aggregate()`, `iterator()` or
-  `aiterator()`, and for an eager `scoped()` queryset and its clones, an evaluation under the same actor, bypass and
-  database reads by that permission statement, decided neither for display nor for structural delivery. The chunks
+  `aiterator()`, an evaluation under the same actor, bypass, database and policy, and for an eager `scoped()`
+  queryset and its clones one under the same actor, bypass and database, reads by that permission statement,
+  decided neither for display nor for structural delivery. The chunks
   of `iterator()` and `aiterator()` open no record and admit none of their rows: inside a running evaluation for the
   same actor their to-one prefetches are delivered for the keys its admitted rows hold.
 - **`rebac.display.referring()` and `rebac.display.admit()` are trusted.** They record rows as admitted with no
@@ -2565,6 +2601,181 @@ with its value) and, for a mapping, the keys whose value `changed`.
   statement added to the read (in-process or stored policy); the first read of a policy and action runs the proof.
   `implies` never opens a recursive name on the side it proves, so under any action but the read action itself
   (even `permission browse = read`) rows of a type whose read action is recursive refer to nothing.
+
+#### Policies without inheritance through links
+
+Draft, [proposal 0023](./proposals/0023-no-inheritance-through-links.md). `REBAC_INHERIT_THROUGH_LINKS`, `True` by
+default, chooses the policy the backend evaluates. `True` is the published policy and changes no statement.
+`False` evaluates a narrower policy derived from the published one (`rebac.links`), so that what inheritance
+through links costs, and what access depends on it, can be measured on a deployment by changing one setting.
+
+**Kinds of relation.** Every relation an arrow walks is classified on the definition that declares it, from its
+resolved backing (`rebac.field_backing`), in this order:
+
+| Kind | The relation |
+|---|---|
+| parent | Backed by a single forward foreign key or one-to-one column of the row itself, the multi-table parent link included, with no further hop in its path and with filters, if any, on the row's own columns |
+| constant | Backed by `rebac:const` |
+| same type | Its allowed subject types are the declaring type itself, whatever its backing: a folder in a folder, a role in a role, a self many-to-many, `parent__parent` |
+| membership | No allowed subject type has a model that stores rows: groups, roles and anchors declared only in the policy |
+| link | Anything else: a path of several hops, a filter over another table, a reverse, many-to-many or generic relation, an attribute backing, a stored relation that names records of another type, a backing that does not resolve |
+
+**The rule.** In a granting position an arrow `link->P` is evaluated as `link->lent(P)`, what the linked record
+grants directly: `P` with the record's own named permissions followed to what they lend, and every arrow removed
+except those through a constant relation or a membership (kept as written: their target is evaluated as the
+narrowed policy evaluates it) and through the multi-table parent link (followed to what the same record lends in
+its parent table). Through a kept constant or membership arrow a record therefore lends the target's narrowed
+permission whole: its same-type hierarchy, its constants and memberships, and those targets' foreign-key parent
+chains; only links are narrowed again. The arrows of a record's own permissions through a parent, a constant, a
+same-type relation or a membership are kept. A link whose target lends all of `P` keeps its arrow. A walk within one type is never
+narrowed, whatever its backing.
+
+**Granting positions only.** A position is granting when it is under an even number of right-hand sides of `-`.
+Under an odd number nothing is narrowed and nothing is removed, in a record's own permissions and in what it lends
+alike, and a permission such an operand names is evaluated the same way. A narrowed exclusion therefore never
+takes away less than the published one. For every actor, action and object, what the narrowed policy grants is a
+subset of what the published policy grants.
+
+**Generated permissions.** Where a version of a declared permission `P` differs from `P`, it is a permission of its
+own in the narrowed policy, on every subject type an arrow dispatches it to: `lent(P)` (what a record lends),
+`excluded(P)` (`P` under an exclusion, narrowed only under a second one) and `excluded(lent(P))` (what a record
+lends, under an exclusion). A name the schema language cannot spell (`rebac.schema.parser.name_errors`, the
+lexer's own identifier and type patterns, also part of `validate_schema`) is refused in new input, but a stored
+policy that already holds one keeps loading and deciding ([Names a policy can spell](#names-a-policy-can-spell)).
+A name inside an expression is read as the compiler reads it: `authenticated` and `anonymous` there are the actor's
+state, never a version of a permission declared under that name; where a generated permission stands for an
+unchanged declared permission of such a name it is that permission's expression, and a relation of such a name it
+would have to stand for is refused (`rebac.E025`, kept), as no expression can name it.
+So the narrowing checks its own input: it refuses (`rebac.E025`, kept) a policy with a name the language cannot
+spell, which is what keeps a declared name from holding a parenthesis, colliding with a generated one or being a
+field gate's `read__<field>` or `write__<field>`; a policy that reads a name two ways
+([Names read one way](#names-read-one-way)), where it would ask whether a name is a permission where the compiler
+reads a relation first; a generated name that a type an arrow reaches, or the type itself, already declares; and a
+definition that would hold two permissions of one name. With the setting `False`
+a stored policy holding such a name therefore fails every decision closed until it is renamed; relationship writes
+proceed. The narrowed policy is not a `.zed` schema. **A generated name is not an
+action.** Every public entry resolves its action against the published policy: `check_access`, `has_access`,
+`check_bulk_permissions`, `held`, `held_many`, `accessible`, `grants_all`, `lookup_subjects`, `queryset_filter`,
+`permission_expression`, a queryset's `with_action` (under every read mechanism: compiled statements, the row scope
+in either mode, the bounded walk and structural prefetch; the whole scope a queryset builds is built under the
+published policy, the policy key its rows are admitted with included), `check_new`, `rebac.rowscope.explain` and what is built
+on them (instance checks, `require_permission`, the evaluator, the DRF, MCP and Django auth surfaces, `rebac
+explain`). Asked for a generated name, each answers as the published policy answers an unknown action. Only the
+proposed-object walk of `check_new` dispatches to generated names, as the evaluated policy's arrows name them.
+Nothing public lists one either: `LocalBackend.schema()` is the published policy whatever the setting, and so is
+what reads it (`rebac.roles.roles_reaching`, the field gates' declared actions); listing, rendering and validating
+against declared names read it. Under `False`, `roles_reaching` therefore names a superset of the roles the
+evaluated policy lets reach a permission; `roles_reaching(..., schema=backend().evaluated_schema())` gives the
+evaluated policy's answer. The experimental entries of proposals 0022 and 0024 refuse a generated name too:
+`rebac.structural.edges()` lists no edge under one, `rebac.structural.explain()` answers that it is a generated name
+(as the parent's action or the child's), and `rebac.display.admits_reading()` admits no row under one.
+
+**The evaluated policy, for proofs.** Experimental entry points of proposal 0023, public and importable but outside
+the stable [Public API surface](#public-api-surface), as the 0.36 mechanisms' are: `LocalBackend.evaluated_schema()`,
+`rebac.links.is_generated(name)`, `rebac.links.inherits_through_links()` and `rebac.links.narrowed_arrows()`.
+`evaluated_schema()` is the policy decisions are made with, for a consumer's code that proves things about it (that a
+permission decomposes into parts it evaluates apart, say): with the setting `True` the published policy, the object
+`schema()` returns; with `False` the narrowed one, the object decisions read (the compiled policy's `effective`
+composition, which `check_new` walks and the residual evaluator reads, and which statements are compiled from unless
+override rows are selected, all but an expired recaveat; then they are compiled from the narrowing of the
+composition that keeps those rows' deadlines), kept per schema snapshot, so calls under one snapshot return one
+object, narrowed once, and a policy change or a change of the setting returns another. The field gates find the
+fields they gate in `schema()`, the published policy, and decide them under the evaluated one, as every decision is:
+a gate's `read__<field>` or `write__<field>` is a declared name, and both policies declare the same names, so both
+find the same gates.
+- It is the object decisions read: never mutate it.
+- It holds generated permissions (`rebac.links.is_generated(name)`), which are not actions: never show one to a user
+  or pass one to an entry. List, render and validate against declared names with `schema()`.
+- A proof made from its text holds only while the policy carries no override: an override's arm holds until its
+  deadline and a recaveat replaces a caveat's expression, neither visible in the text. The library's own prover
+  proves nothing while any override row is stored; a consumer learns the same from
+  `rebac.models.SchemaOverride.objects.using(<the schema's database>).exists()`. Nor does a proof hold on a type that
+  lets a name be read two ways (`rebac.schema.ast.name_conflicts`), which only a stored policy from before that rule
+  was held at runtime can (`rebac.W014`).
+- With a narrowed policy that cannot be built it raises `rebac.E025`'s error, and with a setting that is not a bool
+  `rebac.E028`'s, as a decision does.
+
+It is a `LocalBackend` convenience with no SpiceDB equivalent, an exception to invariant 1 on its merits (`AGENTS.md`):
+`schema()` is the `ReadSchema` of the published policy; the evaluated one is not a `.zed` schema, and no other
+backend evaluates it.
+
+**Only a boolean means anything.** `True` and `False` choose the policy; any other value (the string `"False"` an
+environment variable gives, `0`, `None`) has no safe reading ([Settings catalog](#settings-catalog)): system check
+`rebac.E028` reports it, `check_inherit_through_links` reports that it did not run (under `rebac.W012` and
+`rebac.E025`), and every decision raises `ImproperlyConfigured` until it is fixed: reads and gated writes fail
+closed, and a write that decides nothing (a relationship write, `schema()`, `rebac sync`) proceeds. A decision picks
+neither policy for it: read as truthy, the string `"False"` would evaluate the published policy, which grants more
+than the narrower one the deployment asked for, and `rebac.W012` would not fire; read as falsy, a value meant as on
+would take access away unannounced. Raising is the one reading that grants nothing the deployment did not ask for
+and cannot go unnoticed.
+
+**Where it applies.** `LocalBackend` narrows each composition it evaluates once and keeps the result. The
+snapshot's own composition (the published baseline with the overrides active when it was read; a snapshot expires
+at the first of their deadlines) is narrowed as it stands, without selecting override rows again: that one
+narrowing is what `check_new` walks and what the compiled policy's residual evaluator reads. The field gates find
+their fields in the published policy and decide them under the narrowed one, as every decision is; it declares the
+same names. Where there are override rows, the compiled policy also narrows its tagged composition, which keeps the
+rows whose deadlines its statements witness; that one is kept by the baseline's identity and the rows, so a policy
+prepared afresh at each use while a deadline is ahead reuses it. On the benchmark's policy one narrowing takes 20
+to 40 ms. Because the
+narrowing follows composition, an override of `P` reaches `lent(P)`; a rebuilt expression node carries the override
+tags of the node it replaces. Compiled reads, point and bulk checks, `held`, `held_many`, `accessible`,
+`grants_all`, `permission_expression`, `lookup_subjects`, `check_new`, the field gates, the switchable read
+mechanisms and the compile check (`rebac.E016`) therefore all evaluate the same policy. Kept policies, kept
+statements, grant profiles, the decision cache and the schema facts are keyed by the setting: a change inside a
+running process is seen by the next operation, with no reset, and never serves a statement or a decision of the
+other policy. A scope already built (a `Q` from `queryset_filter`, an expression from
+`LocalBackend.permission_expression`, an eager `scoped()` queryset and its clones) keeps the policy it was built
+under; querysets and `rebac.permission_expression()` bind the policy when their SQL is compiled.
+
+**The policy is a dimension of every scope decision.** The fence of a compiled statement witnesses, for a stored
+policy, the published revision, read where the statement runs, and its override deadlines; for a policy installed in
+process (`LocalBackend.set_schema()`, what `rebac.testing.install_schema()` calls), nothing that tells which backend
+is active: it compares the scope's revision with one taken from the backend instance the scope was built with. The
+published policy and the narrowed one share a revision, so it does not tell them apart either, and the published one
+grants more. A queryset's decision ([Manager and queryset surface](#manager-and-queryset-surface)) is therefore its
+actor, its bypass, its database and its policy (`rebac.managers._evaluated_policy`): the value of the setting
+(`rebac.links.inherits_through_links()`, which the evaluated snapshot reads and the policy's key,
+`compile.read.policy_key`, carries as its last component) and the revision of the active backend's in-process schema,
+none for a stored policy; none of it for a bypass or no actor. It is read at no statement and compared in
+`RebacQuerySet._apply_scope_in_place`, at every evaluation (iteration, `len()`, `bool()`, `count()`, `exists()`,
+`aggregate()`, `iterator()`, `aiterator()` and the async forms, a deep copy's evaluation), and in
+`_RebacQuery._decided_elsewhere`, by each statement that compiles an embedded queryset, in every position, a write's
+statements included. `iterator()` decides its actor, bypass and database where it is called and compares the decision
+again where its statement compiles, at its first rows, where its embedded querysets are decided: if the policy changed
+in between it builds its scope once more, so that the statement and what it embeds read one policy. A write under an
+actor (`update()`, `delete()`, `bulk_update()`) selects its rows by a scope it builds when it runs, under the policy
+then, and by the embedded querysets its conditions hold, decided as above. A queryset built, evaluated or embedded
+under one value and read under the other therefore builds its scope again, under the other, and so does one kept
+across an in-process installation. An eager `scoped()` queryset takes the policy from the scope it holds, as it
+keeps its actor, and by that contract, a limit kept on purpose, keeps the scope it built across an in-process
+installation too: after `install_schema()` it reads the replaced policy, and after `set_schema()` on its own backend,
+whose fence closes it, no row. A mechanism that changes the
+evaluated policy without publishing a revision must be part of that policy, or a scope built under one policy would
+serve the other.
+
+**What is untouched.** The published policy, `rebac sync`, `rebac build-zed`, `rebac.skeleton.export`, relationship
+validation and the write gates' watched columns read the published policy, so changing the setting needs no sync and
+no write depends on the narrowing. `rebac explain` renders the narrowed expression, on a second line, only to
+explain it.
+
+**What is lost.** Every grant that reached a record through a link and was not one of the linked record's own: the
+linked record's parents' grants, its hierarchy's, and what its own links lend. Nothing is gained: no row becomes
+readable that was not.
+
+**Failure.** The narrowing walks expressions iteratively, so no expression the compiler accepts is too deep for it.
+Every failure is raised as one `NarrowingError` (a `SchemaError`, `rebac.E025`), and every decision that needs the
+narrowed policy raises it, so reads and gated writes fail closed; a write that decides nothing (a relationship
+write, a write under `sudo()`, a column no permission reads) does not depend on it. Only a refusal the narrowing
+makes about the policy itself (the names above) is deterministic: it is kept per composed policy, raised again
+without narrowing again, and reported by the system check for the same policy (`NarrowingError.kept` is true). Any
+other exception is raised as the error but not kept, so the next operation narrows again. `rebac.W012` warns
+whenever the setting is `False`.
+
+**The report.** `rebac.links.narrowed_arrows()` lists, for the published policy, each arrow the setting narrows:
+the definition and permission it is in, the relation and why it is a link, the target types and permission, what
+each target still lends, and how many relations and permissions the published policy evaluates from the targets.
+`manage.py rebac links [--type T] [--json]` prints it.
 
 #### The clock
 
@@ -3087,12 +3298,21 @@ where it runs: iteration, `len()`, `bool()`, `count()`, `exists()`,
 the queryset holds. Whether a scope is applied is read from the query, never
 from a result cache. The decision is `effective_actor()` (the queryset's own
 pins, the actor a related manager took from its row, an ambient `sudo()` or
-`system_context()` block, the ambient actor, `REBAC_ENABLED`) and the database
-the statement reads, asked of the router once: the statement runs on the
-database its scope was built for. The query carries the decision it was scoped
-for, published with it in one assignment. A queryset already scoped for that
-decision runs as it is, at the cost of one comparison and no statement;
-otherwise its scope is built again for it, at the cost of building a clone's.
+`system_context()` block, the ambient actor, `REBAC_ENABLED`), the database the
+statement reads, asked of the router once (the statement runs on the database
+its scope was built for), and the policy the scope reads: which of the policies
+of the published revision the backend evaluates, the published one or the one
+without inheritance through links (`REBAC_INHERIT_THROUGH_LINKS`, see
+[its section](#policies-without-inheritance-through-links)), and the revision of
+the active backend's in-process schema, if it has one, read at no statement, and
+none for a bypass or a decision with no actor, whose scope reads no policy. The
+two policies of a revision share it, and an in-process schema is fenced by the
+backend instance a scope was built with, so no fence closes a scope built under
+another of them. The query
+carries the decision it was scoped for, published with it in one assignment. A
+queryset already scoped for that decision runs as it is, at the cost of one
+comparison and no statement; otherwise its scope is built again for it, at the
+cost of building a clone's.
 Embedded in another statement, in any position (a `filter()` or `exclude()`
 condition, an annotation or `alias()`, an aggregate's `filter=`, `order_by()`, a
 `Case`/`When`, a `Window`, a `FilteredRelation` condition, an operand of a set
@@ -3109,8 +3329,8 @@ inside its annotations): Django assigns a lookup's sides in place when it resolv
 a where tree, on lookups a clone shares with the query it was cloned from, and the
 copies keep the statement the queryset is embedded in as it was, whoever compiles
 it. The router is asked once for each embedded queryset where the statement
-compiles; the field check before the statement compiles compares only the actor
-and the bypass, to know whether to leave the check to the compile. A statement
+compiles; the field check before the statement compiles compares only the actor,
+the bypass and the policy, to know whether to leave the check to the compile. A statement
 with nothing embedded does no more work: the decisions are compared only where an
 embedded queryset renders. One object embedded two ways, or read and embedded,
 reads the same rows, whatever the enclosing queryset's own decision, and a
@@ -3120,15 +3340,22 @@ with `MissingActorError`, as it refuses reading the queryset. `iterator()` and
 `aiterator()` decide everything up to their first rows (the scope and its audit
 row, the guards, the embedded querysets, the statement, which Django compiles
 when the first rows are read) in the context they were called in, without the
-evaluator scope they were called in if it has closed since, and keep that context
-no longer than their first rows. The work done for each chunk runs in the context
-that consumes it, as in 0.37.0: its prefetches are read there, so a caller's
-`Prefetch(queryset=...)` that pins nothing takes the consumer's actor, while the
-redaction and the related-row guards use the actor taken at the call.
+evaluator scope they were called in if it has closed since, and keep that
+context no longer than their first rows. The policy is no part of that context:
+`iterator()`, which decides its scope at the call, compares the decision again
+where its statement compiles and builds its scope once more under the policy
+then if it changed, so that the statement and the querysets it embeds read one.
+The work done for each chunk runs in the context that consumes it, as in 0.37.0:
+its prefetches are read there, so a caller's `Prefetch(queryset=...)` that pins
+nothing takes the consumer's actor, while the redaction and the related-row
+guards use the actor taken at the call.
 `scoped()` pins the actor, or the bypass of the block it runs in, so an eager
 queryset keeps its scope wherever it is embedded, as a queryset's own
-`with_actor()` or `sudo()` does. What a scope pins when it is built is kept with
-it: its policy, its caveat verdicts (taken from the stored caveat payloads under
+`with_actor()` or `sudo()` does; it keeps the policy its scope was built under too
+(the value of `REBAC_INHERIT_THROUGH_LINKS` and an in-process schema): its decision
+takes the policy from the scope it holds, and a scope it builds again for another
+actor, bypass or database reads the policy evaluated then. What a scope pins when it is built is kept with it: a stored
+policy's revision, its caveat verdicts (taken from the stored caveat payloads under
 that policy revision, with no request context), and inside an evaluator scope the
 constant-arm witnesses decided then. A queryset read again in
 another evaluator scope, or outside one, keeps them, as an eager `scoped()`
@@ -4054,6 +4281,7 @@ python manage.py rebac sync --prune-stale --check  # read-only retirement/drift 
 python manage.py rebac check                      # doctor: validate without writes
 python manage.py rebac build-zed                  # emit effective.zed for SpiceDB
 python manage.py rebac explain blog/post.read     # print compiled expression
+python manage.py rebac links                      # arrows REBAC_INHERIT_THROUGH_LINKS = False narrows; --type T --json
 python manage.py rebac grant storage/role:viewer auth/user:42  # idempotent member grant; --caveat NAME --caveat-context JSON
 python manage.py rebac revoke storage/role:viewer auth/user:42 # print deleted count; --caveat NAME; --strict fails on 0
 python manage.py rebac relationships --resource storage/role:viewer # tuple listing; --subject TYPE:ID[#rel] --relation NAME --limit N
@@ -4061,7 +4289,11 @@ python manage.py rebac unset-ids                  # rows and principals whose id
 ```
 
 `rebac explain` renders the effective permission expression after active
-`SchemaOverride` rows have been composed with the baseline.
+`SchemaOverride` rows have been composed with the baseline. With
+`REBAC_INHERIT_THROUGH_LINKS = False` it prints, on a second line, the expression
+the narrowed policy evaluates, where that differs; a generated name is not a
+permission it explains. `rebac links` lists every
+arrow that setting narrows ([Policies without inheritance through links](#policies-without-inheritance-through-links)).
 
 No command builds, rebuilds or verifies anything derived: `sync` writes the
 stored schema rows and publishes a policy revision, and permissions are

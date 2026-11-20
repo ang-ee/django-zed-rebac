@@ -226,6 +226,11 @@ def _key_of(backend: LocalBackend, snapshot: SchemaSnapshot) -> tuple[Any, ...]:
         backend._schema_is_manual,
         id(baseline),
         tuple(getattr(row, "pk", None) for row in snapshot.overrides),
+        # The policy without inheritance through links is another policy (proposal 0023).
+        # It shares the revision and the deadlines a statement's fence witnesses, so a
+        # queryset's scope decision compares this component too
+        # (``rebac.managers._evaluated_policy``).
+        snapshot.inherits,
     )
 
 
@@ -257,16 +262,13 @@ def _policy(backend: LocalBackend) -> _Policy:
     active = [row for row in overrides if row.expires_at is None or row.expires_at > selected_at]
     # Permission sites retain their SQL deadlines. CEL expressions cannot be
     # selected in SQL, so choose them once and witness that selection interval.
-    tagged = compose_tagged(
-        baseline,
-        [
-            row
-            for row in overrides
-            if row.kind != SchemaOverride.KIND_RECAVEAT
-            or row.expires_at is None
-            or row.expires_at > selected_at
-        ],
-    )
+    selected = [
+        row
+        for row in overrides
+        if row.kind != SchemaOverride.KIND_RECAVEAT
+        or row.expires_at is None
+        or row.expires_at > selected_at
+    ]
     # Every override deadline still ahead closes a prepared scope: a scope pinned
     # before it selects nothing after it, until it is built again with the new
     # policy. A passed deadline is settled in the composition, except that a
@@ -285,11 +287,28 @@ def _policy(backend: LocalBackend) -> _Policy:
         and row.expires_at <= selected_at
     }
     deadlines = tuple(sorted(ahead | chosen))
+    if snapshot.inherits:
+        tagged = compose_tagged(baseline, selected)
+        effective = compose_tagged(baseline, active).schema
+    else:
+        # Narrowed after composition, so an override of a permission reaches
+        # what it lends; the override tags follow the nodes they were on. The
+        # effective composition is the snapshot's own, narrowed once by the
+        # backend: what check_new reads too. The tagged one, which keeps the
+        # rows whose deadlines the statements witness, is narrowed once more
+        # where there are override rows, and kept for a policy prepared afresh
+        # while a deadline is ahead.
+        effective = snapshot.schema
+        tagged = (
+            backend._narrowed_composition(baseline, selected)
+            if selected
+            else TaggedComposition(effective, {}, {})
+        )
     policy = _Policy(
         key,
         snapshot,
         tagged,
-        compose_tagged(baseline, active).schema,
+        effective,
         CompileProgram.build(tagged.schema, tagged=tagged),
         selected_at,
         deadlines,

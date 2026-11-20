@@ -7,13 +7,14 @@ from __future__ import annotations
 
 import threading
 import time
+from collections import OrderedDict
 from collections.abc import Iterable
 from concurrent.futures import Future
 from dataclasses import dataclass
 from datetime import datetime
 from functools import partial
 from threading import Lock
-from typing import Any
+from typing import TYPE_CHECKING, Any
 from weakref import WeakSet
 
 from django.core.signals import setting_changed
@@ -24,6 +25,7 @@ from ..errors import SchemaError
 from ..field_backing import (
     resolve_field_backing,
 )
+from ..links import NarrowingError, _published_for
 from ..schema.ast import (
     AllowedSubject,
     AttributeBinding,
@@ -52,6 +54,9 @@ from ..types import (
     SubjectRef,
     Zookie,
 )
+
+if TYPE_CHECKING:
+    from ..composition import TaggedComposition
 
 _backend_registry_lock = Lock()
 _db_loaded_backends: WeakSet[LocalBackend] = WeakSet()
@@ -96,13 +101,23 @@ def _enforced_schema_errors(schema: Schema) -> list[str]:
     """Return contracts the local runtime must reject before evaluation.
 
     The backed relations' shape and the subject relations, chosen by the rule
-    that found them. Other ``validate_schema`` findings (an unknown reference,
-    a name read two ways) do not stop a policy from loading, whatever names it
-    uses.
+    that found them, the same for a loaded policy as for an installed one.
+    Other ``validate_schema`` findings (an unknown reference, a name read two
+    ways) do not stop a policy from loading, whatever names it uses; nor does a
+    name the schema language cannot spell: a stored policy that holds one keeps
+    loading (``rebac.W013`` reports it), and only new input is refused
+    (``_spelling_errors``, at ``set_schema`` and at stored-policy writes).
     """
     from ..schema.parser import backing_errors, subject_relation_errors
 
     return backing_errors(schema) + subject_relation_errors(schema)
+
+
+def _spelling_errors(schema: Schema) -> list[str]:
+    """The names of ``schema`` the schema language cannot spell, refused in new input."""
+    from ..schema.parser import name_errors
+
+    return name_errors(schema)
 
 
 def _name_conflicts(schema: Schema) -> list[str]:
@@ -219,7 +234,16 @@ class LocalBackend:
         self._schema_loads: dict[tuple[str, str], Future[SchemaSnapshot | None]] = {}
         self._schema_generation = 0
         self._schema_invalidation_generation = 0
-        self._schema_facts_memo: dict[int, _SchemaFacts] = {}
+        # Keyed by (generation, inherits): the facts of a policy narrowed by
+        # REBAC_INHERIT_THROUGH_LINKS are not those of the published one.
+        self._schema_facts_memo: dict[tuple[int, bool], _SchemaFacts] = {}
+        # Proposal 0023: the narrowed schema of each published snapshot schema,
+        # by identity, and the narrowing of each composed policy, by its
+        # baseline's identity and its override rows; a refusal is kept too.
+        self._narrowed: OrderedDict[int, tuple[Schema, Schema]] = OrderedDict()
+        self._compositions: OrderedDict[
+            tuple[Any, ...], tuple[Schema, TaggedComposition | NarrowingError]
+        ] = OrderedDict()
         # Counter used as a stable monotonic xid on backends (e.g. SQLite test
         # mode) without `txid_current()`.
         self._xid_counter = 0
@@ -233,10 +257,12 @@ class LocalBackend:
         """Install an in-memory schema in place of the stored policy
         (``rebac.testing.install_schema``).
 
-        Each of its names must be read one way (``rebac.schema.ast.name_conflicts``),
-        whoever built it.
+        Its names must be ones the schema language can spell, each read one way
+        (``rebac.schema.ast.name_conflicts``), whoever built it.
         """
-        schema_errors = _name_conflicts(schema) + _enforced_schema_errors(schema)
+        schema_errors = (
+            _spelling_errors(schema) + _name_conflicts(schema) + _enforced_schema_errors(schema)
+        )
         if schema_errors:
             raise SchemaError("; ".join(schema_errors))
         from ..schema.serialization import digest
@@ -248,9 +274,65 @@ class LocalBackend:
             self._schema_is_manual = True
             self._schema_snapshots.clear()
             self._schema_facts_memo.clear()
+            self._narrowed.clear()
+            self._compositions.clear()
             self._schema_generation += 1
 
     def schema(self) -> Schema:
+        """The published effective policy: what ``rebac build-zed`` exports.
+
+        Whatever ``REBAC_INHERIT_THROUGH_LINKS`` says, so that no caller lists a
+        permission the narrowed policy generates (proposal 0023). Listing,
+        rendering and validating against declared names read this one. The
+        policy decisions are made with is ``evaluated_schema()``.
+        """
+        return self._load_schema_snapshot().schema
+
+    def _published_schema(self) -> Schema:
+        """The published effective policy, whatever ``REBAC_INHERIT_THROUGH_LINKS`` says."""
+        return self._load_schema_snapshot().schema
+
+    def evaluated_schema(self) -> Schema:
+        """The policy decisions are made with, for code that proves things about it.
+
+        With ``REBAC_INHERIT_THROUGH_LINKS = True`` it is the published policy,
+        the object ``schema()`` returns. With ``False`` it is the published policy
+        narrowed (``rebac.links``, proposal 0023): the object decisions read (the
+        compiled policy's ``effective`` composition, which ``check_new`` walks and
+        the residual evaluator reads, and which statements are compiled from unless
+        override rows are selected, all but an expired recaveat; then they are
+        compiled from the narrowing of the composition that keeps those rows'
+        deadlines), kept per schema snapshot, so calls under one snapshot return
+        one object, narrowed once, and a policy change or a change of the setting
+        returns another. The field gates
+        find the fields they gate in ``schema()``, the published policy, and decide
+        them under the evaluated one, as every decision is: a gate's
+        ``read__<field>`` or ``write__<field>`` is a declared name, and both policies
+        declare the same names, so both find the same gates.
+
+        Experimental (proposal 0023), outside the stable public API, and a
+        ``LocalBackend`` convenience with no SpiceDB counterpart: the evaluated
+        policy is not a ``.zed`` schema.
+
+        - It is the object decisions read: never mutate it.
+        - It holds generated permissions (``lent(P)``, ``excluded(P)``;
+          ``rebac.links.is_generated(name)``): internal versions of declared
+          permissions, not actions. Never show one to a user or pass one to an
+          entry, which answers it as the published policy answers an unknown
+          action. List, render and validate against declared names with
+          ``schema()``.
+        - A proof made from its text holds only while the policy carries no
+          override: an override's arm holds until its deadline and a recaveat
+          replaces a caveat's expression, neither of which the text shows. The
+          library's prover proves nothing while any override row is stored, and
+          ``rebac.models.SchemaOverride.objects.using(<the schema's database>)
+          .exists()`` tells a consumer the same. Nor does a proof hold on a type
+          that lets a name be read two ways (``rebac.schema.ast.name_conflicts``,
+          ``rebac.W014``).
+        - With the setting ``False`` and a narrowed policy that cannot be built it
+          raises ``NarrowingError`` (``rebac.E025``), and with a setting that is
+          not a bool ``ImproperlyConfigured`` (``rebac.E028``), as a decision does.
+        """
         return self._schema_snapshot().schema
 
     def _manual_schema_revision(self) -> str:
@@ -259,9 +341,101 @@ class LocalBackend:
             return self._manual_revision
 
     def _schema_snapshot(self, known_revision: str | None = None) -> SchemaSnapshot:
+        """The policy every decision is made with: the one place the setting applies.
+
+        ``REBAC_INHERIT_THROUGH_LINKS`` is read at each call (proposal 0023).
+        With ``False`` the snapshot's schema is the published one narrowed
+        (``rebac.links``), and its ``baseline`` is the published policy the
+        compiled policy is composed from. Snapshots are cached and pinned as
+        published, so a change of the setting is seen by the next call.
+        """
         if known_revision is None:
-            return self._load_schema_snapshot()
-        return self._load_schema_snapshot(known_revision)
+            snapshot = self._load_schema_snapshot()
+        else:
+            snapshot = self._load_schema_snapshot(known_revision)
+        from ..links import inherits_through_links
+
+        if inherits_through_links():
+            return snapshot
+        return snapshot._replace(
+            schema=self._narrowed_schema(snapshot),
+            baseline=snapshot.baseline if snapshot.baseline is not None else snapshot.schema,
+            inherits=False,
+        )
+
+    def _narrowed_schema(self, snapshot: SchemaSnapshot) -> Schema:
+        """The snapshot's schema without inheritance through links, kept by its identity.
+
+        The narrowing of the snapshot's own composition, as published: no
+        override row is selected again. The compiled policy reads this same
+        object as its ``effective`` composition, so ``check_new`` and the
+        residual evaluator read one narrowing.
+        """
+        schema = snapshot.schema
+        with self._schema_lock:
+            kept = self._narrowed.get(id(schema))
+            if kept is not None and kept[0] is schema:
+                self._narrowed.move_to_end(id(schema))
+                return kept[1]
+        result = self._narrowed_composition(schema, ()).schema
+        with self._schema_lock:
+            self._narrowed[id(schema)] = (schema, result)
+            while len(self._narrowed) > 16:
+                self._narrowed.popitem(last=False)
+        return result
+
+    def _narrowed_composition(self, baseline: Schema, rows: Iterable[Any]) -> TaggedComposition:
+        """``baseline`` composed with the override ``rows``, narrowed: once per composition.
+
+        Kept by the baseline's identity and the rows' content, so that a policy
+        prepared afresh at each use while an override deadline is ahead narrows
+        once. A refusal the narrowing makes about the policy is kept and raised
+        again; an unexpected failure is raised and not kept, so the next
+        operation narrows again.
+        """
+        from ..composition import compose_tagged
+        from ..links import NarrowingError, narrowed_tagged
+
+        rows = list(rows)
+        key = (
+            id(baseline),
+            tuple(
+                (
+                    getattr(row, "pk", None),
+                    row.kind,
+                    row.expression,
+                    row.expires_at,
+                    getattr(row, "created_at", None),
+                    getattr(row, "target_ct_id", None),
+                    getattr(row, "target_pk", None),
+                )
+                for row in rows
+            ),
+        )
+        with self._schema_lock:
+            kept = self._compositions.get(key)
+            if kept is not None and kept[0] is baseline:
+                self._compositions.move_to_end(key)
+                found = kept[1]
+                if isinstance(found, NarrowingError):
+                    raise found
+                return found
+        composed = compose_tagged(baseline, rows)
+        result: TaggedComposition | NarrowingError
+        try:
+            # Classifying relations resolves model fields: outside the lock.
+            result = narrowed_tagged(composed)
+        except NarrowingError as exc:
+            result = exc
+        if isinstance(result, NarrowingError) and not result.kept:
+            raise result
+        with self._schema_lock:
+            self._compositions[key] = (baseline, result)
+            while len(self._compositions) > 32:
+                self._compositions.popitem(last=False)
+        if isinstance(result, NarrowingError):
+            raise result
+        return result
 
     def _load_schema_snapshot(self, known_revision: str | None = None) -> SchemaSnapshot:
         """The schema at the published revision, pinned to the scope that asks.
@@ -424,7 +598,8 @@ class LocalBackend:
         for key in list(self._schema_snapshots):
             if key[0] == alias:
                 snapshot = self._schema_snapshots.pop(key)
-                self._schema_facts_memo.pop(snapshot.generation, None)
+                for inherits in (True, False):
+                    self._schema_facts_memo.pop((snapshot.generation, inherits), None)
 
     def _read_schema_revision(self, connection: BaseDatabaseWrapper) -> str | None:
         """The published policy revision on the connection's alias."""
@@ -471,14 +646,16 @@ class LocalBackend:
             for relation in definition.relations
         ):
             return None
-        return snapshot.generation, _relationship_generation
+        # A decision of the narrowed policy (proposal 0023) is not one of the published policy.
+        return snapshot.generation, _relationship_generation, snapshot.inherits
 
     def _schema_facts(self, snapshot: SchemaSnapshot) -> _SchemaFacts:
-        """Whole-schema facts derived once per schema generation."""
+        """Whole-schema facts derived once per schema generation and policy."""
         from ..schema.introspection import live_backed_resource_types
 
+        key = (snapshot.generation, snapshot.inherits)
         with self._schema_lock:
-            cached = self._schema_facts_memo.get(snapshot.generation)
+            cached = self._schema_facts_memo.get(key)
             if cached is not None and cached.live_types is not None:
                 return cached
             facts = cached if cached is not None else _SchemaFacts(snapshot.generation)
@@ -487,7 +664,7 @@ class LocalBackend:
                 s.generation == snapshot.generation for s in self._schema_snapshots.values()
             )
             if snapshot.generation != -1 and current:
-                self._schema_facts_memo[snapshot.generation] = facts
+                self._schema_facts_memo[key] = facts
             return facts
 
     def mark_schema_stale(self) -> None:
@@ -496,6 +673,8 @@ class LocalBackend:
         # database write locks can safely evict shared snapshots here.
         with self._schema_lock, self._schema_invalidation_lock:
             self._schema_facts_memo.clear()
+            self._narrowed.clear()
+            self._compositions.clear()
             if not self._schema_is_manual:
                 self._schema_invalidation_generation += 1
                 self._schema_snapshots.clear()
@@ -612,6 +791,10 @@ class LocalBackend:
         return _LoadedSchema(effective, expires_at, baseline, tuple(all_overrides))
 
     # ---------- Public API ----------
+    #
+    # Every entry that takes an action resolves it against the published policy
+    # (``rebac.links._published_for``): a permission the policy without
+    # inheritance through links generates is not an action (proposal 0023).
 
     @_schema_operation
     def check_access(
@@ -624,6 +807,31 @@ class LocalBackend:
         consistency: Consistency | None = None,
         at_zookie: Zookie | None = None,
     ) -> CheckResult:
+        with _published_for(action):
+            return self._check_access(
+                subject=subject,
+                action=action,
+                resource=resource,
+                context=context,
+                consistency=consistency,
+                at_zookie=at_zookie,
+            )
+
+    def _check_access(
+        self,
+        *,
+        subject: SubjectRef,
+        action: str,
+        resource: ObjectRef,
+        context: dict[str, Any] | None = None,
+        consistency: Consistency | None = None,
+        at_zookie: Zookie | None = None,
+    ) -> CheckResult:
+        """``check_access`` for any permission of the evaluated policy, a generated one included.
+
+        For the proposed-object walk (``rebac.preflight``), whose arrow hops
+        name what the evaluated policy names.
+        """
         if not _enforcing():
             return CheckResult.has(reason=_UNENFORCED)
         self._validate_consistency(consistency, at_zookie)
@@ -651,11 +859,27 @@ class LocalBackend:
             return [CheckResult.has(reason=_UNENFORCED) for _item in items]
         self._validate_consistency(consistency, at_zookie)
         from ..compile.read import check_many
+        from ..links import is_generated
         from ..models import active_relationship_model
 
-        return check_many(
-            backend=self, items=list(items), using=active_relationship_model().objects.db
-        )
+        listed = list(items)
+        using = active_relationship_model().objects.db
+        asked = [index for index, item in enumerate(listed) if is_generated(item.action)]
+        if not asked:
+            return check_many(backend=self, items=listed, using=using)
+        # A generated name is the published policy's to answer, as an unknown action.
+        answers: list[CheckResult | None] = [None] * len(listed)
+        rest = [index for index in range(len(listed)) if index not in set(asked)]
+        for indexes in (rest, asked):
+            if not indexes:
+                continue
+            with _published_for([listed[index].action for index in indexes]):
+                found = check_many(
+                    backend=self, items=[listed[index] for index in indexes], using=using
+                )
+            for index, answer in zip(indexes, found, strict=True):
+                answers[index] = answer
+        return [answer for answer in answers if answer is not None]
 
     @_schema_operation
     def queryset_filter(
@@ -671,7 +895,8 @@ class LocalBackend:
             return models.Q()
         from ..compile.read import scope_q
 
-        return scope_q(backend=self, model=model, action=action, actor=subject, using=using)
+        with _published_for(action):
+            return scope_q(backend=self, model=model, action=action, actor=subject, using=using)
 
     @_schema_operation
     def permission_expression(
@@ -687,14 +912,15 @@ class LocalBackend:
             return models.Value(True, output_field=models.BooleanField())
         from ..compile.read import scope_expression
 
-        return scope_expression(
-            backend=self,
-            model=model,
-            action=action,
-            actor=subject,
-            using=using,
-            identity=identity,
-        )
+        with _published_for(action):
+            return scope_expression(
+                backend=self,
+                model=model,
+                action=action,
+                actor=subject,
+                using=using,
+                identity=identity,
+            )
 
     @_schema_operation
     def accessible(
@@ -713,17 +939,18 @@ class LocalBackend:
         if not _enforcing():
             return _every_id(resource_type, active_relationship_model().objects.db)
         self._validate_consistency(consistency, at_zookie)
-        return list(
-            accessible_ids(
-                backend=self,
-                resource_type=resource_type,
-                action=action,
-                actor=subject,
-                using=active_relationship_model().objects.db,
-                context=context,
-                fresh=consistency is not None or at_zookie is not None,
+        with _published_for(action):
+            return list(
+                accessible_ids(
+                    backend=self,
+                    resource_type=resource_type,
+                    action=action,
+                    actor=subject,
+                    using=active_relationship_model().objects.db,
+                    context=context,
+                    fresh=consistency is not None or at_zookie is not None,
+                )
             )
-        )
 
     @_schema_operation
     def held(
@@ -745,11 +972,24 @@ class LocalBackend:
         if not _enforcing():
             return {value for value in ids if value}
         alias = using or active_relationship_model().objects.db
-        settled: set[str] = set()
-        if walk.enabled():
-            # What small lookups on the named rows answer; the compiled statement decides the rest.
-            ids = tuple(dict.fromkeys(ids))
-            settled, answered = walk.decided(
+        with _published_for(action):
+            settled: set[str] = set()
+            if walk.enabled():
+                # What small lookups on the named rows answer; the compiled statement decides the rest.
+                ids = tuple(dict.fromkeys(ids))
+                settled, answered = walk.decided(
+                    backend=self,
+                    resource_type=resource_type,
+                    action=action,
+                    actor=subject,
+                    ids=ids,
+                    using=alias,
+                    context=context,
+                )
+                ids = tuple(value for value in ids if value not in answered)
+                if not ids:
+                    return settled
+            return settled | held(
                 backend=self,
                 resource_type=resource_type,
                 action=action,
@@ -758,18 +998,6 @@ class LocalBackend:
                 using=alias,
                 context=context,
             )
-            ids = tuple(value for value in ids if value not in answered)
-            if not ids:
-                return settled
-        return settled | held(
-            backend=self,
-            resource_type=resource_type,
-            action=action,
-            actor=subject,
-            ids=ids,
-            using=alias,
-            context=context,
-        )
 
     @_schema_operation
     def held_many(
@@ -785,23 +1013,64 @@ class LocalBackend:
         """The held candidate ids per action, equal permissions decided once."""
         from .. import walk
         from ..compile.read import held_many
-        from ..models import active_relationship_model
+        from ..links import is_generated
 
-        ids = _candidates(ids)
-        if not _enforcing():
-            if isinstance(actions, str):
-                raise TypeError("actions must be an iterable of names, not a bare string")
-            candidates = {value for value in ids if value}
-            return {name: set(candidates) for name in dict.fromkeys(actions)}
-        alias = using or active_relationship_model().objects.db
         if isinstance(actions, str):
             raise TypeError("actions must be an iterable of names, not a bare string")
         names = tuple(dict.fromkeys(actions))
-        answers: dict[str, set[str]] = {}
-        if walk.enabled() and names:
-            # As ``held``: the walk's answers first, the compiled statement for what is open.
-            ids = tuple(dict.fromkeys(ids))
-            walked = walk.decided_many(
+        ids = _candidates(ids)
+        if not _enforcing():
+            candidates = {value for value in ids if value}
+            return {name: set(candidates) for name in names}
+        asked = tuple(name for name in names if is_generated(name))
+        if asked and len(asked) < len(names):
+            # A generated name is the published policy's to answer, as an unknown action.
+            ids = tuple(ids)
+            answers = self.held_many(
+                subject=subject,
+                actions=[name for name in names if name not in asked],
+                resource_type=resource_type,
+                ids=ids,
+                context=context,
+                using=using,
+            )
+            answers.update(
+                self.held_many(
+                    subject=subject,
+                    actions=asked,
+                    resource_type=resource_type,
+                    ids=ids,
+                    context=context,
+                    using=using,
+                )
+            )
+            return {name: answers[name] for name in names}
+        from ..models import active_relationship_model
+
+        alias = using or active_relationship_model().objects.db
+        with _published_for(names):
+            answers = {}
+            if walk.enabled() and names:
+                # As ``held``: the walk's answers first, the compiled statement for what is open.
+                ids = tuple(dict.fromkeys(ids))
+                walked = walk.decided_many(
+                    backend=self,
+                    resource_type=resource_type,
+                    actions=names,
+                    actor=subject,
+                    ids=ids,
+                    using=alias,
+                    context=context,
+                )
+                answers = {name: set(walked[name][0]) for name in names}
+                open_ids = {
+                    value for name in names for value in ids if value not in walked[name][1]
+                }
+                names = tuple(name for name in names if not open_ids <= walked[name][1])
+                ids = tuple(value for value in ids if value in open_ids)
+                if not names:
+                    return answers
+            found = held_many(
                 backend=self,
                 resource_type=resource_type,
                 actions=names,
@@ -810,24 +1079,9 @@ class LocalBackend:
                 using=alias,
                 context=context,
             )
-            answers = {name: set(walked[name][0]) for name in names}
-            open_ids = {value for name in names for value in ids if value not in walked[name][1]}
-            names = tuple(name for name in names if not open_ids <= walked[name][1])
-            ids = tuple(value for value in ids if value in open_ids)
-            if not names:
-                return answers
-        found = held_many(
-            backend=self,
-            resource_type=resource_type,
-            actions=names,
-            actor=subject,
-            ids=ids,
-            using=alias,
-            context=context,
-        )
-        for name, held_ids in found.items():
-            answers[name] = answers.get(name, set()) | held_ids
-        return answers
+            for name, held_ids in found.items():
+                answers[name] = answers.get(name, set()) | held_ids
+            return answers
 
     @_schema_operation
     def grants_all(
@@ -844,14 +1098,15 @@ class LocalBackend:
         from ..compile.read import grants_all
         from ..models import active_relationship_model
 
-        return grants_all(
-            backend=self,
-            resource_type=resource_type,
-            action=action,
-            actor=subject,
-            using=active_relationship_model().objects.db,
-            context=context,
-        )
+        with _published_for(action):
+            return grants_all(
+                backend=self,
+                resource_type=resource_type,
+                action=action,
+                actor=subject,
+                using=active_relationship_model().objects.db,
+                context=context,
+            )
 
     @_schema_operation
     def lookup_subjects(
@@ -868,14 +1123,15 @@ class LocalBackend:
         from ..models import active_relationship_model
 
         self._validate_consistency(consistency, at_zookie)
-        return lookup_subjects(
-            backend=self,
-            resource=resource,
-            action=action,
-            subject_type=subject_type,
-            using=active_relationship_model().objects.db,
-            context=context,
-        )
+        with _published_for(action):
+            return lookup_subjects(
+                backend=self,
+                resource=resource,
+                action=action,
+                subject_type=subject_type,
+                using=active_relationship_model().objects.db,
+                context=context,
+            )
 
     @_schema_operation
     def write_relationships(self, writes: Iterable[RelationshipTuple]) -> Zookie:
@@ -1020,9 +1276,12 @@ class LocalBackend:
         return Zookie(self.kind, str(self._next_xid()))
 
     def _write_schema(self, using: str) -> Schema:
-        """The effective policy a relationship write is validated against."""
+        """The effective policy a relationship write is validated against: the published one.
+
+        ``REBAC_INHERIT_THROUGH_LINKS`` narrows permissions only; relations are the same.
+        """
         del using
-        return self._schema_snapshot().schema
+        return self._published_schema()
 
     def _validate_relationship_tuple(self, tup: RelationshipTuple, *, schema: Schema) -> None:
         from django.conf import settings

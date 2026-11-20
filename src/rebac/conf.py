@@ -35,6 +35,11 @@ _DEFAULTS: dict[str, Any] = {
     "REBAC_DEPTH_LIMIT": 8,
     # Compile an evaluator scope's statements for the stored grants its actor can hold (proposal 0019).
     "REBAC_ACTOR_PROFILES": True,
+    # False: evaluate every permission without inheritance through links (proposal 0023).
+    # An arrow through a relation that is not the row's own foreign key, a constant, a
+    # hierarchy of one type or a membership lends only what the linked record grants
+    # directly. Grants less than the published policy, never more; needs no sync.
+    "REBAC_INHERIT_THROUGH_LINKS": True,
     # Read a prefetch's children without their permission statement where the policy proves
     # that the parents just admitted imply them (proposal 0020). Off: every prefetch is scoped.
     "REBAC_STRUCTURAL_PREFETCH": False,
@@ -270,6 +275,10 @@ _TYPES: dict[str, _Type] = {
     "REBAC_SCHEMA_DIR": _PATH,
     "REBAC_DEPTH_LIMIT": _INT,
     "REBAC_ACTOR_PROFILES": _bool(closed=False),
+    # Each value chooses a policy (proposal 0023). Read as True, another value would
+    # evaluate the published policy, which grants more, where the deployment asked for
+    # the narrower one; read as False, it would take access away unannounced. It raises.
+    "REBAC_INHERIT_THROUGH_LINKS": _Type("True or False", _is_bool),
     "REBAC_STRUCTURAL_PREFETCH": _bool(closed=False),
     "REBAC_BOUNDED_WALK": _switch("prove", "decide"),
     "REBAC_ROW_SCOPE": _switch("named", also=("always",)),

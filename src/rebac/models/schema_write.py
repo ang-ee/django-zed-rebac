@@ -25,6 +25,9 @@ class _StoredPolicy(NamedTuple):
     errors: list[str] | None
     #: The places where it lets a name be read two ways (``name_conflicts``), each once.
     conflicts: Counter[str]
+    #: The names it holds that the schema language cannot spell, each place once;
+    #: ``None`` when it cannot be read or composed, so that they are not known.
+    unspelled: Counter[str] | None
 
 
 def _stored_policy_errors(using: str) -> _StoredPolicy:
@@ -37,9 +40,12 @@ def _stored_policy_errors(using: str) -> _StoredPolicy:
     the models.  A name read two ways does not refuse it either: a write may not
     add one (``schema_index_write``), and ``rebac.W014`` reports those it holds.
     The places are counted on the stored names, which no override changes, so
-    they are known while the policy cannot be read or composed.
+    they are known while the policy cannot be read or composed.  Nor do names
+    the schema language cannot spell: a write may not add one, and ``rebac.W013``
+    reports those it holds.  They are read from the composed policy, override
+    expressions included, so they are known only when it composes.
     """
-    from ..backends.local import LocalBackend, _name_conflicts
+    from ..backends.local import LocalBackend, _name_conflicts, _spelling_errors
     from ..compile.program import CompileProgram
     from ..composition import compose_tagged, split_stale_overrides
     from ..schema.parser import ParseError
@@ -47,17 +53,22 @@ def _stored_policy_errors(using: str) -> _StoredPolicy:
     try:
         loaded = LocalBackend()._load_schema_from_db(using)
     except SchemaError, ParseError:
-        return _StoredPolicy(None, Counter(_stored_name_conflicts(using)))
+        return _StoredPolicy(None, Counter(_stored_name_conflicts(using)), None)
     baseline = getattr(loaded, "baseline", loaded[0])
     conflicts = Counter(_name_conflicts(baseline))
     try:
         # Every stored override, expired ones included: one that does not parse or does
         # not compose leaves a policy being repaired, as a refused one does.
         overrides, _stale = split_stale_overrides(baseline, list(getattr(loaded, "overrides", ())))
-        CompileProgram.build(compose_tagged(baseline, overrides).schema)
+        composed = compose_tagged(baseline, overrides).schema
     except (SchemaError, ParseError) as exc:
-        return _StoredPolicy([str(exc)], conflicts)
-    return _StoredPolicy([], conflicts)
+        return _StoredPolicy([str(exc)], conflicts, None)
+    unspelled = Counter(_spelling_errors(composed))
+    try:
+        CompileProgram.build(composed)
+    except SchemaError as exc:
+        return _StoredPolicy([str(exc)], conflicts, unspelled)
+    return _StoredPolicy([], conflicts, unspelled)
 
 
 def _stored_name_conflicts(using: str) -> list[str]:
@@ -106,12 +117,15 @@ def schema_index_write(using: str) -> Iterator[None]:
     validated again, and neither is one that could not be read or composed.
 
     A write may not add a place where a name is read two ways, a repair
-    included
-    (``rebac.schema.ast.name_conflicts``: a built-in's name as a relation, a
-    definition or a subject type; a name declared twice).  What it adds is what
-    the composed policy holds when the owner exits and did not hold when it
-    started, each place counted once per occurrence.  A place already stored
-    therefore blocks no write, and renaming it is a repair.
+    included (``rebac.schema.ast.name_conflicts``: a built-in's name as a
+    relation, a definition or a subject type; a name declared twice), nor a
+    name the schema language cannot spell, except in a repair of a policy that
+    could not be read or composed, where the names it held are not known.
+    What it adds is what the composed policy holds when the owner exits and did
+    not hold when it started: each such name is found at a place (its type, its
+    position and, in an expression, the permission it is in), and a place
+    counts once per occurrence.  A place already stored therefore blocks no
+    write, and renaming it is a repair.
     """
     if using in _owners.get():
         with schema_write_atomic(using):
@@ -138,8 +152,20 @@ def schema_index_write(using: str) -> Iterator[None]:
             # started) is not validated again, but it may remove a name read two ways,
             # never add one.
             conflicting = ended.conflicts - started.conflicts
+            # Names the language cannot spell are compared where both ends are known: a
+            # repair of a policy that could not be read or composed is not held to it.
+            added = (
+                ended.unspelled - started.unspelled
+                if ended.unspelled is not None and started.unspelled is not None
+                else Counter()
+            )
             refused = [
                 *((ended.errors or ()) if sound else ()),
+                *(
+                    f"{place}: a write may not add a name the schema language cannot spell "
+                    "(rebac.W013)"
+                    for place in sorted(added.elements())
+                ),
                 *(
                     f"{place}: a write may not add a name read two ways (rebac.W014)"
                     for place in sorted(conflicting.elements())

@@ -23,6 +23,9 @@ class SchemaSnapshot(NamedTuple):
     using: str | None = None
     baseline: Schema | None = None
     overrides: tuple[Any, ...] = ()
+    # False: ``schema`` is the policy evaluated without inheritance through
+    # links (proposal 0023), and ``baseline`` the published one it came from.
+    inherits: bool = True
 
 
 class SchemaScope:

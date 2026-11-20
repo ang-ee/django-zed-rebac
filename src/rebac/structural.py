@@ -33,6 +33,10 @@ Three things must hold, and each is checked where the child statement is built:
   (``parent_implies_children``);
 - the policy carries no override of any kind, which the proof does not read.
 
+A name the policy without inheritance through links generates (``lent(P)``,
+proposal 0023) is not an action: an edge under one, as the parent's action or the
+child's, is refused.
+
 Only the evaluation that reads the child rows inside the running prefetch is
 delivered (``RebacQuerySet._fetch_all``), and the delivery serves that evaluation
 alone: the queryset keeps no delivered query, so a count, an aggregate,
@@ -497,6 +501,13 @@ def _refusal(
     # a caveat's expression until its own (proposal 0022).
     if _carries_override(policy):
         return "the policy carries an override"
+    from .links import is_generated
+
+    # A name the policy without inheritance through links generates is not an action
+    # (proposal 0023): rows are never admitted under one, nor read under one.
+    for name in (parent_action, child_action):
+        if is_generated(name):
+            return f"{name} is a generated name, not an action"
     child_type = model_resource_type(child_model)
     parent_type = model_resource_type(parent_model)
     if not child_type or not parent_type:

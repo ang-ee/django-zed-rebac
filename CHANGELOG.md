@@ -293,6 +293,8 @@ pre-1.0; breaking changes within a minor version are explicitly called out.
 
 - Database check `rebac.W014`: the stored policy lets a name be read two ways (Changed).
 
+- Database check `rebac.W013`: the stored policy holds a name the schema language cannot spell (Changed).
+
 - **Display rows through a prefetch** (proposal 0024, experimental, under `REBAC_DISPLAY_FIELDS`, off by default).
   `RebacQuerySet.for_display()` (and the manager's) asks for display rows on the queryset of the prefetch of a
   forward foreign key or one-to-one: `Prefetch("author", queryset=Account.objects.with_actor(actor).for_display())`.
@@ -350,8 +352,55 @@ pre-1.0; breaking changes within a minor version are explicitly called out.
 
 - The policy benchmark has `labels`, `page_labels` and `inbox_labels` scenarios, display fields for three label
   types, and the `labels` and `all_labels` mechanisms. `make bench-smoke` runs every scenario twice, without
-  display rows (`today`, `all`) and with them (`labels`, `all_labels`), each run compared with its own first
-  mechanism.
+  display rows (`today`, `all`, `nolinks`) and with them (`labels`, `all_labels`), and compares a mechanism's
+  result with the first mechanism of its run that reads alike: the same policy, display rows on or off.
+
+- **`REBAC_INHERIT_THROUGH_LINKS`** (`True` by default), a draft
+  ([proposal 0023](docs/proposals/0023-no-inheritance-through-links.md)) built to be measured.
+  `False` evaluates every permission under a narrower policy derived from the published one: an arrow through a link
+  (a relation that is not the row's own foreign key, a constant, a walk within one type or a membership: a path of
+  several hops, a filter over another table, a reverse, many-to-many or generic relation to another type, an attribute
+  backing, a stored relation to records of another type) lends only what the linked record grants directly, in
+  granting positions only. It grants a subset of what the published policy grants, never more. **Access is lost**:
+  whatever a record reached only through a link's parents, hierarchy or own links. Every surface that decides
+  evaluates it; a name it generates (`lent(P)`, `excluded(P)`) cannot be declared and is not an action anywhere: every
+  entry answers it as an unknown action, `rebac.structural.edges()` lists no edge under one,
+  `rebac.structural.explain()` says it is one, and `rebac.display.admits_reading()` admits no row under one. A name
+  inside an expression is read as the compiler reads it: `authenticated` and `anonymous` there are the actor's state,
+  never a version of a permission declared under that name. A policy that reads a name two ways (a relation named as a
+  built-in, a name declared as a relation and as a permission, `rebac.W014`) is refused by the narrowing
+  (`rebac.E025`): it asked whether a name is a permission where the compiler reads a relation first, and granted what
+  the published policy denies. Only `True` and `False` choose a policy: any other value (the string `"False"` an
+  environment variable gives, `0`, `None`) has no safe reading, so every decision raises `ImproperlyConfigured` and
+  `rebac.E028` reports it; a write that decides nothing proceeds. The published policy, `rebac sync`, `build-zed`,
+  `rebac.skeleton.export`, relationship validation and the write gates' watched columns are untouched, so changing the
+  setting needs no sync. A change in a running process is seen by the next operation: the policy is a dimension of a
+  queryset's scope decision (the 0.38.0 rule) beside its actor, bypass and database, so a queryset evaluated or
+  embedded under one value and read under the other, in any position and by any path, builds its scope again
+  (`iterator()`, which decides its scope where it is called, compares the decision again where its statement compiles,
+  at its first rows); an eager `scoped()` queryset, a `Q` from `queryset_filter` and an expression from
+  `LocalBackend.permission_expression` keep the policy they were built under. With the setting unchanged a decision
+  costs what it did. See `docs/ARCHITECTURE.md § Policies without inheritance through links`.
+
+- **`manage.py rebac links [--type T] [--json]`** and `rebac.links.narrowed_arrows()`: every arrow the setting
+  narrows in the published policy, why its relation is a link, and what each target still lends. `rebac explain`
+  prints the evaluated expression on a second line when the setting changes it. Both report a setting that is not
+  a bool as a command error naming `rebac.E028`.
+
+- **System checks `rebac.W012`**, a warning while the setting is `False`, and **`rebac.E025`**, the narrowed
+  policy cannot be built or is refused (every decision then fails closed). A refusal about the policy is kept and
+  reported; any other failure is retried by the next operation.
+
+- **`LocalBackend.evaluated_schema()`** (experimental, proposal 0023, outside the stable API): the policy decisions
+  are made with, for a consumer's own proofs about it. With the setting `True` it is the published policy
+  (`schema()`); with `False` the narrowed one, kept per schema snapshot: the composition `check_new` walks and the
+  residual evaluator reads, which statements are compiled from unless override rows are selected (then from the
+  narrowing of the composition that keeps their deadlines). Never mutate it. It holds generated permissions, which are
+  not actions: never show one or pass one to an entry. A proof from its text does not hold while any override is
+  stored (`SchemaOverride` rows), nor on a type that reads a name two ways. `schema()` stays the published policy.
+  `rebac.links.is_generated`, `inherits_through_links` and `narrowed_arrows` are its companions, experimental too.
+
+- The policy benchmark has a `nolinks` mechanism.
 
 ### Changed
 
@@ -399,11 +448,50 @@ pre-1.0; breaking changes within a minor version are explicitly called out.
   and renaming it is a repair. A stored policy that already holds one, written directly to its tables, loads and
   decides as in 0.37.0, and the database check **`rebac.W014`** reports each place (a warning, so that `migrate`
   proceeds; `manage.py check` without `--database` does not run it). The experimental read mechanisms prove nothing
-  from such a policy and leave its compiled statements in place: structural prefetch proves nothing about such a
-  type (the parent's, the child's, or one an arrow lifts to), and the bounded walk and the row scope refuse the
-  whole policy. A parsed schema that `rebac sync` accepts is unaffected.
+  from such a policy and leave its compiled statements in place: structural prefetch and display rows' implied
+  actions prove nothing about such a type (the parent's, the child's, or one an arrow lifts to), and the bounded
+  walk and the row scope refuse the whole policy; with `REBAC_INHERIT_THROUGH_LINKS = False` the narrowing refuses
+  it (`rebac.E025`). A parsed schema that `rebac sync` accepts is unaffected.
+
+- **New input may not introduce a name the `.zed` language cannot spell** (`rebac.schema.parser.name_errors`, also
+  part of `validate_schema`): a type, relation, permission, caveat, caveat parameter, subject relation, subject id
+  or caveat reference that is not one, and in an expression a reference or an arrow's relation that is not an
+  identifier (or is `nil`). `LocalBackend.set_schema()` and `rebac.testing.install_schema()` refuse such a `Schema`
+  built in code, and a write to the stored policy (its definition, relation, permission, caveat and override
+  rows, through their managers, `schema_changes()` or `rebac sync`) is refused with `SchemaError` when it adds
+  one: when the composed policy holds the name at a place (type, position, permission) where it did not before the
+  write; a repair of a stored policy that cannot be read or composed is the exception, as the names it held are not
+  known. A parsed schema is unaffected, and no schema in this repository's suite relied on a looser name.
+
+- **A stored policy that already holds a name the language cannot spell keeps working.** One written directly to
+  the tables (with SQL, or by code that bypassed the write owners) loads and decides exactly as in 0.37.0, and
+  other writes beside it proceed. The new database check **`rebac.W013`** names the type and the name. It is a
+  warning, so that it never blocks an upgrade: `manage.py check --database default` and `migrate`, which runs the
+  database checks, report it and proceed; `manage.py check` without `--database` and other commands do not run it.
+  Silence it with `SILENCED_SYSTEM_CHECKS = ['rebac.W013']`. **Repair:** rename it through the schema write API
+  (for example `SchemaPermission.objects.filter(definition__resource_type=..., name=...).update(name=...)`) or sync
+  a corrected `.zed` file with `rebac sync`. With `REBAC_INHERIT_THROUGH_LINKS = False` the narrowed policy refuses
+  such a policy (`rebac.E025`): every decision fails closed until it is repaired, and relationship writes proceed.
 
 ### Fixed
+
+- **A queryset kept across an in-process schema installation reads the installed policy** (verified on 0.30.0,
+  0.37.0 and 0.38.0; `rebac.testing.install_schema()` is public since 0.24.2). A policy installed in process
+  (`LocalBackend.set_schema()`, what `install_schema()` calls) is fenced by the revision of the backend instance a
+  scope was built with, not by which backend is active. A queryset object evaluated, or embedded, before
+  `install_schema()` made a new backend active, and evaluated again after it, read with the replaced policy's scope
+  (its count, `iterator()` and embeddings), where a fresh read answers the new one; after `set_schema()` on the
+  active backend it read no row. Affected: code that keeps a queryset object across an in-process installation in
+  one process, which is test code or code that installs policies at run time. A stored policy is not: a queryset
+  object evaluated before an override is stored, or before an override's deadline passes, returns no rows when it is
+  evaluated again, until it is built again (a clone, or a new queryset), where a fresh read returns the rows. 0.38.0
+  states it for a revision ("a scope built before a policy revision was published stays closed by its revision fence
+  until it is built again"), and a scope whose statement witnessed an override deadline ahead is closed the same way
+  once it passes; unchanged. The decision of a queryset's scope (the 0.38.0 rule) now carries the active backend's
+  in-process revision, read at no statement, so such a queryset builds its scope again, as it is and embedded. An
+  eager `scoped()` queryset keeps the scope it built, as it keeps its actor, by its own contract, a limit kept on
+  purpose: after `install_schema()` it reads the replaced policy, and after `set_schema()` on its own backend no
+  row. Nothing changes for a stored policy, nor while no schema is installed again.
 
 - **A stored expression that does not parse no longer blocks the write that repairs it** (0.25.0 and later). The
   write owner reads every stored override, expired ones included, when a write starts, and so does every decision.

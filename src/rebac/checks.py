@@ -10,6 +10,7 @@ from typing import TYPE_CHECKING, Any
 from django.core import checks
 from django.db.utils import DatabaseError
 
+from . import links
 from .conf import _wrongly_typed_settings, _WronglyTyped, _WrongSettingType, app_settings
 from .errors import SchemaError
 from .field_visibility import FIELD_DENY_MODES
@@ -103,6 +104,8 @@ def _schema_for_checks() -> Schema | None:
 
     Runtime permission evaluation remains strict. Only schema-dependent system
     checks defer unreadable data while the owning app has pending migrations.
+    The published policy: these checks read relations, which the policy
+    evaluated without inheritance through links shares (``rebac.links``).
     """
     from django.db import DEFAULT_DB_ALIAS, connections
     from django.db.migrations.executor import MigrationExecutor
@@ -113,7 +116,7 @@ def _schema_for_checks() -> Schema | None:
         return None  # E001 owns invalid selection; schema checks need a backend.
     try:
         try:
-            return backend().schema()
+            return backend()._published_schema()
         except SchemaError:
             executor = MigrationExecutor(connections[DEFAULT_DB_ALIAS])
             targets = executor.loader.graph.leaf_nodes("rebac")
@@ -217,7 +220,7 @@ def _schema_on_alias(using: str) -> Schema | None:
     try:
         try:
             if active._schema_is_manual:
-                return active.schema()
+                return active._published_schema()
             schema, _deadline = active._load_schema_from_db(using)
             return schema
         except SchemaError:
@@ -235,14 +238,45 @@ def _schema_on_alias(using: str) -> Schema | None:
     return None
 
 
+def _unspelled_names(schema: Schema, using: str) -> list[checks.CheckMessage]:
+    """W013: names of the stored policy on ``using`` that no ``.zed`` text could spell.
+
+    Such a policy loads and decides as it is; only new input is refused, so the
+    repair is a write. A warning, so that it never stops ``migrate``, which runs
+    the database checks: the policy decides as it did before names were checked.
+    With ``REBAC_INHERIT_THROUGH_LINKS = False`` the narrowing refuses the policy
+    (``rebac.E025``) and every decision fails closed.
+    """
+    from .schema.parser import name_errors
+
+    return [
+        checks.Warning(
+            f"The stored policy on {using!r} holds a name the schema language cannot spell: "
+            f"{error}.",
+            hint="Rename it through the schema write API (SchemaDefinition, SchemaRelation, "
+            "SchemaPermission or SchemaCaveat rows, e.g. "
+            "SchemaPermission.objects.filter(...).update(name=...)), or sync a corrected .zed "
+            "file with 'manage.py rebac sync'. The policy decides as stored meanwhile; a write "
+            "that adds such a name is refused, and with REBAC_INHERIT_THROUGH_LINKS = False "
+            "every decision fails closed (rebac.E025). Silence the warning with "
+            "SILENCED_SYSTEM_CHECKS = ['rebac.W013'].",
+            id="rebac.W013",
+        )
+        for error in name_errors(schema)
+    ]
+
+
 def _names_read_two_ways(schema: Schema, using: str) -> list[checks.CheckMessage]:
     """W014: places where the stored policy on ``using`` lets a name be read two ways.
 
     ``rebac.schema.ast.name_conflicts``: a built-in's name as a relation, a definition
-    or a subject type, or a name declared twice. Such a policy loads and decides as it
-    did before the rule was held at runtime; only new input is refused. The
-    experimental read mechanisms prove nothing from it: structural prefetch about such
-    a type, the bounded walk and the row scope about the whole policy.
+    or a subject type, or a name declared twice. A sibling of ``rebac.W013``, not that
+    check: the name is spelled, the repair differs, and either can be silenced alone.
+    Such a policy loads and decides as it did before the rule was held at runtime; only
+    new input is refused. The experimental read mechanisms prove nothing from it:
+    structural prefetch and display rows' implied actions about such a type, the bounded
+    walk and the row scope about the whole policy; and with
+    ``REBAC_INHERIT_THROUGH_LINKS = False`` the narrowing refuses it (``rebac.E025``).
     """
     from .schema.ast import schema_name_conflicts
 
@@ -252,9 +286,11 @@ def _names_read_two_ways(schema: Schema, using: str) -> list[checks.CheckMessage
             hint="Rename the relation or the permission through the schema write API "
             "(SchemaRelation or SchemaPermission rows), or sync a corrected .zed file with "
             "'manage.py rebac sync'. The policy decides as stored meanwhile; a write that adds "
-            "such a place is refused, and the experimental read mechanisms prove nothing from it "
+            "such a place is refused, the experimental read mechanisms prove nothing from it "
             "(structural prefetch about such a type, the bounded walk and the row scope about "
-            "the policy). Silence the warning with SILENCED_SYSTEM_CHECKS = ['rebac.W014'].",
+            "the policy), and with REBAC_INHERIT_THROUGH_LINKS = False every decision fails "
+            "closed (rebac.E025). Silence the warning with "
+            "SILENCED_SYSTEM_CHECKS = ['rebac.W014'].",
             id="rebac.W014",
         )
         for error in schema_name_conflicts(schema)
@@ -263,10 +299,10 @@ def _names_read_two_ways(schema: Schema, using: str) -> list[checks.CheckMessage
 
 @_register(
     checks.Tags.database,
-    ids=("rebac.E014", "rebac.E015", "rebac.E016", "rebac.E018", "rebac.W014"),
+    ids=("rebac.E014", "rebac.E015", "rebac.E016", "rebac.E018", "rebac.W013", "rebac.W014"),
 )
 def check_policy_models(app_configs: Any = None, **kwargs: Any) -> list[checks.CheckMessage]:
-    """E014-E018 and W014; all schema I/O is opt-in via database checks."""
+    """E014-E018, W013 and W014; all schema I/O is opt-in via database checks."""
     if app_settings.REBAC_BACKEND != "local" or not kwargs.get("databases"):
         return []
     from django.apps import apps
@@ -288,6 +324,7 @@ def check_policy_models(app_configs: Any = None, **kwargs: Any) -> list[checks.C
         schema = _schema_on_alias(using)
         if schema is None:
             continue
+        issues.extend(_unspelled_names(schema, using))
         issues.extend(_names_read_two_ways(schema, using))
         watched = watched_for(schema)
         fields = {
@@ -343,7 +380,13 @@ def check_policy_models(app_configs: Any = None, **kwargs: Any) -> list[checks.C
                         id="rebac.E018",
                     )
                 )
-        issues.extend(program_errors(schema))
+        # The compiler refuses what it is given: the policy the setting evaluates.
+        # A narrowing that cannot be built is rebac.E025's to report.
+        try:
+            evaluated = links.evaluated(schema)
+        except links.NarrowingError:
+            evaluated = schema
+        issues.extend(program_errors(evaluated))
     # Model/schema diagnostics may be identical on multiple explicitly checked aliases.
     unique: list[checks.CheckMessage] = []
     for issue in issues:
@@ -369,6 +412,40 @@ def check_permissions_enforced(app_configs: Any = None, **kwargs: Any) -> list[c
             ),
         )
     ]
+
+
+@_register(ids=("rebac.W012", "rebac.E025"))
+def check_inherit_through_links(
+    app_configs: Any = None, **kwargs: Any
+) -> list[checks.CheckMessage]:
+    """W012: the policy evaluated is not the published one; E025: it cannot be built.
+
+    A value that is not a bool is ``rebac.E028``'s (``rebac.conf``): reading it
+    raises, and this check reports that it did not run.
+    """
+    if app_settings.REBAC_INHERIT_THROUGH_LINKS:
+        return []
+    issues: list[checks.CheckMessage] = [
+        checks.Warning(
+            "REBAC_INHERIT_THROUGH_LINKS is False: permissions are evaluated without "
+            "inheritance through links, a narrower policy than the published one that "
+            "`rebac build-zed` exports.",
+            id="rebac.W012",
+            hint=(
+                "Experimental (proposal 0023). Every read grants a subset of what the published "
+                "policy grants; `manage.py rebac links` lists what is narrowed. Remove the "
+                "setting to evaluate the published policy; silence the warning with "
+                "SILENCED_SYSTEM_CHECKS = ['rebac.W012']."
+            ),
+        )
+    ]
+    schema = _schema_for_checks()
+    if schema is not None:
+        try:
+            links.narrowed(schema)
+        except links.NarrowingError as exc:
+            issues.append(checks.Error(str(exc).removesuffix(" (rebac.E025)"), id="rebac.E025"))
+    return issues
 
 
 @_register(ids=("rebac.E008", "rebac.W008"))

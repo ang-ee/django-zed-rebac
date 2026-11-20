@@ -130,9 +130,10 @@ database, and an evaluation after one that raised are decided again; its query e
 count and its own `iterator()` are decided where they run and never delivered; a decision that is not a delivery
 reads by the permission statement. The 0.38.0 rule holds as it stands: a queryset whose query already carries a
 scope for the same decision keeps that query. After its own `count()`, `exists()`, `aggregate()`, `iterator()` or
-`aiterator()`, and for an eager `scoped()` queryset and its clones, an evaluation under the same actor, bypass and
-database reuses that scope at the cost of one comparison and reads by its permission statement, decided neither
-for display nor for structural delivery. Pickling it strips its actor, as ever.
+`aiterator()`, an evaluation under the same actor, bypass, database and policy (`REBAC_INHERIT_THROUGH_LINKS`,
+proposal 0023), and for an eager `scoped()` queryset and its clones one under the same actor, bypass and database,
+reuses that scope at the cost of one comparison and reads by its permission statement, decided neither for display
+nor for structural delivery. Pickling it strips its actor, as ever.
 
 ## What a delivered row is
 

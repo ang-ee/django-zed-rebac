@@ -14,7 +14,8 @@ the tiny size and runs every scenario with and without the mechanisms, failing
 if a result differs: it needs no database server (in-memory SQLite). It runs
 twice, without display rows and with them (``labels``), each run compared with
 its own first mechanism. A mechanism is compared with the first one of the run
-that reads alike: display rows on or off, and ``plain`` enforces none.
+that reads alike: the same policy (``nolinks`` evaluates the narrower one,
+``plain`` enforces none) and display rows on or off.
 """
 
 from __future__ import annotations
@@ -37,6 +38,8 @@ MECHANISMS: dict[str, dict[str, Any]] = {
     "walk": {"REBAC_BOUNDED_WALK": "decide"},
     "trusted": {"REBAC_TRUSTED_IDS": True},
     "noprofile": {"REBAC_ACTOR_PROFILES": False},
+    # Another, narrower policy (proposal 0023): no inheritance through links.
+    "nolinks": {"REBAC_INHERIT_THROUGH_LINKS": False},
     # Django's own queries: nothing enforced, so every actor reads every row.
     "plain": {"REBAC_ENABLED": False},
     "all": {
@@ -124,7 +127,7 @@ def main() -> None:
         data.build(bench)
         failed = []
         # Display rows change what a label read returns: each run has its own baseline.
-        for mechanisms in ("today,all", "labels,all_labels"):
+        for mechanisms in ("today,all,nolinks", "labels,all_labels"):
             everything = argparse.Namespace(
                 scenario="",
                 actor="heavy,light,outsider,admin",
@@ -235,8 +238,8 @@ def reads(bench: Any, arguments: argparse.Namespace) -> list[dict[str, Any]]:
                         row.update(_explain(connection, statements))
                 compiled.reset()
                 rowscope._built.clear()
-                # Compared only with a mechanism that reads alike: display rows change what
-                # a label read returns, and ``plain`` reads every row.
+                # Compared only with a mechanism that reads alike: another policy decides what
+                # a page holds, and display rows change what a label read returns.
                 row["same"] = result == baselines.setdefault(alike(mechanism), result)
                 report.append(row)
                 line = (
@@ -250,12 +253,13 @@ def reads(bench: Any, arguments: argparse.Namespace) -> list[dict[str, Any]]:
 
 
 def alike(mechanism: str) -> tuple[str, bool]:
-    """What decides what a mechanism reads: whether the policy is enforced, and whether display
-    rows are on."""
+    """What decides what a mechanism reads: the policy (``published``, ``nolinks`` without
+    inheritance through links, ``unenforced``) and whether display rows are on."""
     chosen = MECHANISMS[mechanism]
     if chosen.get("REBAC_ENABLED") is False:
         return "unenforced", False
-    return "published", bool(chosen.get("REBAC_DISPLAY_FIELDS"))
+    policy = "published" if chosen.get("REBAC_INHERIT_THROUGH_LINKS", True) else "nolinks"
+    return policy, bool(chosen.get("REBAC_DISPLAY_FIELDS"))
 
 
 @contextmanager

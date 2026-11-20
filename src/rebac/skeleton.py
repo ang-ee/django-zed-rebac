@@ -70,7 +70,8 @@ def export(directory: str | Path, *, source: dict[str, Any] | None = None) -> di
     """
     from .backends import backend
 
-    schema = backend().schema()
+    # The published policy, whatever REBAC_INHERIT_THROUGH_LINKS evaluates.
+    schema = backend()._published_schema()
     found = skeleton(schema)
     found["source"] = dict(source or {})
     target = Path(directory)

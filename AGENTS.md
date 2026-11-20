@@ -102,6 +102,11 @@ own tables; there is no backend interface to implement.
     and `grants_all()` embed in a Django statement, or answer for a whole type,
     the same lower-bound decision `check_access` makes. They add no permission
     semantics; they are how a Django query carries a permission, not RPCs.
+  - `evaluated_schema()` (experimental, proposal 0023) returns the policy the
+    backend evaluates under `REBAC_INHERIT_THROUGH_LINKS`, for a consumer's own
+    proofs about it. `schema()` is the `ReadSchema` of the published policy; the
+    evaluated one holds generated permissions and is not a `.zed` schema, so it
+    has no SpiceDB counterpart. It adds no permission semantics.
 - **Do** mirror `authzed.api.v1` method names in `LocalBackend` (snake_case
   wrappers around `CheckPermission`, `CheckBulkPermissions`, `LookupResources`,
   `LookupSubjects`, `WriteRelationships`, `WriteSchema`,

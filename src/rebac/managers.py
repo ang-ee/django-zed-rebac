@@ -60,6 +60,7 @@ from .field_visibility import (
     validate_field_deny_mode,
     warn_raise_mode_degrades,
 )
+from .links import inherits_through_links
 from .resources import model_resource_type
 from .schema.cache import schema_operation
 from .types import FieldDenyMode, SubjectRef
@@ -71,6 +72,25 @@ class _ScopeWhere(WhereNode):
     """A removable authorization restriction, separate from caller predicates."""
 
 
+class _Policy(NamedTuple):
+    """The policy a scope reads, as a decision compares it (``_evaluated_policy``).
+
+    ``inherits`` is which policy of the published revision the backend evaluates:
+    ``REBAC_INHERIT_THROUGH_LINKS`` (``rebac.links.inherits_through_links()``), the value
+    ``LocalBackend._schema_snapshot`` reads into the snapshot it evaluates and the policy's
+    key (``compile.read.policy_key``) carries last. ``schema`` is the revision of the active
+    backend's in-process schema (``LocalBackend.set_schema``, what
+    ``rebac.testing.install_schema`` calls), ``None`` for a stored policy. Both are read at
+    no statement, and neither is witnessed by the fence of a compiled statement: it
+    witnesses the published revision of a stored policy and its override deadlines, and
+    for an in-process schema the revision of the backend instance the scope was built with,
+    not which backend is active.
+    """
+
+    inherits: bool
+    schema: str | None
+
+
 class _Decision(NamedTuple):
     """What a queryset's scope is built for: whatever it depends on that two evaluations of
     one queryset object can see differently (ARCHITECTURE.md § Querysets: a scope is decided
@@ -79,19 +99,54 @@ class _Decision(NamedTuple):
     ``actor`` and ``bypass`` are ``effective_actor()``: the pins, an ambient ``sudo()`` or
     ``system_context()`` block, the ambient actor, ``REBAC_ENABLED``. ``using`` is the
     database the statement reads: a scope is compiled for one (its SQL, and the profile
-    and witnesses read there). What the scope pins when it is built (its policy; its
-    caveat verdicts, taken from the stored caveat payloads under that policy revision,
-    with no request context; the constant-arm witnesses an evaluator scope decides) is not
-    part of a decision: it can only leave rows out, never add one, as the policy's revision
-    fence does. Nor is a structural delivery: it is never kept beyond the evaluation it
-    serves (``RebacQuerySet._apply_scope_in_place``). A queryset embedded in a statement
-    with nothing of its own pinned is decided by each statement that compiles it
-    (``_RebacQuery.as_sql``).
+    and witnesses read there). ``policy`` is the policy the scope reads (``_Policy``):
+    which policy of the published revision is evaluated (``REBAC_INHERIT_THROUGH_LINKS``,
+    proposal 0023) and the in-process schema; ``None`` for a bypass or no actor. No fence
+    closes a scope built under the other policy of a revision, which grants more, or under
+    an in-process schema another backend has replaced.
+    What else the scope pins when it is built (a stored policy's revision; its caveat
+    verdicts, taken from the stored caveat payloads under that revision, with no request
+    context; the constant-arm witnesses an evaluator scope decides) is not part of a
+    decision: it can only leave rows out, never add one, as the policy's revision fence
+    does. Nor is a structural delivery: it is never kept beyond the evaluation it serves
+    (``RebacQuerySet._apply_scope_in_place``). A queryset embedded in a statement with
+    nothing of its own pinned is decided by each statement that compiles it
+    (``_RebacQuery.as_sql``). An eager ``scoped()`` queryset keeps the policy its scope was
+    built under, as it keeps its actor: its decision takes ``policy`` from the scope it
+    holds. By that contract, a limit kept on purpose, it keeps the scope it built across an
+    in-process installation too: after ``install_schema()`` it reads the replaced policy,
+    and after ``set_schema()`` on its own backend, whose fence closes it, no row.
     """
 
     actor: SubjectRef | None
     bypass: bool
     using: str
+    policy: _Policy | None
+
+
+def _in_process_schema() -> str | None:
+    """The revision of the active backend's in-process schema; ``None`` for a stored policy.
+
+    Read without the backend's schema lock, which ``set_schema`` holds while it installs:
+    an attribute read sees the revision before or after, and a decision taken across an
+    installation is taken again by the next evaluation.
+    """
+    from .backends import backend
+
+    local = backend()
+    return local._manual_revision if local._schema_is_manual else None
+
+
+def _evaluated_policy(actor: SubjectRef | None, bypass: bool) -> _Policy | None:
+    """The policy a scope decided for ``actor`` and ``bypass`` reads (``_Decision.policy``).
+
+    ``None`` for a bypass or no actor: such a scope reads no policy. Anything else that
+    changes the evaluated policy without publishing a revision belongs in ``_Policy``, so
+    that a scope built under one policy is built again under another.
+    """
+    if bypass or actor is None:
+        return None
+    return _Policy(inherits_through_links(), _in_process_schema())
 
 
 class _CompileOnly(Enum):
@@ -335,6 +390,9 @@ class _RebacQuery(RootQuery, _BypassAuditQuery):
         if held is None or (held.actor, held.bypass) != (actor, bypass):
             return True
         if database and held.using != queryset.db:
+            return True
+        # Built under another policy (an eager queryset keeps its own).
+        if not queryset._rebac_eager_scope and held.policy != _evaluated_policy(actor, bypass):
             return True
         # The same decision, a bypass, and not the same one: the bypass of the block it
         # was resolved in, captured there, with no block in force where it compiles (in
@@ -1375,8 +1433,10 @@ class RebacQuerySet(models.QuerySet[_M]):
         """Decide the scope of this evaluation and return the query that carries it.
 
         The decision (``_Decision``) is taken here at every call, by the function
-        that took it the first time: ``effective_actor`` and the database alias,
-        asked of the router once. The query carries the decision it was scoped
+        that took it the first time: ``effective_actor``, the database alias,
+        asked of the router once, and the policy a scope for them reads
+        (``_evaluated_policy``; an eager queryset's is the one its scope was built
+        under). The query carries the decision it was scoped
         for (``_rebac_scope_for``): whether a scope is applied, and for what, is
         read from the query alone, never from a result cache or a record kept
         beside it. A query already scoped for the same decision is returned as
@@ -1411,10 +1471,18 @@ class RebacQuerySet(models.QuerySet[_M]):
             # a write sees the bypass audit row first.
             self._audit_bypass_once()
         using = self.db
-        decided = _Decision(actor, bypass, using)
         query = self.query
-        if getattr(query, "_rebac_scope_for", None) == decided:
+        held = cast(_Decision | None, getattr(query, "_rebac_scope_for", None))
+        # An eager queryset keeps the policy its scope was built under, as it keeps its
+        # actor; any other is decided under the policy evaluated now.
+        eager = self._rebac_eager_scope and held is not None
+        policy = held.policy if eager and held is not None else _evaluated_policy(actor, bypass)
+        decided = _Decision(actor, bypass, using, policy)
+        if held == decided:
             return query
+        if eager:
+            # Built again for another actor, bypass or database: under the policy now.
+            decided = decided._replace(policy=_evaluated_policy(actor, bypass))
         scoped = _without_query_scope(query)
         cast(Any, scoped)._rebac_scope_for = decided
         if not bypass:
@@ -1479,7 +1547,27 @@ class RebacQuerySet(models.QuerySet[_M]):
         ``deliver``: the statement runs now, and a running structural prefetch
         may deliver it; the answer is whether it did, adding no scope.
         ``using``: the database decided for it.
+
+        A name the policy without inheritance through links generates is not an
+        action (proposal 0023): asked for one, the whole statement is built
+        under the published policy, which answers it as an unknown action, and
+        so are the policy key and what its rows are admitted to.
         """
+        from .links import _published_for
+
+        with _published_for(str(self._rebac_action or "")):
+            return self._scope_query_under(query, actor, root=root, deliver=deliver, using=using)
+
+    def _scope_query_under(
+        self,
+        query: Query,
+        actor: SubjectRef | None,
+        *,
+        root: Query | None,
+        deliver: bool,
+        using: str | None,
+    ) -> bool:
+        """``_scope_query`` under the policy its action is answered by."""
         root = query if root is None else root
         using = self.db if using is None else using
         if query is root:
@@ -1960,21 +2048,40 @@ class RebacQuerySet(models.QuerySet[_M]):
         related = _relation_scope(self) if self._rebac_select_related_guards else None
         chunked = not connections[reading.db].settings_dict.get("DISABLE_SERVER_SIDE_CURSORS")
         size = chunk_size or 2000
-        rows = iter(native._iterable_class(reading, chunked_fetch=chunked, chunk_size=size))
         # The statement compiles when the first rows are read, deciding then the
         # scopes embedded in it: in the context iterator() was called in.
-        return self._finished_chunks(rows, size, actor, sudo, related, copy_context())
+        return self._finished_chunks(reading, chunked, size, actor, sudo, related, copy_context())
 
     def _finished_chunks(
         self,
-        rows: Iterator[Any],
+        reading: Self,
+        chunked: bool,
         size: int,
         actor: SubjectRef | None,
         sudo: bool,
         related: tuple[SubjectRef | None, bool] | None,
         called: Context,
     ) -> Iterator[_M]:
-        chunk = _compiling_in(called).run(lambda: list(islice(rows, size)))
+        rows: Iterator[Any] = iter(())
+
+        def first() -> list[Any]:
+            nonlocal reading, rows
+            # The actor, the bypass and the database were decided at the call; the
+            # policy is no part of that context. Where the statement compiles, and its
+            # embedded querysets are decided, the decision is compared again (one
+            # comparison) and the scope built again under the policy then if it differs,
+            # its field guards with it. A rebuild replaces ``reading``'s own query, so the
+            # query is compared with the one it held before.
+            before = reading.query
+            query = reading._apply_scope_in_place(decision=(actor, sudo), audit=False)
+            if query is not before:
+                reading = reading._reading(query)
+                reading._guard_projected_field_reads(actor, sudo)
+            native = cast(Any, reading)
+            rows = iter(native._iterable_class(reading, chunked_fetch=chunked, chunk_size=size))
+            return list(islice(rows, size))
+
+        chunk = _compiling_in(called).run(first)
         # The context is not kept past the first rows: nothing after them compiles.
         del called
         while chunk:
@@ -2608,7 +2715,9 @@ class RebacQuerySet(models.QuerySet[_M]):
         # keys would be read unscoped, and the bulk guards would refuse the rows
         # outside the actor's scope: a refusal, never a wider write.
         actor_, bypass = rows.effective_actor(strict=True)
-        cast(Any, query)._rebac_scope_for = _Decision(actor_, bypass, rows.db)
+        cast(Any, query)._rebac_scope_for = _Decision(
+            actor_, bypass, rows.db, _evaluated_policy(actor_, bypass)
+        )
         rows._query = query
         return rows
 

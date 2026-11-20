@@ -85,7 +85,7 @@ def _check_new_model(
     resource_type = model_resource_type(type(instance))
     if resource_type is None:
         return CheckResult.has()
-    schema = active_backend.schema()
+    schema = active_backend.evaluated_schema()
     definition = schema.get_definition(resource_type)
     relationships: dict[str, tuple[SubjectRef, ...] | None] = {}
     if definition is not None:
@@ -163,8 +163,31 @@ def check_new(
 
     ``action`` may name either a declared permission or — for direct
     membership checks — a declared relation. An unknown name yields a
-    diagnostic ``NO_PERMISSION``.
+    diagnostic ``NO_PERMISSION``; a name the policy without inheritance
+    through links generates is one (proposal 0023).
     """
+    from .links import _published_for
+
+    with _published_for(action):
+        return _evaluate_new(
+            subject=subject,
+            action=action,
+            resource_type=resource_type,
+            relationships=relationships,
+            backend=backend,
+            context=context,
+        )
+
+
+def _evaluate_new(
+    *,
+    subject: SubjectRef,
+    action: str,
+    resource_type: str,
+    relationships: Mapping[str, Sequence[SubjectRef] | None] | None = None,
+    backend: LocalBackend | None = None,
+    context: dict[str, object] | None = None,
+) -> CheckResult:
     if not app_settings.REBAC_ENABLED:
         return CheckResult.has(reason="permissions are not enforced")
     from .backends import backend as _current_backend
@@ -172,7 +195,7 @@ def check_new(
     rels: Mapping[str, Sequence[SubjectRef] | None] = relationships or {}
     active_backend = backend if backend is not None else _current_backend()
 
-    schema = active_backend.schema()
+    schema = active_backend.evaluated_schema()
 
     definition = schema.get_definition(resource_type)
     if definition is None:
@@ -351,7 +374,8 @@ def _build_ctx(
             raise PermissionDepthExceeded(f"Depth limit {ctx.depth_limit} exceeded")
         saw_conditional = False
         for target_subject in candidates:
-            result = backend.check_access(
+            # The target names a permission of the evaluated policy, a generated one included.
+            result = backend._check_access(
                 subject=ctx.subject,
                 action=target,
                 resource=ObjectRef(target_subject.subject_type, target_subject.subject_id),

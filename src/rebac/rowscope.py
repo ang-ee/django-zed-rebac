@@ -168,7 +168,18 @@ def explain(
 
     ``{"applies": bool, "subqueries": int | None, "blocked": [reasons]}``. For a
     test, a benchmark or a system check: it builds the conditions without keeping them.
+    A name ``REBAC_INHERIT_THROUGH_LINKS = False`` generates is explained as the
+    published policy has it: no action (proposal 0023).
     """
+    from .links import _published_for
+
+    with _published_for(action):
+        return _explain(model, actor, action, using)
+
+
+def _explain(
+    model: type[models.Model], actor: SubjectRef, action: str, using: str
+) -> dict[str, Any]:
     from .backends import backend
     from .backends.local import LocalBackend
 

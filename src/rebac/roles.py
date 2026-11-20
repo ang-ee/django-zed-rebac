@@ -412,9 +412,15 @@ def roles_reaching(
 ) -> frozenset[ObjectRef]:
     """Return statically named role objects that can reach a permission.
 
-    The helper reads the effective schema through ``backend().schema()`` when
-    ``schema`` is omitted. It only returns roles with a concrete object id from
-    the schema, of two shapes:
+    The helper reads the published effective schema through ``backend().schema()``
+    (a name ``REBAC_INHERIT_THROUGH_LINKS = False`` generates is no permission there) when
+    ``schema`` is omitted. Under ``REBAC_INHERIT_THROUGH_LINKS = False`` that answer is a
+    superset of the roles the evaluated policy lets reach the permission: a role reached
+    only through an arrow the narrowing removes or narrows (through a link, proposal 0023)
+    is still named, though no decision grants through it. For the evaluated policy's answer
+    pass ``schema=backend().evaluated_schema()`` (experimental).
+
+    It only returns roles with a concrete object id from the schema, of two shapes:
 
     - **const-backed role relations** — ``relation admin: storage/role //
       rebac:const=admin`` reached through ``admin->member``: tuple-free role

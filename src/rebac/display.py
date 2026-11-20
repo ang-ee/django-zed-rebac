@@ -125,10 +125,10 @@ raised are decided again. An embedding of its query, a count and its own
 is not a delivery reads by the permission statement. A queryset whose query
 already carries a scope for the same decision keeps that query: after its own
 ``count()``, ``exists()``, ``aggregate()``, ``iterator()`` or ``aiterator()``,
-and for an eager ``scoped()`` queryset and its clones, an evaluation under the
-same actor, bypass and database reuses it at the cost of one comparison and
-reads by its permission statement, decided neither for display nor for
-structural delivery.
+an evaluation under the same actor, bypass, database and policy, and for an
+eager ``scoped()`` queryset and its clones one under the same actor, bypass and
+database, reuses it at the cost of one comparison and reads by its permission
+statement, decided neither for display nor for structural delivery.
 
 What is admitted (``referring``, ``admit``): the rows of an evaluation that read
 model instances built from the database by Django's own iterable, with no
@@ -505,15 +505,22 @@ def admits_reading(model: type[models.Model], action: str) -> bool:
     They are when ``action`` is the model's read action, the one a plain read of
     it is scoped by, or when the policy the backend evaluates proves that whoever
     is granted ``action`` on a row of the model's type is granted that read action
-    (``rebac.structural.implies``, proposal 0022). The proof is kept per policy;
-    nothing but the read action itself is proven while the policy carries an
-    override, nor about a type that reads a name two ways.
+    (``rebac.structural.implies``, proposal 0022): the policy without inheritance
+    through links under ``REBAC_INHERIT_THROUGH_LINKS = False``. The proof is kept
+    per policy; nothing but the read action itself is proven while the policy
+    carries an override, nor about a type that reads a name two ways. A name the
+    policy without inheritance through links generates is not an action (proposal
+    0023) and never counts.
 
     A queryset decides this where its scope is built (``RebacQuerySet._scope_query``)
     and its query carries the answer with its decision, to the rows it admits: what
     a recorded row was admitted to is what the policy that admitted it said,
     whatever the policy is when a delivery is decided.
     """
+    from .links import is_generated
+
+    if is_generated(action):
+        return False
     read = str(getattr(model._meta, "rebac_default_action", "read"))
     if action == read:
         return True

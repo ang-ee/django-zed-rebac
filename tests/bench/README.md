@@ -52,16 +52,18 @@ reads the actor's profile at every compile.
 `read` prints one line per scenario, actor and mechanism: rows read, statements, their SQL size, the wall time
 (median of `--repeats`), and with `--explain` on PostgreSQL the planning time, the execution time and the
 planner's memory, summed over the statements. A mechanism is a named set of settings (`today`, `structural`,
-`rows`, `named`, `walk`, `trusted`, `noprofile`, `all`, `labels`, `all_labels`, `plain`); a line ends in `DIFFERS`
-if it read something else than the first mechanism of the run that reads alike: display rows on or off, or nothing
-enforced for `plain`. `labels` turns on `REBAC_DISPLAY_FIELDS` for the profile's `DISPLAY_FIELDS`: the `labels`,
+`rows`, `named`, `walk`, `trusted`, `noprofile`, `all`, `labels`, `all_labels`, `nolinks`, `plain`); a line ends in
+`DIFFERS` if it read something else than the first mechanism of the run that reads alike: the same policy (the
+published one, the narrower one of `nolinks`, or none for `plain`) with display rows on or off. `labels` turns on `REBAC_DISPLAY_FIELDS` for the profile's `DISPLAY_FIELDS`: the `labels`,
 `page_labels` and `inbox_labels` scenarios ask for display rows on their label prefetches (proposal 0024), and read
 display rows where `today` reads whole rows or none, so they are compared only with a mechanism that has display
 rows too. `inbox_labels` reads a page of messages admitted under their inbox action (`read_inbox`), with their parts
 and participants, and their threads, senders' parties and parts' files as labels: children delivered under an
 action that implies theirs, and labels hanging off rows admitted under such an action.
 `plain` is `REBAC_ENABLED = False`: Django's own queries, with every row readable, as the floor the others can be
-compared with. The smoke run compares `all` with `today`, and `all_labels` with `labels`.
+compared with. `nolinks` is `REBAC_INHERIT_THROUGH_LINKS = False` (proposal 0023): another, narrower policy, whose
+reads are compared only with another mechanism of that policy. The smoke run compares `all` with `today`, and
+`all_labels` with `labels`, and runs `nolinks`.
 
 ## The cast
 
