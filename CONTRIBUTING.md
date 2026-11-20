@@ -72,16 +72,28 @@ gh run view <run-id> --log-failed               # the log of each failed step
   database whose role may create databases. Pytest-django adds worker-specific
   test database names. `tests.settings_postgres` fails if the URL is absent;
   it never uses SQLite.
-- `REBAC_TEST_POSTGRES_BINDING` picks how psycopg binds parameters for every
-  PostgreSQL target and the benchmark: `client` (the default, Django's) or
-  `server`, which sets Django's `server_side_binding` and `prepare_threshold = 0`.
-  Under `server` PostgreSQL types each parameter from its context, so a
-  parameter it cannot type fails the statement. The URL cannot carry these
-  options (Django reads typed values), and `tests.settings_postgres` refuses
-  them there. Four migrations of the test app add a foreign key to an existing
-  table, which Django's schema editor sends as two commands in one statement;
-  psycopg cannot prepare that, so `tests/conftest.py` runs that one form
-  unprepared.
+- `REBAC_TEST_POSTGRES_BINDING` picks how psycopg binds parameters for the
+  targets that read `tests.settings_postgres` (`make test-pg`,
+  `make test-postgres`, `make test-pg-scale`) and for the benchmark: `client`
+  (the default, Django's) or `server`, which sets Django's
+  `server_side_binding` and `prepare_threshold = 0`. Under `server` PostgreSQL
+  types each parameter from its context, so a parameter it cannot type fails
+  the statement. The URL cannot carry these options (Django reads typed
+  values), and `tests.settings_postgres` refuses them there. The
+  `schema_vendors` contracts start their own containers with each driver's
+  default binding: they test schema ownership, upgrades and MySQL, and the
+  PostgreSQL targets test parameter typing under both bindings.
+- At `prepare_threshold = 0` psycopg prepares every statement on its first
+  execution, and PostgreSQL refuses to prepare a statement of two commands
+  ("cannot insert multiple commands into a prepared statement"). Django's
+  schema editor sends some schema changes that way, adding a foreign key
+  column to an existing table among them, as four migrations of the test app
+  do; `tests/conftest.py` runs those statements unprepared.
+- SQLite types no parameter, so tier 1 alone would not see one that
+  PostgreSQL cannot type. `tests/conftest.py` reads every statement the suite
+  sends, on any vendor, and fails the test during which a statement tests a
+  bare parameter with `IS NULL` or `IS NOT NULL`, the shape PostgreSQL refuses
+  under server-side binding.
 - The PostgreSQL targets need the driver: `uv sync --group postgres`
   (add the extras from `make install-dev` to keep them). The vendor contracts
   need Docker and both drivers: `uv sync --group postgres --group mysql`;

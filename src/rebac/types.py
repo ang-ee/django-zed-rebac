@@ -15,10 +15,18 @@ type FieldDenyMode = Literal["allow", "redact", "omit", "raise"]
 
 @dataclass(frozen=True, slots=True)
 class ObjectRef:
-    """Typed reference to a resource. `<resource_type>:<resource_id>`."""
+    """Typed reference to a resource. `<resource_type>:<resource_id>`.
+
+    A `None` id is held as the empty id, the model-level sentinel: no statement
+    receives `None` as an object's id.
+    """
 
     resource_type: str
     resource_id: str
+
+    def __post_init__(self) -> None:
+        if self.resource_id is None:
+            object.__setattr__(self, "resource_id", "")
 
     def __str__(self) -> str:
         return f"{self.resource_type}:{self.resource_id}"

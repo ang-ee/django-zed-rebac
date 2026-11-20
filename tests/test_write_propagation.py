@@ -1247,6 +1247,7 @@ definition test/doc {
 
 
 @pytest.mark.slow
+@pytest.mark.pg_delta
 def test_exclusion_intersection_nil_and_type_level_sequence():
     local = install_schema(SET_OPERATION_SCHEMA)
     doc_folder = row("test/doc", "d", "folder", SubjectRef.of("test/folder", "f"))

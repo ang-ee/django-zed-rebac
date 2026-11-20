@@ -214,15 +214,15 @@ _ABSENT: Any = object()
 
 
 def _not_null(expr: Expression | F | OuterRef) -> Q:
-    """Whether an object reference is not NULL; true, unsent, for a statement parameter.
+    """Whether an object reference is not NULL; true, unsent, for a placeholder that never is.
 
-    A column, or a conversion of a wire id, can be NULL. A parameter that stands for an
-    object (a point check's resource id) is bound to its id and never is. Django decides
-    the test of a ``Value`` itself, but not of a parameter it cannot see into, and
-    ``%s IS NOT NULL`` gives PostgreSQL no type for that parameter when parameters are
-    bound on the server.
+    A column, a conversion of a wire id, or a parameter in general can be NULL. A
+    placeholder declared ``never_null`` (a point check's resource id, bound to an
+    ``ObjectRef``'s id, which is never ``None``) cannot. Django decides the test of a
+    ``Value`` itself, but not of a parameter it cannot see into, and ``%s IS NOT NULL``
+    gives PostgreSQL no type for that parameter when parameters are bound on the server.
     """
-    if isinstance(expr, _Param):
+    if isinstance(expr, _Param) and expr.never_null:
         return _TRUE
     return Q(IsNull(expr, False))
 
@@ -248,11 +248,17 @@ CLOCK: Final = Marker("clock")
 
 
 class _Param(Expression):
-    """One statement parameter whose value is bound when the statement runs."""
+    """One statement parameter whose value is bound when the statement runs.
 
-    def __init__(self, marker: object, output_field: models.Field[Any, Any]) -> None:
+    ``never_null`` declares that the value bound is never NULL (``_not_null``).
+    """
+
+    def __init__(
+        self, marker: object, output_field: models.Field[Any, Any], *, never_null: bool = False
+    ) -> None:
         super().__init__(output_field=output_field)
         self.marker = marker
+        self.never_null = never_null
 
     def as_sql(self, compiler: Any, connection: Any) -> tuple[str, tuple[Any, ...]]:
         return "%s", (self.marker,)

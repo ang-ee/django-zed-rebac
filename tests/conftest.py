@@ -2,6 +2,9 @@
 
 from __future__ import annotations
 
+import re
+import traceback
+
 import django
 import pytest
 from django.conf import settings
@@ -11,20 +14,84 @@ def pytest_configure() -> None:
     if not settings.configured:
         from . import settings as test_settings  # noqa: F401
     django.setup()
-    if settings.DATABASES["default"].get("OPTIONS", {}).get("prepare_threshold") is not None:
-        from django.db.backends.signals import connection_created
+    from django.db.backends.signals import connection_created
 
+    connection_created.connect(_watch_untyped_parameters, dispatch_uid=f"{__name__}.untyped")
+    if settings.DATABASES["default"].get("OPTIONS", {}).get("prepare_threshold") is not None:
         connection_created.connect(_run_two_command_ddl_unprepared, dispatch_uid=__name__)
 
 
-def _run_two_command_ddl_unprepared(sender, connection, **kwargs) -> None:
-    """Under prepared statements, run Django's two-command DDL unprepared.
+# A statement PostgreSQL refuses under psycopg's server-side binding, and SQLite,
+# which types no parameter, runs: a bare parameter as the operand of IS [NOT]
+# NULL. psycopg sends a str or None untyped, nothing around the parameter gives
+# it a type, and PostgreSQL fails with "could not determine data type of
+# parameter". The operand of an operator that binds tighter than IS
+# (``col + %s IS NULL``, ``%s::text IS NULL``) takes its type from that operator.
+_NULL_TEST = re.compile(r"%s\s+(?:IS\s+(?:NOT\s+)?NULL|ISNULL|NOTNULL)\b")
+_OPERATOR = frozenset("+-*/<>=~!@#%^&|`?")
+_untyped_statements: list[str] = []
 
-    Django's PostgreSQL schema editor adds a foreign key column to an existing
-    table as one statement of two commands, ``ALTER TABLE ... REFERENCES ...;
-    SET CONSTRAINTS ... IMMEDIATE``, and psycopg cannot prepare more than one
-    command. Four migrations of the test app do that; the library's own
-    migrations, and every other statement, run prepared.
+
+def _untyped_null_test(sql: str) -> bool:
+    # After an operator the parameter is that operator's operand; ``%%s`` is literal text.
+    return any(
+        sql[: found.start()].rstrip()[-1:] not in _OPERATOR for found in _NULL_TEST.finditer(sql)
+    )
+
+
+def _watch_untyped_parameters(sender, connection, **kwargs) -> None:
+    """Watch every statement of every connection for a parameter PostgreSQL cannot type.
+
+    Tier 1 runs on SQLite, which types nothing, and tier 2 reaches only the
+    marked tests; so every statement the suite sends, on any vendor, is read
+    here, and ``untyped_parameters`` fails the test that sent one.
+    """
+    if _record_untyped_parameters not in connection.execute_wrappers:
+        # First, so that a test's own execute_wrapper() pops its wrapper, not this one.
+        connection.execute_wrappers.insert(0, _record_untyped_parameters)
+
+
+def _record_untyped_parameters(execute, sql, params, many, context):
+    if params and isinstance(sql, str) and _untyped_null_test(sql):
+        frames = [frame for frame in traceback.extract_stack()[:-1] if "/rebac/" in frame.filename]
+        _untyped_statements.append(f"{sql}\n{''.join(traceback.format_list(frames[-4:]))}")
+    return execute(sql, params, many, context)
+
+
+@pytest.fixture(autouse=True)
+def untyped_parameters():
+    """Fail a test during which a statement tested a bare parameter for NULL.
+
+    The statement runs as it would, so a caller that catches the error it
+    raises on PostgreSQL cannot hide it here. A statement sent outside a
+    test's own run (creating the test database, another fixture's teardown)
+    is reported by the next test that ends.
+    """
+    yield
+    if _untyped_statements:
+        found = "\n\n".join(_untyped_statements)
+        _untyped_statements.clear()
+        pytest.fail(
+            "A statement tests a bare parameter with IS [NOT] NULL, which PostgreSQL cannot "
+            f"type under server-side binding:\n\n{found}",
+            pytrace=False,
+        )
+
+
+def _run_two_command_ddl_unprepared(sender, connection, **kwargs) -> None:
+    """Under ``prepare_threshold = 0``, run Django's two-command schema statements unprepared.
+
+    Django's PostgreSQL schema editor sends some schema changes as one
+    statement of two commands: adding a foreign key column to an existing
+    table (``ALTER TABLE ... REFERENCES ...; SET CONSTRAINTS ... IMMEDIATE``),
+    as four migrations of the test app do, dropping a foreign key, and filling
+    a default when a column becomes NOT NULL. At threshold 0 psycopg prepares
+    every statement on its first execution, and PostgreSQL refuses to prepare
+    more than one command ("cannot insert multiple commands into a prepared
+    statement"). A threshold of 1 or more never prepares them: psycopg
+    prepares a statement from its second execution, and forgets one that
+    returned more than one result. The library's own migrations, and every
+    other statement, run prepared.
     """
     if _unprepared_ddl not in connection.execute_wrappers:
         # First, so that a test's own execute_wrapper() pops its wrapper, not this one.
@@ -32,7 +99,8 @@ def _run_two_command_ddl_unprepared(sender, connection, **kwargs) -> None:
 
 
 def _unprepared_ddl(execute, sql, params, many, context):
-    if params is not None or many or not isinstance(sql, str) or "; SET CONSTRAINTS " not in sql:
+    # The schema editor sends its statements composed, without parameters.
+    if params is not None or many or not isinstance(sql, str) or ";" not in sql.rstrip("; "):
         return execute(sql, params, many, context)
     raw = context["connection"].connection
     threshold, raw.prepare_threshold = raw.prepare_threshold, None

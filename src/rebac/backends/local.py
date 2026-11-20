@@ -138,6 +138,11 @@ def _every_id(resource_type: str, using: str) -> list[str]:
     return sorted({str(value) for value in rows})
 
 
+def _candidates(ids: Iterable[str]) -> tuple[str, ...]:
+    """The candidate ids of ``held``, a ``None`` read as the empty id, as ``ObjectRef`` reads it."""
+    return tuple("" if value is None else value for value in ids)
+
+
 class LocalBackend:
     """Evaluates permissions as queries over the application's own tables.
 
@@ -720,6 +725,7 @@ class LocalBackend:
         from ..compile.read import held
         from ..models import active_relationship_model
 
+        ids = _candidates(ids)
         if not _enforcing():
             return {value for value in ids if value}
         alias = using or active_relationship_model().objects.db
@@ -765,6 +771,7 @@ class LocalBackend:
         from ..compile.read import held_many
         from ..models import active_relationship_model
 
+        ids = _candidates(ids)
         if not _enforcing():
             if isinstance(actions, str):
                 raise TypeError("actions must be an iterable of names, not a bare string")

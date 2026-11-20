@@ -1733,7 +1733,12 @@ primary key needs no consumer-specific identity override.
 Model identity resolution rejects `None` and empty strings before constructing
 an object reference. Empty resource IDs are model-level backend-check sentinels,
 asking for any accessible row or a row-independent grant; they are not the
-identities of saved rows. Proposed-row create checks use `check_new()` with
+identities of saved rows. An `ObjectRef` constructed with `None` as its id
+holds the empty id, and `held()` and `held_many()` read a `None` candidate as
+the empty id: every entry answers `None` as it answers the empty id,
+relationship writes refuse both, and no statement receives `None` as an
+object's id. A `SubjectRef` over such a reference is the actor with the empty
+id. Proposed-row create checks use `check_new()` with
 the candidate's relationship overlay, and so does
 `instance.check_access("create")` on an unsaved instance: it asks about that
 candidate, not about any row. Every other action on an unsaved instance keeps
@@ -4026,12 +4031,27 @@ Three layers of tests define the project target:
 The supported matrix is declared once, in `pyproject.toml` (`requires-python`,
 the Django pin) and `.github/workflows/ci.yml`; at the time of writing that is
 Python 3.14 × Django 6.1, with SQLite and PostgreSQL 16 for the `local`
-backend. On PostgreSQL both of Django's parameter bindings are supported and
-tested: the default, where psycopg interpolates parameters into the statement,
-and server-side binding with prepared statements (`OPTIONS =
-{"server_side_binding": True, "prepare_threshold": 0}`), where PostgreSQL must
-type every parameter from its context. `REBAC_TEST_POSTGRES_BINDING=server`
-selects the second for any PostgreSQL target (`tests/settings_postgres.py`).
+backend.
+
+On PostgreSQL the library's statements are valid under both of Django's
+parameter bindings: the default, where psycopg interpolates parameters into the
+statement, and server-side binding (`OPTIONS = {"server_side_binding": True}`),
+where PostgreSQL must type every parameter from its context, with statements
+prepared at any `prepare_threshold`. The suite runs under the default and under
+server-side binding with every statement prepared (`"prepare_threshold": 0`):
+`REBAC_TEST_POSTGRES_BINDING=server` selects the second for the targets that
+read `tests/settings_postgres.py`; the `schema_vendors` contracts keep each
+driver's default binding. One limit is Django's own. Its PostgreSQL schema
+editor sends some schema changes as one statement of two commands: adding a
+foreign-key column to an existing table, dropping a foreign key, filling a
+default when a column becomes `NOT NULL`. PostgreSQL refuses to prepare a
+statement of two commands, and at threshold 0 psycopg prepares every statement
+on its first execution, so a migration that makes such a change fails. At a
+threshold of 1 or more psycopg prepares a statement only from its second
+execution, and never one that returned two results, so schema statements run
+unprepared and migrations succeed. The suite, at threshold 0, runs those
+statements unprepared (`tests/conftest.py`).
+
 Test databases and temporary files must be worker-local, and fixtures
 must restore process-local state between tests, so any test can run on any
 worker in any order. Random ordering is opt-in with
@@ -4084,6 +4104,12 @@ Rules that keep the tiers honest:
   migrations), and every test that has ever failed on PostgreSQL while passing
   on SQLite, under either binding. A PostgreSQL-only failure found in tier 3
   adds that test to `pg_delta` in the same change that fixes it.
+- **Tier 1 reads every statement for a parameter PostgreSQL cannot type.**
+  SQLite types no parameter, and tier 2 runs only the marked tests, so
+  `tests/conftest.py` reads each statement every test sends, on any vendor,
+  and fails the test during which one tests a bare parameter with `IS NULL` or
+  `IS NOT NULL`: psycopg's server-side binding sends a string or `None`
+  untyped, and nothing there gives PostgreSQL a type.
 - **A vendor-specific test skips, it does not return.** A test that cannot run
   on the current vendor calls `pytest.skip`; an early `return` reports a pass
   for something that did not run.
@@ -4247,9 +4273,10 @@ nodes but assigns the sides of the lookups they share; `Query.resolve_expression
 keeps those sides and discards the node it resolved; and `Lookup.process_lhs`
 resolves a condition again where its statement compiles. Database floors follow Django 6.1:
 PostgreSQL 15, MySQL 8.4, SQLite 3.37. On PostgreSQL, psycopg's server-side
-binding and prepared statements (`server_side_binding`, `prepare_threshold`)
-are supported and tested beside the default binding
-([Testing](#testing)).
+binding (`server_side_binding`) is supported beside the default binding, with
+prepared statements at any `prepare_threshold`; at threshold 0 PostgreSQL
+refuses Django's own two-command schema statements, so use 1 or more where
+migrations run ([Testing](#testing)).
 
 Public API (`rebac.*` direct imports + the schema language) is intended to be
 stable across patch releases. `rebac._internal.*` is private.

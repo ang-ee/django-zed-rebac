@@ -8,6 +8,7 @@ from django.test import override_settings
 from django.utils import timezone
 
 from rebac import (
+    CheckItem,
     ObjectRef,
     PermissionDepthExceeded,
     RelationshipTuple,
@@ -1343,6 +1344,48 @@ def test_model_level_check_of_a_type_level_exclusion_ignores_concrete_bans(insta
         subjects=[user("alice"), user("bob")], resources=[doc(""), doc("one")], actions=["read"]
     )
     assert _check(doc(""), "read", user("alice")).allowed
+
+
+def test_a_none_id_is_the_empty_id(install, settings):
+    """``None`` as an object's id is read as the empty id, by every check and by ``held``.
+
+    A chain longer than the depth limit leaves the recursion unconverged, and
+    the statement at the empty id tests the id for NULL there: bound as NULL,
+    that test made ``recban`` hold for ``None`` and not for the empty id.
+    ``held`` point-checks the candidates of a type that stores no rows, and
+    the empty id is not one; a ``None`` among them was checked at the type.
+    """
+    settings.REBAC_DEPTH_LIMIT = 2
+    install("""
+        definition auth/user {}
+        definition test/doc {
+            relation a: auth/user
+            relation parent: test/doc
+            permission rec = a + parent->rec
+            permission recban = authenticated - rec
+            permission open = authenticated - a
+        }
+    """)
+    seed(
+        ["test/doc:x0#a@auth/user:alice"]
+        + [f"test/doc:x{i + 1}#parent@test/doc:x{i}" for i in range(6)]
+    )
+    alice = user("alice")
+    none = ObjectRef("test/doc", None)  # type: ignore[arg-type]
+    assert none == doc("")
+    assert _check(none, "recban", alice) == _check(doc(""), "recban", alice) == CheckResult.no()
+    assert backend().check_bulk_permissions([CheckItem(alice, "recban", none)]) == [
+        CheckResult.no()
+    ]
+    for nil in (None, ""):
+        ids = [nil, "x0", "other"]
+        assert backend().held(subject=alice, action="open", resource_type="test/doc", ids=ids) == {
+            "other"
+        }
+        assert backend().held_many(
+            subject=alice, actions=["open"], resource_type="test/doc", ids=ids
+        ) == {"open": {"other"}}
+        assert not backend().held(subject=alice, action="open", resource_type="test/doc", ids=[nil])
 
 
 def test_subject_enumeration_lists_named_subjects_and_nobody_by_class(install):

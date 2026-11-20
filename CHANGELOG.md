@@ -5,22 +5,52 @@ pre-1.0; breaking changes within a minor version are explicitly called out.
 
 ## [Unreleased]
 
+### Changed
+
+- **An object id of `None` is the empty id.** `ObjectRef` holds a `None` id as `""`, and `held()` and
+  `held_many()` read a `None` candidate as `""`, so every entry answers a `None` id as it answers the empty id,
+  the model-level sentinel, and no statement receives `None` as an object's id. Relationship writes refuse it, as
+  before. Three answers change for a `None` resource id:
+  - `check_access()` and `check_bulk_permissions()` of a permission that excludes a recursion, such as
+    `authenticated - rec` with `rec = a + parent->rec`, while a chain of that recursion is longer than
+    `REBAC_DEPTH_LIMIT`. The statement at the type tested the id for NULL where the recursion had not
+    converged; bound as NULL, that test failed, the exclusion did not apply and the check answered `HAS`. It
+    answers `NO`, as for the empty id.
+  - `held()` and `held_many()` on a type that stores no rows returned `None` as held when the actor held the
+    action at the type, and raised `TypeError` when `None` stood beside other ids. `None` is not a candidate, as
+    the empty id is not.
+  - `lookup_subjects()` took the candidates of a field-backed relation from every row of its model, and returned
+    those that a row-independent arm grants. It returns what it returns for the empty id.
+
+  A `SubjectRef` is built on an `ObjectRef`, so an actor whose id is `None` is the actor with the empty id:
+  `authenticated` held for it and no longer does, and a relationship written with an empty subject id now names
+  it, as it names the empty id.
+
 ### Fixed
 
 - **Statements are valid under psycopg's server-side binding and prepared statements.** With Django's
-  PostgreSQL options `server_side_binding: True` and `prepare_threshold`, parameters reach PostgreSQL apart from
-  the statement, and it must type each one from its context. A point check (a create-rule check,
+  PostgreSQL option `server_side_binding: True`, parameters reach PostgreSQL apart from the statement, and it
+  must type each one from its context; `prepare_threshold` does not matter. A point check (a create-rule check,
   `check_access`, `held`, `held_many`) whose permission reached a stored relation's closure, an attribute
   relation or a recursion tested its resource id parameter as `%s IS NOT NULL`, which gives the parameter no
   type, and failed with `could not determine data type of parameter $n`. That parameter is bound to the
-  resource's id and is never NULL, so the test is now decided while compiling and not sent: under either
-  binding, and on every database, those statements lose `%s IS NOT NULL` and one parameter. Rows, decisions
-  and statement counts do not change. No other statement the library sends depends on the binding: none sets
-  a parameter in `SET` or DDL, and none sends two commands at once.
+  resource's id, which is never `None` (above), so the test is now decided while compiling and not sent: under
+  either binding, and on every database, those statements lose `%s IS NOT NULL` and one parameter. Rows and
+  statement counts do not change, nor do decisions, except for a `None` id (above). No other statement the
+  library sends depends on the binding: none sets a parameter in `SET` or DDL, and none sends two commands at
+  once.
 
 - Tier 2 and the nightly whole-suite PostgreSQL job run under both bindings (`REBAC_TEST_POSTGRES_BINDING=server`,
-  read by `tests/settings_postgres.py`), and the 39 tests that failed only under server-side binding are marked
-  `pg_delta`.
+  read by `tests/settings_postgres.py`), and the tests that failed only under server-side binding, slow ones
+  included, are marked `pg_delta`. Tier 1 fails a test during which any statement tests a bare parameter with
+  `IS NULL` or `IS NOT NULL` (`tests/conftest.py`), so the shape is caught on SQLite, in every test.
+
+### Documentation
+
+- `README.md` and ARCHITECTURE.md § Testing say what is supported on PostgreSQL (server-side binding, prepared
+  statements at any `prepare_threshold`) and what is Django's own limit: at threshold 0 PostgreSQL refuses to
+  prepare the schema editor's two-command statements, such as adding a foreign-key column to an existing table,
+  so such a migration fails; from threshold 1 psycopg prepares a statement only from its second execution.
 
 ## [0.38.0] — 2026-11-24
 

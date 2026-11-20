@@ -914,7 +914,8 @@ def _point_statement(
     verdicts = operation.verdicts(key)
 
     def build() -> models.QuerySet[Any] | bool:
-        at = At(key[0], _Param(_RESOURCE_WIRE, models.TextField()), None, False)
+        # Bound to an ObjectRef's id, which is a string, never None.
+        at = At(key[0], _Param(_RESOURCE_WIRE, models.TextField(), never_null=True), None, False)
         point = PointRow(at.ref, row_types) if row_types is not None else None
         compiler = operation.compiler(verdicts, point=point)
         if which == "depth":
