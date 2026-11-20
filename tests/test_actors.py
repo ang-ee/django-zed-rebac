@@ -107,6 +107,25 @@ def test_unsaved_rebac_model_subject_raises():
         to_subject_ref(SubjectContainer(slug="reviewers", title="Reviewers"))
 
 
+@pytest.mark.django_db
+def test_an_unsaved_group_is_no_subject():
+    from django.contrib.auth.models import Group
+
+    with pytest.raises(NoActorResolvedError, match="no pk"):
+        to_subject_ref(Group(name="ghosts"))
+
+
+@pytest.mark.parametrize("public_id", [None, ""])
+def test_a_registered_subject_without_an_id_is_no_subject(public_id):
+    @rebac_subject(type="auth/apikey", id_attr="public_id")
+    class ApiKey:
+        def __init__(self, value: str | None) -> None:
+            self.public_id = value
+
+    with pytest.raises(NoActorResolvedError, match="no public_id"):
+        to_subject_ref(ApiKey(public_id))
+
+
 def test_unknown_actor_raises():
     with pytest.raises(NoActorResolvedError):
         to_subject_ref(object())

@@ -72,14 +72,17 @@ gh run view <run-id> --log-failed               # the log of each failed step
   database whose role may create databases. Pytest-django adds worker-specific
   test database names. `tests.settings_postgres` fails if the URL is absent;
   it never uses SQLite.
-- `REBAC_TEST_POSTGRES_BINDING` picks how psycopg binds parameters for the
-  targets that read `tests.settings_postgres` (`make test-pg`,
-  `make test-postgres`, `make test-pg-scale`) and for the benchmark: `client`
-  (the default, Django's) or `server`, which sets Django's
-  `server_side_binding` and `prepare_threshold = 0`. Under `server` PostgreSQL
-  types each parameter from its context, so a parameter it cannot type fails
-  the statement. The URL cannot carry these options (Django reads typed
-  values), and `tests.settings_postgres` refuses them there. The
+- `REBAC_TEST_POSTGRES_BINDING` picks how psycopg binds parameters for
+  `make test-pg`, `make test-postgres` and the benchmark: `client` (the
+  default, Django's) or `server`, which sets Django's `server_side_binding`
+  and `prepare_threshold = 0`. Under `server` PostgreSQL types each parameter
+  from its context, so a parameter it cannot type fails the statement; that
+  run tests that statements are valid and return the same rows and decisions.
+  The URL cannot carry these options (Django reads typed values), and
+  `tests.settings_postgres` refuses them there. `make test-pg-scale` runs
+  under the default binding whatever the variable says: its frozen plan
+  fingerprints are that binding's plans, and a parameter bound on the server
+  shows its type in a plan's filter (`'1'::smallint` for `1`). The
   `schema_vendors` contracts start their own containers with each driver's
   default binding: they test schema ownership, upgrades and MySQL, and the
   PostgreSQL targets test parameter typing under both bindings.
@@ -91,9 +94,10 @@ gh run view <run-id> --log-failed               # the log of each failed step
   do; `tests/conftest.py` runs those statements unprepared.
 - SQLite types no parameter, so tier 1 alone would not see one that
   PostgreSQL cannot type. `tests/conftest.py` reads every statement the suite
-  sends, on any vendor, and fails the test during which a statement tests a
-  bare parameter with `IS NULL` or `IS NOT NULL`, the shape PostgreSQL refuses
-  under server-side binding.
+  sends, on any vendor, for one such shape, a parameter tested for NULL, and
+  fails the test that sent one (the forms it reads are in
+  `tests/test_untyped_parameter_check.py`). Any other untypable parameter is
+  found by tier 2 under `REBAC_TEST_POSTGRES_BINDING=server`.
 - The PostgreSQL targets need the driver: `uv sync --group postgres`
   (add the extras from `make install-dev` to keep them). The vendor contracts
   need Docker and both drivers: `uv sync --group postgres --group mysql`;

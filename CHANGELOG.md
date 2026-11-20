@@ -7,10 +7,11 @@ pre-1.0; breaking changes within a minor version are explicitly called out.
 
 ### Changed
 
-- **An object id of `None` is the empty id.** `ObjectRef` holds a `None` id as `""`, and `held()` and
-  `held_many()` read a `None` candidate as `""`, so every entry answers a `None` id as it answers the empty id,
-  the model-level sentinel, and no statement receives `None` as an object's id. Relationship writes refuse it, as
-  before. Three answers change for a `None` resource id:
+- **An object id of `None` is the empty id.** `ObjectRef` holds a `None` id as `""`, `SubjectRef.of()` reads a
+  `None` id as `""` where it gave `"None"`, and `held()` and `held_many()` read a `None` candidate as `""`, so
+  every entry answers a `None` id as it answers the empty id, the model-level sentinel, and no statement receives
+  `None` as an object's id. Relationship writes refuse it, as a resource id as before and as a subject id now
+  (below). Three answers change for a `None` resource id:
   - `check_access()` and `check_bulk_permissions()` of a permission that excludes a recursion, such as
     `authenticated - rec` with `rec = a + parent->rec`, while a chain of that recursion is longer than
     `REBAC_DEPTH_LIMIT`. The statement at the type tested the id for NULL where the recursion had not
@@ -23,8 +24,20 @@ pre-1.0; breaking changes within a minor version are explicitly called out.
     those that a row-independent arm grants. It returns what it returns for the empty id.
 
   A `SubjectRef` is built on an `ObjectRef`, so an actor whose id is `None` is the actor with the empty id:
-  `authenticated` held for it and no longer does, and a relationship written with an empty subject id now names
-  it, as it names the empty id.
+  `authenticated` held for it and no longer does, and a relationship stored with an empty subject id, by an
+  earlier version or directly through the relationship models, names it as it names the empty id.
+  `to_subject_ref()` refuses a Django group or a `@rebac_subject` instance whose id is `None` or empty
+  (`NoActorResolvedError`), as it refuses an unsaved user, where it gave the id `"None"` or `""`.
+
+- **A relationship write with an empty subject id is refused.** `write_relationships()` (the backend's and
+  `rebac`'s), and the helpers that write through it (`memberships.grant()`, `roles.grant()`, `roles.imply()`),
+  accepted a subject whose id is `""` and stored a row that every actor with the empty id holds. With the
+  normalisation above a `None` subject id did the same, where it had failed on the column's `NOT NULL`
+  constraint. Both now raise `ValueError: Subject IDs cannot be empty.` before anything is written, as an empty
+  resource id does; a wildcard subject is `*`. Rows already stored keep their meaning. Deletes and filters are
+  unchanged: `RelationshipFilter` reads an empty or `None` field as any value, and `delete_relationship()` and
+  `memberships.revoke()` match the empty id exactly, which a `None` subject id now is too, so such a call can
+  remove a stored row with an empty subject id where it matched nothing; removing one only takes access away.
 
 ### Fixed
 
@@ -42,15 +55,20 @@ pre-1.0; breaking changes within a minor version are explicitly called out.
 
 - Tier 2 and the nightly whole-suite PostgreSQL job run under both bindings (`REBAC_TEST_POSTGRES_BINDING=server`,
   read by `tests/settings_postgres.py`), and the tests that failed only under server-side binding, slow ones
-  included, are marked `pg_delta`. Tier 1 fails a test during which any statement tests a bare parameter with
-  `IS NULL` or `IS NOT NULL` (`tests/conftest.py`), so the shape is caught on SQLite, in every test.
+  included, are marked `pg_delta`. Tier 1 fails a test during which a statement tests a parameter for NULL
+  (`tests/conftest.py`, the forms it reads in `tests/test_untyped_parameter_check.py`): that one shape is caught on
+  SQLite, in every test, and the tier 2 run under server-side binding is the guard for every other.
 
 ### Documentation
 
 - `README.md` and ARCHITECTURE.md § Testing say what is supported on PostgreSQL (server-side binding, prepared
   statements at any `prepare_threshold`) and what is Django's own limit: at threshold 0 PostgreSQL refuses to
   prepare the schema editor's two-command statements, such as adding a foreign-key column to an existing table,
-  so such a migration fails; from threshold 1 psycopg prepares a statement only from its second execution.
+  so such a migration fails; from threshold 1 psycopg prepares a statement only from its second execution. They
+  also say what the run under server-side binding tests: statements are valid and return the same rows and
+  decisions. Plans are tested under the default binding only: `make test-pg-scale` runs under it whatever
+  `REBAC_TEST_POSTGRES_BINDING` says, since its frozen plan fingerprints are that binding's, and no test covers
+  the generic plans PostgreSQL may give a prepared statement after its fifth execution.
 
 ## [0.38.0] — 2026-11-24
 

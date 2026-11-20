@@ -21,30 +21,71 @@ def pytest_configure() -> None:
         connection_created.connect(_run_two_command_ddl_unprepared, dispatch_uid=__name__)
 
 
-# A statement PostgreSQL refuses under psycopg's server-side binding, and SQLite,
-# which types no parameter, runs: a bare parameter as the operand of IS [NOT]
+# One shape of statement that PostgreSQL refuses under psycopg's server-side
+# binding, and SQLite, which types no parameter, runs: a parameter tested for
 # NULL. psycopg sends a str or None untyped, nothing around the parameter gives
 # it a type, and PostgreSQL fails with "could not determine data type of
-# parameter". The operand of an operator that binds tighter than IS
-# (``col + %s IS NULL``, ``%s::text IS NULL``) takes its type from that operator.
-_NULL_TEST = re.compile(r"%s\s+(?:IS\s+(?:NOT\s+)?NULL|ISNULL|NOTNULL)\b")
+# parameter". Read: the parameter, alone or in parentheses, then comments, then
+# IS [NOT] NULL, ISNULL, NOTNULL or IS [NOT] DISTINCT FROM NULL, in any case.
+# The shape is flagged whatever value the test binds: psycopg types an int, but
+# the same statement is bound to a string for another identity type. Not
+# flagged: the operand of an operator that binds tighter than IS (``col + %s IS
+# NULL``, ``%s::text IS NULL``, also unary ``-%s``) or the argument of a function
+# (``f(%s) IS NULL``), and every other untypable shape, such as a parameter of a
+# function that takes any type. The tier 2 run under server-side binding is the
+# general guard; this one sees every test, in tier 1.
+_GAP = r"(?:\s|/\*.*?\*/|--[^\n]*\n)*"
+_NULL_TEST = re.compile(
+    rf"%s(?P<closing>(?:{_GAP}\))*){_GAP}"
+    r"(?i:IS\s+(?:NOT\s+)?(?:NULL|DISTINCT\s+FROM\s+NULL)|ISNULL|NOTNULL)\b",
+    re.DOTALL,
+)
 _OPERATOR = frozenset("+-*/<>=~!@#%^&|`?")
+# Words after which a parenthesis opens an expression, not a function's arguments.
+_KEYWORDS = frozenset(
+    {"AND", "OR", "NOT", "WHERE", "WHEN", "THEN", "ELSE", "ON", "SELECT", "HAVING", "RETURNING"}
+)
 _untyped_statements: list[str] = []
 
 
 def _untyped_null_test(sql: str) -> bool:
-    # After an operator the parameter is that operator's operand; ``%%s`` is literal text.
     return any(
-        sql[: found.start()].rstrip()[-1:] not in _OPERATOR for found in _NULL_TEST.finditer(sql)
+        _bare(sql[: found.start()], found["closing"].count(")"))
+        for found in _NULL_TEST.finditer(sql)
     )
 
 
+def _bare(before: str, parentheses: int) -> bool:
+    """Whether the parameter after ``before``, closed by ``parentheses``, is tested alone."""
+    before = _uncommented(before)
+    for _ in range(parentheses):
+        if not before.endswith("("):
+            # ``f(x, %s) IS NULL``: the parenthesis closes a call, whose result is tested.
+            return False
+        before = _uncommented(before[:-1])
+    word = re.search(r"[\w$\"]+$", before)
+    if parentheses and word is not None:
+        # ``f(%s) IS NULL`` calls a function; ``WHERE (%s) IS NULL`` does not.
+        return word.group().upper() in _KEYWORDS
+    # After an operator the parameter is that operator's operand; ``%%s`` is literal text.
+    return before[-1:] not in _OPERATOR
+
+
+def _uncommented(sql: str) -> str:
+    """``sql`` without the whitespace and block comments it ends with."""
+    sql = sql.rstrip()
+    while sql.endswith("*/") and "/*" in sql:
+        sql = sql[: sql.rindex("/*")].rstrip()
+    return sql
+
+
 def _watch_untyped_parameters(sender, connection, **kwargs) -> None:
-    """Watch every statement of every connection for a parameter PostgreSQL cannot type.
+    """Watch every statement of every connection for a parameter tested for NULL.
 
     Tier 1 runs on SQLite, which types nothing, and tier 2 reaches only the
     marked tests; so every statement the suite sends, on any vendor, is read
-    here, and ``untyped_parameters`` fails the test that sent one.
+    here for that one shape, and ``untyped_parameters`` fails the test that
+    sent one.
     """
     if _record_untyped_parameters not in connection.execute_wrappers:
         # First, so that a test's own execute_wrapper() pops its wrapper, not this one.
@@ -60,7 +101,7 @@ def _record_untyped_parameters(execute, sql, params, many, context):
 
 @pytest.fixture(autouse=True)
 def untyped_parameters():
-    """Fail a test during which a statement tested a bare parameter for NULL.
+    """Fail a test during which a statement tested a parameter for NULL.
 
     The statement runs as it would, so a caller that catches the error it
     raises on PostgreSQL cannot hide it here. A statement sent outside a
@@ -72,8 +113,8 @@ def untyped_parameters():
         found = "\n\n".join(_untyped_statements)
         _untyped_statements.clear()
         pytest.fail(
-            "A statement tests a bare parameter with IS [NOT] NULL, which PostgreSQL cannot "
-            f"type under server-side binding:\n\n{found}",
+            "A statement tests a parameter for NULL, which PostgreSQL cannot type under "
+            f"server-side binding:\n\n{found}",
             pytrace=False,
         )
 

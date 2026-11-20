@@ -1731,15 +1731,22 @@ their stored values. Relation descriptors returning model objects are rejected.
 The relation's underlying target field owns column conversion; a parent-link
 primary key needs no consumer-specific identity override.
 Model identity resolution rejects `None` and empty strings before constructing
-an object reference. Empty resource IDs are model-level backend-check sentinels,
+an object reference, and `to_subject_ref()` rejects them for every kind of
+principal. Empty resource IDs are model-level backend-check sentinels,
 asking for any accessible row or a row-independent grant; they are not the
-identities of saved rows. An `ObjectRef` constructed with `None` as its id
-holds the empty id, and `held()` and `held_many()` read a `None` candidate as
-the empty id: every entry answers `None` as it answers the empty id,
-relationship writes refuse both, and no statement receives `None` as an
-object's id. A `SubjectRef` over such a reference is the actor with the empty
-id. Proposed-row create checks use `check_new()` with
-the candidate's relationship overlay, and so does
+identities of saved rows. One rule holds for `None`: every constructor of a
+reference reads it as the empty id (`ObjectRef(type, None)`,
+`SubjectRef(ObjectRef(type, None))`, `SubjectRef.of(type, None)`), and `held()`
+and `held_many()` read a `None` candidate the same way. Every entry answers
+`None` as it answers the empty id, and no statement receives `None` as an
+object's id. `write_relationships()`, and the helpers that write through it
+(`memberships.grant()`, `roles.grant()`, `roles.imply()`), refuse an empty
+resource id and an empty subject id, `None` included: a wildcard subject is
+`*`, and an empty id names nothing. A `SubjectRef` whose id is empty is the
+actor with the empty id; a row that names it can come only from an earlier
+version or from a direct write to the relationship models, which store rows as
+written. Proposed-row create
+checks use `check_new()` with the candidate's relationship overlay, and so does
 `instance.check_access("create")` on an unsaved instance: it asks about that
 candidate, not about any row. Every other action on an unsaved instance keeps
 the model-level sentinel, which answers for any row of the type: a
@@ -4039,9 +4046,16 @@ statement, and server-side binding (`OPTIONS = {"server_side_binding": True}`),
 where PostgreSQL must type every parameter from its context, with statements
 prepared at any `prepare_threshold`. The suite runs under the default and under
 server-side binding with every statement prepared (`"prepare_threshold": 0`):
-`REBAC_TEST_POSTGRES_BINDING=server` selects the second for the targets that
-read `tests/settings_postgres.py`; the `schema_vendors` contracts keep each
-driver's default binding. One limit is Django's own. Its PostgreSQL schema
+`REBAC_TEST_POSTGRES_BINDING=server` selects the second for `make test-pg` and
+`make test-postgres`. What that second run tests is that every statement is
+valid and returns the same rows and decisions. Plans are tested under the
+default binding only: `make test-pg-scale` runs under it whatever the variable
+says, because its frozen plan fingerprints are that binding's plans (a
+parameter bound on the server shows its type in a plan's filter, `'1'::smallint`
+for `1`). PostgreSQL may also move a statement psycopg has prepared to a generic
+plan after its fifth execution (`plan_cache_mode = auto`); no test covers the
+plans of prepared statements. The `schema_vendors` contracts keep each driver's
+default binding. One limit is Django's own. Its PostgreSQL schema
 editor sends some schema changes as one statement of two commands: adding a
 foreign-key column to an existing table, dropping a foreign key, filling a
 default when a column becomes `NOT NULL`. PostgreSQL refuses to prepare a
@@ -4104,12 +4118,19 @@ Rules that keep the tiers honest:
   migrations), and every test that has ever failed on PostgreSQL while passing
   on SQLite, under either binding. A PostgreSQL-only failure found in tier 3
   adds that test to `pg_delta` in the same change that fixes it.
-- **Tier 1 reads every statement for a parameter PostgreSQL cannot type.**
-  SQLite types no parameter, and tier 2 runs only the marked tests, so
-  `tests/conftest.py` reads each statement every test sends, on any vendor,
-  and fails the test during which one tests a bare parameter with `IS NULL` or
-  `IS NOT NULL`: psycopg's server-side binding sends a string or `None`
-  untyped, and nothing there gives PostgreSQL a type.
+- **Tier 1 checks one shape of untypable parameter; tier 2 is the general
+  guard.** SQLite types no parameter, and tier 2 runs only the marked tests,
+  so `tests/conftest.py` reads each statement every test sends, on any
+  vendor, and fails the test during which one tests a parameter for NULL: the
+  parameter, alone or in parentheses, then comments, then `IS [NOT] NULL`,
+  `ISNULL`, `NOTNULL` or `IS [NOT] DISTINCT FROM NULL`, in any case.
+  psycopg's server-side binding sends a string or `None` untyped, and nothing
+  there gives PostgreSQL a type. The shape is refused whatever value the test
+  binds, an int included, because the same statement is bound to a string for
+  another identity type. Every other untypable shape (a unary operator on a
+  parameter, a parameter of a function that takes any type) is left to the
+  tier 2 run under server-side binding (`tests/test_untyped_parameter_check.py`
+  lists both).
 - **A vendor-specific test skips, it does not return.** A test that cannot run
   on the current vendor calls `pytest.skip`; an early `return` reports a pass
   for something that did not run.
@@ -4274,9 +4295,10 @@ keeps those sides and discards the node it resolved; and `Lookup.process_lhs`
 resolves a condition again where its statement compiles. Database floors follow Django 6.1:
 PostgreSQL 15, MySQL 8.4, SQLite 3.37. On PostgreSQL, psycopg's server-side
 binding (`server_side_binding`) is supported beside the default binding, with
-prepared statements at any `prepare_threshold`; at threshold 0 PostgreSQL
-refuses Django's own two-command schema statements, so use 1 or more where
-migrations run ([Testing](#testing)).
+prepared statements at any `prepare_threshold`: statements are valid and return
+the same rows and decisions, and plans are tested under the default binding
+only. At threshold 0 PostgreSQL refuses Django's own two-command schema
+statements, so use 1 or more where migrations run ([Testing](#testing)).
 
 Public API (`rebac.*` direct imports + the schema language) is intended to be
 stable across patch releases. `rebac._internal.*` is private.

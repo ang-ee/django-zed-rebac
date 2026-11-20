@@ -1018,6 +1018,9 @@ class LocalBackend:
             raise ValueError("Resource IDs cannot be empty.")
         if tup.resource.resource_id == "*":
             raise ValueError("'*' is reserved for wildcard subjects, not resource IDs.")
+        if not tup.subject.subject_id:
+            # A wildcard subject is ``*``; an empty id names no subject.
+            raise ValueError("Subject IDs cannot be empty.")
         expires_at = tup.expires_at
         if expires_at is not None:
             if (

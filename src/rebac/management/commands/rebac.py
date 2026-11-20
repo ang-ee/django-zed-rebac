@@ -11,6 +11,7 @@ python manage.py rebac migrate-storage --to registry   # registry-storage cutove
 python manage.py rebac grant storage/role:viewer auth/user:42
 python manage.py rebac revoke storage/role:viewer auth/user:42
 python manage.py rebac relationships --resource storage/role:viewer
+python manage.py rebac unset-ids                # rows and principals whose id is unset
 """
 
 from __future__ import annotations
@@ -24,8 +25,9 @@ from pathlib import Path
 from typing import TYPE_CHECKING, Any, cast
 
 from django.apps import apps
+from django.core.exceptions import FieldDoesNotExist
 from django.core.management.base import BaseCommand, CommandError
-from django.db import connections, router
+from django.db import connections, models, router
 from django.db.models import Model, Q
 from django.utils import timezone
 
@@ -60,6 +62,42 @@ def _subject_ref(value: str) -> SubjectRef:
     ):
         raise ValueError(f"Invalid SubjectRef: {value!r} (expected '<type>:<id>[#relation]')")
     return ref
+
+
+# The stored ids an unset id leaves: empty, and the text earlier versions wrote for ``None``.
+_UNSET_IDS = ("", "None")
+
+
+def _principal_models() -> list[tuple[str, type[Model], str]]:
+    """The models ``to_subject_ref()`` resolves by an id attribute, with that attribute."""
+    from django.contrib.auth import get_user_model
+    from django.contrib.auth.models import Group
+
+    from ..._id import subject_id_attr
+    from ...actors import _subject_registry
+    from ...resources import model_resource_type
+
+    found: dict[type[Model], str] = {}
+    for model in (get_user_model(), Group):
+        found[model] = subject_id_attr(model)
+    for cls, (_type, id_attr) in _subject_registry.items():
+        if isinstance(cls, type) and issubclass(cls, Model) and not cls._meta.abstract:
+            found.setdefault(cls, subject_id_attr(cls) if model_resource_type(cls) else id_attr)
+    return sorted(
+        ((model._meta.label, model, attr) for model, attr in found.items()),
+        key=lambda entry: entry[0],
+    )
+
+
+def _stored_field(model: type[Model], attr: str) -> models.Field[Any, Any] | None:
+    """The concrete field an id attribute reads, or ``None`` for a property or a path."""
+    if attr == "pk":
+        return model._meta.pk
+    try:
+        field = model._meta.get_field(attr)
+    except FieldDoesNotExist:
+        return None
+    return field if isinstance(field, models.Field) and field.concrete else None
 
 
 def _require_known_types(*resource_types: str) -> None:
@@ -325,6 +363,15 @@ class Command(BaseCommand):
         p_rels.add_argument("--relation", help="Exact relation name.")
         p_rels.add_argument("--limit", type=int, help="Maximum rows (default: unlimited).")
 
+        p_unset = sub.add_parser(
+            "unset-ids",
+            help=(
+                "List relationship rows whose resource or subject id is empty or 'None', and "
+                "users, groups and registered subjects whose id attribute is unset or 'None'."
+            ),
+        )
+        p_unset.add_argument("--check", action="store_true", help="Fail if anything is listed.")
+
     def handle(self, *args: Any, **options: Any) -> None:
         cmd = options["cmd"]
         if cmd == "sync":
@@ -337,6 +384,8 @@ class Command(BaseCommand):
             self._handle_explain(options)
         elif cmd == "migrate-storage":
             self._handle_migrate_storage(options)
+        elif cmd == "unset-ids":
+            self._handle_unset_ids(options)
         elif cmd in {"grant", "revoke", "relationships"}:
             try:
                 if cmd == "grant":
@@ -431,6 +480,57 @@ class Command(BaseCommand):
             rows = rows[:limit]
         for row in rows.iterator():
             self.stdout.write(str(row))
+
+    # ---------- unset ids ----------
+
+    def _handle_unset_ids(self, options: dict[str, Any]) -> None:
+        """List the rows and principals an unset id leaves behind.
+
+        Rows: a resource or subject id that is empty or the text ``"None"``, which
+        earlier versions stored for a subject resolved from an instance whose id
+        attribute was unset (``str(None)``), and which a direct write to the
+        relationship models can still store. Principals: users, groups and
+        ``@rebac_subject`` models whose id attribute is ``None``, empty or
+        ``"None"``; ``to_subject_ref()`` refuses the first two, and the third holds
+        every row stored under ``"None"``. Read only.
+        """
+        from ...models import RelationshipRegistry, active_relationship_model
+
+        relationship_model = active_relationship_model()
+        rows = cast(
+            "RelationshipQuerySet | RelationshipRegistryQuerySet",
+            relationship_model.objects.filter(
+                Q(resource_id__in=_UNSET_IDS) | Q(subject_id__in=_UNSET_IDS)
+            ),
+        ).order_by_resource()
+        if relationship_model is RelationshipRegistry:
+            rows = cast("RelationshipRegistryQuerySet", rows).select_related(
+                "resource_fk", "subject_fk"
+            )
+        listed = 0
+        for row in rows.iterator():
+            unset = [
+                f"{side} id is {value!r}"
+                for side, value in (("resource", row.resource_id), ("subject", row.subject_id))
+                if value in _UNSET_IDS
+            ]
+            self.stdout.write(f"{row}\t{', '.join(unset)}")
+            listed += 1
+        for label, model, attr in _principal_models():
+            field = _stored_field(model, attr)
+            if field is None:
+                self.stderr.write(f"{label}: {attr} is not a stored field; its rows are not read")
+                continue
+            unset_q = Q(**{f"{attr}__isnull": True})
+            if isinstance(field, (models.CharField, models.TextField)):
+                unset_q |= Q(**{f"{attr}__in": _UNSET_IDS})
+            for pk, value in (
+                model._base_manager.filter(unset_q).order_by("pk").values_list("pk", attr)
+            ):
+                self.stdout.write(f"{label} pk={pk!r}\t{attr} is {value!r}")
+                listed += 1
+        if options["check"] and listed:
+            raise CommandError(f"{listed} relationship rows and principals have an unset id.")
 
     # ---------- sync ----------
 

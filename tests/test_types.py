@@ -33,6 +33,21 @@ def test_subject_ref_with_relation():
     assert s.optional_relation == "member"
 
 
+def test_every_reference_constructor_reads_none_as_the_empty_id():
+    """One rule: a reference built from ``None`` holds the empty id, never ``"None"``."""
+    from dataclasses import replace
+
+    empty = ObjectRef("blog/post", "")
+    assert ObjectRef("blog/post", None) == empty  # type: ignore[arg-type]
+    assert ObjectRef.parse("blog/post:") == empty
+    assert replace(ObjectRef("blog/post", "1"), resource_id=None) == empty  # type: ignore[arg-type]
+    assert SubjectRef(ObjectRef("auth/user", None)).subject_id == ""  # type: ignore[arg-type]
+    assert SubjectRef.of("auth/user", None) == SubjectRef.of("auth/user", "")  # type: ignore[arg-type]
+    assert str(SubjectRef.of("auth/group", None, "member")) == "auth/group:#member"  # type: ignore[arg-type]
+    # Any other id is its string, as before.
+    assert SubjectRef.of("auth/user", 42).subject_id == "42"  # type: ignore[arg-type]
+
+
 def test_subject_ref_round_trip():
     raw = "agents/grant:abc#valid"
     s = SubjectRef.parse(raw)

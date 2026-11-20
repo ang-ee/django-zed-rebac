@@ -1388,6 +1388,49 @@ def test_a_none_id_is_the_empty_id(install, settings):
         assert not backend().held(subject=alice, action="open", resource_type="test/doc", ids=[nil])
 
 
+def test_an_empty_subject_id_is_refused_on_write(install):
+    """No writer stores a relationship whose subject id is empty or ``None``.
+
+    Such a row would name the actor with the empty id, and with it every actor
+    whose id is ``None``.
+    """
+    from rebac import memberships, roles, write_relationships
+    from rebac.models import RebacResource, active_relationship_model
+
+    install("""
+        definition auth/user {}
+        definition test/role {
+            relation member: auth/user
+            relation includes: test/role
+        }
+        definition test/doc {
+            relation a: auth/user
+            permission view = a
+        }
+    """)
+    doc_e = doc("e")
+    for nil in (None, ""):
+        user = SubjectRef(ObjectRef("auth/user", nil))  # type: ignore[arg-type]
+        role = ObjectRef("test/role", nil)  # type: ignore[arg-type]
+        tuple_ = RelationshipTuple(doc_e, "a", user)
+        writes = [
+            (backend().write_relationships, ([tuple_],), {}),
+            (write_relationships, ([tuple_],), {}),
+            (memberships.grant, (), {"subject": user, "container": "test/role:r"}),
+            (roles.grant, (), {"actor": user, "role": "test/role:r"}),
+            (roles.imply, (), {"parent": "test/role:r", "child": role}),
+        ]
+        for write, args, kwargs in writes:
+            with pytest.raises(ValueError, match="Subject IDs cannot be empty"):
+                write(*args, **kwargs)
+            assert not active_relationship_model()._base_manager.exists(), write
+    assert not RebacResource.objects.filter(resource_id="").exists()
+    for nil in (None, ""):
+        actor = SubjectRef(ObjectRef("auth/user", nil))  # type: ignore[arg-type]
+        assert _check(doc_e, "view", actor) == CheckResult.no()
+        assert _accessible("view", actor) == []
+
+
 def test_subject_enumeration_lists_named_subjects_and_nobody_by_class(install):
     active = install("""
         definition auth/user {}

@@ -72,7 +72,8 @@ class SubjectRef:
 
     @classmethod
     def of(cls, type_: str, id_: str, relation: str = "") -> SubjectRef:
-        return cls(ObjectRef(type_, str(id_)), relation)
+        """``id_`` as a string, ``None`` as the empty id (as ``ObjectRef`` holds it)."""
+        return cls(ObjectRef(type_, "" if id_ is None else str(id_)), relation)
 
 
 class PermissionResult(StrEnum):

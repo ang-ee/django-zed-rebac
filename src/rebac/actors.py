@@ -326,10 +326,7 @@ def to_subject_ref(actor: ActorLike) -> SubjectRef:
             resource = to_object_ref(actor)
             return SubjectRef(resource, subject_relation(user_model))
         attr = subject_id_attr(user_model)
-        return SubjectRef.of(
-            user_subject_type(),
-            str(getattr(actor, attr)),
-        )
+        return SubjectRef.of(user_subject_type(), _principal_id(actor, attr))
 
     if model_resource_type(actor):
         if actor.pk is None:
@@ -345,22 +342,34 @@ def to_subject_ref(actor: ActorLike) -> SubjectRef:
     if isinstance(actor, Group):
         attr = subject_id_attr(Group)
         return SubjectRef.of(
-            type_with_prefix(app_settings.REBAC_GROUP_TYPE),
-            str(getattr(actor, attr)),
-            "member",
+            type_with_prefix(app_settings.REBAC_GROUP_TYPE), _principal_id(actor, attr), "member"
         )
 
     # @rebac_subject-registered?
     for cls, (type_, id_attr) in _subject_registry.items():
         if isinstance(actor, cls):
-            value = getattr(actor, id_attr)
-            return SubjectRef.of(type_with_prefix(type_), str(value))
+            return SubjectRef.of(type_with_prefix(type_), _principal_id(actor, id_attr))
 
     raise NoActorResolvedError(
         f"Cannot resolve {actor.__class__.__name__} instance to SubjectRef. "
         f"Decorate the class with @rebac_subject(type=..., id_attr=...) "
         f"or pass a SubjectRef directly."
     )
+
+
+def _principal_id(actor: Any, attr: str) -> str:
+    """The wire id of a principal resolved from an instance.
+
+    An unset id (``None`` or empty) is refused, as an unsaved principal is:
+    ``str()`` would turn ``None`` into the id ``"None"``.
+    """
+    value = getattr(actor, attr)
+    if value is None or value == "":
+        raise NoActorResolvedError(
+            f"{actor.__class__.__name__} instance has no {attr}; "
+            "save it before using it as a subject."
+        )
+    return str(value)
 
 
 def grant_subject_ref(agent: Any, on_behalf_of: Any | None) -> SubjectRef:

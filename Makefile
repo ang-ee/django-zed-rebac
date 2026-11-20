@@ -63,17 +63,19 @@ test:
 # Tier 2: the PostgreSQL delta. Tests that are also slow run in test-postgres.
 # The timeout counts each worker's test-database creation, several seconds on
 # a freshly started PostgreSQL, so it is wider than tier 1's.
-# REBAC_TEST_POSTGRES_BINDING=server runs the targets that read
-# tests/settings_postgres.py (test-pg, test-postgres, test-pg-scale) with
-# parameters bound on the server and every statement prepared; CI runs tier 2
-# and test-postgres under both bindings.
+# REBAC_TEST_POSTGRES_BINDING=server runs test-pg and test-postgres with
+# parameters bound on the server and every statement prepared
+# (tests/settings_postgres.py); CI runs both under both bindings.
 test-pg: require-postgres
 	$(PYTEST) $(PG) -n $(PG_WORKERS) --dist worksteal -m '$(PG_DELTA_MARKS)' --timeout=60 --durations=10 $(ARGS)
 
-# Timing and planner measurements run alone, without worker contention.
+# Timing and planner measurements run alone, without worker contention, and
+# always under the default binding, whatever REBAC_TEST_POSTGRES_BINDING says:
+# the frozen plan fingerprints are its plans (a parameter bound on the server
+# shows its type in a plan's filter, '1'::smallint for 1).
 .PHONY: test-pg-scale
 test-pg-scale: require-postgres
-	$(PYTEST) $(PG) -m scale --timeout=900 -s tests/test_scope_plans.py $(ARGS)
+	REBAC_TEST_POSTGRES_BINDING=client $(PYTEST) $(PG) -m scale --timeout=900 -s tests/test_scope_plans.py $(ARGS)
 
 # The policy benchmark (tests/bench/README.md): a real policy over generated rows. This target
 # builds the tiny size in SQLite and fails if a mechanism changes what a read returns.
