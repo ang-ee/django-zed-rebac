@@ -11,6 +11,35 @@ def pytest_configure() -> None:
     if not settings.configured:
         from . import settings as test_settings  # noqa: F401
     django.setup()
+    if settings.DATABASES["default"].get("OPTIONS", {}).get("prepare_threshold") is not None:
+        from django.db.backends.signals import connection_created
+
+        connection_created.connect(_run_two_command_ddl_unprepared, dispatch_uid=__name__)
+
+
+def _run_two_command_ddl_unprepared(sender, connection, **kwargs) -> None:
+    """Under prepared statements, run Django's two-command DDL unprepared.
+
+    Django's PostgreSQL schema editor adds a foreign key column to an existing
+    table as one statement of two commands, ``ALTER TABLE ... REFERENCES ...;
+    SET CONSTRAINTS ... IMMEDIATE``, and psycopg cannot prepare more than one
+    command. Four migrations of the test app do that; the library's own
+    migrations, and every other statement, run prepared.
+    """
+    if _unprepared_ddl not in connection.execute_wrappers:
+        # First, so that a test's own execute_wrapper() pops its wrapper, not this one.
+        connection.execute_wrappers.insert(0, _unprepared_ddl)
+
+
+def _unprepared_ddl(execute, sql, params, many, context):
+    if params is not None or many or not isinstance(sql, str) or "; SET CONSTRAINTS " not in sql:
+        return execute(sql, params, many, context)
+    raw = context["connection"].connection
+    threshold, raw.prepare_threshold = raw.prepare_threshold, None
+    try:
+        return execute(sql, params, many, context)
+    finally:
+        raw.prepare_threshold = threshold
 
 
 @pytest.fixture(autouse=True)

@@ -1,6 +1,6 @@
 name: CI
 
-# Tier 1 and tier 2 (docs/ARCHITECTURE.md § Test tiers) as two parallel jobs.
+# Tier 1 and tier 2 (docs/ARCHITECTURE.md § Test tiers) as parallel jobs.
 # Tier 1 is the gate for merging and for publishing: Publish to PyPI reads the
 # result of the `tier 1` job, not of this whole run. Tier 3 runs in
 # release.yml.
@@ -36,10 +36,17 @@ jobs:
       - name: Lint, format, types and the SQLite suite
         run: make check
 
+  # Twice: with Django's default client-side binding, and with server-side
+  # binding and every statement prepared, where PostgreSQL must type each
+  # parameter from its context (REBAC_TEST_POSTGRES_BINDING, tests/settings_postgres.py).
   postgres-delta:
-    name: postgres-delta
+    name: postgres-delta (${{ matrix.binding }} binding)
     runs-on: ubuntu-latest
     timeout-minutes: 15
+    strategy:
+      fail-fast: false
+      matrix:
+        binding: [client, server]
     services:
       postgres:
         image: postgres:16
@@ -56,6 +63,7 @@ jobs:
           --health-retries 5
     env:
       REBAC_TEST_POSTGRES_URL: postgresql://postgres:rebac-test@127.0.0.1:5432/rebac_test
+      REBAC_TEST_POSTGRES_BINDING: ${{ matrix.binding }}
     steps:
       - uses: actions/checkout@v5
       # uv's managed Python bundles a current SQLite. The runner's system

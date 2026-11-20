@@ -115,6 +115,7 @@ def scope(actor, action="read"):
     )
 
 
+@pytest.mark.pg_delta
 def test_all_conditional_membership_paths_and_missing_sets(active):
     active.write_relationships(
         [
@@ -232,6 +233,7 @@ def test_held_checks_only_requested_rows_and_model_less_ids(active):
     ) == {"external"}
 
 
+@pytest.mark.pg_delta
 def test_held_context_checks_canonical_ids_and_excludes_noncanonical_ids(active):
     Post._base_manager.bulk_create([Post(pk=1, title="one")])
     active.write_relationships(
@@ -261,6 +263,7 @@ def test_held_context_checks_canonical_ids_and_excludes_noncanonical_ids(active)
     )
 
 
+@pytest.mark.pg_delta
 def test_held_keeps_a_direct_grant_beside_a_depth_uncertain_id(active, settings):
     from rebac.errors import PermissionDepthExceeded
 
@@ -292,6 +295,7 @@ def test_held_keeps_a_direct_grant_beside_a_depth_uncertain_id(active, settings)
     assert active.held(**args, ids=("direct", "deep")) == {"direct"}
 
 
+@pytest.mark.pg_delta
 def test_lookup_subjects_expands_nested_members_and_excludes_denials(active):
     reference_harness.seed(
         [
@@ -324,6 +328,7 @@ def test_lookup_subjects_context(active):
     assert list(active.lookup_subjects(**args, context={"a": True})) == [ALICE]
 
 
+@pytest.mark.pg_delta
 def test_harness_conditional_paths_and_wildcard_groups(active):
     active.write_relationships(
         [
@@ -358,6 +363,7 @@ def test_harness_conditional_paths_and_wildcard_groups(active):
     )
 
 
+@pytest.mark.pg_delta
 def test_missing_policy_row_fails_closed(active):
     Post._base_manager.bulk_create([Post(pk=1, title="one")])
     reference_harness.seed(["blog/post:1#viewer@auth/user:alice"], backend=active)
@@ -384,6 +390,7 @@ def test_identity_filter_rejects_noncanonical_integer_spelling(active):
         assert not Post._base_manager.filter(model_identity_filter(Post, "pk", wire)).exists()
 
 
+@pytest.mark.pg_delta
 @pytest.mark.django_db(transaction=True)
 def test_decision_cache_observes_owned_revoke(active):
     resource = ObjectRef("blog/post", "1")
@@ -594,6 +601,7 @@ def test_lazy_scope_keeps_type_and_exclusion_arms_after_construction(active):
     assert list(pending.values_list("pk", flat=True)) == [2]
 
 
+@pytest.mark.pg_delta
 def test_scope_rejects_noncanonical_wire_identity(active):
     Post._base_manager.bulk_create([Post(pk=1, title="one")])
     reference_harness.seed(["blog/post:01#viewer@auth/user:alice"], backend=active)
@@ -716,6 +724,7 @@ def test_execution_fence_closes_scope_when_policy_row_is_removed_after_construct
     assert list(pending) == []
 
 
+@pytest.mark.pg_delta
 @pytest.mark.parametrize(
     "context,expected",
     [(None, {"carol"}), ({"a": True}, {"carol"}), ({"a": False}, {"bob", "carol"})],

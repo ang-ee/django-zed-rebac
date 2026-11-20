@@ -214,6 +214,16 @@ _ABSENT: Any = object()
 
 
 def _not_null(expr: Expression | F | OuterRef) -> Q:
+    """Whether an object reference is not NULL; true, unsent, for a statement parameter.
+
+    A column, or a conversion of a wire id, can be NULL. A parameter that stands for an
+    object (a point check's resource id) is bound to its id and never is. Django decides
+    the test of a ``Value`` itself, but not of a parameter it cannot see into, and
+    ``%s IS NOT NULL`` gives PostgreSQL no type for that parameter when parameters are
+    bound on the server.
+    """
+    if isinstance(expr, _Param):
+        return _TRUE
     return Q(IsNull(expr, False))
 
 
@@ -494,7 +504,7 @@ class Compiler:
 
     def _in(self, expr: Expression | F | OuterRef, rows: QuerySet[Any]) -> Q:
         """Two-valued membership in an id set: a NULL reference is not a member."""
-        return _not_null(expr) & Q(In(expr, self._ids(rows)))
+        return _and(_not_null(expr), Q(In(expr, self._ids(rows))))
 
     # ---------- The actor's id, as a value or as a placeholder ----------
 

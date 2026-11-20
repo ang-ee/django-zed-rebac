@@ -165,6 +165,7 @@ definition blog/sluggedpost {
 """
 
 
+@pytest.mark.pg_delta
 @pytest.mark.django_db
 @pytest.mark.parametrize(
     ("field", "expect_sql"),

@@ -4026,7 +4026,13 @@ Three layers of tests define the project target:
 The supported matrix is declared once, in `pyproject.toml` (`requires-python`,
 the Django pin) and `.github/workflows/ci.yml`; at the time of writing that is
 Python 3.14 × Django 6.1, with SQLite and PostgreSQL 16 for the `local`
-backend. Test databases and temporary files must be worker-local, and fixtures
+backend. On PostgreSQL both of Django's parameter bindings are supported and
+tested: the default, where psycopg interpolates parameters into the statement,
+and server-side binding with prepared statements (`OPTIONS =
+{"server_side_binding": True, "prepare_threshold": 0}`), where PostgreSQL must
+type every parameter from its context. `REBAC_TEST_POSTGRES_BINDING=server`
+selects the second for any PostgreSQL target (`tests/settings_postgres.py`).
+Test databases and temporary files must be worker-local, and fixtures
 must restore process-local state between tests, so any test can run on any
 worker in any order. Random ordering is opt-in with
 `-p randomly --randomly-seed=137` (`make test-random`).
@@ -4057,8 +4063,8 @@ blocker like any other.
 | Tier | Runs | Contents | Budget |
 |---|---|---|---|
 | **1. Fast** — `make check` | Every change, every push and pull request. The only gate for merging and for publishing a tag. | Ruff lint and format, strict mypy, Pyright, then the SQLite suite without `slow`, in parallel with work stealing, stopping at the first failure. | 1 minute on a developer machine, 5 minutes in CI. |
-| **2. PostgreSQL delta** — `make test-pg` | Every push and pull request, as a job beside tier 1. Locally when a change touches SQL generation, transactions, locking or migrations. | Only the tests marked `postgresql` or `pg_delta`, on PostgreSQL 16. | 3 minutes. |
-| **3. Release** — `make test-release` | Nightly on `main` and on demand before a release. Never inside a fix loop. | `slow` on SQLite; the whole suite including `slow` on PostgreSQL; the full `reference_exhaustive` sweep; the `schema_vendors` PostgreSQL/MySQL contracts; a randomized parallel run with seed 137; the `scale` matrix on PostgreSQL, alone (`make test-pg-scale`); the SpiceDB conformance suite once it lands. | No measured budget at the moment; independent parallel jobs in CI, where the sweep is the longest. |
+| **2. PostgreSQL delta** — `make test-pg` | Every push and pull request, as a job beside tier 1, once per parameter binding. Locally when a change touches SQL generation, transactions, locking or migrations. | Only the tests marked `postgresql` or `pg_delta`, on PostgreSQL 16, with the default binding and with server-side binding and prepared statements. | 3 minutes. |
+| **3. Release** — `make test-release` | Nightly on `main` and on demand before a release. Never inside a fix loop. | `slow` on SQLite; the whole suite including `slow` on PostgreSQL, under each binding in CI; the full `reference_exhaustive` sweep; the `schema_vendors` PostgreSQL/MySQL contracts; a randomized parallel run with seed 137; the `scale` matrix on PostgreSQL, alone (`make test-pg-scale`); the SpiceDB conformance suite once it lands. | No measured budget at the moment; independent parallel jobs in CI, where the sweep is the longest. |
 
 Rules that keep the tiers honest:
 
@@ -4076,8 +4082,8 @@ Rules that keep the tiers honest:
   branch on the vendor, at least one test for each area that emits SQL
   (recursive scopes, compiled reads, write gates, schema write owners,
   migrations), and every test that has ever failed on PostgreSQL while passing
-  on SQLite. A PostgreSQL-only failure found in tier 3 adds that test to
-  `pg_delta` in the same change that fixes it.
+  on SQLite, under either binding. A PostgreSQL-only failure found in tier 3
+  adds that test to `pg_delta` in the same change that fixes it.
 - **A vendor-specific test skips, it does not return.** A test that cannot run
   on the current vendor calls `pytest.skip`; an early `return` reports a pass
   for something that did not run.
@@ -4095,13 +4101,15 @@ Default `pytest` deselects `slow`, `reference_exhaustive` and
 `schema_vendors`. `make test` runs the tier 1 selection serially, for
 debugging only.
 
-Tiers 1 and 2 are the two parallel jobs of `.github/workflows/ci.yml`, on
+Tiers 1 and 2 are the parallel jobs of `.github/workflows/ci.yml`, on
 every push to `main`, every version tag and every pull request:
 `tier 1` runs `make check` and `postgres-delta` runs `make test-pg`
-against a PostgreSQL 16 service container. Publish to PyPI reads the result of
+against a PostgreSQL 16 service container, twice: with the default binding
+and with `REBAC_TEST_POSTGRES_BINDING=server`. Publish to PyPI reads the result of
 the `tier 1` job, not of the whole CI run, so a tag publishes on tier
 1 alone. Tier 3 is `.github/workflows/release.yml`, nightly on `main` and on
-demand, with one job per part; the reference sweep is split across six jobs by
+demand, with one job per part, the whole PostgreSQL suite once per binding;
+the reference sweep is split across six jobs by
 expression shape. `make test-release` runs the same parts locally in sequence,
 continues past a failing part and reports each one. `make pg-up` starts a
 disposable PostgreSQL 16 container for tier 2 and the PostgreSQL parts of tier
@@ -4238,7 +4246,10 @@ returns early when the prefixes differ); `WhereNode.resolve_expression` clones t
 nodes but assigns the sides of the lookups they share; `Query.resolve_expression`
 keeps those sides and discards the node it resolved; and `Lookup.process_lhs`
 resolves a condition again where its statement compiles. Database floors follow Django 6.1:
-PostgreSQL 15, MySQL 8.4, SQLite 3.37.
+PostgreSQL 15, MySQL 8.4, SQLite 3.37. On PostgreSQL, psycopg's server-side
+binding and prepared statements (`server_side_binding`, `prepare_threshold`)
+are supported and tested beside the default binding
+([Testing](#testing)).
 
 Public API (`rebac.*` direct imports + the schema language) is intended to be
 stable across patch releases. `rebac._internal.*` is private.

@@ -84,6 +84,7 @@ definition test/doc {
 """
 
 
+@pytest.mark.pg_delta
 @pytest.mark.parametrize("install", STORAGE_TIERS, indirect=True)
 def test_all_set_operations_and_finite_exclusion(install):
     install(BASE)
@@ -235,6 +236,7 @@ def test_arrow_plain_and_caveated_edges_to_same_target_stay_separate(install):
     assert _check(resources[1], "read", user("alice")).conditional_on == ("enabled",)
 
 
+@pytest.mark.pg_delta
 def test_nested_conditional_ban_reaches_the_exclusion(install):
     from tests.testapp.models import Post
 
@@ -431,6 +433,7 @@ def test_conditional_exclusion_hole_is_a_definite_regrant(install, conditional_p
     assert _check(doc(), "read", user("alice")).allowed
 
 
+@pytest.mark.pg_delta
 def test_membership_recursion_through_a_group_cycle(install):
     install(BASE)
     seed(
@@ -474,6 +477,7 @@ def test_grouped_conditional_exclusion_does_not_visit_a_short_circuited_hole(ins
     )
 
 
+@pytest.mark.pg_delta
 def test_wildcard_grant_with_a_ban_travels_through_recursive_data_cycle(install):
     install(BASE)
     seed(
@@ -665,6 +669,7 @@ def test_plain_and_caveated_alternatives_of_one_union(install):
     )
 
 
+@pytest.mark.pg_delta
 def test_relations_not_referenced_as_usersets_are_directly_checkable(install):
     install(BASE)
     seed(
@@ -709,6 +714,7 @@ def test_tuples_written_inside_a_transaction_are_read_after_it(install):
     )
 
 
+@pytest.mark.pg_delta
 def test_separate_groups_grant_separate_documents(install):
     install(BASE)
     seed(
@@ -968,6 +974,7 @@ def test_field_backed_arrow_and_filtered_constant(install):
     )
 
 
+@pytest.mark.pg_delta
 def test_dynamic_and_fixed_attributes_preserve_tuple_precedence(install):
     from django.contrib.auth import get_user_model
 
@@ -1439,6 +1446,7 @@ def test_timed_tighten_to_nil_denies_until_its_deadline(settings, storage):
             assert _check(doc("one"), "read", user("alice")).allowed is allowed
 
 
+@pytest.mark.pg_delta
 @pytest.mark.parametrize("storage", ["denormalized", "registry"])
 def test_override_that_the_compiler_refuses_is_rolled_back_when_written(settings, storage):
     from rebac.models import SchemaOverride
@@ -1476,6 +1484,7 @@ def test_override_that_the_compiler_refuses_is_rolled_back_when_written(settings
     assert not _check(doc("two"), "read", user("alice")).allowed
 
 
+@pytest.mark.pg_delta
 def test_userset_relation_used_as_an_exclusion_operand(install):
     install("""
         definition auth/user {}
@@ -1676,6 +1685,7 @@ ANCHOR = """
 """
 
 
+@pytest.mark.pg_delta
 def test_resource_type_whose_model_has_no_table(install):
     from tests.testapp.models import RoleAnchor
 

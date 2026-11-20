@@ -248,6 +248,7 @@ def test_sets_changed_by_another_process_are_answered_afresh_not_as_a_depth(offi
         ]
 
 
+@pytest.mark.pg_delta
 def test_an_item_beyond_the_depth_limit_raises_as_check_access_does(settings):
     settings.REBAC_DEPTH_LIMIT = 2
     local = install_schema(SCHEMA)

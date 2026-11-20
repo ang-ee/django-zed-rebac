@@ -122,6 +122,7 @@ def beyond_depth_limit(depth):
         yield
 
 
+@pytest.mark.pg_delta
 @pytest.mark.parametrize("storage", ["denormalized", "registry"])
 @pytest.mark.parametrize("shape", ["role", "folder"])
 @pytest.mark.parametrize("backing", ["tuple", "field"])
@@ -151,6 +152,7 @@ def test_recursive_chain_parity(storage, shape, backing, depth):
                 )
 
 
+@pytest.mark.pg_delta
 @pytest.mark.parametrize("storage", ["denormalized", "registry"])
 @pytest.mark.parametrize("shape", ["role", "folder"])
 @pytest.mark.parametrize("backing", ["tuple", "field"])
@@ -193,6 +195,7 @@ def test_recursion_is_decided_within_the_depth_limit_and_refused_beyond_it(
             assert scoped.filter(pk=rows[-1].pk).exists()
 
 
+@pytest.mark.pg_delta
 @pytest.mark.parametrize("storage", STORAGE_TIERS)
 @pytest.mark.parametrize("shape", ["role", "folder"])
 @pytest.mark.parametrize("backing", ["tuple", "field", "path"])
@@ -350,6 +353,7 @@ def test_set_operation_cycle_is_refused():
     assert {error.id for error in errors} == {"rebac.E016"}
 
 
+@pytest.mark.pg_delta
 @pytest.mark.parametrize("storage", ["denormalized", "registry"])
 def test_missing_subject_set_definition_denies_its_branch_without_fallback(storage):
     from rebac import backend

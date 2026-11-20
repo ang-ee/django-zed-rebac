@@ -278,6 +278,7 @@ def test_outer_rollback_reverts_nested_tuple_and_source_write():
     assert not reads_round(responder, second)
 
 
+@pytest.mark.pg_delta
 def test_third_party_tracked_user_pre_save_tuple_write_inside_atomic():
     install_schema(
         backend(),

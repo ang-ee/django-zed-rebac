@@ -353,6 +353,7 @@ def test_unknown_action_returns_diagnostic(backend):
     assert result.reason and "unknown action" in result.reason
 
 
+@pytest.mark.pg_delta
 def test_virtual_relation_with_subject_set_candidate(backend):
     """A virtual `auth/group:g1#member` candidate resolves via the backend.
 
@@ -378,6 +379,7 @@ def test_virtual_relation_with_subject_set_candidate(backend):
     assert result.allowed
 
 
+@pytest.mark.pg_delta
 def test_virtual_relation_with_subject_set_candidate_denies_non_member(backend):
     backend.write_relationships(
         [

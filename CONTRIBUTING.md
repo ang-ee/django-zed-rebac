@@ -31,6 +31,8 @@ make test                   # the tier 1 selection, serial, for debugging
 make pg-up                  # prints: export REBAC_TEST_POSTGRES_URL=...; run that line
 eval "$(make -s pg-up)"     # the same, exported in one step
 make test-pg                # tests marked postgresql or pg_delta, slow excluded
+REBAC_TEST_POSTGRES_BINDING=server make test-pg   # the same, parameters bound on the server, every
+                            # statement prepared; CI runs tier 2 both ways
 make pg-down                # remove the container
 
 # Tier 3: before a release, never inside a change
@@ -70,6 +72,16 @@ gh run view <run-id> --log-failed               # the log of each failed step
   database whose role may create databases. Pytest-django adds worker-specific
   test database names. `tests.settings_postgres` fails if the URL is absent;
   it never uses SQLite.
+- `REBAC_TEST_POSTGRES_BINDING` picks how psycopg binds parameters for every
+  PostgreSQL target and the benchmark: `client` (the default, Django's) or
+  `server`, which sets Django's `server_side_binding` and `prepare_threshold = 0`.
+  Under `server` PostgreSQL types each parameter from its context, so a
+  parameter it cannot type fails the statement. The URL cannot carry these
+  options (Django reads typed values), and `tests.settings_postgres` refuses
+  them there. Four migrations of the test app add a foreign key to an existing
+  table, which Django's schema editor sends as two commands in one statement;
+  psycopg cannot prepare that, so `tests/conftest.py` runs that one form
+  unprepared.
 - The PostgreSQL targets need the driver: `uv sync --group postgres`
   (add the extras from `make install-dev` to keep them). The vendor contracts
   need Docker and both drivers: `uv sync --group postgres --group mysql`;
@@ -173,13 +185,13 @@ statement counts and compile time per scope. Written assertions are not results.
 Python 3.14 and Django 6.1, in three workflows:
 
 - **CI** (`.github/workflows/ci.yml`) runs on pushes to `main`, on version
-  tags and on pull requests, as two parallel jobs. `tier 1` runs
+  tags and on pull requests, as parallel jobs. `tier 1` runs
   `make check`: tier 1, and the check branch protection requires.
   `postgres-delta` runs `make test-pg` against a `postgres:16` service
-  container: tier 2.
+  container, once per `REBAC_TEST_POSTGRES_BINDING` (`client`, `server`): tier 2.
 - **Release** (`.github/workflows/release.yml`) runs tier 3 nightly on `main`
   at 03:17 UTC and on demand, one job per part: `slow` on SQLite, the whole
-  suite on PostgreSQL 16, the reference
+  suite on PostgreSQL 16 under each binding, the reference
   sweep as six jobs split by expression shape, the Docker PostgreSQL/MySQL
   vendor contracts, and the random-order run. Its result on `main` is the
   release evidence; [Commands](#commands) shows how to start and read it with

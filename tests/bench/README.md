@@ -41,7 +41,8 @@ python -m tests.bench.run census --size medium
 
 `--size` also takes a unit count. Environment: `REBAC_BENCH_STORAGE` (`registry`, the default, or
 `denormalized`), `REBAC_BENCH_JIT=on` (PostgreSQL's JIT is off otherwise), `REBAC_BENCH_TIMEOUT=120s` (a read past
-it is reported, not waited for), `REBAC_BENCH_POLICY` (the export to use).
+it is reported, not waited for), `REBAC_BENCH_POLICY` (the export to use), `REBAC_TEST_POSTGRES_BINDING=server`
+(parameters bound on the server and every statement prepared, as `tests/settings_postgres.py` describes).
 
 `read --uncommitted` runs each read inside a transaction that has written one relationship and not committed
 it, which is how a test that seeds grants in its own transaction reads: the library then keeps no decision and

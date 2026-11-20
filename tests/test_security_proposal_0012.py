@@ -11,6 +11,7 @@ from rebac.schema import parse_zed
 from tests.backend_setup import install_schema
 
 
+@pytest.mark.pg_delta
 @pytest.mark.django_db(transaction=True)
 def test_autocommit_user_attribute_move_with_consumer_pre_save_tuple_write():
     reset_backend()

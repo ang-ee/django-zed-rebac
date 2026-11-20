@@ -366,6 +366,7 @@ def test_plain_collector_cascade(active):
     assert not allowed(ALICE, round_)
 
 
+@pytest.mark.pg_delta
 def test_plain_attribute_old_containers_and_fixed_boolean_anchor(active, django_user_model):
     from rebac import to_subject_ref
 
@@ -388,6 +389,7 @@ def test_plain_attribute_old_containers_and_fixed_boolean_anchor(active, django_
     assert not allowed(subject, old) and not allowed(subject, new)
 
 
+@pytest.mark.pg_delta
 @pytest.mark.parametrize("surface", ["backend", "public", "membership", "role"])
 def test_tuple_write_owners(active, surface):
     from rebac import memberships, relationships, roles
@@ -418,6 +420,7 @@ def test_tuple_write_owners(active, surface):
     assert not allowed(ALICE, resource, "effective_member")
 
 
+@pytest.mark.pg_delta
 def test_role_hierarchy_owners(active):
     from rebac import roles
 
@@ -965,6 +968,7 @@ def test_concurrent_tuple_writes_both_take_effect(active):
 # Cases from the semantic review of membership and type-level grants.
 
 
+@pytest.mark.pg_delta
 def test_membership_write_reaches_arrow_and_userset_readers(active):
     active.set_schema(
         parse_zed("""

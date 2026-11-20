@@ -653,6 +653,7 @@ def test_explicit_pk_create_checks_self_keyed_attribute_before_row_exists():
     assert Folder._base_manager.get(pk=folder.pk).name == "explicit"
 
 
+@pytest.mark.pg_delta
 @override_settings(REBAC_AUDIT_DENIALS=True, REBAC_DEPTH_LIMIT=2)
 def test_depth_uncertain_absent_container_is_an_audited_edge_denial():
     install_schema(

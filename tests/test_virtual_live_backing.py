@@ -233,6 +233,7 @@ def test_filtered_reverse_roster_requires_one_matching_membership_row(active, ac
     assert list(pending) == []
 
 
+@pytest.mark.pg_delta
 def test_attribute_kind_uses_virtual_subject_identity_for_checks_and_lookups(active, actors):
     _alice, _bob = actors
     with sudo(reason="virtual attribute identity fixtures"):

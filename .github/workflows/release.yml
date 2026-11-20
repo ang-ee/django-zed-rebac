@@ -37,10 +37,16 @@ jobs:
       - name: Slow tests
         run: make test-slow
 
+  # Under both bindings, as tier 2 in ci.yml: the whole suite reaches statement
+  # families that the tier 2 selection does not.
   postgres:
-    name: whole suite (PostgreSQL 16)
+    name: whole suite (PostgreSQL 16, ${{ matrix.binding }} binding)
     runs-on: ubuntu-latest
     timeout-minutes: 90
+    strategy:
+      fail-fast: false
+      matrix:
+        binding: [client, server]
     services:
       postgres:
         image: postgres:16
@@ -60,6 +66,7 @@ jobs:
           --health-retries 5
     env:
       REBAC_TEST_POSTGRES_URL: postgresql://postgres:rebac-test@127.0.0.1:5432/rebac_test
+      REBAC_TEST_POSTGRES_BINDING: ${{ matrix.binding }}
     steps:
       - uses: actions/checkout@v5
       # uv's managed Python bundles a current SQLite. The runner's system

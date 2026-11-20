@@ -93,6 +93,7 @@ def test_deep_scopes_have_constant_parse_depth(storage, backing, deep):
     deep_scope_proof(storage, backing, deep)
 
 
+@pytest.mark.pg_delta
 @pytest.mark.parametrize("storage", STORAGE_TIERS)
 @pytest.mark.parametrize("backing", ["tuple", "field", "path"])
 def test_recursive_exclusions_keep_expiry_and_intermediate_denials(storage, backing):

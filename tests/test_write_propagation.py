@@ -162,6 +162,7 @@ def test_fan_in_readers_follow_only_the_permission_they_read(active):
     assert_reads_match(subjects=[USER, BOB], resources=[thread, *messages], actions=["read"])
 
 
+@pytest.mark.pg_delta
 def test_revocation_crosses_recursive_component(active):
     root = row("test/role", "root", "member")
     document = ObjectRef("test/doc", "one")

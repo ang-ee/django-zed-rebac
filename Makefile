@@ -63,6 +63,9 @@ test:
 # Tier 2: the PostgreSQL delta. Tests that are also slow run in test-postgres.
 # The timeout counts each worker's test-database creation, several seconds on
 # a freshly started PostgreSQL, so it is wider than tier 1's.
+# REBAC_TEST_POSTGRES_BINDING=server runs any PostgreSQL target with parameters
+# bound on the server and every statement prepared (tests/settings_postgres.py);
+# CI runs tier 2 and test-postgres under both bindings.
 test-pg: require-postgres
 	$(PYTEST) $(PG) -n $(PG_WORKERS) --dist worksteal -m '$(PG_DELTA_MARKS)' --timeout=60 --durations=10 $(ARGS)
 

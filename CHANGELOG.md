@@ -5,6 +5,23 @@ pre-1.0; breaking changes within a minor version are explicitly called out.
 
 ## [Unreleased]
 
+### Fixed
+
+- **Statements are valid under psycopg's server-side binding and prepared statements.** With Django's
+  PostgreSQL options `server_side_binding: True` and `prepare_threshold`, parameters reach PostgreSQL apart from
+  the statement, and it must type each one from its context. A point check (a create-rule check,
+  `check_access`, `held`, `held_many`) whose permission reached a stored relation's closure, an attribute
+  relation or a recursion tested its resource id parameter as `%s IS NOT NULL`, which gives the parameter no
+  type, and failed with `could not determine data type of parameter $n`. That parameter is bound to the
+  resource's id and is never NULL, so the test is now decided while compiling and not sent: under either
+  binding, and on every database, those statements lose `%s IS NOT NULL` and one parameter. Rows, decisions
+  and statement counts do not change. No other statement the library sends depends on the binding: none sets
+  a parameter in `SET` or DDL, and none sends two commands at once.
+
+- Tier 2 and the nightly whole-suite PostgreSQL job run under both bindings (`REBAC_TEST_POSTGRES_BINDING=server`,
+  read by `tests/settings_postgres.py`), and the 39 tests that failed only under server-side binding are marked
+  `pg_delta`.
+
 ## [0.38.0] — 2026-11-24
 
 A security release: upgrade. It fixes ways a queryset could read with a permission scope other than the one in
