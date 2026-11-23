@@ -204,10 +204,16 @@ Python 3.14 and Django 6.1, in three workflows:
   tags and on pull requests, as parallel jobs. `tier 1` runs
   `make check`: tier 1, and the check branch protection requires.
   `postgres-delta` runs `make test-pg` against a `postgres:16` service
-  container, once per `REBAC_TEST_POSTGRES_BINDING` (`client`, `server`): tier 2.
+  container, once per `REBAC_TEST_POSTGRES_BINDING` (`client`, `server`): tier 2,
+  reported as two checks, `postgres-delta (client binding)` and
+  `postgres-delta (server binding)`. The single check `postgres-delta` of 0.37
+  and earlier no longer reports: branch protection on a fork that requires it
+  waits for it and blocks merging, so require the two new names instead (or
+  `tier 1` alone, as this repository does).
 - **Release** (`.github/workflows/release.yml`) runs tier 3 nightly on `main`
   at 03:17 UTC and on demand, one job per part: `slow` on SQLite, the whole
-  suite on PostgreSQL 16 under each binding, the reference
+  suite on PostgreSQL 16 under each binding (`whole suite (PostgreSQL 16, client
+  binding)` and `… server binding)`), the reference
   sweep as six jobs split by expression shape, the Docker PostgreSQL/MySQL
   vendor contracts, and the random-order run. Its result on `main` is the
   release evidence; [Commands](#commands) shows how to start and read it with

@@ -2,19 +2,70 @@
 
 from __future__ import annotations
 
+import functools
 import logging
+from collections.abc import Callable
 from typing import TYPE_CHECKING, Any
 
 from django.core import checks
 from django.db.utils import DatabaseError
 
-from .conf import app_settings
+from .conf import _wrongly_typed_settings, _WronglyTyped, _WrongSettingType, app_settings
 from .errors import SchemaError
 from .field_visibility import FIELD_DENY_MODES
 from .roles import is_role_type
 
 if TYPE_CHECKING:
     from .schema.ast import Schema
+
+type _Check = Callable[..., list[checks.CheckMessage]]
+
+
+def _register(*tags: str) -> Callable[[_Check], _Check]:
+    """Register a ``rebac`` check that reports nothing while it reads a refused setting.
+
+    Reading a setting whose value has a type it does not accept, and no safe
+    reading, raises; ``rebac.E028`` reports that setting by name, and the check
+    runs once the setting is fixed.
+    """
+
+    def decorate(check: _Check) -> _Check:
+        @functools.wraps(check)
+        def guarded(app_configs: Any = None, **kwargs: Any) -> list[checks.CheckMessage]:
+            try:
+                return check(app_configs, **kwargs)
+            except _WrongSettingType:
+                return []
+
+        checks.register("rebac", *tags)(guarded)
+        return guarded
+
+    return decorate
+
+
+def _type_hint(entry: _WronglyTyped) -> str:
+    if entry.expected == "True or False":
+        convert = (
+            f"a value read from the environment is a str: convert it there, for example "
+            f'{entry.name} = os.environ.get("{entry.name}", "{str(entry.default).lower()}")'
+            '.lower() in ("1", "true").'
+        )
+    elif entry.expected == "an int":
+        convert = "a value read from the environment is a str: convert it there with int()."
+    else:
+        convert = "a setting is a Python value, never parsed from text by the library."
+    return f"Write {entry.name} as {entry.expected} in the settings module; {convert}"
+
+
+@_register()
+def check_setting_types(app_configs: Any = None, **kwargs: Any) -> list[checks.CheckMessage]:
+    """E028: a setting whose value has a type it does not accept."""
+    return [
+        checks.Error(
+            f"{entry.problem()}: {entry.reading()}.", hint=_type_hint(entry), id="rebac.E028"
+        )
+        for entry in _wrongly_typed_settings()
+    ]
 
 
 def _schema_for_checks() -> Schema | None:
@@ -49,7 +100,7 @@ def _schema_for_checks() -> Schema | None:
         return None
 
 
-@checks.register("rebac")
+@_register()
 def check_backend_setting(app_configs: Any = None, **kwargs: Any) -> list[checks.CheckMessage]:
     issues: list[checks.CheckMessage] = []
     backend = app_settings.REBAC_BACKEND
@@ -90,7 +141,7 @@ def check_backend_setting(app_configs: Any = None, **kwargs: Any) -> list[checks
     return issues
 
 
-@checks.register("rebac")
+@_register()
 def check_caveat_dependency(app_configs: Any = None, **kwargs: Any) -> list[checks.CheckMessage]:
     """Report the optional CEL dependency only for installed caveat schemas."""
     from importlib.util import find_spec
@@ -152,7 +203,7 @@ def _schema_on_alias(using: str) -> Schema | None:
     return None
 
 
-@checks.register("rebac", checks.Tags.database)
+@_register(checks.Tags.database)
 def check_policy_models(app_configs: Any = None, **kwargs: Any) -> list[checks.CheckMessage]:
     """E014-E018; all schema I/O is opt-in via database checks."""
     if app_settings.REBAC_BACKEND != "local" or not kwargs.get("databases"):
@@ -239,7 +290,7 @@ def check_policy_models(app_configs: Any = None, **kwargs: Any) -> list[checks.C
     return unique
 
 
-@checks.register("rebac")
+@_register()
 def check_permissions_enforced(app_configs: Any = None, **kwargs: Any) -> list[checks.CheckMessage]:
     """W011: the deployment enforces no permission."""
     if app_settings.REBAC_ENABLED:
@@ -258,7 +309,7 @@ def check_permissions_enforced(app_configs: Any = None, **kwargs: Any) -> list[c
     ]
 
 
-@checks.register("rebac")
+@_register()
 def check_field_read_mode_setting(
     app_configs: Any = None, **kwargs: Any
 ) -> list[checks.CheckMessage]:
@@ -285,7 +336,7 @@ def check_field_read_mode_setting(
     return issues
 
 
-@checks.register("rebac")
+@_register()
 def check_field_backed_relations(
     app_configs: Any = None,
     **kwargs: Any,
@@ -394,7 +445,7 @@ def _attribute_collation_warnings(schema: Any) -> list[checks.CheckMessage]:
     return issues
 
 
-@checks.register("rebac")
+@_register()
 def check_auth_backend_installed(
     app_configs: Any = None, **kwargs: Any
 ) -> list[checks.CheckMessage]:
@@ -429,7 +480,7 @@ def check_auth_backend_installed(
     return []
 
 
-@checks.register("rebac")
+@_register()
 def check_zookie_transport_setting(
     app_configs: Any = None, **kwargs: Any
 ) -> list[checks.CheckMessage]:
@@ -471,7 +522,7 @@ def check_zookie_transport_setting(
     return issues
 
 
-@checks.register("rebac")
+@_register()
 def check_actor_middleware_order(
     app_configs: Any = None, **kwargs: Any
 ) -> list[checks.CheckMessage]:
@@ -510,7 +561,7 @@ def _is_rebac_bound(model: Any) -> bool:
     return bool(getattr(meta, "rebac_resource_type", None))
 
 
-@checks.register("rebac")
+@_register()
 def check_universal_admin_in_roles(
     app_configs: Any = None, **kwargs: Any
 ) -> list[checks.CheckMessage]:
@@ -590,7 +641,7 @@ def check_universal_admin_in_roles(
     return issues
 
 
-@checks.register("rebac")
+@_register()
 def check_cross_rbac_relations(app_configs: Any = None, **kwargs: Any) -> list[checks.CheckMessage]:
     """Warn when an RBAC-bound model declares a forward FK / O2O / M2M whose
     target is also RBAC-bound.
@@ -649,17 +700,17 @@ def check_cross_rbac_relations(app_configs: Any = None, **kwargs: Any) -> list[c
     return issues
 
 
-@checks.register("rebac")
+@_register()
 def check_tracked_models_setting(
     app_configs: Any = None, **kwargs: Any
 ) -> list[checks.CheckMessage]:
     from django.apps import apps
 
     labels = app_settings.REBAC_TRACKED_MODELS
-    if not isinstance(labels, list) or any(not isinstance(label, str) for label in labels):
+    if not isinstance(labels, (list, tuple)) or any(not isinstance(label, str) for label in labels):
         return [
             checks.Error(
-                "REBAC_TRACKED_MODELS must be a list of app_label.ModelName strings.",
+                "REBAC_TRACKED_MODELS must be a list or tuple of app_label.ModelName strings.",
                 id="rebac.E018",
             )
         ]
@@ -676,7 +727,7 @@ def check_tracked_models_setting(
     return issues
 
 
-@checks.register("rebac")
+@_register()
 def check_declared_base_managers(
     app_configs: Any = None, **kwargs: Any
 ) -> list[checks.CheckMessage]:
@@ -717,7 +768,7 @@ def check_declared_base_managers(
     return issues
 
 
-@checks.register("rebac")
+@_register()
 def check_default_managers(app_configs: Any = None, **kwargs: Any) -> list[checks.CheckMessage]:
     """E024: a RebacMixin model's default manager must return a RebacQuerySet."""
     from django.apps import apps
@@ -755,7 +806,7 @@ def check_default_managers(app_configs: Any = None, **kwargs: Any) -> list[check
     return issues
 
 
-@checks.register("rebac")
+@_register()
 def check_stale_override_references(
     app_configs: Any = None, **kwargs: Any
 ) -> list[checks.CheckMessage]:

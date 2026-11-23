@@ -2,13 +2,26 @@
 
 Read via the public `app_settings` proxy — never call `getattr(settings, ...)`
 directly inside the package; use `app_settings.<KEY>`.
+
+Every setting declares the values it accepts (``_TYPES``), and the proxy is the
+one place that reads them. A value of another type is never used as written:
+a setting with a reading that widens nothing (a protection on, a loosening or
+a mechanism that skips or shortens a permission statement off) reads that
+(``closed``), and every other setting raises ``ImproperlyConfigured`` when it
+is read, except the few that a check of their own refuses whatever the type
+(``checked_by``). A string is a string: ``"False"`` is not ``False``. System
+check ``rebac.E028`` reports each wrongly typed setting by name.
 """
 
 from __future__ import annotations
 
+import os
+from collections.abc import Callable
+from dataclasses import dataclass
 from typing import Any
 
 from django.conf import settings
+from django.core.exceptions import ImproperlyConfigured
 from django.core.signals import setting_changed
 
 _DEFAULTS: dict[str, Any] = {
@@ -155,9 +168,165 @@ _DEFAULTS: dict[str, Any] = {
 }
 
 
+class _WrongSettingType(ImproperlyConfigured):
+    """A setting whose value has a type it does not accept, and no safe reading."""
+
+
+_RAISE: Any = object()
+
+
+@dataclass(frozen=True, slots=True)
+class _Type:
+    """The values a setting accepts and how a value of another type is read.
+
+    ``expected`` says what to write. ``closed`` is the reading of a value it does
+    not accept, or ``_RAISE`` where no reading is safe. ``checked_by`` names the
+    system check that reports any value the setting refuses (not ``rebac.E028``);
+    such a setting is passed through as written, and its readers refuse or ignore
+    a value they do not know.
+    """
+
+    expected: str
+    accepts: Callable[[Any], bool]
+    closed: Any = _RAISE
+    checked_by: str = ""
+
+
+def _is_bool(value: Any) -> bool:
+    return value is True or value is False
+
+
+def _is_int(value: Any) -> bool:
+    return isinstance(value, int) and not isinstance(value, bool)
+
+
+def _bool(closed: bool) -> _Type:
+    return _Type("True or False", _is_bool, closed)
+
+
+def _switch(*names: str, also: tuple[str, ...] = ()) -> _Type:
+    """True, False or one of ``names``; ``also`` are spellings read but not documented."""
+    spelled = " or ".join(f'"{name}"' for name in names)
+    known = (*names, *also)
+    return _Type(
+        f"True, False or {spelled}",
+        lambda value: _is_bool(value) or (isinstance(value, str) and value in known),
+        False,
+    )
+
+
+_INT = _Type("an int", _is_int)
+_STR = _Type("a str", lambda value: isinstance(value, str))
+_OPTIONAL_STR = _Type("a str or None", lambda value: value is None or isinstance(value, str))
+_PATH = _Type(
+    "a str, a pathlib.Path or None",
+    lambda value: value is None or isinstance(value, (str, os.PathLike)),
+)
+
+
+def _checked_by(check: str) -> _Type:
+    return _Type("", lambda value: True, checked_by=check)
+
+
+# One entry per setting in ``_DEFAULTS``. A bool or switch that loosens protection, or lets the
+# library skip or shorten a permission statement, reads a wrongly typed value as off; one that
+# protects, audits or lints reads it as on. Names, numbers, dotted paths and types have no safe
+# reading: guessing one could name other subjects or resolve actors another way.
+_TYPES: dict[str, _Type] = {
+    "REBAC_BACKEND": _checked_by("rebac.E001"),
+    # Read while models are imported and the registry is populated, where nothing may raise.
+    "REBAC_TRACKED_MODELS": _checked_by("rebac.E018"),
+    "REBAC_RELATIONSHIP_MODEL": _STR,
+    "REBAC_SCHEMA_DIR": _PATH,
+    "REBAC_DEPTH_LIMIT": _INT,
+    "REBAC_ACTOR_PROFILES": _bool(closed=False),
+    "REBAC_STRUCTURAL_PREFETCH": _bool(closed=False),
+    "REBAC_BOUNDED_WALK": _switch("prove", "decide"),
+    "REBAC_ROW_SCOPE": _switch("named", also=("always",)),
+    "REBAC_DISPLAY_FIELDS": _switch("fallback", also=("always",)),
+    "REBAC_TRUSTED_IDS": _bool(closed=False),
+    "REBAC_DEFAULT_CONSISTENCY": _STR,
+    "REBAC_CACHE_ALIAS": _STR,
+    "REBAC_LOOKUP_CACHE_TTL": _INT,
+    "REBAC_STRICT_MODE": _bool(closed=True),
+    "REBAC_ENABLED": _bool(closed=True),
+    "REBAC_REQUIRE_SUDO_REASON": _bool(closed=True),
+    "REBAC_ALLOW_SUDO": _bool(closed=False),
+    "REBAC_GC_INTERVAL_SECONDS": _INT,
+    "REBAC_AUTHENTICATION_MIDDLEWARE": _STR,
+    "REBAC_ACTOR_RESOLVER": _STR,
+    "REBAC_MCP_ACTOR_RESOLVER": _STR,
+    "REBAC_TYPE_PREFIX": _OPTIONAL_STR,
+    "REBAC_SUPERUSER_BYPASS": _bool(closed=False),
+    "REBAC_USER_TYPE": _STR,
+    "REBAC_GROUP_TYPE": _STR,
+    "REBAC_ANONYMOUS_TYPE": _STR,
+    "REBAC_UNIVERSAL_ADMIN_ROLE": _OPTIONAL_STR,
+    "REBAC_RESOURCE_ID_ATTR": _STR,
+    "REBAC_USER_ID_ATTR": _STR,
+    "REBAC_AUDIT_DENIALS": _bool(closed=True),
+    "REBAC_LINT_BARE_PREFETCH": _bool(closed=True),
+    "REBAC_LOCAL_BACKEND_STORAGE": _checked_by("rebac.E006"),
+    "REBAC_LOCAL_BACKEND_REGISTRY_BATCH_SIZE": _INT,
+    "REBAC_EVALUATOR_CACHE_SIZE": _INT,
+    "REBAC_FIELD_READ_MODE": _checked_by("rebac.E008"),
+    "REBAC_FIELD_READ_FAIL_CLOSED_ON_CONDITIONAL": _bool(closed=True),
+    "REBAC_ZOOKIE_TRANSPORT": _checked_by("rebac.E007"),
+    "REBAC_ZOOKIE_HEADER_NAME": _STR,
+    "REBAC_ZOOKIE_SESSION_KEY": _STR,
+}
+
+
+@dataclass(frozen=True, slots=True)
+class _WronglyTyped:
+    """A setting whose configured value has a type it does not accept (``rebac.E028``)."""
+
+    name: str
+    value: Any
+    expected: str
+    closed: Any
+    default: Any
+
+    @property
+    def raises(self) -> bool:
+        return self.closed is _RAISE
+
+    def problem(self) -> str:
+        """What is wrong: the setting, the value's type and the value, and what it accepts."""
+        shown = repr(self.value)
+        if len(shown) > 60:
+            shown = shown[:57] + "..."
+        return f"{self.name} is {type(self.value).__name__} {shown}, not {self.expected}"
+
+    def reading(self) -> str:
+        """What the library does with the value."""
+        if self.raises:
+            return "every read of it raises ImproperlyConfigured"
+        return f"it is read as {self.closed!r}"
+
+
+def _configured(name: str) -> Any:
+    return getattr(settings, name, _DEFAULTS[name])
+
+
+def _wrongly_typed(name: str, value: Any) -> _WronglyTyped | None:
+    kind = _TYPES[name]
+    if kind.checked_by or kind.accepts(value):
+        return None
+    return _WronglyTyped(name, value, kind.expected, kind.closed, _DEFAULTS[name])
+
+
+def _wrongly_typed_settings() -> list[_WronglyTyped]:
+    """Every setting whose configured value has a type it does not accept, by name."""
+    found = (_wrongly_typed(name, _configured(name)) for name in sorted(_TYPES))
+    return [entry for entry in found if entry is not None]
+
+
 class _AppSettings:
     """Lazy proxy. Reads from `django.conf.settings`, falls back to defaults.
 
+    A value of a type the setting does not accept reads as the setting's closed
+    reading, or raises ``_WrongSettingType`` (see the module docstring).
     Cached values invalidate on `setting_changed` signal (test ergonomics).
     """
 
@@ -181,7 +350,12 @@ class _AppSettings:
             raise AttributeError(f"Unknown REBAC setting: {name!r}")
         if name in self._cache:
             return self._cache[name]
-        value = getattr(settings, name, _DEFAULTS[name])
+        value = _configured(name)
+        wrong = _wrongly_typed(name, value)
+        if wrong is not None:
+            if wrong.raises:
+                raise _WrongSettingType(f"{wrong.problem()} (rebac.E028).")
+            value = wrong.closed
         self._cache[name] = value
         return value
 

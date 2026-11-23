@@ -70,7 +70,7 @@ how design intent erodes.
 | Python module | `rebac` |
 | Settings prefix | `REBAC_*` |
 | Management command | `manage.py rebac <subcommand>` |
-| System-check IDs | `rebac.E001` … `rebac.E024`, `rebac.W001` … `rebac.W011` (with gaps and retired IDs documented in the check table) |
+| System-check IDs | `rebac.E001` … `rebac.E028`, `rebac.W001` … `rebac.W011` (with gaps and retired IDs documented in the check table) |
 | Schema header comments | `// @rebac_package`, `// @rebac_package_version`, `// @rebac_schema_revision` |
 | App label | `rebac` |
 | Public Python imports | `from rebac import ...` |
