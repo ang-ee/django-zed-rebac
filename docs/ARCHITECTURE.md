@@ -2290,6 +2290,13 @@ statement in place.
   their statement. An arrow into a recursion from outside it is read with the whole limit and is delivered.
 - **Admission is per database.** Children are delivered only when their queryset reads the database the parents
   were read from.
+- **A delivery serves one evaluation.** Only the evaluation that reads the child rows inside the running prefetch
+  is delivered. A count, an existence test, an aggregate, `iterator()`, `explain()`, an eager `scoped()` and an
+  embedding carry their statement, inside the prefetch too, and the queryset keeps no delivered query: whatever it
+  sends after the delivered evaluation, or after one that raised, is decided again. The record of admitted parents
+  serves the thread, and the asyncio task in it, that runs the prefetch, until the prefetch ends: a context copied
+  while it runs (a signal receiver's `contextvars.copy_context()`, a task or a thread started then) delivers and
+  admits nothing, there or after. Django's async ORM runs a whole evaluation in one worker thread, and delivers.
 - **A union's arms are read as the compiler reads them.** Structural prefetch and the walk open a permission named
   in a union into its own arms, and a built-in name there is the actor's state, never a permission declared under
   it (`rebac.schema.ast.is_builtin_reference`, `member`, which the compiler resolves names through).
@@ -2303,9 +2310,11 @@ statement in place.
 - **Nothing runs when nothing is enforced.** `REBAC_ENABLED = False` answers before any of them.
 - **Several statements, several states.** A compiled answer is one statement. Structural prefetch and the walk
   read several, each seeing the state committed when it runs, so under READ COMMITTED a decision can be assembled
-  from adjacent states. They are exact inside one snapshot (a transaction on a connection configured for
-  repeatable read; any transaction on SQLite). After an exclusion the walk reads the fence again, so a policy
-  revision published under it answers nothing.
+  from adjacent states. Inside one snapshot (a transaction on a connection configured for repeatable read; any
+  transaction on SQLite) every statement reads the same data, but each reads its own instant, so a deadline (a
+  row's expiry, a caveat that reads the time, an override's) can fall between two of them: a parent admitted, or
+  an arm proved, just before it, is used by a statement that runs after it. After an exclusion the walk reads the
+  fence again, so a policy revision published under it answers nothing.
 - **Display fields need a `RebacMixin` model**, whose `save` leaves hidden columns alone.
 
 #### The clock
@@ -2819,6 +2828,61 @@ pickling does, without evaluating the queryset. It also clears cached results,
 field-visibility state and prefetch completion so restored results are checked
 again. The receiving process must establish its own trusted actor or bypass
 context before materializing or mutating it.
+
+A statement a queryset sends carries the scope decided for that evaluation,
+where it runs: iteration, `len()`, `bool()`, `count()`, `exists()`,
+`aggregate()`, `iterator()`, `aiterator()` and their async forms, whatever rows
+the queryset holds. Whether a scope is applied is read from the query, never
+from a result cache. The decision is `effective_actor()` (the queryset's own
+pins, the actor a related manager took from its row, an ambient `sudo()` or
+`system_context()` block, the ambient actor, `REBAC_ENABLED`), the database the
+statement reads, and the evaluator scope. A queryset already scoped for that
+decision runs as it is, at the cost of one comparison; otherwise its scope is
+built again for it. A pin wins over ambient state at every evaluation, as at
+the first: a `with_actor()` queryset evaluated in a later `sudo()` block reads
+as its actor, and a `sudo()` queryset evaluated under `actor_context()` reads
+every row. A related manager Django's prefetch filled holds the rows that read
+admitted and its own query, never scoped: what it sends (`iterator()`,
+`aggregate()`, a clone, an embedding) is decided like any related manager's
+read, by the actor the manager took from its row, else the ambient state, and
+without either raises `MissingActorError` in strict mode. A structural delivery
+(`REBAC_STRUCTURAL_PREFETCH`) is decided only for an evaluation that reads its
+rows inside the running prefetch, and lasts that evaluation: the queryset keeps
+no delivered query, so whatever it sends next is decided again. The record of
+admitted parents serves only the thread, and the asyncio task in it, that runs
+the prefetch, and only until it ends: a context copied meanwhile delivers and
+admits nothing. The
+action is fixed on the queryset (`with_action()` returns a clone). A policy
+revision published after the scope was built is not compared, which would cost
+a statement: the scope's revision fence closes it, so it admits nothing until
+it is built again (a clone, or another decision). Settings that only change
+the statement's form (the switchable read mechanisms) are not compared either:
+they change no answer.
+
+Rows a queryset holds (its result cache) are handed out as Django hands them
+out, under any context: they were read, stamped, redacted and guarded by the
+evaluation that read them, as a chunk of `iterator()` consumed later was, and
+handing them out reads nothing. `count()` and `exists()` answer from them;
+`iterator()`, `aiterator()` and `aggregate()`, which Django sends to the
+database whether or not rows are held, decide their scope as any other read.
+A queryset holds rows only once everything that makes them safe to hand out
+has succeeded: when reading them, their prefetches, field redaction or the
+`rebac_select_related()` guards raise, it holds none, and indexing, slicing,
+`first()`, `repr()` and a later `count()` read them again. Rows Django's
+prefetch hands a related manager are redacted and guarded for its actor at its
+first use; when that raises, it keeps none.
+
+A queryset whose permission scope cannot be built (any exception while it is
+built: a `SchemaError`, a failed statement, an interrupt) raises and keeps no
+part of it: evaluating the same queryset again, embedding it (`Subquery()`,
+`Exists()`, a lookup on its `query`) or copying it builds the scope again, so
+it raises again or reads what the scope admits, never unscoped rows. The scope
+is built on a copy of the query, which replaces the queryset's own only once
+complete, and each evaluation runs the query it decided. Two threads that
+evaluate one queryset object therefore never run a statement scoped for
+another decision or for none; at worst each builds the scope. Django does not
+make a shared queryset thread-safe otherwise: one thread can hand out the rows
+the other read.
 
 ### `with_actor` vs `sudo` — distinct verbs
 

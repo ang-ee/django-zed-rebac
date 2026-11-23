@@ -25,14 +25,27 @@ Three things must hold, and each is checked where the child statement is built:
   (``parent_implies_children``);
 - the policy carries no override of any kind, which the proof does not read.
 
+Only the evaluation that reads the child rows inside the running prefetch is
+delivered (``RebacQuerySet._fetch_all``), and the delivery serves that evaluation
+alone: the queryset keeps no delivered query, so a count, an aggregate,
+``iterator()``, an eager ``scoped()`` or an embedding, inside the prefetch or
+after it, carries its statement. The record of admitted parents serves only the
+thread, and the asyncio task in it, that runs the prefetch, until it ends
+(``_Delivery.serves``).
+
 Anything else falls back to the scoped read. The setting is off by default:
 whether a parent read moments ago may admit its children is a consistency
-decision (an evaluator scope inside one repeatable-read snapshot makes it
-exact), and the library does not take it for the application.
+decision, and the library does not take it for the application. Inside one
+repeatable-read snapshot the children's statement reads the data the parents'
+did, but at its own instant: a deadline (a grant's expiry, a caveat that reads
+the time, an override's) that falls between the two statements is read as
+passed by the second and not by the first.
 """
 
 from __future__ import annotations
 
+import asyncio
+import threading
 from collections.abc import Iterator
 from contextlib import contextmanager
 from contextvars import ContextVar
@@ -64,9 +77,24 @@ _PROOFS: dict[tuple[Any, ...], bool] = {}
 _PROOF_LIMIT = 4096
 
 
+def _current_task() -> object | None:
+    try:
+        return asyncio.current_task()
+    except RuntimeError:
+        # No event loop runs in this thread (the sync ORM, a worker thread).
+        return None
+
+
 @dataclass
 class _Delivery:
-    """The rows one prefetch has admitted so far, for one actor."""
+    """The rows one prefetch has admitted so far, for one actor.
+
+    The record lives in a context variable, and a context copied while the prefetch
+    runs (a signal receiver's ``copy_context()``, a task or a thread started then)
+    carries it elsewhere and beyond the prefetch. It serves only the thread, and the
+    asyncio task in it, that opened it, and only until the prefetch that opened it
+    ends (``serves``): anywhere else, and after, nothing is delivered or admitted.
+    """
 
     actor: SubjectRef
     # (model, database, action) -> primary keys the actor holds the action on: a
@@ -74,6 +102,18 @@ class _Delivery:
     rows: dict[tuple[type[models.Model], str | None, str], set[Any]] = field(default_factory=dict)
     # How many child statements were read without their permission statement.
     delivered: int = 0
+    thread: int = field(default_factory=threading.get_ident)
+    task: object | None = field(default_factory=_current_task)
+    closed: bool = False
+
+    def serves(self, actor: SubjectRef) -> bool:
+        """Whether this record may deliver or admit for ``actor`` here and now."""
+        return (
+            not self.closed
+            and self.actor == actor
+            and self.thread == threading.get_ident()
+            and self.task is _current_task()
+        )
 
 
 _delivery: ContextVar[_Delivery | None] = ContextVar("rebac_structural_delivery", default=None)
@@ -96,7 +136,7 @@ def delivering(
     delivery already open for the same actor.
     """
     current = _delivery.get()
-    if current is not None and current.actor == actor:
+    if current is not None and current.serves(actor):
         _admit(current, model, action, rows)
         yield current
         return
@@ -106,6 +146,8 @@ def delivering(
     try:
         yield opened
     finally:
+        # Closed first: a context copied inside the block keeps the record.
+        opened.closed = True
         _delivery.reset(token)
 
 
@@ -116,7 +158,7 @@ def admit(actor: SubjectRef, model: type[models.Model], action: str, rows: list[
     of ``a`` have no prefetch of their own to open a delivery with.
     """
     current = _delivery.get()
-    if current is not None and current.actor == actor:
+    if current is not None and current.serves(actor):
         _admit(current, model, action, rows)
 
 
@@ -132,7 +174,7 @@ def delivers(
     """Whether ``query``, read from database ``using``, reads only children the running
     prefetch already admitted there."""
     delivery = _delivery.get()
-    if delivery is None or delivery.actor != actor:
+    if delivery is None or not delivery.serves(actor):
         return False
     if query.combined_queries or query.is_sliced or query.model is not model:
         return False
