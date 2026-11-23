@@ -71,10 +71,11 @@ these must hold:
      action (the one a plain read of it is scoped by), or under an action `A` such that the policy proves that
      whoever is granted `A` on a row of that type is granted its read action (`rebac.structural.implies`,
      [proposal 0022](./0022-structural-delivery-under-an-implied-action.md)). The proof reads the policy the backend
-     evaluates; it is structural's own, kept per policy and proven afresh for a new one; while the policy carries an
-     override of any kind nothing is proven and only the read action counts, nor is anything proven about a type
-     that reads a name two ways. It is decided where the queryset's scope is built, and carried by its query with
-     its decision to the rows it admits: what a row was admitted to is
+     evaluates, the narrowed one under `REBAC_INHERIT_THROUGH_LINKS = False`; it is structural's own, kept per
+     policy and proven afresh for a new one; while the policy carries an override of any kind nothing is proven
+     and only the read action counts, nor is anything proven about a type that reads a name two ways; a name the
+     narrowing generates (`lent(P)`, `excluded(P)`) never counts. It is decided where the queryset's scope is
+     built, and carried by its query with its decision to the rows it admits: what a row was admitted to is
      what the policy that admitted it says, whatever the policy is when a delivery is decided, as for a row
      admitted under the read action itself. An inbox that lists messages under `read_inbox`, which implies `read`,
      shows the labels its messages refer to; an action that grants what the read action does not (`peek`, where a
@@ -215,12 +216,16 @@ Statements / SQL / wall time, median of 5; the time is the range of two runs.
 
 ## Verification
 
-Parents admitted under an implied action (`tests/test_display_prefetch.py`): delivery under an action that implies
-read and none under one that does not; the proof kept per policy and proven afresh; nothing but the read action
-while an override is stored; a policy replaced between admission and delivery, both ways, and while the parents are
-built; the gate and a key no admitted row holds; a target's own ordering, in Django's prefetch and in a binding
-evaluated as it stands. The scope rule with display rows on: a display read reused under another actor, embedded,
-iterated in another context, and evaluated again after it raised.
+Parents admitted under an implied action (`tests/test_display_prefetch.py`, `tests/test_display_rows_under_narrowing.py`,
+`tests/test_mechanisms_together.py`): delivery under an action that implies read and none under one that does not;
+the proof kept per policy and proven afresh; nothing but the read action while an override is stored; a policy
+replaced between admission and delivery, both ways, and while the parents are built; an eager scope built under one
+value of `REBAC_INHERIT_THROUGH_LINKS` and read under the other, and a queryset counted under one value and listed
+under the other, both ways; the narrowed policy proving what the published
+one does not; generated names, which the narrowed policy proves imply read and which still lend nothing; the gate
+and a key no admitted row holds; children delivered structurally lending their labels; a target's own ordering, in
+Django's prefetch and in a binding evaluated as it stands. The scope rule with display rows on: a display read
+reused under another actor, embedded, iterated in another context, and evaluated again after it raised.
 
 `tests/test_display_prefetch.py`: the request changes no statement where it does not apply (statement text compared,
 on PostgreSQL too); delivery with no permission statement, counted and classified, under both settings, with

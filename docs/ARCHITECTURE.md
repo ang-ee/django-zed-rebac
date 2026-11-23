@@ -2425,7 +2425,7 @@ with its value) and, for a mapping, the keys whose value `changed`.
 
 | Setting | What it does | What keeps the compiled statement |
 |---|---|---|
-| `REBAC_STRUCTURAL_PREFETCH` | A prefetch's children are read by the foreign key that names their parents, with no permission statement, where the child's action is a union with the arm `relation->T` over that unfiltered foreign key and holding the parent's action grants `T`: `T` is that action, or the policy proves the action implies it (`rebac.structural`) | An intersection or exclusion above the arm, a filtered or generic backing, an action not proven to imply the arm's, an edge inside a recursion, another database than the parents', parents scoped under another policy than the children are decided under, a type that reads a name two ways, an override of any kind |
+| `REBAC_STRUCTURAL_PREFETCH` | A prefetch's children are read by the foreign key that names their parents, with no permission statement, where the child's action is a union with the arm `relation->T` over that unfiltered foreign key and holding the parent's action grants `T`: `T` is that action, or the policy proves the action implies it (`rebac.structural`) | An intersection or exclusion above the arm, a filtered or generic backing, an action not proven to imply the arm's, a generated name, an edge inside a recursion, another database than the parents', parents scoped under another policy than the children are decided under, a type that reads a name two ways, an override of any kind |
 | `REBAC_ROW_SCOPE` | The scope becomes `EXISTS` conditions on the row: a grant row on its id, a parent row that satisfies the parent's conditions, a constant's fixed object (`rebac.rowscope`) | A recursion; a caveated or expiring relation; a backing the walk does not read; more than 24 subqueries; a queryset embedded in another, combined, counted or aggregated; a policy that reads a name two ways |
 | `REBAC_BOUNDED_WALK` | `held` and `held_many` read the permission from the candidate rows by one lookup per relation (`rebac.walk`) | A recursive or caveated part is asked of the compiled statement alone; candidates that name no row keep their compiled answer; a policy that reads a name two ways |
 | `REBAC_DISPLAY_FIELDS` | A joined row is delivered with its key and declared display fields, the rest hidden as a denied field is (`rebac.display`); so is a row a `for_display()` prefetch of a forward foreign key asks for, read by the library by primary key without a statement, where every key asked for is held by a row admitted to be read, under its type's read action or one the policy proves implies it (proposal 0024) | A model that declares no display fields; a `for_display()` queryset fetched any other way, which reads as without the request |
@@ -2474,7 +2474,15 @@ with its value) and, for a mapping, the keys whose value `changed`.
   throughout, its prefetches included, but an eager `scoped()` queryset keeps the statement it was built with. The
   scope carries, beside its decision, the key of the policy it was built under (`compile.read.policy_key`); the
   parents' rows are admitted with that key, and children are delivered only under the same one. Parents scoped
-  before a policy change deliver nothing after it: their children keep their statement.
+  before a policy change deliver nothing after it, and so do the rows of an eager `scoped()` queryset built under
+  one value of `REBAC_INHERIT_THROUGH_LINKS` and read under the other: their children keep their statement. A
+  queryset that is not eager is scoped again under the value in force when it is read
+  ([Policies without inheritance through links](#policies-without-inheritance-through-links)).
+- **A generated name is not an action.** An edge under a name the policy without inheritance through links
+  generates (`lent(P)`, `excluded(P)`), as the parent's action or the child's, is refused. Structural prefetch, its
+  prover, the recursion analysis and `rebac.structural.explain` read the policy the backend evaluates, the narrowed
+  one under `REBAC_INHERIT_THROUGH_LINKS = False`, as the compiler does, and a delivery returns what the scoped read
+  under that policy returns.
 - **A union's arms are read as the compiler reads them.** Structural prefetch and the walk open a permission named
   in a union into its own arms, and a built-in name there is the actor's state, never a permission declared under
   it (`rebac.schema.ast.is_builtin_reference`, `member`, which the compiler resolves names through).
@@ -2561,7 +2569,7 @@ with its value) and, for a mapping, the keys whose value `changed`.
   proves, on the policy the backend evaluates, that whoever holds `A` on a row of that type holds its read action
   (`rebac.display.admits_reading`): an inbox listing messages under `read_inbox` shows their labels. The proof is
   kept per policy, and nothing is proven while the policy carries an override (only the read action counts) or
-  about a type that reads a name two ways. It is decided where the queryset's scope is built, and carried by its
+  about a type that reads a name two ways; a generated name never counts. It is decided where the queryset's scope is built, and carried by its
   query with its decision, so a policy that changes before the delivery is decided does not change what a row was
   admitted to. The target's own `Meta.ordering` is not the caller's: a read by key needs no order (Django's
   prefetch clears it anyway). The library then reads the rows itself from a bare `QuerySet` of the model, which no
@@ -2708,6 +2716,19 @@ neither policy for it: read as truthy, the string `"False"` would evaluate the p
 than the narrower one the deployment asked for, and `rebac.W012` would not fire; read as falsy, a value meant as on
 would take access away unannounced. Raising is the one reading that grants nothing the deployment did not ask for
 and cannot go unnoticed.
+
+**Display rows.** A `for_display()` prefetch ([proposal 0024](./proposals/0024-display-rows-through-a-prefetch.md))
+shows what the foreign keys of admitted parents name, and a parent is admitted when a queryset scoped under its
+model's read action read it, or under an action the policy proves implies it: under `False`, by the narrowed policy,
+which the proof reads too (it proves `lent(…)` versions as it proves declared names, and a generated name never
+counts). The rows shown are the rows those parents' foreign keys name, whether or not the reader may read them: the
+policy decides which parents are admitted, where their scope is built and under the policy it is built under. A
+queryset evaluated after a change of the setting is scoped again under the new policy; an eager `scoped()` queryset
+built under one value and read under the other admits its rows as the policy it was built under admits them, and they
+refer to display rows accordingly, while structural prefetch delivers none of their children. The field gates it
+consults are declared names, which both policies share. Rows scoped under a generated name are none (an unknown
+action), and rows recorded under one admit nothing. The display read itself issues no permission statement and does
+not depend on the setting.
 
 **Where it applies.** `LocalBackend` narrows each composition it evaluates once and keeps the result. The
 snapshot's own composition (the published baseline with the overrides active when it was read; a snapshot expires

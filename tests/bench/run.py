@@ -14,8 +14,9 @@ the tiny size and runs every scenario with and without the mechanisms, failing
 if a result differs: it needs no database server (in-memory SQLite). It runs
 twice, without display rows and with them (``labels``), each run compared with
 its own first mechanism. A mechanism is compared with the first one of the run
-that reads alike: the same policy (``nolinks`` evaluates the narrower one,
-``plain`` enforces none) and display rows on or off.
+that reads alike: the same policy (``nolinks``, ``nolinks_labels`` and
+``everything`` evaluate the narrower one, ``plain`` enforces none) and display rows
+on or off.
 """
 
 from __future__ import annotations
@@ -58,6 +59,17 @@ MECHANISMS: dict[str, dict[str, Any]] = {
         "REBAC_BOUNDED_WALK": "decide",
         "REBAC_TRUSTED_IDS": True,
         "REBAC_DISPLAY_FIELDS": True,
+    },
+    # Both experiments together: display rows for the parents the narrower policy admits.
+    "nolinks_labels": {"REBAC_INHERIT_THROUGH_LINKS": False, "REBAC_DISPLAY_FIELDS": True},
+    # Everything on: the switches of ``all``, display rows, and the narrower policy.
+    "everything": {
+        "REBAC_STRUCTURAL_PREFETCH": True,
+        "REBAC_ROW_SCOPE": True,
+        "REBAC_BOUNDED_WALK": "decide",
+        "REBAC_TRUSTED_IDS": True,
+        "REBAC_DISPLAY_FIELDS": True,
+        "REBAC_INHERIT_THROUGH_LINKS": False,
     },
 }
 
@@ -127,7 +139,7 @@ def main() -> None:
         data.build(bench)
         failed = []
         # Display rows change what a label read returns: each run has its own baseline.
-        for mechanisms in ("today,all,nolinks", "labels,all_labels"):
+        for mechanisms in ("today,all,nolinks", "labels,all_labels,nolinks_labels,everything"):
             everything = argparse.Namespace(
                 scenario="",
                 actor="heavy,light,outsider,admin",
@@ -172,7 +184,7 @@ def reads(bench: Any, arguments: argparse.Namespace) -> list[dict[str, Any]]:
     names = [name for name in arguments.scenario.split(",") if name] or list(scenarios)
     connection = connections[bench.using]
     report: list[dict[str, Any]] = []
-    header = f"{'scenario':<14}{'actor':<9}{'mechanism':<11}{'rows':>5}{'stmts':>6}{'sql KB':>9}{'wall ms':>9}"
+    header = f"{'scenario':<14}{'actor':<9}{'mechanism':<15}{'rows':>5}{'stmts':>6}{'sql KB':>9}{'wall ms':>9}"
     if arguments.explain:
         header += f"{'plan ms':>9}{'exec ms':>9}{'plan MiB':>9}"
     print(header)
@@ -205,7 +217,7 @@ def reads(bench: Any, arguments: argparse.Namespace) -> list[dict[str, Any]]:
                                 "error": reason,
                             }
                         )
-                        print(f"{name:<14}{who:<9}{mechanism:<11}  {reason}", flush=True)
+                        print(f"{name:<14}{who:<9}{mechanism:<15}  {reason}", flush=True)
                         compiled.reset()
                         rowscope._built.clear()
                         continue
@@ -243,7 +255,7 @@ def reads(bench: Any, arguments: argparse.Namespace) -> list[dict[str, Any]]:
                 row["same"] = result == baselines.setdefault(alike(mechanism), result)
                 report.append(row)
                 line = (
-                    f"{name:<14}{who:<9}{mechanism:<11}{row['rows']:>5}{row['statements']:>6}"
+                    f"{name:<14}{who:<9}{mechanism:<15}{row['rows']:>5}{row['statements']:>6}"
                     f"{row['sql_kb']:>9}{row['wall_ms']:>9}"
                 )
                 if "plan_ms" in row:

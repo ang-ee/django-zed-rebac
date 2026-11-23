@@ -312,10 +312,11 @@ pre-1.0; breaking changes within a minor version are explicitly called out.
   built (`__init__`, `post_init`) sees no hidden value and loads none. The queryset's own conditions never run, and
   the check reads no row. A display row admits nothing. A row is **admitted to be read** under its type's read
   action, or under an action `A` such that `rebac.structural.implies` (proposal 0022) proves, on the policy the
-  backend evaluates, that whoever holds `A` on a row of that type holds its read action
-  (`rebac.display.admits_reading`): an inbox that lists messages under `read_inbox` shows the threads and senders
-  they refer to. The proof is structural's own, kept per policy; nothing is proven while the policy carries an
-  override (only the read action counts then), nor about a type that reads a name two ways. It is decided where
+  backend evaluates (the narrowed one under `REBAC_INHERIT_THROUGH_LINKS = False`), that whoever holds `A` on a row
+  of that type holds its read action (`rebac.display.admits_reading`): an inbox that lists messages under
+  `read_inbox` shows the threads and senders they refer to. The proof is structural's own, kept per policy; nothing
+  is proven while the policy carries an override (only the read action counts then), nor about a type that reads a
+  name two ways, and a name the narrowing generates never counts. It is decided where
   the parents' scope is built and carried by their query with its decision, so a policy that changes before the
   delivery is decided does not change what they were admitted to. Whether a queryset delivers display rows is
   decided by an evaluation that scopes its query, and serves that evaluation alone: the queryset keeps nothing of
@@ -352,8 +353,9 @@ pre-1.0; breaking changes within a minor version are explicitly called out.
 
 - The policy benchmark has `labels`, `page_labels` and `inbox_labels` scenarios, display fields for three label
   types, and the `labels` and `all_labels` mechanisms. `make bench-smoke` runs every scenario twice, without
-  display rows (`today`, `all`, `nolinks`) and with them (`labels`, `all_labels`), and compares a mechanism's
-  result with the first mechanism of its run that reads alike: the same policy, display rows on or off.
+  display rows (`today`, `all`, `nolinks`) and with them (`labels`, `all_labels`, `nolinks_labels`, `everything`),
+  and compares a mechanism's result with the first mechanism of its run that reads alike: the same policy, display
+  rows on or off.
 
 - **`REBAC_INHERIT_THROUGH_LINKS`** (`True` by default), a draft
   ([proposal 0023](docs/proposals/0023-no-inheritance-through-links.md)) built to be measured.
@@ -400,7 +402,20 @@ pre-1.0; breaking changes within a minor version are explicitly called out.
   stored (`SchemaOverride` rows), nor on a type that reads a name two ways. `schema()` stays the published policy.
   `rebac.links.is_generated`, `inherits_through_links` and `narrowed_arrows` are its companions, experimental too.
 
-- The policy benchmark has a `nolinks` mechanism.
+- The policy benchmark has a `nolinks` mechanism, `nolinks_labels` (display rows under the narrower policy) and
+  `everything` (the switches of `all`, display rows and the narrower policy).
+
+- **The three mechanisms together** (proposals 0022, 0023, 0024, experimental). Structural prefetch, its
+  implication prover, the recursion analysis and `rebac.structural.explain` read the policy the backend evaluates,
+  the narrowed one under `REBAC_INHERIT_THROUGH_LINKS = False`, as the compiler does, and a delivery returns what
+  the scoped read under that policy returns. Children a
+  prefetch delivered structurally were admitted, so the rows they refer to are delivered as display rows; a display
+  row was never admitted, so nothing is delivered structurally under it. A parent's admission delivers children
+  structurally only under the policy its scope was built under: the children of an eager `scoped()` queryset built
+  under one value of the setting and prefetched under the other keep their statement. Its rows still lend display
+  rows, as the policy it was built under admitted them (`rebac.display.admits_reading`, decided where the scope is
+  built). A queryset that is not eager is scoped again under the policy in force at each evaluation, and its rows
+  are admitted as that policy says.
 
 ### Changed
 

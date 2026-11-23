@@ -276,6 +276,20 @@ def test_off_by_default_every_prefetch_is_scoped(rows):
     assert "rebac_" in child
 
 
+@pytest.mark.parametrize("value", ["True", "False", 1, "on"])
+def test_only_true_turns_it_on(rows, settings, value):
+    """A value read from the environment is a string: ``"False"`` was truthy and turned the
+    mechanism on, reading children without their statement. Anything but ``True`` is off."""
+    settings.REBAC_STRUCTURAL_PREFETCH = value
+    local = install_schema(SCHEMA)
+    local.write_relationships([grant("scope/thread", 1, "reader")])
+    assert not structural.enabled()
+    found, statements = threads_with_messages()
+    assert found == {1: [1, 2]}
+    child = next(sql for sql in statements if 'FROM "testapp_scopemessage"' in sql)
+    assert "rebac_" in child
+
+
 def test_a_rule_that_proves_nothing_keeps_the_scoped_read(rows, structural_on):
     schema = SCHEMA.replace(
         "relation direct: auth/user\n    permission read = thread->read + direct",
