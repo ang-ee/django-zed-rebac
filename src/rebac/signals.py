@@ -141,9 +141,9 @@ def tracked_model(model: type[Model]) -> bool:
     if issubclass(model, RebacTrackedMixin):
         return True
     labels = {settings.AUTH_USER_MODEL.lower(), "auth.group"}
-    configured = app_settings.REBAC_TRACKED_MODELS
-    if isinstance(configured, (list, tuple)):
-        labels.update(label.lower() for label in configured if isinstance(label, str))
+    # A list or tuple of str labels; any other value raises (rebac.E018) at the first model class
+    # prepared after this module loads, or in ready(): django.setup() stops.
+    labels.update(label.lower() for label in app_settings.REBAC_TRACKED_MODELS)
     return any(
         hasattr(base, "_meta") and base._meta.label_lower in labels for base in model.__mro__
     )

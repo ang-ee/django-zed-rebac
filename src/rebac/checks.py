@@ -20,13 +20,17 @@ if TYPE_CHECKING:
 
 type _Check = Callable[..., list[checks.CheckMessage]]
 
+# The ids each registered check reports, by function name.
+_CHECK_IDS: dict[str, tuple[str, ...]] = {}
 
-def _register(*tags: str) -> Callable[[_Check], _Check]:
-    """Register a ``rebac`` check that reports nothing while it reads a refused setting.
 
-    Reading a setting whose value has a type it does not accept, and no safe
-    reading, raises; ``rebac.E028`` reports that setting by name, and the check
-    runs once the setting is fixed.
+def _register(*tags: str, ids: tuple[str, ...]) -> Callable[[_Check], _Check]:
+    """Register a ``rebac`` check under ``tags``; ``ids`` are the ids it reports.
+
+    A check that reads a setting whose value has no safe reading cannot run. It
+    then reports that it did not run, once under each of its own ids, at that id's
+    level and under its own tags: silencing ``rebac.E028`` does not silence it, and
+    a run that selects the check never passes because it was skipped.
     """
 
     def decorate(check: _Check) -> _Check:
@@ -34,13 +38,23 @@ def _register(*tags: str) -> Callable[[_Check], _Check]:
         def guarded(app_configs: Any = None, **kwargs: Any) -> list[checks.CheckMessage]:
             try:
                 return check(app_configs, **kwargs)
-            except _WrongSettingType:
-                return []
+            except _WrongSettingType as exc:
+                return [_not_run(check.__name__, exc.entry, check_id) for check_id in ids]
 
         checks.register("rebac", *tags)(guarded)
+        _CHECK_IDS[check.__name__] = ids
         return guarded
 
     return decorate
+
+
+def _not_run(name: str, entry: _WronglyTyped, check_id: str) -> checks.CheckMessage:
+    level = checks.Error if ".E" in check_id else checks.Warning
+    return level(
+        f"{name} did not run, so {check_id} is not checked: {entry.problem()}.",
+        hint=f"Write the setting as {entry.expected} ({entry.report}), then run the checks again.",
+        id=check_id,
+    )
 
 
 def _type_hint(entry: _WronglyTyped) -> str:
@@ -57,15 +71,31 @@ def _type_hint(entry: _WronglyTyped) -> str:
     return f"Write {entry.name} as {entry.expected} in the settings module; {convert}"
 
 
-@_register()
+@_register(ids=("rebac.E028", "rebac.W015"))
 def check_setting_types(app_configs: Any = None, **kwargs: Any) -> list[checks.CheckMessage]:
-    """E028: a setting whose value has a type it does not accept."""
-    return [
-        checks.Error(
-            f"{entry.problem()}: {entry.reading()}.", hint=_type_hint(entry), id="rebac.E028"
-        )
-        for entry in _wrongly_typed_settings()
-    ]
+    """E028: a setting whose value is not one it accepts. W015: the same, for an unread setting.
+
+    Settings with a check of their own (E001, E006, E007, E008, E018) are reported there.
+    """
+    issues: list[checks.CheckMessage] = []
+    for entry in _wrongly_typed_settings():
+        if entry.report == "rebac.E028":
+            issues.append(
+                checks.Error(
+                    f"{entry.problem()}: {entry.reading()}.",
+                    hint=_type_hint(entry),
+                    id="rebac.E028",
+                )
+            )
+        elif entry.report == "rebac.W015":
+            issues.append(
+                checks.Warning(
+                    f"{entry.problem()}: {entry.reading()}.",
+                    hint=(f"{entry.name} is reserved. Remove it, or write it as {entry.expected}."),
+                    id="rebac.W015",
+                )
+            )
+    return issues
 
 
 def _schema_for_checks() -> Schema | None:
@@ -100,7 +130,7 @@ def _schema_for_checks() -> Schema | None:
         return None
 
 
-@_register()
+@_register(ids=("rebac.E001", "rebac.E006", "rebac.W005"))
 def check_backend_setting(app_configs: Any = None, **kwargs: Any) -> list[checks.CheckMessage]:
     issues: list[checks.CheckMessage] = []
     backend = app_settings.REBAC_BACKEND
@@ -111,15 +141,17 @@ def check_backend_setting(app_configs: Any = None, **kwargs: Any) -> list[checks
                 id="rebac.E001",
             )
         )
-    storage = app_settings.REBAC_LOCAL_BACKEND_STORAGE
-    if storage not in ("denormalized", "registry"):
+    wrong = app_settings.problem("REBAC_LOCAL_BACKEND_STORAGE")
+    if wrong is not None:
         issues.append(
             checks.Error(
-                f"REBAC_LOCAL_BACKEND_STORAGE={storage!r} (expected 'denormalized' or 'registry')",
+                f"REBAC_LOCAL_BACKEND_STORAGE={wrong.value!r} (expected 'denormalized' or "
+                f"'registry'): {wrong.reading()}, at every query.",
+                hint="Write exactly 'denormalized' or 'registry'.",
                 id="rebac.E006",
             )
         )
-    elif backend == "local" and storage == "denormalized":
+    elif backend == "local" and app_settings.REBAC_LOCAL_BACKEND_STORAGE == "denormalized":
         issues.append(
             checks.Warning(
                 "REBAC_LOCAL_BACKEND_STORAGE='denormalized' — the registry "
@@ -141,7 +173,7 @@ def check_backend_setting(app_configs: Any = None, **kwargs: Any) -> list[checks
     return issues
 
 
-@_register()
+@_register(ids=("rebac.E021",))
 def check_caveat_dependency(app_configs: Any = None, **kwargs: Any) -> list[checks.CheckMessage]:
     """Report the optional CEL dependency only for installed caveat schemas."""
     from importlib.util import find_spec
@@ -203,7 +235,7 @@ def _schema_on_alias(using: str) -> Schema | None:
     return None
 
 
-@_register(checks.Tags.database)
+@_register(checks.Tags.database, ids=("rebac.E014", "rebac.E015", "rebac.E016", "rebac.E018"))
 def check_policy_models(app_configs: Any = None, **kwargs: Any) -> list[checks.CheckMessage]:
     """E014-E018; all schema I/O is opt-in via database checks."""
     if app_settings.REBAC_BACKEND != "local" or not kwargs.get("databases"):
@@ -290,7 +322,7 @@ def check_policy_models(app_configs: Any = None, **kwargs: Any) -> list[checks.C
     return unique
 
 
-@_register()
+@_register(ids=("rebac.W011",))
 def check_permissions_enforced(app_configs: Any = None, **kwargs: Any) -> list[checks.CheckMessage]:
     """W011: the deployment enforces no permission."""
     if app_settings.REBAC_ENABLED:
@@ -309,7 +341,7 @@ def check_permissions_enforced(app_configs: Any = None, **kwargs: Any) -> list[c
     ]
 
 
-@_register()
+@_register(ids=("rebac.E008", "rebac.W008"))
 def check_field_read_mode_setting(
     app_configs: Any = None, **kwargs: Any
 ) -> list[checks.CheckMessage]:
@@ -336,7 +368,7 @@ def check_field_read_mode_setting(
     return issues
 
 
-@_register()
+@_register(ids=("rebac.E009", "rebac.E010", "rebac.E011", "rebac.W009"))
 def check_field_backed_relations(
     app_configs: Any = None,
     **kwargs: Any,
@@ -445,7 +477,7 @@ def _attribute_collation_warnings(schema: Any) -> list[checks.CheckMessage]:
     return issues
 
 
-@_register()
+@_register(ids=("rebac.W001",))
 def check_auth_backend_installed(
     app_configs: Any = None, **kwargs: Any
 ) -> list[checks.CheckMessage]:
@@ -480,7 +512,7 @@ def check_auth_backend_installed(
     return []
 
 
-@_register()
+@_register(ids=("rebac.E007", "rebac.W006"))
 def check_zookie_transport_setting(
     app_configs: Any = None, **kwargs: Any
 ) -> list[checks.CheckMessage]:
@@ -522,7 +554,7 @@ def check_zookie_transport_setting(
     return issues
 
 
-@_register()
+@_register(ids=("rebac.E003", "rebac.E004"))
 def check_actor_middleware_order(
     app_configs: Any = None, **kwargs: Any
 ) -> list[checks.CheckMessage]:
@@ -561,7 +593,7 @@ def _is_rebac_bound(model: Any) -> bool:
     return bool(getattr(meta, "rebac_resource_type", None))
 
 
-@_register()
+@_register(ids=("rebac.E005", "rebac.W004"))
 def check_universal_admin_in_roles(
     app_configs: Any = None, **kwargs: Any
 ) -> list[checks.CheckMessage]:
@@ -641,7 +673,7 @@ def check_universal_admin_in_roles(
     return issues
 
 
-@_register()
+@_register(ids=("rebac.W003",))
 def check_cross_rbac_relations(app_configs: Any = None, **kwargs: Any) -> list[checks.CheckMessage]:
     """Warn when an RBAC-bound model declares a forward FK / O2O / M2M whose
     target is also RBAC-bound.
@@ -700,20 +732,27 @@ def check_cross_rbac_relations(app_configs: Any = None, **kwargs: Any) -> list[c
     return issues
 
 
-@_register()
+@_register(ids=("rebac.E018",))
 def check_tracked_models_setting(
     app_configs: Any = None, **kwargs: Any
 ) -> list[checks.CheckMessage]:
     from django.apps import apps
 
-    labels = app_settings.REBAC_TRACKED_MODELS
-    if not isinstance(labels, (list, tuple)) or any(not isinstance(label, str) for label in labels):
+    wrong = app_settings.problem("REBAC_TRACKED_MODELS")
+    if wrong is not None:
         return [
             checks.Error(
-                "REBAC_TRACKED_MODELS must be a list or tuple of app_label.ModelName strings.",
+                f"REBAC_TRACKED_MODELS must be a list or tuple of app_label.ModelName strings; "
+                f"{wrong.problem()}: {wrong.reading()}. A process cannot start with it: "
+                "django.setup() raises while it imports the models, before any check runs.",
+                hint=(
+                    'A one-label tuple needs its comma: ("app_label.Model",). Without it the '
+                    "value is a str."
+                ),
                 id="rebac.E018",
             )
         ]
+    labels = app_settings.REBAC_TRACKED_MODELS
     issues: list[checks.CheckMessage] = []
     for label in sorted(set(labels)):
         try:
@@ -727,7 +766,7 @@ def check_tracked_models_setting(
     return issues
 
 
-@_register()
+@_register(ids=("rebac.E023",))
 def check_declared_base_managers(
     app_configs: Any = None, **kwargs: Any
 ) -> list[checks.CheckMessage]:
@@ -768,7 +807,7 @@ def check_declared_base_managers(
     return issues
 
 
-@_register()
+@_register(ids=("rebac.E024",))
 def check_default_managers(app_configs: Any = None, **kwargs: Any) -> list[checks.CheckMessage]:
     """E024: a RebacMixin model's default manager must return a RebacQuerySet."""
     from django.apps import apps
@@ -806,7 +845,7 @@ def check_default_managers(app_configs: Any = None, **kwargs: Any) -> list[check
     return issues
 
 
-@_register()
+@_register(ids=("rebac.W010",))
 def check_stale_override_references(
     app_configs: Any = None, **kwargs: Any
 ) -> list[checks.CheckMessage]:

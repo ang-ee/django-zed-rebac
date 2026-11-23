@@ -4,13 +4,16 @@ Read via the public `app_settings` proxy — never call `getattr(settings, ...)`
 directly inside the package; use `app_settings.<KEY>`.
 
 Every setting declares the values it accepts (``_TYPES``), and the proxy is the
-one place that reads them. A value of another type is never used as written:
-a setting with a reading that widens nothing (a protection on, a loosening or
-a mechanism that skips or shortens a permission statement off) reads that
-(``closed``), and every other setting raises ``ImproperlyConfigured`` when it
-is read, except the few that a check of their own refuses whatever the type
-(``checked_by``). A string is a string: ``"False"`` is not ``False``. System
-check ``rebac.E028`` reports each wrongly typed setting by name.
+one place that reads them. A value a setting does not accept never widens what
+the library allows: a boolean reads its closed reading (a protection on, a
+loosening or a mechanism that skips or shortens a permission statement off); a
+number, a name, a path, the storage layout and the tracked models raise
+``ImproperlyConfigured`` when read; the backend, the field read mode and the
+Zookie transport pass to readers that refuse any value they do not know; and the
+reserved settings the library does not read have no effect. A string is a
+string: ``"False"`` is not ``False``. System checks name each such setting
+(``rebac.E028``, ``W015``, or the setting's own check), and ``AppConfig.ready()``
+logs each once, for a process that runs no checks.
 """
 
 from __future__ import annotations
@@ -168,28 +171,28 @@ _DEFAULTS: dict[str, Any] = {
 }
 
 
-class _WrongSettingType(ImproperlyConfigured):
-    """A setting whose value has a type it does not accept, and no safe reading."""
-
-
 _RAISE: Any = object()
 
 
 @dataclass(frozen=True, slots=True)
 class _Type:
-    """The values a setting accepts and how a value of another type is read.
+    """The values a setting accepts and how a value it does not accept is read.
 
     ``expected`` says what to write. ``closed`` is the reading of a value it does
-    not accept, or ``_RAISE`` where no reading is safe. ``checked_by`` names the
-    system check that reports any value the setting refuses (not ``rebac.E028``);
-    such a setting is passed through as written, and its readers refuse or ignore
-    a value they do not know.
+    not accept, or ``_RAISE`` where no reading is safe. ``report`` is the system
+    check that names such a value. ``passes`` hands the value to its readers as
+    written, with ``reads_as`` saying what they do with it: a setting whose
+    readers refuse or ignore any value they do not know, and one the library does
+    not read at all (``inert``).
     """
 
     expected: str
     accepts: Callable[[Any], bool]
     closed: Any = _RAISE
-    checked_by: str = ""
+    report: str = "rebac.E028"
+    passes: bool = False
+    reads_as: str = ""
+    inert: bool = False
 
 
 def _is_bool(value: Any) -> bool:
@@ -198,6 +201,10 @@ def _is_bool(value: Any) -> bool:
 
 def _is_int(value: Any) -> bool:
     return isinstance(value, int) and not isinstance(value, bool)
+
+
+def _is_str(value: Any) -> bool:
+    return isinstance(value, str)
 
 
 def _bool(closed: bool) -> _Type:
@@ -215,8 +222,32 @@ def _switch(*names: str, also: tuple[str, ...] = ()) -> _Type:
     )
 
 
+def _one_of(*names: str, report: str, **kwargs: Any) -> _Type:
+    return _Type(
+        " or ".join(f'"{name}"' for name in names),
+        lambda value: isinstance(value, str) and value in names,
+        report=report,
+        **kwargs,
+    )
+
+
+def _labels(value: Any) -> bool:
+    return isinstance(value, (list, tuple)) and all(isinstance(label, str) for label in value)
+
+
+def _inert(kind: _Type) -> _Type:
+    return _Type(
+        kind.expected,
+        kind.accepts,
+        report="rebac.W015",
+        passes=True,
+        reads_as="the library does not read it, so it has no effect",
+        inert=True,
+    )
+
+
 _INT = _Type("an int", _is_int)
-_STR = _Type("a str", lambda value: isinstance(value, str))
+_STR = _Type("a str", _is_str)
 _OPTIONAL_STR = _Type("a str or None", lambda value: value is None or isinstance(value, str))
 _PATH = _Type(
     "a str, a pathlib.Path or None",
@@ -224,19 +255,18 @@ _PATH = _Type(
 )
 
 
-def _checked_by(check: str) -> _Type:
-    return _Type("", lambda value: True, checked_by=check)
-
-
 # One entry per setting in ``_DEFAULTS``. A bool or switch that loosens protection, or lets the
-# library skip or shorten a permission statement, reads a wrongly typed value as off; one that
-# protects, audits or lints reads it as on. Names, numbers, dotted paths and types have no safe
-# reading: guessing one could name other subjects or resolve actors another way.
+# library skip or shorten a permission statement, reads a value it does not accept as off; one
+# that protects, audits or lints reads it as on. Names, numbers, dotted paths, types and the
+# storage layout have no safe reading: guessing one could name other subjects, resolve actors
+# another way or read another table.
 _TYPES: dict[str, _Type] = {
-    "REBAC_BACKEND": _checked_by("rebac.E001"),
-    # Read while models are imported and the registry is populated, where nothing may raise.
-    "REBAC_TRACKED_MODELS": _checked_by("rebac.E018"),
-    "REBAC_RELATIONSHIP_MODEL": _STR,
+    # backend() raises ValueError for any other value.
+    "REBAC_BACKEND": _one_of(
+        "local", report="rebac.E001", passes=True, reads_as="backend() raises ValueError"
+    ),
+    "REBAC_TRACKED_MODELS": _Type("a list or tuple of str", _labels, report="rebac.E018"),
+    "REBAC_RELATIONSHIP_MODEL": _inert(_STR),
     "REBAC_SCHEMA_DIR": _PATH,
     "REBAC_DEPTH_LIMIT": _INT,
     "REBAC_ACTOR_PROFILES": _bool(closed=False),
@@ -245,14 +275,14 @@ _TYPES: dict[str, _Type] = {
     "REBAC_ROW_SCOPE": _switch("named", also=("always",)),
     "REBAC_DISPLAY_FIELDS": _switch("fallback", also=("always",)),
     "REBAC_TRUSTED_IDS": _bool(closed=False),
-    "REBAC_DEFAULT_CONSISTENCY": _STR,
-    "REBAC_CACHE_ALIAS": _STR,
-    "REBAC_LOOKUP_CACHE_TTL": _INT,
+    "REBAC_DEFAULT_CONSISTENCY": _inert(_STR),
+    "REBAC_CACHE_ALIAS": _inert(_STR),
+    "REBAC_LOOKUP_CACHE_TTL": _inert(_INT),
     "REBAC_STRICT_MODE": _bool(closed=True),
     "REBAC_ENABLED": _bool(closed=True),
     "REBAC_REQUIRE_SUDO_REASON": _bool(closed=True),
     "REBAC_ALLOW_SUDO": _bool(closed=False),
-    "REBAC_GC_INTERVAL_SECONDS": _INT,
+    "REBAC_GC_INTERVAL_SECONDS": _inert(_INT),
     "REBAC_AUTHENTICATION_MIDDLEWARE": _STR,
     "REBAC_ACTOR_RESOLVER": _STR,
     "REBAC_MCP_ACTOR_RESOLVER": _STR,
@@ -266,12 +296,30 @@ _TYPES: dict[str, _Type] = {
     "REBAC_USER_ID_ATTR": _STR,
     "REBAC_AUDIT_DENIALS": _bool(closed=True),
     "REBAC_LINT_BARE_PREFETCH": _bool(closed=True),
-    "REBAC_LOCAL_BACKEND_STORAGE": _checked_by("rebac.E006"),
+    # Read per query: a value read as the other layout would read and write a stale table.
+    "REBAC_LOCAL_BACKEND_STORAGE": _one_of("denormalized", "registry", report="rebac.E006"),
     "REBAC_LOCAL_BACKEND_REGISTRY_BATCH_SIZE": _INT,
     "REBAC_EVALUATOR_CACHE_SIZE": _INT,
-    "REBAC_FIELD_READ_MODE": _checked_by("rebac.E008"),
+    # Every field gate validates the mode and raises ValueError for any other value.
+    "REBAC_FIELD_READ_MODE": _one_of(
+        "allow",
+        "redact",
+        "omit",
+        "raise",
+        report="rebac.E008",
+        passes=True,
+        reads_as="every field read gate raises ValueError",
+    ),
     "REBAC_FIELD_READ_FAIL_CLOSED_ON_CONDITIONAL": _bool(closed=True),
-    "REBAC_ZOOKIE_TRANSPORT": _checked_by("rebac.E007"),
+    # Any other value transports no Zookie: freshness across requests only, no permission.
+    "REBAC_ZOOKIE_TRANSPORT": _one_of(
+        "none",
+        "header",
+        "session",
+        report="rebac.E007",
+        passes=True,
+        reads_as='it is read as "none"',
+    ),
     "REBAC_ZOOKIE_HEADER_NAME": _STR,
     "REBAC_ZOOKIE_SESSION_KEY": _STR,
 }
@@ -279,30 +327,61 @@ _TYPES: dict[str, _Type] = {
 
 @dataclass(frozen=True, slots=True)
 class _WronglyTyped:
-    """A setting whose configured value has a type it does not accept (``rebac.E028``)."""
+    """A setting whose configured value is not one it accepts."""
 
     name: str
     value: Any
-    expected: str
-    closed: Any
+    kind: _Type
     default: Any
 
     @property
+    def expected(self) -> str:
+        return self.kind.expected
+
+    @property
+    def closed(self) -> Any:
+        return self.kind.closed
+
+    @property
+    def report(self) -> str:
+        return self.kind.report
+
+    @property
     def raises(self) -> bool:
-        return self.closed is _RAISE
+        return not self.kind.passes and self.kind.closed is _RAISE
 
     def problem(self) -> str:
         """What is wrong: the setting, the value's type and the value, and what it accepts."""
         shown = repr(self.value)
         if len(shown) > 60:
             shown = shown[:57] + "..."
-        return f"{self.name} is {type(self.value).__name__} {shown}, not {self.expected}"
+        detail = ""
+        if self.kind.accepts is _labels and isinstance(self.value, (list, tuple)):
+            # A lazy translation string prints as the str it stands for: name the item's type.
+            index, item = next(
+                (index, item) for index, item in enumerate(self.value) if not isinstance(item, str)
+            )
+            detail = f" (item {index} is {type(item).__name__} {item!r})"
+        return f"{self.name} is {type(self.value).__name__} {shown}{detail}, not {self.expected}"
 
     def reading(self) -> str:
         """What the library does with the value."""
+        if self.kind.passes:
+            return self.kind.reads_as
         if self.raises:
             return "every read of it raises ImproperlyConfigured"
         return f"it is read as {self.closed!r}"
+
+
+class _WrongSettingType(ImproperlyConfigured):
+    """A setting whose value is not one it accepts, and has no safe reading."""
+
+    def __init__(self, entry: _WronglyTyped) -> None:
+        hint = ""
+        if entry.name == "REBAC_TRACKED_MODELS" and isinstance(entry.value, str):
+            hint = ' A one-label tuple needs its comma: ("app_label.Model",).'
+        super().__init__(f"{entry.problem()} ({entry.report}).{hint}")
+        self.entry = entry
 
 
 def _configured(name: str) -> Any:
@@ -311,13 +390,13 @@ def _configured(name: str) -> Any:
 
 def _wrongly_typed(name: str, value: Any) -> _WronglyTyped | None:
     kind = _TYPES[name]
-    if kind.checked_by or kind.accepts(value):
+    if kind.accepts(value):
         return None
-    return _WronglyTyped(name, value, kind.expected, kind.closed, _DEFAULTS[name])
+    return _WronglyTyped(name, value, kind, _DEFAULTS[name])
 
 
 def _wrongly_typed_settings() -> list[_WronglyTyped]:
-    """Every setting whose configured value has a type it does not accept, by name."""
+    """Every setting whose configured value is not one it accepts, by name."""
     found = (_wrongly_typed(name, _configured(name)) for name in sorted(_TYPES))
     return [entry for entry in found if entry is not None]
 
@@ -325,9 +404,10 @@ def _wrongly_typed_settings() -> list[_WronglyTyped]:
 class _AppSettings:
     """Lazy proxy. Reads from `django.conf.settings`, falls back to defaults.
 
-    A value of a type the setting does not accept reads as the setting's closed
-    reading, or raises ``_WrongSettingType`` (see the module docstring).
-    Cached values invalidate on `setting_changed` signal (test ergonomics).
+    A value the setting does not accept reads as the setting's closed reading,
+    raises ``_WrongSettingType``, or passes to readers that refuse it (see the
+    module docstring). Cached values invalidate on `setting_changed` signal
+    (test ergonomics).
     """
 
     def __init__(self) -> None:
@@ -343,7 +423,18 @@ class _AppSettings:
             if apps.ready:
                 from .signals import connect_tracked_signals
 
-                connect_tracked_signals()
+                try:
+                    connect_tracked_signals()
+                except _WrongSettingType:
+                    # Only an override changes a setting in a running process; the receivers
+                    # stay as they were. A process that starts with the value stops in setup.
+                    pass
+
+    def problem(self, name: str) -> _WronglyTyped | None:
+        """Whether ``name``'s configured value is one it accepts, without reading it."""
+        if name not in _DEFAULTS:
+            raise AttributeError(f"Unknown REBAC setting: {name!r}")
+        return _wrongly_typed(name, _configured(name))
 
     def __getattr__(self, name: str) -> Any:
         if name not in _DEFAULTS:
@@ -352,9 +443,9 @@ class _AppSettings:
             return self._cache[name]
         value = _configured(name)
         wrong = _wrongly_typed(name, value)
-        if wrong is not None:
+        if wrong is not None and not wrong.kind.passes:
             if wrong.raises:
-                raise _WrongSettingType(f"{wrong.problem()} (rebac.E028).")
+                raise _WrongSettingType(wrong)
             value = wrong.closed
         self._cache[name] = value
         return value

@@ -22,15 +22,18 @@ pre-1.0; breaking changes within a minor version are explicitly called out.
   - `lookup_subjects()` took the candidates of a field-backed relation from every row of its model, and returned
     those that a row-independent arm grants. It returns what it returns for the empty id.
 
-  For an actor built with a `None` id (`SubjectRef.of(type, None)`, `SubjectRef(ObjectRef(type, None))`):
-  - `authenticated` held for it and no longer does.
-  - It held the rows stored under the subject id `"None"` (which 0.37 and earlier wrote for it), and holds those
-    stored with the empty subject id instead. A row stored under `"None"` is now named only by that text:
-    `SubjectRef.of(type, "None")`.
-  - `delete_relationship()` and `memberships.revoke()` with such a subject removed the row stored under `"None"`
-    (the `SubjectRef(ObjectRef(type, None))` form matched nothing); both now remove the row stored with the empty
-    subject id, and leave the `"None"` row.
-  - Audit rows record it as `<type>:` where they recorded `<type>:None`.
+  For an actor built with a `None` id, both forms are now the actor with the empty id:
+  - `authenticated` held for both and no longer does. Wildcard grants (`auth/user:*`) hold as before.
+  - `SubjectRef.of(type, None)` held the rows stored under the subject id `"None"` (which 0.37 and earlier wrote
+    for it); it holds the rows stored with the empty subject id instead. A row stored under `"None"` is now named
+    only by that text: `SubjectRef.of(type, "None")`.
+  - `SubjectRef(ObjectRef(type, None))` held no stored row (its id was compared as NULL); it now holds the rows
+    stored with the empty subject id. That is a widening: from nothing to whatever such rows grant.
+  - `delete_relationship()` and `memberships.revoke()` with `SubjectRef.of(type, None)` removed the row stored
+    under `"None"`, and with `SubjectRef(ObjectRef(type, None))` matched nothing; both now remove the row stored
+    with the empty subject id, and leave the `"None"` row.
+  - Audit rows record it with the empty subject id, where they recorded `SubjectRef.of(type, None)` under
+    `"None"`.
 
 - **A relationship write with an empty subject id is refused.** `write_relationships()` (the backend's and
   `rebac`'s) and the helpers that write through it (`memberships.grant()`, `roles.grant()`, `roles.imply()`)
@@ -45,35 +48,45 @@ pre-1.0; breaking changes within a minor version are explicitly called out.
   relationship models store rows as written.
 
 - **A principal whose id attribute is unset is no subject.** `to_subject_ref()` raises `NoActorResolvedError` for a
-  user, a Django group or a `@rebac_subject` instance whose id attribute is `None` or empty, as it did for an
-  unsaved user. It gave `<type>:None` or `<type>:` instead: one subject shared by every such principal, which held
-  the others' grants and, under `"None"`, `authenticated`. A saved user or group always has an id under the default
-  `REBAC_USER_ID_ATTR = "pk"`; the users affected are those of a deployment whose `REBAC_USER_ID_ATTR`, or the user
-  model's `Meta.rebac_id_attr`, names a field that can be `None` or empty. Every surface that resolves an actor
-  from an instance follows:
+  user, a Django group, a model-owned subject (a model with `Meta.rebac_resource_type`, a user model that declares
+  one included) or a `@rebac_subject` instance whose id attribute is `None` or empty, as it did for an unsaved
+  user. A user, group or registered subject gave `<type>:None` or `<type>:` instead: one subject shared by every
+  such principal, which held the others' grants and, under `"None"`, `authenticated`. A model-owned subject raised
+  `TypeError`, which the request resolvers and `RebacBackend` did not catch, so such a user's request failed with a
+  server error; it is now served as anonymous like the others. A saved user or group always has an id under the
+  default `REBAC_USER_ID_ATTR = "pk"`; the users affected are those of a deployment whose `REBAC_USER_ID_ATTR`, or
+  the user model's `Meta.rebac_id_attr`, names a field that can be `None` or empty. An identity attribute that
+  does not exist still raises `TypeError`: that is a configuration error, not a principal without an id. Every
+  surface that resolves an actor from an instance follows:
   - `with_actor()`, `as_user()`, `actor_context()`, `grant_subject_ref()`, `permission_expression(actor=...)`,
     `check_permission(actor=...)`, `memberships.grant()`, `revoke()` and `containers_of()`, `roles.grant()`,
     `revoke()` and `roles_of()`, and a create check of a relation that `proposed_relationships()` fills with such
     a principal, raise `NoActorResolvedError`. `memberships.grant(subject=Group())` stored a row under
     `auth/group:None#member`, and `memberships.revoke(subject=Group())` removed it.
   - Requests resolve such a user as anonymous: the default actor resolver (`ActorMiddleware`) returns the anonymous
-    actor, and the superuser bypass does not open for such a superuser. Without an ambient actor, DRF's
-    permission class denies and its filter backend returns no rows, and the Strawberry WebSocket consumer sets no
-    actor.
+    actor, and the superuser bypass does not open for such a superuser. The resolver says so once per user type and
+    reason, as a warning on the `rebac` logger that names the model and the identity attribute and nothing that
+    identifies the user. Without an ambient actor, DRF's permission class denies and its filter backend returns no
+    rows, and the Strawberry WebSocket consumer sets no actor.
   - `RebacBackend.has_perm()` and `has_module_perms()` return `False` for such a user, unless the superuser
     bypass answers first. They answered from the shared subject's grants.
   - Deleting such a principal removes no relationship row, since it has no subject identity. Deleting one used to
     remove every row stored under the shared subject, including those the other principals held.
 
-- **A setting of the wrong type is never used as written, and `rebac.E028` stops management commands.** Every
+- **A setting's value is read by its declared type, and one it does not accept never widens what the library
+  allows; `rebac.E028` stops management commands.** Every
   `REBAC_*` setting was read as written, and the boolean ones by truthiness, so a string from an environment
   variable turned protections the wrong way: `REBAC_ALLOW_SUDO = "False"` left `sudo()` allowed,
   `REBAC_SUPERUSER_BYPASS = "False"` left the superuser bypass on, `REBAC_TRUSTED_IDS = "False"` dropped the id
   guard, `REBAC_STRUCTURAL_PREFETCH = "False"` read children with no permission statement, and
   `REBAC_ENABLED = "False"` enforced while `rebac.W011` stayed silent; a falsy value of another type (`None`, `0`,
   `""`) switched off `REBAC_ENABLED`, `REBAC_STRICT_MODE`, `REBAC_REQUIRE_SUDO_REASON` and
-  `REBAC_FIELD_READ_FAIL_CLOSED_ON_CONDITIONAL`. Each setting now declares the values it accepts
-  (ARCHITECTURE.md § Settings catalog), and a value of another type is read closed or not at all:
+  `REBAC_FIELD_READ_FAIL_CLOSED_ON_CONDITIONAL`; and a storage layout spelled any other way (`None` from an unset
+  variable, `"Registry"`) read the denormalized table, which after `rebac migrate-storage --to registry` is the
+  stale copy: grants revoked since the cutover held again, and new ones went to the dead table. Each setting now
+  declares the values it accepts (ARCHITECTURE.md § Settings catalog), and a value it does not accept is read
+  closed, raises where it is read, is refused by its readers, or, for a setting the library does not read, has no
+  effect:
   - A boolean setting accepts `True` and `False` only, and `REBAC_ROW_SCOPE`, `REBAC_BOUNDED_WALK` and
     `REBAC_DISPLAY_FIELDS` their documented strings as well. Any other value, `"True"`, `"False"`, `1` and `0`
     included, is read as the protective reading: `REBAC_ENABLED`, `REBAC_STRICT_MODE`,
@@ -86,12 +99,36 @@ pre-1.0; breaking changes within a minor version are explicitly called out.
     widen something, and reading one of another type raises `ImproperlyConfigured` naming it. Most of these
     failed where they were used already (a string depth limit raised `TypeError`); a `bool` or a `float` for an
     int, which worked, raises too.
-  - `REBAC_BACKEND`, `REBAC_LOCAL_BACKEND_STORAGE`, `REBAC_ZOOKIE_TRANSPORT`, `REBAC_FIELD_READ_MODE` and
-    `REBAC_TRACKED_MODELS` keep their own checks (`rebac.E001`, `E006`, `E007`, `E008`, `E018`) and readings.
-  - System check `rebac.E028` (an error) reports each wrongly typed setting by name, with the value's type and
-    what to write. A deployment that passes a string meaning what it says (`REBAC_ALLOW_SUDO = "True"`) got what it
-    meant until now; with this release its management commands (`migrate`, `runserver`, `check`) stop on
+  - `REBAC_LOCAL_BACKEND_STORAGE` accepts exactly `"denormalized"` or `"registry"` (a `str` enum member or a
+    `StrEnum` whose value is one of them included), and any other value raises `ImproperlyConfigured` at every
+    query, while the server starts and logs it (`rebac.E006`). The readers tested for `"registry"` and read
+    anything else as the denormalized table: right for a deployment that never migrated, the stale copy for one
+    that did. So `"denormalized "` with a trailing space (from an `.env` file), a plain `Enum` member whose value
+    is `"denormalized"`, and a lazy string were read as the denormalized table, and now raise at every query.
+  - `REBAC_TRACKED_MODELS` accepts a list or tuple of `str` labels, and any other value stops every process:
+    `django.setup()` raises `ImproperlyConfigured` naming the setting while it imports the models, so no process
+    starts with the gate of a third-party backing model off. No system check runs then, and none lists it; the
+    error is how an operator finds out. A one-label tuple written without its comma (`("app.Model")`) is a
+    string, and the message says so; for a list or tuple it names the item that is not a `str` and its type. The
+    readers took any value that was not a list or tuple as no model, and a list or tuple with an item that was
+    not a `str` (`None`, a lazy translation string) as its `str` items alone: the process started, the item's
+    model ungated. Both now stop the process.
+  - `REBAC_BACKEND`, `REBAC_FIELD_READ_MODE` and `REBAC_ZOOKIE_TRANSPORT` reach their readers as written, as
+    before, and their checks (`rebac.E001`, `E008`, `E007`) report a value they do not accept: `backend()` raises
+    `ValueError` for any backend but `"local"`, every field read gate raises `ValueError` for an unknown mode, and
+    an unknown transport carries no Zookie (freshness across requests only).
+  - `REBAC_RELATIONSHIP_MODEL`, `REBAC_DEFAULT_CONSISTENCY`, `REBAC_CACHE_ALIAS`, `REBAC_LOOKUP_CACHE_TTL` and
+    `REBAC_GC_INTERVAL_SECONDS` are not read by the library (Changed); a value of another type is reported by the
+    warning `rebac.W015` and has no effect.
+  - System check `rebac.E028` (an error) reports each other wrongly typed setting by name, with the value's type
+    and what to write. A deployment that passes a string meaning what it says (`REBAC_ALLOW_SUDO = "True"`) got
+    what it meant until now; with this release its management commands (`migrate`, `runserver`, `check`) stop on
     `rebac.E028`, and its server reads the value closed (`sudo()` refused). See Upgrading.
+  - A server runs no system checks, so `AppConfig.ready()` says once per process, on the `rebac` logger, what each
+    setting it does not accept is read as: an error for one that raises, a warning otherwise.
+  - A system check that reads such a setting and cannot run reports that it did not run, once under each id it
+    checks, at that id's level and under its own tags (`check --database default --tag database` included).
+    Silencing `rebac.E028` silences none of these.
 
   The library does not read the strings `"true"`, `"false"`, `"1"` or `"0"` as booleans. Django's settings are
   Python values (`DEBUG = "False"` is truthy too), and a library that parsed some spellings would still have to
@@ -113,7 +150,12 @@ pre-1.0; breaking changes within a minor version are explicitly called out.
     or wrote relationship rows directly (fixtures, data migrations, the ORM).
   - *How to find out:* `python manage.py rebac unset-ids` lists every relationship row whose resource or subject
     id is `""` or `"None"`, with which id it is, and every user, group and `@rebac_subject` model row whose id
-    attribute is `None`, `""` or `"None"`; `--check` exits non-zero when it lists anything. In the ORM:
+    attribute is `None`, `""` or `"None"`. It runs without the system checks, so it works while `rebac.E028` or
+    another check error stops other commands. `--check` exits 1 when it lists anything, and 3 when it lists nothing
+    but could not examine something (an id attribute that is a property, a setting it needs that it cannot read),
+    which it names on standard error with how to examine it; without the relationship table (migrations not
+    run) it says so and exits 4. It cannot run in a process that does not start (a `REBAC_TRACKED_MODELS` it
+    does not accept). In the ORM:
     `active_relationship_model().objects.filter(Q(subject_id__in=["", "None"]) | Q(resource_id__in=["", "None"]))`.
   - *What to do:* a row stored under `""` or `"None"` was shared by every principal whose id was unset, and
     nothing records which one wrote it. Grant what the real principals should hold, under their own ids, then
@@ -125,8 +167,9 @@ pre-1.0; breaking changes within a minor version are explicitly called out.
     them with `delete_relationships(RelationshipFilter(subject_id=""))`: an empty filter field matches every
     value. Give each listed principal an id, or keep it from acting.
   - *If nothing is done:* a row with an empty subject id grants to any actor built with a `None` or empty id,
-    which `SubjectRef.of(type, None)` now builds (code that builds a subject from an unsaved instance's or an
-    anonymous user's id, such as `SubjectRef.of("auth/user", user.pk)`, gets that actor); a row stored under
+    which `SubjectRef.of(type, None)` and `SubjectRef(ObjectRef(type, None))` now build (code that builds a subject
+    from an unsaved instance's or an anonymous user's id, such as `SubjectRef.of("auth/user", user.pk)`, gets that
+    actor; the second form held no stored row until now); a row stored under
     `"None"` is held by no subject the library builds, and by a principal whose id attribute is the text `"None"`
     (a username `"None"`), alone. A row with an empty or `"None"` resource id names no object. Writing a row with
     an empty subject id again refuses its batch. The principals listed cannot act.
@@ -134,15 +177,21 @@ pre-1.0; breaking changes within a minor version are explicitly called out.
 - **Settings of the wrong type.**
   - *Who is affected:* a deployment that sets a `REBAC_*` setting to a value of another type than the one
     ARCHITECTURE.md § Settings catalog declares; most often a string read from the environment.
-  - *How to find out:* `python manage.py check` lists each as `rebac.E028`, with the setting, the value's type and
-    what to write.
+  - *How to find out:* `python manage.py check` lists each as `rebac.E028` (`rebac.W015` for an unread setting,
+    `rebac.E006` for the storage layout), with the setting, the value's type and what to write; a process that
+    runs no checks logs each once at start. A `REBAC_TRACKED_MODELS` that is not a list or tuple of `str` labels
+    stops every process, `manage.py check` included, at setup with an error that names it; no check lists it.
   - *What to do:* convert in the settings module: `REBAC_ALLOW_SUDO = os.environ.get("REBAC_ALLOW_SUDO",
     "true").lower() in ("1", "true")`, `env.bool("REBAC_ALLOW_SUDO", default=True)` with django-environ,
-    `int(os.environ["REBAC_DEPTH_LIMIT"])` for a number.
-  - *If nothing is done:* management commands stop on `rebac.E028`. A server that runs no checks reads each
-    boolean closed (`sudo()` refused, the superuser bypass and the experimental mechanisms off, enforcement,
-    strict mode, denial auditing and the `rebac.W003` lint on) and raises `ImproperlyConfigured` where it reads
-    a wrongly typed number, name or path. Silencing `rebac.E028` lets commands run; it changes no reading.
+    `int(os.environ["REBAC_DEPTH_LIMIT"])` for a number. Write the storage layout exactly `"denormalized"` or
+    `"registry"`, and a one-label `REBAC_TRACKED_MODELS` tuple with its comma: `("app_label.Model",)`.
+  - *If nothing is done:* management commands stop on `rebac.E028` or `rebac.E006`. A server that runs no checks
+    reads each boolean closed (`sudo()` refused, the superuser bypass and the experimental mechanisms off,
+    enforcement, strict mode, denial auditing and the `rebac.W003` lint on) and raises `ImproperlyConfigured`
+    where it reads a wrongly typed number, name or path, logging each once at start. With a storage layout it does
+    not accept, a server starts, logs an error, and raises at every query. With a `REBAC_TRACKED_MODELS` it does
+    not accept, no process starts. Silencing `rebac.E028` lets commands run; it changes no reading, and a check
+    that cannot run because of the setting still says so under its own ids.
 
 - **CI on a fork.** Require `postgres-delta (client binding)` and `postgres-delta (server binding)` in branch
   protection instead of `postgres-delta`, or `tier 1` alone.
@@ -152,11 +201,17 @@ pre-1.0; breaking changes within a minor version are explicitly called out.
 - `manage.py rebac unset-ids [--check]` lists relationship rows and principals with an unset id (Upgrading,
   ARCHITECTURE.md § Management commands). Read only.
 
-- System check `rebac.E028`: a setting whose value has a type it does not accept (above).
+- System check `rebac.E028`: a setting whose value has a type it does not accept (above). System check
+  `rebac.W015`: the same for a setting the library does not read.
 
 ### Changed
 
 - `rebac.E018` accepts `REBAC_TRACKED_MODELS` as a tuple of labels, as the library already read it.
+
+- `REBAC_RELATIONSHIP_MODEL`, `REBAC_DEFAULT_CONSISTENCY`, `REBAC_CACHE_ALIAS`, `REBAC_LOOKUP_CACHE_TTL` and
+  `REBAC_GC_INTERVAL_SECONDS` are documented as what they are: reserved, not read by the library, and without
+  effect. The settings catalog described a swappable relationship model, a default consistency, an `accessible()`
+  cache with a TTL and an expiration task that the library does not have. They stay accepted in this release.
 
 ### Fixed
 

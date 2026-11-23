@@ -70,7 +70,7 @@ how design intent erodes.
 | Python module | `rebac` |
 | Settings prefix | `REBAC_*` |
 | Management command | `manage.py rebac <subcommand>` |
-| System-check IDs | `rebac.E001` … `rebac.E028`, `rebac.W001` … `rebac.W011` (with gaps and retired IDs documented in the check table) |
+| System-check IDs | `rebac.E001` … `rebac.E028`, `rebac.W001` … `rebac.W015` (with gaps and retired IDs documented in the check table) |
 | Schema header comments | `// @rebac_package`, `// @rebac_package_version`, `// @rebac_schema_revision` |
 | App label | `rebac` |
 | Public Python imports | `from rebac import ...` |
@@ -484,9 +484,16 @@ access via `rebac.backend()`.
 
 - All settings prefixed `REBAC_`. **No nested dict** (defeats
   `SILENCED_SYSTEM_CHECKS`).
-- Read via `app_settings` object exposed by `rebac.conf`.
+- Read via `app_settings` object exposed by `rebac.conf`, which knows each
+  setting's type; never `getattr(settings, "REBAC_...")` (a test enforces it).
 - Validation routed through Django's system checks framework (IDs
-  `rebac.E001`, etc.). **Don't** raise at import time or in `ready()`.
+  `rebac.E001`, etc.). **Don't** raise at import time or in `ready()`. The one
+  exception is `REBAC_TRACKED_MODELS`: a value that is not a list or tuple of
+  `str` labels raises where it is read to connect the write receivers, which is
+  while Django imports the models (the `class_prepared` receiver) or in `ready()`,
+  because a process that cannot read it would run with a backing model's write
+  gate off. `django.setup()` fails with an error naming the setting; no system
+  check runs, so none reports it.
 - Production-only checks (`--deploy`) belong in Django's system-check framework.
 
 ### Public API surface

@@ -821,7 +821,7 @@ class Relationship(models.Model):
 
 **`caveat_key`.** A library-owned digest of the caveat name and the pinned context, empty for a tuple without a caveat. It is not part of the wire shape. Every supported write path writes it with the tuple, and statements select caveated tuples by it (see [Caveats](#caveats)).
 
-**Swappability.** Projects that need to extend the model (audit FKs, multi-tenant prefix, etc.) declare a custom subclass and point `REBAC_RELATIONSHIP_MODEL = "myapp.MyRelationship"`. The plugin uses [`swapper`](https://pypi.org/project/swapper/) to keep migrations correct across this swap. Default behaviour: `swapper` returns the built-in `rebac.Relationship`.
+**Swappability.** Not implemented. `REBAC_RELATIONSHIP_MODEL` is reserved and not read: the relationship model is `rebac.Relationship`, or `rebac.RelationshipRegistry` under `REBAC_LOCAL_BACKEND_STORAGE = "registry"`.
 
 **`written_at_xid` (Zookie equivalent).** Populated on save:
 - PostgreSQL: `txid_current()` via a default expression.
@@ -1149,19 +1149,19 @@ All settings prefixed `REBAC_`. No nested dict. Read via the public `app_setting
 | Setting | Default | Type | Purpose |
 |---|---|---|---|
 | `REBAC_BACKEND` | `"local"` | `"local"` | Select the local runtime; other values fail the system check. |
-| `REBAC_RELATIONSHIP_MODEL` | `"rebac.Relationship"` | `str` | Swappable relationship model (Django convention). |
-| `REBAC_LOCAL_BACKEND_STORAGE` | `"denormalized"` | `"denormalized"` \| `"registry"` | LocalBackend relationship storage shape. Registry mode is opt-in and uses `RelationshipRegistry` + `RebacResource`. |
+| `REBAC_RELATIONSHIP_MODEL` | `"rebac.Relationship"` | `str` | Reserved: the library does not read it, and setting it has no effect. The relationship model is chosen by `REBAC_LOCAL_BACKEND_STORAGE`. |
+| `REBAC_LOCAL_BACKEND_STORAGE` | `"denormalized"` | `"denormalized"` \| `"registry"` | LocalBackend relationship storage shape. Registry mode is opt-in and uses `RelationshipRegistry` + `RebacResource`. Exactly one of the two strings: any other value raises `ImproperlyConfigured` at every query, since after a cutover the other table is a stale copy (`rebac.E006`). |
 | `REBAC_LOCAL_BACKEND_REGISTRY_BATCH_SIZE` | `5000` | `int` | Batch size for `python manage.py rebac migrate-storage`. |
 | `REBAC_SCHEMA_DIR` | `BASE_DIR / "rebac"` | `Path` \| `str` \| `None` | Where `build-zed` writes `effective.zed`. |
 | `REBAC_DEPTH_LIMIT` | `8` | `int` | Bound on a recursive permission other than stored subject-set membership (nested groups, followed to a fixed point), and the cap on the permission walker (`check_new`). Within the bound a point check answers; one that cannot be decided within it raises `PermissionDepthExceeded`; a queryset scope includes only rows provable within it. Choose it to cover the deepest recursive chain in the data. A finite recursive CTE carries the depth as a column; where recursion falls back to nested SQL, statement size grows linearly with the bound. See [Recursion](#recursion). |
 | `REBAC_TRACKED_MODELS` | `[]` | `list[str]` \| `tuple[str, ...]` | Third-party backing models (`"app_label.ModelName"`), gated by explicit-sender receivers. User and Group are automatically tracked. |
-| `REBAC_DEFAULT_CONSISTENCY` | `"minimize_latency"` | `str` | Default `Consistency` for checks. |
-| `REBAC_CACHE_ALIAS` | `"default"` | `str` | Django cache backend name for `accessible()` cache. |
-| `REBAC_LOOKUP_CACHE_TTL` | `60` (s) | `int` | TTL for `accessible()` cache. Invalidated on relationship writes for the matching `(subject, action, resource_type)`. |
+| `REBAC_DEFAULT_CONSISTENCY` | `"minimize_latency"` | `str` | Reserved: the library does not read it, and setting it has no effect. |
+| `REBAC_CACHE_ALIAS` | `"default"` | `str` | Reserved: the library does not read it, and setting it has no effect; there is no `accessible()` cache. |
+| `REBAC_LOOKUP_CACHE_TTL` | `60` (s) | `int` | Reserved: the library does not read it, and setting it has no effect. |
 | `REBAC_STRICT_MODE` | `True` | `bool` | If `True`, queryset construction without an actor (and not in `sudo()`) raises `MissingActorError`. **Production default.** |
 | `REBAC_REQUIRE_SUDO_REASON` | `True` | `bool` | If `True`, `sudo()` calls without a `reason=...` raise. |
 | `REBAC_ALLOW_SUDO` | `True` | `bool` | Globally disable the request-path `sudo()` bypass. Strict tenants set `False`. **Does NOT gate `system_context()`** — framework-owned jobs (migrations, fixture seeders, asset loaders) must still be able to bypass even on strict tenants; the two surfaces are deliberately split. Every block-scoped `system_context()` entry still emits a `KIND_SUDO_BYPASS` audit row, same as block-scoped `sudo()`. |
-| `REBAC_GC_INTERVAL_SECONDS` | `300` | `int` | How often the expiration GC task runs. |
+| `REBAC_GC_INTERVAL_SECONDS` | `300` | `int` | Reserved: the library does not read it, and setting it has no effect; no expiration task is shipped (`gc-expired` is planned). |
 | `REBAC_AUTHENTICATION_MIDDLEWARE` | `"django.contrib.auth.middleware.AuthenticationMiddleware"` | `str` | Middleware path that populates `request.user`. `rebac.middleware.ActorMiddleware` must appear after this path. Frameworks that replace Django's stock auth middleware set this to their canonical middleware. |
 | `REBAC_ACTOR_RESOLVER` | `"rebac.actors.default_resolver"` | `str` | Dotted-path callable that resolves `request → SubjectRef`. Override for custom identity layers (e.g., agent grants). |
 | `REBAC_MCP_ACTOR_RESOLVER` | `"rebac.mcp.default_actor_resolver"` | `str` | Dotted-path callable resolving an MCP request `Context → SubjectRef`, consulted before ambient `current_actor()`. The default reads a canonical `SubjectRef` string from trusted server-populated `ctx.request_context.meta["actor_subject"]`. Invalid explicit identity fails closed. |
@@ -1189,36 +1189,56 @@ All settings prefixed `REBAC_`. No nested dict. Read via the public `app_setting
 | `REBAC_FIELD_READ_MODE` | `"allow"` | `"allow"` \| `"redact"` \| `"omit"` \| `"raise"` | Deny behavior for schema permissions named `read__<field>`. `"raise"` currently degrades to `"redact"` and emits `rebac.W008` until descriptor-level protected fields land. |
 | `REBAC_FIELD_READ_FAIL_CLOSED_ON_CONDITIONAL` | `True` | `bool` | Bulk field redaction has no per-row caveat context; `True` treats conditional `read__<field>` results as denied. Set `False` only when conditional visibility is acceptable without context. |
 
-Each setting is read by the type in the table, in one place (`rebac.conf`), and
-a value of another type is never used as written. A string is a string:
-`"False"` is not `False`, and the library parses no spelling of a boolean or a
-number, since Django's settings are Python values and conversion belongs in the
-settings module. A boolean accepts `True` and `False` only (`REBAC_ROW_SCOPE`,
-`REBAC_BOUNDED_WALK` and `REBAC_DISPLAY_FIELDS` their documented strings as
-well), and an int an `int` that is not a `bool`. A boolean of another type is
-read as the reading that widens nothing: on for a protection, auditing or the
-lint (`REBAC_ENABLED`, `REBAC_STRICT_MODE`, `REBAC_REQUIRE_SUDO_REASON`,
-`REBAC_FIELD_READ_FAIL_CLOSED_ON_CONDITIONAL`, `REBAC_AUDIT_DENIALS`,
-`REBAC_LINT_BARE_PREFETCH`), off for a loosening or a mechanism that skips or
-shortens a permission statement (`REBAC_ALLOW_SUDO`, `REBAC_SUPERUSER_BYPASS`,
-`REBAC_TRUSTED_IDS`, `REBAC_STRUCTURAL_PREFETCH`, `REBAC_ACTOR_PROFILES`,
-`REBAC_ROW_SCOPE`, `REBAC_BOUNDED_WALK`, `REBAC_DISPLAY_FIELDS`). A number, a
-name, a dotted path, a subject type or a directory of another type has no such
-reading (a default could resolve actors another way or name other subjects), and
-reading it raises `ImproperlyConfigured`. `REBAC_BACKEND`,
-`REBAC_LOCAL_BACKEND_STORAGE`, `REBAC_ZOOKIE_TRANSPORT`, `REBAC_FIELD_READ_MODE`
-and `REBAC_TRACKED_MODELS` are read as written and refused by their own checks,
-whatever the type: their readers refuse a value outside the set, or read no
-label from it. `REBAC_TRACKED_MODELS` is read while models are imported, where
-nothing may raise, so a wrongly typed value tracks no model at run time;
-`rebac.E018` stops management commands on it. `rebac.E028` reports every other
-wrongly typed setting by name, with the value's type and what to write.
+Each setting is read by the type in the table, in one place (`app_settings`,
+`rebac.conf`); no module reads a `REBAC_` setting around it, and a test holds
+that. A value the setting does not accept never widens what the library allows.
+A string is a string: `"False"` is not `False`, and the library parses no
+spelling of a boolean or a number, since Django's settings are Python values
+and conversion belongs in the settings module. A boolean accepts `True` and
+`False` only (`REBAC_ROW_SCOPE`, `REBAC_BOUNDED_WALK` and `REBAC_DISPLAY_FIELDS`
+their documented strings as well), and an int an `int` that is not a `bool`. A
+value it does not accept is read in one of four ways:
+
+- **Closed** (a boolean): the reading that widens nothing. On for a protection,
+  auditing or the lint (`REBAC_ENABLED`, `REBAC_STRICT_MODE`,
+  `REBAC_REQUIRE_SUDO_REASON`, `REBAC_FIELD_READ_FAIL_CLOSED_ON_CONDITIONAL`,
+  `REBAC_AUDIT_DENIALS`, `REBAC_LINT_BARE_PREFETCH`); off for a loosening or a
+  mechanism that skips or shortens a permission statement (`REBAC_ALLOW_SUDO`,
+  `REBAC_SUPERUSER_BYPASS`, `REBAC_TRUSTED_IDS`, `REBAC_STRUCTURAL_PREFETCH`,
+  `REBAC_ACTOR_PROFILES`, `REBAC_ROW_SCOPE`, `REBAC_BOUNDED_WALK`,
+  `REBAC_DISPLAY_FIELDS`). `rebac.E028`.
+- **Raises** `ImproperlyConfigured` where it is read: a number, a name, a
+  dotted path, a subject type or a directory has no safe reading (a default
+  could resolve actors another way or name other subjects), `rebac.E028`; the
+  storage layout, read at every query, since after a cutover the other table is
+  a stale copy, `rebac.E006` (a `str` enum member whose value is one of the two
+  is accepted; padding, a plain `Enum` member and a lazy string are not); the
+  tracked models, read where the write receivers are connected, which is while
+  Django imports the models or in `AppConfig.ready()`, so `django.setup()` fails
+  naming the setting and no process starts with a backing model's gate off. No
+  check runs then, and none reports it; the error names the item that is not a
+  `str` and its type.
+- **Refused by its readers**, which receive it as written: `backend()` raises
+  `ValueError` for any `REBAC_BACKEND` but `"local"` (`rebac.E001`), every
+  field read gate raises `ValueError` for an unknown `REBAC_FIELD_READ_MODE`
+  (`rebac.E008`), and an unknown `REBAC_ZOOKIE_TRANSPORT` carries no Zookie,
+  which affects freshness across requests and no permission (`rebac.E007`).
+- **No effect**: the reserved settings the library does not read
+  (`REBAC_RELATIONSHIP_MODEL`, `REBAC_DEFAULT_CONSISTENCY`, `REBAC_CACHE_ALIAS`,
+  `REBAC_LOOKUP_CACHE_TTL`, `REBAC_GC_INTERVAL_SECONDS`). `rebac.W015`.
+
+A server runs no system checks, so `AppConfig.ready()` logs each setting it
+does not accept once per process on the `rebac` logger, with what it is read
+as: an error for one that raises, a warning otherwise.
 
 Validation runs in Django's system-checks framework. `rebac.E001` accepts only
 the local backend; schema-dependent checks skip backend resolution then, so an
 invalid setting is reported as a check rather than crashing `manage.py check`.
-A check that reads a setting whose wrongly typed value raises reports nothing
-until it is fixed; `rebac.E028` reports the setting.
+A check that reads a setting whose value raises cannot run. It reports that it
+did not run, naming the setting, once under each id it checks, at that id's
+level and under its own tags, so a run that selects it (`check --database
+default --tag database` included) does not pass, and silencing `rebac.E028` does
+not hide it.
 `rebac.W001` recognizes the shipped auth backend and its subclasses by class
 identity, including the two public import paths.
 
@@ -1241,6 +1261,8 @@ class RebacConfig(AppConfig):
         signals.connect_tracked_signals()  # app registry only
 ```
 
+`ready()` also logs each setting whose value it does not accept ([Settings catalog](#settings-catalog)). Connecting the receivers raises `ImproperlyConfigured` for a `REBAC_TRACKED_MODELS` that is not a list or tuple of `str` labels: the receivers are the write gate of a third-party backing model, and a process that cannot read which models they cover must not start. The receivers are connected as each model class is prepared, so the error is raised while Django imports the models, before `ready()` and before any system check; the ready-time log does not run for this setting. Every other setting is validated by the system checks.
+
 **No queries. No model instantiation. No backend resolution at import time.** The backend singleton is constructed lazily on first access via `rebac.backend()` — this avoids `AppRegistryNotReady` and keeps `migrate` fast. Importing `rebac.backends` before app population must not import Django auth models merely for type annotations.
 
 Schema-dependent checks defer an unreadable persisted schema while Django's
@@ -1258,7 +1280,7 @@ System checks (in `rebac/checks.py`):
 | `rebac.E003` | Error | A model with `Meta.rebac_resource_type` references a type not declared in any loaded `permissions.zed`. |
 | `rebac.E004` | Error | Permission expressions parse against operator grammar. |
 | `rebac.E005` | Error | `permissions.zed` declared in an `AppConfig` cannot be located on disk. |
-| `rebac.E006` | Error | `REBAC_LOCAL_BACKEND_STORAGE` is `"denormalized"` or `"registry"`. |
+| `rebac.E006` | Error | `REBAC_LOCAL_BACKEND_STORAGE` is exactly `"denormalized"` or `"registry"`; any other value raises at every query. |
 | `rebac.E007` | Error | `REBAC_ZOOKIE_TRANSPORT` is `"none"`, `"header"`, or `"session"`. |
 | `rebac.E008` | Error | `REBAC_FIELD_READ_MODE` is not one of `"allow"`, `"redact"`, `"omit"`, or `"raise"`. |
 | `rebac.E009` | Error | A field-, attribute- or const-backed relation cannot be resolved: missing Django model, identity field, relation path, attribute or filter lookup; a path that ends on a different model than the declared subject type; or a const-backed relation whose target type has no schema definition. A read whose permission reaches such a relation raises `SchemaError` citing this ID; permissions that do not reach it are still decided. |
@@ -1267,11 +1289,11 @@ System checks (in `rebac/checks.py`):
 | `rebac.E014` | Error (database) | The identity of a resource model, a field-backed target or a dynamic attribute container column cannot be compared with stored tuples: it has no canonical wire/column codec (supported: integer/auto, char/text/slug, UUID). Custom encoded field conversions that SQL cannot reproduce are refused. Fixed Boolean attribute anchors do not require a Boolean codec. |
 | `rebac.E015` | Error (database) | A scoped or backing model's **write** alias differs from the relationship write alias. Models a permission reads must share the relationship database alias, because one statement joins them. Separate read replicas are allowed. |
 | `rebac.E016` | Error (database) | A recursive component of the policy is refused by the compiler: a permission of the component is reached through the right-hand side of `-` inside the component, or one expression uses permissions of the component more than once. See [Recursion](#recursion). |
-| `rebac.E018` | Error | A model on a permission backing path is neither `RebacMixin`, `RebacTrackedMixin`, nor explicitly tracked, so writes to it would not be gated (database check). Auto-created throughs with an owned/tracked endpoint and configured User/Group models are tracked automatically. Invalid `REBAC_TRACKED_MODELS` labels, and a value that is not a list or tuple of labels, are errors too. |
+| `rebac.E018` | Error | A model on a permission backing path is neither `RebacMixin`, `RebacTrackedMixin`, nor explicitly tracked, so writes to it would not be gated (database check). Auto-created throughs with an owned/tracked endpoint and configured User/Group models are tracked automatically. Invalid `REBAC_TRACKED_MODELS` labels are errors too. A value that is not a list or tuple of `str` labels stops `django.setup()` before any check runs, so this check reports it only where the setting changes in a running process. |
 | `rebac.E021` | Error | The schema declares a caveat but `cel-python` (the `caveats` extra) is not installed, so caveat bodies cannot be validated or evaluated. |
 | `rebac.E023` | Error | A `RebacMixin` / `RebacTrackedMixin` model's declared base manager returns a queryset that is not a `TrackedQuerySet`, or one that filters rows. The library reads a model's rows and owns its gated writes through the base manager. (`E020` and `E022` are reserved by proposals 0011 and 0013.) |
 | `rebac.E024` | Error | A `RebacMixin` model's default manager returns a queryset that is not a `RebacQuerySet`. Django's admin, model forms, related managers and `validate_unique()` read rows through `_default_manager`; a plain manager there leaves those reads unscoped with no `MissingActorError`. Override `objects` only with a `RebacManager` subclass. |
-| `rebac.E028` | Error | A setting's value has a type the setting does not accept ([Settings catalog](#settings-catalog)): the message names the setting, the value's type and what it is read as, and the hint what to write. A boolean is read as its closed reading meanwhile, and any other setting raises `ImproperlyConfigured` where it is read. Settings with a check of their own (`E001`, `E006`, `E007`, `E008`, `E018`) are reported there. (`E025` to `E027` are reserved.) |
+| `rebac.E028` | Error | A setting's value is not one the setting accepts ([Settings catalog](#settings-catalog)): the message names the setting, the value's type and what it is read as, and the hint what to write. A boolean is read closed meanwhile, and any other setting raises `ImproperlyConfigured` where it is read. The storage layout and the tracked models are reported by `E006` and `E018`, the backend, the field read mode and the Zookie transport by `E001`, `E008` and `E007`, and the reserved settings by `W015`. (`E025` to `E027` are reserved.) |
 | `rebac.W001` | Warning | `rebac.backends.RebacBackend` not in `AUTHENTICATION_BACKENDS`. |
 | `rebac.W002` | Warning | A model with `Meta.rebac_resource_type` is missing `RebacMixin`. |
 | `rebac.W003` | Warning | An RBAC-bound relation exists where bare `select_related("rel")` / `prefetch_related("rel")` can be unsafe outside the REBAC helpers or Strawberry-Django optimizer. |
@@ -1282,7 +1304,10 @@ System checks (in `rebac/checks.py`):
 | `rebac.W009` | Warning | A text attribute-backed column declares a case-insensitive collation (`*_ci`, or the MySQL default), so SQL scoping and Python checks could disagree on container ids. Best-effort detection. |
 | `rebac.W010` | Warning | A stored override references a relation or permission removed from the current baseline; that override is ignored until updated or deleted. |
 | `rebac.W011` | Warning | `REBAC_ENABLED` is `False`: no permission is checked, and every caller reads and writes every row. |
+| `rebac.W015` | Warning | A reserved setting the library does not read (`REBAC_RELATIONSHIP_MODEL`, `REBAC_DEFAULT_CONSISTENCY`, `REBAC_CACHE_ALIAS`, `REBAC_LOOKUP_CACHE_TTL`, `REBAC_GC_INTERVAL_SECONDS`) has a value of another type than documented. It has no effect either way. |
 | `rebac.W101` | Retired | Not reused. |
+
+`rebac.E025` to `rebac.E027` and `rebac.W012` to `rebac.W014` are not assigned in this release.
 
 `rebac.E014`, `rebac.E015`, `rebac.E016` and the backing-path form of
 `rebac.E018` read the stored schema, so they run only as database checks:
@@ -3861,15 +3886,22 @@ listing accepts them so orphaned tuples remain inspectable after schema changes.
 row whose resource or subject id is `""` or the text `"None"`, with which id it
 is, in the listing's order, and each user, group and `@rebac_subject` model row
 whose identity attribute is `None`, `""` or `"None"`, by model label and primary
-key. A write refuses an empty id, and `"None"` is what earlier versions wrote for
-an unset one (see [Django model validation and stored identity
+key. A wildcard subject (`*`) is not an unset id. A write refuses an empty id,
+and `"None"` is what earlier versions wrote for an unset one (see [Django model
+validation and stored identity
 references](#django-model-validation-and-stored-identity-references)); a direct
 write to the relationship models stores either. A principal whose identity is
-the text `"None"` holds every row stored under it, so it is listed too. An
-identity attribute that is not a stored field (a property, a dotted path) is
-named on standard error and not read. `--check` fails when anything is listed.
-Each row is removed by its exact stored values with
-`rebac.relationships.delete_relationship()`, `""` and `"None"` included.
+the text `"None"` holds every row stored under it, so it is listed too. It runs
+without the system checks, since it is what an operator runs while an upgrade's
+check errors stand. What it cannot examine it names on standard error, with how
+to examine it: an identity attribute that is not a stored field (a property, a
+dotted path), and a setting it needs that has no safe reading. When it lists a
+row it says on standard error how to remove one: by its exact stored values with
+`rebac.relationships.delete_relationship()`, `""` and `"None"` included, never
+with a `RelationshipFilter` that has an empty field, which matches every value.
+`--check` exits 1 when anything is listed, and 3 when nothing is listed but
+something could not be examined. Without the relationship table (migrations not
+run) it says so and exits 4, with or without `--check`.
 
 The `write-schema`, `gc-expired`, `retype-relationships`, `build-zed --check`,
 and `sync --target` interfaces are planned and not implemented. Use

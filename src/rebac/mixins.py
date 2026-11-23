@@ -936,8 +936,12 @@ class RebacMixin(RebacTrackedMixin):
                 continue
             snapshot[name] = value
         instance._rebac_loaded_values = snapshot
+        # A setting with no safe reading raises here, as it does at every read.
+        # A row whose id cannot be read now (a deferred column, a computed
+        # attribute) is left unstamped, and its id is read when it is needed.
+        attr = resource_id_attr(cls)
         try:
-            instance._rebac_resource_id = str(getattr(instance, resource_id_attr(cls)))
+            instance._rebac_resource_id = str(getattr(instance, attr))
         except Exception:
             pass
         return instance

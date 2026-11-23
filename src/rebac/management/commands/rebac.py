@@ -67,26 +67,54 @@ def _subject_ref(value: str) -> SubjectRef:
 # The stored ids an unset id leaves: empty, and the text earlier versions wrote for ``None``.
 _UNSET_IDS = ("", "None")
 
+# Where the operator removes what the finder lists.
+_REMOVE_EXACTLY = (
+    "Remove a listed row by its exact stored values with "
+    'rebac.relationships.delete_relationship(RelationshipTuple(...)), "" and "None" included. '
+    "Never with delete_relationships(RelationshipFilter(...)) and an empty field: an empty "
+    'filter field matches every value, so RelationshipFilter(subject_id="") deletes every row '
+    "the other fields select."
+)
 
-def _principal_models() -> list[tuple[str, type[Model], str]]:
-    """The models ``to_subject_ref()`` resolves by an id attribute, with that attribute."""
+# ``unset-ids --check``: something listed, or nothing listed and something not examined.
+_LISTED, _NOT_EXAMINED = 1, 3
+# ``unset-ids``, whatever the options: the relationship table is not there (migrations not run).
+_NO_TABLE = 4
+
+
+def _principal_models() -> list[tuple[str, type[Model], str | None]]:
+    """The models ``to_subject_ref()`` resolves by an id attribute.
+
+    With each, the attribute a ``@rebac_subject`` registration names, or ``None`` for the
+    user model and Group, whose attribute ``subject_id_attr()`` decides from the settings.
+    Reads no setting: the caller decides the attribute where it reports a setting it cannot
+    read.
+    """
     from django.contrib.auth import get_user_model
     from django.contrib.auth.models import Group
 
-    from ..._id import subject_id_attr
     from ...actors import _subject_registry
-    from ...resources import model_resource_type
 
-    found: dict[type[Model], str] = {}
-    for model in (get_user_model(), Group):
-        found[model] = subject_id_attr(model)
+    found: dict[type[Model], str | None] = {get_user_model(): None, Group: None}
     for cls, (_type, id_attr) in _subject_registry.items():
         if isinstance(cls, type) and issubclass(cls, Model) and not cls._meta.abstract:
-            found.setdefault(cls, subject_id_attr(cls) if model_resource_type(cls) else id_attr)
+            found.setdefault(cls, id_attr)
     return sorted(
         ((model._meta.label, model, attr) for model, attr in found.items()),
         key=lambda entry: entry[0],
     )
+
+
+def _missing_tables(model: type[Model]) -> list[str]:
+    """The tables ``model`` reads that its database does not have, in the order it reads them."""
+    from ...models import RelationshipRegistry
+
+    alias = router.db_for_read(model)
+    tables = [model._meta.db_table]
+    if model is RelationshipRegistry:
+        tables.append(RebacResource._meta.db_table)
+    present = set(connections[alias].introspection.table_names())
+    return [table for table in tables if table not in present]
 
 
 def _stored_field(model: type[Model], attr: str) -> models.Field[Any, Any] | None:
@@ -363,14 +391,29 @@ class Command(BaseCommand):
         p_rels.add_argument("--relation", help="Exact relation name.")
         p_rels.add_argument("--limit", type=int, help="Maximum rows (default: unlimited).")
 
+        unset_help = (
+            "List relationship rows whose resource or subject id is empty or 'None', and "
+            "users, groups and registered subjects whose id attribute is unset or 'None'. "
+            "Read only, and runs without the system checks."
+        )
         p_unset = sub.add_parser(
-            "unset-ids",
+            "unset-ids", help=unset_help, description=f"{unset_help} {_REMOVE_EXACTLY}"
+        )
+        p_unset.add_argument(
+            "--check",
+            action="store_true",
             help=(
-                "List relationship rows whose resource or subject id is empty or 'None', and "
-                "users, groups and registered subjects whose id attribute is unset or 'None'."
+                f"Exit {_LISTED} if anything is listed, or {_NOT_EXAMINED} if nothing is "
+                f"listed and something could not be examined. Without the relationship table "
+                f"the command exits {_NO_TABLE}, with or without --check."
             ),
         )
-        p_unset.add_argument("--check", action="store_true", help="Fail if anything is listed.")
+
+    def execute(self, *args: Any, **options: Any) -> Any:
+        if options.get("cmd") == "unset-ids":
+            # The finder is for an upgrade in progress, which a check error can be part of.
+            options["skip_checks"] = True
+        return super().execute(*args, **options)
 
     def handle(self, *args: Any, **options: Any) -> None:
         cmd = options["cmd"]
@@ -492,34 +535,71 @@ class Command(BaseCommand):
         relationship models can still store. Principals: users, groups and
         ``@rebac_subject`` models whose id attribute is ``None``, empty or
         ``"None"``; ``to_subject_ref()`` refuses the first two, and the third holds
-        every row stored under ``"None"``. Read only.
+        every row stored under ``"None"``. Read only. What it cannot examine (a
+        setting it needs that has no safe reading, an id attribute that is not a
+        stored field) it says on standard error, and ``--check`` does not pass.
         """
+        from ..._id import subject_id_attr
+        from ...conf import _WrongSettingType
         from ...models import RelationshipRegistry, active_relationship_model
+        from ...resources import model_resource_type
 
-        relationship_model = active_relationship_model()
-        rows = cast(
-            "RelationshipQuerySet | RelationshipRegistryQuerySet",
-            relationship_model.objects.filter(
-                Q(resource_id__in=_UNSET_IDS) | Q(subject_id__in=_UNSET_IDS)
-            ),
-        ).order_by_resource()
-        if relationship_model is RelationshipRegistry:
-            rows = cast("RelationshipRegistryQuerySet", rows).select_related(
-                "resource_fk", "subject_fk"
-            )
-        listed = 0
-        for row in rows.iterator():
-            unset = [
-                f"{side} id is {value!r}"
-                for side, value in (("resource", row.resource_id), ("subject", row.subject_id))
-                if value in _UNSET_IDS
-            ]
-            self.stdout.write(f"{row}\t{', '.join(unset)}")
-            listed += 1
-        for label, model, attr in _principal_models():
+        listed = rows_listed = 0
+        not_examined: list[str] = []
+        try:
+            relationship_model = active_relationship_model()
+        except _WrongSettingType as exc:
+            not_examined.append(f"relationship rows: {exc}")
+        else:
+            missing = _missing_tables(relationship_model)
+            if missing:
+                raise CommandError(
+                    f"The relationship table{'s' if len(missing) > 1 else ''} "
+                    f"{', '.join(missing)} {'are' if len(missing) > 1 else 'is'} not there: "
+                    "run manage.py migrate, then run unset-ids again.",
+                    returncode=_NO_TABLE,
+                )
+            rows = cast(
+                "RelationshipQuerySet | RelationshipRegistryQuerySet",
+                relationship_model.objects.filter(
+                    Q(resource_id__in=_UNSET_IDS) | Q(subject_id__in=_UNSET_IDS)
+                ),
+            ).order_by_resource()
+            if relationship_model is RelationshipRegistry:
+                rows = cast("RelationshipRegistryQuerySet", rows).select_related(
+                    "resource_fk", "subject_fk"
+                )
+            for row in rows.iterator():
+                unset = [
+                    f"{side} id is {value!r}"
+                    for side, value in (("resource", row.resource_id), ("subject", row.subject_id))
+                    if value in _UNSET_IDS
+                ]
+                self.stdout.write(f"{row}\t{', '.join(unset)}")
+                rows_listed += 1
+        listed += rows_listed
+        for label, model, registered in _principal_models():
+            try:
+                # A model-owned subject is named by its resource identity, as to_subject_ref does.
+                if registered is None or model_resource_type(model):
+                    attr = subject_id_attr(model)
+                else:
+                    attr = registered
+            except _WrongSettingType as exc:
+                not_examined.append(f"{label}: {exc}")
+                continue
+            missing = _missing_tables(model)
+            if missing:
+                not_examined.append(f"{label}: its table {missing[0]} is not there (migrate)")
+                continue
             field = _stored_field(model, attr)
             if field is None:
-                self.stderr.write(f"{label}: {attr} is not a stored field; its rows are not read")
+                not_examined.append(
+                    f"{label}: {attr} is not a stored field, so no query can select its rows. "
+                    f'Examine them in Python: [obj.pk for obj in apps.get_model("{label}")'
+                    f'._base_manager.iterator() if operator.attrgetter("{attr}")(obj) in '
+                    '(None, "", "None")]'
+                )
                 continue
             unset_q = Q(**{f"{attr}__isnull": True})
             if isinstance(field, (models.CharField, models.TextField)):
@@ -529,8 +609,21 @@ class Command(BaseCommand):
             ):
                 self.stdout.write(f"{label} pk={pk!r}\t{attr} is {value!r}")
                 listed += 1
-        if options["check"] and listed:
-            raise CommandError(f"{listed} relationship rows and principals have an unset id.")
+        for line in not_examined:
+            self.stderr.write(f"Not examined: {line}")
+        if rows_listed:
+            self.stderr.write(_REMOVE_EXACTLY)
+        if not options["check"]:
+            return
+        if listed:
+            raise CommandError(
+                f"{listed} relationship rows and principals have an unset id.", returncode=_LISTED
+            )
+        if not_examined:
+            raise CommandError(
+                f"Nothing listed, but {len(not_examined)} could not be examined (above).",
+                returncode=_NOT_EXAMINED,
+            )
 
     # ---------- sync ----------
 

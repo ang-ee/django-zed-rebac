@@ -12,7 +12,9 @@ from __future__ import annotations
 
 import builtins
 import hashlib
+import logging
 import re
+import threading
 from base64 import urlsafe_b64encode
 from collections.abc import AsyncIterator, Callable, Iterator
 from contextlib import asynccontextmanager, contextmanager
@@ -323,6 +325,7 @@ def to_subject_ref(actor: ActorLike) -> SubjectRef:
                 "save/load a real user row."
             )
         if model_resource_type(user_model):
+            _require_resource_id(actor)
             resource = to_object_ref(actor)
             return SubjectRef(resource, subject_relation(user_model))
         attr = subject_id_attr(user_model)
@@ -336,6 +339,7 @@ def to_subject_ref(actor: ActorLike) -> SubjectRef:
                 f"{actor.__class__.__name__} instance is unsaved; "
                 "save it before using it as a subject."
             )
+        _require_resource_id(actor)
         resource = to_object_ref(actor)
         return SubjectRef(resource, subject_relation(actor))
 
@@ -355,6 +359,27 @@ def to_subject_ref(actor: ActorLike) -> SubjectRef:
         f"Decorate the class with @rebac_subject(type=..., id_attr=...) "
         f"or pass a SubjectRef directly."
     )
+
+
+def _require_resource_id(actor: Any) -> None:
+    """Refuse a model-owned principal whose resource id is unset, as ``_principal_id`` does.
+
+    ``to_object_ref`` raises ``TypeError`` for it, which the request resolvers do not
+    take as "no actor"; an identity attribute that does not exist is still its error.
+    """
+    from ._id import resource_id_attr
+    from .resources import _resolve_dotted
+
+    attr = resource_id_attr(actor)
+    try:
+        value = _resolve_dotted(actor, attr)
+    except AttributeError:
+        return
+    if value is None or (isinstance(value, str) and not value):
+        raise NoActorResolvedError(
+            f"{actor.__class__.__name__} instance has no {attr}; "
+            "save it before using it as a subject."
+        )
 
 
 def _principal_id(actor: Any, attr: str) -> str:
@@ -592,8 +617,31 @@ def default_resolver(request: Any) -> SubjectRef | None:
         return anonymous_actor()
     try:
         return to_subject_ref(user)
-    except NoActorResolvedError:
+    except NoActorResolvedError as exc:
+        _log_served_as_anonymous(user, exc)
         return anonymous_actor()
+
+
+_served_as_anonymous: set[tuple[str, str]] = set()
+_served_as_anonymous_lock = threading.Lock()
+
+
+def _log_served_as_anonymous(user: Any, exc: NoActorResolvedError) -> None:
+    """Warn once per user type and reason that an authenticated user is served as anonymous.
+
+    The reason is the resolver's message, which names the class and the identity
+    attribute, never a value of either: nothing that identifies the user is logged.
+    """
+    meta = getattr(user, "_meta", None)
+    label = meta.label if meta is not None else type(user).__name__
+    key = (label, str(exc))
+    with _served_as_anonymous_lock:
+        if key in _served_as_anonymous:
+            return
+        _served_as_anonymous.add(key)
+    logging.getLogger("rebac").warning(
+        "An authenticated %s is served as the anonymous actor: %s", label, exc
+    )
 
 
 def get_actor_resolver() -> Callable[[Any], SubjectRef | None]:
