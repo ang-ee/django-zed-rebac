@@ -15,7 +15,15 @@ from django.core import checks
 from ..composition import TaggedComposition
 from ..errors import SchemaError
 from ..field_backing import resolve_field_backing
-from ..schema.ast import ConstBinding, PermArrow, PermBinOp, PermExpr, PermRef, Schema
+from ..schema.ast import (
+    ConstBinding,
+    PermArrow,
+    PermBinOp,
+    PermExpr,
+    PermRef,
+    Schema,
+    is_builtin_reference,
+)
 from ..schema.graph import Dependency, Key, dispatch_graph, strongly_connected_components
 
 __all__ = ["CompileProgram", "Key", "program_errors"]
@@ -94,7 +102,7 @@ class CompileProgram:
             if isinstance(expr, PermBinOp) and expr.op == "+":
                 expression(key, expr.left)
                 expression(key, expr.right)
-            elif isinstance(expr, PermRef):
+            elif isinstance(expr, PermRef) and not is_builtin_reference(expr.name):
                 visit((key[0], expr.name))
             elif isinstance(expr, PermArrow):
                 definition = self.schema.get_definition(key[0])

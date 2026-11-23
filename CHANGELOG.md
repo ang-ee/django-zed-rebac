@@ -13,6 +13,27 @@ pre-1.0; breaking changes within a minor version are explicitly called out.
   inside an evaluator scope raised `ValueError: zip() argument 2 is longer than argument 1`: the statement that
   probes each stored relation name had no name to probe and selected the whole generation row. There is nothing
   to probe then, and the profile is the keys the first statement read; no second statement is sent.
+- **Structural prefetch no longer delivers a child past the depth limit** (0.36.0 and later,
+  `REBAC_STRUCTURAL_PREFETCH`). A recursion is read to `REBAC_DEPTH_LIMIT` hops from where its component is entered.
+  A child whose permission, or a permission its union opens on the way to the arm, is in the recursive component
+  of the arm's target (the subfolders of a folder whose `read` is `parent->read + viewer`, or two types whose
+  permissions recurse through the delivered key) reads the parent's permission one hop into that component, with
+  one hop less of the limit than the parent was admitted with. The children of a parent admitted at the limit were
+  delivered though the scoped read withheld them. Such an edge now keeps the children's statement. An arrow into a
+  recursion from another type (a document's `folder->read`) enters it afresh and is delivered as before.
+- **Structural prefetch delivers children only on the database their parents were read from** (0.36.0 and later).
+  The record of admission kept primary keys alone, so parents read from one database delivered the children of a
+  prefetch read from another, where the children's own statement admitted none. Admissions are kept per database.
+- **A permission declared under a built-in name is not a union arm** (structural prefetch and the bounded walk,
+  0.36.0 and later). Inside an expression `authenticated` and `anonymous` are the actor's state, whatever the
+  definition declares under those names, but both mechanisms opened a permission declared as `anonymous` (or
+  `authenticated`) into its expression: structural prefetch delivered children through an arm the compiled
+  statement does not read, and the walk in `"prove"` mode held ids it denies. The compiler and both mechanisms
+  resolve names through the same functions, `rebac.schema.ast.is_builtin_reference` and `member`; no compiled
+  statement changes.
+- **Structural prefetch delivers nothing while any override is stored, as specified** (0.36.0 and later). It looked
+  only for the arms and sites that permission overrides tag, so a recaveat override, which tags none, left
+  deliveries on.
 
 ## [0.37.0] — 2026-11-19
 

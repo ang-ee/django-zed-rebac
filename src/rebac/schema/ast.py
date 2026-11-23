@@ -326,6 +326,37 @@ class Definition:
         )
 
 
+# What a name means where the compiler reads it. The permission compiler, the reachability
+# its program and its caveat verdicts follow (compile.program, compile.conditions), and the
+# union arms structural prefetch proves an edge from, which the bounded walk's "prove" mode
+# reads too (structural._union_arms), resolve names through these two.
+
+
+def is_builtin_reference(name: str) -> bool:
+    """Whether ``name``, named inside a permission expression, is a built-in test of the actor.
+
+    ``authenticated`` and ``anonymous`` there are the actor's state, whatever the
+    definition declares under those names.
+    """
+    return name in BUILTIN_ACTOR_TYPES
+
+
+def member(definition: Definition, name: str) -> Relation | Permission | None:
+    """What ``name`` is on ``definition`` where it is checked or an arrow leads to it.
+
+    Its relation, else its permission, else nothing, which grants nothing. A built-in
+    name is a member like any other here: only inside an expression is it the actor's
+    state (``is_builtin_reference``).
+    """
+    for relation in definition.relations:
+        if relation.name == name:
+            return relation
+    for permission in definition.permissions:
+        if permission.name == name:
+            return permission
+    return None
+
+
 @dataclass
 class Schema:
     """Top-level parsed schema."""

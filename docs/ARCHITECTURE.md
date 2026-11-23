@@ -147,8 +147,10 @@ directly in permission expressions. They are schema-level grants, not
 relationship rows and not user-declared definitions. `anonymous`
 matches the canonical anonymous SubjectRef typed by `REBAC_ANONYMOUS_TYPE`
 (default `auth/anonymous:*`); `authenticated` matches any non-anonymous
-resolved subject. See "Anonymous subject — built-in" below for the
-typing rationale.
+resolved subject. Inside an expression the two names are these terms
+even where a definition declares a permission under one of them; that
+permission is read only by a check of its name or an arrow to it. See "Anonymous
+subject — built-in" below for the typing rationale.
 
 The fundamental check operation: `check_access(subject, action, resource, context)` returns one of:
 
@@ -2270,7 +2272,7 @@ statement in place.
 
 | Setting | What it does | What keeps the compiled statement |
 |---|---|---|
-| `REBAC_STRUCTURAL_PREFETCH` | A prefetch's children are read by the foreign key that names their parents, with no permission statement, where the child's action is a union with the arm `relation->parent_action` over that unfiltered foreign key (`rebac.structural`) | An intersection or exclusion above the arm, a filtered or generic backing, an override |
+| `REBAC_STRUCTURAL_PREFETCH` | A prefetch's children are read by the foreign key that names their parents, with no permission statement, where the child's action is a union with the arm `relation->parent_action` over that unfiltered foreign key (`rebac.structural`) | An intersection or exclusion above the arm, a filtered or generic backing, an edge inside a recursion, another database than the parents', an override of any kind |
 | `REBAC_ROW_SCOPE` | The scope becomes `EXISTS` conditions on the row: a grant row on its id, a parent row that satisfies the parent's conditions, a constant's fixed object (`rebac.rowscope`) | A recursion; a caveated or expiring relation; a backing the walk does not read; more than 24 subqueries; a queryset embedded in another, combined, counted or aggregated |
 | `REBAC_BOUNDED_WALK` | `held` and `held_many` read the permission from the candidate rows by one lookup per relation (`rebac.walk`) | A recursive or caveated part is asked of the compiled statement alone; candidates that name no row keep their compiled answer |
 | `REBAC_DISPLAY_FIELDS` | A joined row is delivered with its key and declared display fields, the rest hidden as a denied field is (`rebac.display`) | A model that declares no display fields |
@@ -2282,6 +2284,15 @@ statement in place.
 - **The row scope asks each row the caller's conditions select.** Where those select many rows and the actor
   holds few, the id set would have named the few: on 3.2 million rows of which the actor holds none, a page cost
   152 ms against 17 ms compiled. `"named"` confines it to queries that name their rows.
+- **No delivery across an edge of a recursion.** A child whose permission, or a permission its union opens on the
+  way to the arm, is in the recursive component of the arm's target reads the parent's permission one hop into
+  the component, with one hop less of `REBAC_DEPTH_LIMIT` than the parent was admitted with: such children keep
+  their statement. An arrow into a recursion from outside it is read with the whole limit and is delivered.
+- **Admission is per database.** Children are delivered only when their queryset reads the database the parents
+  were read from.
+- **A union's arms are read as the compiler reads them.** Structural prefetch and the walk open a permission named
+  in a union into its own arms, and a built-in name there is the actor's state, never a permission declared under
+  it (`rebac.schema.ast.is_builtin_reference`, `member`, which the compiler resolves names through).
 - **`rebac.rowscope.explain(model, actor, action)`** says whether a permission is written as row conditions, with
   how many subqueries, and each obstacle by the relation it sits on.
 - **`rebac.snapshot.read_snapshot()`** opens or joins one transaction for a unit of reading in which the library

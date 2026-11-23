@@ -15,11 +15,15 @@ rows are still stamped with the actor, so field gates apply as ever.
 
 Three things must hold, and each is checked where the child statement is built:
 
-- the parents were read by a queryset scoped for this actor and action, in the
-  prefetch that is running now (``delivering``), and the child query is bound
-  to those parents by a mandatory ``fk IN (…)`` condition (``_bound_parents``);
-- the policy proves the implication (``parent_implies_children``);
-- the policy carries no override, which the proof does not read.
+- the parents were read by a queryset scoped for this actor and action, from the
+  database the children are read from, in the prefetch that is running now
+  (``delivering``), and the child query is bound to those parents by a mandatory
+  ``fk IN (…)`` condition (``_bound_parents``);
+- the policy proves the implication, and the child's read does not reach the arm's
+  target inside a recursion it has already entered, where it would read the target
+  with less of the depth limit than the parent was admitted with
+  (``parent_implies_children``);
+- the policy carries no override of any kind, which the proof does not read.
 
 Anything else falls back to the scoped read. The setting is off by default:
 whether a parent read moments ago may admit its children is a consistency
@@ -42,7 +46,17 @@ from django.db.models.lookups import Exact, In
 from django.db.models.sql.where import WhereNode
 
 from .resources import model_resource_type
-from .schema.ast import Definition, FieldBinding, PermArrow, PermBinOp, PermExpr, PermRef
+from .schema.ast import (
+    Definition,
+    FieldBinding,
+    PermArrow,
+    PermBinOp,
+    PermExpr,
+    Permission,
+    PermRef,
+    is_builtin_reference,
+    member,
+)
 from .types import SubjectRef
 
 # The proofs of one policy, by edge. Bounded: a policy change starts a new key.
@@ -55,8 +69,9 @@ class _Delivery:
     """The rows one prefetch has admitted so far, for one actor."""
 
     actor: SubjectRef
-    # (model, action) -> primary keys the actor holds the action on.
-    rows: dict[tuple[type[models.Model], str], set[Any]] = field(default_factory=dict)
+    # (model, database, action) -> primary keys the actor holds the action on: a
+    # row is admitted on the database it was read from, and delivers children there.
+    rows: dict[tuple[type[models.Model], str | None, str], set[Any]] = field(default_factory=dict)
     # How many child statements were read without their permission statement.
     delivered: int = 0
 
@@ -106,12 +121,16 @@ def admit(actor: SubjectRef, model: type[models.Model], action: str, rows: list[
 
 
 def _admit(delivery: _Delivery, model: type[models.Model], action: str, rows: list[Any]) -> None:
-    admitted = delivery.rows.setdefault((model, action), set())
-    admitted.update(row.pk for row in rows if isinstance(row, models.Model))
+    for row in rows:
+        if isinstance(row, models.Model):
+            delivery.rows.setdefault((model, row._state.db, action), set()).add(row.pk)
 
 
-def delivers(query: Any, model: type[models.Model], actor: SubjectRef, action: str) -> bool:
-    """Whether ``query`` reads only children the running prefetch already admitted."""
+def delivers(
+    query: Any, model: type[models.Model], actor: SubjectRef, action: str, *, using: str
+) -> bool:
+    """Whether ``query``, read from database ``using``, reads only children the running
+    prefetch already admitted there."""
     delivery = _delivery.get()
     if delivery is None or delivery.actor != actor:
         return False
@@ -124,8 +143,8 @@ def delivers(query: Any, model: type[models.Model], actor: SubjectRef, action: s
         parent = fk.related_model
         if not isinstance(parent, type) or not fk.target_field.primary_key:
             continue
-        for (admitted_model, parent_action), pks in delivery.rows.items():
-            if admitted_model is not parent or not values <= pks:
+        for (admitted_model, database, parent_action), pks in delivery.rows.items():
+            if admitted_model is not parent or database != using or not values <= pks:
                 continue
             if parent_implies_children(
                 policy,
@@ -239,8 +258,10 @@ def _proves(
 ) -> bool:
     from .field_backing import resolve_field_backing
 
-    # An override retags arms the walk below would read as plain unions.
-    if policy.tagged.arms or policy.tagged.sites:
+    # The proof reads the policy's text. An override makes what is evaluated depend on
+    # more than the text: an arm or a site holds until its deadline, a recaveat replaces
+    # a caveat's expression until its own.
+    if _carries_override(policy):
         return False
     child_type = model_resource_type(child_model)
     parent_type = model_resource_type(parent_model)
@@ -254,7 +275,9 @@ def _proves(
     if schema.get_permission(parent_type, parent_action) is None:
         return False
     relations = {relation.name: relation for relation in definition.relations}
-    for arm in _union_arms(definition, permission.expression, frozenset({child_action})):
+    for arm, opened in _opened_union_arms(
+        definition, permission.expression, frozenset({child_action})
+    ):
         if not isinstance(arm, PermArrow) or arm.target != parent_action:
             continue
         relation = relations.get(arm.via)
@@ -275,20 +298,73 @@ def _proves(
             and resolved.generic is None
             and resolved.single_valued
             and not resolved.filters
+            and not _deeper_in_recursion(
+                policy.program, child_type, opened, parent_type, parent_action
+            )
         ):
             return True
     return False
 
 
+def _carries_override(policy: Any) -> bool:
+    """Whether the policy is composed with a stored override, of any kind."""
+    return bool(policy.snapshot.overrides or policy.tagged.arms or policy.tagged.sites)
+
+
+def _deeper_in_recursion(
+    program: Any, child_type: str, opened: frozenset[str], parent_type: str, target: str
+) -> bool:
+    """Whether the child reads the arm's target inside a recursion its own read has entered.
+
+    A recursion is read to ``REBAC_DEPTH_LIMIT`` hops counted from where its component
+    was entered on the way. The parent was admitted with ``target``'s component entered
+    at the parent. When the child's action, or a permission its union opens on the way
+    to the arm (``opened``), is in that component, the child's read has entered it
+    already: it reads ``target`` across the delivered edge, one hop into the component,
+    with one hop less of the limit, and admits fewer children than the parent's
+    admission covers. Outside the component, the child enters it afresh at the parent
+    and reads ``target`` with the whole limit, as the parent was read.
+    """
+    key = (parent_type, target)
+    if key not in program.recursive:
+        return False
+    component = program.components.get(key, frozenset())
+    return any((child_type, name) in component for name in opened)
+
+
+def _opened(definition: Definition, name: str) -> PermExpr | None:
+    """The expression a name stands for inside an expression, if it stands for one.
+
+    Read as the compiler reads it: a built-in name is the actor's state whatever the
+    definition declares, a relation is itself, a permission is its expression.
+    """
+    if is_builtin_reference(name):
+        return None
+    found = member(definition, name)
+    return found.expression if isinstance(found, Permission) else None
+
+
 def _union_arms(definition: Definition, expr: PermExpr, seen: frozenset[str]) -> Iterator[PermExpr]:
-    """The arms of a union, a named permission of the same definition opened into its own."""
+    """The arms of a union, a named permission of the same definition opened into its own.
+
+    A name is opened as the compiler reads it: a built-in name is the actor's state,
+    never a permission declared under it.
+    """
+    for arm, _opened_names in _opened_union_arms(definition, expr, seen):
+        yield arm
+
+
+def _opened_union_arms(
+    definition: Definition, expr: PermExpr, seen: frozenset[str]
+) -> Iterator[tuple[PermExpr, frozenset[str]]]:
+    """``_union_arms``, each arm with the names opened on the way to it, ``seen`` included."""
     if isinstance(expr, PermBinOp) and expr.op == "+":
-        yield from _union_arms(definition, expr.left, seen)
-        yield from _union_arms(definition, expr.right, seen)
+        yield from _opened_union_arms(definition, expr.left, seen)
+        yield from _opened_union_arms(definition, expr.right, seen)
         return
     if isinstance(expr, PermRef) and expr.name not in seen:
-        named = next((item for item in definition.permissions if item.name == expr.name), None)
+        named = _opened(definition, expr.name)
         if named is not None:
-            yield from _union_arms(definition, named.expression, seen | {expr.name})
+            yield from _opened_union_arms(definition, named, seen | {expr.name})
             return
-    yield expr
+    yield expr, seen

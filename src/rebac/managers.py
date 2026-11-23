@@ -1273,7 +1273,7 @@ class RebacQuerySet(models.QuerySet[_M]):
         from .backends import backend
 
         action = str(self._rebac_action or getattr(model._meta, "rebac_default_action", "read"))
-        if query is self.query and structural.delivers(query, model, actor, action):
+        if query is self.query and structural.delivers(query, model, actor, action, using=self.db):
             # Children of parents the running prefetch admitted, where the
             # policy proves the parent's action grants theirs (proposal 0020).
             return
