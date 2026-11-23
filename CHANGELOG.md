@@ -88,14 +88,27 @@ pre-1.0; breaking changes within a minor version are explicitly called out.
   views and DRF evaluate `.all()` of it), so that one actor's count decides the next actor's read. A pinned actor or
   bypass (`with_actor()`, the queryset's own `sudo()`) was never affected: it wins over the context at every
   evaluation, as before. Each evaluation now decides again, by the same function (`effective_actor()`) with the
-  database it reads and the evaluator scope, and builds the scope again where the decision differs; the same
-  decision costs one comparison and no statement. Answers that change for correct
-  code: a queryset read again in another evaluator scope, or routed to another database, no longer keeps the
-  first scope's plan choices (a constant-arm witness decided `False`, the first database's grant profile), which
-  read fewer rows than its scope admits, never more. Unchanged: rows a queryset holds are handed out as Django
-  hands them out, whatever the context; a queryset whose scope was applied earlier keeps that decision where it is
-  embedded (`Subquery()`, `Exists()`), as specified; a scope built before a policy revision was published stays
-  closed by its revision fence until it is built again.
+  database it reads, and builds the scope again where the decision differs, at the cost of building a clone's
+  scope; the same decision costs one comparison and no statement. A queryset routed to another database between
+  two evaluations is built for that database, where it ran the first database's statement before. Unchanged: a
+  scope keeps what it pinned when it was built (its policy, the caveat verdicts and constant-arm witnesses of the
+  evaluator scope it was built in) when it is read again in another evaluator scope; rows a queryset holds are
+  handed out as Django hands them out, whatever the context; an eager `scoped()` queryset keeps the actor it
+  pinned; a scope built before a policy revision was published stays closed by its revision fence until it is
+  built again.
+- **An embedded queryset is decided where it is embedded** (0.22.0 and later, since embedded querysets are scoped).
+  The same object embedded in another statement as `Subquery(qs)`, `Exists(qs)` or a lookup on its query
+  (`filter(x__in=qs.query)`), or deep-copied and then embedded, kept the decision of its last evaluation, where
+  every direct read, and a lookup on the queryset itself (`filter(x__in=qs)`), decided again: one object embedded
+  two ways gave two answers. After the member's `count()`, the outsider's `filter(thread__in=Subquery(ids))` read
+  the member's threads; after an administrator's `iterator()`, `Exists(threads)` was true for everyone; in strict
+  mode, after the actor's context had closed, the embedding read with that actor's scope where reading the
+  queryset raised `MissingActorError`. Exposure needs one queryset object read under one actor and embedded under
+  another or with none, the shared-object case above. The queryset's query also kept its decision in a record
+  beside it, published after it: another thread evaluating the same object in between could leave one
+  evaluation's query under another's record, and an embedding read the record. Embedding now decides by the same
+  rule as an evaluation, from the decision the query itself carries, published with it at once. An eager
+  `scoped()` queryset keeps the actor it pinned wherever it is embedded.
 - **A queryset holds rows only once they are safe to hand out.** The result cache was filled before the
   prefetches, field redaction and the `rebac_select_related()` guards ran on it. When one of them raised (a
   related row the guard refuses, a prefetch or redaction statement that fails or is cancelled), the exception
@@ -152,6 +165,24 @@ pre-1.0; breaking changes within a minor version are explicitly called out.
   the prefetch that opened it ends: anywhere else, and after, nothing is delivered or admitted, and the read keeps
   its statement. An evaluation through Django's async ORM (`async for`, `sync_to_async`) still delivers: the whole
   evaluation runs in one worker thread.
+
+### Upgrade
+
+- **Embedding a queryset with nothing in force raises in strict mode.** A queryset evaluated inside
+  `actor_context()` and embedded (`Subquery()`, `Exists()`, a lookup on its query) after the context closed, with
+  no actor and no `sudo()` block in force, raises `MissingActorError`, as reading it does; it read with the closed
+  context's scope before. Pin the actor with `with_actor()`, or make the queryset eager with `scoped()` inside the
+  context.
+- **A prefetched related manager's `iterator()`, `aiterator()` and `aggregate()` need an actor.** They are scoped
+  now (above): with no actor taken from the row and none in force, strict mode raises `MissingActorError`, as
+  iterating the manager already did. They read every row of the relation before.
+- **Non-strict deployments (`REBAC_STRICT_MODE = False`) can read more rows from a reused queryset.** A queryset
+  evaluated under an actor and read again with no actor in force now reads what non-strict mode specifies for no
+  actor, every row its conditions select; it read with the earlier actor's scope before. Only a queryset object
+  reused across contexts is concerned: clone it per context, or pin its actor.
+- **A read router is asked once per evaluation**, where it was asked three or four times, and the statement runs on
+  the database the scope was built for. A router whose answer changes between calls no longer splits one
+  evaluation between databases.
 
 ## [0.37.0] — 2026-11-19
 

@@ -22,6 +22,7 @@ from django.db.models.functions import Abs, Lower
 from django.test import override_settings
 
 from rebac import (
+    MissingActorError,
     ObjectRef,
     PermissionDenied,
     RelationshipTuple,
@@ -444,14 +445,21 @@ def test_a_scoped_queryset_keeps_the_actor_it_was_scoped_with(people, rows):
     with actor_context(to_subject_ref(people["alice"])):
         evaluated = Post.objects.filter(body="")
         assert len(list(evaluated)) == 2
-        refused = Post.objects.filter(title__startswith="secret")
+        eager = Post.objects.filter(body="").scoped()
+        refused = Post.objects.filter(title__startswith="secret").scoped()
         with pytest.raises(PermissionDenied):
             list(refused)
-    # Embedded after the context closed: alice's scope and alice's gates.
     bypass = Post.objects.sudo(reason="test.outer")
-    assert bypass.filter(Exists(evaluated)).count() == 2
+    # Embedded after the context closed: scoped() pinned alice, so her scope and her gates.
+    assert bypass.filter(Exists(eager)).count() == 2
     with pytest.raises(PermissionDenied):
         bypass.filter(Exists(refused)).count()
+    # An evaluation pins nothing: embedded with no actor in force, it is refused, as
+    # reading it is.
+    with pytest.raises(MissingActorError):
+        list(evaluated)
+    with pytest.raises(MissingActorError):
+        bypass.filter(Exists(evaluated)).count()
 
 
 @override_settings(REBAC_FIELD_READ_MODE="redact")

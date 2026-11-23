@@ -73,26 +73,17 @@ class _Decision(NamedTuple):
 
     ``actor`` and ``bypass`` are ``effective_actor()``: the pins, an ambient ``sudo()`` or
     ``system_context()`` block, the ambient actor, ``REBAC_ENABLED``. ``using`` is the
-    database the statement reads. ``evaluator`` is the evaluator scope, whose plan choices
-    (the actor's grant profile, constant-arm witnesses) the scope was built with, by weak
-    reference, compared by identity, so a queryset kept beyond it does not keep it. A
-    structural delivery is not part of a decision: it is never kept beyond the evaluation
-    it serves (``RebacQuerySet._apply_scope_in_place``).
+    database the statement reads: a scope is compiled for one (its SQL, and the profile
+    and witnesses read there). What the scope pins when it is built (its policy, the
+    caveat verdicts and constant-arm witnesses an evaluator scope decides) is not part of
+    a decision: it can only leave rows out, never add one, as the policy's revision fence
+    does. Nor is a structural delivery: it is never kept beyond the evaluation it serves
+    (``RebacQuerySet._apply_scope_in_place``).
     """
 
     actor: SubjectRef | None
     bypass: bool
     using: str
-    evaluator: weakref.ref[Any] | None
-
-    def __reduce__(self) -> tuple[Any, ...]:
-        # The evaluator scope is this process's and held weakly: a pickle or a copy
-        # carries none, so what reads it decides again.
-        return (_Decision, (self.actor, self.bypass, self.using, None))
-
-
-def _weak(value: Any) -> weakref.ref[Any] | None:
-    return None if value is None else weakref.ref(value)
 
 
 class _CompileOnly(Enum):
@@ -352,32 +343,16 @@ class _RebacQuery(RootQuery, _BypassAuditQuery):
         )
         for name, value in state.items():
             setattr(queryset, name, value)
-        earlier = queryset._rebac_scope_decision
-        if (
-            earlier is not None
-            and earlier.bypass
-            and not queryset.is_sudo()
-            and not queryset._rebac_eager_scope
-        ):
-            # A bypass an earlier evaluation took from a sudo() block it no
-            # longer runs in is decided again, as a clone's is.
-            queryset._reset_scope()
-        if not queryset._rebac_scope_applied:
-            # Building an expression runs no query, so it must write no audit row
-            # (annotations are built at import time, during app initialisation).
-            # A scope applied earlier (scoped(), an evaluation) keeps the decision
-            # it was applied with: a queryset evaluated under actor_context() may
-            # be embedded after it has closed.
-            with ctes.isolated():
-                queryset._apply_scope_in_place(audit=False)
-        # The query that carries the scope: building it replaced the queryset's.
-        clone = cast(Self, queryset.query)
-        decision = queryset._rebac_scope_decision
-        actor, bypass = (
-            (decision.actor, decision.bypass)
-            if decision is not None
-            else queryset.effective_actor(strict=True)
-        )
+        # Embedded, the queryset's scope is decided here, as at any evaluation: the
+        # scope its query carries is kept only for the same decision, read from the
+        # query itself (an eager ``scoped()`` queryset's pins keep it the same). With
+        # no actor and no bypass in force, strict mode refuses, as reading it does.
+        # Building an expression runs no query, so it writes no audit row
+        # (annotations are built at import time, during app initialisation).
+        with ctes.isolated():
+            clone = cast(Self, queryset._apply_scope_in_place(audit=False))
+        decision = cast(_Decision, cast(Any, clone)._rebac_scope_for)
+        actor, bypass = decision.actor, decision.bypass
         if bypass:
             queryset._capture_ambient_bypass()
         reason = queryset._bypass_audit_reason(embedded=True) if bypass else None
@@ -385,21 +360,14 @@ class _RebacQuery(RootQuery, _BypassAuditQuery):
 
         # A set combination has one actor policy, owned by its root queryset.
         # _scope_query already applied it to each operand (or the root bypass
-        # lifted it). Django resolves each operand again below; prevent stale
-        # operand metadata from reapplying a different actor or rejecting an
-        # intentionally unscoped right-hand operand.
-        part_decision = (
-            decision if decision is not None else _Decision(actor, bypass, queryset.db, None)
-        )
-
+        # lifted it). Django resolves each operand again below: each carries the
+        # root's decision, so it keeps the scope the root gave it rather than
+        # applying its own or rejecting an intentionally unscoped operand.
         def resolved_parts(query: Query) -> None:
             for part in query.combined_queries:
                 if isinstance(part, _RebacQuery):
-                    part._rebac_state = {
-                        **state,
-                        "_rebac_scope_applied": True,
-                        "_rebac_scope_decision": part_decision,
-                    }
+                    part._rebac_state = dict(state)
+                    cast(Any, part)._rebac_scope_for = decision
                     # The combination's own check reads every operand.
                     part._rebac_checked = True
                 resolved_parts(part)
@@ -907,8 +875,6 @@ class RebacQuerySet(models.QuerySet[_M]):
         state["_rebac_bypass_entry"] = _BypassEntry()
         state["_rebac_internal_bypass"] = False
         state["_rebac_ambient_bypass"] = False
-        state["_rebac_scope_applied"] = False
-        state["_rebac_scope_decision"] = None
         state["_rebac_eager_scope"] = False
         state["_rebac_visibility_applied"] = False
         state["_prefetch_done"] = False
@@ -986,10 +952,10 @@ class RebacQuerySet(models.QuerySet[_M]):
 
     def explain(self, *, format: str | None = None, **options: Any) -> str:
         scoped = self._clone()
-        scoped._apply_scope_in_place()
+        reading = scoped._reading(scoped._apply_scope_in_place())
         scoped._audit_bypass_once()
-        scoped._guard_clause_field_reads(*scoped.effective_actor(strict=True))
-        return super(RebacQuerySet, scoped).explain(format=format, **options)
+        reading._guard_clause_field_reads(*scoped.effective_actor(strict=True))
+        return super(RebacQuerySet, reading).explain(format=format, **options)
 
     # Note: a second `_clone` override below combines the actor + scope-flag
     # propagation; this stub kept for readability.
@@ -1125,8 +1091,6 @@ class RebacQuerySet(models.QuerySet[_M]):
         # when values_select is populated. This is an internal SQL replacement;
         # preserve the caller's scalar/tuple/model iterable contract.
         self._query = _without_query_scope(self.query)
-        self._rebac_scope_applied = False
-        self._rebac_scope_decision = None
 
     def _refresh_scope(self) -> None:
         self._reset_scope()
@@ -1263,12 +1227,6 @@ class RebacQuerySet(models.QuerySet[_M]):
             fail_closed=self._rebac_aggregate_scope,
         )
 
-    # Whether the queryset's query carries a scope, and the decision it was built
-    # for: a record for embedding and clones. The query carries its own decision
-    # (``_rebac_scope_for``), which is what an evaluation compares with.
-    _rebac_scope_applied: bool = False
-    _rebac_scope_decision: _Decision | None = None
-
     def _apply_scope_in_place(
         self,
         *,
@@ -1279,16 +1237,18 @@ class RebacQuerySet(models.QuerySet[_M]):
         """Decide the scope of this evaluation and return the query that carries it.
 
         The decision (``_Decision``) is taken here at every call, by the function
-        that took it the first time: ``effective_actor``, the database alias and
-        the evaluator scope. Whether a scope is applied is read from the query
-        alone, never from a result cache. A query already scoped for the same
-        decision is returned as it is, at the cost of one comparison. Otherwise
-        the scope is built on a copy of the query with no scope in it, and the
-        copy replaces the queryset's query, by one assignment, once it is
-        complete; the record follows. A scope that raises while it is built
-        therefore leaves the queryset as it was, with no part of it, and another
-        thread reading the same queryset meanwhile sees the query before or
-        after, never one in between.
+        that took it the first time: ``effective_actor`` and the database alias,
+        asked of the router once. The query carries the decision it was scoped
+        for (``_rebac_scope_for``): whether a scope is applied, and for what, is
+        read from the query alone, never from a result cache or a record kept
+        beside it. A query already scoped for the same decision is returned as
+        it is, at the cost of one comparison. Otherwise the scope is built on a
+        copy of the query with no scope in it, and the copy, which carries its
+        decision, replaces the queryset's query by one assignment once it is
+        complete. A scope that raises while it is built therefore leaves the
+        queryset as it was, with no part of it, and another thread reading the
+        same queryset meanwhile sees one query and its own decision, before or
+        after, never one in between and never one with another's decision.
 
         Only an evaluation that runs its rows now (``executing``, ``_fetch_all``)
         may be delivered by a running structural prefetch, and a delivered query
@@ -1305,7 +1265,8 @@ class RebacQuerySet(models.QuerySet[_M]):
         # ``decision`` is an ``(actor, bypass)`` resolved earlier by a lazy
         # reader, which must not resolve the ambient context again.
         actor, bypass = decision if decision is not None else self.effective_actor(strict=True)
-        decided = _Decision(actor, bypass, self.db, _weak(current_evaluator()))
+        using = self.db
+        decided = _Decision(actor, bypass, using)
         query = self.query
         if getattr(query, "_rebac_scope_for", None) == decided:
             return query
@@ -1317,15 +1278,13 @@ class RebacQuerySet(models.QuerySet[_M]):
             if executing:
                 # This query is run as it stands: its scope may refer to its own rows.
                 with rowscope.executing(scoped):
-                    if self._scope_query(scoped, actor, deliver=True):
+                    if self._scope_query(scoped, actor, deliver=True, using=using):
                         # Children of parents the running prefetch admitted: no
                         # permission statement, for this evaluation only.
                         return scoped
             else:
-                self._scope_query(scoped, actor)
+                self._scope_query(scoped, actor, using=using)
         self._query = scoped
-        self._rebac_scope_decision = decided
-        self._rebac_scope_applied = True
         return scoped
 
     def _reading(self, query: Query) -> Self:
@@ -1334,12 +1293,14 @@ class RebacQuerySet(models.QuerySet[_M]):
 
         Django runs ``self.query`` when it compiles, after the decision. Another
         thread evaluating the same queryset under another decision may replace
-        that query in between; the evaluation runs the one it decided. A shallow
+        that query in between; the evaluation runs the one it decided, on the
+        database it was decided for, without asking the router again. A shallow
         copy, without pickling's ``__getstate__``, which drops the actor.
         """
         reading = object.__new__(type(self))
         vars(reading).update(vars(self))
         reading._query = query
+        cast(Any, reading)._db = cast(_Decision, cast(Any, query)._rebac_scope_for).using
         return reading
 
     @schema_operation
@@ -1350,22 +1311,25 @@ class RebacQuerySet(models.QuerySet[_M]):
         *,
         root: Query | None = None,
         deliver: bool = False,
+        using: str | None = None,
     ) -> bool:
         """Add the scope to ``query``, its operands and its parts.
 
         ``root`` is the query the scope is built for, the statement itself.
         ``deliver``: the statement runs now, and a running structural prefetch
         may deliver it; the answer is whether it did, adding no scope.
+        ``using``: the database decided for it.
         """
         root = query if root is None else root
+        using = self.db if using is None else using
         for operand in _nested_queries(query.where, boolean_operands_only=True):
-            self._scope_query(operand, actor, root=root)
+            self._scope_query(operand, actor, root=root, using=using)
             if isinstance(operand, _RebacQuery):
                 operand._rebac_check = (self, actor)
                 operand._rebac_checked = False
         if query.combined_queries:
             for part in query.combined_queries:
-                self._scope_query(part, actor, root=root)
+                self._scope_query(part, actor, root=root, using=using)
             return False
         model = query.model
         if model is None:
@@ -1383,17 +1347,17 @@ class RebacQuerySet(models.QuerySet[_M]):
         if (
             deliver
             and query is root
-            and structural.delivers(query, model, actor, action, using=self.db)
+            and structural.delivers(query, model, actor, action, using=using)
         ):
             # Children of parents the running prefetch admitted, where the
             # policy proves the parent's action grants theirs (proposal 0020).
             return True
         # The scope as conditions on each row, where the setting and the policy
         # allow it (proposal 0020); the compiled id sets otherwise.
-        predicate = rowscope.predicate(query, model, actor, action, self.db)
+        predicate = rowscope.predicate(query, model, actor, action, using)
         if predicate is None:
             predicate = backend().queryset_filter(
-                model=model, subject=actor, action=action, using=self.db
+                model=model, subject=actor, action=action, using=using
             )
         # The compiled predicate keeps the authorization clause identifiable,
         # including in Django's cloned and combined WHERE trees, so a changed
@@ -1418,8 +1382,6 @@ class RebacQuerySet(models.QuerySet[_M]):
         clone._rebac_select_related_guards = self._rebac_select_related_guards
         clone._rebac_eager_scope = self._rebac_eager_scope
         clone._rebac_aggregate_scope = self._rebac_aggregate_scope
-        clone._rebac_scope_applied = self._rebac_scope_applied
-        clone._rebac_scope_decision = self._rebac_scope_decision
         if not self._rebac_eager_scope:
             clone._reset_scope()
         return clone
@@ -1794,7 +1756,7 @@ class RebacQuerySet(models.QuerySet[_M]):
         self._audit_bypass_once()
         reading._guard_projected_field_reads(actor, sudo)
         related = _relation_scope(self) if self._rebac_select_related_guards else None
-        chunked = not connections[self.db].settings_dict.get("DISABLE_SERVER_SIDE_CURSORS")
+        chunked = not connections[reading.db].settings_dict.get("DISABLE_SERVER_SIDE_CURSORS")
         size = chunk_size or 2000
         rows = iter(native._iterable_class(reading, chunked_fetch=chunked, chunk_size=size))
         return self._finished_chunks(rows, size, actor, sudo, related)
@@ -1935,7 +1897,7 @@ class RebacQuerySet(models.QuerySet[_M]):
         )
         native = cast(Any, self)
         lookups = native._prefetch_related_lookups
-        chunked = not connections[self.db].settings_dict.get("DISABLE_SERVER_SIDE_CURSORS")
+        chunked = not connections[reading.db].settings_dict.get("DISABLE_SERVER_SIDE_CURSORS")
         iterable = native._iterable_class(reading, chunked_fetch=chunked, chunk_size=chunk_size)
         chunk: list[Any] = []
 
@@ -2411,18 +2373,19 @@ class RebacQuerySet(models.QuerySet[_M]):
         refusal never depends on a row the actor cannot read.
         """
         rows = self._system_capture(reason=reason)
-        # The scope stays through the clones that read the keys.
+        # The scope stays through the clones that read the keys, on one database.
         rows._rebac_eager_scope = True
+        cast(Any, rows)._db = rows.db
         query = _without_query_scope(rows.query)
         rows._scope_query(query, actor)
-        # Recorded as the capture's own decision, a bypass: the evaluations that
-        # read the keys find their scope decided, and keep the actor's scope.
+        # Recorded as the capture's own decision, a bypass, which its pin keeps
+        # the same: the evaluations that read the keys find their scope decided
+        # and keep the actor's scope. Were it decided again (it cannot be), the
+        # keys would be read unscoped, and the bulk guards would refuse the rows
+        # outside the actor's scope: a refusal, never a wider write.
         actor_, bypass = rows.effective_actor(strict=True)
-        decided = _Decision(actor_, bypass, rows.db, _weak(current_evaluator()))
-        cast(Any, query)._rebac_scope_for = decided
+        cast(Any, query)._rebac_scope_for = _Decision(actor_, bypass, rows.db)
         rows._query = query
-        rows._rebac_scope_decision = decided
-        rows._rebac_scope_applied = True
         return rows
 
     def _writing_actor(self, actor: SubjectRef | None) -> SubjectRef:

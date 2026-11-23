@@ -2835,10 +2835,24 @@ where it runs: iteration, `len()`, `bool()`, `count()`, `exists()`,
 the queryset holds. Whether a scope is applied is read from the query, never
 from a result cache. The decision is `effective_actor()` (the queryset's own
 pins, the actor a related manager took from its row, an ambient `sudo()` or
-`system_context()` block, the ambient actor, `REBAC_ENABLED`), the database the
-statement reads, and the evaluator scope. A queryset already scoped for that
-decision runs as it is, at the cost of one comparison; otherwise its scope is
-built again for it. A pin wins over ambient state at every evaluation, as at
+`system_context()` block, the ambient actor, `REBAC_ENABLED`) and the database
+the statement reads, asked of the router once: the statement runs on the
+database its scope was built for. The query carries the decision it was scoped
+for, published with it in one assignment. A queryset already scoped for that
+decision runs as it is, at the cost of one comparison and no statement;
+otherwise its scope is built again for it, at the cost of building a clone's.
+Embedded in another statement (`Subquery()`, `Exists()`, a lookup on the
+queryset or on its `query`, a deep copy embedded), a queryset is decided where
+it is embedded by the same rule, so one object embedded two ways reads the same
+rows; with no actor and no bypass in force, strict mode refuses the embedding
+with `MissingActorError`, as it refuses reading it. `scoped()` pins the actor,
+or the bypass of the block it runs in, so an eager queryset keeps its scope
+wherever it is embedded. What a scope pins when it is
+built is kept with it: its policy, and inside an evaluator scope the caveat
+verdicts and constant-arm witnesses decided then. A queryset read again in
+another evaluator scope, or outside one, keeps them, as an eager `scoped()`
+queryset does; they can leave rows out, never add one, until the scope is built
+again. A pin wins over ambient state at every evaluation, as at
 the first: a `with_actor()` queryset evaluated in a later `sudo()` block reads
 as its actor, and a `sudo()` queryset evaluated under `actor_context()` reads
 every row. A related manager Django's prefetch filled holds the rows that read
@@ -2985,6 +2999,7 @@ Resolution order:
 A pinned actor (path 2) **always wins** over ambient state (paths 3-4) — there is no path by which ambient sudo or the ambient actor ContextVar can override an explicit `.with_actor(...)`. This is the inverse of Odoo's `allowed_company_ids` ambient-scope precedence; we want the explicit local scope to be the authoritative one. If code truly wants bypass inside an elevated block, it must call `.sudo(reason=...)` on that queryset or instance.
 
 **Critical: scope sticks across writes.** A queryset created with `with_actor(actor)` produces instances tagged with that actor; `instance.save()` re-checks against the same actor, regardless of what `current_actor()` says now. This is the Odoo `with_user(...)` invariant translated into Django — the actor follows the recordset.
+Re-pinning an instance (`instance.with_actor(other)`) changes what it reads and writes next, not what it already holds: the rows of a prefetched related manager, a cached forward relation and the field values it loaded are not checked again for the new actor, as Django keeps held rows.
 Only a REBAC queryset or `RebacMixin` instance can carry that pin; an unrelated
 tracked model's callable attribute named `actor` does not become an actor scope.
 
@@ -3239,9 +3254,9 @@ ordering. `order_by()` with no arguments clears a default ordering.
 
 A queryset used as a subquery (`Subquery()`, `Exists()`, a lookup such as
 `pk__in=queryset`) is checked for what it selects, filters, groups and orders
-on, as resolved into the enclosing statement, whether its scope is applied
-there or was applied earlier (`scoped()`, or an evaluation that was
-refused), with the actor its scope was applied with. A column of the
+on, as resolved into the enclosing statement, with the actor its scope is
+decided for where it is embedded: the pinned actor of an eager `scoped()`
+queryset, else the one in force there. A column of the
 enclosing row it refers to (`OuterRef`) is the enclosing query's to answer
 for. It is checked once: when the statement that holds it is checked, sharing
 that check's schema read, if it sits in that statement's clauses or
