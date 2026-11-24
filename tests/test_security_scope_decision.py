@@ -27,21 +27,39 @@ import copy
 import pickle
 import threading
 from collections.abc import Callable, Iterator
-from typing import Any
+from typing import Any, ClassVar
 
 import pytest
 from asgiref.sync import sync_to_async
 from django.core.management import call_command
 from django.db import connection, connections
 from django.db.backends.base.base import BaseDatabaseWrapper
-from django.db.models import Count, Exists, OuterRef, Prefetch, Subquery
+from django.db.models import (
+    Case,
+    Count,
+    Exists,
+    F,
+    FilteredRelation,
+    Max,
+    OuterRef,
+    Prefetch,
+    Q,
+    Subquery,
+    Value,
+    When,
+    Window,
+)
+from django.db.models.functions import Coalesce
 from django.db.models.signals import post_init
 from django.test.utils import CaptureQueriesContext
 
+import rebac.managers as rebac_managers
 from rebac import (
     MissingActorError,
     PermissionDenied,
+    SubjectRef,
     actor_context,
+    backend,
     evaluator_scope,
     structural,
     sudo,
@@ -222,13 +240,16 @@ definition scope/message {
 """
 
 
+@pytest.mark.parametrize("read", ["read", "embedded"])
 def test_a_queryset_routed_to_another_database_is_scoped_for_it(
-    settings, django_db_blocker, tmp_path
+    settings, django_db_blocker, tmp_path, read
 ):
     """Inside an evaluator scope the member's grant profile, read on the database the
     scope is built for, leaves out the arms of relations it holds no row of there. The
     other database holds the member's direct grant on message 3: built for the first
-    database, the scope read it without that arm."""
+    database, the scope read it without that arm. Embedded, the messages are decided for
+    the database by each statement that compiles them, as read they are by each
+    evaluation."""
     from rebac.testing import install_schema
 
     alias = "decision_other"
@@ -248,6 +269,16 @@ def test_a_queryset_routed_to_another_database_is_scoped_for_it(
             _behind_the_library(alias, "scope/message", 3, "direct")
             settings.DATABASE_ROUTERS = [_Route()]
             rows = ScopeMessage.objects.with_actor(MEMBER)
+            if read == "embedded":
+                with evaluator_scope(), actor_context(MEMBER):
+                    _Route.alias = "default"
+                    threads = ScopeThread.objects.sudo(reason="test.decision-route").annotate(
+                        v=Subquery(_first_message())
+                    )
+                    assert _pairs(threads.all()) == [(1, None), (2, None), (3, None)]
+                    _Route.alias = alias
+                    assert _pairs(threads.all()) == [(1, None), (2, None), (3, 3)]
+                return
             with evaluator_scope():
                 _Route.alias = "default"
                 assert rows.count() == 0
@@ -572,6 +603,674 @@ def test_a_query_and_its_decision_are_published_together(settings, monkeypatch):
         assert sorted(ids) == []
 
 
+# ---------- An embedded scope decided by its context, in every position ----------
+
+POSITIONS_SCHEMA = """
+definition auth/user {}
+definition scope/thread {
+    relation reader: auth/user
+    permission read = reader
+}
+definition scope/message {
+    relation thread: scope/thread // rebac:field=thread
+    relation reader: auth/user
+    permission read = reader
+}
+definition scope/part {
+    relation message: scope/message // rebac:field=message
+    permission read = message->read
+}
+"""
+
+
+def _positions(settings: Any, storage: str) -> None:
+    """Both actors read the three threads; the member alone reads message 2."""
+    settings.REBAC_LOCAL_BACKEND_STORAGE = storage
+    local = install_schema(POSITIONS_SCHEMA)
+    ScopeThread._base_manager.bulk_create([ScopeThread(id=n) for n in (1, 2, 3)])
+    ScopeMessage._base_manager.bulk_create([ScopeMessage(id=n, thread_id=n) for n in (1, 2, 3)])
+    local.write_relationships(
+        [
+            grant("scope/thread", n, "reader", actor)
+            for n in (1, 2, 3)
+            for actor in (MEMBER, OUTSIDER)
+        ]
+        + [grant("scope/message", 2, "reader")]
+    )
+
+
+def _first_message() -> Any:
+    return ScopeMessage.objects.filter(thread=OuterRef("pk")).values("pk")[:1]
+
+
+def _messages() -> Any:
+    return ScopeMessage.objects.filter(thread=OuterRef("pk"))
+
+
+def _pairs(rows: Any) -> list[tuple[int, Any]]:
+    return sorted((row.pk, row.v) for row in rows)
+
+
+def _pks(rows: Any) -> list[int]:
+    return sorted(row.pk for row in rows)
+
+
+# A position, the queryset it builds on an outer one, how it is read, and what the member
+# and the outsider read.
+POSITIONS: dict[str, tuple[Callable[[Any], Any], Callable[[Any], Any], Any, Any]] = {
+    "filter condition": (lambda outer: outer.filter(Exists(_messages())), _pks, [2], []),
+    "exclude condition": (
+        lambda outer: outer.exclude(Exists(_messages())),
+        _pks,
+        [1, 3],
+        [1, 2, 3],
+    ),
+    "annotation": (
+        lambda outer: outer.annotate(v=Subquery(_first_message())),
+        _pairs,
+        [(1, None), (2, 2), (3, None)],
+        [(1, None), (2, None), (3, None)],
+    ),
+    "alias": (
+        lambda outer: outer.alias(v=Subquery(_first_message())).filter(v__isnull=False),
+        _pks,
+        [2],
+        [],
+    ),
+    "aggregate filter": (
+        lambda outer: outer.annotate(v=Count("pk", filter=Q(Exists(_messages())))),
+        _pairs,
+        [(1, 0), (2, 1), (3, 0)],
+        [(1, 0), (2, 0), (3, 0)],
+    ),
+    "order_by": (
+        lambda outer: outer.order_by(Subquery(_first_message()).desc(nulls_last=True), "pk"),
+        lambda rows: [row.pk for row in rows],
+        [2, 1, 3],
+        [1, 2, 3],
+    ),
+    "Case and When": (
+        lambda outer: outer.annotate(
+            v=Case(When(Exists(_messages()), then=Value(1)), default=Value(0))
+        ),
+        _pairs,
+        [(1, 0), (2, 1), (3, 0)],
+        [(1, 0), (2, 0), (3, 0)],
+    ),
+    "Window": (
+        lambda outer: outer.annotate(v=Window(expression=Max(Subquery(_first_message())))),
+        _pairs,
+        [(1, 2), (2, 2), (3, 2)],
+        [(1, None), (2, None), (3, None)],
+    ),
+    "FilteredRelation condition": (
+        lambda outer: outer.annotate(
+            visible=FilteredRelation(
+                "scopemessage",
+                condition=Q(scopemessage__pk__in=Subquery(ScopeMessage.objects.values("pk"))),
+            )
+        ).annotate(v=F("visible__pk")),
+        _pairs,
+        [(1, None), (2, 2), (3, None)],
+        [(1, None), (2, None), (3, None)],
+    ),
+    "combinator operand": (
+        lambda outer: (
+            outer.annotate(v=Subquery(_first_message()))
+            .values_list("pk", "v")
+            .union(outer.filter(pk=0).annotate(v=Subquery(_first_message())).values_list("pk", "v"))
+        ),
+        sorted,
+        [(1, None), (2, 2), (3, None)],
+        [(1, None), (2, None), (3, None)],
+    ),
+    "values over an annotation": (
+        lambda outer: outer.annotate(v=Subquery(_first_message())).values_list("pk", "v"),
+        sorted,
+        [(1, None), (2, 2), (3, None)],
+        [(1, None), (2, None), (3, None)],
+    ),
+    "In, a Subquery on the right": (
+        lambda outer: outer.filter(pk__in=Subquery(ScopeMessage.objects.values("thread"))),
+        _pks,
+        [2],
+        [],
+    ),
+    "In, a queryset on the right": (
+        lambda outer: outer.filter(pk__in=ScopeMessage.objects.values("thread")),
+        _pks,
+        [2],
+        [],
+    ),
+}
+
+
+def _outer(case: str) -> Any:
+    """``changes``: the outer is decided by the context too; ``pinned``: by its own bypass."""
+    if case == "changes":
+        return ScopeThread.objects.all()
+    return ScopeThread.objects.sudo(reason="test.decision-positions")
+
+
+@pytest.mark.parametrize("storage", LAYOUTS)
+@pytest.mark.parametrize("case", ["changes", "pinned"])
+@pytest.mark.parametrize("position", list(POSITIONS))
+def test_an_embedded_scope_is_decided_by_each_statement_in_every_position(
+    settings, storage, case, position
+):
+    """Built under the member, the queryset is read under the outsider, as it is and as
+    a clone: every position of the statement carries the outsider's scope, whether the
+    outer's own decision changes with the actor or not. Before, an annotation, a
+    ``Case``, a ``Window``, a filtered relation, an operand, a values projection and
+    ``In`` kept the member's."""
+    _positions(settings, storage)
+    build, read, members, outsiders_ = POSITIONS[position]
+    with actor_context(MEMBER):
+        rows = build(_outer(case))
+        assert read(rows.all()) == members
+    with actor_context(OUTSIDER):
+        assert read(rows) == outsiders_
+        assert read(rows.all()) == outsiders_
+    with actor_context(MEMBER):
+        # ``rows`` holds the outsider's rows now; a clone reads again.
+        assert read(rows.all()) == members
+
+
+def test_an_evaluated_queryset_embedded_with_nothing_in_force_is_refused_where_it_is_embedded(
+    settings,
+):
+    """Strict mode: read under the member, then embedded with no actor in force. Building
+    the expression raises, before any statement holds it."""
+    _positions(settings, "denormalized")
+    with actor_context(MEMBER):
+        messages = ScopeMessage.objects.values("thread")
+        assert list(messages) == [{"thread": 2}]
+    outer = _outer("pinned")
+    with pytest.raises(MissingActorError):
+        outer.annotate(v=Subquery(messages.all()[:1]))
+    with pytest.raises(MissingActorError):
+        outer.filter(pk__in=Subquery(messages))
+
+
+def _inner_in_a_block(pin: Callable[[Any], Any]) -> Any:
+    with sudo(reason="test.decision-same-block"):
+        return pin(_first_message())
+
+
+SAME_DECISION: dict[str, tuple[Callable[[], Any], Callable[[], Any]]] = {
+    # Built where it is read.
+    "decided by the actor": (_first_message, lambda: actor_context(MEMBER)),
+    "its own bypass": (
+        lambda: _first_message().sudo(reason="test.decision-same"),
+        lambda: actor_context(OUTSIDER),
+    ),
+    # A block's bypass it pinned with scoped(), read outside any block.
+    "a block's bypass it pinned": (
+        lambda: _inner_in_a_block(lambda inner: inner.scoped()),
+        lambda: actor_context(OUTSIDER),
+    ),
+    # A block's bypass it captured where it was resolved, read in a block.
+    "a block's bypass": (_first_message, lambda: sudo(reason="test.decision-same-read")),
+}
+
+
+@pytest.mark.parametrize("case", list(SAME_DECISION))
+def test_a_statement_that_decides_as_its_embedded_scope_was_decided_resolves_nothing_again(
+    settings, monkeypatch, case
+):
+    """Compiled for the decision it was resolved for, an embedded queryset is compiled as
+    it is: the statement's text is the one it had, and nothing is resolved again."""
+    _positions(settings, "denormalized")
+    inner, context = SAME_DECISION[case]
+    with context():
+        threads = _outer("pinned").annotate(v=Subquery(inner()))
+        first = str(threads.query)
+        resolved: list[Any] = []
+        real = rebac_managers._RebacQuery.resolve_expression
+
+        def counted(self: Any, *args: Any, **kwargs: Any) -> Any:
+            resolved.append(self)
+            return real(self, *args, **kwargs)
+
+        monkeypatch.setattr(rebac_managers._RebacQuery, "resolve_expression", counted)
+        assert str(threads.query) == first
+        list(threads.all())
+    assert resolved == []
+
+
+PINS: dict[str, Callable[[Any], Any]] = {
+    "scoped()": lambda inner: inner.scoped(),
+    "with_actor()": lambda inner: inner.with_actor(MEMBER),
+    "sudo()": lambda inner: inner.sudo(reason="test.decision-pinned-inner"),
+}
+
+
+@pytest.mark.parametrize("storage", LAYOUTS)
+@pytest.mark.parametrize("pin", list(PINS))
+def test_an_embedded_queryset_keeps_what_it_pins(settings, storage, pin):
+    """Embedded with its own pin, built under the member and read under the outsider
+    or with nothing in force: the member's scope, or every row."""
+    _positions(settings, storage)
+    pinned = PINS[pin]
+    with actor_context(MEMBER):
+        annotated = _outer("pinned").annotate(v=Subquery(pinned(_first_message())))
+        listed = _outer("pinned").filter(pk__in=pinned(ScopeMessage.objects.values("thread")))
+    values = [(1, 1), (2, 2), (3, 3)] if pin == "sudo()" else [(1, None), (2, 2), (3, None)]
+    threads_ = [1, 2, 3] if pin == "sudo()" else [2]
+    for context in (actor_context(OUTSIDER), contextlib.nullcontext()):
+        with context:
+            assert _pairs(annotated.all()) == values
+            assert _pks(listed.all()) == threads_
+
+
+@pytest.mark.parametrize("position", ["annotation", "In, a queryset on the right"])
+def test_an_embedded_scope_with_nothing_in_force_is_refused(settings, position):
+    """Strict mode: the outer pins its own bypass, the embedded queryset pins nothing.
+    Compiled with no actor in force, the statement is not sent."""
+    _positions(settings, "denormalized")
+    build, read, members, _outsiders = POSITIONS[position]
+    with actor_context(MEMBER):
+        rows = build(_outer("pinned"))
+        assert read(rows.all()) == members
+    with pytest.raises(MissingActorError):
+        read(rows)
+
+
+@pytest.mark.parametrize("position", ["annotation", "In, a queryset on the right"])
+def test_an_embedded_scope_built_in_a_sudo_block_is_decided_for_the_same_actor_after_it(
+    settings, position
+):
+    """The same actor in force inside the block and after it: the bypass is the part of
+    the decision that changes."""
+    _positions(settings, "denormalized")
+    build, read, members, _outsiders = POSITIONS[position]
+    everything = [(1, 1), (2, 2), (3, 3)] if position == "annotation" else [1, 2, 3]
+    with actor_context(MEMBER):
+        with sudo(reason="test.decision-block"):
+            rows = build(_outer("pinned"))
+            assert read(rows.all()) == everything
+        assert read(rows.all()) == members
+
+
+@pytest.mark.parametrize("strict", [True, False])
+def test_a_class_level_queryset_with_an_embedded_scope(settings, strict):
+    """Built at import, with nothing in force. Strict mode refuses it there, as before.
+    Without strict mode the embedded queryset was decided as "no actor, every row" and
+    stayed so for every reader; it is decided for each reader now."""
+    _positions(settings, "denormalized")
+    settings.REBAC_STRICT_MODE = strict
+    if strict:
+        with pytest.raises(MissingActorError):
+            ScopeThread.objects.annotate(v=Subquery(_first_message()))
+        return
+    queryset = ScopeThread.objects.annotate(v=Subquery(_first_message()))
+    with actor_context(MEMBER):
+        assert _pairs(queryset.all()) == [(1, None), (2, 2), (3, None)]
+    with actor_context(OUTSIDER):
+        assert _pairs(queryset.all()) == [(1, None), (2, None), (3, None)]
+    assert _pairs(queryset.all()) == [(1, 1), (2, 2), (3, 3)]
+
+
+def test_an_iterator_decides_embedded_scopes_where_it_is_called(settings):
+    _positions(settings, "denormalized")
+    with actor_context(MEMBER):
+        rows = POSITIONS["annotation"][0](_outer("pinned"))
+    with actor_context(OUTSIDER):
+        pending = rows.iterator(chunk_size=10)
+    with actor_context(MEMBER):
+        assert _pairs(pending) == [(1, None), (2, None), (3, None)]
+
+
+@pytest.mark.django_db(transaction=True)
+def test_an_aiterator_decides_embedded_scopes_where_it_is_called(settings):
+    _positions(settings, "denormalized")
+    with actor_context(MEMBER):
+        rows = POSITIONS["annotation"][0](_outer("pinned"))
+
+    async def scenario() -> list[tuple[int, Any]]:
+        with actor_context(OUTSIDER):
+            pending = rows.aiterator(chunk_size=10)
+        with actor_context(MEMBER):
+            return sorted([(row.pk, row.v) async for row in pending])
+
+    assert asyncio.run(scenario()) == [(1, None), (2, None), (3, None)]
+
+
+LAZY_EMBEDDINGS: dict[str, tuple[Callable[[Any], Any], Callable[[Any], Any], Any]] = {
+    "an annotation": (
+        lambda outer: outer.annotate(v=Subquery(_first_message())),
+        lambda row: (row.pk, row.v),
+        [(1, None), (2, 2), (3, None)],
+    ),
+    "a condition": (
+        lambda outer: outer.filter(Exists(_messages())),
+        lambda row: row.pk,
+        [2],
+    ),
+}
+
+
+@pytest.mark.django_db(transaction=True)
+@pytest.mark.parametrize("storage", LAYOUTS)
+@pytest.mark.parametrize("strict", [True, False], ids=["strict", "non-strict"])
+@pytest.mark.parametrize("case", ["changes", "pinned"])
+@pytest.mark.parametrize("embedding", list(LAZY_EMBEDDINGS))
+@pytest.mark.parametrize("read", ["iterator", "aiterator"])
+def test_a_lazy_read_consumed_after_its_context_closed_reads_as_where_it_was_called(
+    settings, storage, strict, case, embedding, read
+):
+    """Created under the member and consumed after the member's context closed, with
+    nothing in force: everything up to the first rows (the scope, the guards that decide
+    the embedded queryset, the statement) is decided where the read was called. Before,
+    aiterator() ran its guards at the first read and raised ``MissingActorError``."""
+    _positions(settings, storage)
+    settings.REBAC_STRICT_MODE = strict
+    build, row_of, expected = LAZY_EMBEDDINGS[embedding]
+    if read == "iterator":
+        with actor_context(MEMBER):
+            pending = build(_outer(case)).iterator(chunk_size=1)
+        assert sorted(row_of(row) for row in pending) == expected
+        return
+
+    async def scenario() -> list[Any]:
+        with actor_context(MEMBER):
+            pending = build(_outer(case)).aiterator(chunk_size=1)
+        return sorted([row_of(row) async for row in pending])
+
+    assert asyncio.run(scenario()) == expected
+
+
+def test_an_iterator_consumed_after_its_evaluator_scope_closed_sends_what_it_sent_outside_one(
+    settings,
+):
+    """Its first rows compile in the context it was called in, without the evaluator scope
+    that has closed since: no statement more than a read made outside one."""
+    from django.db import connection
+    from django.test.utils import CaptureQueriesContext
+
+    _positions(settings, "denormalized")
+    build = LAZY_EMBEDDINGS["an annotation"][0]
+    with actor_context(MEMBER):
+        with CaptureQueriesContext(connection) as outside:
+            assert len(list(build(_outer("changes")).iterator(chunk_size=1))) == 3
+        with evaluator_scope():
+            pending = build(_outer("changes")).iterator(chunk_size=1)
+        with CaptureQueriesContext(connection) as after:
+            assert len(list(pending)) == 3
+    assert len(after.captured_queries) == len(outside.captured_queries)
+
+
+@pytest.mark.django_db(transaction=True)
+@pytest.mark.parametrize("read", ["iterator", "aiterator"])
+def test_a_lazy_read_keeps_the_context_it_was_called_in_only_until_its_first_rows(settings, read):
+    """Its first rows read inside the evaluator scope, the scope closed after them: the
+    evaluator is not kept alive by the rows still to read."""
+    import gc
+    import weakref
+
+    _positions(settings, "denormalized")
+    build = LAZY_EMBEDDINGS["an annotation"][0]
+    if read == "iterator":
+        with actor_context(MEMBER):
+            with evaluator_scope() as evaluator:
+                pending = build(_outer("changes")).iterator(chunk_size=1)
+                next(pending)
+            held = weakref.ref(evaluator)
+            del evaluator
+            gc.collect()
+            assert held() is None
+            assert len(list(pending)) == 2
+        return
+
+    with actor_context(MEMBER):
+        rows = build(_outer("changes"))
+
+    async def scenario() -> tuple[bool, int]:
+        with actor_context(MEMBER):
+            with evaluator_scope() as evaluator:
+                pending = rows.aiterator(chunk_size=1)
+                await anext(pending)
+            held = weakref.ref(evaluator)
+            del evaluator
+            gc.collect()
+            return held() is None, len([row async for row in pending])
+
+    assert asyncio.run(scenario()) == (True, 2)
+
+
+class _CountingReads:
+    """A read router that counts how often it is asked."""
+
+    asked = 0
+
+    def db_for_read(self, model: Any, **hints: Any) -> str | None:
+        _CountingReads.asked += 1
+        return None
+
+
+ROUTED_READS: dict[str, tuple[Callable[[], Any], Callable[[Any], Any], int]] = {
+    # The queryset's own evaluation once; each queryset embedded in its statement once,
+    # where the statement compiles.
+    "a list, nothing embedded": (lambda: _outer("changes"), list, 1),
+    "a list, one embedded": (
+        lambda: _outer("changes").annotate(v=Subquery(_first_message())),
+        list,
+        2,
+    ),
+    "a list, three embedded": (
+        lambda: (
+            _outer("changes")
+            .annotate(a=Subquery(_first_message()), b=Exists(_messages()))
+            .filter(pk__in=ScopeMessage.objects.values("thread"))
+        ),
+        list,
+        4,
+    ),
+    # count() leaves out an annotation nothing refers to: nothing embedded compiles.
+    "a count, one embedded": (
+        lambda: _outer("changes").annotate(v=Subquery(_first_message())),
+        lambda rows: rows.count(),
+        1,
+    ),
+    "an iterator, one embedded": (
+        lambda: _outer("changes").annotate(v=Subquery(_first_message())),
+        lambda rows: list(rows.iterator(chunk_size=10)),
+        2,
+    ),
+}
+
+
+@pytest.mark.parametrize("read", list(ROUTED_READS))
+def test_a_read_asks_the_router_once_for_itself_and_once_for_each_embedded_queryset(settings, read):
+    _positions(settings, "denormalized")
+    settings.DATABASE_ROUTERS = [_CountingReads()]
+    build, run, expected = ROUTED_READS[read]
+    with actor_context(MEMBER):
+        rows = build()
+        for _ in range(2):
+            _CountingReads.asked = 0
+            run(rows.all())
+            assert _CountingReads.asked == expected, _CountingReads.asked
+
+
+def _lookups(query: Any) -> list[tuple[int, int, int]]:
+    """Every lookup reachable from a query (its conditions, its annotations, the
+    conditions inside those, the queries nested in either), as the identities of it and
+    its two sides."""
+    found: list[tuple[int, int, int]] = []
+    seen: set[int] = set()
+
+    def visit(value: Any) -> None:
+        if value is None or id(value) in seen:
+            return
+        seen.add(id(value))
+        if hasattr(value, "where") and hasattr(value, "annotations"):
+            visit(value.where)
+            for annotation in value.annotations.values():
+                visit(annotation)
+            return
+        if hasattr(value, "children"):
+            for child in value.children:
+                visit(child)
+            return
+        if hasattr(value, "lhs") and hasattr(value, "rhs"):
+            found.append((id(value), id(value.lhs), id(value.rhs)))
+            visit(value.lhs)
+            visit(value.rhs)
+        visit(getattr(value, "query", None))
+        for source in getattr(value, "get_source_expressions", list)():
+            visit(source)
+
+    visit(query)
+    return found
+
+
+def test_compiling_a_statement_for_another_actor_leaves_it_as_it_was(settings):
+    """Three levels: a bypass outer, a condition over the messages, a condition over their
+    parts in it, and annotations, one with conditions of its own. Compiled under the outsider, the queryset decided
+    again for the outsider is resolved from conditions of its own: the lookups of the
+    statement the member built are the same objects, with the same sides."""
+    _positions(settings, "denormalized")
+    with actor_context(MEMBER):
+        # Conditions inside an embedded queryset's annotations too.
+        flagged = _messages().annotate(
+            k=Case(When(pk=2, then=Value(1)), default=Value(0)),
+            n=Count("scopepart", filter=Q(scopepart__fragment_id=7)),
+        )
+        shared = (
+            _outer("pinned")
+            .filter(
+                Exists(_messages().filter(Exists(ScopePart.objects.filter(message=OuterRef("pk")))))
+            )
+            .annotate(v=Subquery(_first_message()), k=Subquery(flagged.values("k")[:1]))
+        )
+        member_sql = str(shared.query)
+    before = _lookups(shared.query)
+    assert len(before) >= 10, len(before)
+    with actor_context(OUTSIDER):
+        assert str(shared.query) != member_sql
+    assert _lookups(shared.query) == before
+    with actor_context(MEMBER):
+        assert str(shared.query) == member_sql
+
+
+THIRD = SubjectRef.of("auth/user", "third")
+
+
+def _sudo_threads() -> Any:
+    return ScopeThread.objects.sudo(reason="test.decision-identity")
+
+
+# Statements nested more than one level, or sharing one embedded queryset.
+NESTED_SHAPES: dict[str, Callable[[], Any]] = {
+    "an outer reference two levels up": lambda: _sudo_threads().annotate(
+        p=Subquery(
+            _messages()
+            .annotate(
+                q=Subquery(
+                    ScopePart.objects.filter(
+                        message=OuterRef("pk"), message__thread=OuterRef(OuterRef("pk"))
+                    ).values("pk")[:1]
+                )
+            )
+            .values("q")[:1]
+        )
+    ),
+    "one embedded queryset in three places": lambda: (
+        lambda inner: (
+            _sudo_threads()
+            .annotate(a=Subquery(inner.values("pk")[:1]), b=Subquery(inner.values("pk")[:1]))
+            .filter(Exists(inner) | Q(pk=1))
+        )
+    )(_messages()),
+    "the enclosing queryset embedded in a third": lambda: ScopeMessage.objects.sudo(
+        reason="test.decision-identity-top"
+    ).filter(thread__in=_sudo_threads().filter(Exists(_messages())).values("pk")),
+    "a distinct, sliced embedded queryset": lambda: _sudo_threads().annotate(
+        m=Subquery(_messages().values("thread_id").distinct().order_by("thread_id")[:1])
+    ),
+    "an annotation over an annotation": lambda: (
+        _sudo_threads()
+        .annotate(m=Coalesce(Subquery(_first_message()), Value(0)))
+        .annotate(m2=F("m") + 1)
+    ),
+    "a grouped count embedded": lambda: _sudo_threads().annotate(
+        n=Subquery(
+            ScopePart.objects.filter(message__thread=OuterRef("pk"))
+            .order_by()
+            .values("message__thread")
+            .annotate(c=Count("pk"))
+            .values("c")[:1]
+        )
+    ),
+    "three levels, the last pinned to the member": lambda: _sudo_threads().filter(
+        Exists(
+            _messages().filter(
+                Exists(ScopePart.objects.with_actor(MEMBER).filter(message=OuterRef("pk")))
+            )
+        )
+    ),
+    "a combination of two": lambda: (
+        _sudo_threads()
+        .filter(Exists(_messages()))
+        .values_list("pk", flat=True)
+        .union(
+            ScopeThread.objects.sudo(reason="test.decision-identity-b")
+            .filter(pk__in=ScopeMessage.objects.values("thread_id"))
+            .values_list("pk", flat=True)
+        )
+    ),
+}
+
+
+def _at(build: Callable[[Any], Any], case: str) -> Callable[[], Any]:
+    return lambda: build(_outer(case))
+
+
+IDENTITY_STATEMENTS: dict[str, Callable[[], Any]] = {
+    **{
+        f"{position}, {case}": _at(entry[0], case)
+        for position, entry in POSITIONS.items()
+        for case in ("changes", "pinned")
+    },
+    **NESTED_SHAPES,
+}
+
+
+def _statement(rows: Any) -> tuple[list[str], str]:
+    from django.db import connection
+    from django.test.utils import CaptureQueriesContext
+
+    with CaptureQueriesContext(connection) as captured:
+        listed = sorted(map(str, rows))
+    sent = [query["sql"] for query in captured.captured_queries if "testapp_scope" in query["sql"]]
+    return listed, sent[-1]
+
+
+@pytest.mark.parametrize("storage", LAYOUTS)
+@pytest.mark.parametrize("reader", ["outsider", "third"])
+@pytest.mark.parametrize("statement", list(IDENTITY_STATEMENTS))
+def test_a_statement_decided_again_is_the_statement_built_for_its_reader(
+    settings, storage, reader, statement
+):
+    """Built under the member and read by another reader, a statement whose embedded
+    querysets are decided again sends, byte for byte, the statement built under that
+    reader: as it is, as a clone, and read a second time."""
+    _positions(settings, storage)
+    local = backend()
+    local.write_relationships([grant("scope/thread", 3, "reader", THIRD)])
+    who = OUTSIDER if reader == "outsider" else THIRD
+    build = IDENTITY_STATEMENTS[statement]
+    with actor_context(MEMBER):
+        kept = build()
+        member = _statement(kept.all())
+    with actor_context(who):
+        fresh = _statement(build())
+        assert _statement(kept) == fresh
+        assert _statement(kept.all()) == fresh
+    assert member[1] != fresh[1]
+
+
 # ---------- Each read runs the query it decided ----------
 
 
@@ -645,6 +1344,31 @@ def test_a_read_asks_the_router_once_and_runs_where_it_was_decided(settings, rea
         _CountingRoute.asked = 0
         function(rows.all())
         assert _CountingRoute.asked == 1, _CountingRoute.asked
+
+
+class _AuditSeeingRoute:
+    """A read router that notes, each time it is asked, the bypass audit rows written."""
+
+    seen: ClassVar[list[int]] = []
+
+    def db_for_read(self, model: Any, **hints: Any) -> str | None:
+        if model is ScopeThread:
+            from rebac.models import PermissionAuditEvent
+
+            _AuditSeeingRoute.seen.append(
+                PermissionAuditEvent.objects.filter(reason="test.route-after-audit").count()
+            )
+        return None
+
+
+def test_a_router_is_asked_after_the_bypass_audit_row_is_written(settings):
+    """As in 0.37.0: a router that sends reads to the primary once a write was made sees
+    the audit row first."""
+    install(settings)
+    settings.DATABASE_ROUTERS = [_AuditSeeingRoute()]
+    _AuditSeeingRoute.seen = []
+    list(ScopeThread.objects.sudo(reason="test.route-after-audit"))
+    assert _AuditSeeingRoute.seen and set(_AuditSeeingRoute.seen) == {1}, _AuditSeeingRoute.seen
 
 
 # ---------- A structural delivery serves the one evaluation it was decided for ----------

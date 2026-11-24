@@ -2112,7 +2112,9 @@ does not hook (see [Bypass audit granularity](#with_actor-vs-sudo--distinct-verb
 statement (a `Subquery` in `ORDER BY`, a REBAC `Subquery` as an INSERT value)
 builds its scope then, reading the schema revision, unless an evaluator scope
 pins it, and the caveat-verdict rows, and deciding the constant-arm witness
-inside an evaluator scope. A new
+inside an evaluator scope; so does (e) an embedded queryset that pins nothing of
+its own, compiled by a statement that decides it for another actor or bypass
+than the one it was built for (below). A new
 caveat instance is absent from an already prepared lower bound; a newly
 built scope sees it. Likewise, a scope prepared with the constant arms left
 out (a kept `False`) leaves them out when it renders after a tuple write that
@@ -2841,15 +2843,44 @@ database its scope was built for. The query carries the decision it was scoped
 for, published with it in one assignment. A queryset already scoped for that
 decision runs as it is, at the cost of one comparison and no statement;
 otherwise its scope is built again for it, at the cost of building a clone's.
-Embedded in another statement (`Subquery()`, `Exists()`, a lookup on the
-queryset or on its `query`, a deep copy embedded), a queryset is decided where
-it is embedded by the same rule, so one object embedded two ways reads the same
-rows; with no actor and no bypass in force, strict mode refuses the embedding
-with `MissingActorError`, as it refuses reading it. `scoped()` pins the actor,
-or the bypass of the block it runs in, so an eager queryset keeps its scope
-wherever it is embedded. What a scope pins when it is
-built is kept with it: its policy, and inside an evaluator scope the caveat
-verdicts and constant-arm witnesses decided then. A queryset read again in
+Embedded in another statement, in any position (a `filter()` or `exclude()`
+condition, an annotation or `alias()`, an aggregate's `filter=`, `order_by()`, a
+`Case`/`When`, a `Window`, a `FilteredRelation` condition, an operand of a set
+combination, `values()` over an annotation, the right of an `In` lookup, as a
+`Subquery()`, an `Exists()`, a lookup on the queryset or on its `query`, or a deep
+copy), a queryset that pins nothing of its own (no `scoped()`, `with_actor()` or
+`sudo()` on it) is decided by each statement that compiles it, by the same rule.
+Where that statement decides as the scope it carries was decided, the scope is
+compiled as it is; otherwise it is resolved again into the statement, as Django
+resolves a condition again when it compiles, its scope built for the statement's
+decision and checked for the gated fields it reads with that decision's actor.
+It is resolved from copies of its conditions (the lookups of its `where`, and those
+inside its annotations): Django assigns a lookup's sides in place when it resolves
+a where tree, on lookups a clone shares with the query it was cloned from, and the
+copies keep the statement the queryset is embedded in as it was, whoever compiles
+it. The router is asked once for each embedded queryset where the statement
+compiles; the field check before the statement compiles compares only the actor
+and the bypass, to know whether to leave the check to the compile. A statement
+with nothing embedded does no more work: the decisions are compared only where an
+embedded queryset renders. One object embedded two ways, or read and embedded,
+reads the same rows, whatever the enclosing queryset's own decision, and a
+statement decided again sends, byte for byte, the statement built under its
+reader. With no actor and no bypass in force, strict mode refuses the statement
+with `MissingActorError`, as it refuses reading the queryset. `iterator()` and
+`aiterator()` decide everything up to their first rows (the scope and its audit
+row, the guards, the embedded querysets, the statement, which Django compiles
+when the first rows are read) in the context they were called in, without the
+evaluator scope they were called in if it has closed since, and keep that context
+no longer than their first rows. The work done for each chunk runs in the context
+that consumes it, as in 0.37.0: its prefetches are read there, so a caller's
+`Prefetch(queryset=...)` that pins nothing takes the consumer's actor, while the
+redaction and the related-row guards use the actor taken at the call.
+`scoped()` pins the actor, or the bypass of the block it runs in, so an eager
+queryset keeps its scope wherever it is embedded, as a queryset's own
+`with_actor()` or `sudo()` does. What a scope pins when it is built is kept with
+it: its policy, its caveat verdicts (taken from the stored caveat payloads under
+that policy revision, with no request context), and inside an evaluator scope the
+constant-arm witnesses decided then. A queryset read again in
 another evaluator scope, or outside one, keeps them, as an eager `scoped()`
 queryset does; they can leave rows out, never add one, until the scope is built
 again. A pin wins over ambient state at every evaluation, as at
@@ -2921,14 +2952,15 @@ or a module-level entry it derives querysets from is audited once per actor
 per process. A row written inside a transaction counts
 only if that transaction commits: after a rollback, of a savepoint too, the
 next use writes it again. A queryset that `scoped()` pins inside a `sudo()`
-block, and a queryset embedded inside one in an annotation (`Subquery`,
-`Exists`) or as a lookup's value (`pk__in=`), keep the block's bypass after it
-closes: each is an entry of its own, audited when it takes effect outside a
-block (the embedded one with each statement that executes it). Django resolves
-a condition (`filter(Exists(...))`) again when its statement compiles, so a
-condition built inside a block is scoped, and audited, by the decision taken
-there. A queryset evaluated inside a block and embedded after it has its scope
-decided where it is embedded, as a lookup or a write on it is. When a bypass queryset is embedded in another
+block keeps the block's bypass after it closes: it is an entry of its own,
+audited when it takes effect outside a block (embedded, with each statement that
+executes it). A queryset embedded inside a block that pins nothing of its own, in
+any position, is decided by each statement that compiles it: inside the block,
+the block's bypass, covered by the block's row; outside it, the actor in force
+there, with no bypass to audit (without strict mode and with no actor, every row,
+unaudited as any read with no actor is). A queryset evaluated inside a block and embedded
+after it has its scope decided where it is embedded, as a lookup or a write on it
+is. When a bypass queryset is embedded in another
 statement, each execution audits every distinct `(entry, reason)` pair it
 renders, even if that pair appears in several filters, annotations or `Exists`
 expressions. A count followed by a list read audits the embedded entry twice.
@@ -3221,7 +3253,10 @@ query's scope decision, not the outer one: a bypass (`sudo` /
 for its own projection when it is resolved, so
 `Subquery(Model.objects.with_actor(a).values("gated"))` still raises while an
 `Exists` over a bypass queryset that filters on a gated column hands the outer
-row only its boolean.
+row only its boolean. It answers once for each decision: an embedded queryset
+decided again by a later statement, for another actor, is checked again for
+that actor where it is decided (when the statement compiles), and the check of
+the earlier decision is not made for the later one.
 The `NOT EXISTS` Django builds for an `exclude()` across a to-many relation
 (`Query.split_exclude`) is not an embedded queryset: it is a correlated piece
 of the outer statement, like the join a `filter()` across the same relation
@@ -3255,13 +3290,18 @@ ordering. `order_by()` with no arguments clears a default ordering.
 A queryset used as a subquery (`Subquery()`, `Exists()`, a lookup such as
 `pk__in=queryset`) is checked for what it selects, filters, groups and orders
 on, as resolved into the enclosing statement, with the actor its scope is
-decided for where it is embedded: the pinned actor of an eager `scoped()`
-queryset, else the one in force there. A column of the
+decided for by the statement that compiles it: its pinned actor (`scoped()`,
+`with_actor()`), else the one in force there. A column of the
 enclosing row it refers to (`OuterRef`) is the enclosing query's to answer
-for. It is checked once: when the statement that holds it is checked, sharing
-that check's schema read, if it sits in that statement's clauses or
-selection; else when it is compiled (an aggregate's expression, an update's
-value, a statement of a model that is not a rebac resource). Its ordering
+for. It is checked once for each decision: when the statement that holds it is
+checked, sharing that check's schema read, if it sits in that statement's
+clauses or selection and that statement decides it as it was decided; else when
+it is compiled (an aggregate's expression, an update's value, a statement of a
+model that is not a rebac resource, one decided again by that statement). A check
+left to the compile is made where the subquery is rendered: one that Django leaves
+out of the statement it sends (a count of a grouped projection drops an annotation
+nothing groups on) reads nothing and is not made, where the same queryset built
+fresh under that actor is checked, and refused, before it compiles. Its ordering
 counts as Django compiles it: an `__in` lookup clears the ordering of an
 unsliced query, and `Exists()` clears it always.
 
@@ -4190,7 +4230,14 @@ currently targets Django 6.1.x and Python 3.14+. Package dependencies constrain
 Django and its development stubs to the audited 6.1 line; support for newer
 Django feature releases requires verification of the ORM hooks this package uses
 (the private queryset, manager, validation and admin hooks it touches are
-listed in the 0.30.0 changelog entry). Database floors follow Django 6.1:
+listed in the 0.30.0 changelog entry), and of the query resolution an embedded
+queryset decided again relies on, pinned by `tests/test_django_query_resolution.py`:
+a resolved `Query` resolved again into its statement gives the same statement
+(its outer references are already columns of that statement, and `bump_prefix`
+returns early when the prefixes differ); `WhereNode.resolve_expression` clones the
+nodes but assigns the sides of the lookups they share; `Query.resolve_expression`
+keeps those sides and discards the node it resolved; and `Lookup.process_lhs`
+resolves a condition again where its statement compiles. Database floors follow Django 6.1:
 PostgreSQL 15, MySQL 8.4, SQLite 3.37.
 
 Public API (`rebac.*` direct imports + the schema language) is intended to be
