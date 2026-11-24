@@ -5,6 +5,19 @@ pre-1.0; breaking changes within a minor version are explicitly called out.
 
 ## [Unreleased]
 
+## [0.38.0] — 2026-11-24
+
+A security release: upgrade. It fixes ways a queryset could read with a permission scope other than the one in
+force, or with none: one queryset object evaluated under two decisions, or again after its scope raised; a
+queryset embedded in another statement, built under one actor and read under another (the rows it selects, its
+field-read check, and the rows a write selects by it); a prefetched related manager streamed with `iterator()`;
+and rows held, or read again, without their redaction and guards. Each entry under Fixed names the releases it
+reaches and what exposure needs. It also fixes the grant profile's read past its bound and six defects of the
+experimental structural prefetch, one of them shared with the bounded walk. The fixes change behaviour in seven
+places, listed under Upgrade; one reverses what 0.31.5 specified for a queryset embedded inside a `sudo()` block,
+which is why this is a minor version. The statements the policy benchmark sends (414, over a real policy) are
+byte for byte those of 0.37.0.
+
 ### Fixed
 
 - **An actor's grant profile is read past its bound under a policy with no stored relation** (0.35.2 and later).
@@ -135,9 +148,10 @@ pre-1.0; breaking changes within a minor version are explicitly called out.
   does still; without strict mode its embedded queryset was decided as "no actor, every row" and stayed so for
   every reader. Exposure needs an enclosing queryset built under one actor and read, or cloned and read, under
   another: one kept across requests or across the actors of one process (cached on a module or a class after it
-  was built under an actor), or, without strict mode, the class-level queryset above. An embedded queryset that pins nothing of
-  its own (no `scoped()`, `with_actor()` or `sudo()` on it) is now decided by each statement that compiles it, in
-  every position: compiled as it is for the same decision, and resolved again into the statement for another, as
+  was built under an actor), or, without strict mode, the class-level queryset above. An embedded queryset that
+  pins nothing of its own (no `scoped()`, `with_actor()` or `sudo()` on it) is now decided by each statement that
+  compiles it, in every position: compiled as it is for the same decision, and resolved again into the statement
+  for another, as
   Django resolves a condition again when it compiles, from conditions of its own, so that compiling leaves the
   statement it is embedded in as it was. The field-read check of what it filters, orders or selects on is made
   again for each other decision, with the actor decided then, and is not made for a bypass: the outsider's
@@ -145,8 +159,8 @@ pre-1.0; breaking changes within a minor version are explicitly called out.
   scope. `iterator()` and `aiterator()` decide everything up to their first rows (the scope, the guards, the
   embedded querysets, the statement) in the context they were called in, without an evaluator scope that has
   closed since, and keep that context no longer. A queryset built inside a `sudo()` block and embedded there pins
-  nothing, so outside the block it is decided for the actor in force; with `scoped()` inside the block, or its own `sudo()`, it keeps the bypass, and
-  each statement that runs it outside a block audits it, as before.
+  nothing, so outside the block it is decided for the actor in force; with `scoped()` inside the block, or its own
+  `sudo()`, it keeps the bypass, and each statement that runs it outside a block audits it, as before.
 - **A queryset holds rows only once they are safe to hand out.** The result cache was filled before the
   prefetches, field redaction and the `rebac_select_related()` guards ran on it. When one of them raised (a
   related row the guard refuses, a prefetch or redaction statement that fails or is cancelled), the exception
@@ -211,8 +225,9 @@ pre-1.0; breaking changes within a minor version are explicitly called out.
   `MissingActorError` when that statement is compiled with no actor and no `sudo()` block in force, as reading it
   does: a queryset evaluated inside `actor_context()` and embedded after the context closed, and an enclosing
   queryset built under an actor (its own `sudo()`, say) and read after it, printed (`str(qs.query)`) or explained
-  (`explain()`). It read, printed and explained with the closed context's scope before. Pin the actor with `with_actor()`, or make the embedded queryset eager
-  with `scoped()` inside the context. `iterator()` and `aiterator()` compile when their first rows are read, in
+  (`explain()`). It read, printed and explained with the closed context's scope before. Pin the actor with
+  `with_actor()`, or make the embedded queryset eager with `scoped()` inside the context. `iterator()` and
+  `aiterator()` compile when their first rows are read, in
   the context they were called in: a `PermissionDenied` of the field-read check on an embedded queryset decided
   again there is raised by that first read rather than by the call.
 - **A queryset embedded inside a `sudo()` block no longer carries the block's bypass outside it.** Embedded in an
