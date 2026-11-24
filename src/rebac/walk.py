@@ -43,9 +43,11 @@ the data. The walk is several: each lookup reads the state committed when it
 runs. Under READ COMMITTED a grant, a foreign key or a blocking row that
 changes between two lookups can give an answer that held in neither state (a
 row read under a parent it has since left; an exclusion read after it was
-lifted and the grant withdrawn). Inside one snapshot the walk is exact: a
-transaction on a connection configured for repeatable read
-(``snapshot.isolated``), or any transaction on SQLite. Whether a bounded
+lifted and the grant withdrawn). Inside one snapshot (a transaction on a
+connection configured for repeatable read, ``snapshot.isolated``, or any
+transaction on SQLite) every lookup reads the same data, but each at its own
+instant, so a deadline (a row's expiry, a caveat that reads the time, an
+override's) can fall between two of them. Whether a bounded
 decision may be assembled from adjacent states is the application's decision,
 as it is for a prefetch; that is why the setting is off by default. A policy
 revision published during a walk is handled: after an exclusion the fence is

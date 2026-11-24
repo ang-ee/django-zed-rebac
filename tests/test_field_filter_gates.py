@@ -22,6 +22,7 @@ from django.db.models.functions import Abs, Lower
 from django.test import override_settings
 
 from rebac import (
+    MissingActorError,
     ObjectRef,
     PermissionDenied,
     RelationshipTuple,
@@ -444,14 +445,21 @@ def test_a_scoped_queryset_keeps_the_actor_it_was_scoped_with(people, rows):
     with actor_context(to_subject_ref(people["alice"])):
         evaluated = Post.objects.filter(body="")
         assert len(list(evaluated)) == 2
-        refused = Post.objects.filter(title__startswith="secret")
+        eager = Post.objects.filter(body="").scoped()
+        refused = Post.objects.filter(title__startswith="secret").scoped()
         with pytest.raises(PermissionDenied):
             list(refused)
-    # Embedded after the context closed: alice's scope and alice's gates.
     bypass = Post.objects.sudo(reason="test.outer")
-    assert bypass.filter(Exists(evaluated)).count() == 2
+    # Embedded after the context closed: scoped() pinned alice, so her scope and her gates.
+    assert bypass.filter(Exists(eager)).count() == 2
     with pytest.raises(PermissionDenied):
         bypass.filter(Exists(refused)).count()
+    # An evaluation pins nothing: embedded with no actor in force, it is refused, as
+    # reading it is.
+    with pytest.raises(MissingActorError):
+        list(evaluated)
+    with pytest.raises(MissingActorError):
+        bypass.filter(Exists(evaluated)).count()
 
 
 @override_settings(REBAC_FIELD_READ_MODE="redact")
@@ -574,3 +582,91 @@ def test_a_subquery_is_checked_under_any_outer_statement(people, rows, outer):
         run()
     with sudo(reason="test.verify"):
         assert not Post.objects.filter(body="found").exists()
+
+
+def _secret_inner():
+    return Post.objects.filter(pk=OuterRef("pk"), title__startswith="secret")
+
+
+EMBEDDED_POSITIONS = {
+    "a condition": lambda outer: outer.filter(Exists(_secret_inner())),
+    "an annotation": lambda outer: outer.annotate(v=Exists(_secret_inner())),
+    "the right of In": lambda outer: outer.filter(
+        pk__in=Subquery(Post.objects.filter(title__startswith="secret").values("pk"))
+    ),
+}
+
+
+@override_settings(REBAC_FIELD_READ_MODE="redact")
+@pytest.mark.parametrize("_schema", ["denormalized", "registry"], indirect=True)
+@pytest.mark.parametrize("outer", ["decided by the actor", "its own bypass"])
+@pytest.mark.parametrize("position", list(EMBEDDED_POSITIONS))
+def test_an_embedded_queryset_is_checked_for_each_actor_it_is_decided_for(
+    people, rows, position, outer
+):
+    """carol reads every title, alice only her own: built and read under carol, then
+    read under alice, the embedded queryset that filters on titles is refused, as
+    built under alice it is. Its check under carol answered for carol only; a
+    condition was decided again for alice and kept carol's check."""
+    build = EMBEDDED_POSITIONS[position]
+
+    def outer_queryset():
+        if outer == "its own bypass":
+            return Post.objects.sudo(reason="test.outer")
+        return Post.objects.all()
+
+    with actor_context(to_subject_ref(people["carol"])):
+        rows_ = build(outer_queryset())
+        list(rows_)
+    with actor_context(to_subject_ref(people["alice"])):
+        with pytest.raises(PermissionDenied, match="read__title"):
+            list(build(outer_queryset()))
+        with pytest.raises(PermissionDenied, match="read__title"):
+            list(rows_.all())
+
+
+@override_settings(REBAC_FIELD_READ_MODE="redact")
+@pytest.mark.parametrize("_schema", ["denormalized", "registry"], indirect=True)
+@pytest.mark.parametrize("read", ["by carol", "in a sudo block"])
+@pytest.mark.parametrize("position", list(EMBEDDED_POSITIONS))
+def test_an_embedded_queryset_is_not_refused_for_an_actor_it_is_no_longer_decided_for(
+    people, rows, position, read
+):
+    """Built under alice, who may not filter on titles, and read by carol, who may, or
+    with a bypass: the check alice's decision would make is not made."""
+    with actor_context(to_subject_ref(people["alice"])):
+        rows_ = EMBEDDED_POSITIONS[position](Post.objects.sudo(reason="test.outer"))
+    context = (
+        actor_context(to_subject_ref(people["carol"]))
+        if read == "by carol"
+        else sudo(reason="test.read")
+    )
+    with context:
+        list(rows_.all())
+
+
+@override_settings(REBAC_FIELD_READ_MODE="redact")
+def test_a_check_waiting_for_the_compile_is_made_where_the_subquery_is_rendered(people, rows):
+    """A field check the statement could not make before it compiled, because the
+    embedded queryset is decided again there for another actor, is made where it is
+    rendered. A count of a grouped projection leaves the annotation out (Django counts
+    the groups' rows without it): nothing gated is read and nothing is refused. Built
+    fresh under alice, the same count is refused before it compiles, as before."""
+
+    def counted():
+        return (
+            Post.objects.sudo(reason="test.outer")
+            .annotate(flag=Exists(_secret_inner()))
+            .values("flag")
+            .order_by()
+        )
+
+    with actor_context(to_subject_ref(people["carol"])):
+        reused = counted()
+        assert reused.count() == 2
+    with actor_context(to_subject_ref(people["alice"])):
+        assert reused.count() == 2
+        with pytest.raises(PermissionDenied, match="read__title"):
+            counted().count()
+        with pytest.raises(PermissionDenied, match="read__title"):
+            list(reused.all())

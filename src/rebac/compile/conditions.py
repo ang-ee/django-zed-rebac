@@ -17,7 +17,15 @@ from django.db.models import Q
 
 from rebac.compile import formulas as conditions
 from rebac.models import active_relationship_model
-from rebac.schema.ast import PermArrow, PermBinOp, PermExpr, PermRef, Relation, Schema
+from rebac.schema.ast import (
+    PermArrow,
+    PermBinOp,
+    PermExpr,
+    PermRef,
+    Relation,
+    Schema,
+    is_builtin_reference,
+)
 
 type Key = tuple[str, str]
 
@@ -35,7 +43,8 @@ def reachable_relations(schema: Schema, key: Key) -> frozenset[Key]:
 
     def expression(type_: str, expr: PermExpr) -> None:
         if isinstance(expr, PermRef):
-            node((type_, expr.name))
+            if not is_builtin_reference(expr.name):
+                node((type_, expr.name))
         elif isinstance(expr, PermArrow):
             node((type_, expr.via))
             definition = schema.get_definition(type_)

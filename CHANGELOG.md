@@ -5,6 +5,263 @@ pre-1.0; breaking changes within a minor version are explicitly called out.
 
 ## [Unreleased]
 
+## [0.38.0] — 2026-11-24
+
+A security release: upgrade. It fixes ways a queryset could read with a permission scope other than the one in
+force, or with none: one queryset object evaluated under two decisions, or again after its scope raised; a
+queryset embedded in another statement, built under one actor and read under another (the rows it selects, its
+field-read check, and the rows a write selects by it); a prefetched related manager streamed with `iterator()`;
+and rows held, or read again, without their redaction and guards. Each entry under Fixed names the releases it
+reaches and what exposure needs. It also fixes the grant profile's read past its bound and six defects of the
+experimental structural prefetch, one of them shared with the bounded walk. The fixes change behaviour in seven
+places, listed under Upgrade; one reverses what 0.31.5 specified for a queryset embedded inside a `sudo()` block,
+which is why this is a minor version. The statements the policy benchmark sends (414, over a real policy) are
+byte for byte those of 0.37.0.
+
+### Fixed
+
+- **An actor's grant profile is read past its bound under a policy with no stored relation** (0.35.2 and later).
+  When more than 1,000 relationship rows name an actor (left by an earlier policy, or of relations no longer
+  declared) and no relation of the policy can hold stored rows (every one is field- or constant-backed), a read
+  inside an evaluator scope raised `ValueError: zip() argument 2 is longer than argument 1`: the statement that
+  probes each stored relation name had no name to probe and selected the whole generation row. There is nothing
+  to probe then, and the profile is the keys the first statement read; no second statement is sent.
+- **Structural prefetch no longer delivers a child past the depth limit** (0.36.0 and later,
+  `REBAC_STRUCTURAL_PREFETCH`). A recursion is read to `REBAC_DEPTH_LIMIT` hops from where its component is entered.
+  A child whose permission, or a permission its union opens on the way to the arm, is in the recursive component
+  of the arm's target (the subfolders of a folder whose `read` is `parent->read + viewer`, or two types whose
+  permissions recurse through the delivered key) reads the parent's permission one hop into that component, with
+  one hop less of the limit than the parent was admitted with. The children of a parent admitted at the limit were
+  delivered though the scoped read withheld them. Such an edge now keeps the children's statement. An arrow into a
+  recursion from another type (a document's `folder->read`) enters it afresh and is delivered as before.
+- **Structural prefetch delivers children only on the database their parents were read from** (0.36.0 and later).
+  The record of admission kept primary keys alone, so parents read from one database delivered the children of a
+  prefetch read from another, where the children's own statement admitted none. Admissions are kept per database.
+- **A permission declared under a built-in name is not a union arm** (structural prefetch and the bounded walk,
+  0.36.0 and later). Inside an expression `authenticated` and `anonymous` are the actor's state, whatever the
+  definition declares under those names, but both mechanisms opened a permission declared as `anonymous` (or
+  `authenticated`) into its expression: structural prefetch delivered children through an arm the compiled
+  statement does not read, and the walk in `"prove"` mode held ids it denies. Both now resolve names through the
+  functions the compiler uses, `rebac.schema.ast.is_builtin_reference` and `member`, and so does the reachability
+  the compiler's program and its caveat verdicts follow, which still counted the declared permission's relations.
+  For a policy that declares a permission under a built-in name and names the built-in in another permission's
+  expression, the statements of reads that reach the built-in change, and no answer does: the compiled expression
+  read the built-in there, never the declared permission. They no longer read the caveat verdicts of a relation
+  reached only through the declared permission (one statement fewer per such read), so the caveat keys those
+  verdicts named leave the scope, point-check and `held_many` statements, and a point check that took a lower and
+  an upper bound takes one statement; nor do they decide an inherited constant-arm witness reached only through it
+  (one statement fewer), so the scope selects that parent's ids as an id set of its own. No statement is added.
+  Measured on four such policies in both storage layouts: 7,190 operations, the same answers, 13,176 statements
+  where there were 15,572. Three policies that declare no permission under a built-in name (one names both
+  built-ins) compile the same statements.
+- **Structural prefetch delivers nothing while any override is stored, as specified** (0.36.0 and later). It looked
+  only for the arms and sites that permission overrides tag, so a recaveat override, which tags none, left
+  deliveries on.
+- **A queryset whose scope raised read unscoped rows when it was evaluated again.** Every published release
+  (0.1.4 and later; 0.1.3, where the code first appears, was tagged and not published, and the package index lists
+  no older release). A queryset recorded its permission scope as applied before building it. When building it
+  raised, the exception reached the caller, but the same queryset object, evaluated again, ran its own conditions
+  with no permission condition: every row they select, whoever the actor. Building the scope reads the policy
+  (under a stored policy, its published revision and rows), compiles it, and inside an evaluator scope reads the
+  actor's grant profile, so what raised there includes a `SchemaError` (a policy the compiler refuses,
+  `rebac.E016`, or a stored policy that no longer loads), a database error in one of those statements (a cancelled
+  or timed-out statement, a lost connection), the profile's `ValueError` of 0.35.2 to 0.37.0 (above), and any other
+  exception or an interrupt. The paths that reuse the object: iteration and `list()`, `len()`, `bool()`, `count()`,
+  `exists()`, and `async for`, `acount()` and `aexists()`, which run them (0.1.4); `iterator()` (0.7.0);
+  `aggregate()`, `aiterator()` and `aaggregate()` (0.11.1). The same object embedded in another statement as
+  `Subquery(qs)`, `Exists(qs)` or a lookup on its query (`filter(x__in=qs.query)`) carried the record and ran
+  unscoped too (0.22.0 and later, since embedded querysets are scoped), and so did `copy.deepcopy(qs)`. Another
+  thread evaluating the same object while the scope was built found it recorded and read every row. A set
+  combination ran with its operands scoped before the failure and the others unscoped, and with
+  `REBAC_STRUCTURAL_PREFETCH` (0.36.0 and later) the unscoped rows admitted their children, delivered with no
+  permission statement. Field read gates still applied to the rows. Exposure needed code that catches the
+  exception and evaluates the same object again: Django's views, templates, paginator (which counts the queryset,
+  then slices a clone), DRF and `get_object_or_404` clone the queryset or let the exception end the request,
+  where a retry wrapper around a function given the queryset, an exception handler that renders it, or an
+  interactive shell reuses it. A refused policy and the profile's `ValueError` raise at every first evaluation, so
+  such code met them every time; a cancelled statement, when it struck. Not affected: a clone (`filter()`,
+  `all()`, `get()`, `first()`, `values()`, `in_bulk()`, slicing, a lookup on the queryset itself such as
+  `filter(x__in=qs)`, a prefetch's queryset), which builds its own scope; writes (`update()`, `delete()`,
+  `bulk_update()`), which select their rows by a scope of their own; `MissingActorError`, raised before a scope is
+  recorded, and the field guards' `PermissionDenied`, raised after it is built. The scope is now built on a copy of
+  the query, which replaces the queryset's own once complete and is recorded only then: a queryset whose scope
+  raised keeps no part of it, and its next evaluation, embedding or copy builds the scope again, so it raises
+  again or reads what the scope admits. Two threads evaluating one object each run the scope they decided.
+- **A queryset's scope is decided where it is evaluated, at every evaluation.** Every published release (0.1.4 and
+  later). A queryset kept the scope its first evaluation built and never compared it with the context of a later
+  one. An evaluation that leaves no result cache (`count()`, `exists()`, `aggregate()`, `iterator()` and the async
+  forms), and a list, `len()` or `bool()` after one of them, read with the first evaluation's scope: after a count
+  inside a `sudo()` or `system_context()` block, every row; after one actor's count or existence test, that
+  actor's rows, for the next; after a count with `REBAC_ENABLED = False`, every row once it is `True`. `iterator()`
+  and `aiterator()` read with the scope of the evaluation that filled the result cache. The paths: iteration,
+  `len()`, `bool()`, `count()`, `exists()`, `async for`, `acount()` and `aexists()` (0.1.4), `iterator()` (0.7.0),
+  `aggregate()`, `aiterator()` and `aaggregate()` (0.11.1). Exposure needs one queryset object evaluated under two
+  decisions: a total counted, or an existence tested, inside a bypass block and the same object read after it; or
+  one object kept across requests or tasks (a module or class attribute evaluated directly, where Django's generic
+  views and DRF evaluate `.all()` of it), so that one actor's count decides the next actor's read. A pinned actor or
+  bypass (`with_actor()`, the queryset's own `sudo()`) was never affected: it wins over the context at every
+  evaluation, as before. Each evaluation now decides again, by the same function (`effective_actor()`) with the
+  database it reads, and builds the scope again where the decision differs, at the cost of building a clone's
+  scope; the same decision costs one comparison and no statement. A queryset routed to another database between
+  two evaluations is built for that database, where it ran the first database's statement before. Unchanged: a
+  scope keeps what it pinned when it was built (its policy; its caveat verdicts, taken from the stored caveat
+  payloads under that policy revision, with no request context; inside an evaluator scope, the constant-arm
+  witnesses decided then) when it is read again in another evaluator scope; rows a queryset holds are
+  handed out as Django hands them out, whatever the context; an eager `scoped()` queryset keeps the actor it
+  pinned; a scope built before a policy revision was published stays closed by its revision fence until it is
+  built again.
+- **An embedded queryset is decided where it is embedded** (0.22.0 and later, since embedded querysets are scoped;
+  verified on 0.34.0 and 0.37.0).
+  The same object embedded in another statement as `Subquery(qs)`, `Exists(qs)` or a lookup on its query
+  (`filter(x__in=qs.query)`), or deep-copied and then embedded, kept the decision of its last evaluation, where
+  every direct read, and a lookup on the queryset itself (`filter(x__in=qs)`), decided again: one object embedded
+  two ways gave two answers. After the member's `count()`, the outsider's `filter(thread__in=Subquery(ids))` read
+  the member's threads; after an administrator's `iterator()`, `Exists(threads)` was true for everyone; in strict
+  mode, after the actor's context had closed, the embedding read with that actor's scope where reading the
+  queryset raised `MissingActorError`. Exposure needs one queryset object read under one actor and embedded under
+  another or with none, the shared-object case above. The queryset's query also kept its decision in a record
+  beside it, published after it: another thread evaluating the same object in between could leave one
+  evaluation's query under another's record, and an embedding read the record. Embedding now decides by the same
+  rule as an evaluation, from the decision the query itself carries, published with it at once. An eager
+  `scoped()` queryset keeps the actor it pinned wherever it is embedded.
+
+  The scope an embedded queryset was given where the enclosing queryset was built also stayed with the enclosing
+  queryset and its clones, whether the enclosing queryset's own decision changed with the actor or not (it pinned
+  its own `sudo()` or `with_actor()`), in every position of the statement but `order_by()`: a `filter()` or
+  `exclude()` condition, an annotation (`annotate(v=Subquery(...))`), an `alias()` and a filter on it, an
+  aggregate's `filter=`, a `Case`/`When` condition, a `Window`, a `FilteredRelation` condition, an operand of a set
+  combination, `values()` over an annotation, and the right of an `In` lookup (`filter(x__in=Subquery(qs))`,
+  `filter(x__in=qs)`); 0.22.0 and later (verified on 0.34.0 and 0.37.0). Built under the member and read under the
+  outsider, they read with the member's scope. The kept decision also carried the member's field-read check
+  (`REBAC_FIELD_READ_MODE`), 0.27.0 and later (the release that first checked an embedded queryset's fields;
+  verified on 0.34.0 and 0.37.0): a condition on a gated field,
+  `Message.objects.sudo(...).filter(Exists(Thread.objects.filter(pk=OuterRef("thread"), label="second")))`, built
+  under the member, who may read `label`, and read under the outsider, who may not, was not refused: it answered
+  the outsider `[2]` and a count of 1 (and so did `exists()`, `aggregate()`, `iterator()`, `values_list()`,
+  `explain()`, `str(query)` and a distinct count), and the outsider learned which thread is labelled "second".
+  Writes were selected by the kept decision too: an `update()`, `delete()` or `bulk_update()` whose conditions
+  embed such a queryset (directly, or through a filter on an annotation), built under the member and run under the
+  outsider, wrote or deleted the rows the member's scope selected (thread 2 above). The writer's own write or
+  delete permission still applied, but which rows were written depended on data only the member could read. A
+  class-level queryset built at import with nothing in force
+  (`queryset = Thread.objects.annotate(v=Subquery(...))`) raised `MissingActorError` there in strict mode, and
+  does still; without strict mode its embedded queryset was decided as "no actor, every row" and stayed so for
+  every reader. Exposure needs an enclosing queryset built under one actor and read, or cloned and read, under
+  another: one kept across requests or across the actors of one process (cached on a module or a class after it
+  was built under an actor), or, without strict mode, the class-level queryset above. An embedded queryset that
+  pins nothing of its own (no `scoped()`, `with_actor()` or `sudo()` on it) is now decided by each statement that
+  compiles it, in every position: compiled as it is for the same decision, and resolved again into the statement
+  for another, as
+  Django resolves a condition again when it compiles, from conditions of its own, so that compiling leaves the
+  statement it is embedded in as it was. The field-read check of what it filters, orders or selects on is made
+  again for each other decision, with the actor decided then, and is not made for a bypass: the outsider's
+  statement above is refused, as the one built under the outsider is, and the writes above select by the writer's
+  scope. `iterator()` and `aiterator()` decide everything up to their first rows (the scope, the guards, the
+  embedded querysets, the statement) in the context they were called in, without an evaluator scope that has
+  closed since, and keep that context no longer. A queryset built inside a `sudo()` block and embedded there pins
+  nothing, so outside the block it is decided for the actor in force; with `scoped()` inside the block, or its own
+  `sudo()`, it keeps the bypass, and each statement that runs it outside a block audits it, as before.
+- **A queryset holds rows only once they are safe to hand out.** The result cache was filled before the
+  prefetches, field redaction and the `rebac_select_related()` guards ran on it. When one of them raised (a
+  related row the guard refuses, a prefetch or redaction statement that fails or is cancelled), the exception
+  reached the caller and the queryset kept the rows: iteration, `len()` and `bool()` ran the work again, but
+  indexing, slicing, `first()` and `last()` of an ordered queryset, `repr()`, `count()`, `exists()` and a
+  paginator's page read them as they stood, with unredacted gated fields (0.7.0 and later) and a related row the
+  guard had refused (0.8.0 and later). And from 0.23.0 the record that the held rows had been redacted outlived
+  them: after `update()` or `delete()` (which drop the rows held, as Django's do) or `copy.deepcopy()` (which
+  copies none), the next evaluation read rows again and neither redacted nor guarded them, with no failure
+  needed. Exposure: the first needs code that catches the exception and goes on with the same queryset, or an
+  error report that prints the failing frame's local variables (Django's technical 500 page under `DEBUG`, and the
+  HTML report `AdminEmailHandler(include_html=True)` attaches, show each with `repr()`, so a held row shows what
+  its `__str__` shows); the second, a queryset read again after a queryset `update()` or `delete()` through it, or
+  a deep copy of an evaluated queryset. Rows are now read, stamped, prefetched, redacted and guarded aside, and
+  become the cache only once all of it has succeeded; rows read again are redacted and guarded as the first were.
+  Rows Django's prefetch hands a related manager, finished by the read that loaded them, are dropped when their
+  redaction for the manager's actor raises. Unchanged: `iterator()` and `aiterator()` already yielded a chunk
+  only once it was finished.
+
+- **A related manager filled by a prefetch scopes what `iterator()` reads.** `iterator()` (0.7.0 and later) and
+  `aiterator()` (0.11.1 and later) applied the scope only when the queryset held no rows. A related manager
+  Django's prefetch fills (a reverse foreign key, a many-to-many relation from either side) holds the rows the
+  prefetch read for it, scoped, and a query of its own that nothing scoped; Django's `iterator()` runs that query
+  whatever is held. So `thread.messages.all().iterator()` after `prefetch_related("messages")` or
+  `rebac_prefetch_related("messages")` returned every message of the thread, with no permission statement.
+  `aggregate()`, a clone (`filter()`, `values()`, slicing) and an embedding were scoped: they never read the cache
+  to decide. Exposure: code that streams a prefetched to-many relation with `iterator()` or `aiterator()` (an
+  export, a streaming response over a row's children). Whether a scope is applied is now read from the query
+  alone, so every statement is decided where it runs. The manager decides as a related manager's read does: by
+  the actor it took from its row when the prefetch built it, else the ambient actor or `sudo()` block, and with
+  neither raises `MissingActorError` in strict mode. Unchanged: the rows it holds are handed out as held rows are,
+  and `count()` and `exists()` answer from them.
+- **A structural delivery lasts the one evaluation it was decided for** (`REBAC_STRUCTURAL_PREFETCH`, experimental
+  and off by default; 0.36.0 and later). A child query bound to parents the running prefetch had admitted carried
+  no permission statement wherever its scope was applied inside the prefetch (a list, a count, an existence test,
+  an aggregate, `iterator()`, an eager `scoped()`), and the queryset kept that decision. So `iterator()`,
+  `aggregate()` or an embedding of the same queryset after its delivered evaluation, a count or `scoped()`
+  queryset decided inside the prefetch and read after it, and the same queryset evaluated again after its
+  delivered evaluation raised, read the parents' children with no permission statement, though the actor may have
+  lost the parent since. Exposure needs a queryset evaluated or scoped while a prefetch delivers children and kept
+  beyond it; the querysets Django's prefetch builds are its own, so it needs code that runs inside the prefetch
+  and keeps what it evaluated. Only the evaluation that reads the child rows inside the running prefetch is
+  delivered now, and the queryset keeps no delivered query: whatever it sends next is decided again. What a
+  prefetch delivers is unchanged.
+- **The record of a structural delivery serves only the prefetch running it, where it runs**
+  (`REBAC_STRUCTURAL_PREFETCH`, experimental and off by default; 0.36.0 and later). The parents a running prefetch
+  admitted were recorded in a context variable, with no end and no owner, so a context copied while the prefetch
+  ran kept the record: code run in that context afterwards, or meanwhile in another thread or asyncio task, had a
+  child queryset bound to those parents delivered with no permission statement, though the actor may have lost
+  them, and admitted its rows in turn (a part delivered under a message delivered that way). Carriers of a copied
+  context: a signal receiver that calls `contextvars.copy_context()` (to hand work to a pool, say), an asyncio task
+  created during the evaluation, a thread that inherits its creator's context (the default on a free-threaded
+  build). The record now serves only the thread, and the asyncio task in it, that opened it, and is closed when
+  the prefetch that opened it ends: anywhere else, and after, nothing is delivered or admitted, and the read keeps
+  its statement. An evaluation through Django's async ORM (`async for`, `sync_to_async`) still delivers: the whole
+  evaluation runs in one worker thread.
+
+### Upgrade
+
+- **Embedding a queryset with nothing in force raises in strict mode.** A queryset that pins nothing of its own,
+  embedded anywhere in a statement (`Subquery()`, `Exists()`, an annotation, a lookup on it or its query), raises
+  `MissingActorError` when that statement is compiled with no actor and no `sudo()` block in force, as reading it
+  does: a queryset evaluated inside `actor_context()` and embedded after the context closed, and an enclosing
+  queryset built under an actor (its own `sudo()`, say) and read after it, printed (`str(qs.query)`) or explained
+  (`explain()`). It read, printed and explained with the closed context's scope before. Pin the actor with
+  `with_actor()`, or make the embedded queryset eager with `scoped()` inside the context. `iterator()` and
+  `aiterator()` compile when their first rows are read, in
+  the context they were called in: a `PermissionDenied` of the field-read check on an embedded queryset decided
+  again there is raised by that first read rather than by the call.
+- **A queryset embedded inside a `sudo()` block no longer carries the block's bypass outside it.** Embedded in an
+  annotation or as a lookup's value inside the block and run after it, it is decided for the actor in force there
+  (without strict mode and with no actor, every row, with no audit row, as any read with no actor); it read every
+  row before, audited as a bypass. Make it eager with `scoped()` inside the block, or give it its own
+  `sudo(reason=...)`, to keep the bypass outside the block.
+- **A prefetched related manager's `iterator()`, `aiterator()` and `aggregate()` need an actor.** They are scoped
+  now (above): with no actor taken from the row and none in force, strict mode raises `MissingActorError`, as
+  iterating the manager already did. They read every row of the relation before.
+- **Non-strict deployments (`REBAC_STRICT_MODE = False`) can read more rows from a reused queryset.** A queryset
+  evaluated under an actor and read again, or embedded, with no actor in force now reads what non-strict mode
+  specifies for no actor, every row its conditions select; it read with the earlier actor's scope before. Only a
+  queryset object reused across contexts is concerned: clone it per context, or pin its actor.
+- **Non-strict deployments: a class-level queryset with an embedded queryset reads per reader.** Built at import
+  with nothing in force (`queryset = Thread.objects.annotate(v=Subquery(Message.objects.filter(...)))`), its
+  embedded queryset was decided as "no actor, every row" and every reader got the unscoped value. Each reader's
+  statement now decides it for that reader: an actor reads the values it may read, and a read with no actor reads
+  every row, as before.
+- **A read router is asked once for an evaluation, and once for each queryset embedded in its statement**, where
+  it was asked three or four times for the evaluation and once or twice for each embedded queryset: the
+  evaluation's call comes after the bypass audit row is written, as before, and its statement runs on the
+  database the scope was built for; an embedded queryset's call comes where the statement compiles, and once more
+  where the embedded queryset is built, as before. A router whose answer changes between calls no longer splits one
+  evaluation between databases; one that alternates between evaluations makes each switch build the scope again,
+  and inside an evaluator scope that build reads the other database's grant profile, one statement more per
+  switch.
+- **The bypass audit rows of an `iterator()` or `aiterator()` read carry the actor of the context it was called
+  in**, when its rows are consumed in another: the rows of a `scoped()` or `sudo()` queryset embedded in it (both
+  methods), and `aiterator()`'s own. They carried the consumer's actor before (`iterator()` wrote its own at the
+  call already). `aiterator()` now writes its own row from the worker thread, where the mark of an entry audited
+  for the actor and evaluator scope is kept, so `aiterator()`, `acount()` and `aiterator()` again under one actor
+  and evaluator scope write one row, where 0.37.0 wrote two.
+
 ## [0.37.0] — 2026-11-19
 
 PostgreSQL statements change for an actor whose profile folds more than one constant arm of a permission: they

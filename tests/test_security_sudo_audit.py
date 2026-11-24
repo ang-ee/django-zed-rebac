@@ -165,6 +165,69 @@ def test_a_bypass_is_audited_once_per_actor_and_evaluator_scope(post):
     assert _bypass_rows(reason).count() == 4
 
 
+LAZY_CALLER = SubjectRef.of("auth/user", "caller")
+LAZY_CONSUMER = SubjectRef.of("auth/user", "consumer")
+
+
+def _lazy_rows(rows, read):
+    import asyncio
+
+    if read == "iterator":
+        return [row.pk for row in rows]
+
+    async def consume():
+        return [row.pk async for row in rows]
+
+    return asyncio.run(consume())
+
+
+@pytest.mark.django_db(transaction=True)
+@pytest.mark.parametrize("read", ["iterator", "aiterator"])
+@pytest.mark.parametrize("bypass", ["its own sudo()", "a sudo() block"])
+@pytest.mark.parametrize("consumed", ["where it was called", "in another context"])
+def test_a_lazy_bypass_read_writes_one_audit_row(post, read, bypass, consumed):
+    """A bypass read through iterator() or aiterator() writes one audit row with its
+    reason, also when its rows are consumed in another context than the call's."""
+    reason = f"audit.lazy.{read}.{bypass}.{consumed}"
+    with actor_context(LAZY_CALLER):
+        if bypass == "its own sudo()":
+            rows = Post.objects.sudo(reason=reason)
+            pending = getattr(rows, read)(chunk_size=1)
+        else:
+            with sudo(reason=reason):
+                pending = getattr(Post.objects.all(), read)(chunk_size=1)
+                if consumed == "where it was called":
+                    assert _lazy_rows(pending, read) == [post.pk]
+        if bypass == "its own sudo()" and consumed == "where it was called":
+            assert _lazy_rows(pending, read) == [post.pk]
+    if consumed == "in another context":
+        with actor_context(LAZY_CONSUMER):
+            assert _lazy_rows(pending, read) == [post.pk]
+    assert _bypass_rows(reason).count() == 1
+    assert _actors(reason) == ["caller"]
+
+
+@pytest.mark.django_db(transaction=True)
+def test_an_async_bypass_is_audited_once_per_actor_and_evaluator_scope(post):
+    """aiterator() writes its row from the worker thread, where the mark that the entry
+    was audited for this actor and evaluator scope is kept: aiterator(), acount() and
+    aiterator() again write one row (0.37.0 wrote two)."""
+    import asyncio
+
+    reason = "audit.async-units"
+    rows = Post.objects.sudo(reason=reason)
+
+    async def requests():
+        with actor_context(LAZY_CALLER), evaluator_scope():
+            first = [row.pk async for row in rows.aiterator(chunk_size=1)]
+            counted = await rows.acount()
+            again = [row.pk async for row in rows.aiterator(chunk_size=1)]
+        return first, counted, again
+
+    assert asyncio.run(requests()) == ([post.pk], 1, [post.pk])
+    assert _bypass_rows(reason).count() == 1
+
+
 def test_two_captures_of_one_queryset_under_sudo_blocks_are_two_bypasses(post):
     base = Post.objects.all()
     with sudo(reason="audit.capture-one"):
@@ -180,16 +243,23 @@ def test_two_captures_of_one_queryset_under_sudo_blocks_are_two_bypasses(post):
 
 
 @pytest.mark.parametrize("embed", ["subquery", "lookup"])
-def test_an_expression_built_inside_a_sudo_block_is_audited_where_it_executes_outside(post, embed):
+@pytest.mark.parametrize("pinned", [False, True], ids=["ambient", "scoped"])
+def test_an_expression_built_inside_a_sudo_block_is_decided_where_it_executes(post, embed, pinned):
+    """Built inside a block, an embedded queryset that pins nothing is decided by each
+    statement that compiles it: outside the block, the outsider's scope, and no bypass
+    to audit. One made eager with ``scoped()`` inside the block pinned the block's
+    bypass: each statement that executes it outside the block audits it."""
     from rebac import RelationshipTuple, to_object_ref
 
     outsider = SubjectRef.of("auth/user", "outsider")
     with sudo(reason="test.fixture"):
         hidden = Post.objects.create(title="hidden")
     backend().write_relationships([RelationshipTuple(to_object_ref(post), "owner", outsider)])
-    reason = f"audit.block-built.{embed}"
+    reason = f"audit.block-built.{embed}.{pinned}"
     with sudo(reason=reason):
         inner = Post.objects.filter(title="hidden").values("pk")
+        if pinned:
+            inner = inner.scoped()
         if embed == "subquery":
             outer = Post.objects.annotate(found=Subquery(inner[:1]))
             # Executed inside the block, the block's own row covers it.
@@ -199,15 +269,35 @@ def test_an_expression_built_inside_a_sudo_block_is_audited_where_it_executes_ou
             assert list(outer.all()) == [hidden]
     assert _bypass_rows(reason).count() == 1
     with actor_context(outsider):
-        # The block's bypass was pinned when the expression was built: each
-        # statement that executes it outside the block audits it.
         if embed == "subquery":
-            assert list(outer.values_list("pk", "found")) == [(post.pk, hidden.pk)]
+            found = hidden.pk if pinned else None
+            assert list(outer.values_list("pk", "found")) == [(post.pk, found)]
         else:
-            # The outer rows are the outsider's; the pinned inner bypass runs.
+            # The outer rows are the outsider's either way.
             assert list(outer.all()) == []
-        assert _bypass_rows(reason).count() == 2
-        assert _actors(reason)[-1] == "outsider"
+        assert _bypass_rows(reason).count() == (2 if pinned else 1)
+        if pinned:
+            assert _actors(reason)[-1] == "outsider"
+
+
+@pytest.mark.parametrize("embed", ["subquery", "lookup"])
+def test_an_expression_built_inside_a_sudo_block_and_run_with_no_actor_is_no_bypass(
+    post, settings, embed
+):
+    """Without strict mode a read with no actor reads every row, as the block's bypass
+    does: what differs is the decision, and the bypass it no longer audits outside."""
+    settings.REBAC_STRICT_MODE = False
+    reason = f"audit.block-built.no-actor.{embed}"
+    with sudo(reason=reason):
+        inner = Post.objects.values("pk")
+        if embed == "subquery":
+            outer = Post.objects.annotate(found=Subquery(inner[:1]))
+        else:
+            outer = Post.objects.filter(pk__in=inner)
+        assert list(outer.values_list("pk", flat=True)) == [post.pk]
+    assert _bypass_rows(reason).count() == 1
+    assert list(outer.values_list("pk", flat=True)) == [post.pk]
+    assert _bypass_rows(reason).count() == 1
 
 
 def test_a_condition_built_inside_a_sudo_block_is_scoped_where_it_executes(post):

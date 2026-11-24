@@ -64,6 +64,8 @@ from ..schema.ast import (
     PermRef,
     Relation,
     Schema,
+    is_builtin_reference,
+    member,
 )
 from ..types import SubjectRef
 from . import ctes
@@ -768,17 +770,16 @@ class Compiler:
         definition = self.schema.get_definition(key[0])
         if definition is None:
             return _FALSE
-        relation = next((r for r in definition.relations if r.name == key[1]), None)
-        if relation is not None:
+        found = member(definition, key[1])
+        if isinstance(found, Relation):
             return self._relation(
-                definition, relation, at, bound, updated, depth_possible=depth_possible
+                definition, found, at, bound, updated, depth_possible=depth_possible
             )
-        permission = self.schema.get_permission(*key)
-        if permission is None:
+        if found is None:
             return _FALSE
         return self._expression(
             definition,
-            permission.expression,
+            found.expression,
             at,
             bound,
             updated,
@@ -1427,10 +1428,12 @@ class Compiler:
         if isinstance(expr, PermNil):
             result = _FALSE
         elif isinstance(expr, PermRef):
-            if expr.name == "authenticated":
-                result = _truth(self.shape.authenticated)
-            elif expr.name == "anonymous":
-                result = _truth(self.shape.anonymous)
+            if is_builtin_reference(expr.name):
+                result = _truth(
+                    self.shape.authenticated
+                    if expr.name == "authenticated"
+                    else self.shape.anonymous
+                )
             else:
                 result = self._holds(
                     (type_, expr.name),

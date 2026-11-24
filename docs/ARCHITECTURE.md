@@ -147,8 +147,10 @@ directly in permission expressions. They are schema-level grants, not
 relationship rows and not user-declared definitions. `anonymous`
 matches the canonical anonymous SubjectRef typed by `REBAC_ANONYMOUS_TYPE`
 (default `auth/anonymous:*`); `authenticated` matches any non-anonymous
-resolved subject. See "Anonymous subject — built-in" below for the
-typing rationale.
+resolved subject. Inside an expression the two names are these terms
+even where a definition declares a permission under one of them; that
+permission is read only by a check of its name or an arrow to it. See "Anonymous
+subject — built-in" below for the typing rationale.
 
 The fundamental check operation: `check_access(subject, action, resource, context)` returns one of:
 
@@ -2110,7 +2112,9 @@ does not hook (see [Bypass audit granularity](#with_actor-vs-sudo--distinct-verb
 statement (a `Subquery` in `ORDER BY`, a REBAC `Subquery` as an INSERT value)
 builds its scope then, reading the schema revision, unless an evaluator scope
 pins it, and the caveat-verdict rows, and deciding the constant-arm witness
-inside an evaluator scope. A new
+inside an evaluator scope; so does (e) an embedded queryset that pins nothing of
+its own, compiled by a statement that decides it for another actor or bypass
+than the one it was built for (below). A new
 caveat instance is absent from an already prepared lower bound; a newly
 built scope sees it. Likewise, a scope prepared with the constant arms left
 out (a kept `False`) leaves them out when it renders after a tuple write that
@@ -2270,7 +2274,7 @@ statement in place.
 
 | Setting | What it does | What keeps the compiled statement |
 |---|---|---|
-| `REBAC_STRUCTURAL_PREFETCH` | A prefetch's children are read by the foreign key that names their parents, with no permission statement, where the child's action is a union with the arm `relation->parent_action` over that unfiltered foreign key (`rebac.structural`) | An intersection or exclusion above the arm, a filtered or generic backing, an override |
+| `REBAC_STRUCTURAL_PREFETCH` | A prefetch's children are read by the foreign key that names their parents, with no permission statement, where the child's action is a union with the arm `relation->parent_action` over that unfiltered foreign key (`rebac.structural`) | An intersection or exclusion above the arm, a filtered or generic backing, an edge inside a recursion, another database than the parents', an override of any kind |
 | `REBAC_ROW_SCOPE` | The scope becomes `EXISTS` conditions on the row: a grant row on its id, a parent row that satisfies the parent's conditions, a constant's fixed object (`rebac.rowscope`) | A recursion; a caveated or expiring relation; a backing the walk does not read; more than 24 subqueries; a queryset embedded in another, combined, counted or aggregated |
 | `REBAC_BOUNDED_WALK` | `held` and `held_many` read the permission from the candidate rows by one lookup per relation (`rebac.walk`) | A recursive or caveated part is asked of the compiled statement alone; candidates that name no row keep their compiled answer |
 | `REBAC_DISPLAY_FIELDS` | A joined row is delivered with its key and declared display fields, the rest hidden as a denied field is (`rebac.display`) | A model that declares no display fields |
@@ -2282,6 +2286,22 @@ statement in place.
 - **The row scope asks each row the caller's conditions select.** Where those select many rows and the actor
   holds few, the id set would have named the few: on 3.2 million rows of which the actor holds none, a page cost
   152 ms against 17 ms compiled. `"named"` confines it to queries that name their rows.
+- **No delivery across an edge of a recursion.** A child whose permission, or a permission its union opens on the
+  way to the arm, is in the recursive component of the arm's target reads the parent's permission one hop into
+  the component, with one hop less of `REBAC_DEPTH_LIMIT` than the parent was admitted with: such children keep
+  their statement. An arrow into a recursion from outside it is read with the whole limit and is delivered.
+- **Admission is per database.** Children are delivered only when their queryset reads the database the parents
+  were read from.
+- **A delivery serves one evaluation.** Only the evaluation that reads the child rows inside the running prefetch
+  is delivered. A count, an existence test, an aggregate, `iterator()`, `explain()`, an eager `scoped()` and an
+  embedding carry their statement, inside the prefetch too, and the queryset keeps no delivered query: whatever it
+  sends after the delivered evaluation, or after one that raised, is decided again. The record of admitted parents
+  serves the thread, and the asyncio task in it, that runs the prefetch, until the prefetch ends: a context copied
+  while it runs (a signal receiver's `contextvars.copy_context()`, a task or a thread started then) delivers and
+  admits nothing, there or after. Django's async ORM runs a whole evaluation in one worker thread, and delivers.
+- **A union's arms are read as the compiler reads them.** Structural prefetch and the walk open a permission named
+  in a union into its own arms, and a built-in name there is the actor's state, never a permission declared under
+  it (`rebac.schema.ast.is_builtin_reference`, `member`, which the compiler resolves names through).
 - **`rebac.rowscope.explain(model, actor, action)`** says whether a permission is written as row conditions, with
   how many subqueries, and each obstacle by the relation it sits on.
 - **`rebac.snapshot.read_snapshot()`** opens or joins one transaction for a unit of reading in which the library
@@ -2292,9 +2312,11 @@ statement in place.
 - **Nothing runs when nothing is enforced.** `REBAC_ENABLED = False` answers before any of them.
 - **Several statements, several states.** A compiled answer is one statement. Structural prefetch and the walk
   read several, each seeing the state committed when it runs, so under READ COMMITTED a decision can be assembled
-  from adjacent states. They are exact inside one snapshot (a transaction on a connection configured for
-  repeatable read; any transaction on SQLite). After an exclusion the walk reads the fence again, so a policy
-  revision published under it answers nothing.
+  from adjacent states. Inside one snapshot (a transaction on a connection configured for repeatable read; any
+  transaction on SQLite) every statement reads the same data, but each reads its own instant, so a deadline (a
+  row's expiry, a caveat that reads the time, an override's) can fall between two of them: a parent admitted, or
+  an arm proved, just before it, is used by a statement that runs after it. After an exclusion the walk reads the
+  fence again, so a policy revision published under it answers nothing.
 - **Display fields need a `RebacMixin` model**, whose `save` leaves hidden columns alone.
 
 #### The clock
@@ -2809,6 +2831,104 @@ field-visibility state and prefetch completion so restored results are checked
 again. The receiving process must establish its own trusted actor or bypass
 context before materializing or mutating it.
 
+A statement a queryset sends carries the scope decided for that evaluation,
+where it runs: iteration, `len()`, `bool()`, `count()`, `exists()`,
+`aggregate()`, `iterator()`, `aiterator()` and their async forms, whatever rows
+the queryset holds. Whether a scope is applied is read from the query, never
+from a result cache. The decision is `effective_actor()` (the queryset's own
+pins, the actor a related manager took from its row, an ambient `sudo()` or
+`system_context()` block, the ambient actor, `REBAC_ENABLED`) and the database
+the statement reads, asked of the router once: the statement runs on the
+database its scope was built for. The query carries the decision it was scoped
+for, published with it in one assignment. A queryset already scoped for that
+decision runs as it is, at the cost of one comparison and no statement;
+otherwise its scope is built again for it, at the cost of building a clone's.
+Embedded in another statement, in any position (a `filter()` or `exclude()`
+condition, an annotation or `alias()`, an aggregate's `filter=`, `order_by()`, a
+`Case`/`When`, a `Window`, a `FilteredRelation` condition, an operand of a set
+combination, `values()` over an annotation, the right of an `In` lookup, as a
+`Subquery()`, an `Exists()`, a lookup on the queryset or on its `query`, or a deep
+copy), a queryset that pins nothing of its own (no `scoped()`, `with_actor()` or
+`sudo()` on it) is decided by each statement that compiles it, by the same rule.
+Where that statement decides as the scope it carries was decided, the scope is
+compiled as it is; otherwise it is resolved again into the statement, as Django
+resolves a condition again when it compiles, its scope built for the statement's
+decision and checked for the gated fields it reads with that decision's actor.
+It is resolved from copies of its conditions (the lookups of its `where`, and those
+inside its annotations): Django assigns a lookup's sides in place when it resolves
+a where tree, on lookups a clone shares with the query it was cloned from, and the
+copies keep the statement the queryset is embedded in as it was, whoever compiles
+it. The router is asked once for each embedded queryset where the statement
+compiles; the field check before the statement compiles compares only the actor
+and the bypass, to know whether to leave the check to the compile. A statement
+with nothing embedded does no more work: the decisions are compared only where an
+embedded queryset renders. One object embedded two ways, or read and embedded,
+reads the same rows, whatever the enclosing queryset's own decision, and a
+statement decided again sends, byte for byte, the statement built under its
+reader. With no actor and no bypass in force, strict mode refuses the statement
+with `MissingActorError`, as it refuses reading the queryset. `iterator()` and
+`aiterator()` decide everything up to their first rows (the scope and its audit
+row, the guards, the embedded querysets, the statement, which Django compiles
+when the first rows are read) in the context they were called in, without the
+evaluator scope they were called in if it has closed since, and keep that context
+no longer than their first rows. The work done for each chunk runs in the context
+that consumes it, as in 0.37.0: its prefetches are read there, so a caller's
+`Prefetch(queryset=...)` that pins nothing takes the consumer's actor, while the
+redaction and the related-row guards use the actor taken at the call.
+`scoped()` pins the actor, or the bypass of the block it runs in, so an eager
+queryset keeps its scope wherever it is embedded, as a queryset's own
+`with_actor()` or `sudo()` does. What a scope pins when it is built is kept with
+it: its policy, its caveat verdicts (taken from the stored caveat payloads under
+that policy revision, with no request context), and inside an evaluator scope the
+constant-arm witnesses decided then. A queryset read again in
+another evaluator scope, or outside one, keeps them, as an eager `scoped()`
+queryset does; they can leave rows out, never add one, until the scope is built
+again. A pin wins over ambient state at every evaluation, as at
+the first: a `with_actor()` queryset evaluated in a later `sudo()` block reads
+as its actor, and a `sudo()` queryset evaluated under `actor_context()` reads
+every row. A related manager Django's prefetch filled holds the rows that read
+admitted and its own query, never scoped: what it sends (`iterator()`,
+`aggregate()`, a clone, an embedding) is decided like any related manager's
+read, by the actor the manager took from its row, else the ambient state, and
+without either raises `MissingActorError` in strict mode. A structural delivery
+(`REBAC_STRUCTURAL_PREFETCH`) is decided only for an evaluation that reads its
+rows inside the running prefetch, and lasts that evaluation: the queryset keeps
+no delivered query, so whatever it sends next is decided again. The record of
+admitted parents serves only the thread, and the asyncio task in it, that runs
+the prefetch, and only until it ends: a context copied meanwhile delivers and
+admits nothing. The
+action is fixed on the queryset (`with_action()` returns a clone). A policy
+revision published after the scope was built is not compared, which would cost
+a statement: the scope's revision fence closes it, so it admits nothing until
+it is built again (a clone, or another decision). Settings that only change
+the statement's form (the switchable read mechanisms) are not compared either:
+they change no answer.
+
+Rows a queryset holds (its result cache) are handed out as Django hands them
+out, under any context: they were read, stamped, redacted and guarded by the
+evaluation that read them, as a chunk of `iterator()` consumed later was, and
+handing them out reads nothing. `count()` and `exists()` answer from them;
+`iterator()`, `aiterator()` and `aggregate()`, which Django sends to the
+database whether or not rows are held, decide their scope as any other read.
+A queryset holds rows only once everything that makes them safe to hand out
+has succeeded: when reading them, their prefetches, field redaction or the
+`rebac_select_related()` guards raise, it holds none, and indexing, slicing,
+`first()`, `repr()` and a later `count()` read them again. Rows Django's
+prefetch hands a related manager are redacted and guarded for its actor at its
+first use; when that raises, it keeps none.
+
+A queryset whose permission scope cannot be built (any exception while it is
+built: a `SchemaError`, a failed statement, an interrupt) raises and keeps no
+part of it: evaluating the same queryset again, embedding it (`Subquery()`,
+`Exists()`, a lookup on its `query`) or copying it builds the scope again, so
+it raises again or reads what the scope admits, never unscoped rows. The scope
+is built on a copy of the query, which replaces the queryset's own only once
+complete, and each evaluation runs the query it decided. Two threads that
+evaluate one queryset object therefore never run a statement scoped for
+another decision or for none; at worst each builds the scope. Django does not
+make a shared queryset thread-safe otherwise: one thread can hand out the rows
+the other read.
+
 ### `with_actor` vs `sudo` — distinct verbs
 
 [Borrowed from Odoo's `with_user` / `sudo` distinction. Adapted with mandatory `reason` and a generic actor type.]
@@ -2832,14 +2952,15 @@ or a module-level entry it derives querysets from is audited once per actor
 per process. A row written inside a transaction counts
 only if that transaction commits: after a rollback, of a savepoint too, the
 next use writes it again. A queryset that `scoped()` pins inside a `sudo()`
-block, and a queryset embedded inside one in an annotation (`Subquery`,
-`Exists`) or as a lookup's value (`pk__in=`), keep the block's bypass after it
-closes: each is an entry of its own, audited when it takes effect outside a
-block (the embedded one with each statement that executes it). Django resolves
-a condition (`filter(Exists(...))`) again when its statement compiles, so a
-condition built inside a block is scoped, and audited, by the decision taken
-there. A queryset evaluated inside a block and embedded after it has its scope
-decided where it is embedded, as a lookup or a write on it is. When a bypass queryset is embedded in another
+block keeps the block's bypass after it closes: it is an entry of its own,
+audited when it takes effect outside a block (embedded, with each statement that
+executes it). A queryset embedded inside a block that pins nothing of its own, in
+any position, is decided by each statement that compiles it: inside the block,
+the block's bypass, covered by the block's row; outside it, the actor in force
+there, with no bypass to audit (without strict mode and with no actor, every row,
+unaudited as any read with no actor is). A queryset evaluated inside a block and embedded
+after it has its scope decided where it is embedded, as a lookup or a write on it
+is. When a bypass queryset is embedded in another
 statement, each execution audits every distinct `(entry, reason)` pair it
 renders, even if that pair appears in several filters, annotations or `Exists`
 expressions. A count followed by a list read audits the embedded entry twice.
@@ -2910,6 +3031,7 @@ Resolution order:
 A pinned actor (path 2) **always wins** over ambient state (paths 3-4) — there is no path by which ambient sudo or the ambient actor ContextVar can override an explicit `.with_actor(...)`. This is the inverse of Odoo's `allowed_company_ids` ambient-scope precedence; we want the explicit local scope to be the authoritative one. If code truly wants bypass inside an elevated block, it must call `.sudo(reason=...)` on that queryset or instance.
 
 **Critical: scope sticks across writes.** A queryset created with `with_actor(actor)` produces instances tagged with that actor; `instance.save()` re-checks against the same actor, regardless of what `current_actor()` says now. This is the Odoo `with_user(...)` invariant translated into Django — the actor follows the recordset.
+Re-pinning an instance (`instance.with_actor(other)`) changes what it reads and writes next, not what it already holds: the rows of a prefetched related manager, a cached forward relation and the field values it loaded are not checked again for the new actor, as Django keeps held rows.
 Only a REBAC queryset or `RebacMixin` instance can carry that pin; an unrelated
 tracked model's callable attribute named `actor` does not become an actor scope.
 
@@ -3131,7 +3253,10 @@ query's scope decision, not the outer one: a bypass (`sudo` /
 for its own projection when it is resolved, so
 `Subquery(Model.objects.with_actor(a).values("gated"))` still raises while an
 `Exists` over a bypass queryset that filters on a gated column hands the outer
-row only its boolean.
+row only its boolean. It answers once for each decision: an embedded queryset
+decided again by a later statement, for another actor, is checked again for
+that actor where it is decided (when the statement compiles), and the check of
+the earlier decision is not made for the later one.
 The `NOT EXISTS` Django builds for an `exclude()` across a to-many relation
 (`Query.split_exclude`) is not an embedded queryset: it is a correlated piece
 of the outer statement, like the join a `filter()` across the same relation
@@ -3164,14 +3289,19 @@ ordering. `order_by()` with no arguments clears a default ordering.
 
 A queryset used as a subquery (`Subquery()`, `Exists()`, a lookup such as
 `pk__in=queryset`) is checked for what it selects, filters, groups and orders
-on, as resolved into the enclosing statement, whether its scope is applied
-there or was applied earlier (`scoped()`, or an evaluation that was
-refused), with the actor its scope was applied with. A column of the
+on, as resolved into the enclosing statement, with the actor its scope is
+decided for by the statement that compiles it: its pinned actor (`scoped()`,
+`with_actor()`), else the one in force there. A column of the
 enclosing row it refers to (`OuterRef`) is the enclosing query's to answer
-for. It is checked once: when the statement that holds it is checked, sharing
-that check's schema read, if it sits in that statement's clauses or
-selection; else when it is compiled (an aggregate's expression, an update's
-value, a statement of a model that is not a rebac resource). Its ordering
+for. It is checked once for each decision: when the statement that holds it is
+checked, sharing that check's schema read, if it sits in that statement's
+clauses or selection and that statement decides it as it was decided; else when
+it is compiled (an aggregate's expression, an update's value, a statement of a
+model that is not a rebac resource, one decided again by that statement). A check
+left to the compile is made where the subquery is rendered: one that Django leaves
+out of the statement it sends (a count of a grouped projection drops an annotation
+nothing groups on) reads nothing and is not made, where the same queryset built
+fresh under that actor is checked, and refused, before it compiles. Its ordering
 counts as Django compiles it: an `__in` lookup clears the ordering of an
 unsliced query, and `Exists()` clears it always.
 
@@ -4100,7 +4230,14 @@ currently targets Django 6.1.x and Python 3.14+. Package dependencies constrain
 Django and its development stubs to the audited 6.1 line; support for newer
 Django feature releases requires verification of the ORM hooks this package uses
 (the private queryset, manager, validation and admin hooks it touches are
-listed in the 0.30.0 changelog entry). Database floors follow Django 6.1:
+listed in the 0.30.0 changelog entry), and of the query resolution an embedded
+queryset decided again relies on, pinned by `tests/test_django_query_resolution.py`:
+a resolved `Query` resolved again into its statement gives the same statement
+(its outer references are already columns of that statement, and `bump_prefix`
+returns early when the prefixes differ); `WhereNode.resolve_expression` clones the
+nodes but assigns the sides of the lookups they share; `Query.resolve_expression`
+keeps those sides and discards the node it resolved; and `Lookup.process_lhs`
+resolves a condition again where its statement compiles. Database floors follow Django 6.1:
 PostgreSQL 15, MySQL 8.4, SQLite 3.37.
 
 Public API (`rebac.*` direct imports + the schema language) is intended to be
