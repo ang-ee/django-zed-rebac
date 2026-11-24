@@ -30,7 +30,7 @@ from django.db.models.sql import Query
 from django.db.models.sql.subqueries import UpdateQuery
 from django.db.models.sql.where import ExtraWhere, NothingNode, WhereNode
 
-from . import rowscope, structural
+from . import bounded, rowscope, structural
 from ._id import resource_id_attr
 from .actors import (
     ActorLike,
@@ -1431,9 +1431,10 @@ class RebacQuerySet(models.QuerySet[_M]):
         using = self.db if using is None else using
         if query is root:
             # The policy this scope is built under, carried with its decision: children
-            # are delivered under the rows it reads only under that policy (proposal 0022).
+            # are delivered under the rows it reads only under that policy (proposal 0022),
+            # and a bounded read decides its candidates under that policy alone (0025).
             cast(Any, query)._rebac_scope_policy = (
-                structural.policy_key() if structural.enabled() else None
+                structural.policy_key() if structural.enabled() or bounded.enabled() else None
             )
         for operand in _nested_queries(query.where, boolean_operands_only=True):
             self._scope_query(operand, actor, root=root, using=using)
@@ -1762,6 +1763,8 @@ class RebacQuerySet(models.QuerySet[_M]):
         if self._result_cache is not None:
             self._finish_held_rows()
             return
+        # A bounded read replaces only a scope this evaluation built (proposal 0025).
+        kept = self.query if bounded.enabled() else None
         query = self._apply_scope_in_place(executing=True)
         reading = self._reading(query)
         actor, sudo, *_ = cast(_Decision, cast(Any, query)._rebac_scope_for)
@@ -1776,6 +1779,13 @@ class RebacQuerySet(models.QuerySet[_M]):
             and runtime_field_deny_mode(field_mode) != "allow"
             and bool(gated_read_fields(self.model))
         )
+        if bounded.enabled():
+            # A read whose conditions select few rows, decided by those rows (proposal 0025):
+            # the same statement with the keys the walk admitted in place of the scope, for
+            # this evaluation alone. The queryset keeps the query it decided.
+            served = bounded.read(self, query, built=query is not kept)
+            if served is not None:
+                reading = self._reading(served)
         native = cast(Any, self)
         # Django's own _fetch_all, with the rows stamped before their
         # prefetches run: a related manager reads the row's actor pin.

@@ -8,10 +8,15 @@
 ``read`` prints, for each scenario, actor and mechanism: the rows read, the
 statements and their SQL size, the wall time (median of ``--repeats``), and on
 PostgreSQL the planning and execution time and the planner's memory, summed
-over the statements. ``census`` says, per model, whether its read permission can
-be written as row conditions and how many relations it reaches. ``smoke`` builds
-the tiny size and runs every scenario with and without the mechanisms, failing
-if a result differs: it needs no database server (in-memory SQLite).
+over the statements; under a bounded mechanism, how many of its list reads were
+decided by their candidates and how many kept their statement. ``census`` says,
+per model, whether its read permission can be written as row conditions and how
+many relations it reaches. ``smoke`` builds the tiny size and runs every
+scenario with and without the mechanisms, failing if a result differs, or if a
+bounded mechanism that decided no read by its candidates sent other statements
+than ``today`` beside its key reads: it needs no database server (in-memory
+SQLite). ``--statements FILE`` (``read`` and ``smoke``) writes every statement
+each read sent, with its parameters, to compare two checkouts byte for byte.
 """
 
 from __future__ import annotations
@@ -42,6 +47,18 @@ MECHANISMS: dict[str, dict[str, Any]] = {
         "REBAC_BOUNDED_WALK": "decide",
         "REBAC_TRUSTED_IDS": True,
     },
+    # A list read whose conditions select at most 256 rows, decided by those rows (proposal
+    # 0025): "bounded_keys" where the walk reads nothing of them but their keys, "bounded"
+    # where it may read the foreign keys it follows and their grants' subjects too.
+    "bounded_keys": {"REBAC_BOUNDED_READ": True},
+    "bounded": {"REBAC_BOUNDED_READ": "identifiers"},
+    "all_bounded": {
+        "REBAC_STRUCTURAL_PREFETCH": True,
+        "REBAC_ROW_SCOPE": True,
+        "REBAC_BOUNDED_WALK": "decide",
+        "REBAC_TRUSTED_IDS": True,
+        "REBAC_BOUNDED_READ": "identifiers",
+    },
 }
 
 
@@ -68,7 +85,9 @@ def main() -> None:
         help="read inside a transaction that has written a relationship and not committed it",
     )
     read.add_argument("--json", default="")
-    commands.add_parser("smoke")
+    read.add_argument("--statements", default="", help="write every statement sent to this file")
+    smoke = commands.add_parser("smoke")
+    smoke.add_argument("--statements", default="", help="write every statement sent to this file")
     census = commands.add_parser("census")
     census.add_argument("--size", default="small")
     census.add_argument("--actor", default="light")
@@ -103,12 +122,15 @@ def main() -> None:
         everything = argparse.Namespace(
             scenario="",
             actor="heavy,light,outsider,admin",
-            mechanism="today,all",
+            mechanism="today,all,bounded_keys,bounded,all_bounded",
             repeats=1,
             explain=False,
             uncommitted=False,
+            statements=arguments.statements,
         )
-        failed = [row for row in reads(bench, everything) if "error" in row or row["same"] is False]
+        report = reads(bench, everything)
+        failed = [row for row in report if "error" in row or row["same"] is False]
+        failed += [row for row in report if row.get("kept_differs")]
         sys.exit(f"{len(failed)} read(s) failed or differed" if failed else 0)
     bench = data.load(settings.REBAC_BENCH_POLICY, arguments.size)
     if arguments.command == "build":
@@ -142,6 +164,8 @@ def reads(bench: Any, arguments: argparse.Namespace) -> list[dict[str, Any]]:
     names = [name for name in arguments.scenario.split(",") if name] or list(scenarios)
     connection = connections[bench.using]
     report: list[dict[str, Any]] = []
+    sent: list[dict[str, Any]] = []
+    tally = _BoundedTally()
     header = f"{'scenario':<14}{'actor':<9}{'mechanism':<11}{'rows':>5}{'stmts':>6}{'sql KB':>9}{'wall ms':>9}"
     if arguments.explain:
         header += f"{'plan ms':>9}{'exec ms':>9}{'plan MiB':>9}"
@@ -150,6 +174,7 @@ def reads(bench: Any, arguments: argparse.Namespace) -> list[dict[str, Any]]:
         for who in arguments.actor.split(","):
             actor = bench.actor(who)
             baseline: Any = None
+            today: list[tuple[str, Any]] | None = None
             for mechanism in arguments.mechanism.split(","):
                 with override_settings(**MECHANISMS[mechanism]):
                     compiled.reset()
@@ -185,7 +210,7 @@ def reads(bench: Any, arguments: argparse.Namespace) -> list[dict[str, Any]]:
                         seen.append((sql, params))
                         return execute(sql, params, many, context)
 
-                    with _transaction(bench, actor, arguments.uncommitted):
+                    with _transaction(bench, actor, arguments.uncommitted), tally.counting():
                         with connection.execute_wrapper(capture):
                             run()
                     times = []
@@ -203,6 +228,30 @@ def reads(bench: Any, arguments: argparse.Namespace) -> list[dict[str, Any]]:
                         "sql_kb": round(sum(len(sql) for sql, _ in statements) / 1024, 1),
                         "wall_ms": round(median(times), 1),
                     }
+                    if MECHANISMS[mechanism].get("REBAC_BOUNDED_READ"):
+                        row["bounded"] = {"served": tally.served, "kept": tally.kept}
+                        if (
+                            mechanism.startswith("bounded")
+                            and not tally.served
+                            and not tally.walked
+                            and today is not None
+                        ):
+                            # Nothing decided by its candidates, and no walk begun: the statements
+                            # are today's, beside the key reads of those that read keys first.
+                            row["kept_differs"] = [
+                                item for item in statements if not _key_read(item[0])
+                            ] != today
+                    if mechanism == "today":
+                        today = statements
+                    if arguments.statements:
+                        sent.append(
+                            {
+                                "scenario": name,
+                                "actor": who,
+                                "mechanism": mechanism,
+                                "statements": [[sql, _plain(params)] for sql, params in statements],
+                            }
+                        )
                     if arguments.explain and connection.vendor == "postgresql":
                         row.update(_explain(connection, statements))
                 compiled.reset()
@@ -221,8 +270,68 @@ def reads(bench: Any, arguments: argparse.Namespace) -> list[dict[str, Any]]:
                 )
                 if "plan_ms" in row:
                     line += f"{row['plan_ms']:>9}{row['exec_ms']:>9}{row['plan_mib']:>9}"
+                if "bounded" in row:
+                    line += f"  decided by candidates {row['bounded']['served']}, kept {row['bounded']['kept']}"
+                if row.get("kept_differs"):
+                    line += "  KEPT STATEMENTS DIFFER"
                 print(line + ("  DIFFERS" if row["same"] is False else ""), flush=True)
+    if arguments.statements:
+        with open(arguments.statements, "w") as handle:
+            json.dump(sent, handle, indent=1)
     return report
+
+
+class _BoundedTally:
+    """How many list reads a bounded mechanism decided by their candidates, and how many kept
+    their statement, from the library's ``rebac.bounded`` debug log."""
+
+    def __init__(self) -> None:
+        self.served = 0
+        self.kept = 0
+        # Reads kept after the walk had begun: their statements include its lookups.
+        self.walked = 0
+
+    @contextmanager
+    def counting(self) -> Iterator[None]:
+        import logging
+
+        tally = self
+
+        class Counter(logging.Handler):
+            def emit(self, record: logging.LogRecord) -> None:
+                message = record.getMessage()
+                if "decided by its candidates" in message:
+                    tally.served += 1
+                else:
+                    tally.kept += 1
+                    tally.walked += "for these rows" in message
+
+        self.served = self.kept = self.walked = 0
+        logger = logging.getLogger("rebac.bounded")
+        handler = Counter(logging.DEBUG)
+        level = logger.level
+        logger.addHandler(handler)
+        logger.setLevel(logging.DEBUG)
+        try:
+            yield
+        finally:
+            logger.removeHandler(handler)
+            logger.setLevel(level)
+
+
+def _key_read(sql: str) -> bool:
+    """A bounded read's candidates statement: a table's keys, unordered, at most 257."""
+    return sql.startswith("SELECT ") and ' AS "pk" FROM ' in sql and sql.endswith(" LIMIT 257")
+
+
+def _plain(params: Any) -> Any:
+    """Statement parameters as JSON can write them."""
+    if params is None:
+        return None
+    return [
+        value if isinstance(value, (int, float, str, bool, type(None))) else repr(value)
+        for value in params
+    ]
 
 
 @contextmanager

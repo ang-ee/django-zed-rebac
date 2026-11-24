@@ -57,6 +57,7 @@ CLOSED = {
     "REBAC_ACTOR_PROFILES": False,
     "REBAC_ROW_SCOPE": False,
     "REBAC_BOUNDED_WALK": False,
+    "REBAC_BOUNDED_READ": False,
     # Auditing and linting stay on.
     "REBAC_AUDIT_DENIALS": True,
     "REBAC_LINT_BARE_PREFETCH": True,
@@ -108,7 +109,7 @@ WRONG = {
     "a str or None": [5, b"text", ["x"]],
     "a str, a pathlib.Path or None": [5, ["x"]],
 }
-SWITCHES = {"REBAC_DISPLAY_FIELDS", "REBAC_ROW_SCOPE", "REBAC_BOUNDED_WALK"}
+SWITCHES = {"REBAC_DISPLAY_FIELDS", "REBAC_ROW_SCOPE", "REBAC_BOUNDED_WALK", "REBAC_BOUNDED_READ"}
 STORAGE_WRONG = [None, b"registry", "Registry", ["registry"], "columnar"]
 TRACKED_WRONG = [
     "testapp.BackingStage",  # ("testapp.BackingStage") without its comma
@@ -200,6 +201,7 @@ def test_a_wrongly_typed_unread_setting_is_a_warning_that_says_it_is_unread(name
         ("REBAC_DISPLAY_FIELDS", "fallback"),
         ("REBAC_BOUNDED_WALK", "prove"),
         ("REBAC_BOUNDED_WALK", "decide"),
+        ("REBAC_BOUNDED_READ", "identifiers"),
         ("REBAC_TYPE_PREFIX", None),
         ("REBAC_UNIVERSAL_ADMIN_ROLE", "platform/role:admin"),
         ("REBAC_DEPTH_LIMIT", 12),
@@ -574,12 +576,15 @@ def test_sudo_needs_a_reason_while_require_reason_is_not_a_bool(value):
 
 @pytest.mark.parametrize("value", ["True", "prove ", 1])
 def test_the_switches_read_off_while_not_spelled_as_declared(value):
-    from rebac import display, rowscope, walk
+    from rebac import bounded, display, rowscope, walk
 
     with override_settings(
-        REBAC_ROW_SCOPE=value, REBAC_DISPLAY_FIELDS=value, REBAC_BOUNDED_WALK=value
+        REBAC_ROW_SCOPE=value,
+        REBAC_DISPLAY_FIELDS=value,
+        REBAC_BOUNDED_WALK=value,
+        REBAC_BOUNDED_READ=value,
     ):
-        assert (rowscope.mode(), display.mode(), walk.mode()) == ("", "", "")
+        assert (rowscope.mode(), display.mode(), walk.mode(), bounded.mode()) == ("", "", "", "")
 
 
 @pytest.mark.django_db
@@ -721,16 +726,17 @@ def test_a_conditional_field_stays_hidden_while_its_switch_is_not_a_bool(value):
 
 @pytest.mark.parametrize("value", FALSY_WRONG)
 def test_the_switches_read_off_for_a_falsy_value_too(value):
-    from rebac import codec, display, rowscope, structural, walk
+    from rebac import bounded, codec, display, rowscope, structural, walk
 
     with override_settings(
         REBAC_ROW_SCOPE=value,
         REBAC_DISPLAY_FIELDS=value,
         REBAC_BOUNDED_WALK=value,
+        REBAC_BOUNDED_READ=value,
         REBAC_STRUCTURAL_PREFETCH=value,
         REBAC_TRUSTED_IDS=value,
     ):
-        assert (rowscope.mode(), display.mode(), walk.mode()) == ("", "", "")
+        assert (rowscope.mode(), display.mode(), walk.mode(), bounded.mode()) == ("", "", "", "")
         assert structural.enabled() is False
         assert codec._trusted(type("Codec", (), {"kind": "integer"})()) is False
 

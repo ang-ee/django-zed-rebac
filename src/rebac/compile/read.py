@@ -202,6 +202,9 @@ class _Policy:
     # only a stored policy from before the rule was held at runtime. The experimental read
     # mechanisms refuse such a policy.
     name_conflicts: tuple[str, ...] = ()
+    # Where the walk would ask the compiled statement, by type, action and whether only the
+    # keys of the rows asked about may be read (``rebac.walk.compiler_part``).
+    walked: dict[tuple[str, str, bool], str | None] = field(default_factory=dict)
 
     @property
     def schema(self) -> Schema:
@@ -1585,6 +1588,40 @@ def scope_q(
     return Q(
         scope_expression(backend=backend, model=model, action=action, actor=actor, using=using)
     )
+
+
+@schema_operation
+def scope_admits_nothing(
+    *,
+    backend: LocalBackend,
+    model: type[models.Model],
+    action: str,
+    actor: SubjectRef,
+    using: str,
+) -> bool:
+    """Whether the compiled scope of ``model`` rows admits no row for the actor.
+
+    The statement ``scope_q`` renders compiles to nothing where the actor's grant profile
+    and the constant-arm witnesses leave no arm of the permission. A bounded read
+    (``rebac.bounded``, proposal 0025) asks this before it reads a candidate: that statement
+    is then the cheapest read there is.
+    """
+    expression = scope_expression(
+        backend=backend, model=model, action=action, actor=actor, using=using
+    )
+    if not isinstance(expression, _Scope):
+        return True
+    key = (cast(str, model_resource_type(model)), action)
+    operation = _Operation.begin(backend, actor, using, policy=expression.policy)
+    operation.adopt(key, expression.verdicts)
+    compiled = _scope_statement(
+        operation,
+        model,
+        key,
+        witness=expression.witness,
+        inherited=expression.inherited,
+    )
+    return compiled is False
 
 
 @schema_operation

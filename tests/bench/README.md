@@ -51,8 +51,13 @@ reads the actor's profile at every compile.
 `read` prints one line per scenario, actor and mechanism: rows read, statements, their SQL size, the wall time
 (median of `--repeats`), and with `--explain` on PostgreSQL the planning time, the execution time and the
 planner's memory, summed over the statements. A mechanism is a named set of settings (`today`, `structural`,
-`rows`, `named`, `walk`, `trusted`, `noprofile`, `all`); a line ends in `DIFFERS` if it read something else than
-the first mechanism did. `plain` is `REBAC_ENABLED = False`: Django's own queries, with every row
+`rows`, `named`, `walk`, `trusted`, `noprofile`, `all`, and the bounded reads of proposal 0025: `bounded_keys`,
+`bounded`, `all_bounded`); a line ends in `DIFFERS` if it read something else than the first mechanism did, and
+under a bounded mechanism it says how many list reads were decided by their candidates. `--statements FILE`
+writes every statement a run sent, with its parameters, to compare two checkouts.
+`python -m tests.bench.candidates` explains where a read's candidates are decided and what each statement costs
+(`plans`, `statements`), and reads a page for readers of a known small share of a model (`sparse-setup` on a
+scratch database named `sparse_*`, then `sparse`). `plain` is `REBAC_ENABLED = False`: Django's own queries, with every row
 readable, as the floor the others can be compared with.
 
 ## The cast

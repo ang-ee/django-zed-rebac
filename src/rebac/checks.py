@@ -371,6 +371,38 @@ def check_permissions_enforced(app_configs: Any = None, **kwargs: Any) -> list[c
     ]
 
 
+@_register(ids=("rebac.W016",))
+def check_bounded_read(app_configs: Any = None, **kwargs: Any) -> list[checks.CheckMessage]:
+    """W016: the experimental bounded read is on, with what it discloses."""
+    from .bounded import mode
+
+    mode_in_force = mode()
+    if not mode_in_force:
+        return []
+    crossing = (
+        "Up to 257 primary keys of rows the actor may not read enter the process"
+        if mode_in_force == "keys"
+        else "Up to 257 primary keys of rows the actor may not read, the foreign keys the walk "
+        "follows from them and the subjects of their grants enter the process"
+    )
+    return [
+        checks.Warning(
+            f"REBAC_BOUNDED_READ is {app_settings.REBAC_BOUNDED_READ!r} (experimental): a list "
+            "read whose own conditions select at most 256 rows reads their keys without the "
+            f"permission and decides them by lookups. {crossing}, and the parameters of those "
+            "lookups (statement logs, SQL debug logs, error reports). Whether more than 256 "
+            "rows, hidden ones included, match a read's conditions shows as its latency.",
+            id="rebac.W016",
+            hint=(
+                "A read is assembled from several statements, so under READ COMMITTED it can "
+                "read adjacent states; see proposal 0025 (docs/proposals/0025-bounded-reads.md). "
+                "Remove the setting to read every list with its compiled scope; silence the "
+                "warning with SILENCED_SYSTEM_CHECKS = ['rebac.W016']."
+            ),
+        )
+    ]
+
+
 @_register(ids=("rebac.E008", "rebac.W008"))
 def check_field_read_mode_setting(
     app_configs: Any = None, **kwargs: Any

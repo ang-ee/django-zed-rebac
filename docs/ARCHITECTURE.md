@@ -1221,6 +1221,7 @@ All settings prefixed `REBAC_`. No nested dict. Read via the public `app_setting
 | `REBAC_STRUCTURAL_PREFETCH` | `False` | `bool` | Experimental. Children of parents a prefetch just admitted are read by foreign key, without their permission statement, where the policy proves the parent's action grants theirs, the parent's action being the one the child's arm names or one the policy proves implies it. See [Switchable read mechanisms](#switchable-read-mechanisms). |
 | `REBAC_ROW_SCOPE` | `False` | `bool \| "named"` | Experimental. The scope of a statement a queryset runs itself is written as conditions on each row instead of membership in the ids the actor holds. `"named"`: only where the queryset's own conditions bind its primary key or a foreign key to literal values. Needs PostgreSQL's JIT off. |
 | `REBAC_BOUNDED_WALK` | `False` | `bool \| "prove" \| "decide"` | Experimental. `held` and `held_many` are answered by lookups on the rows the ids name. `"prove"` (or `True`) settles the ids a grant, a column or a parent shows held; `"decide"` reads the whole permission and answers no as well. |
+| `REBAC_BOUNDED_READ` | `False` | `bool \| "identifiers"` | Experimental. A list read whose own conditions select at most 256 rows reads their keys without the permission, the walk decides them, and the rows it admits are read by key, with the read's own ordering and slice. `True`: only where the walk reads nothing of a candidate but its key; `"identifiers"`: also where it reads the foreign keys it follows and the subjects of the grants on it. Keys of rows the actor may not read enter the process; system check `rebac.W016`. See [Bounded reads](#bounded-reads). |
 | `REBAC_DISPLAY_FIELDS` | `False` | `bool \| "fallback"` | Experimental. A related row `rebac_select_related` loaded is delivered with the display fields its model declares (`Meta.rebac_display_fields`). `"fallback"`: where the actor may not read the row, instead of raising. `True`: always, without the check. |
 | `REBAC_TRUSTED_IDS` | `False` | `bool` | Experimental. A stored id of an integer identity is converted to its key by the cast alone. A relationship row whose id is not canonical then makes PostgreSQL raise on the statement. |
 | `REBAC_ZOOKIE_TRANSPORT` | `"none"` | `"none"` \| `"header"` \| `"session"` | Optional cross-request transport for the current Zookie. |
@@ -1235,8 +1236,8 @@ that. A value the setting does not accept never widens what the library allows.
 A string is a string: `"False"` is not `False`, and the library parses no
 spelling of a boolean or a number, since Django's settings are Python values
 and conversion belongs in the settings module. A boolean accepts `True` and
-`False` only (`REBAC_ROW_SCOPE`, `REBAC_BOUNDED_WALK` and `REBAC_DISPLAY_FIELDS`
-their documented strings as well), and an int an `int` that is not a `bool`. A
+`False` only (`REBAC_ROW_SCOPE`, `REBAC_BOUNDED_WALK`, `REBAC_BOUNDED_READ` and
+`REBAC_DISPLAY_FIELDS` their documented strings as well), and an int an `int` that is not a `bool`. A
 value it does not accept is read in one of four ways:
 
 - **Closed** (a boolean): the reading that widens nothing. On for a protection,
@@ -1246,7 +1247,7 @@ value it does not accept is read in one of four ways:
   mechanism that skips or shortens a permission statement (`REBAC_ALLOW_SUDO`,
   `REBAC_SUPERUSER_BYPASS`, `REBAC_TRUSTED_IDS`, `REBAC_STRUCTURAL_PREFETCH`,
   `REBAC_ACTOR_PROFILES`, `REBAC_ROW_SCOPE`, `REBAC_BOUNDED_WALK`,
-  `REBAC_DISPLAY_FIELDS`). `rebac.E028`.
+  `REBAC_BOUNDED_READ`, `REBAC_DISPLAY_FIELDS`). `rebac.E028`.
 - **Raises** `ImproperlyConfigured` where it is read: a number, a name, a
   dotted path, a subject type or a directory has no safe reading (a default
   could resolve actors another way or name other subjects), `rebac.E028`; the
@@ -1346,6 +1347,7 @@ System checks (in `rebac/checks.py`):
 | `rebac.W011` | Warning | `REBAC_ENABLED` is `False`: no permission is checked, and every caller reads and writes every row. |
 | `rebac.W014` | Warning (database) | The stored policy lets a name be read two ways (`rebac.schema.ast.name_conflicts`): a built-in's name as a relation, a definition or a subject type, or a name declared twice. It loads and decides as stored; new input with such a place is refused. The experimental read mechanisms prove nothing from it: structural prefetch about such a type, the bounded walk and the row scope about the whole policy. A warning, so that `migrate` proceeds. Rename the relation or the permission; silence it with `SILENCED_SYSTEM_CHECKS = ['rebac.W014']`. See [Names read one way](#names-read-one-way). |
 | `rebac.W015` | Warning | A reserved setting the library does not read (`REBAC_RELATIONSHIP_MODEL`, `REBAC_DEFAULT_CONSISTENCY`, `REBAC_CACHE_ALIAS`, `REBAC_LOOKUP_CACHE_TTL`, `REBAC_GC_INTERVAL_SECONDS`) has a value of another type than documented. It has no effect either way. |
+| `rebac.W016` | Warning | `REBAC_BOUNDED_READ` is on: experimental, and what it discloses. Up to 257 primary keys of rows the actor may not read (with `"identifiers"`, also the foreign keys the walk follows from them and the subjects of their grants) enter the process and the walk's statement parameters; whether more than 256 rows, hidden ones included, match a read's conditions shows as its latency. See [Bounded reads](#bounded-reads). |
 | `rebac.W101` | Retired | Not reused. |
 
 `rebac.E025` to `rebac.E027`, `rebac.W012` and `rebac.W013` are not assigned in this release.
@@ -2390,6 +2392,7 @@ statement in place.
 | `REBAC_STRUCTURAL_PREFETCH` | A prefetch's children are read by the foreign key that names their parents, with no permission statement, where the child's action is a union with the arm `relation->T` over that unfiltered foreign key and holding the parent's action grants `T`: `T` is that action, or the policy proves the action implies it (`rebac.structural`) | An intersection or exclusion above the arm, a filtered or generic backing, an action not proven to imply the arm's, an edge inside a recursion, another database than the parents', parents scoped under another policy than the children are decided under, a type that reads a name two ways, an override of any kind |
 | `REBAC_ROW_SCOPE` | The scope becomes `EXISTS` conditions on the row: a grant row on its id, a parent row that satisfies the parent's conditions, a constant's fixed object (`rebac.rowscope`) | A recursion; a caveated or expiring relation; a backing the walk does not read; more than 24 subqueries; a queryset embedded in another, combined, counted or aggregated; a policy that reads a name two ways |
 | `REBAC_BOUNDED_WALK` | `held` and `held_many` read the permission from the candidate rows by one lookup per relation (`rebac.walk`) | A recursive or caveated part is asked of the compiled statement alone; candidates that name no row keep their compiled answer; a policy that reads a name two ways |
+| `REBAC_BOUNDED_READ` | A list read whose conditions select at most 256 rows is decided by those rows: their keys read without the permission, the walk on them, the rows read by key ([Bounded reads](#bounded-reads)) | More than 256 candidates; a question the walk would hand to the compiled statement; anything but a list of rows of the model each kept with its key, in an order that ends ties by the key (see the rule) |
 | `REBAC_DISPLAY_FIELDS` | A joined row is delivered with its key and declared display fields, the rest hidden as a denied field is (`rebac.display`) | A model that declares no display fields |
 | `REBAC_TRUSTED_IDS` | The id conversion is the cast alone (`rebac.codec`) | Text and UUID identities |
 
@@ -2456,6 +2459,51 @@ statement in place.
   an arm proved, just before it, is used by a statement that runs after it. After an exclusion the walk reads the
   fence again, so a policy revision published under it answers nothing.
 - **Display fields need a `RebacMixin` model**, whose `save` leaves hidden columns alone.
+
+#### Bounded reads
+
+Experimental, [proposal 0025](./proposals/0025-bounded-reads.md), `REBAC_BOUNDED_READ`, off by default; `rebac.bounded`
+is its specification. A compiled scope builds every id set its permission reaches, whatever the read's own
+conditions select: the files of one folder cost what a page of every file costs. With the setting on, a list read
+(`RebacQuerySet._fetch_all`, over a scope the same evaluation built) is decided by its candidates:
+
+1. one statement selects, `LIMIT 257`, the primary keys the read's own conditions select, with no permission, no
+   ordering and no slice;
+2. if 256 or fewer come back, the walk decides exactly those keys (`rebac.walk.decided_alone`): one lookup per
+   relation, and the compiled statement for a part it cannot read, bounded to the ids that reach it, never for the
+   read's own question or a permission of its type that reaches half of what the question reaches;
+3. the read's own statement runs with the admitted keys in place of its scope (`pk IN (…)`), its ordering and its
+   slice as written.
+
+With 257 keys, or wherever the rule below or the walk cannot show the compiled statement's answer, the read sends
+its compiled statement unchanged, after the key read at most. It never reads a second batch of candidates.
+
+- **The rule** (`rebac.bounded.refusal`), read from the decided query before any row: an actor, enforcement, no
+  bypass; a model whose identity is its integer primary key; Django's own row classes; no set combination,
+  `select_for_update()`, `distinct(*fields)`, aggregate, grouping, window, `extra()`, hand-written SQL, random
+  ordering, `FilteredRelation`, query nested anywhere in it (`Subquery`, `Exists`, `__in=queryset`), or join that
+  can repeat a row (a reverse foreign key, a many-to-many); an ordering that orders by the primary key, unless the
+  conditions bind a unique column to one value (tied rows come in an order neither statement determines); a scope
+  this evaluation built, under the policy in force, with no stored override; an actor the walk reads; and a
+  question the guard lets through. `count()`, `exists()`, `aggregate()`, `iterator()`, `aiterator()`,
+  `explain()`, writes and embeddings are not served.
+- **The guard** (`rebac.walk.compiler_part`, kept on the policy in `_Policy.walked`): where the walk would hand
+  the read's own question to the compiled statement (a recursive or caveated question; an arm of its union it
+  cannot read; a part below an exclusion it cannot read), that statement costs what the read's own costs, and the
+  read keeps it without reading a key. So does a part on a type that stores no rows. Where the walk would compile
+  a permission of the question's type that reaches half of what the question reaches (`walk._reach`), for the
+  candidates its readable arms leave, it ends, and the read sends its compiled statement.
+- **What crosses into the process.** `True`: of a row the actor may not read, at most its key, and no other
+  column. `"identifiers"`: also the foreign keys the walk follows from it and the subjects of the grants on it that
+  name a subject set or a parent. They appear as the walk's statement parameters (statement and slow-query logs,
+  `django.db.backends` debug logging and `connection.queries` under `DEBUG`, error reports' SQL breadcrumbs) and in
+  frame locals of a lookup that raises.
+- **Timing.** Latency says whether more than 256 rows, hidden ones included, match the read's conditions.
+- **Several statements, several states**, as for the walk above. Inside an evaluator scope the walk reads grants
+  as they are, where the compiled statement reads the grant profile taken at the scope's first read: a grant
+  written by another process meanwhile can be read by the bounded read and not by the compiled statement.
+- **Statements.** A key read, the walk's lookups and compiled parts, the rows: as many for one candidate as for
+  256, each lookup naming one relation. A read that selects nothing sends the key read alone.
 
 #### The clock
 
@@ -4230,7 +4278,9 @@ project's code or data ([tests/bench/README.md](../tests/bench/README.md)):
 - `tests.benchapp` rebuilds one stand-in model per entry; `tests.bench.data` generates rows and relationship
   rows in SQL, with a fixed cast of users; a policy's `profile.py` holds the reads an application makes.
 - `python -m tests.bench.run build|read|census` under `DJANGO_SETTINGS_MODULE=tests.settings_bench`.
-  `make bench-smoke` builds the tiny size in SQLite and fails if a mechanism changes what a read returns.
+  `make bench-smoke` builds the tiny size in SQLite and fails if a mechanism changes what a read returns, or if a
+  bounded mechanism that decided no read by its candidates sent other statements than `today` beside its key
+  reads. `--statements FILE` writes every statement a run sent, to compare two checkouts byte for byte.
 
 The export checked in under `tests/bench/policies/` is a composed application of 147 definitions over 142
 models; its origin is recorded in its `skeleton.json`. Nothing in the benchmark is collected by pytest or run in

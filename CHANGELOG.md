@@ -206,9 +206,42 @@ pre-1.0; breaking changes within a minor version are explicitly called out.
 
 - Database check `rebac.W014`: the stored policy lets a name be read two ways (Changed).
 
+- **Bounded reads** (experimental, off by default, `REBAC_BOUNDED_READ`; proposal 0025). A list read whose own
+  conditions select at most 256 rows is decided by those rows: one statement reads their primary keys without the
+  permission (`LIMIT 257`, no ordering, no slice), the walk decides exactly those keys (`rebac.walk.decided_alone`:
+  one lookup per relation, and the compiled statement for a part it cannot read, bounded to the ids that reach
+  it, never for the read's own question or a permission of its type that reaches half of what it reaches), and
+  the read's own statement runs with the admitted keys in place of its
+  scope, its ordering and slice as written. With 257 keys, or wherever the rule (`rebac.bounded.refusal`) or the
+  walk cannot show the compiled statement's answer, the read sends its compiled statement unchanged. It never reads
+  a second batch. Served: iteration, `len()`, `bool()`, slicing and indexing, `get()`, `first()`, `last()`,
+  `earliest()`, `latest()`, `in_bulk()`, `values()`, `values_list()` and a prefetch's child read, over a scope the
+  same evaluation built, for a model whose identity is its integer primary key, whose rows the statement reads
+  once each, in an order that ends ties by the key (or one row at most). Not served: `count()`, `exists()`,
+  `aggregate()`, `iterator()`, `aiterator()`, `explain()`, writes, embeddings, set combinations,
+  `select_for_update()`, `distinct(*fields)`, aggregates, windows, `extra()`, hand-written SQL, a query nested in
+  the read, a join to many rows, a bypass, a stored override, an eager `scoped()` queryset. A question the walk
+  would hand whole to the compiled statement keeps its statement before any key is read
+  (`rebac.walk.compiler_part`, kept per policy). `True` decides only where the walk reads nothing of a candidate
+  but its key; `"identifiers"` also where it reads the foreign keys it follows from it and the subjects of its
+  grants. What it costs: up to 257 keys of rows the actor may not read (with `"identifiers"`, their foreign keys
+  and grant subjects too) enter the process and the walk's statement parameters (statement logs, SQL debug logs,
+  error reports); whether more than 256 rows, hidden ones included, match a read's conditions shows as latency;
+  and a read is several statements, so under READ COMMITTED it can be assembled from adjacent states. System check
+  **`rebac.W016`** says so while it is on. On the benchmark's application policy at the medium size (measured under load), one folder's files
+  for the reader with many grants took 76 ms against 1,427 ms today; with the other mechanisms on, one thread's
+  messages 581 against 1,888 ms and one message with everything shown 1,337 against 2,260 ms; alone, the setting
+  is slower on those two (the walk asks the compiled statement for the thread's permissions); `tasks` keeps its
+  statement (the guard), and every page of more than 256 rows sends one key read more. With the setting off no
+  statement changes.
+
 ### Changed
 
 - `rebac.E018` accepts `REBAC_TRACKED_MODELS` as a tuple of labels, as the library already read it.
+
+- The bounded walk reads the application clock through `rebac.clock.application_now`, as the compiled statement
+  does, where it had imported the function: a test that replaces the clock there is read the same way by both.
+  Nothing changes outside such a test.
 
 - `REBAC_RELATIONSHIP_MODEL`, `REBAC_DEFAULT_CONSISTENCY`, `REBAC_CACHE_ALIAS`, `REBAC_LOOKUP_CACHE_TTL` and
   `REBAC_GC_INTERVAL_SECONDS` are documented as what they are: reserved, not read by the library, and without

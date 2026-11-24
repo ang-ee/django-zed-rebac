@@ -35,6 +35,12 @@ Both modes leave a caveat context, an override, an anonymous actor and an actor
 that is a subject set to the compiled statement, so ``held`` returns the same
 set whatever the setting.
 
+``decided_alone`` answers a bounded read's question (``rebac.bounded``, proposal 0025),
+whatever the setting, as ``"decide"`` does, except that it never hands the question
+itself to the compiled statement, asks it one statement at most for any other part, and
+answers ``None`` where it would need more; the read then keeps its statement.
+``compiler_part`` says, from the policy alone, where that would be.
+
 A foreign key is read from its column: its target is taken to be a row, which
 the database guarantees for an enforced key once the transaction commits.
 
@@ -62,9 +68,9 @@ from typing import TYPE_CHECKING, Any, cast
 from django.db import models
 from django.db.models import Exists, Q
 
+from . import clock
 from ._id import _NATIVE_INTEGER_FIELDS, model_identity_fields, resource_id_attr
 from .actors import is_anonymous_actor
-from .clock import application_now
 from .codec import identity_codec
 from .field_backing import ResolvedFieldBacking, resolve_const_backing, resolve_field_backing
 from .resources import model_for_resource_type, stores_rows
@@ -119,6 +125,302 @@ def mode() -> str:
 
 def enabled() -> bool:
     return bool(mode())
+
+
+def decided_alone(
+    *,
+    backend: LocalBackend,
+    resource_type: str,
+    action: str,
+    actor: SubjectRef,
+    ids: Iterable[str],
+    using: str,
+    policy_key: Any,
+    keys_only: bool,
+) -> set[str] | None:
+    """Exactly the ids among ``ids`` on which the actor holds ``action``, decided by the walk
+    without handing that question to the compiled statement.
+
+    The walk may ask the compiled statement for another part of the permission, as ``"decide"``
+    does, for the ids that reach it, where that part's type stores rows and the ids are one
+    batch: one statement, bounded to those ids. ``None``
+    wherever the answer would need more: the question itself compiled (a part of its own union
+    the walk cannot read, ``compiler_part``), another permission of the question's type that
+    reaches half the relations the question reaches or more, compiled for the candidates the
+    walk's readable arms leave (it costs about what the question costs), a part on a type without
+    rows, a relation with more subject rows on the candidates than
+    ``_ROWS``, a candidate that is not a canonical identity, a policy other than the one whose key
+    is ``policy_key``, or an exclusion read while the fence closed. ``keys_only``: also wherever
+    a lookup would select a column of a candidate row other than its key (a foreign key it
+    follows, the subject of a grant on it that names a subject set or a parent); a part so
+    refused may still be compiled, which reads it inside the database. A candidate that is no
+    row of the type, or that the fence does not admit, is not held: the compiled statement,
+    fenced the same way, selects no such row. For a bounded read (``rebac.bounded``, proposal
+    0025), which keeps its compiled statement wherever this is ``None``.
+    """
+    walk = _walk(backend, actor, using, None)
+    if walk is None or walk.policy.key != policy_key:
+        return None
+    walk.question = (resource_type, action)
+    candidates = set(ids)
+    if keys_only:
+        walk.candidates = (resource_type, frozenset(candidates))
+    rows = walk.existing(resource_type, candidates)
+    if rows is None:
+        return None
+    found = walk.exact(resource_type, action, rows, frozenset(), negated=False)
+    if found is None or (walk.excluded and not walk.open()):
+        return None
+    return found
+
+
+def compiler_part(
+    policy: Any, resource_type: str, action: str, *, keys_only: bool = False
+) -> str | None:
+    """Why ``decided_alone`` could not decide ``action`` on ``resource_type`` under ``policy``,
+    from the policy alone; ``None`` where it can, save what depends on the rows.
+
+    The walk hands a part it cannot read to the compiled statement: a recursive or caveated
+    part whole, a relation or a permission whose union holds an arm it cannot read (a backing
+    it does not read, a wildcard, fixed or caveated subject it cannot follow), and below an
+    exclusion the nearest permission above it. Named here: the question itself handed over (the
+    compiled statement then costs what the read's own statement costs), and any part on a type
+    that stores no rows (asked in batches of point checks). ``keys_only``: a lookup on the
+    candidates that would select another of their columns counts as a part the walk cannot read.
+    An override, or a name read two ways, refuses the policy. Kept on the policy
+    (``compile.read._Policy.walked``).
+    """
+    question = (resource_type, action, keys_only)
+    kept: dict[tuple[str, str, bool], str | None] = policy.walked
+    if question not in kept:
+        if policy.tagged.arms or policy.tagged.sites:
+            found: str | None = "an override retags the policy"
+        elif policy.name_conflicts:
+            found = "the policy reads a name two ways"
+        else:
+            reading = _Reading(
+                policy.schema, policy.program, (resource_type, action), keys_only=keys_only
+            )
+            found = reading.handed((resource_type, action), frozenset(), asked=True)
+        kept[question] = found
+    return kept[question]
+
+
+class _Reading:
+    """``compiler_part``'s reading of a policy: the walk's structure, without its rows.
+
+    ``asked`` marks the ids of the question itself, the candidate rows, of which a key-only
+    reading reads nothing but the key.
+    """
+
+    def __init__(self, schema: Any, program: Any, question: Key, *, keys_only: bool) -> None:
+        self.schema = schema
+        self.program = program
+        self.question = question
+        self.keys_only = keys_only
+
+    def handed(self, key: Key, path: frozenset[Key], *, asked: bool) -> str | None:
+        """Why ``_Walk._evaluate`` would ask the compiled statement for ``key`` itself, outside
+        an exclusion; ``None`` where it reads ``key``, maybe asking for deeper parts."""
+        if key not in self.program.dependencies:
+            return None
+        name = f"{key[0]}#{key[1]}"
+        if key in path or _handed_over(self.schema, self.program, key):
+            return f"{name} is recursive or admits a caveated subject"
+        definition = self.schema.get_definition(key[0])
+        if definition is None:
+            return None
+        path = path | {key}
+        relation = next((r for r in definition.relations if r.name == key[1]), None)
+        if relation is not None:
+            return self.through(definition, relation, None, path, negated=False, asked=asked)
+        permission = self.schema.get_permission(*key)
+        arms = _flat_union(permission.expression) if permission is not None else ()
+        for arm in arms:
+            found = self.expression(definition, arm, path, negated=False, asked=asked)
+            if found is not None:
+                return found
+        return None
+
+    def exact(self, key: Key, path: frozenset[Key], *, negated: bool, asked: bool) -> str | None:
+        """Why ``_Walk.exact`` would answer ``None``: below an exclusion, any part it cannot
+        read; outside one, the question compiled or a compiled part on a type without rows."""
+        asked = asked and self.keys_only
+        if key not in self.program.dependencies:
+            return None
+        if not negated:
+            found = self.handed(key, path, asked=asked)
+            if found is None:
+                return None
+            if key == self.question:
+                return found
+            model = model_for_resource_type(key[0])
+            if model is None or not stores_rows(model):
+                return (
+                    found
+                    if "stores no rows" in found
+                    else f"{found}, on {key[0]}, which stores no rows"
+                )
+            return None
+        name = f"{key[0]}#{key[1]}"
+        if key in path or _handed_over(self.schema, self.program, key):
+            return f"{name} is recursive or admits a caveated subject, below an exclusion"
+        definition = self.schema.get_definition(key[0])
+        if definition is None:
+            return None
+        path = path | {key}
+        relation = next((r for r in definition.relations if r.name == key[1]), None)
+        if relation is not None:
+            return self.through(definition, relation, None, path, negated=True, asked=asked)
+        permission = self.schema.get_permission(*key)
+        arms = _flat_union(permission.expression) if permission is not None else ()
+        for arm in arms:
+            found = self.expression(definition, arm, path, negated=True, asked=asked)
+            if found is not None:
+                return found
+        return None
+
+    def expression(
+        self,
+        definition: Definition,
+        expr: PermExpr,
+        path: frozenset[Key],
+        *,
+        negated: bool,
+        asked: bool,
+    ) -> str | None:
+        """Why ``_Walk._expression`` would answer ``None``."""
+        if isinstance(expr, PermNil):
+            return None
+        if isinstance(expr, PermRef):
+            if expr.name in ("authenticated", "anonymous"):
+                return None
+            return self.exact(
+                (definition.resource_type, expr.name), path, negated=negated, asked=asked
+            )
+        if isinstance(expr, PermArrow):
+            relation = next((r for r in definition.relations if r.name == expr.via), None)
+            if relation is None:
+                return None
+            return self.through(
+                definition, relation, expr.target, path, negated=negated, asked=asked
+            )
+        if not isinstance(expr, PermBinOp) or expr.op not in ("+", "&", "-"):
+            return f"an expression on {definition.resource_type} the walk does not read"
+        return self.expression(
+            definition, expr.left, path, negated=negated, asked=asked
+        ) or self.expression(
+            definition, expr.right, path, negated=negated or expr.op == "-", asked=asked
+        )
+
+    def through(
+        self,
+        definition: Definition,
+        relation: Relation,
+        target: str | None,
+        path: frozenset[Key],
+        *,
+        negated: bool,
+        asked: bool,
+    ) -> str | None:
+        """Why ``_Walk._through`` would answer ``None``."""
+        asked = asked and self.keys_only
+        name = f"{definition.resource_type}#{relation.name}"
+        backing = relation.backing
+        constant = None
+        if isinstance(backing, FieldBinding):
+            if asked:
+                return f"{name}: a foreign key of the rows asked about, which is not their key"
+            obstacle = backing_obstacle(definition, relation)
+            if obstacle is not None:
+                return f"{name}: {obstacle}"
+        elif isinstance(backing, ConstBinding):
+            constant = resolve_const_backing(definition, relation)
+            if constant is None or len(relation.allowed_subjects) != 1:
+                return f"{name}: a constant the walk does not read"
+        elif backing is not None:
+            return f"{name}: an attribute, generic or path backing"
+        if backing is not None:
+            [allowed] = relation.allowed_subjects
+            if allowed.wildcard or allowed.id or allowed.with_caveat:
+                return f"{name}: a wildcard, fixed or caveated subject"
+            if allowed.relation and not _declares(self.schema, allowed.type, allowed.relation):
+                return None
+            if (
+                constant is not None
+                and constant.filters
+                and _integer_identity(constant.source_model) is None
+            ):
+                return f"{name}: a filtered constant on a key that is not an integer"
+            followed = target if target is not None else (allowed.relation or None)
+            if followed is None:
+                return None
+            return self.exact((allowed.type, followed), path, negated=negated, asked=False)
+        through = _stored_through(self.schema, relation, target)
+        if through is None:
+            return f"{name}: a caveated subject, or a wildcard or fixed id followed through"
+        if through and asked:
+            return f"{name}: a subject set or a parent named on the rows asked about"
+        for subject_type, subject_relation in sorted(through):
+            followed = target if target is not None else subject_relation
+            found = self.exact((subject_type, followed), path, negated=negated, asked=False)
+            if found is not None:
+                return found
+        return None
+
+
+def _reach(policy: Any, key: Key) -> int:
+    """How many relations ``key`` reaches in ``policy``, itself included: the size of the id sets
+    its compiled statement builds."""
+    program, schema = policy.program, policy.schema
+    nodes = {key} | (program.reachable(key) if key in program.dependencies else frozenset())
+    return sum(
+        1
+        for resource_type, name in nodes
+        if (definition := schema.get_definition(resource_type)) is not None
+        and any(relation.name == name for relation in definition.relations)
+    )
+
+
+def _handed_over(schema: Any, program: Any, key: Key) -> bool:
+    """Whether ``key`` is the compiler's to read whole (``_Walk.handed_over``)."""
+    if key in program.recursive or key in program.alias_cycles:
+        return True
+    definition = schema.get_definition(key[0])
+    relation = (
+        next((r for r in definition.relations if r.name == key[1]), None) if definition else None
+    )
+    return relation is not None and any(
+        allowed.with_caveat for allowed in relation.allowed_subjects
+    )
+
+
+def _declares(schema: Any, resource_type: str, name: str) -> bool:
+    """Whether ``resource_type`` declares the relation ``name``."""
+    definition = schema.get_definition(resource_type)
+    return definition is not None and any(r.name == name for r in definition.relations)
+
+
+def _stored_through(schema: Any, relation: Relation, target: str | None) -> set[Key] | None:
+    """The ``(subject type, subject relation)`` shapes whose subjects a stored relation's rows are
+    followed to (the relation is empty for an arrow); ``None`` for a shape the walk does not read:
+    a caveated subject, a wildcard or a fixed id on a subject set or an arrow
+    (``_Walk.stored_shapes``)."""
+    through: set[Key] = set()
+    for allowed in relation.allowed_subjects:
+        if allowed.with_caveat:
+            return None
+        if allowed.relation and not _declares(schema, allowed.type, allowed.relation):
+            continue
+        if target is not None:
+            if allowed.relation or allowed.wildcard or allowed.id:
+                return None
+            through.add((allowed.type, ""))
+        elif allowed.relation:
+            if allowed.wildcard or allowed.id:
+                return None
+            through.add((allowed.type, allowed.relation))
+    return through
 
 
 def _walk(
@@ -249,12 +551,35 @@ class _Walk:
         # Whether an exclusion was read: its lookups are fenced, and a fence that
         # closed under them would have excluded nobody (``decided_many``).
         self.excluded = False
+        # The question of a bounded read (``decided_alone``): never handed to the compiled
+        # statement, which is asked only one statement for any other part.
+        self.question: Key | None = None
+        # The rows a key-only question asks about, by type: no lookup selects a column of
+        # theirs but the key (``decided_alone``).
+        self.candidates: tuple[str, frozenset[str]] | None = None
         from .compile.read import _fence
 
         # Every lookup reads nothing while the published policy revision is not
         # this policy's: the walk then answers nothing, and the compiled
         # statement, fenced the same way, denies.
         self.fence = Q(Exists(_fence(policy, backend=backend, using=using, parametric=False)))
+
+    def _as_costly_as_the_question(self, key: Key) -> bool:
+        """Whether ``key`` is a permission of the question's type that reaches at least half the
+        relations the question reaches: compiled for the candidates, its statement costs about
+        what the read's own costs (``decided_alone``, proposal 0025)."""
+        assert self.question is not None
+        if key[0] != self.question[0] or self.schema.get_permission(*key) is None:
+            return False
+        return 2 * _reach(self.policy, key) >= _reach(self.policy, self.question)
+
+    def _asked(self, resource_type: str, ids: set[str]) -> bool:
+        """Whether ``ids`` include a row a key-only question asks about."""
+        return (
+            self.candidates is not None
+            and resource_type == self.candidates[0]
+            and not self.candidates[1].isdisjoint(ids)
+        )
 
     def open(self) -> bool:
         """Whether the fence admits reads now, for a question that makes no lookup of its own."""
@@ -303,17 +628,7 @@ class _Walk:
         subject, what holds and what may hold differ, and the walk reads one
         answer for both.
         """
-        if key in self.program.recursive or key in self.program.alias_cycles:
-            return True
-        definition = self.schema.get_definition(key[0])
-        relation = (
-            next((r for r in definition.relations if r.name == key[1]), None)
-            if definition
-            else None
-        )
-        return relation is not None and any(
-            allowed.with_caveat for allowed in relation.allowed_subjects
-        )
+        return _handed_over(self.schema, self.program, key)
 
     def _reaches_compiler(self, key: Key) -> bool:
         """Whether reading ``key`` may ask the compiler: such arms are read last."""
@@ -420,6 +735,14 @@ class _Walk:
         from .compile.read import held
 
         model = model_for_resource_type(key[0])
+        if self.question is not None and (
+            key == self.question
+            or self._as_costly_as_the_question(key)
+            or model is None
+            or not stores_rows(model)
+            or len(ids) > _CHUNK
+        ):
+            return None
         if model is not None and stores_rows(model):
             codec = identity_codec(model, resource_id_attr(model))
             if not all(codec.is_canonical(value, using=self.using) for value in ids):
@@ -503,6 +826,9 @@ class _Walk:
         path: frozenset[Key],
         negated: bool,
     ) -> set[str] | None:
+        if self._asked(definition.resource_type, ids):
+            # It would select the foreign key of a row asked about.
+            return None
         backed = self._backed(definition, relation)
         if backed is None:
             return None
@@ -593,9 +919,12 @@ class _Walk:
         if read_as is None:
             return None
         named, through = read_as
+        if through and self._asked(definition.resource_type, ids):
+            # It would select the subjects of grants on a row asked about.
+            return None
         live = Q(expires_at__isnull=True)
         if relation.with_expiration:
-            live |= Q(expires_at__gt=application_now())
+            live |= Q(expires_at__gt=clock.application_now())
         rows = (
             _relationships()
             .objects.using(self.using)
@@ -665,24 +994,17 @@ class _Walk:
         ``None`` for a shape the walk does not read: a caveated subject, a
         wildcard or a fixed id on a subject set or an arrow. The walk and the row
         scope both read a stored relation through this, so they cannot come to
-        read the same policy differently.
+        read the same policy differently; ``compiler_part`` reads ``through`` the
+        same way (``_stored_through``).
         """
+        through = _stored_through(self.schema, relation, target)
+        if through is None:
+            return None
         named: set[str] = set()
-        through: set[Key] = set()
-        for allowed in relation.allowed_subjects:
-            if allowed.with_caveat:
-                return None
-            if allowed.relation and not self._is_relation(allowed.type, allowed.relation):
-                continue
-            if target is not None:
-                if allowed.relation or allowed.wildcard or allowed.id:
-                    return None
-                through.add((allowed.type, ""))
-            elif allowed.relation:
-                if allowed.wildcard or allowed.id:
-                    return None
-                through.add((allowed.type, allowed.relation))
-            elif allowed.type == self.actor.subject_type:
+        if target is None:
+            for allowed in relation.allowed_subjects:
+                if allowed.relation or allowed.type != self.actor.subject_type:
+                    continue
                 if allowed.wildcard:
                     named.add("*")
                 elif not allowed.id or allowed.id == self.actor.subject_id:
@@ -690,8 +1012,7 @@ class _Walk:
         return named, through
 
     def _is_relation(self, resource_type: str, name: str) -> bool:
-        definition = self.schema.get_definition(resource_type)
-        return definition is not None and any(r.name == name for r in definition.relations)
+        return _declares(self.schema, resource_type, name)
 
     # ---------- Proving: what a few lookups show, and no more ----------
 
@@ -757,7 +1078,7 @@ class _Walk:
             return set()
         live = Q(expires_at__isnull=True)
         if relation.with_expiration:
-            live |= Q(expires_at__gt=application_now())
+            live |= Q(expires_at__gt=clock.application_now())
         rows = (
             _relationships()
             .objects.using(self.using)
