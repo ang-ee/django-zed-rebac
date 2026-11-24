@@ -43,11 +43,12 @@ _DEFAULTS: dict[str, Any] = {
     # settles the ids a grant on the row, a column or a parent shows held; "decide" reads the
     # whole permission and answers no as well.
     "REBAC_BOUNDED_WALK": False,
-    # Decide a list read whose own conditions select at most 256 rows by those rows: their keys
-    # are read without the permission, the walk decides them, and the rows it admits are read by
-    # key (proposal 0025). Experimental. True: only where the walk reads nothing of those rows
-    # but their keys. "identifiers": also where it reads the foreign keys it follows and the
-    # subjects of their grants. Off: every list read carries its compiled scope.
+    # Decide a list read whose conditions name only keys the reader holds and select at most 256
+    # rows by those rows: their keys are read without the permission, the walk decides them, and
+    # the rows it admits are read by key (proposal 0025). Experimental. True: only where the walk
+    # reads nothing of those rows but their keys. "identifiers": also where it reads the foreign
+    # keys it follows and the subjects of their grants. Off: every list read carries its
+    # compiled scope.
     "REBAC_BOUNDED_READ": False,
     # Write a queryset's scope as conditions on each of its rows instead of membership in the
     # ids the actor holds (proposal 0020). "named": only where the queryset's own conditions bind

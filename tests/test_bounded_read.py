@@ -1,12 +1,15 @@
 """Bounded reads (proposal 0025): a narrow list read decided by its candidate rows.
 
-With ``REBAC_BOUNDED_READ`` on, a list read whose own conditions select at most 256 rows
-reads their keys without the permission, the walk decides exactly those keys, and the read's
-own statement runs with the admitted keys in place of its scope. Here: the same rows, order,
-slices and downstream work as the compiled statement over random policies, both storage
-layouts and both modes; the eligibility rule, under which every read it refuses sends the
-compiled statement byte for byte; the guard against the walk's compiled parts; the decision
-rule of 0.38.0; what crosses into the process; the statement count; and inertness when off.
+With ``REBAC_BOUNDED_READ`` on, a list read whose conditions are all on the model's own key or
+foreign keys, and select at most 256 rows, reads their keys without the permission, the walk
+decides exactly those keys, and the read's own statement runs with the admitted keys in place
+of its scope. Here: the same rows, order, slices and downstream work as the compiled statement
+over random policies, both storage layouts and both modes; the eligibility rule, under which
+every read it refuses sends the compiled statement byte for byte, each refusal asserted by the
+reason the library logs; what the key read and the walk select from model tables; what a reader
+can still learn from the statements a read sends, pinned by their counts; the statements of one
+read under a concurrent commit; the guard and the cost rule against the walk's compiled parts;
+the decision rule of 0.38.0; the statement count; and inertness when off.
 """
 
 from __future__ import annotations
@@ -14,6 +17,7 @@ from __future__ import annotations
 import logging
 import random
 import re
+import threading
 from collections.abc import Callable
 from typing import Any
 
@@ -25,14 +29,20 @@ from django.db.models import (
     Exists,
     F,
     FilteredRelation,
+    IntegerField,
     OuterRef,
     Prefetch,
     Q,
     Subquery,
+    Value,
+    Window,
 )
 from django.db.models.expressions import RawSQL
-from django.db.models.functions import Random
-from django.test.utils import CaptureQueriesContext
+from django.db.models.functions import Abs, Random, RowNumber
+from django.db.models.lookups import Exact
+from django.db.models.query import ModelIterable
+from django.test import override_settings
+from django.test.utils import CaptureQueriesContext, register_lookup
 
 from rebac import (
     MissingActorError,
@@ -48,6 +58,7 @@ from rebac import (
     walk,
 )
 from rebac.managers import _ScopeWhere
+from rebac.snapshot import read_snapshot
 from rebac.testing import install_schema
 from tests.backend_setup import sqlite_alias
 from tests.mechanism_policies import application_shaped, label_threads, seeds
@@ -155,18 +166,28 @@ def probes(statements: list[tuple[str, Any]], table: str) -> list[str]:
     ]
 
 
-def compiled(statements: list[tuple[str, Any]]) -> list[str]:
-    """The statements that carry a compiled scope: an id set or a recursion."""
-    return [sql for sql, _ in statements if "rebac_ids" in sql or sql.startswith("WITH")]
+def compiled(statements: list[tuple[str, Any]], table: str | None = None) -> list[str]:
+    """The statements that carry a compiled scope (an id set or a recursion); with ``table``,
+    those whose own rows are that table's: a read of it, not of another table."""
+    own = re.compile(
+        rf'SELECT (?:DISTINCT )?"{table}"\."\w+"(?: AS "\w+")?(?:, "\w+"\."\w+"(?: AS "\w+")?)*'
+        rf' FROM "{table}"'
+    )
+    return [
+        sql
+        for sql, _ in statements
+        if ("rebac_ids" in sql or sql.startswith("WITH")) and (table is None or own.search(sql))
+    ]
 
 
 def both(read: Callable[[], Any], settings: Any, mode: Any = "identifiers"):
-    """The read with the setting off and on: both outcomes must agree."""
-    settings.REBAC_BOUNDED_READ = False
-    expected, today = captured(read)
-    settings.REBAC_BOUNDED_READ = mode
-    found, statements = captured(read)
-    settings.REBAC_BOUNDED_READ = False
+    """The read with the setting off and on: both outcomes must agree. (The setting is entered
+    and left by ``override_settings``: the ``settings`` fixture keeps one more holder for each
+    assignment, and a thousand of them exhaust the recursion limit.)"""
+    with override_settings(REBAC_BOUNDED_READ=False):
+        expected, today = captured(read)
+    with override_settings(REBAC_BOUNDED_READ=mode):
+        found, statements = captured(read)
     assert found == expected
     return expected, today, statements
 
@@ -175,16 +196,38 @@ def messages(actor: SubjectRef = MEMBER):
     return ScopeMessage.objects.with_actor(actor)
 
 
+def threads(actor: SubjectRef = MEMBER):
+    return ScopeThread.objects.with_actor(actor)
+
+
+def parent_check(keys: list[int], actor: SubjectRef = MEMBER) -> str:
+    """The statement the reader's own read of those threads sends today: what a bounded read
+    sends first to check the parents it names."""
+    with override_settings(REBAC_BOUNDED_READ=False):
+        _result, statements = captured(
+            lambda: list(
+                threads(actor).filter(pk__in=sorted(keys)).order_by().values_list("pk", flat=True)
+            )
+        )
+    [(sql, _params)] = statements
+    return sql
+
+
 # ---------- A narrow read, decided by its candidates ----------
 
 
 def test_a_narrow_read_is_decided_by_its_candidates(local, settings):
+    """Messages of thread 1, which the member may read: the reader's own read of thread 1
+    first, then the key read, the walk's lookups and the rows. No compiled read of messages."""
     result, today, statements = both(
         lambda: list(messages().filter(thread_id=1).order_by("pk")), settings
     )
     assert result == ("returned", [(n, n, 1) for n in (1, 2, 3, 4)])
-    assert compiled(today) and not compiled(statements)
+    assert compiled(today, "testapp_scopemessage")
+    assert not compiled(statements, "testapp_scopemessage")
+    assert statements[0][0] == parent_check([1])
     [probe] = probes(statements, "testapp_scopemessage")
+    assert probe == statements[1][0]
     # The read's own conditions, no ordering, no slice, the key column alone.
     assert probe == (
         'SELECT "testapp_scopemessage"."id" AS "pk" FROM "testapp_scopemessage" '
@@ -196,50 +239,98 @@ def test_a_narrow_read_is_decided_by_its_candidates(local, settings):
     assert '"testapp_scopemessage"."id" IN (' in final and "ORDER BY" in final
 
 
-def test_the_rows_are_read_in_the_reads_order_with_its_slice_taken_after_the_decision(
-    local, settings
-):
-    # Messages 1-4 and 5 are readable, 6 and 7 not; 7 sorts first descending.
+def test_the_key_read_is_the_tables_keys_under_the_reads_conditions(local, settings):
+    """No join, ordering, slice, projection or distinct of the read reaches the key read: it
+    reads the model's own table under the read's conditions, which are on keys alone."""
+    expected = (
+        'SELECT "testapp_scopemessage"."id" AS "pk" FROM "testapp_scopemessage" '
+        'WHERE "testapp_scopemessage"."thread_id" IN ({}) LIMIT 257'
+    )
     for read in (
-        lambda: list(messages().order_by("-pk")[:2]),
-        lambda: list(messages().order_by("-pk")[1:3]),
-        lambda: list(messages().order_by("pk")[3:]),
-        lambda: messages().order_by("-pk")[0],
-        lambda: messages().order_by("-thread_id", "pk")[:3],
+        lambda: list(messages().filter(thread_id__in=[1]).order_by("thread__label", "-pk")[1:3]),
+        lambda: list(
+            messages().filter(thread_id__in=[1]).order_by("pk").values_list("pk", "thread__label")
+        ),
+        lambda: list(
+            messages().filter(thread_id__in=[1]).annotate(label=F("thread__label")).order_by("pk")
+        ),
+        lambda: list(messages().filter(thread_id__in=[1]).select_related("thread").order_by("pk")),
+        lambda: list(messages().filter(thread_id__in=[1]).order_by("pk").distinct()),
+    ):
+        _result, _today, statements = both(read, settings)
+        [probe] = probes(statements, "testapp_scopemessage")
+        assert probe == statements[1][0]
+        if connection.vendor == "sqlite":
+            assert probe == expected.format("1")
+        else:
+            assert probe == expected.format("%s") or probe == expected.format("1"), probe
+
+
+def test_the_rows_are_read_in_the_reads_order_with_its_slice_taken_after_the_decision(settings):
+    """Thread 1 is readable; of its messages 1-12 the member may read the odd ones by a direct
+    grant and not the even ones (``LEAKS``): slices before and after the first row, indexing
+    and descending orders read today's rows in today's order."""
+    local = install_schema(LEAKS)
+    ScopeThread._base_manager.bulk_create([ScopeThread(id=1)])
+    ScopeMessage._base_manager.bulk_create([ScopeMessage(id=n, thread_id=1) for n in range(1, 13)])
+    local.write_relationships(
+        [grant("scope/thread", 1, "reader")]
+        + [grant("scope/message", n, "direct") for n in range(1, 13, 2)]
+    )
+
+    def in_thread():
+        return messages().filter(thread_id=1)
+
+    for read in (
+        lambda: list(in_thread().order_by("-pk")[:2]),
+        lambda: list(in_thread().order_by("-pk")[1:3]),
+        lambda: list(in_thread().order_by("pk")[3:]),
+        lambda: in_thread().order_by("-pk")[0],
+        lambda: in_thread().order_by("-thread_id", "pk")[:3],
     ):
         result, _today, statements = both(read, settings)
         assert result[0] == "returned"
-        assert probes(statements, "testapp_scopemessage") and not compiled(statements)
-    assert both(lambda: list(messages().order_by("-pk")[:2]), settings)[0] == (
+        assert probes(statements, "testapp_scopemessage")
+        assert not compiled(statements, "testapp_scopemessage")
+    assert both(lambda: list(in_thread().order_by("-pk")[:2]), settings)[0] == (
         "returned",
-        [(5, 5, 2), (4, 4, 1)],
+        [(11, 11, 1), (9, 9, 1)],
     )
 
 
 @pytest.mark.parametrize(
     "read",
     [
-        pytest.param(lambda: messages().get(pk=2), id="get"),
-        pytest.param(lambda: messages().get(pk=6), id="get-hidden"),
-        pytest.param(lambda: messages().first(), id="first"),
-        pytest.param(lambda: messages().last(), id="last"),
-        pytest.param(lambda: messages().order_by("pk").last(), id="last-ordered"),
-        pytest.param(lambda: messages().in_bulk([6]), id="in_bulk-one"),
-        pytest.param(lambda: len(messages().filter(thread_id=2).order_by("pk")), id="len"),
-        pytest.param(lambda: bool(messages().filter(thread_id=2, pk=6)), id="bool"),
+        pytest.param(lambda: messages().filter(thread_id=1).order_by("-pk")[:1].get(), id="get"),
+        pytest.param(lambda: messages().filter(thread_id=1).first(), id="first"),
+        pytest.param(lambda: messages().filter(thread_id=1).last(), id="last"),
+        pytest.param(lambda: messages().filter(thread_id=1).earliest("pk"), id="earliest"),
+        pytest.param(lambda: messages().filter(thread_id=1).order_by("pk")[2], id="index"),
+        pytest.param(lambda: len(messages().filter(thread_id=1).order_by("pk")), id="len"),
+        pytest.param(lambda: bool(messages().filter(thread_id=1).order_by("pk")), id="bool"),
         pytest.param(
-            lambda: list(messages().order_by("pk").values_list("pk", flat=True)), id="values_list"
+            lambda: list(
+                messages().filter(thread_id=1).order_by("pk").values_list("pk", flat=True)
+            ),
+            id="values_list",
         ),
         pytest.param(
-            lambda: list(messages().order_by("-pk").values("pk", "thread_id")), id="values"
+            lambda: list(messages().filter(thread_id=1).order_by("-pk").values("pk", "thread_id")),
+            id="values",
         ),
         pytest.param(
-            lambda: list(messages().order_by("pk").values_list("pk", "thread__label", named=True)),
+            lambda: list(
+                messages()
+                .filter(thread_id=1)
+                .order_by("pk")
+                .values_list("pk", "thread__label", named=True)
+            ),
             id="named-values",
         ),
         pytest.param(
             lambda: [
-                (m.pk, m.thread.pk) for m in messages().select_related("thread").order_by("pk")
+                (m.pk, m.thread.pk)
+                for m in messages().filter(thread_id=1).select_related("thread").order_by("pk")
             ],
             id="select_related",
         ),
@@ -248,31 +339,72 @@ def test_the_rows_are_read_in_the_reads_order_with_its_slice_taken_after_the_dec
         ),
         pytest.param(
             lambda: list(
-                messages().annotate(double=F("pk") * 2).filter(double__gt=4).order_by("pk")
+                messages()
+                .filter(thread_id=1)
+                .annotate(double=F("pk") * 2)
+                .order_by("-double", "pk")
             ),
-            id="annotation",
+            id="annotation, ordered by it",
+        ),
+        pytest.param(
+            lambda: list(messages().filter(thread=ScopeThread(pk=1)).order_by("pk")),
+            id="a foreign key by its object",
+        ),
+        pytest.param(
+            lambda: list(messages().filter(thread__pk=1).order_by("pk")),
+            id="a foreign key by its target's key",
+        ),
+        pytest.param(
+            lambda: [m.pk for m in threads().get(pk=1).scopemessage_set.order_by("pk")],
+            id="related manager",
         ),
     ],
 )
 def test_each_entry_point_reads_what_the_compiled_statement_reads(local, settings, read):
     result, _today, statements = both(read, settings)
-    # Each is decided by its candidates: no compiled scope is sent.
+    # Each is decided by its candidates: no compiled read of messages is sent.
     assert probes(statements, "testapp_scopemessage"), result
-    assert not compiled(statements), result
+    assert not compiled(statements, "testapp_scopemessage"), result
+
+
+def test_a_forward_prefetch_of_referred_rows_is_decided_by_its_candidates(local, settings):
+    """Django reads a forward foreign key's prefetch as ``pk IN ((1,),)`` (``TupleIn``): the
+    related rows' own keys, which the rule reads as ``pk IN (1)``. The reader holds key 1:
+    the messages this evaluation read refer to it."""
+    result, _today, statements = both(
+        lambda: [
+            (m.pk, m.thread.pk, m.thread.label)
+            for m in messages().filter(thread_id=1).order_by("pk").rebac_prefetch_related("thread")
+        ],
+        settings,
+    )
+    assert result == ("returned", [[n, 1, "thread"] for n in (1, 2, 3, 4)])
+    assert probes(statements, "testapp_scopemessage") and probes(statements, "testapp_scopethread")
+    assert not compiled(statements, "testapp_scopemessage")
+    # The one compiled read of threads is the check of thread 1, the messages' parent.
+    assert compiled(statements, "testapp_scopethread") == [parent_check([1])]
 
 
 def test_a_guarded_join_is_guarded_as_ever(local, settings):
-    """``rebac_select_related()`` refuses a joined thread the member may not read: message 5
-    is readable through its direct grant, its thread is not."""
+    """``rebac_select_related()`` refuses a joined thread the member may not read: part 5's
+    message is readable through its direct grant, its thread is not."""
     result, _today, statements = both(
-        lambda: list(messages().rebac_select_related("thread").order_by("pk")), settings
+        lambda: list(
+            ScopePart.objects.with_actor(MEMBER)
+            .filter(message_id=5)
+            .rebac_select_related("message__thread")
+            .order_by("pk")
+        ),
+        settings,
     )
     assert result[:2] == ("raised", "PermissionDenied")
-    assert probes(statements, "testapp_scopemessage")
+    assert probes(statements, "testapp_scopepart")
 
 
 def test_prefetched_children_are_decided_by_their_candidates_too(local, settings):
-    """A prefetch whose queryset ends ties by the key: its children are decided as any read."""
+    """A prefetch whose queryset ends ties by the key: its children are decided as any read,
+    their parents proven by the evaluation that read them, with no statement of its own. The
+    threads themselves, read by no condition, keep their statement."""
 
     def read():
         threads = (
@@ -294,10 +426,14 @@ def test_prefetched_children_are_decided_by_their_candidates_too(local, settings
             for thread in threads
         }
 
-    result, _today, statements = both(read, settings)
+    result, today, statements = both(read, settings)
     assert result == ("returned", {1: {4: [4], 3: [3], 2: [2], 1: [1]}})
     assert probes(statements, "testapp_scopemessage") and probes(statements, "testapp_scopepart")
-    assert not compiled(statements)
+    assert not compiled(statements, "testapp_scopemessage")
+    assert not compiled(statements, "testapp_scopepart")
+    # The threads' own statement, and then no check of a parent: the prefetch admitted them.
+    assert statements[0] == today[0]
+    assert len(compiled(statements)) == 1
 
 
 def test_unordered_children_keep_their_statement(local, settings):
@@ -314,34 +450,52 @@ def test_unordered_children_keep_their_statement(local, settings):
 
     result, _today, statements = both(read, settings)
     assert result[0] == "returned"
-    assert probes(statements, "testapp_scopethread")
-    assert not probes(statements, "testapp_scopemessage") and compiled(statements)
+    assert not probes(statements, "testapp_scopemessage")
+    assert compiled(statements, "testapp_scopemessage")
 
 
-def test_structural_delivery_comes_first(local, settings):
-    """A child query the running prefetch delivers carries no scope to replace."""
+def test_structural_delivery_comes_first(local, settings, caplog):
+    """A child query the running prefetch delivers carries no scope to replace. (Its children
+    are ordered by the key, so that nothing else refuses it.)"""
     settings.REBAC_STRUCTURAL_PREFETCH = True
 
     def read():
         threads = (
             ScopeThread.objects.with_actor(MEMBER)
+            .filter(pk__in=[1, 2])
             .order_by("pk")
-            .rebac_prefetch_related("scopemessage_set")
+            .rebac_prefetch_related(
+                Prefetch("scopemessage_set", queryset=messages().order_by("pk"))
+            )
         )
         return {thread.pk: [m.pk for m in thread.scopemessage_set.all()] for thread in threads}
 
-    result, _today, statements = both(read, settings)
+    with caplog.at_level(logging.DEBUG, logger="rebac.bounded"):
+        result, _today, statements = both(read, settings)
     assert result == ("returned", {1: [1, 2, 3, 4]})
     assert not probes(statements, "testapp_scopemessage")
+    assert any(
+        "keeps its statement: it carries no compiled scope" in message for message in logged(caplog)
+    ), logged(caplog)
 
 
 # ---------- The bound ----------
+
+
+def analyzed() -> None:
+    """After a bulk load inside the test's transaction: on PostgreSQL the planner has no
+    statistics for it, and nests loops over the whole load (a statement of minutes, holding the
+    test's locks after the test times out). As ``test_read_contract`` does."""
+    if connection.vendor == "postgresql":
+        with connection.cursor() as cursor:
+            cursor.execute("ANALYZE")
 
 
 def fill(thread: int, count: int, start: int = 100) -> None:
     ScopeMessage._base_manager.bulk_create(
         [ScopeMessage(id=start + n, thread_id=thread) for n in range(count)]
     )
+    analyzed()
 
 
 @pytest.mark.parametrize(("count", "served"), [(256, True), (257, False)])
@@ -356,31 +510,43 @@ def test_a_read_past_the_bound_sends_the_compiled_statement_unchanged(
     assert result == ("returned", [100 + count - 5, 100 + count - 6, 100 + count - 7])
     [probe] = probes(statements, "testapp_scopemessage")
     if served:
-        assert not compiled(statements)
+        assert not compiled(statements, "testapp_scopemessage")
     else:
-        # The key read, then the compiled read, byte for byte: never a second batch.
-        assert statements == [(probe, statements[0][1]), *today]
+        # The check of thread 1, the key read, then the compiled read, byte for byte: never a
+        # second batch.
+        assert [sql for sql, _ in statements] == [parent_check([1]), probe, *(s for s, _ in today)]
 
 
 def test_the_statement_count_does_not_depend_on_the_candidates(local, settings):
-    """One key read, the walk's lookups, the rows: as many statements for 1 candidate as for 200."""
-    fill(2, 198)
+    """The check of the parent, one key read, the walk's lookups, the rows: as many statements
+    for 1 candidate as for 202. (Threads 1 and 4, both readable, are the parents.)"""
+    ScopeThread._base_manager.bulk_create([ScopeThread(id=4)])
+    ScopeMessage._base_manager.bulk_create([ScopeMessage(id=50, thread_id=4)])
+    local.write_relationships([grant("scope/thread", 4, "reader")])
+    fill(1, 198)
     settings.REBAC_BOUNDED_READ = "identifiers"
-    few = captured(lambda: list(messages().filter(thread_id=3).order_by("pk")))[1]
-    many = captured(lambda: list(messages().filter(thread_id=2).order_by("pk")))[1]
+    few = captured(lambda: list(messages().filter(thread_id=4).order_by("pk")))[1]
+    many = captured(lambda: list(messages().filter(thread_id=1).order_by("pk")))[1]
     assert len(probes(few, "testapp_scopemessage")) == len(probes(many, "testapp_scopemessage"))
     assert len(few) == len(many)
-    # The key read; the candidate rows; their threads; reader, the admin role, blocked; the
-    # hidden constant; the message's direct and editor grants; the rows.
+    # The thread; the key read; the candidate rows; their threads; reader, the admin role,
+    # blocked; the hidden constant; the rows.
     assert len(many) == 9, "\n".join(sql for sql, _ in many)
 
 
-def test_a_read_that_selects_nothing_sends_the_key_read_alone(local, settings):
+def test_a_read_that_selects_nothing_sends_the_check_and_the_key_read_alone(local, settings):
+    """Thread 4 is readable and holds no message."""
+    ScopeThread._base_manager.bulk_create([ScopeThread(id=4)])
+    local.write_relationships([grant("scope/thread", 4, "reader")])
     result, _today, statements = both(
-        lambda: list(messages().filter(thread_id=99).order_by("pk")), settings
+        lambda: list(messages().filter(thread_id=4).order_by("pk")), settings
     )
     assert result == ("returned", [])
-    assert len(statements) == 1 and probes(statements, "testapp_scopemessage")
+    assert [sql for sql, _ in statements] == [
+        parent_check([4]),
+        *probes(statements, "testapp_scopemessage"),
+    ]
+    assert len(statements) == 2
 
 
 # ---------- What a read must be: each refusal sends the compiled statement ----------
@@ -409,6 +575,38 @@ def _untimed(statements: list[tuple[str, Any]]) -> list[tuple[str, Any]]:
     ]
 
 
+def _transformed() -> Any:
+    with register_lookup(IntegerField, Abs):
+        return list(messages().filter(pk__abs=2).order_by("pk"))
+
+
+def _labelled() -> Any:
+    """A manager whose own queryset filters on a content column, as a default filter does."""
+
+    class Labelled(type(ScopeThread.objects)):  # type: ignore[misc]
+        def get_queryset(self) -> Any:
+            return super().get_queryset().filter(label="thread")
+
+    manager = Labelled()
+    manager.model = ScopeThread
+    return list(manager.with_actor(MEMBER).filter(pk__in=[1, 2]).order_by("pk"))
+
+
+def _locked() -> Any:
+    with transaction.atomic():
+        return [m.pk for m in messages().select_for_update().filter(thread_id=1).order_by("pk")]
+
+
+class _OwnRows(ModelIterable):  # type: ignore[type-arg]
+    """A third-party row class, here Django's own under another name."""
+
+
+def _own_rows() -> Any:
+    queryset = messages().filter(thread_id=1).order_by("pk")
+    queryset._iterable_class = _OwnRows
+    return [m.pk for m in queryset]
+
+
 REFUSED: dict[str, Callable[[], Any]] = {
     "count": lambda: messages().filter(thread_id=1).count(),
     "exists": lambda: messages().filter(thread_id=1).exists(),
@@ -418,6 +616,12 @@ REFUSED: dict[str, Callable[[], Any]] = {
     ),
     "grouped values": lambda: list(
         messages().values("thread_id").annotate(n=Count("pk")).order_by("thread_id")
+    ),
+    "window": lambda: list(
+        messages()
+        .filter(thread_id=1)
+        .annotate(n=Window(RowNumber(), order_by=F("pk").asc()))
+        .order_by("pk")
     ),
     "union": lambda: list(messages().filter(pk=1).union(messages().filter(pk=5))),
     "intersection": lambda: list(messages().filter(pk__lt=5).intersection(messages())),
@@ -466,13 +670,88 @@ REFUSED: dict[str, Callable[[], Any]] = {
     "random condition": lambda: len(
         list(messages().annotate(draw=Random()).filter(draw__lt=2).order_by("pk"))
     ),
+    "select_for_update": _locked,
+    "distinct on fields": lambda: list(
+        messages().filter(thread_id__in=[1, 2]).order_by("thread_id", "pk").distinct("thread_id")
+    ),
+    "own iterable class": _own_rows,
+    "a subject set as the actor": lambda: [
+        m.pk
+        for m in messages(SubjectRef.of("auth/group", "g", "member"))
+        .filter(thread_id=1)
+        .order_by("pk")
+    ],
+    # The conditions a read may have: on its own key or a foreign key of its own table, by
+    # exact, in or isnull, against literal values, joined by AND. Every other condition is
+    # refused; each read below is otherwise eligible.
+    "a content column": lambda: list(threads().filter(label="thread").order_by("pk")),
+    "a pattern on a content column": lambda: list(
+        threads().filter(label__startswith="hid").order_by("pk")
+    ),
+    "a range on the key": lambda: list(messages().filter(pk__gt=2).order_by("pk")),
+    "between two keys": lambda: list(messages().filter(pk__range=(1, 3)).order_by("pk")),
+    "keys joined by OR": lambda: list(messages().filter(Q(pk=1) | Q(thread_id=2)).order_by("pk")),
+    "querysets joined by OR": lambda: list(
+        (messages().filter(pk=1) | messages().filter(pk=5)).order_by("pk")
+    ),
+    "exclude()": lambda: list(messages().exclude(pk=1).order_by("pk")),
+    "a negated Q": lambda: list(messages().filter(~Q(thread_id=2)).order_by("pk")),
+    "a transform": _transformed,
+    "an expression as the condition's left side": lambda: list(
+        messages().filter(Exact(Abs("pk"), 2)).order_by("pk")
+    ),
+    "an annotation in a condition": lambda: list(
+        messages().annotate(double=F("pk") * 2).filter(double=4).order_by("pk")
+    ),
+    "F() on the right": lambda: list(messages().filter(pk=F("thread_id")).order_by("pk")),
+    "Value() on the right": lambda: list(messages().filter(pk=Value(2)).order_by("pk")),
+    "a condition through a join": lambda: list(
+        messages().filter(thread__label="thread").order_by("pk")
+    ),
+    "a boolean expression": lambda: list(
+        messages().filter(Value(True, output_field=BooleanField())).order_by("pk")
+    ),
+    "a manager's own filter": _labelled,
     "iterator": lambda: [m.pk for m in messages().filter(thread_id=1).iterator(chunk_size=10)],
     "unordered rows": lambda: sorted(m.pk for m in messages().filter(thread_id=1)),
     "in_bulk of several": lambda: messages().in_bulk([1, 5, 6]),
     "ordering with ties": lambda: [m.pk for m in messages().order_by("thread_id")],
     "none()": lambda: list(messages().none()),
+    # Every key the conditions name must be one the reader holds.
+    "a client's key": lambda: list(threads().filter(pk=2).order_by("pk")),
+    "get() by a client's key": lambda: threads().get(pk=1),
+    "in_bulk()": lambda: threads().order_by("pk").in_bulk([1, 2]),
+    "a client's key beside a parent": lambda: list(
+        messages().filter(thread_id=1, pk__in=[1, 2]).order_by("pk")
+    ),
+    "threads by a client's key": lambda: list(threads().filter(pk__in=[1, 2]).order_by("pk")),
+    "no condition": lambda: list(threads().order_by("pk")),
+    "isnull": lambda: list(threads().filter(pk__isnull=False).order_by("pk")),
+    "a foreign key by isnull": lambda: list(messages().filter(thread__isnull=False).order_by("pk")),
 }
 
+# The reads refused for their conditions, which the narrowed rule added.
+CONDITIONS = [
+    "a content column",
+    "a pattern on a content column",
+    "a range on the key",
+    "between two keys",
+    "keys joined by OR",
+    "querysets joined by OR",
+    "exclude()",
+    "a negated Q",
+    "a transform",
+    "an expression as the condition's left side",
+    "an annotation in a condition",
+    "F() on the right",
+    "Value() on the right",
+    "a condition through a join",
+    "a boolean expression",
+    "a manager's own filter",
+]
+NEITHER_KEY = "a condition on a column that is neither the primary key nor a foreign key"
+UNHELD = "a key that no row this evaluation read refers to"
+EXPRESSION = "a condition on an expression, a transform or an annotation"
 
 # Why each read above keeps its statement, as ``rebac.bounded`` logs it; ``None``: a path the
 # bounded read does not serve at all, which never asks.
@@ -482,6 +761,7 @@ REFUSED_BECAUSE: dict[str, str | None] = {
     "aggregate": None,
     "annotated aggregate": "an aggregate or a grouping",
     "grouped values": "an aggregate or a grouping",
+    "window": "a window",
     "union": "a set combination",
     "intersection": "a set combination",
     "or of sliced operands": "a query embedded in it",
@@ -496,39 +776,99 @@ REFUSED_BECAUSE: dict[str, str | None] = {
     "raw condition": "hand-written SQL",
     "random order": "a random ordering",
     "random condition": "a random value",
+    "select_for_update": "select_for_update()",
+    "distinct on fields": "distinct(*fields)",
+    "own iterable class": "its rows are built by an iterable class of its own",
+    "a subject set as the actor": "an actor the walk does not read",
+    "a content column": NEITHER_KEY,
+    "a pattern on a content column": "a condition by the lookup 'startswith'",
+    "a range on the key": "a condition by the lookup 'gt'",
+    "between two keys": "a condition by the lookup 'range'",
+    "keys joined by OR": "conditions joined by OR or XOR",
+    "querysets joined by OR": "conditions joined by OR or XOR",
+    "exclude()": "a negated condition",
+    "a negated Q": "a negated condition",
+    "a transform": EXPRESSION,
+    "an expression as the condition's left side": EXPRESSION,
+    "an annotation in a condition": EXPRESSION,
+    "F() on the right": "a condition compared with an expression",
+    "Value() on the right": "a condition compared with an expression",
+    "a condition through a join": "a condition reached through a join",
+    "a boolean expression": EXPRESSION,
+    "a manager's own filter": NEITHER_KEY,
     "iterator": None,
     "unordered rows": "its ordering leaves ties",
     "in_bulk of several": "its ordering leaves ties",
     "ordering with ties": "its ordering leaves ties",
     "none()": "it selects nothing",
+    "a client's key": UNHELD,
+    "get() by a client's key": UNHELD,
+    "in_bulk()": UNHELD,
+    "a client's key beside a parent": UNHELD,
+    "threads by a client's key": UNHELD,
+    "no condition": "it names no key the reader holds: it has no condition",
+    "isnull": "it names no key the reader holds: isnull",
+    "a foreign key by isnull": "it names no key the reader holds: isnull",
+}
+
+# Keys mode refuses a message's read before it reads what the conditions name: the message's
+# read follows its thread.
+REFUSED_IN_KEYS_MODE: dict[str, str] = {
+    name: "the walk would ask the compiled statement: scope/message#thread"
+    for name in ("a client's key beside a parent", "a foreign key by isnull")
 }
 
 
-@pytest.mark.parametrize("name", list(REFUSED))
-def test_a_read_the_rule_refuses_sends_the_compiled_statement(local, settings, caplog, name):
+def logged(caplog: Any) -> list[str]:
+    return [record.getMessage() for record in caplog.records if record.name == "rebac.bounded"]
+
+
+def refused_because(
+    read: Callable[[], Any], settings: Any, caplog: Any, because: str, mode: Any = "identifiers"
+) -> Any:
+    """``refused``, and every read it served logged ``because`` as the reason it kept its
+    statement."""
+    caplog.clear()
     with caplog.at_level(logging.DEBUG, logger="rebac.bounded"):
-        refused(REFUSED[name], settings)
-    kept = [record.getMessage() for record in caplog.records if record.name == "rebac.bounded"]
+        result = refused(read, settings, mode)
+    messages = logged(caplog)
+    assert messages and all(f"keeps its statement: {because}" in m for m in messages), messages
+    return result
+
+
+@pytest.mark.parametrize("mode", MODES)
+@pytest.mark.parametrize("name", list(REFUSED))
+def test_a_read_the_rule_refuses_sends_the_compiled_statement(local, settings, caplog, name, mode):
     because = REFUSED_BECAUSE[name]
+    if mode is True:
+        because = REFUSED_IN_KEYS_MODE.get(name, because)
     if because is None:
-        assert kept == []
+        with caplog.at_level(logging.DEBUG, logger="rebac.bounded"):
+            refused(REFUSED[name], settings, mode)
+        assert logged(caplog) == []
     else:
-        assert kept and all(f"keeps its statement: {because}" in message for message in kept), kept
+        refused_because(REFUSED[name], settings, caplog, because, mode)
 
 
-def test_select_for_update_sends_the_compiled_statement(local, settings):
-    def read():
-        with transaction.atomic():
-            return [m.pk for m in messages().select_for_update().filter(thread_id=1)]
-
-    refused(read, settings)
-
-
-@pytest.mark.postgresql
-def test_distinct_on_fields_sends_the_compiled_statement(local, settings):
-    if connection.vendor != "postgresql":
-        pytest.skip("DISTINCT ON is PostgreSQL's")
-    refused(lambda: list(messages().order_by("thread_id", "pk").distinct("thread_id")), settings)
+@pytest.mark.parametrize("mode", MODES)
+@pytest.mark.parametrize(
+    "parents", [[2], [3], [99], [1, 2]], ids=["with children", "without", "absent", "one of two"]
+)
+def test_a_read_naming_a_parent_the_reader_may_not_read_keeps_its_statement(
+    leaky, settings, caplog, mode, parents
+):
+    """The member may not read thread 2 (three messages) or thread 3 (none); thread 99 does not
+    exist. The check is one statement, the reader's own read of the threads named, byte for
+    byte; then today's statement. No key is read."""
+    with caplog.at_level(logging.DEBUG, logger="rebac.bounded"):
+        _result, today, statements = both(
+            lambda: list(messages().filter(thread_id__in=parents).order_by("pk")), settings, mode
+        )
+    assert [sql for sql, _ in statements] == [parent_check(parents), *(sql for sql, _ in today)]
+    assert logged(caplog) == [
+        f"A read of {ScopeMessage} keeps its statement: "
+        "it names a parent the reader may not read (testapp.ScopeThread)."
+    ]
 
 
 @pytest.mark.parametrize(
@@ -541,22 +881,22 @@ def test_distinct_on_fields_sends_the_compiled_statement(local, settings):
         ),
     ],
 )
-def test_a_bypass_sends_its_own_statement(local, settings, read):
-    refused(read, settings)
+def test_a_bypass_sends_its_own_statement(local, settings, caplog, read):
+    refused_because(read, settings, caplog, "a bypass reads every row")
 
 
-def test_a_bypass_block_sends_its_own_statement(local, settings):
+def test_a_bypass_block_sends_its_own_statement(local, settings, caplog):
     def read():
         with sudo(reason="test"):
-            return [m.pk for m in ScopeMessage.objects.order_by("pk")]
+            return [m.pk for m in ScopeMessage.objects.filter(thread_id=1).order_by("pk")]
 
-    refused(read, settings)
+    refused_because(read, settings, caplog, "a bypass reads every row")
 
     def system():
         with system_context(reason="test"):
-            return [m.pk for m in ScopeMessage.objects.order_by("pk")]
+            return [m.pk for m in ScopeMessage.objects.filter(thread_id=1).order_by("pk")]
 
-    refused(system, settings)
+    refused_because(system, settings, caplog, "a bypass reads every row")
 
 
 def test_nothing_enforced_sends_the_plain_statement(local, settings):
@@ -632,7 +972,7 @@ def test_a_stored_override_keeps_the_compiled_statement(settings, kind):
     LocalBackend().write_relationships([grant("scope/thread", 1, "reader")])
 
     def read_messages():
-        return [m.pk for m in messages().order_by("pk")]
+        return [m.pk for m in messages().filter(thread_id=1).order_by("pk")]
 
     result, _today, statements = both(read_messages, settings)
     assert result == ("returned", [1, 2]) and probes(statements, "testapp_scopemessage")
@@ -753,8 +1093,15 @@ def test_a_recursion_under_the_depth_limit(settings, limit):
         "blog/folder#read is recursive or admits a caveated subject"
     )
     refused(lambda: [f.pk for f in Folder.objects.with_actor(alice).order_by("pk")], settings)
+    with override_settings(REBAC_BOUNDED_READ=False):
+        readable = [f.pk for f in Folder.objects.with_actor(alice).order_by("pk")]
+    # The posts of the folders alice may read: those folders are the parents the read names.
     result, _today, statements = both(
-        lambda: [p.title for p in Post.objects.with_actor(alice).order_by("pk")], settings
+        lambda: [
+            p.title
+            for p in Post.objects.with_actor(alice).filter(folder_id__in=readable).order_by("pk")
+        ],
+        settings,
     )
     assert result == ("returned", [str(depth) for depth in range(min(limit, 3) + 1)])
     assert probes(statements, "testapp_post")
@@ -783,7 +1130,7 @@ def test_an_actor_whose_profile_admits_nothing_keeps_its_statement(settings):
     ScopeMessage._base_manager.bulk_create([ScopeMessage(id=n, thread_id=1) for n in (1, 2)])
     local.write_relationships([grant("scope/thread", 1, "reader")])
     settings.REBAC_BOUNDED_READ = "identifiers"
-    ordered = messages(OUTSIDER).order_by("pk")
+    ordered = messages(OUTSIDER).filter(thread_id=1).order_by("pk")
     assert not bounded.refusal(ordered, ordered.scoped().query)
     for actor, rows, probed in ((OUTSIDER, [], False), (MEMBER, [1, 2], True)):
         with evaluator_scope():
@@ -809,9 +1156,18 @@ def test_the_grant_profile_of_an_evaluator_scope_reads_the_same_rows(local, sett
 # ---------- Keys mode: of a row the actor may not read, nothing but its key ----------
 
 
+def cached(row: Any, name: str) -> Any:
+    """The key of the related row a prefetch delivered to ``row``, ``None`` for none."""
+    related = row._state.fields_cache.get(name)
+    return None if related is None else related.pk
+
+
 def test_keys_mode_reads_nothing_of_a_candidate_but_its_key(local, settings, monkeypatch):
     """Threads: direct and public grants, a constant role and a filtered constant, all read
-    by key. The walk follows no foreign key of a thread and no subject of a grant on one."""
+    by key. The walk follows no foreign key of a thread and no subject of a grant on one. The
+    messages, read through their thread, keep their statement in keys mode; the thread they
+    refer to is read by a forward prefetch of one row and decided by its candidates. (Django
+    reads a forward prefetch unordered, so a read of several such rows ties.)"""
     followed: list[tuple[str, set[str]]] = []
     targets = walk._Walk._targets
 
@@ -821,12 +1177,19 @@ def test_keys_mode_reads_nothing_of_a_candidate_but_its_key(local, settings, mon
 
     monkeypatch.setattr(walk._Walk, "_targets", recording)
     result, _today, statements = both(
-        lambda: [t.pk for t in ScopeThread.objects.with_actor(MEMBER).order_by("pk")],
+        lambda: [
+            (m.pk, cached(m, "thread"))
+            for m in messages()
+            .filter(thread_id__in=[1])
+            .order_by("pk")
+            .rebac_prefetch_related("thread")
+        ],
         settings,
         mode=True,
     )
-    assert result == ("returned", [1])
-    assert probes(statements, "testapp_scopethread") and not compiled(statements)
+    assert result == ("returned", [[1, 1], [2, 1], [3, 1], [4, 1]])
+    assert probes(statements, "testapp_scopethread")
+    assert not compiled(statements, "testapp_scopethread")
     assert followed == []
     for sql, _params in statements[:-1]:
         selected = re.match(r'SELECT (.*?) FROM "testapp_scopethread"', sql)
@@ -863,9 +1226,724 @@ def test_identifiers_mode_reads_the_foreign_keys_it_follows(local, settings, mon
         return targets(self, resolved, source, ids)
 
     monkeypatch.setattr(walk._Walk, "_targets", recording)
-    both(lambda: [m.pk for m in messages().filter(thread_id=2).order_by("pk")], settings)
-    # Message 6 is not readable; its thread's key was read.
-    assert {"5", "6"} in followed
+    both(lambda: [m.pk for m in messages().filter(thread_id=1).order_by("pk")], settings)
+    # The thread's key of every candidate was read, to follow ``thread->read``.
+    assert {"1", "2", "3", "4"} in followed
+
+
+# ---------- What crosses: the columns the key read and the walk select ----------
+
+MODEL_TABLES: dict[str, Any] = {
+    model._meta.db_table: model for model in (ScopeThread, ScopeMessage, ScopePart)
+}
+# A statement that selects plain columns of one table; a compiled part, which selects a key
+# and a truth value computed inside the database.
+COLUMNS = re.compile(r'SELECT (?:DISTINCT )?((?:"\w+"\."\w+"(?: AS "\w+")?(?:, )?)+) FROM "(\w+)"')
+COMPILED_PART = re.compile(r'SELECT "\w+"\."\w+" AS "pk", CASE WHEN ')
+
+
+def stated(table: str, mode: str) -> set[str]:
+    """The columns of a model table a bounded read's key read and walk may select in ``mode``
+    (``rebac.bounded.mode()``): the key, and with ``"identifiers"`` the foreign keys."""
+    meta = MODEL_TABLES[table]._meta
+    columns = {meta.pk.column}
+    if mode == "identifiers":
+        columns |= {field.column for field in meta.concrete_fields if field.is_relation}
+    return columns
+
+
+def crossing(statements: list[str], mode: str) -> list[str]:
+    """The statements among ``statements`` that select from a model table any column ``mode``
+    does not let cross, or that read a model table in a shape not recognised here."""
+    found = []
+    for sql in statements:
+        if sql.startswith("WITH") or COMPILED_PART.match(sql):
+            continue
+        match = COLUMNS.match(sql)
+        if match is None:
+            if any(f'"{table}"' in sql for table in MODEL_TABLES):
+                found.append(sql)
+            continue
+        if match.group(2) not in MODEL_TABLES:
+            continue
+        columns = set(re.findall(r'"\w+"\."(\w+)"', match.group(1)))
+        if columns - stated(match.group(2), mode):
+            found.append(sql)
+    return found
+
+
+class Boundary:
+    """Records every statement a bounded read sends before its rows' statement (the key read,
+    the walk's lookups and compiled parts) and keeps those that select more than the mode lets
+    cross. The rows' statement, and today's statement after a fallback, run after it."""
+
+    def __init__(self, monkeypatch: Any) -> None:
+        self.windows = 0
+        self.found: list[tuple[str, str]] = []
+        decided = bounded._decided
+
+        def recording(queryset: Any, query: Any) -> Any:
+            mode = bounded.mode()
+            with CaptureQueriesContext(connections[query._rebac_scope_for[2]]) as capture:
+                result = decided(queryset, query)
+            self.windows += 1
+            statements = [item["sql"] for item in capture.captured_queries]
+            self.found += [(mode, sql) for sql in crossing(statements, mode)]
+            return result
+
+        monkeypatch.setattr(bounded, "_decided", recording)
+
+
+# A message's foreign key read inside another permission of its type, not in its own union:
+# the guard lets ``True`` through, and the walk must refuse the lookup when it would run.
+FOREIGN_KEY_BELOW = """
+definition auth/user {}
+definition scope/thread {
+    relation reader: auth/user
+    permission read = reader
+}
+definition scope/message {
+    relation thread: scope/thread // rebac:field=thread
+    relation direct: auth/user
+    permission view = thread->read
+    permission read = direct + view
+}
+definition scope/part { permission read = nil }
+"""
+
+# A grant to a subject set read inside another permission of the thread's type.
+SUBJECT_SET_BELOW = """
+definition auth/user {}
+definition auth/group { relation member: auth/user }
+definition scope/thread {
+    relation reader: auth/user
+    relation grp: auth/group#member
+    permission shared = grp
+    permission read = reader + shared
+}
+definition scope/message {
+    relation direct: auth/user
+    permission read = direct
+}
+definition scope/part { permission read = nil }
+"""
+
+
+def test_keys_mode_selects_no_foreign_key_of_a_candidate(settings, caplog, monkeypatch):
+    local = install_schema(FOREIGN_KEY_BELOW)
+    ScopeThread._base_manager.bulk_create([ScopeThread(id=1), ScopeThread(id=2)])
+    ScopeMessage._base_manager.bulk_create(
+        [ScopeMessage(id=n, thread_id=1 if n < 3 else 2) for n in (1, 2, 3, 4)]
+    )
+    local.write_relationships(
+        [grant("scope/thread", 1, "reader"), grant("scope/message", 3, "direct")]
+    )
+    policy = structural.current_policy()
+    assert walk.compiler_part(policy, "scope/message", "read", keys_only=True) is None
+    boundary = Boundary(monkeypatch)
+    with caplog.at_level(logging.DEBUG, logger="rebac.bounded"):
+        result, today, statements = both(
+            lambda: [m.pk for m in messages().filter(thread_id=1).order_by("pk")],
+            settings,
+            mode=True,
+        )
+    assert result == ("returned", [1, 2])
+    assert boundary.windows == 1 and boundary.found == []
+    # The walk ends at ``view``: it would read the candidates' thread, or compile a permission
+    # of their type that reaches what the question reaches. Today's statement follows.
+    assert logged(caplog) == [
+        f"A read of {ScopeMessage} keeps its statement: "
+        "the walk would ask the compiled statement for these rows."
+    ]
+    assert _untimed(statements[-len(today) :]) == _untimed(today)
+
+
+def test_keys_mode_reads_no_subject_of_a_grant_on_a_candidate(settings, caplog, monkeypatch):
+    """Threads 2 and 3 are granted to groups by ``grp``; only group g holds the member. Keys mode
+    asks the compiled statement for ``grp`` on the candidates, which reads those grants inside
+    the database, and never selects the subject of a grant on a candidate."""
+    local = install_schema(SUBJECT_SET_BELOW)
+    ScopeThread._base_manager.bulk_create([ScopeThread(id=n) for n in (1, 2, 3)])
+    ScopeMessage._base_manager.bulk_create([ScopeMessage(id=n, thread_id=n) for n in (1, 2, 3)])
+    local.write_relationships(
+        [
+            *(grant("scope/message", n, "direct") for n in (1, 2, 3)),
+            grant("scope/thread", 1, "reader"),
+            grant("scope/thread", 2, "grp", SubjectRef.of("auth/group", "g", "member")),
+            grant("scope/thread", 3, "grp", SubjectRef.of("auth/group", "h", "member")),
+            grant("auth/group", "g", "member"),
+        ]
+    )
+    assert (
+        walk.compiler_part(structural.current_policy(), "scope/thread", "read", keys_only=True)
+        is None
+    )
+    lookups: list[int] = []
+    stored = walk._Walk._through_stored
+
+    def recording(self, definition, relation, target, ids, path, negated):
+        shapes = self.stored_shapes(relation, target)
+        on_candidates = definition.resource_type == "scope/thread" and bool(
+            set(ids) & {"1", "2", "3"}
+        )
+        with CaptureQueriesContext(connection) as capture:
+            found = stored(self, definition, relation, target, ids, path, negated)
+        if shapes is not None and shapes[1] and on_candidates:
+            lookups.append(len(capture.captured_queries))
+        return found
+
+    monkeypatch.setattr(walk._Walk, "_through_stored", recording)
+    # The message of each thread, and by a forward prefetch the thread it refers to, one row
+    # decided by its candidates.
+    for thread, expected in ((1, [[1, 1]]), (2, [[2, 2]]), (3, [[3, None]])):
+        caplog.clear()
+        with caplog.at_level(logging.DEBUG, logger="rebac.bounded"):
+            result, _today, _statements = both(
+                lambda thread=thread: [
+                    (m.pk, cached(m, "thread"))
+                    for m in messages()
+                    .filter(thread_id=thread)
+                    .order_by("pk")
+                    .rebac_prefetch_related("thread")
+                ],
+                settings,
+                mode=True,
+            )
+        assert result == ("returned", expected)
+        assert f"A read of {ScopeThread} is decided by its candidates." in logged(caplog)
+    # Asked, refused before any statement.
+    assert lookups and set(lookups) == {0}, lookups
+
+
+# ---------- The cost rule: a permission as wide as the question ends the walk ----------
+
+# ``other`` holds an arm the walk cannot read (a wildcard followed through): it would be
+# compiled for the candidates ``direct`` leaves, and it reaches all but one of the relations
+# the question reaches.
+AS_WIDE = """
+definition auth/user {}
+definition scope/thread {
+    relation reader: auth/user
+    relation editor: auth/user
+    permission view = editor
+    permission read = reader + editor
+}
+definition scope/message {
+    relation thread: scope/thread // rebac:field=thread
+    relation linked: scope/thread | auth/user:*
+    relation direct: auth/user
+    permission other = linked->read + thread->view
+    permission read = direct + other
+}
+definition scope/part { permission read = nil }
+"""
+
+
+@pytest.mark.parametrize("mode", MODES)
+def test_the_walk_ends_where_it_would_compile_a_permission_as_wide_as_the_question(
+    settings, caplog, mode
+):
+    """The guard lets the question through: ``other`` is not the question. Thread 1 is readable
+    (``reader``) but grants no ``view``. The walk reads ``direct``, which leaves messages 1, 2
+    and 4, and ``thread->view``, which grants none, and would then compile ``other`` for them, a
+    permission of the question's type that reaches half of what the question reaches or more:
+    it ends, and the read sends today's statements after the key read and the lookups so far."""
+    local = install_schema(AS_WIDE)
+    ScopeThread._base_manager.bulk_create([ScopeThread(id=1)])
+    ScopeMessage._base_manager.bulk_create([ScopeMessage(id=n, thread_id=1) for n in (1, 2, 3, 4)])
+    local.write_relationships(
+        [grant("scope/thread", 1, "reader"), grant("scope/message", 3, "direct")]
+    )
+    policy = structural.current_policy()
+    assert walk.compiler_part(policy, "scope/message", "read", keys_only=mode is True) is None
+    assert 2 * walk._reach(policy, ("scope/message", "other")) >= walk._reach(
+        policy, ("scope/message", "read")
+    )
+    with caplog.at_level(logging.DEBUG, logger="rebac.bounded"):
+        result, today, statements = both(
+            lambda: [m.pk for m in messages().filter(thread_id=1).order_by("pk")],
+            settings,
+            mode,
+        )
+    assert result == ("returned", [3])
+    assert logged(caplog) == [
+        f"A read of {ScopeMessage} keeps its statement: "
+        "the walk would ask the compiled statement for these rows."
+    ]
+    # The check of thread 1, the key read, the walk's lookups so far, then today's statement
+    # byte for byte.
+    assert _untimed(statements[-len(today) :]) == _untimed(today)
+    assert statements[0][0] == parent_check([1])
+    assert probes(statements[1:2], "testapp_scopemessage")
+    assert (len(today), len(statements)) == WALKED_THEN_KEPT[mode], [s for s, _ in statements]
+
+
+# Today's statements, and the statements of the read above: the check of thread 1, the key
+# read and the walk's lookups before it ends (keys mode reads nothing of a candidate's thread),
+# then today's.
+WALKED_THEN_KEPT: dict[Any, tuple[int, int]] = {True: (1, 5), "identifiers": (1, 7)}
+
+
+# ---------- What a reader can still learn: pinned by the statements a read sends ----------
+
+# Threads and messages both decided by the walk in either mode. A message is read by a direct
+# grant or a group's ``editor`` grant, less ``muted``.
+LEAKS = """
+definition auth/user {}
+definition auth/group { relation member: auth/user }
+definition scope/thread {
+    relation reader: auth/user
+    permission read = reader
+}
+definition scope/message {
+    relation thread: scope/thread // rebac:field=thread
+    relation direct: auth/user
+    relation editor: auth/group#member
+    relation muted: auth/user
+    permission read = (direct + editor) - muted
+}
+definition scope/part { permission read = nil }
+"""
+
+
+@pytest.fixture
+def leaky():
+    """The member may read threads 1 and 4, not 2 or 3. Thread 1 holds message 1, which the
+    member may read, and messages 2, 6 and 7, which it may not: 2 holds no grant, 6 is granted
+    to the member and muted, 7 is granted to group h, which the member is not in. Thread 2
+    holds messages 3-5, threads 3 and 4 none."""
+    backend = install_schema(LEAKS)
+    ScopeThread._base_manager.bulk_create([ScopeThread(id=n) for n in (1, 2, 3, 4, 5)])
+    ScopeMessage._base_manager.bulk_create(
+        [
+            ScopeMessage(id=n, thread_id=thread)
+            for n, thread in ((1, 1), (2, 1), (3, 2), (4, 2), (5, 2), (6, 1), (7, 1))
+        ]
+    )
+    backend.write_relationships(
+        [
+            grant("scope/thread", 1, "reader"),
+            grant("scope/thread", 4, "reader"),
+            grant("scope/message", 1, "direct"),
+            grant("scope/message", 6, "direct"),
+            grant("scope/message", 6, "muted"),
+            grant("scope/message", 7, "editor", SubjectRef.of("auth/group", "h", "member")),
+        ]
+    )
+    return backend
+
+
+# Reads by keys the member does not hold: a key it names itself, a parent it may not read or
+# that does not exist. Each pair of the same kind must send the same statements.
+UNHELD_READS: dict[str, Callable[[], Any]] = {
+    "a hidden key": lambda: list(messages().filter(pk=3).order_by("pk")),
+    "an absent key": lambda: list(messages().filter(pk=99).order_by("pk")),
+    "a hidden key and a parent": lambda: list(messages().filter(pk=3, thread_id=2).order_by("pk")),
+    "an absent key and a parent": lambda: list(
+        messages().filter(pk=99, thread_id=2).order_by("pk")
+    ),
+    "a parent with three hidden children": lambda: list(
+        messages().filter(thread_id=2).order_by("pk")
+    ),
+    "a parent with no children": lambda: list(messages().filter(thread_id=3).order_by("pk")),
+    "an absent parent": lambda: list(messages().filter(thread_id=99).order_by("pk")),
+}
+
+
+@pytest.mark.parametrize("mode", MODES)
+def test_a_read_by_keys_the_reader_does_not_hold_says_nothing_of_hidden_rows(leaky, mode):
+    """A key the reader names itself keeps today's statement, whether a row has it or not. A
+    parent the reader may not read, or that does not exist, costs the check (the reader's own
+    read of it) and then today's statement, whether it has children or not. Every read here
+    returns nothing; each pair sends the same statements as the other, byte for byte but for
+    the key named."""
+    sent = {}
+    for name, read in UNHELD_READS.items():
+        with override_settings(REBAC_BOUNDED_READ=False):
+            expected, today = captured(read)
+        with override_settings(REBAC_BOUNDED_READ=mode):
+            result, statements = captured(read)
+        assert result == expected == ("returned", []), name
+        sent[name] = [sql for sql, _ in statements]
+        if "parent" in name and "key" not in name:
+            assert sent[name][1:] == [sql for sql, _ in today], name
+        else:
+            assert sent[name] == [sql for sql, _ in today], name
+
+    def masked(name: str) -> list[str]:
+        return [re.sub(r"\b(3|99)\b", "<key>", sql) for sql in sent[name]]
+
+    assert masked("a hidden key") == masked("an absent key")
+    assert masked("a hidden key and a parent") == masked("an absent key and a parent")
+    assert {name: len(found) for name, found in sent.items()} == {
+        "a hidden key": 1,
+        "an absent key": 1,
+        "a hidden key and a parent": 1,
+        "an absent key and a parent": 1,
+        "a parent with three hidden children": 2,
+        "a parent with no children": 2,
+        "an absent parent": 2,
+    }
+    assert sent["an absent parent"][0] == parent_check([99])
+
+
+@pytest.mark.parametrize("mode", MODES)
+def test_the_children_of_a_parent_the_reader_may_not_read_send_the_same_statements(leaky, mode):
+    """Thread 3, which the member may not read, holds 0, then 3, then 300 messages: the read of
+    its children sends the same statements each time, byte for byte."""
+    sent = []
+    for count in (0, 3, 300):
+        ScopeMessage._base_manager.filter(thread_id=3).delete()
+        ScopeMessage._base_manager.bulk_create(
+            [ScopeMessage(id=1000 + n, thread_id=3) for n in range(count)]
+        )
+        analyzed()
+        with override_settings(REBAC_BOUNDED_READ=mode):
+            result, statements = captured(
+                lambda: list(messages().filter(thread_id=3).order_by("pk"))
+            )
+        assert result == ("returned", [])
+        sent.append(statements)
+    assert sent[0] == sent[1] == sent[2]
+    assert sent[0][0][0] == parent_check([3])
+    assert len(sent[0]) == 2
+
+
+# What a reader learns of a parent it may read: whether it has hidden children and how many.
+# The statements the read of thread 4's messages sends with 0, 1, 3 and 300 messages the
+# member may not read in it: the check; the key read; then the walk's lookups, or today's
+# statement past the bound.
+HIDDEN_CHILDREN: dict[int, int] = {0: 2, 1: 6, 3: 6, 300: 3}
+
+
+@pytest.mark.parametrize("mode", MODES)
+def test_the_hidden_children_of_a_readable_parent_show_in_the_statements(leaky, mode):
+    counts = {}
+    for count in HIDDEN_CHILDREN:
+        ScopeMessage._base_manager.filter(thread_id=4).delete()
+        ScopeMessage._base_manager.bulk_create(
+            [ScopeMessage(id=2000 + n, thread_id=4) for n in range(count)]
+        )
+        analyzed()
+        with override_settings(REBAC_BOUNDED_READ=mode):
+            result, statements = captured(
+                lambda: list(messages().filter(thread_id=4).order_by("pk"))
+            )
+        assert result == ("returned", [])
+        assert statements[0][0] == parent_check([4])
+        counts[count] = len(statements)
+    assert counts == HIDDEN_CHILDREN, counts
+
+
+@pytest.mark.parametrize("mode", MODES)
+def test_the_bound_tells_how_many_hidden_children_a_readable_parent_has(leaky, settings, mode):
+    """Thread 1 holds one message the member may read and three it may not. Thread 4 holds 252
+    the member may read, thread 5, which it may read too, one more. Threads 1 and 4 select 256
+    candidates, decided by the walk; threads 1, 4 and 5 select 257, and the read sends today's
+    statement after the check and the key read. The reader who counts its own 253 learns that
+    thread 1 holds 256 - 252 - 1 = 3 it may not read."""
+    keys = range(1000, 1253)
+    ScopeMessage._base_manager.bulk_create(
+        [ScopeMessage(id=key, thread_id=4 if key < 1252 else 5) for key in keys]
+    )
+    leaky.write_relationships(
+        [grant("scope/thread", 5, "reader")]
+        + [grant("scope/message", key, "direct") for key in keys]
+    )
+    analyzed()
+    counts = []
+    for threads_read in ([1, 4], [1, 4, 5]):
+        result, today, statements = both(
+            lambda threads_read=threads_read: [
+                m.pk for m in messages().filter(thread_id__in=threads_read).order_by("pk")
+            ],
+            settings,
+            mode,
+        )
+        assert result == (
+            "returned",
+            [1, *(key for key in keys if key < 1252 or 5 in threads_read)],
+        )
+        assert statements[0][0] == parent_check(threads_read)
+        counts.append((len(today), len(statements)))
+    # The check (one statement for all the threads named), the key read, the walk's lookups,
+    # the rows; past the bound the check, the key read and today's statement.
+    assert counts == BOUND_COUNTS[mode], counts
+
+
+BOUND_COUNTS: dict[Any, list[tuple[int, int]]] = {
+    # ``editor`` asked of the compiled statement for the candidates ``direct`` left.
+    True: [(1, 8), (1, 3)],
+    # ``editor``'s rows, then group h's members, for message 7.
+    "identifiers": [(1, 9), (1, 3)],
+}
+
+
+# What the walk's lookups show of a hidden child of a readable parent: each of threads 10-12,
+# which the member may read, holds one message it may not: 10 one with no grant, 11 one granted
+# to the member and muted, 12 one granted to group h. The statements each read sends, by kind:
+# the check of the thread, the key read, the candidates that exist, a relationship lookup, a
+# compiled part, the policy's fence read again after an exclusion.
+WHAT_HOLDS: dict[Any, dict[int, list[str]]] = {
+    # Keys mode reads no subject of a grant on a candidate: ``editor`` is asked of the compiled
+    # statement unless ``direct`` settled the candidate first.
+    True: {
+        10: ["check", "keys", "rows", "lookup", "part", "fence"],
+        11: ["check", "keys", "rows", "lookup", "lookup", "fence"],
+        12: ["check", "keys", "rows", "lookup", "part", "fence"],
+    },
+    # Identifiers mode follows the group a grant on the candidate names.
+    "identifiers": {
+        10: ["check", "keys", "rows", "lookup", "lookup", "fence"],
+        11: ["check", "keys", "rows", "lookup", "lookup", "fence"],
+        12: ["check", "keys", "rows", "lookup", "lookup", "lookup", "fence"],
+    },
+}
+
+
+def kind(sql: str) -> str:
+    if sql.endswith("LIMIT 257"):
+        return "keys"
+    if re.match(r'SELECT "\w+"\."id" AS "pk", CASE WHEN', sql):
+        return "part"
+    if sql.startswith("WITH") or "rebac_ids" in sql:
+        return "check"
+    if '"rebac_relationship"' in sql.split(" FROM ")[1][:40]:
+        return "lookup"
+    if sql.startswith('SELECT 1 AS "a" FROM "rebac_schemageneration"'):
+        return "fence"
+    return "rows"
+
+
+@pytest.mark.parametrize("mode", MODES)
+def test_the_lookups_follow_what_holds_on_a_hidden_child_of_a_readable_parent(leaky, mode):
+    ScopeThread._base_manager.bulk_create([ScopeThread(id=n) for n in (10, 11, 12)])
+    ScopeMessage._base_manager.bulk_create([ScopeMessage(id=n, thread_id=n) for n in (10, 11, 12)])
+    leaky.write_relationships(
+        [
+            *(grant("scope/thread", n, "reader") for n in (10, 11, 12)),
+            grant("scope/message", 11, "direct"),
+            grant("scope/message", 11, "muted"),
+            grant("scope/message", 12, "editor", SubjectRef.of("auth/group", "h", "member")),
+        ]
+    )
+    kinds = {}
+    with override_settings(REBAC_BOUNDED_READ=mode):
+        for thread in (10, 11, 12):
+            result, statements = captured(
+                lambda thread=thread: list(messages().filter(thread_id=thread).order_by("pk"))
+            )
+            assert result == ("returned", [])
+            kinds[thread] = [kind(sql) for sql, _ in statements]
+    assert kinds == WHAT_HOLDS[mode], kinds
+
+
+# ---------- The record of held keys: one evaluation, one actor, one database ----------
+
+
+def test_a_referred_key_is_held_only_inside_the_evaluation_that_read_the_referring_row(
+    local, settings, caplog
+):
+    """The messages of thread 1 refer to thread 1: inside their prefetch the member holds key 1.
+    Once that evaluation ends, a read of thread 1 by its key names a key the member supplies,
+    and keeps today's statement."""
+    settings.REBAC_BOUNDED_READ = "identifiers"
+    with caplog.at_level(logging.DEBUG, logger="rebac.bounded"):
+        rows = list(messages().filter(thread_id=1).order_by("pk").rebac_prefetch_related("thread"))
+        assert [cached(m, "thread") for m in rows] == [1, 1, 1, 1]
+        assert f"A read of {ScopeThread} is decided by its candidates." in logged(caplog)
+        caplog.clear()
+        assert [t.pk for t in threads().filter(pk=1).order_by("pk")] == [1]
+    assert logged(caplog) == [f"A read of {ScopeThread} keeps its statement: {UNHELD}."]
+
+
+def test_a_referred_key_is_held_only_by_the_actor_that_read_the_referring_row(
+    local, settings, caplog
+):
+    """Inside the member's prefetch, a prefetched read pinned to another actor holds none of the
+    keys the member's rows refer to."""
+    settings.REBAC_BOUNDED_READ = "identifiers"
+    with caplog.at_level(logging.DEBUG, logger="rebac.bounded"):
+        rows = list(
+            messages()
+            .filter(thread_id=1)
+            .order_by("pk")
+            .rebac_prefetch_related(Prefetch("thread", queryset=threads(ADMIN)))
+        )
+    assert [m.pk for m in rows] == [1, 2, 3, 4]
+    assert f"A read of {ScopeThread} keeps its statement: {UNHELD}." in logged(caplog)
+    assert f"A read of {ScopeThread} is decided by its candidates." not in logged(caplog)
+
+
+# ---------- Several statements: a commit between the walk and the rows ----------
+
+
+def _concurrently(write: Callable[[], None]) -> None:
+    """Run ``write`` in a transaction on a connection of its own, and commit it, before
+    returning. Whatever happens, that transaction ends and that connection closes: an error in
+    ``write`` rolls it back; a writer still running after 30 s has its PostgreSQL backend ended,
+    which ends its transaction and its locks, and the test fails."""
+    errors: list[BaseException] = []
+    backends: list[int] = []
+
+    def run() -> None:
+        try:
+            with transaction.atomic():
+                if connection.vendor == "postgresql":
+                    backends.append(connection.connection.info.backend_pid)
+                write()
+        except BaseException as error:
+            errors.append(error)
+        finally:
+            for wrapper in connections.all(initialized_only=True):
+                if wrapper.vendor == "sqlite" and wrapper.connection is not None:
+                    # Django leaves an in-memory database open on close(); this thread's
+                    # connection is one of several to it, and the test's own keeps it.
+                    wrapper.connection.close()
+                    wrapper.connection = None
+                else:
+                    wrapper.close()
+
+    worker = threading.Thread(target=run)
+    worker.start()
+    worker.join(30)
+    if worker.is_alive():
+        if backends:
+            ending = connections.create_connection("default")
+            try:
+                with ending.cursor() as cursor:
+                    cursor.execute("SELECT pg_terminate_backend(%s)", [backends[0]])
+            finally:
+                ending.close()
+        worker.join(10)
+        pytest.fail("the writer did not finish")
+    assert not errors, errors
+
+
+@pytest.mark.django_db(transaction=True)
+@pytest.mark.parametrize("isolation", ["autocommit", "read_snapshot", "repeatable read"])
+def test_the_rows_statement_reads_what_was_committed_after_the_walk(
+    settings, monkeypatch, isolation
+):
+    """Pinned, as proposal 0025 states it. The member reads the messages of thread 1, and
+    thread 1 by the forward prefetch of the thread they refer to. The walk admits thread 1 by
+    the member's grant; a transaction then revokes the grant, rewrites the thread's label and
+    commits; the thread's rows' statement reads the new label. Under READ COMMITTED, inside
+    ``read_snapshot()`` too, the read returns what neither state gives: the messages and their
+    thread, with content written after the member lost it. In a transaction at REPEATABLE READ
+    every statement reads one snapshot, and the read returns the state before the write."""
+    if connection.vendor != "postgresql" and isolation != "autocommit":
+        pytest.skip("on SQLite a transaction reads one snapshot and holds the writer off")
+    local = install_schema(SCHEMA)
+    ScopeThread._base_manager.bulk_create([ScopeThread(id=1, label="old")])
+    ScopeMessage._base_manager.bulk_create([ScopeMessage(id=n, thread_id=1) for n in (1, 2)])
+    local.write_relationships([grant("scope/thread", 1, "reader")])
+
+    def read() -> list[tuple[int, Any]]:
+        rows = (
+            messages()
+            .filter(thread_id=1)
+            .order_by("pk")
+            .rebac_prefetch_related(Prefetch("thread", queryset=threads().order_by("pk")))
+        )
+        return [(m.pk, getattr(m._state.fields_cache.get("thread"), "label", None)) for m in rows]
+
+    with override_settings(REBAC_BOUNDED_READ=False):
+        before = read()
+
+    def write() -> None:
+        local.delete_relationship(grant("scope/thread", 1, "reader"))
+        ScopeThread._base_manager.filter(pk=1).update(label="written after the revocation")
+
+    decided = walk.decided_alone
+    fired: list[bool] = []
+
+    def deciding(**kwargs: Any) -> Any:
+        found = decided(**kwargs)
+        if kwargs["resource_type"] == "scope/thread" and not fired:
+            fired.append(True)
+            _concurrently(write)
+        return found
+
+    monkeypatch.setattr(walk, "decided_alone", deciding)
+    try:
+        with override_settings(REBAC_BOUNDED_READ=True):
+            if isolation == "autocommit":
+                found = read()
+            elif isolation == "read_snapshot":
+                with read_snapshot():
+                    found = read()
+            else:
+                with transaction.atomic():
+                    with connection.cursor() as cursor:
+                        cursor.execute("SET TRANSACTION ISOLATION LEVEL REPEATABLE READ")
+                    found = read()
+    finally:
+        # Whatever failed above, the test's own connection holds no transaction after it.
+        assert not connection.in_atomic_block
+    with override_settings(REBAC_BOUNDED_READ=False):
+        after = read()
+    assert fired and (before, after) == ([(1, "old"), (2, "old")], [])
+    if isolation == "repeatable read":
+        assert found == before
+    else:
+        assert found == [(1, "written after the revocation"), (2, "written after the revocation")]
+
+
+# ---------- Other refusals, each by its reason ----------
+
+
+def test_a_model_whose_identity_is_not_its_integer_key_keeps_its_statement(settings, caplog):
+    from django.contrib.auth import get_user_model
+
+    from tests.testapp.models import TextIdentityPost
+
+    local = install_schema(
+        """
+        definition auth/user {}
+        definition blog/textidentitypost {
+            relation shared: auth/user
+            permission read = shared
+        }
+        """
+    )
+    with sudo(reason="fixture"):
+        author = get_user_model()._base_manager.create(username="author")
+        posts = [
+            TextIdentityPost._base_manager.create(public_id=name, title=name, author=author)
+            for name in ("a", "b")
+        ]
+    local.write_relationships(
+        [RelationshipTuple(ObjectRef("blog/textidentitypost", "a"), "shared", MEMBER)]
+    )
+    refused_because(
+        lambda: [
+            p.public_id
+            for p in TextIdentityPost.objects.with_actor(MEMBER)
+            .filter(pk__in=[post.pk for post in posts])
+            .order_by("pk")
+        ],
+        settings,
+        caplog,
+        "the model's identity is not its integer primary key",
+    )
+
+
+def test_the_walk_answers_nothing_under_another_policy_than_the_one_named(local):
+    """``decided_alone`` reads the policy in force and answers only if it is the one the read's
+    scope was built under."""
+    policy = structural.current_policy()
+    question: dict[str, Any] = {
+        "backend": local,
+        "resource_type": "scope/thread",
+        "action": "read",
+        "actor": MEMBER,
+        "ids": ["1", "2", "3"],
+        "using": "default",
+        "keys_only": True,
+    }
+    assert walk.decided_alone(**question, policy_key=policy.key) == {"1"}
+    assert walk.decided_alone(**question, policy_key=("another", "policy")) is None
 
 
 # ---------- The decision rule of 0.38.0 ----------
@@ -925,11 +2003,12 @@ def test_a_scope_built_under_another_policy_is_not_decided_by_its_candidates(loc
     assert [m.pk for m in scoped._clone()] == expected
 
 
-def test_another_database_is_read_on_that_database(settings, django_db_blocker, tmp_path):
+def test_another_database_is_read_on_that_database(settings, caplog, django_db_blocker, tmp_path):
+    """The check of the parent, the keys, the walk and the rows are read on the database the
+    evaluation decided: grants on the default database admit nothing on another, and the
+    other's own grants do. A parent the reader may read there is checked there."""
     from django.core.management import call_command
 
-    """The keys, the walk and the rows are read on the database the evaluation decided: grants
-    on the default database admit nothing on another, and the other's own grants do."""
     from rebac.models import active_relationship_model
 
     alias = "bounded_other"
@@ -943,12 +2022,12 @@ def test_another_database_is_read_on_that_database(settings, django_db_blocker, 
                 ScopeMessage._base_manager.using(database).bulk_create(
                     [ScopeMessage(id=n, thread_id=1) for n in (1, 2)]
                 )
-            local.write_relationships([grant("scope/message", 2, "direct")])
+            local.write_relationships([grant("scope/thread", 1, "reader")])
 
             def read(database: str):
-                return [m.pk for m in messages().using(database).order_by("pk")]
+                return [m.pk for m in messages().using(database).filter(thread_id=1).order_by("pk")]
 
-            def each(database: str) -> Any:
+            def each(database: str, served: bool) -> Any:
                 settings.REBAC_BOUNDED_READ = False
                 expected, _today = captured(lambda: read(database), database)
                 settings.REBAC_BOUNDED_READ = "identifiers"
@@ -958,22 +2037,38 @@ def test_another_database_is_read_on_that_database(settings, django_db_blocker, 
                     found, statements = captured(lambda: read(database), database)
                 settings.REBAC_BOUNDED_READ = False
                 assert found == expected
-                assert probes(statements, "testapp_scopemessage")
-                assert not compiled(statements)
+                # Where thread 1 is readable on that database the read is decided by its
+                # candidates; where it is not, its check keeps today's statement.
+                assert bool(probes(statements, "testapp_scopemessage")) is served
+                assert not compiled(statements, "testapp_scopemessage") or not served
                 # Nothing of it is read on the other database.
                 assert elsewhere.captured_queries == []
                 return found
 
-            assert each("default") == ("returned", [2])
-            assert each(alias) == ("returned", [])
+            assert each("default", True) == ("returned", [1, 2])
+            assert each(alias, False) == ("returned", [])
+            # A key a row read on one database refers to is not held on another: the thread
+            # prefetched on the other database keeps its statement.
+            settings.REBAC_BOUNDED_READ = "identifiers"
+            with caplog.at_level(logging.DEBUG, logger="rebac.bounded"):
+                list(
+                    messages()
+                    .filter(thread_id=1)
+                    .order_by("pk")
+                    .rebac_prefetch_related(
+                        Prefetch("thread", queryset=threads().using(alias).order_by("pk"))
+                    )
+                )
+            settings.REBAC_BOUNDED_READ = False
+            assert f"A read of {ScopeThread} keeps its statement: {UNHELD}." in logged(caplog)
             relationships = active_relationship_model()._base_manager
             rows = list(relationships.using("default").all())
             for row in rows:
                 row.pk = None
             relationships.using(alias).bulk_create(rows)
             relationships.using("default").all().delete()
-            assert each(alias) == ("returned", [2])
-            assert each("default") == ("returned", [])
+            assert each(alias, True) == ("returned", [1, 2])
+            assert each("default", False) == ("returned", [])
     finally:
         connections[alias].close()
         del connections[alias]
@@ -1028,7 +2123,13 @@ def test_a_warning_says_what_the_setting_discloses(settings, value):
         assert issue.id == "rebac.W016"
         assert "experimental" in issue.msg and "257 primary keys" in issue.msg
         assert "latency" in issue.msg and "adjacent states" in issue.hint
-        assert ("foreign keys" in issue.msg) is (value == "identifiers")
+        # What a reader still learns, as the proposal states it.
+        assert "for a parent they may read, how many of its children (up to 256)" in issue.msg
+        assert "of rows whose key or parent they do not already hold, nothing" in issue.msg
+        assert "content written after the actor lost it" in issue.hint
+        assert ("the foreign keys the walk follows from them" in issue.msg) is (
+            value == "identifiers"
+        )
     else:
         assert issues == []
 
@@ -1128,11 +2229,42 @@ def _reads(model: Any, actor: SubjectRef) -> dict[str, Callable[[], Any]]:
         "values": lambda: list(rows().order_by("pk").values("pk")),
         "count": lambda: rows().count(),
         "exists": lambda: rows().filter(pk=2).exists(),
+        # Conditions the rule accepts, and conditions it refuses.
+        "keys": lambda: list(rows().filter(pk__in=[1, 3]).order_by("-pk")),
+        "no key": lambda: list(rows().filter(pk__isnull=True).order_by("pk")),
+        "range": lambda: list(rows().filter(pk__gte=2).order_by("pk")),
+        "or": lambda: list(rows().filter(Q(pk=1) | Q(pk=3)).order_by("pk")),
+        "exclude": lambda: list(rows().exclude(pk=2).order_by("-pk")[:2]),
     }
+    if model is ScopeThread:
+        reads["content"] = lambda: list(rows().filter(label="hidden").order_by("pk"))
+    if model is ScopePart:
+        reads["by message"] = lambda: _pks(rows().filter(message_id__in=[1, 2]).order_by("pk"))
+        reads["through a join"] = lambda: _pks(rows().filter(message__thread_id=1).order_by("pk"))
+        # A forward prefetch of one row: the message the parts of message 1 refer to.
+        reads["with their message"] = lambda: [
+            (p.pk, cached(p, "message"))
+            for p in rows().filter(message_id=1).order_by("pk").rebac_prefetch_related("message")
+        ]
     if model is ScopeMessage:
         reads.update(
             {
                 "by thread": lambda: _pks(rows().filter(thread_id=1).order_by("-pk")),
+                "by thread and key": lambda: _pks(
+                    rows().filter(thread__in=[1, 2], pk__in=[1, 3]).order_by("pk")
+                ),
+                "with a thread": lambda: _pks(rows().filter(thread__isnull=False).order_by("pk")),
+                "by thread label": lambda: _pks(
+                    rows().filter(thread__label="hidden").order_by("pk")
+                ),
+                "with its thread": lambda: [
+                    (m.pk, m.thread.pk, m.thread.label)
+                    for m in rows().filter(pk=3).rebac_prefetch_related("thread")
+                ],
+                "with their threads": lambda: [
+                    (m.pk, m.thread.pk)
+                    for m in rows().order_by("pk").rebac_prefetch_related("thread")
+                ],
                 "joined": lambda: [
                     (m.pk, m.thread.pk) for m in rows().select_related("thread").order_by("pk")
                 ],
@@ -1144,12 +2276,52 @@ def _reads(model: Any, actor: SubjectRef) -> dict[str, Callable[[], Any]]:
                     m.pk: _pks(m.scopepart_set.all())
                     for m in rows().order_by("pk").rebac_prefetch_related("scopepart_set")
                 },
+                # A reverse prefetch ordered by the key: its parents, admitted by the
+                # evaluation that read them, are the keys its children's read names.
+                "parts by key": lambda: {
+                    m.pk: _pks(m.scopepart_set.all())
+                    for m in rows()
+                    .order_by("pk")
+                    .rebac_prefetch_related(
+                        Prefetch(
+                            "scopepart_set",
+                            queryset=ScopePart.objects.with_actor(actor).order_by("pk"),
+                        )
+                    )
+                },
+                "parts of thread 1 by key": lambda: {
+                    m.pk: _pks(m.scopepart_set.all())
+                    for m in rows()
+                    .filter(thread_id=1)
+                    .order_by("-pk")
+                    .rebac_prefetch_related(
+                        Prefetch(
+                            "scopepart_set",
+                            queryset=ScopePart.objects.with_actor(actor).order_by("-pk"),
+                        )
+                    )
+                },
             }
         )
     if model is ScopeThread:
         reads["messages"] = lambda: {
             t.pk: {m.pk: _pks(m.scopepart_set.all()) for m in t.scopemessage_set.all()}
             for t in rows().order_by("pk").rebac_prefetch_related("scopemessage_set__scopepart_set")
+        }
+        reads["messages and parts by key"] = lambda: {
+            t.pk: {m.pk: _pks(m.scopepart_set.all()) for m in t.scopemessage_set.all()}
+            for t in rows()
+            .order_by("pk")
+            .rebac_prefetch_related(
+                Prefetch(
+                    "scopemessage_set",
+                    queryset=ScopeMessage.objects.with_actor(actor).order_by("pk"),
+                ),
+                Prefetch(
+                    "scopemessage_set__scopepart_set",
+                    queryset=ScopePart.objects.with_actor(actor).order_by("pk"),
+                ),
+            )
         }
     return reads
 
@@ -1165,11 +2337,12 @@ CASES: dict[str, int] = {"compared": 0, "served": 0}
 
 
 @pytest.mark.django_db(transaction=True)
+@pytest.mark.parametrize("structural_prefetch", [False, True], ids=["", "structural"])
 @pytest.mark.parametrize("storage", ["denormalized", "registry"])
 @pytest.mark.parametrize("generator", list(GENERATORS))
 @pytest.mark.parametrize("seed", seeds(24, fast=3))
 def test_a_bounded_read_reads_what_the_compiled_statement_reads(
-    seed, generator, storage, settings, monkeypatch
+    seed, generator, storage, structural_prefetch, settings, monkeypatch
 ):
     """Random policies with unions, intersections, exclusions, constants, filtered constants,
     caveats, wildcards and subject sets: for every model, actor and read, with the setting in
@@ -1177,6 +2350,9 @@ def test_a_bounded_read_reads_what_the_compiled_statement_reads(
     does with the setting off, in the same order."""
     schema, tuples = GENERATORS[generator](seed)
     seeded(schema, tuples, storage, settings)
+    # Structural prefetch delivers children of admitted parents with no scope, before the
+    # bounded read is asked; the same record proves the parents of the children it does not.
+    settings.REBAC_STRUCTURAL_PREFETCH = structural_prefetch
     if generator == "application":
         label_threads(application_shaped(seed)[2])
     served: list[bool] = []
@@ -1188,30 +2364,35 @@ def test_a_bounded_read_reads_what_the_compiled_statement_reads(
         return found
 
     monkeypatch.setattr(bounded, "read", counting)
+    # What the key read and the walk select from model tables, for every read either mode walks.
+    boundary = Boundary(monkeypatch)
     compared = 0
     for actor in (ADMIN, MEMBER, OUTSIDER):
         for model in (ScopeThread, ScopeMessage, ScopePart):
             for name, read in _reads(model, actor).items():
-                settings.REBAC_BOUNDED_READ = False
-                expected = outcome(read)
-                with evaluator_scope():
-                    expected_scoped = outcome(read)
+                with override_settings(REBAC_BOUNDED_READ=False):
+                    expected = outcome(read)
+                    with evaluator_scope():
+                        expected_scoped = outcome(read)
                 assert expected_scoped == expected, (actor, model, name)
                 for mode in MODES:
-                    settings.REBAC_BOUNDED_READ = mode
-                    assert outcome(read) == expected, (actor, model, name, mode, seed)
-                    with evaluator_scope():
-                        assert outcome(read) == expected, (actor, model, name, mode, "scope")
+                    with override_settings(REBAC_BOUNDED_READ=mode):
+                        assert outcome(read) == expected, (actor, model, name, mode, seed)
+                        with evaluator_scope():
+                            assert outcome(read) == expected, (actor, model, name, mode, "scope")
                     compared += 2
     CASES["compared"] += compared
     CASES["served"] += sum(served)
     # Read with ``-s``: the cases this run compared, and how many reads were decided by candidates.
     print(
-        f"bounded differential {generator} {seed} {storage}: {compared} compared, {sum(served)} decided"
+        f"bounded differential {generator} {seed} {storage}: {compared} compared, "
+        f"{sum(served)} decided, {boundary.windows} walked"
     )
-    if generator in ("application", "keyed"):
+    assert boundary.found == [], boundary.found[:3]
+    if generator == "keyed":
         # These policies are read by the walk alone: the differential exercises the mechanism,
-        # not only its fallback.
+        # not only its fallback. (An application-shaped policy can leave no read served once
+        # every key must be held: its thread's read follows a parent the reads do not name.)
         assert any(served)
 
 

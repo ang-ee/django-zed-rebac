@@ -113,6 +113,12 @@ class _Delivery:
     rows: dict[tuple[type[models.Model], str | None, str], dict[Any, set[Any]]] = field(
         default_factory=dict
     )
+    # (model, database) -> policy key -> primary keys of ``model`` that admitted rows hold in a
+    # foreign key: keys the actor holds because a row it read refers to them. Kept only while
+    # the bounded read is on, which serves a read by such keys (proposal 0025).
+    referred: dict[tuple[type[models.Model], str | None], dict[Any, set[Any]]] = field(
+        default_factory=dict
+    )
     # How many child statements were read without their permission statement.
     delivered: int = 0
     thread: int = field(default_factory=threading.get_ident)
@@ -203,11 +209,31 @@ def policy_key() -> Any:
 def _admit(
     delivery: _Delivery, model: type[models.Model], action: str, rows: list[Any], policy: Any
 ) -> None:
+    from . import bounded
+
     key = policy if policy is not None else policy_key()
+    # The foreign keys of ``model`` that name another model's rows by their primary key.
+    referring: list[tuple[str, type[models.Model]]] = (
+        [
+            (fk.attname, fk.related_model)
+            for fk in model._meta.concrete_fields
+            if isinstance(fk, models.ForeignKey)
+            and isinstance(fk.related_model, type)
+            and fk.target_field.primary_key
+        ]
+        if bounded.enabled()
+        else []
+    )
     for row in rows:
         if isinstance(row, models.Model):
             admitted = delivery.rows.setdefault((model, row._state.db, action), {})
             admitted.setdefault(key, set()).add(row.pk)
+            for attname, target in referring:
+                # Read from the row as loaded: a deferred column is not fetched for this.
+                value = row.__dict__.get(attname)
+                if value is not None:
+                    referred = delivery.referred.setdefault((target, row._state.db), {})
+                    referred.setdefault(key, set()).add(value)
 
 
 def delivers(

@@ -206,34 +206,51 @@ pre-1.0; breaking changes within a minor version are explicitly called out.
 
 - Database check `rebac.W014`: the stored policy lets a name be read two ways (Changed).
 
-- **Bounded reads** (experimental, off by default, `REBAC_BOUNDED_READ`; proposal 0025). A list read whose own
-  conditions select at most 256 rows is decided by those rows: one statement reads their primary keys without the
-  permission (`LIMIT 257`, no ordering, no slice), the walk decides exactly those keys (`rebac.walk.decided_alone`:
-  one lookup per relation, and the compiled statement for a part it cannot read, bounded to the ids that reach
-  it, never for the read's own question or a permission of its type that reaches half of what it reaches), and
-  the read's own statement runs with the admitted keys in place of its
-  scope, its ordering and slice as written. With 257 keys, or wherever the rule (`rebac.bounded.refusal`) or the
-  walk cannot show the compiled statement's answer, the read sends its compiled statement unchanged. It never reads
-  a second batch. Served: iteration, `len()`, `bool()`, slicing and indexing, `get()`, `first()`, `last()`,
-  `earliest()`, `latest()`, `in_bulk()`, `values()`, `values_list()` and a prefetch's child read, over a scope the
-  same evaluation built, for a model whose identity is its integer primary key, whose rows the statement reads
-  once each, in an order that ends ties by the key (or one row at most). Not served: `count()`, `exists()`,
+- **Bounded reads** (experimental, off by default, `REBAC_BOUNDED_READ`; proposal 0025). A list read whose
+  conditions name only keys the reader already holds, and select at most 256 rows, is decided by those rows: where
+  it names parents by a foreign key that the running evaluation has not admitted, it first reads them as the reader
+  would, one statement per parent model; one statement reads the candidates' primary keys without the permission
+  (`SELECT <key> FROM <the model's table> WHERE <the read's conditions> LIMIT 257`: no join, ordering, slice or
+  projection of the read); the walk decides exactly those keys (`rebac.walk.decided_alone`: one lookup per
+  relation, and the compiled statement for a part it cannot read, bounded to the ids that reach it, never for the
+  read's own question or a permission of its type that reaches half of what it reaches); and the read's own
+  statement runs with the admitted keys in place of its scope, its ordering and slice as written. With 257 keys, or
+  wherever the rule (`rebac.bounded.refusal`) or the walk cannot show the compiled statement's answer, the read
+  sends its compiled statement unchanged. It never reads a second batch. Eligible: a read every condition of which
+  is on the model's own primary key or a foreign-key column of its own table, by `exact` or `in` against literal
+  values, joined by `AND`, every key it names held: a parent the reader may read (a reverse prefetch's parents,
+  admitted by the evaluation that read them, at no statement; any other, by the parents' read), or a key that a row
+  the same evaluation read for the same actor, on the same database, refers to (a forward prefetch). A key the
+  client supplies (`get(pk=…)`, `in_bulk()`), a read with no condition, `isnull`, and a condition on any other
+  column, a range or pattern lookup, an `OR`, a negation, a transform, an expression on either side, a condition
+  through a join or an annotation in a condition keep the statement. The record of held keys is structural
+  prefetch's, opened while either setting is on; with structural prefetch off it costs no statement and about 0.4
+  µs per admitted row. Served: iteration, `len()`, `bool()`, slicing and indexing, `get()`, `first()`, `last()`,
+  `earliest()`, `latest()`, `values()`, `values_list()` and a prefetch's child read, over a scope the same
+  evaluation built, for a model whose identity is its integer primary key, whose rows the statement reads once
+  each, in an order that ends ties by the key (or one row at most). Not served: `count()`, `exists()`,
   `aggregate()`, `iterator()`, `aiterator()`, `explain()`, writes, embeddings, set combinations,
   `select_for_update()`, `distinct(*fields)`, aggregates, windows, `extra()`, hand-written SQL, a query nested in
   the read, a join to many rows, a bypass, a stored override, an eager `scoped()` queryset. A question the walk
   would hand whole to the compiled statement keeps its statement before any key is read
   (`rebac.walk.compiler_part`, kept per policy). `True` decides only where the walk reads nothing of a candidate
   but its key; `"identifiers"` also where it reads the foreign keys it follows from it and the subjects of its
-  grants. What it costs: up to 257 keys of rows the actor may not read (with `"identifiers"`, their foreign keys
-  and grant subjects too) enter the process and the walk's statement parameters (statement logs, SQL debug logs,
-  error reports); whether more than 256 rows, hidden ones included, match a read's conditions shows as latency;
-  and a read is several statements, so under READ COMMITTED it can be assembled from adjacent states. System check
-  **`rebac.W016`** says so while it is on. On the benchmark's application policy at the medium size (measured under load), one folder's files
-  for the reader with many grants took 76 ms against 1,427 ms today; with the other mechanisms on, one thread's
-  messages 581 against 1,888 ms and one message with everything shown 1,337 against 2,260 ms; alone, the setting
-  is slower on those two (the walk asks the compiled statement for the thread's permissions); `tasks` keeps its
-  statement (the guard), and every page of more than 256 rows sends one key read more. With the setting off no
-  statement changes.
+  grants. What it discloses: A reader who can observe the statements a read sends, or its latency, learns, for a
+  parent they may read, how many of its children they may not read, up to 256; and, from the number and kind of the
+  walk's lookups, what holds on such a child: which arms of the permission hold on it, as far as the lookups differ
+  with them (a grant to the reader that an exclusion removes, a grant to a group). Of a row whose key or whose
+  parent the reader does not already hold they learn nothing, but for this: with `"identifiers"`, the walk follows
+  a hidden child's foreign keys and grants to groups, and its lookups show what holds on the rows they name. Up to
+  257 keys of rows the actor may not read, the grants on them that name the actor (with `"identifiers"`, their
+  foreign keys and grant subjects too) enter the process and the walk's statement parameters (statement logs, SQL
+  debug logs, error reports). A read is several statements: under READ COMMITTED, inside `read_snapshot()` too, it
+  can be assembled from adjacent states, and a row the walk admitted can be read with content written after the
+  actor lost it. A read whose walk begins and then ends costs the parents' read, the key read and the lookups so
+  far beside today's statements. System check **`rebac.W016`** says so while it is on. On the benchmark's
+  application policy at the medium size (measured under load; medians of five interleaved passes), one folder's
+  files for the reader with many grants took 124 ms against 1,726 ms today, the folder's own read included; the
+  other reads measured are within today's range, and a page of rows, which names no key, sends today's statements.
+  With the setting off no statement changes.
 
 ### Changed
 

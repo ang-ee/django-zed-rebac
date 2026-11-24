@@ -1461,6 +1461,8 @@ class RebacQuerySet(models.QuerySet[_M]):
         if (
             deliver
             and query is root
+            # The record is also kept for a bounded read (proposal 0025), which delivers nothing.
+            and structural.enabled()
             and structural.delivers(query, model, actor, action, using=using)
         ):
             # Children of parents the running prefetch admitted, where the
@@ -1800,7 +1802,9 @@ class RebacQuerySet(models.QuerySet[_M]):
             actor is not None
             and not sudo
             and bool(model_resource_type(self.model))
-            and structural.enabled()
+            # The record also proves, for a bounded read inside the prefetch, the parents and
+            # the referred keys a child read names (proposal 0025).
+            and (structural.enabled() or bounded.enabled())
             and pinned is not None
         )
         action = str(

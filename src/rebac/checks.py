@@ -380,7 +380,8 @@ def check_bounded_read(app_configs: Any = None, **kwargs: Any) -> list[checks.Ch
     if not mode_in_force:
         return []
     crossing = (
-        "Up to 257 primary keys of rows the actor may not read enter the process"
+        "Up to 257 primary keys of rows the actor may not read enter the process, with the "
+        "grants on them that name the actor"
         if mode_in_force == "keys"
         else "Up to 257 primary keys of rows the actor may not read, the foreign keys the walk "
         "follows from them and the subjects of their grants enter the process"
@@ -388,16 +389,23 @@ def check_bounded_read(app_configs: Any = None, **kwargs: Any) -> list[checks.Ch
     return [
         checks.Warning(
             f"REBAC_BOUNDED_READ is {app_settings.REBAC_BOUNDED_READ!r} (experimental): a list "
-            "read whose own conditions select at most 256 rows reads their keys without the "
+            "read whose conditions name only keys the reader holds (a parent it may read, a key a "
+            "row it read refers to) and select at most 256 rows reads their keys without the "
             f"permission and decides them by lookups. {crossing}, and the parameters of those "
-            "lookups (statement logs, SQL debug logs, error reports). Whether more than 256 "
-            "rows, hidden ones included, match a read's conditions shows as its latency.",
+            "lookups (statement logs, SQL debug logs, error reports). A reader who sees the "
+            "statements a read sends, or its latency, learns, for a parent they may read, how "
+            "many of its children (up to 256) they may not read and what holds on such a child as "
+            "far as the walk's lookups differ with it; of rows whose key or parent they do not "
+            "already hold, nothing, but with 'identifiers' what holds on the rows a hidden child's "
+            "foreign keys and group grants name.",
             id="rebac.W016",
             hint=(
-                "A read is assembled from several statements, so under READ COMMITTED it can "
-                "read adjacent states; see proposal 0025 (docs/proposals/0025-bounded-reads.md). "
-                "Remove the setting to read every list with its compiled scope; silence the "
-                "warning with SILENCED_SYSTEM_CHECKS = ['rebac.W016']."
+                "A read is assembled from several statements: under READ COMMITTED, inside "
+                "read_snapshot() too, it can read adjacent states, and a row the walk admitted "
+                "can be read with content written after the actor lost it. See proposal 0025 "
+                "(docs/proposals/0025-bounded-reads.md). Remove the setting to read every list "
+                "with its compiled scope; silence the warning with "
+                "SILENCED_SYSTEM_CHECKS = ['rebac.W016']."
             ),
         )
     ]

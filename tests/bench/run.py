@@ -304,7 +304,8 @@ class _BoundedTally:
                     tally.served += 1
                 else:
                     tally.kept += 1
-                    tally.walked += "for these rows" in message
+                    # Kept after the walk began, or after reading the parents it names.
+                    tally.walked += "for these rows" in message or "a parent the reader" in message
 
         self.served = self.kept = self.walked = 0
         logger = logging.getLogger("rebac.bounded")
