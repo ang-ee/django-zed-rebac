@@ -131,6 +131,15 @@ class _Kept:
             offset = stop
         if ctes.register(tuple(definitions)):
             return f"({self.body})", values[offset:]
+        # PROTOTYPE (experiment branch only): assemble with the bound values, so that the
+        # SQLite in-place form can order them as its text does.
+        import os as _os
+
+        if _os.environ.get("REBAC_X_INLINE"):
+            sql, params = ctes.assemble(
+                (self.body, values[offset:]), tuple(definitions), connections[self.using]
+            )
+            return f"({sql})", tuple(params)
         return self.sql, values
 
 

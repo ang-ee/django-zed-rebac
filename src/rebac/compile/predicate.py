@@ -483,7 +483,13 @@ class Compiler:
                 QuerySet(model=rows.model, query=body, using=self.using),
                 name=self._cte_name(id_name(name_key)),
             )
-            definition = ctes.Definition(cte.name, sql, tuple(params), key)
+            # PROTOTYPE (experiment branch only): REBAC_X_IDSET_MATERIALIZED=mat|notmat spells every id set.
+            import os as _os
+
+            _spelling = {"mat": True, "notmat": False}.get(
+                _os.environ.get("REBAC_X_IDSET_MATERIALIZED", "")
+            )
+            definition = ctes.Definition(cte.name, sql, tuple(params), key, _spelling)
             # Check the full signature, even when the short name collides.
             if any(item.name == cte.name and item.template != key for item in self._id_sets):
                 raise SchemaError("Conflicting REBAC id-set CTE definitions")

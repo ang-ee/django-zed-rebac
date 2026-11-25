@@ -160,6 +160,14 @@ def assemble(
         return body
     if not definitions and not explain:
         return body
+    # PROTOTYPE (experiment branch only): REBAC_X_INLINE=always|budget writes id sets in place on SQLite.
+    import os as _os
+
+    _mode = _os.environ.get("REBAC_X_INLINE", "")
+    if _mode and connection.vendor == "sqlite" and not explain:
+        inlined = _x_inline(body, definitions, _mode)
+        if inlined is not None:
+            return inlined
     sql = _assembled_sql(
         connection.alias,
         connection.vendor,
@@ -168,6 +176,83 @@ def assemble(
         _encode(explain) if explain else None,
     )
     return sql, (*chain.from_iterable(item.params for item in definitions), *body[1])
+
+
+_X_STATS: list[dict[str, Any]] = []
+
+
+def _x_inline(body: SQL, definitions: tuple[Definition, ...], mode: str) -> SQL | None:
+    """PROTOTYPE. Each id set written in place at every FROM item that names it.
+
+    SQLite 3.54 checks its cursor count only when it resolves a CTE reference; a statement
+    without one is held only to the expression depth. Returns None (keep the WITH) for an
+    application CTE, a recursive definition, or a nested WITH that redefines a collected name.
+    """
+    import re
+
+    defs = {item.name: item for item in definitions}
+    if any(not item.template for item in definitions):
+        return None
+    # A kept statement's text alone (``_Kept.sql``): its values are bound in prefix order.
+    if len(body[1]) != len(re.findall(r"(?<!%)%s", body[0])):
+        return None
+    names = "|".join(re.escape(name) for name in defs)
+    texts = [body[0], *(item.sql for item in definitions)]
+    if re.search(r'"(?:%s)"\s+AS\s+(?:NOT\s+)?(?:MATERIALIZED\s+)?\(' % names, " ".join(texts)):
+        return None
+    ref = re.compile(r'%%|%s|\b(FROM|JOIN)\s+"(' + names + r')"(?:\s+("[^"]+"))?')
+    for item in definitions:
+        if re.search(r'\b(?:FROM|JOIN)\s+"%s"' % re.escape(item.name), item.sql):
+            return None
+    item_re = re.compile(r'\b(?:FROM|JOIN)\s+"(\w+)"(?!\s*\()')
+
+    def cost() -> int:
+        info = {}
+        for item in definitions:
+            found = item_re.findall(item.sql)
+            info[item.name] = (len(found), [f for f in found if f in defs])
+        memo: dict[str, int] = {}
+
+        def n(name: str) -> int:
+            if name not in memo:
+                k, refs = info[name]
+                memo[name] = k + sum(n(r) for r in refs)
+            return memo[name]
+
+        found = item_re.findall(body[0])
+        return len(found) + sum(n(f) for f in found if f in defs)
+
+    estimate = cost()
+    if mode == "budget" and estimate < 900:
+        return None
+
+    def splice(text: str, params: tuple[Any, ...]) -> tuple[str, list[Any]]:
+        out: list[str] = []
+        bound: list[Any] = []
+        position = 0
+        taken = 0
+        for match in ref.finditer(text):
+            token = match.group(0)
+            if token == "%%":
+                continue
+            if token == "%s":
+                bound.append(params[taken])
+                taken += 1
+                continue
+            inner_sql, inner_params = splice(defs[match.group(2)].sql, defs[match.group(2)].params)
+            alias = match.group(3) or f'"{match.group(2)}"'
+            out.append(text[position : match.start()])
+            out.append(f"{match.group(1)} ({inner_sql}) {alias}")
+            bound.extend(inner_params)
+            position = match.end()
+        out.append(text[position:])
+        if taken != len(params):
+            raise SchemaError("prototype inline: parameter count mismatch")
+        return "".join(out), bound
+
+    sql, params = splice(body[0], tuple(body[1]))
+    _X_STATS.append({"estimate": estimate, "bytes": len(sql), "ctes": len(definitions)})
+    return sql, tuple(params)
 
 
 @lru_cache(maxsize=512)
