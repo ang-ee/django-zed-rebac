@@ -5,6 +5,23 @@ pre-1.0; breaking changes within a minor version are explicitly called out.
 
 ## [Unreleased]
 
+### Changed
+
+- **CI and local development run on CPython 3.14.9** (the workflows and `.python-version`). No installed package
+  changes. uv's CPython 3.14.10 bundles SQLite 3.54.1, and SQLite 3.54 refuses a statement once the common table
+  expressions it refers to unfold to 1,000 cursors (`VIEWs and/or subqueries nested too deep`): each reference to
+  a common table expression counts a copy of everything that expression reads, and the limit cannot be raised on
+  a standard build. The library writes a permission's id sets as common table expressions, and a wide policy's
+  reads unfold to more than that: on SQLite 3.54.1, nine tests of tier 1 fail and `make bench-smoke` is refused 50
+  of its 88 reads. CPython 3.14.9 bundles SQLite 3.53.1, which accepts them. PostgreSQL is not affected. An
+  application that runs a wide policy on SQLite 3.54 or later meets the same refusal; until the compiler writes
+  such statements another way, run it on SQLite 3.53 or on PostgreSQL.
+- **One slow test has a time limit of its own** (`test_thirty_three_thousand_arrow_readers_see_a_new_grant`, 900
+  seconds). It writes 33,000 relationships one at a time inside one transaction, and PostgreSQL, whose
+  statistics still call the table empty, picks the index for each row's lookup arbitrarily: about 170 seconds on
+  a CI runner with one index, about 300 with another, on 0.37.0 as on 0.38.0. The whole-suite job's limit of 300
+  seconds was met by the slower plan, not by a change in the library.
+
 ## [0.38.0] — 2026-11-24
 
 A security release: upgrade. It fixes ways a queryset could read with a permission scope other than the one in
