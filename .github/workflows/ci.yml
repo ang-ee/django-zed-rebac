@@ -7,6 +7,11 @@ name: CI
 
 # Pushes to lane branches don't run CI; their commits run it on main or in a
 # pull request, so one commit is tested once.
+# The Python is pinned to 3.14.9, whose bundled SQLite is 3.53.1. SQLite 3.54
+# refuses a statement once the common table expressions it refers to unfold to
+# 1,000 cursors, and a wide policy's reads unfold to more (CHANGELOG, Unreleased).
+# The install step fails on a newer SQLite rather than let nine unrelated tests fail.
+
 on:
   push:
     branches: [main]
@@ -31,8 +36,8 @@ jobs:
         uses: astral-sh/setup-uv@v7
       - name: Install dependencies
         run: |
-          uv sync --locked --python 3.14 --managed-python --extra caveats --extra drf --extra strawberry
-          uv run --no-sync python -c 'import sqlite3; print("SQLite", sqlite3.sqlite_version)'
+          uv sync --locked --python 3.14.9 --managed-python --extra caveats --extra drf --extra strawberry
+          uv run --no-sync python -c 'import sqlite3; print("SQLite", sqlite3.sqlite_version); assert sqlite3.sqlite_version_info < (3, 54), "SQLite 3.54 refuses wide statements: see CHANGELOG"'
       - name: Lint, format, types and the SQLite suite
         run: make check
 
@@ -64,7 +69,7 @@ jobs:
         uses: astral-sh/setup-uv@v7
       - name: Install dependencies and PostgreSQL driver
         run: |
-          uv sync --locked --python 3.14 --managed-python --extra caveats --extra drf --extra strawberry --group postgres
-          uv run --no-sync python -c 'import sqlite3; print("SQLite", sqlite3.sqlite_version)'
+          uv sync --locked --python 3.14.9 --managed-python --extra caveats --extra drf --extra strawberry --group postgres
+          uv run --no-sync python -c 'import sqlite3; print("SQLite", sqlite3.sqlite_version); assert sqlite3.sqlite_version_info < (3, 54), "SQLite 3.54 refuses wide statements: see CHANGELOG"'
       - name: PostgreSQL delta
         run: make test-pg

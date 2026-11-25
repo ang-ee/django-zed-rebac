@@ -973,7 +973,14 @@ definition test/message {
 """
 
 
+# 33,000 rows are written one at a time, each after a lookup of that row, inside one
+# transaction, so PostgreSQL's statistics still call the table empty and every index
+# costs the same for the lookup. With the unique index the test takes about 170 s on a
+# CI runner; with an index keyed by the subject, which all the rows share, each lookup
+# reads the rows written so far and it takes about 300 s. The test checks an answer,
+# not a time, so its limit covers the slower plan.
 @pytest.mark.slow
+@pytest.mark.timeout(900)
 def test_thirty_three_thousand_arrow_readers_see_a_new_grant():
     local = install_schema(LARGE_FAN_OUT_SCHEMA)
     local.write_relationships(
