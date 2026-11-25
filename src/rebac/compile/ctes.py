@@ -8,6 +8,7 @@ its local recursive helpers are not candidates for collection.
 from __future__ import annotations
 
 import pickle
+import re
 from collections.abc import Callable, Iterator, Mapping, Sequence
 from contextlib import contextmanager
 from contextvars import ContextVar
@@ -16,7 +17,7 @@ from datetime import datetime
 from functools import lru_cache
 from hashlib import sha256
 from io import BytesIO
-from itertools import chain
+from itertools import accumulate, chain
 from typing import Any, cast
 
 from django.apps import apps
@@ -153,11 +154,25 @@ class _CompiledCompiler(SQLCompiler):
 
 
 def assemble(
-    body: SQL, definitions: tuple[Definition, ...], connection: Any, explain: Any = None
+    body: SQL,
+    definitions: tuple[Definition, ...],
+    connection: Any,
+    explain: Any = None,
+    *,
+    second: bool = False,
 ) -> SQL:
-    """Reuse django-cte's assembled text; bind fresh parameters in prefix order."""
+    """Reuse django-cte's assembled text; bind fresh parameters in the order of the text.
+
+    ``second`` marks another binding of id sets that the statement around it
+    already names (``embedded``).
+    """
     if not body[0]:
         return body
+    if definitions and _counts_cte_copies(connection):
+        # The statement around a second binding cannot be rewritten once a
+        # nested WITH defines its names again, so that binding never keeps one.
+        budget = 0 if second else _CURSOR_BUDGET
+        body, definitions = _in_place(body, definitions, connection.ops.quote_name, budget)
     if not definitions and not explain:
         return body
     sql = _assembled_sql(
@@ -168,6 +183,186 @@ def assemble(
         _encode(explain) if explain else None,
     )
     return sql, (*chain.from_iterable(item.params for item in definitions), *body[1])
+
+
+# ---------- Id sets written in place, where SQLite counts a CTE's copies ----------
+
+# SQLite 3.54 copies a CTE at every FROM item that names it, and refuses the
+# statement ("VIEWs and/or subqueries nested too deep") when the cursors it has
+# allocated reach SQLITE_LIMIT_EXPR_DEPTH as it resolves a CTE's name. A
+# statement that names no CTE is not held to that count.
+_SQLITE_COUNTS_CTE_COPIES = (3, 54)
+# From this many cursors a statement's id sets are written in place. SQLite's
+# limit is 1000 on a standard build. The count is taken from the text and is
+# SQLite's own for text the library writes; the margin is for the few cursors
+# a text does not show (the tables behind a view). A connection that lowers
+# the limit is not followed: compiling a statement opens none.
+_CURSOR_BUDGET = 900
+# Past either of these a statement stays as it is written, for SQLite to
+# refuse. Every copy of a set repeats its cursors and its text, so a policy
+# whose paths multiply unfolds without bound: SQLite takes seconds and half a
+# gigabyte to prepare 12,000 cursors written in place. The widest statement of
+# the policy benchmark has 3,800 and is 0.5 MB long.
+_CURSOR_CEILING = 8_000
+_IN_PLACE_SIZE = 2_000_000
+_FROM_ITEM = re.compile(r"\b(?:FROM|JOIN)\b")
+# One text of a statement: an id set's quoted name (None for an application
+# CTE and for the body), its SQL and how many values it binds.
+type _Text = tuple[str | None, str, int]
+# A text cut at a reference it makes: the text before it with the positions of
+# its values, then what opens the set referred to, that set and what closes it.
+type _Piece = tuple[str, tuple[int, ...], tuple[str, int, str] | None]
+
+
+def _counts_cte_copies(connection: Any) -> bool:
+    # Asked of SQLite alone: its version is the linked library's, read without a connection.
+    return connection.vendor == "sqlite" and bool(
+        connection.get_database_version() >= _SQLITE_COUNTS_CTE_COPIES
+    )
+
+
+def _in_place(
+    body: SQL, definitions: tuple[Definition, ...], quote: Callable[[str], str], budget: int
+) -> tuple[SQL, tuple[Definition, ...]]:
+    """Write each id set where it is named, in a statement of ``budget`` cursors or more.
+
+    Returns the body and the definitions that keep their names: all of them for
+    a statement that stays as it is, application CTEs alone otherwise. Values
+    follow the text: a set written at several places binds its values at each.
+    """
+    texts: tuple[_Text, ...] = (
+        *(
+            # An application CTE has no template: it keeps its name.
+            (quote(item.name) if item.template else None, item.sql, len(item.params))
+            for item in definitions
+        ),
+        (None, body[0], len(body[1])),
+    )
+    unfolded = _unfolded(texts)
+    if unfolded is None:
+        return body, definitions
+    cursors, size = unfolded
+    if not budget <= cursors <= _CURSOR_CEILING or size > _IN_PLACE_SIZE:
+        return body, definitions
+    pool = (*chain.from_iterable(item.params for item in definitions), *body[1])
+    *applications, (sql, order) = _placed(texts)
+    kept = tuple(
+        Definition(
+            item.name,
+            placed_sql,
+            tuple(pool[position] for position in placed_order),
+            item.template,
+            item.materialized,
+        )
+        for item, (placed_sql, placed_order) in zip(
+            (item for item in definitions if not item.template), applications, strict=True
+        )
+    )
+    return (sql, tuple(pool[position] for position in order)), kept
+
+
+def _references(texts: tuple[_Text, ...]) -> tuple[re.Pattern[str], dict[str, int]]:
+    """A pattern for each placeholder and each use of an id set's name in ``texts``.
+
+    Groups: the FROM or JOIN keyword, the name and the alias of a reference;
+    or the name alone and the dot that makes it a column's qualifier (also
+    after a FROM that is an operator's, as in IS DISTINCT FROM).
+    """
+    sets = {name: index for index, (name, _sql, _count) in enumerate(texts) if name}
+    names = "|".join(map(re.escape, sets))
+    return (
+        re.compile(
+            rf'%%|%s|\b(FROM|JOIN)\s+({names})(?!\.)(?:\s+(?:AS\s+)?("[^"]*"))?|({names})(\.)?'
+        ),
+        sets,
+    )
+
+
+@lru_cache(maxsize=512)
+def _unfolded(texts: tuple[_Text, ...]) -> tuple[int, int] | None:
+    """The cursors SQLite allocates for a statement, and its length written in place.
+
+    Counted as SQLite does: every FROM item of a text, and at each one naming
+    an id set, that set's count again. The length adds up the same way. None
+    when the statement cannot be written in place.
+    """
+    token, sets = _references(texts)
+    if not sets:
+        return None
+    cursors: list[int] = []
+    sizes: list[int] = []
+    for index, (_name, sql, count) in enumerate(texts):
+        referred = []
+        bound = 0
+        for match in token.finditer(sql):
+            if match[0] == "%s":
+                bound += 1
+            elif match[2]:
+                referred.append(sets[match[2]])
+            elif match[4] and not match[5]:
+                # The name is used some other way: a nested WITH that defines
+                # it again, for a second binding. Its references are its own.
+                return None
+        if bound != count or any(other >= index for other in referred):
+            # Values that cannot be told apart by their placeholders; or a set
+            # that names itself, or one defined after it.
+            return None
+        cursors.append(len(_FROM_ITEM.findall(sql)) + sum(cursors[other] for other in referred))
+        sizes.append(len(sql) + sum(sizes[other] for other in referred))
+    stay = [index for index, (name, _sql, _count) in enumerate(texts) if name is None]
+    return sum(cursors[index] for index in stay), sum(sizes[index] for index in stay)
+
+
+@lru_cache(maxsize=64)
+def _placed(texts: tuple[_Text, ...]) -> tuple[tuple[str, tuple[int, ...]], ...]:
+    """The texts that keep their place (application CTEs, then the body), id sets written in.
+
+    Each is paired with the positions of the values it binds, in text order,
+    among the values of ``texts`` taken in their order. Text alone is kept
+    here, never a bound value. ``_unfolded`` has accepted ``texts``.
+    """
+    token, sets = _references(texts)
+    starts = tuple(accumulate((count for _name, _sql, count in texts), initial=0))
+    cut: list[list[_Piece]] = []
+    for index, (_name, sql, _count) in enumerate(texts):
+        pieces: list[_Piece] = []
+        positions: list[int] = []
+        start = 0
+        taken = starts[index]
+        for match in token.finditer(sql):
+            if match[0] == "%s":
+                positions.append(taken)
+                taken += 1
+            elif match[2]:
+                # An unaliased set keeps its name, which its columns are qualified by.
+                reference = (f"{match[1]} (", sets[match[2]], f") {match[3] or match[2]}")
+                pieces.append((sql[start : match.start()], tuple(positions), reference))
+                positions = []
+                start = match.end()
+        pieces.append((sql[start:], tuple(positions), None))
+        cut.append(pieces)
+
+    def written(index: int) -> tuple[str, tuple[int, ...]]:
+        # One pass over the unfolded text, without a copy of each set on the way.
+        parts: list[str] = []
+        order: list[int] = []
+        unfinished = [(iter(cut[index]), "")]
+        while unfinished:
+            rest, closing = unfinished[-1]
+            for text, bound, reference in rest:
+                parts.append(text)
+                order += bound
+                if reference is not None:
+                    opening, inner, inner_closing = reference
+                    parts.append(opening)
+                    unfinished.append((iter(cut[inner]), inner_closing))
+                    break
+            else:
+                parts.append(closing)
+                unfinished.pop()
+        return "".join(parts), tuple(order)
+
+    return tuple(written(index) for index, (name, _sql, _count) in enumerate(texts) if name is None)
 
 
 @lru_cache(maxsize=512)
@@ -301,6 +496,11 @@ def register(definitions: tuple[Definition, ...]) -> bool:
     return statement is not None and statement.add(definitions)
 
 
+def embedded() -> bool:
+    """Whether what compiles now is part of a statement that collects id sets."""
+    return _current.get() is not None
+
+
 def _compile(compiler: Any, method: Callable[[], Any], body: Callable[[], Any]) -> Any:
     query = compiler.query
     own = getattr(query, "_rebac_id_sets", ())
@@ -319,6 +519,8 @@ def _render(compiler: Any, body_method: Callable[[], Any], own: tuple[Definition
     query = compiler.query
     attached = getattr(query, "_with_ctes", ())
     explain = query.explain_info
+    # Rendered inside a collecting statement only for a binding that statement refused.
+    second = embedded()
     # Exactly the metadata bracket used by django-cte. It is restored even
     # on failure; no query graph or compiler.query substitution is involved.
     query.explain_info = None
@@ -352,6 +554,7 @@ def _render(compiler: Any, body_method: Callable[[], Any], own: tuple[Definition
                 (*statement.definitions.values(), *application),
                 compiler.connection,
                 explain,
+                second=second,
             )
     finally:
         query.explain_info = explain

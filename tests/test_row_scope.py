@@ -7,6 +7,7 @@ from django.db import connection
 from django.test.utils import CaptureQueriesContext
 
 from rebac import SubjectRef, rowscope, sudo
+from rebac.compile import ctes
 from rebac.testing import install_schema
 from tests.mechanism_policies import (
     ADMIN,
@@ -219,7 +220,13 @@ def test_a_permission_too_large_as_row_conditions_keeps_the_compiled_scope(local
     assert rowscope.row_conditions(ScopeThread, MEMBER, "p1", "default") is not None
     assert rowscope.row_conditions(ScopeThread, MEMBER, "read", "default") is None
     found, statements = read(ScopeThread)
-    assert found == expected and id_sets(statements)
+    assert found == expected
+    # The compiled scope: its id sets by name, or, for a SQLite that counts a
+    # CTE's copies, written where they were named (it unfolds past the limit).
+    if ctes._counts_cte_copies(connection):
+        assert any("FROM (SELECT" in sql for sql in statements)
+    else:
+        assert id_sets(statements)
     assert read(ScopeThread, action="p1")[0] == read(ScopeThread, action="p1")[0]
 
 
