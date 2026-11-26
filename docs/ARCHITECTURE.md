@@ -2730,8 +2730,10 @@ of its own.
   written, and SQLite refuses one that binds more than the connection takes
   (`too many SQL variables`, 32,766 by default). A bulk check cuts its
   statements by their text, so it sends one statement for each item whose
-  statement is written in place. Run such a policy on PostgreSQL, or on SQLite
-  before 3.54.
+  statement is written in place. It also gathers items that each read alone
+  into one statement, and that statement is refused when the items hold a
+  recursive closure and together pass 1,000 cursors. Run such a policy on
+  PostgreSQL, or on SQLite before 3.54.
 
 - Query plans on PostgreSQL tables of tens of millions of rows have not been
   verified. A trial at that scale is in progress, and this document makes no
