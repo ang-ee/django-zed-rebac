@@ -1,7 +1,10 @@
 """Statement-wide id sets, with recursive CTEs kept at their own boundary."""
 
 import re
+import sqlite3
 from collections import Counter
+from contextlib import contextmanager
+from dataclasses import replace
 
 import pytest
 from django.db import connection
@@ -10,7 +13,14 @@ from django.test.utils import CaptureQueriesContext
 from django.utils import timezone
 from django_cte import CTE, with_cte
 
-from rebac import RelationshipTuple, SubjectRef, share_id_sets, sudo, to_object_ref
+from rebac import (
+    CheckItem,
+    RelationshipTuple,
+    SubjectRef,
+    share_id_sets,
+    sudo,
+    to_object_ref,
+)
 from rebac.compile import ctes
 from rebac.compile.predicate import Compiler
 from rebac.models import PermissionAuditEvent
@@ -175,11 +185,17 @@ def test_different_actor_bindings_do_not_alias(shared_rows, monkeypatch):
     )
     sql, params = _sql(rows.values("pk", "alice", "bob"))
     assert sql.startswith("WITH RECURSIVE ")
-    assert sql.count("WITH RECURSIVE") > 1
-    assert max(Counter(_definitions(sql)).values()) == 2
     assert "alice" in params and "bob" in params
-    assert fallbacks
-    assert any("bob" in params for _, params in fallbacks)
+    if ctes._counts_cte_copies(connection):
+        # The second binding is written in place, whatever its size: the
+        # statement around it could not be rewritten past a name defined twice.
+        assert sql.count("WITH RECURSIVE") == 1
+        assert max(Counter(_definitions(sql)).values()) == 1
+    else:
+        assert sql.count("WITH RECURSIVE") > 1
+        assert max(Counter(_definitions(sql)).values()) == 2
+        assert fallbacks
+        assert any("bob" in params for _, params in fallbacks)
     expected_alice, expected_bob = _expected(reference), _expected(reference, BOB)
     for pk, alice, bob in rows.values_list("pk", "alice", "bob"):
         assert alice == (pk in expected_alice)
@@ -1133,3 +1149,271 @@ def test_accessible_sql_stable_across_actors_and_expiration_instants(monkeypatch
         bindings.append(tuple(params))
     assert texts[0] == texts[1] == texts[2]
     assert bindings[0] != bindings[1] != bindings[2]
+
+
+# ---------- Id sets written in place, where SQLite counts a CTE's copies ----------
+
+sqlite_only = pytest.mark.skipif(
+    connection.vendor != "sqlite", reason="SQLite's limit on the copies of a CTE"
+)
+LEAF, MIDDLE = "rebac_ids_00000000000000aa", "rebac_ids_00000000000000bb"
+
+
+@contextmanager
+def _written_in_place(monkeypatch, budget=0):
+    """As on SQLite 3.54: a statement at or past ``budget`` cursors has no id set by name."""
+    with monkeypatch.context() as patch:
+        patch.setattr(ctes, "_counts_cte_copies", lambda connection: True)
+        patch.setattr(ctes, "_CURSOR_BUDGET", budget)
+        yield
+
+
+def _names_no_id_set(sql):
+    """No id set is defined or selected from by name (a column may still be qualified by one)."""
+    return not re.search(_id_pattern() + r" AS \(|(?:FROM|JOIN) " + _id_pattern() + r"(?!\.)", sql)
+
+
+def _handwritten():
+    leaf = ctes.Definition(LEAF, 'SELECT %s AS "v", \'100%%\' AS "p"', ("leaf",), b"leaf")
+    middle = ctes.Definition(
+        MIDDLE, f'SELECT %s || "U0"."v" || %s AS "v" FROM "{LEAF}" "U0"', ("<", ">"), b"middle"
+    )
+    # An application CTE: it has no template, and reads a set it gives no alias.
+    application = ctes.Definition(
+        "application", f'SELECT %s || "v" AS "v" FROM "{MIDDLE}"', ("app:",), b""
+    )
+    # A set under an alias written with AS, a set without one, and a set's
+    # column after a FROM that is not a clause's.
+    body = (
+        f'SELECT %s, "application"."v", "V0"."v", "{LEAF}"."v", "{LEAF}"."p", %s'
+        f' FROM "application" INNER JOIN "{MIDDLE}" AS "V0" ON (1 = 1)'
+        f' INNER JOIN "{LEAF}" ON (1 = 1)'
+        f' WHERE %s = %s AND "V0"."v" IS DISTINCT FROM "{LEAF}"."v"',
+        ("first", "last", 1, 1),
+    )
+    return body, (leaf, middle, application)
+
+
+def _rows(statement):
+    with connection.cursor() as cursor:
+        cursor.execute(*statement)
+        return cursor.fetchall()
+
+
+@sqlite_only
+def test_values_follow_the_text_of_a_statement_written_in_place(monkeypatch):
+    body, definitions = _handwritten()
+    named = ctes.assemble(body, definitions, connection)
+    assert named[1] == ("leaf", "<", ">", "app:", "first", "last", 1, 1)
+    with _written_in_place(monkeypatch):
+        placed = ctes.assemble(body, definitions, connection)
+    sql, params = placed
+    # The application CTE keeps its name and comes first; every id set is
+    # written where it was named, as often as it was named, with its values.
+    assert params == ("app:", "<", ">", "leaf", "first", "last", "<", ">", "leaf", "leaf", 1, 1)
+    assert sql.count("WITH RECURSIVE") == 1 and sql.startswith('WITH RECURSIVE "application" AS (')
+    assert _names_no_id_set(sql)
+    # A set named without an alias keeps its name for the columns it qualifies.
+    assert f') "{LEAF}" ON (1 = 1)' in sql and f') "{MIDDLE}")' in sql
+    assert ') "V0" ON (1 = 1)' in sql and sql.endswith(f'IS DISTINCT FROM "{LEAF}"."v"')
+    assert sql.count("'100%%'") == 3
+    expected = [("first", "app:<leaf>", "<leaf>", "leaf", "100%", "last")]
+    assert _rows(named) == _rows(placed) == expected
+
+
+@sqlite_only
+def test_a_statement_within_the_budget_keeps_its_text(monkeypatch):
+    body, definitions = _handwritten()
+    named = ctes.assemble(body, definitions, connection)
+    # Five FROM items are written and the middle set's one is read twice; the
+    # FROM of IS DISTINCT FROM is counted with them, on the safe side.
+    texts = (*((f'"{d.name}"' if d.template else None, d.sql, len(d.params)) for d in definitions),)
+    leaf, middle, application = definitions
+    # Its length in place, counting each text once for each place it is written.
+    size = len(body[0]) + len(application.sql) + 2 * len(middle.sql) + 3 * len(leaf.sql)
+    assert ctes._unfolded((*texts, (None, body[0], len(body[1])))) == (7, size)
+    with _written_in_place(monkeypatch, budget=8):
+        assert ctes.assemble(body, definitions, connection) == named
+    with _written_in_place(monkeypatch, budget=7):
+        assert ctes.assemble(body, definitions, connection) != named
+
+
+@sqlite_only
+@pytest.mark.parametrize(
+    "why",
+    [
+        "a second binding",
+        "a set that names itself",
+        "values without placeholders",
+        "too many cursors",
+        "too long",
+    ],
+)
+def test_a_statement_that_cannot_be_written_in_place_keeps_its_names(monkeypatch, why):
+    body, definitions = _handwritten()
+    leaf, middle, application = definitions
+    if why == "a second binding":
+        # Another binding of the same set kept its nested WITH: the references
+        # inside it are its own, and the text does not tell them from the rest.
+        nested = (
+            f'(WITH RECURSIVE "{LEAF}" AS (SELECT %s AS "v") SELECT "U0"."v" FROM "{LEAF}" "U0")'
+        )
+        body = (body[0] + f" AND %s IN {nested}", (*body[1], "other", "other"))
+    elif why == "a set that names itself":
+        recursive = replace(leaf, sql=leaf.sql + f' UNION SELECT "v", "p" FROM "{LEAF}"')
+        definitions = (recursive, middle, application)
+    elif why == "values without placeholders":
+        definitions = (replace(leaf, params=("leaf", "stray")), middle, application)
+    elif why == "too many cursors":
+        monkeypatch.setattr(ctes, "_CURSOR_CEILING", 5)
+    else:
+        monkeypatch.setattr(ctes, "_IN_PLACE_SIZE", 400)
+    named = (
+        ctes.assemble(body, definitions, connection)
+        if why != "values without placeholders"
+        else None
+    )
+    with _written_in_place(monkeypatch):
+        assert ctes._in_place(body, definitions, connection.ops.quote_name, 0) == (
+            body,
+            definitions,
+        )
+        if named is not None:
+            assert ctes.assemble(body, definitions, connection, second=True) == named
+
+
+@sqlite_only
+def test_a_policy_whose_paths_multiply_is_not_written_out(monkeypatch):
+    # Forty sets, each read twice by the next and binding nothing (arrows over
+    # model fields): 2 ** 40 copies of the first. It is counted, never built.
+    names = [f"rebac_ids_{level:016x}" for level in range(40)]
+    definitions = [ctes.Definition(names[0], 'SELECT "id" FROM "testapp_post"', (), b"0")]
+    for level in range(1, 40):
+        below = names[level - 1]
+        sql = (
+            f'SELECT "U0"."id" FROM "{below}" "U0" WHERE "U0"."id" IN'
+            f' (SELECT "U1"."id" FROM "{below}" "U1")'
+        )
+        definitions.append(ctes.Definition(names[level], sql, (), str(level).encode()))
+    body = (f'SELECT "V0"."id" FROM "{names[-1]}" "V0"', ())
+    monkeypatch.setattr(ctes, "_placed", None)
+    named = ctes.assemble(body, tuple(definitions), connection)
+    assert named[0].startswith("WITH RECURSIVE ") and len(named[0]) < 10_000
+    with _written_in_place(monkeypatch):
+        assert ctes.assemble(body, tuple(definitions), connection) == named
+
+
+def _read_statements(shared_rows):
+    """Reads that embed permission scopes each way a statement can."""
+    scope = Post.objects.with_actor(ALICE).scoped().order_by().values("pk")
+    branches = [
+        Post.objects.with_actor(ALICE).filter(title=title).scoped().order_by().values("pk")
+        for title in ("inherited", "direct", "hidden")
+    ]
+    application = CTE(
+        Post._base_manager.filter(pk__in=scope).values("pk"), name="application_posts"
+    )
+    return {
+        "scoped root": Post.objects.with_actor(ALICE)
+        .scoped()
+        .order_by("pk")
+        .values_list("pk", "title"),
+        "shared root": share_id_sets(Post._base_manager.all())
+        .filter(Exists(scope.filter(pk=OuterRef("pk"))), pk__in=scope.all())
+        .annotate(seen=Subquery(scope.filter(pk=OuterRef("pk"))[:1]), marker=Value("body"))
+        .order_by("pk")
+        .values_list("pk", "seen", "marker"),
+        "plain root": Post._base_manager.filter(pk__in=scope)
+        .filter(pk__in=scope.all())
+        .order_by("pk")
+        .values_list("pk", flat=True),
+        "union": branches[0].union(*branches[1:]).order_by("pk"),
+        "two actors": share_id_sets(Post._base_manager.all())
+        .annotate(
+            alice=Exists(Post.objects.with_actor(ALICE).filter(pk=OuterRef("pk"))),
+            bob=Exists(Post.objects.with_actor(BOB).filter(pk=OuterRef("pk"))),
+        )
+        .order_by("pk")
+        .values_list("pk", "alice", "bob"),
+        "application CTE": share_id_sets(
+            with_cte(application, select=QuerySet(model=Post, query=application.queryset().query))
+        )
+        .filter(pk__in=scope)
+        .order_by("pk")
+        .values_list("pk", flat=True),
+    }
+
+
+@sqlite_only
+def test_reads_written_in_place_return_the_rows_of_the_named_form(shared_rows, monkeypatch):
+    local, reference, posts = shared_rows
+    expected, expected_bob = _expected(reference), _expected(reference, BOB)
+    statements = _read_statements(shared_rows)
+    named = {label: (_sql(rows), list(rows)) for label, rows in statements.items()}
+    assert [pk for pk, _title in named["scoped root"][1]] == sorted(expected)
+    assert [(pk, pk in expected, pk in expected_bob) for pk, _, _ in named["two actors"][1]] == (
+        named["two actors"][1]
+    )
+    items = [
+        CheckItem(actor, "read", to_object_ref(post)) for post in posts for actor in (ALICE, BOB)
+    ]
+    checked = [answer.allowed for answer in local.check_bulk_permissions(items)]
+    with _written_in_place(monkeypatch):
+        for label, rows in statements.items():
+            rows = rows.all()
+            sql, params = _sql(rows)
+            assert sql != named[label][0][0], label
+            assert _names_no_id_set(sql), label
+            assert sql.count("WITH RECURSIVE") == (label == "application CTE"), label
+            assert sql.count("%s") == len(params), label
+            assert list(rows) == named[label][1], label
+        assert [a.allowed for a in local.check_bulk_permissions(items)] == checked
+        for actor, held in ((ALICE, expected), (BOB, expected_bob)):
+            found = local.accessible(subject=actor, action="read", resource_type="blog/post")
+            assert {int(pk) for pk in found} == held
+        with CaptureQueriesContext(connection) as captured:
+            assert statements["scoped root"].explain()
+        assert [q["sql"] for q in captured if q["sql"].startswith("EXPLAIN")]
+    # Past the context a statement has its names again: nothing kept was rewritten.
+    for label, rows in statements.items():
+        assert _sql(rows.all()) == named[label][0], label
+    # Under the budget, where the database counts copies: the text of the named
+    # form, but for a second binding, which is written in place at any size.
+    with monkeypatch.context() as patch:
+        patch.setattr(ctes, "_counts_cte_copies", lambda connection: True)
+        for label, rows in statements.items():
+            if label != "two actors":
+                assert _sql(rows.all()) == named[label][0], label
+        both = statements["two actors"].all()
+        assert _sql(both)[0].count("WITH RECURSIVE") == 1
+        assert max(Counter(_definitions(_sql(both)[0])).values()) == 1
+        assert list(both) == named["two actors"][1]
+
+
+@sqlite_only
+@pytest.mark.parametrize("operation", ["update", "delete"])
+def test_writes_scoped_in_place_select_only_allowed_rows(shared_rows, monkeypatch, operation):
+    _, reference, posts = shared_rows
+    expected = _expected(reference)
+    scope = Post.objects.with_actor(ALICE).values("pk")
+    rows = Post._base_manager.filter(pk__in=scope).filter(pk__in=scope.all())
+    with (
+        _written_in_place(monkeypatch),
+        sudo(reason="in-place write"),
+        CaptureQueriesContext(connection) as captured,
+    ):
+        if operation == "update":
+            assert rows.update(title="changed") == len(expected)
+            kept = set(Post._base_manager.filter(title="changed").values_list("pk", flat=True))
+            assert kept == expected
+        else:
+            rows.delete()
+            left = set(Post._base_manager.values_list("pk", flat=True))
+            assert left == {post.pk for post in posts} - expected
+    writes = [q["sql"] for q in captured if q["sql"].startswith(operation.upper())]
+    assert writes and all(_names_no_id_set(sql) and "WITH RECURSIVE" not in sql for sql in writes)
+
+
+def test_only_sqlite_from_3_54_has_id_sets_written_in_place():
+    counted = connection.vendor == "sqlite" and sqlite3.sqlite_version_info >= (3, 54)
+    assert ctes._counts_cte_copies(connection) is counted

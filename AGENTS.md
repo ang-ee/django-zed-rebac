@@ -474,9 +474,11 @@ access via `rebac.backend()`.
   uninstall routine is the only raw-SQL exception. One documented exception
   covers SQL text that Django's own compiler produced: kept statement bodies
   and id sets are frozen SQL/parameter tuples, attached at the outermost owned
-  SELECT through the pinned django-cte adapter; the identity conversion's
-  guard is embedded as compiled text too (ARCHITECTURE.md § Statement shape
-  and § Inline permission scopes). No permission statement is written by hand.
+  SELECT through the pinned django-cte adapter, or, on a SQLite that counts
+  the copies of a CTE, written unchanged where the statement names them; the
+  identity conversion's guard is embedded as compiled text too
+  (ARCHITECTURE.md § Statement shape and § Inline permission scopes). No
+  permission statement is written by hand.
   CI runs SQLite and PostgreSQL; the opt-in MySQL 8.4 vendor suite
   is a release gate.
 

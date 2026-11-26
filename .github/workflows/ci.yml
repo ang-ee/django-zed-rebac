@@ -1,16 +1,20 @@
 name: CI
 
-# Tier 1 and tier 2 (docs/ARCHITECTURE.md § Test tiers) as two parallel jobs.
+# Tier 1 and tier 2 (docs/ARCHITECTURE.md § Test tiers) as parallel jobs.
 # Tier 1 is the gate for merging and for publishing: Publish to PyPI reads the
 # result of the `tier 1` job, not of this whole run. Tier 3 runs in
 # release.yml.
 
 # Pushes to lane branches don't run CI; their commits run it on main or in a
 # pull request, so one commit is tested once.
-# The Python is pinned to 3.14.9, whose bundled SQLite is 3.53.1. SQLite 3.54
-# refuses a statement once the common table expressions it refers to unfold to
-# 1,000 cursors, and a wide policy's reads unfold to more (CHANGELOG, Unreleased).
-# The install step fails on a newer SQLite rather than let nine unrelated tests fail.
+# Tier 1 and tier 2 run on Python 3.14.9, whose bundled SQLite is 3.53.1.
+# SQLite 3.54 counts a copy of a common table expression at every reference to
+# it and refuses a statement at 1,000 cursors. The library writes such a
+# statement's id sets in place there, but a recursive closure past the limit is
+# still refused (docs/ARCHITECTURE.md, Known limits), and the tests of those
+# reads can only state the refusal. The pinned jobs read them; their install
+# step fails on a newer SQLite rather than run the other expectations unnoticed.
+# The `tier 1, SQLite 3.54` job runs the same gate on Python 3.14.10 (SQLite 3.54.1).
 
 on:
   push:
@@ -38,6 +42,21 @@ jobs:
         run: |
           uv sync --locked --python 3.14.9 --managed-python --extra caveats --extra drf --extra strawberry
           uv run --no-sync python -c 'import sqlite3; print("SQLite", sqlite3.sqlite_version); assert sqlite3.sqlite_version_info < (3, 54), "SQLite 3.54 refuses wide statements: see CHANGELOG"'
+      - name: Lint, format, types and the SQLite suite
+        run: make check
+
+  sqlite-3-54:
+    name: tier 1, SQLite 3.54
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v5
+      - name: Install uv
+        uses: astral-sh/setup-uv@v7
+      - name: Install dependencies
+        run: |
+          uv sync --locked --python 3.14.10 --managed-python --extra caveats --extra drf --extra strawberry
+          uv run --no-sync python -c 'import sqlite3; print("SQLite", sqlite3.sqlite_version); assert sqlite3.sqlite_version_info >= (3, 54), "this job is for a SQLite that counts the copies of a common table expression"'
       - name: Lint, format, types and the SQLite suite
         run: make check
 

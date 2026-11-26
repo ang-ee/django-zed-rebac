@@ -5,17 +5,55 @@ pre-1.0; breaking changes within a minor version are explicitly called out.
 
 ## [Unreleased]
 
+## [0.38.1] — 2026-11-25
+
+Partial support for SQLite 3.54, which uv's CPython 3.14.10 bundles. SQLite 3.54 refuses the statements a wide
+policy compiles to; this release writes them in a form it accepts where one exists. It is not full support: a
+statement that holds a recursive closure (a group whose members are groups, a folder under a folder) and
+unfolds past 1,000 cursors, and a statement past 8,000 cursors, are refused as before, and an application whose
+policy produces them still needs SQLite 3.53 (CPython 3.14.9) or PostgreSQL for those reads. Measured on one
+application's test suite on SQLite 3.54.1: 891 tests did not pass with 0.38.0, 308 do not with this release.
+Nothing changes on PostgreSQL, on SQLite before 3.54, or for a statement under 900 cursors: the statements the
+policy benchmark sends on PostgreSQL are byte for byte those of 0.38.0.
+
+### Fixed
+
+- **A wide policy is read on SQLite 3.54 and later, where SQLite accepts a form of its statement.** SQLite 3.54
+  refuses a statement (`VIEWs and/or subqueries nested too deep`) when the cursors it has allocated reach
+  `SQLITE_LIMIT_EXPR_DEPTH` as it resolves a reference to a common table expression, and it counts a copy of a
+  common table expression at every reference to it. The limit is 1,000 on a standard build. The library writes a permission's id sets as common table expressions, and
+  a wide policy's reads unfold to more: on SQLite 3.54.1, nine tests of tier 1 failed and `make bench-smoke` was
+  refused 50 of its 88 reads. uv's CPython 3.14.10 bundles SQLite 3.54.1.
+  On SQLite 3.54 and later, a statement that would unfold to 900 cursors or more now has each id set written
+  where it is named, as a subquery in the FROM clause, and names no common table expression of the library's.
+  Its values are bound in the order of its text, a set's values at each place it is written. A second binding
+  of the same sets in one statement (another actor's scope) is written in place at any size. Every other
+  statement under that count, every statement on an older SQLite and every statement on PostgreSQL keep their
+  text.
+  Measured on SQLite 3.54.1: `make bench-smoke` returns the rows of all 88 reads in the statement counts of
+  SQLite 3.53.1, and tier 1 passes. 51 of the 88 reads send a statement written in place: their SQL is 3.5
+  times as long at the median and 5.1 times at most (the widest read sends 1.59 MB where it sent 460 KB). With
+  both forms run on SQLite 3.53.1, those reads take about twice as long at the median and up to 3.4 times,
+  the widest 74 ms where it took 27, at the benchmark's smallest size; the benchmark's process peaks at 430 MB
+  where it peaked at 310 MB. A bulk check sends one statement for each item whose statement is written in
+  place (60 statements where it sent 30, for 60 wide items).
+  Some statements are still refused on SQLite 3.54 and later, and read by an older SQLite and by PostgreSQL.
+  The one that matters most: a statement that holds a recursive closure (a group whose members are groups, a
+  folder under a folder) which SQLite resolves after the statement has allocated 1,000 cursors, because a
+  recursive common table expression keeps its name. A wide policy with such a relation is refused as before,
+  and so is a bulk check that gathers into one statement enough items that each hold one.
+  The others: a statement past 8,000 cursors or 2,000,000 characters in place, as a policy whose paths double
+  at each level, or a wide policy read for three or four actors in one statement; one that also names a common table expression of the application's which SQLite resolves
+  after 1,000 cursors; several scopes embedded in a root that does not share id sets (a plain Django root
+  without `share_id_sets()`, a write), each counted alone; and one that reads a model backed by a database view
+  at many places. See Known limits in `docs/ARCHITECTURE.md`.
+
 ### Changed
 
-- **CI and local development run on CPython 3.14.9** (the workflows and `.python-version`). No installed package
-  changes. uv's CPython 3.14.10 bundles SQLite 3.54.1, and SQLite 3.54 refuses a statement once the common table
-  expressions it refers to unfold to 1,000 cursors (`VIEWs and/or subqueries nested too deep`): each reference to
-  a common table expression counts a copy of everything that expression reads, and the limit cannot be raised on
-  a standard build. The library writes a permission's id sets as common table expressions, and a wide policy's
-  reads unfold to more than that: on SQLite 3.54.1, nine tests of tier 1 fail and `make bench-smoke` is refused 50
-  of its 88 reads. CPython 3.14.9 bundles SQLite 3.53.1, which accepts them. PostgreSQL is not affected. An
-  application that runs a wide policy on SQLite 3.54 or later meets the same refusal; until the compiler writes
-  such statements another way, run it on SQLite 3.53 or on PostgreSQL.
+- **CI runs tier 1 on two SQLite versions.** The `tier 1` and `postgres-delta` jobs, the release workflow and
+  `.python-version` stay on CPython 3.14.9, whose SQLite is 3.53.1: they read the statements SQLite 3.54 still
+  refuses. A new job, `tier 1, SQLite 3.54`, runs `make check` on CPython 3.14.10, where the tests of those
+  reads state the refusal instead. No installed package changes.
 - **One slow test has a time limit of its own** (`test_thirty_three_thousand_arrow_readers_see_a_new_grant`, 900
   seconds). It writes 33,000 relationships one at a time inside one transaction, and PostgreSQL, whose
   statistics still call the table empty, picks the index for each row's lookup arbitrarily: about 170 seconds on

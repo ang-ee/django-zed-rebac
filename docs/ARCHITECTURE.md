@@ -1993,6 +1993,32 @@ set; its recursive helper stays inside that definition. Correlated recursive
 helpers stay at their original boundary. Existing application CTEs follow the
 collected id sets in the outer prefix, with positional parameters in that order.
 
+**Id sets written in place on SQLite 3.54 and later.** SQLite 3.54 copies a CTE
+at every FROM item that names it, and refuses a statement (`VIEWs and/or
+subqueries nested too deep`) when the cursors it has allocated reach
+`SQLITE_LIMIT_EXPR_DEPTH` as it resolves a CTE's name: 1,000 on a standard
+build. A statement that names no CTE is not held to that count. On those
+versions `rebac.compile.ctes.assemble` counts from the text what a statement
+unfolds to: the FROM items of each text, and at each one that names an id set,
+that set's count again. For the text the library writes this is SQLite's own
+count. From 900 it writes every id set where it is named, as a subquery under
+the alias the name had, and no `WITH` for them. Values are bound in the order
+of the text: a set written at three places binds its values three times.
+Application CTEs keep their names, with the id sets they read written into
+them. The count is taken for each `WITH` the library would write: a
+statement's root, or alone the scope of a write and each scope under a root
+that does not share id sets. A second binding of sets the statement already
+names (another actor's scope in the same statement) is written in place at any
+size, because the statement around it cannot be rewritten once a nested `WITH`
+defines its names again. A statement under 900, every statement on an older
+SQLite and every statement on another database keep their text. The statement
+stays as it is written, for SQLite to refuse, past 8,000 cursors or 2,000,000
+characters in place: each copy of a set repeats its cursors and its text, and
+SQLite takes seconds and half a gigabyte to prepare 12,000 cursors written this
+way. A recursive helper keeps its name in either form. Compiling opens no
+connection, so a connection that lowers the limit is not followed. See
+[Known limits](#known-limits).
+
 **Named debt: django-cte statement adapter.** `rebac.compile.ctes` is the only
 module that uses django-cte's private API. It owns JIT mixin construction,
 `CTECompiler` ordering and the bypass of its prefix renderer, `_with_ctes`,
@@ -2676,6 +2702,38 @@ of its own.
   with the number of paths through shared id sets even where the text does not.
   A recursive form that falls back to nested SQL still grows with
   `REBAC_DEPTH_LIMIT`; choose that limit for the policy and the vendor.
+- SQLite 3.54 and later hold that limit against the cursors a statement has
+  allocated when it resolves a reference to a CTE, and count a copy of the CTE
+  at every reference. A statement that would reach it has its id sets written
+  in place (see [Inline permission scopes](#inline-permission-scopes)): its
+  text is about 3.5 times as long, it takes about twice as long, and the
+  policy benchmark's process peaks at 430 MB where it peaked at 310 MB. These
+  statements are still refused there (`VIEWs and/or subqueries nested too
+  deep`), and read by an older SQLite and by PostgreSQL:
+  - one that holds a recursive closure (a group whose members are groups, a
+    folder under a folder) which SQLite resolves after the statement has
+    allocated 1,000 cursors: a recursive CTE keeps its name. A wide policy
+    with such a relation is refused as before;
+  - one that unfolds past 8,000 cursors or 2,000,000 characters. A policy
+    whose paths double at each level gets there alone; so does an ordinary wide
+    policy read for three or four actors in one statement, since each
+    actor's scope is written out in full;
+  - one that also names a CTE of the application's, where SQLite resolves that
+    name after 1,000 cursors: the subqueries written in place count there;
+  - several scopes embedded in a root that does not share id sets (a plain
+    Django root without `share_id_sets()`, a write), which are each counted
+    alone and can pass the limit together;
+  - one that reads a model backed by a database view at many places: the
+    count sees the view as one table.
+
+  A statement written in place binds a set's values once for each place it is
+  written, and SQLite refuses one that binds more than the connection takes
+  (`too many SQL variables`, 32,766 by default). A bulk check cuts its
+  statements by their text, so it sends one statement for each item whose
+  statement is written in place. It also gathers items that each read alone
+  into one statement, and that statement is refused when the items hold a
+  recursive closure and together pass 1,000 cursors. Run such a policy on
+  PostgreSQL, or on SQLite before 3.54.
 
 - Query plans on PostgreSQL tables of tens of millions of rows have not been
   verified. A trial at that scale is in progress, and this document makes no
@@ -4095,10 +4153,13 @@ Default `pytest` deselects `slow`, `reference_exhaustive` and
 `schema_vendors`. `make test` runs the tier 1 selection serially, for
 debugging only.
 
-Tiers 1 and 2 are the two parallel jobs of `.github/workflows/ci.yml`, on
+Tiers 1 and 2 are parallel jobs of `.github/workflows/ci.yml`, on
 every push to `main`, every version tag and every pull request:
 `tier 1` runs `make check` and `postgres-delta` runs `make test-pg`
-against a PostgreSQL 16 service container. Publish to PyPI reads the result of
+against a PostgreSQL 16 service container. Both run on CPython 3.14.9, whose
+SQLite is 3.53; a third job, `tier 1, SQLite 3.54`, runs `make check` on
+CPython 3.14.10, whose SQLite counts the copies of a CTE (see
+[Known limits](#known-limits)). Publish to PyPI reads the result of
 the `tier 1` job, not of the whole CI run, so a tag publishes on tier
 1 alone. Tier 3 is `.github/workflows/release.yml`, nightly on `main` and on
 demand, with one job per part; the reference sweep is split across six jobs by

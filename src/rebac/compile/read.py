@@ -114,13 +114,10 @@ class _Kept:
 
     @property
     def sql(self) -> str:
-        sql, _params = ctes.assemble((self.body, ()), self.definitions, connections[self.using])
-        return f"({sql})"
+        return self._alone(*self._bind(self.params))[0]
 
-    def render(self, bound: Iterable[Any]) -> tuple[str, tuple[Any, ...]]:
-        values = tuple(bound)
-        if not self.definitions:
-            return self.sql, values
+    def _bind(self, values: tuple[Any, ...]) -> tuple[tuple[ctes.Definition, ...], ctes.SQL]:
+        """The definitions and the body, each with its own of ``values``."""
         definitions = []
         offset = 0
         for item in self.definitions:
@@ -129,9 +126,25 @@ class _Kept:
                 ctes.Definition(item.name, item.sql, values[offset:stop], item.template)
             )
             offset = stop
-        if ctes.register(tuple(definitions)):
-            return f"({self.body})", values[offset:]
-        return self.sql, values
+        return tuple(definitions), (self.body, values[offset:])
+
+    def _alone(
+        self, definitions: tuple[ctes.Definition, ...], body: ctes.SQL, *, second: bool = False
+    ) -> ctes.SQL:
+        """The statement carrying its own definitions.
+
+        The assembler orders the values: an id set written in place of its
+        name binds its values there, not ahead of the statement.
+        """
+        sql, params = ctes.assemble(body, definitions, connections[self.using], second=second)
+        return f"({sql})", params
+
+    def render(self, bound: Iterable[Any]) -> ctes.SQL:
+        definitions, body = self._bind(tuple(bound))
+        if definitions and ctes.register(definitions):
+            return f"({body[0]})", body[1]
+        # Nothing collects id sets here, or what does names these for another binding.
+        return self._alone(definitions, body, second=ctes.embedded())
 
 
 class _Candidate:

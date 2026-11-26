@@ -12,6 +12,13 @@ the depth of every subquery nested in a WHERE clause while it resolves names
 and refuses a statement deeper than ``SQLITE_LIMIT_EXPR_DEPTH`` (1000); a CTE
 body does not count toward the depth of the expression that selects from it,
 so the depth grows with the length of an arrow chain, not its square.
+
+SQLite 3.54 and later hold the same limit against the cursors a statement has
+allocated when it resolves a reference to a CTE, and copy a CTE at every
+reference to it. A statement whose copies reach the limit has its id sets
+written where they are named instead. That does not serve a recursive closure,
+which keeps its name, nor a statement that would bind more values in place
+than SQLite takes: SQLite refuses both.
 """
 
 from __future__ import annotations
@@ -20,10 +27,11 @@ import re
 import sqlite3
 
 import pytest
-from django.db import connection
+from django.db import OperationalError, connection
+from django.db.models import Exists, OuterRef
 
-from rebac import ObjectRef, RelationshipTuple, SubjectRef, sudo, to_object_ref
-from rebac.compile import read
+from rebac import ObjectRef, RelationshipTuple, SubjectRef, share_id_sets, sudo, to_object_ref
+from rebac.compile import ctes, read
 from rebac.compile.predicate import Compiler
 from rebac.testing import install_schema
 from tests.testapp.models import Post
@@ -40,13 +48,18 @@ ARMS = 6
 # still expands each CTE reference while it resolves the statement, so this
 # stays small enough for SQLite to execute.
 BRANCHING = 9
+# A chain without nested groups long enough to unfold past 1,000 cursors (1,207).
+LONG = 40
+# SQLite 3.54 and later count the copies of a CTE (the module's last paragraph).
+COUNTED = ctes._counts_cte_copies(connection)
 
 
-def _schema(levels: int, *, branching: bool) -> str:
+def _schema(levels: int, *, branching: bool, nested_groups: bool = True) -> str:
+    # A group whose members are groups is read through a recursive closure.
     lines = [
         "definition auth/user {}",
         "definition auth/group {",
-        "    relation member: auth/user | auth/group#member",
+        f"    relation member: auth/user{' | auth/group#member' if nested_groups else ''}",
         "}",
     ]
     for level in range(levels):
@@ -75,8 +88,8 @@ def _schema(levels: int, *, branching: bool) -> str:
     return "\n".join(lines)
 
 
-def _install(levels: int, *, branching: bool):
-    local = install_schema(_schema(levels, branching=branching))
+def _install(levels: int, *, branching: bool, nested_groups: bool = True):
+    local = install_schema(_schema(levels, branching=branching, nested_groups=nested_groups))
     with sudo(reason="wide policy fixture"):
         post = Post.objects.create(title="reached at the end of the chain")
     tuples = [RelationshipTuple(to_object_ref(post), "parent", SubjectRef.of("chain/t0", "0"))]
@@ -144,6 +157,15 @@ def _scope_ids(local, actor: SubjectRef) -> list[int]:
     return list(Post._base_manager.filter(scope).values_list("pk", flat=True))
 
 
+def _refused_where_copies_are_counted(local, actor: SubjectRef, expected: list[int]) -> None:
+    """The scope's rows; on SQLite 3.54 and later, the refusal of a statement it cannot read."""
+    if COUNTED:
+        with pytest.raises(OperationalError, match="nested too deep"):
+            _scope_ids(local, actor)
+    else:
+        assert _scope_ids(local, actor) == expected
+
+
 def test_a_statement_grows_with_its_distinct_id_sets_not_its_paths(monkeypatch):
     built = _counting_nodes(monkeypatch)
     single = _scope_sql(install_schema(_schema(BRANCHING, branching=False)), ACTOR)
@@ -165,12 +187,14 @@ def test_a_statement_grows_with_its_distinct_id_sets_not_its_paths(monkeypatch):
     # The kept statement defines every id set it selects from.
     defined = set(re.findall(_id_set_name() + r" AS \(", statement))
     assert set(re.findall(r"FROM " + _id_set_name(), statement)) == defined
-    assert _scope_ids(local, ACTOR) == [post.pk]
+    # 2 ** 9 paths unfold to 28,000 cursors, past what is written in place:
+    # where SQLite counts the copies, the statement stays as written and is refused.
+    _refused_where_copies_are_counted(local, ACTOR, [post.pk])
     # Nothing in the statement depends on the actor beyond its bound
     # parameters: compiled afresh for another actor, it is the same text.
     read.reset()
     assert _scope_sql(local, OTHER) == sql
-    assert _scope_ids(local, OTHER) == []
+    _refused_where_copies_are_counted(local, OTHER, [])
 
 
 def test_each_enumeration_branch_defines_the_id_sets_it_selects():
@@ -182,7 +206,10 @@ def test_each_enumeration_branch_defines_the_id_sets_it_selects():
     assert local.accessible(subject=OTHER, action="read", resource_type="blog/post") == []
 
 
-@pytest.mark.skipif(connection.vendor != "sqlite", reason="SQLite's expression depth")
+@pytest.mark.skipif(
+    connection.vendor != "sqlite" or COUNTED,
+    reason="SQLite's expression depth, where the limit counts nothing else",
+)
 def test_a_long_arrow_chain_reads_under_a_fixed_expression_depth():
     local, post = _install(CHAIN, branching=False)
     connection.ensure_connection()
@@ -197,6 +224,69 @@ def test_a_long_arrow_chain_reads_under_a_fixed_expression_depth():
         ).allowed
     finally:
         raw.setlimit(sqlite3.SQLITE_LIMIT_EXPR_DEPTH, previous)
+
+
+@pytest.mark.skipif(not COUNTED, reason="SQLite 3.54's count of a CTE's copies")
+def test_a_recursive_closure_past_sqlites_cursor_limit_is_refused():
+    # The chain's groups nest, and a recursive closure keeps its name: SQLite
+    # has allocated more than 1,000 cursors when it resolves it (1,231).
+    local, post = _install(CHAIN, branching=False)
+    with pytest.raises(OperationalError, match="nested too deep"):
+        _scope_ids(local, ACTOR)
+    with pytest.raises(OperationalError, match="nested too deep"):
+        local.check_access(subject=ACTOR, action="read", resource=to_object_ref(post))
+
+
+@pytest.mark.skipif(connection.vendor != "sqlite", reason="SQLite's limit on the copies of a CTE")
+def test_a_statement_past_sqlites_cursor_limit_is_read_with_its_id_sets_in_place(monkeypatch):
+    local, post = _install(LONG, branching=False, nested_groups=False)
+    statement, _params = _scope_statement(local, ACTOR)
+    assert bool(re.search(_id_set_name() + r" AS \(", statement)) is not COUNTED
+    # SQLite 3.54 and later read it as it is written for them; an older SQLite reads either form.
+    rows = {actor: _scope_ids(local, actor) for actor in (ACTOR, OTHER)}
+    assert rows == {ACTOR: [post.pk], OTHER: []}
+    monkeypatch.setattr(ctes, "_counts_cte_copies", lambda connection: True)
+    statement, _params = _scope_statement(local, ACTOR)
+    assert "WITH RECURSIVE" not in statement and not re.search(_id_set_name(), statement)
+    assert {actor: _scope_ids(local, actor) for actor in (ACTOR, OTHER)} == rows
+    assert local.check_access(subject=ACTOR, action="read", resource=to_object_ref(post)).allowed
+    assert not local.check_access(
+        subject=OTHER, action="read", resource=to_object_ref(post)
+    ).allowed
+    # A statement within the limit keeps its names.
+    short, _post = _install(3, branching=False, nested_groups=False)
+    read.reset()
+    assert re.search(_id_set_name() + r" AS \(", _scope_statement(short, ACTOR)[0])
+
+
+@pytest.mark.skipif(connection.vendor != "sqlite", reason="SQLite's limit on the copies of a CTE")
+def test_two_bindings_in_one_statement_are_read_past_the_limit_together(monkeypatch):
+    # 607 cursors for each actor: under the limit alone, past it together.
+    local, post = _install(20, branching=False, nested_groups=False)
+
+    def scope(actor):
+        q = read.scope_q(backend=local, model=Post, action="read", actor=actor, using="default")
+        return Exists(Post._base_manager.filter(q, pk=OuterRef("pk")))
+
+    rows = share_id_sets(Post._base_manager.all()).annotate(actor=scope(ACTOR), other=scope(OTHER))
+    assert list(rows.values_list("pk", "actor", "other")) == [(post.pk, True, False)]
+    monkeypatch.setattr(ctes, "_counts_cte_copies", lambda connection: True)
+    sql, params = rows.values_list("pk", "actor", "other").query.sql_with_params()
+    assert "WITH RECURSIVE" not in sql and not re.search(_id_set_name(), sql)
+    assert params.count("wide") and params.count("other")
+    assert list(rows.all().values_list("pk", "actor", "other")) == [(post.pk, True, False)]
+
+
+@pytest.mark.skipif(not COUNTED, reason="SQLite 3.54's count of a CTE's copies")
+def test_sqlite_refuses_a_named_statement_at_the_count_the_library_takes(monkeypatch):
+    # 997 cursors by the library's count, then 1,027: SQLite's limit of 1,000 lies between.
+    monkeypatch.setattr(ctes, "_CURSOR_BUDGET", 10**9)
+    under, post = _install(33, branching=False, nested_groups=False)
+    assert _scope_ids(under, ACTOR) == [post.pk]
+    over, _post = _install(34, branching=False, nested_groups=False)
+    read.reset()
+    with pytest.raises(OperationalError, match="nested too deep"):
+        _scope_ids(over, ACTOR)
 
 
 @pytest.mark.skipif(connection.vendor != "sqlite", reason="SQLite's expression depth")

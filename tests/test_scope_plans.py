@@ -15,7 +15,7 @@ from statistics import median
 from time import perf_counter
 
 import pytest
-from django.db import connection
+from django.db import OperationalError, connection
 from django.db.models import Count, Exists, OuterRef
 from django.utils import timezone
 
@@ -27,6 +27,7 @@ from rebac import (
     evaluator_scope,
     to_object_ref,
 )
+from rebac.compile import ctes
 from rebac.models import RebacResource, active_relationship_model
 from rebac.models.generation import SchemaGeneration
 from rebac.testing import install_schema
@@ -398,6 +399,12 @@ def test_field_arrow_diamond_keeps_shared_predicate_definitions(levels):
     # Branching doubles the paths at each level, but not the emitted text.
     assert len(sql) < 3 * len(single)
     assert len(sql) < 3000 * (levels + 1)
+    if levels == 9 and ctes._counts_cte_copies(connection):
+        # Doubled nine times the statement is 2.9 MB in place, more than the library
+        # writes out, and SQLite 3.54 and later refuse it as written (Known limits).
+        with pytest.raises(OperationalError, match="nested too deep"):
+            list(rows.values_list("pk", flat=True))
+        return
     assert list(rows.values_list("pk", flat=True)) == [1]
     assert not Folder.objects.with_actor(MEMBER).filter(name="level-1").exists()
     if connection.vendor == "postgresql" and connection.pg_version >= 170000:

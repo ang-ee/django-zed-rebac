@@ -173,10 +173,13 @@ statement counts and compile time per scope. Written assertions are not results.
 Python 3.14 and Django 6.1, in three workflows:
 
 - **CI** (`.github/workflows/ci.yml`) runs on pushes to `main`, on version
-  tags and on pull requests, as two parallel jobs. `tier 1` runs
+  tags and on pull requests, as three parallel jobs. `tier 1` runs
   `make check`: tier 1, and the check branch protection requires.
   `postgres-delta` runs `make test-pg` against a `postgres:16` service
-  container: tier 2.
+  container: tier 2. Both run on CPython 3.14.9, whose SQLite is 3.53.
+  `tier 1, SQLite 3.54` runs `make check` on CPython 3.14.10, whose SQLite
+  counts the copies of a common table expression and has wide statements
+  written another way (`docs/ARCHITECTURE.md`, Known limits).
 - **Release** (`.github/workflows/release.yml`) runs tier 3 nightly on `main`
   at 03:17 UTC and on demand, one job per part: `slow` on SQLite, the whole
   suite on PostgreSQL 16, the reference

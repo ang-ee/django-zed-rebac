@@ -1,9 +1,11 @@
 """Permission semantics against source facts, the reference model, and the walker."""
 
+from contextlib import nullcontext
 from datetime import timedelta
 from unittest.mock import patch
 
 import pytest
+from django.db import OperationalError, connection
 from django.test import override_settings
 from django.utils import timezone
 
@@ -17,7 +19,7 @@ from rebac import (
     sudo,
 )
 from rebac.backends import reset_backend
-from rebac.compile import formulas
+from rebac.compile import ctes, formulas
 from rebac.schema import parse_zed
 from rebac.testing import install_schema
 from rebac.types import CheckResult, RelationshipFilter
@@ -773,7 +775,7 @@ def test_removing_one_ban_leaves_unrelated_bans_in_force(install):
 
 @pytest.mark.pg_delta
 @pytest.mark.parametrize("install", STORAGE_TIERS, indirect=True)
-def test_expiry_of_recursive_grants_and_memberships(install):
+def test_expiry_of_recursive_grants_and_memberships(install, settings):
     active = install("""
         use expiration
         definition auth/user {}
@@ -813,13 +815,24 @@ def test_expiry_of_recursive_grants_and_memberships(install):
             ]
         )
     active.write_relationships(rows)
+    # Once every grant has expired, each check needs its upper bound and the bulk check
+    # gathers them: in the registry layout one statement then holds 88 recursive closures
+    # and passes 1,000 cursors, which SQLite 3.54 and later refuse (Known limits).
+    refused = settings.REBAC_LOCAL_BACKEND_STORAGE == "registry" and ctes._counts_cte_copies(
+        connection
+    )
     for instant in (now, short, long):
-        assert_reads_match(
-            subjects=subjects,
-            resources=[doc(), doc("group"), doc("leaf")],
-            actions=["read", "edit"],
-            now=instant,
-        )
+        with (
+            pytest.raises(OperationalError, match="nested too deep")
+            if refused and instant is long
+            else nullcontext()
+        ):
+            assert_reads_match(
+                subjects=subjects,
+                resources=[doc(), doc("group"), doc("leaf")],
+                actions=["read", "edit"],
+                now=instant,
+            )
     # A grant lasts as long as its longest path: the nested group and the
     # parent document outlive the direct rows.
     for instant, allowed in ((short, True), (long, False)):
